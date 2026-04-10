@@ -1,0 +1,272 @@
+"""Server-side database: Postgres schema, connection pool, and query functions.
+
+Uses psycopg v3 + psycopg_pool, matching the pattern in ~/hive/src/hive/server/db.py.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Any
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Json
+from psycopg_pool import AsyncConnectionPool
+
+from .models import AgentConfig, AgentRecord, LogEntry, SandboxRecord
+
+log = logging.getLogger(__name__)
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/agent_sdk_server")
+
+_PG_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS agents (
+        id      TEXT PRIMARY KEY,
+        name    TEXT,
+        config  JSONB
+    )""",
+    """CREATE TABLE IF NOT EXISTS sandboxes (
+        id              TEXT PRIMARY KEY,
+        provider        TEXT NOT NULL,
+        sandbox_ref     TEXT NOT NULL,
+        status          TEXT DEFAULT 'stopped',
+        name            TEXT UNIQUE,
+        image           TEXT DEFAULT 'python:3.12-slim',
+        auto_stop_min   INTEGER DEFAULT 15,
+        labels          JSONB DEFAULT '{}',
+        env_vars        JSONB DEFAULT '{}',
+        resources       JSONB DEFAULT '{}',
+        agent_count     INTEGER DEFAULT 0,
+        last_activity   TIMESTAMPTZ,
+        error_message   TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
+    """CREATE TABLE IF NOT EXISTS sessions (
+        id                  TEXT PRIMARY KEY,
+        agent_id            TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        sandbox_id          TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
+        inner_session_id    TEXT,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
+    """CREATE TABLE IF NOT EXISTS session_log (
+        id          SERIAL PRIMARY KEY,
+        session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        sandbox_id  TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
+        event_type  TEXT NOT NULL,
+        payload     JSONB NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_sandbox ON sessions(sandbox_id)",
+    "CREATE INDEX IF NOT EXISTS idx_session_log_session ON session_log(session_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_session_log_agent ON session_log(agent_id, created_at DESC)",
+]
+
+
+# ---------------------------------------------------------------------------
+# Init + pool lifecycle
+# ---------------------------------------------------------------------------
+
+def init_db() -> None:
+    """Run DDL. Call once before workers start (sync)."""
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    try:
+        for stmt in _PG_SCHEMA:
+            conn.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_pool: AsyncConnectionPool | None = None
+
+
+async def init_pool(min_size: int = 2, max_size: int = 10) -> None:
+    global _pool
+    _pool = AsyncConnectionPool(
+        DATABASE_URL,
+        kwargs={"row_factory": dict_row},
+        min_size=min_size,
+        max_size=max_size,
+        open=False,
+    )
+    await _pool.open()
+
+
+async def close_pool() -> None:
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+
+
+@asynccontextmanager
+async def get_db():
+    """Borrow an async connection from the pool. Auto-commits on success, rolls back on error."""
+    if _pool is None:
+        raise RuntimeError("Database pool not initialized. Call init_pool() first.")
+    async with _pool.connection() as conn:
+        try:
+            yield conn
+            await conn.commit()
+        except Exception:
+            # Let the pool context manager handle broken connections —
+            # manual conn.close() here would corrupt pool state (double-close).
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Agent CRUD
+# ---------------------------------------------------------------------------
+
+async def upsert_agent(agent: AgentRecord) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO agents (id, name, config) VALUES (%s, %s, %s)"
+            " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, config=EXCLUDED.config",
+            (agent.id, agent.name, Json(agent.config.to_dict())),
+        )
+
+
+async def get_agent(agent_id: str) -> AgentRecord | None:
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT * FROM agents WHERE id = %s", (agent_id,)
+        )).fetchone()
+    if row is None:
+        return None
+    config_data = row["config"] if row["config"] else {}
+    return AgentRecord(id=row["id"], name=row["name"], config=AgentConfig.from_dict(config_data))
+
+
+async def list_agents() -> list[AgentRecord]:
+    async with get_db() as conn:
+        rows = await (await conn.execute("SELECT * FROM agents")).fetchall()
+    return [
+        AgentRecord(
+            id=r["id"], name=r["name"],
+            config=AgentConfig.from_dict(r["config"] if r["config"] else {}),
+        )
+        for r in rows
+    ]
+
+
+async def delete_agent(agent_id: str) -> None:
+    async with get_db() as conn:
+        await conn.execute("DELETE FROM agents WHERE id = %s", (agent_id,))
+
+
+# ---------------------------------------------------------------------------
+# Sandbox CRUD
+# ---------------------------------------------------------------------------
+
+async def upsert_sandbox(sandbox: SandboxRecord) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO sandboxes (id, provider, sandbox_ref, status)"
+            " VALUES (%s, %s, %s, %s)"
+            " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
+            " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status",
+            (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status),
+        )
+
+
+async def get_sandbox(sandbox_id: str) -> SandboxRecord | None:
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT * FROM sandboxes WHERE id = %s", (sandbox_id,)
+        )).fetchone()
+    if row is None:
+        return None
+    return SandboxRecord(
+        id=row["id"], provider=row["provider"],
+        sandbox_ref=row["sandbox_ref"], status=row["status"],
+    )
+
+
+async def list_sandboxes() -> list[SandboxRecord]:
+    async with get_db() as conn:
+        rows = await (await conn.execute("SELECT * FROM sandboxes")).fetchall()
+    return [
+        SandboxRecord(id=r["id"], provider=r["provider"],
+                      sandbox_ref=r["sandbox_ref"], status=r["status"])
+        for r in rows
+    ]
+
+
+async def delete_sandbox(sandbox_id: str) -> None:
+    async with get_db() as conn:
+        await conn.execute("DELETE FROM sandboxes WHERE id = %s", (sandbox_id,))
+
+
+# ---------------------------------------------------------------------------
+# Session CRUD
+# ---------------------------------------------------------------------------
+
+async def upsert_session(session_id: str, agent_id: str, sandbox_id: str,
+                         inner_session_id: str | None) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO sessions (id, agent_id, sandbox_id, inner_session_id)"
+            " VALUES (%s, %s, %s, %s)"
+            " ON CONFLICT(id) DO UPDATE SET inner_session_id=EXCLUDED.inner_session_id",
+            (session_id, agent_id, sandbox_id, inner_session_id),
+        )
+
+
+async def get_session(session_id: str) -> dict | None:
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT * FROM sessions WHERE id = %s", (session_id,)
+        )).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Session log
+# ---------------------------------------------------------------------------
+
+def _row_to_log_entry(r: dict) -> LogEntry:
+    return LogEntry(id=r["id"], session_id=r["session_id"], agent_id=r["agent_id"],
+                    sandbox_id=r["sandbox_id"], event_type=r["event_type"],
+                    payload=r["payload"], created_at=r["created_at"].timestamp())
+
+
+async def log_event(*, session_id: str, agent_id: str, sandbox_id: str,
+                    event_type: str, payload: dict) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO session_log (session_id, agent_id, sandbox_id, event_type, payload)"
+            " VALUES (%s, %s, %s, %s, %s)",
+            (session_id, agent_id, sandbox_id, event_type, Json(payload)),
+        )
+
+
+async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT id, session_id, agent_id, sandbox_id, event_type, payload, created_at"
+            " FROM session_log WHERE session_id = %s ORDER BY created_at ASC LIMIT %s",
+            (session_id, limit),
+        )).fetchall()
+    return [_row_to_log_entry(r) for r in rows]
+
+
+async def get_agent_log(agent_id: str, limit: int = 100) -> list[LogEntry]:
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT id, session_id, agent_id, sandbox_id, event_type, payload, created_at"
+            " FROM session_log WHERE agent_id = %s ORDER BY created_at DESC LIMIT %s",
+            (agent_id, limit),
+        )).fetchall()
+    return [_row_to_log_entry(r) for r in rows]
