@@ -1,0 +1,1438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AFE Agent SDK — Data Model</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0f1117;
+    color: #e6edf3;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 60px;
+    min-height: 100vh;
+  }
+
+  .page-wrap {
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+
+  /* ── Page header ── */
+  .page-header { margin-bottom: 48px; }
+  .page-header h1 {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: #e6edf3;
+    margin-bottom: 8px;
+  }
+  .page-header .subtitle {
+    font-size: 15px;
+    color: #8b949e;
+  }
+
+  /* ── Section ── */
+  .section { margin-bottom: 60px; }
+  .section-divider {
+    border: none;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    margin-bottom: 48px;
+  }
+  .section-header { margin-bottom: 28px; }
+  .section-header h2 {
+    font-size: 24px;
+    font-weight: 600;
+    color: #e6edf3;
+    letter-spacing: -0.3px;
+    margin-bottom: 6px;
+  }
+  .section-header .section-sub {
+    font-size: 13px;
+  }
+
+  /* ── Two-column grid ── */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px;
+    align-items: start;
+  }
+  .col { display: flex; flex-direction: column; gap: 16px; }
+
+  /* ── Card ── */
+  .card {
+    border-radius: 14px;
+    border: 1px solid rgba(255,255,255,0.08);
+    overflow: hidden;
+  }
+
+  /* ── Card header ── */
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 18px;
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .card-header .table-name { display: flex; align-items: center; gap: 8px; }
+  .card-header .table-name .dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  }
+  .card-header .badges { display: flex; align-items: center; gap: 6px; }
+
+  /* Category badge */
+  .badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 4px;
+    line-height: 1.6;
+  }
+
+  /* Status badges */
+  .badge-new {
+    background: rgba(34,197,94,0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34,197,94,0.3);
+  }
+  .badge-updated {
+    background: rgba(245,158,11,0.12);
+    color: #fbbf24;
+    border: 1px solid rgba(245,158,11,0.25);
+  }
+
+  /* ── Card body ── */
+  .card-body {
+    background: rgba(255,255,255,0.02);
+    padding: 8px 18px 14px;
+  }
+
+  /* ── Field row ── */
+  .field {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .field:last-of-type { border-bottom: none; }
+
+  .field-badges { display: flex; gap: 4px; flex-shrink: 0; }
+  .badge-pk {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+    padding: 1px 5px; border-radius: 3px;
+    background: rgba(251,191,36,0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(251,191,36,0.25);
+    text-transform: uppercase;
+    line-height: 1.6;
+  }
+  .badge-fk {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+    padding: 1px 5px; border-radius: 3px;
+    background: rgba(96,165,250,0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(96,165,250,0.25);
+    text-transform: uppercase;
+    line-height: 1.6;
+  }
+
+  .field-name {
+    font-family: "SF Mono", "Fira Code", "Fira Mono", "Roboto Mono", monospace;
+    color: #d1d5db;
+    min-width: 120px;
+    font-size: 12.5px;
+    flex-shrink: 0;
+  }
+  .field-type {
+    color: #6b7280;
+    font-size: 11px;
+    font-family: "SF Mono", "Fira Code", monospace;
+    flex-shrink: 0;
+  }
+  .field-desc {
+    color: #4b5563;
+    font-size: 11px;
+    margin-left: auto;
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  /* NEW field highlight */
+  .field.is-new {
+    background: rgba(34,197,94,0.04);
+    border-radius: 4px;
+    padding-left: 6px;
+    margin-left: -6px;
+    border-bottom: 1px solid rgba(34,197,94,0.08);
+  }
+  .badge-field-new {
+    font-size: 9px; font-weight: 700;
+    padding: 1px 5px; border-radius: 3px;
+    background: rgba(34,197,94,0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34,197,94,0.25);
+    text-transform: uppercase;
+    line-height: 1.6;
+    letter-spacing: 0.4px;
+  }
+
+  /* ── Method row (SDK / events) ── */
+  .method-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .method-row:last-of-type { border-bottom: none; }
+  .method-name {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #d1d5db;
+    font-size: 12px;
+  }
+  .method-ret {
+    color: #6b7280;
+    font-size: 11px;
+    font-family: "SF Mono", "Fira Code", monospace;
+  }
+  .method-desc {
+    color: #4b5563;
+    font-size: 11px;
+    margin-left: auto;
+    white-space: nowrap;
+  }
+  .method-row.is-new .method-name { color: #a7f3d0; }
+  .method-row.is-new { background: rgba(34,197,94,0.04); border-radius: 4px; padding-left: 6px; margin-left: -6px; }
+
+  /* Event row */
+  .event-row {
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 12px;
+    color: #d1d5db;
+  }
+  .event-row:last-of-type { border-bottom: none; }
+  .event-row.is-new { color: #a7f3d0; background: rgba(34,197,94,0.04); border-radius: 4px; padding-left: 6px; margin-left: -6px; border-bottom: 1px solid rgba(34,197,94,0.08); }
+  .event-detail { color: #6b7280; font-size: 11px; }
+
+  /* ── Relation note ── */
+  .relation-note {
+    margin-top: 10px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 11px;
+    color: #8b949e;
+    line-height: 1.6;
+  }
+
+  /* ── Lifecycle diagram ── */
+  .lifecycle-diagram {
+    background: rgba(0,0,0,0.3);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 10px;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 12px;
+    color: #a7f3d0;
+    line-height: 1.9;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .lifecycle-item {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    padding: 4px 0;
+    font-size: 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .lifecycle-item:last-of-type { border-bottom: none; }
+  .lifecycle-key {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #86efac;
+    min-width: 110px;
+    flex-shrink: 0;
+  }
+  .lifecycle-val { color: #6b7280; font-size: 11px; }
+
+  /* MCP routing rows */
+  .route-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 12px;
+  }
+  .route-row:last-of-type { border-bottom: none; }
+  .route-from {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #fde68a;
+    min-width: 60px;
+    flex-shrink: 0;
+  }
+  .route-arrow { color: #4b5563; flex-shrink: 0; }
+  .route-to {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #fbbf24;
+    flex-shrink: 0;
+  }
+  .route-impl {
+    color: #4b5563;
+    font-size: 11px;
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  /* ── API Endpoints section ── */
+  .endpoints-card {
+    border-radius: 14px;
+    border: 1px solid rgba(255,255,255,0.08);
+    overflow: hidden;
+  }
+  .endpoints-card-header {
+    padding: 12px 18px;
+    background: rgba(255,255,255,0.03);
+    font-size: 13px;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .endpoints-body {
+    padding: 8px 18px 14px;
+    background: rgba(255,255,255,0.02);
+  }
+  .endpoint-group-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #4b5563;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    padding: 12px 0 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    margin-bottom: 4px;
+  }
+  .endpoint-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .endpoint-row:last-of-type { border-bottom: none; }
+  .method-badge {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    min-width: 56px;
+    text-align: center;
+    line-height: 1.6;
+    flex-shrink: 0;
+  }
+  .method-get    { background: rgba(34,197,94,0.12);  color: #4ade80;  border: 1px solid rgba(34,197,94,0.25); }
+  .method-post   { background: rgba(59,130,246,0.12); color: #60a5fa;  border: 1px solid rgba(59,130,246,0.25); }
+  .method-delete { background: rgba(239,68,68,0.12);  color: #f87171;  border: 1px solid rgba(239,68,68,0.25); }
+  .method-put    { background: rgba(245,158,11,0.12); color: #fbbf24;  border: 1px solid rgba(245,158,11,0.25); }
+
+  .endpoint-path {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #d1d5db;
+    font-size: 12px;
+    min-width: 300px;
+    flex-shrink: 0;
+  }
+  .endpoint-desc {
+    color: #6b7280;
+    font-size: 11px;
+  }
+  .endpoint-new-badge {
+    margin-left: auto;
+    font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+    padding: 1px 6px; border-radius: 3px;
+    background: rgba(34,197,94,0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34,197,94,0.25);
+    text-transform: uppercase;
+    line-height: 1.6;
+    flex-shrink: 0;
+  }
+
+  /* Color helpers — generated per category */
+  /* blue */
+  .ch-blue   { background: rgba(59,130,246,0.15); color: #93c5fd; }
+  .dot-blue  { background: #3b82f6; }
+  .badge-blue { background: rgba(59,130,246,0.12); color: #60a5fa; border: 1px solid rgba(59,130,246,0.2); }
+  /* orange */
+  .ch-orange   { background: rgba(249,115,22,0.15); color: #fdba74; }
+  .dot-orange  { background: #f97316; }
+  .badge-orange { background: rgba(249,115,22,0.12); color: #fb923c; border: 1px solid rgba(249,115,22,0.2); }
+  /* purple */
+  .ch-purple   { background: rgba(168,85,247,0.15); color: #d8b4fe; }
+  .dot-purple  { background: #a855f7; }
+  .badge-purple { background: rgba(168,85,247,0.12); color: #c084fc; border: 1px solid rgba(168,85,247,0.2); }
+  /* pink */
+  .ch-pink   { background: rgba(236,72,153,0.15); color: #f9a8d4; }
+  .dot-pink  { background: #ec4899; }
+  .badge-pink { background: rgba(236,72,153,0.12); color: #f472b6; border: 1px solid rgba(236,72,153,0.2); }
+  /* cyan */
+  .ch-cyan   { background: rgba(6,182,212,0.15); color: #67e8f9; }
+  .dot-cyan  { background: #06b6d4; }
+  .badge-cyan { background: rgba(6,182,212,0.12); color: #22d3ee; border: 1px solid rgba(6,182,212,0.2); }
+  /* green */
+  .ch-green   { background: rgba(34,197,94,0.15); color: #86efac; }
+  .dot-green  { background: #22c55e; }
+  .badge-green { background: rgba(34,197,94,0.12); color: #4ade80; border: 1px solid rgba(34,197,94,0.2); }
+  /* amber */
+  .ch-amber   { background: rgba(245,158,11,0.15); color: #fde68a; }
+  .dot-amber  { background: #f59e0b; }
+  .badge-amber { background: rgba(245,158,11,0.12); color: #fbbf24; border: 1px solid rgba(245,158,11,0.2); }
+</style>
+</head>
+<body>
+<div class="page-wrap">
+
+  <!-- ═══════════════════════════════════════════════
+       PAGE HEADER
+  ═══════════════════════════════════════════════ -->
+  <div class="page-header">
+    <h1>AFE Agent SDK — Data Model</h1>
+    <p class="subtitle">Schema reference for the auto-feature-engineer agent server</p>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════
+       SECTION 1: DATA MODEL
+  ═══════════════════════════════════════════════ -->
+  <div class="section">
+    <div class="section-header">
+      <h2>Data Model</h2>
+      <p class="section-sub" style="color:#8b949e;">SQLite persistence + in-process runtime state + sandbox-agent layer</p>
+    </div>
+
+    <div class="two-col">
+      <!-- LEFT COL -->
+      <div class="col">
+
+        <!-- agents table -->
+        <div class="card">
+          <div class="card-header ch-blue">
+            <div class="table-name">
+              <span class="dot dot-blue"></span>
+              agents
+            </div>
+            <div class="badges">
+              <span class="badge badge-blue">core</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <div class="field-badges"><span class="badge-pk">PK</span></div>
+              <span class="field-name">id</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">UUID</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">name</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">human label</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">config</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">JSON blob (AgentConfig)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- sandboxes table -->
+        <div class="card">
+          <div class="card-header ch-green">
+            <div class="table-name">
+              <span class="dot dot-green"></span>
+              sandboxes
+            </div>
+            <div class="badges">
+              <span class="badge badge-green">core</span>
+              <span class="badge badge-updated">updated</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <div class="field-badges"><span class="badge-pk">PK</span></div>
+              <span class="field-name">id</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">UUID</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">provider</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">"local" | "daytona"</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">sandbox_ref</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">port or sandbox_id</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">status</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">default 'stopped'</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">name</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">UNIQUE, human label</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">image</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">default 'python:3.12-slim'</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">auto_stop_min</span>
+              <span class="field-type">INTEGER</span>
+              <span class="field-desc">default 15</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">labels</span>
+              <span class="field-type">JSONB</span>
+              <span class="field-desc">default '{}'</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">env_vars</span>
+              <span class="field-type">JSONB</span>
+              <span class="field-desc">default '{}'</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">resources</span>
+              <span class="field-type">JSONB</span>
+              <span class="field-desc">default '{}'</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">agent_count</span>
+              <span class="field-type">INTEGER</span>
+              <span class="field-desc">default 0</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">last_activity</span>
+              <span class="field-type">TIMESTAMPTZ</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">error_message</span>
+              <span class="field-type">TEXT</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">created_at</span>
+              <span class="field-type">TIMESTAMPTZ</span>
+              <span class="field-desc">default now()</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">updated_at</span>
+              <span class="field-type">TIMESTAMPTZ</span>
+              <span class="field-desc">default now()</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- sessions table -->
+        <div class="card">
+          <div class="card-header ch-orange">
+            <div class="table-name">
+              <span class="dot dot-orange"></span>
+              sessions
+            </div>
+            <div class="badges">
+              <span class="badge badge-orange">Server DB</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <div class="field-badges"><span class="badge-pk">PK</span></div>
+              <span class="field-name">id</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">session_id</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">agent_id</span>
+              <span class="field-type">TEXT</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">sandbox_id</span>
+              <span class="field-type">TEXT</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">inner_session_id</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">ACP session handle</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">created_at</span>
+              <span class="field-type">REAL</span>
+            </div>
+            <div class="relation-note">Persisted so sessions survive server restarts. Resume with just <code style="font-family:monospace;color:#fb923c;">POST /sessions/{id}/resume</code>.</div>
+          </div>
+        </div>
+
+        <!-- session_log table -->
+        <div class="card">
+          <div class="card-header ch-orange">
+            <div class="table-name">
+              <span class="dot dot-orange"></span>
+              session_log
+            </div>
+            <div class="badges">
+              <span class="badge badge-orange">Server DB</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <div class="field-badges"><span class="badge-pk">PK</span></div>
+              <span class="field-name">id</span>
+              <span class="field-type">INTEGER</span>
+              <span class="field-desc">auto</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">session_id</span>
+              <span class="field-type">TEXT</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">agent_id</span>
+              <span class="field-type">TEXT</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">sandbox_id</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">FK → sandboxes</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">event_type</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">user_message | assistant_message | tool_call | tool_result | usage | error</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">payload</span>
+              <span class="field-type">JSONB</span>
+              <span class="field-desc">JSON</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">created_at</span>
+              <span class="field-type">TIMESTAMPTZ</span>
+              <span class="field-desc">default now()</span>
+            </div>
+            <div class="relation-note">Append-only telemetry. Query via <code style="font-family:monospace;color:#fb923c;">GET /sessions/{id}/log</code>.</div>
+          </div>
+        </div>
+
+        <!-- SSE Events -->
+        <div class="card">
+          <div class="card-header ch-pink">
+            <div class="table-name">
+              <span class="dot dot-pink"></span>
+              SSE Events
+            </div>
+            <div class="badges">
+              <span class="badge badge-pink">streaming</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="event-row">agent_message_delta | agent_message_chunk <span class="event-detail">{ content: { text } }</span></div>
+            <div class="event-row">tool_call | execute_tool_started <span class="event-detail">{ _meta: { claudeCode: { toolName } }, rawInput }</span></div>
+            <div class="event-row is-new">tool_call_update <span class="event-detail">{ _meta: { claudeCode: { toolResponse } } }</span></div>
+            <div class="event-row">usage_updated | usage_update <span class="event-detail">{ cost }</span></div>
+            <div class="event-row">JSON-RPC result <span class="event-detail">{ stopReason }</span> <span class="event-detail">— prompt done</span></div>
+            <div class="event-row">JSON-RPC error <span class="event-detail">{ code, message }</span></div>
+            <div class="relation-note">Raw ACP events proxied from sandbox-agent via <code style="font-family:monospace;color:#f472b6;">GET /sandboxes/{sandbox_id}/events</code></div>
+          </div>
+        </div>
+
+        <!-- SandboxAgentClient -->
+        <div class="card">
+          <div class="card-header ch-amber">
+            <div class="table-name">
+              <span class="dot dot-amber"></span>
+              SandboxAgentClient
+            </div>
+            <div class="badges">
+              <span class="badge badge-amber">ACP client</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="endpoint-group-label">Session lifecycle</div>
+            <div class="method-row">
+              <span class="method-name">health()</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">initialize(session_id, agent, cwd, mcp_servers, skills)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">resume(session_id, agent, inner_session_id, cwd)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">prompt(session_id, message)</span>
+              <span class="method-ret">→ PromptResponse</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">stream_events(session_id)</span>
+              <span class="method-ret">→ AsyncIterator</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">list_sessions(session_id)</span>
+              <span class="method-ret">→ list[dict]</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">cancel_prompt(session_id)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">close_session(session_id)</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Agent discovery</div>
+            <div class="method-row is-new">
+              <span class="method-name">list_agents()</span>
+              <span class="method-ret">→ list[AgentInfo]</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">install_agent(agent_type)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">get_agent_info(agent_type)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Config</div>
+            <div class="method-row">
+              <span class="method-name">set_mode / set_model / set_thought_level</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">configure_mcp(name, config, directory)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">configure_skills(name, config, directory)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">deploy_skills_from_config(skills, cwd)</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Filesystem</div>
+            <div class="method-row">
+              <span class="method-name">list_dir / read_file / write_file / run_command</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">delete_path(path, recursive) / mkdir(path) / move_file(src, dst) / stat(path)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">upload_files(files, base_path)</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Processes</div>
+            <div class="method-row is-new">
+              <span class="method-name">start_process / list_processes / stop_process / kill_process</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">get_process_logs / send_process_input / get_process_info</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Desktop</div>
+            <div class="method-row is-new">
+              <span class="method-name">screenshot(region)</span>
+              <span class="method-ret">→ bytes</span>
+            </div>
+            <div class="relation-note">Wraps sandbox-agent REST+SSE API. One instance per active session.</div>
+          </div>
+        </div>
+
+      </div><!-- /left col -->
+
+      <!-- RIGHT COL -->
+      <div class="col">
+
+        <!-- AgentConfig -->
+        <div class="card">
+          <div class="card-header ch-blue">
+            <div class="table-name">
+              <span class="dot dot-blue"></span>
+              AgentConfig
+            </div>
+            <div class="badges">
+              <span class="badge badge-blue">JSON blob</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">agent_type</span>
+              <span class="field-type">str</span>
+              <span class="field-desc">"claude" | "codex" | "opencode"</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">model</span>
+              <span class="field-type">str?</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">prompt</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">system prompt</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">cwd</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">working directory</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">tools</span>
+              <span class="field-type">list[str]?</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">mcp_servers</span>
+              <span class="field-type">dict?</span>
+              <span class="field-desc">name → config</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">skills</span>
+              <span class="field-type">dict?</span>
+              <span class="field-desc">name → config</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">dockerfile</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">custom sandbox image</span>
+            </div>
+            <div class="relation-note">Stored as JSON in agents.config column.</div>
+          </div>
+        </div>
+
+        <!-- Agent SDK -->
+        <div class="card">
+          <div class="card-header ch-cyan">
+            <div class="table-name">
+              <span class="dot dot-cyan"></span>
+              Agent SDK
+            </div>
+            <div class="badges">
+              <span class="badge badge-cyan">client</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="method-row">
+              <span class="method-name">Agent(name, agent_type, provider, model, cwd, prompt, tools, mcp_servers, skills, db, session_id, sandbox_id, dockerfile, api_url)</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Class methods</div>
+            <div class="method-row is-new">
+              <span class="method-name">Agent.from_prompt_file(name, prompt_path, **kw)</span>
+              <span class="method-ret">→ Agent</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">Agent.from_config(name, config, **kw)</span>
+              <span class="method-ret">→ Agent</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">Agent.readonly(name, **kw)</span>
+              <span class="method-ret">→ Agent</span>
+              <span class="method-desc">Read/Glob/Grep only</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">Agent.coder(name, **kw)</span>
+              <span class="method-ret">→ Agent</span>
+              <span class="method-desc">full coding tools</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Core messaging</div>
+            <div class="method-row">
+              <span class="method-name">arun(message)</span>
+              <span class="method-ret">→ str</span>
+              <span class="method-desc">async, full response</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">astream(message)</span>
+              <span class="method-ret">→ AsyncIterator[str]</span>
+              <span class="method-desc">async streaming</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">astream_events(message)</span>
+              <span class="method-ret">→ AsyncIterator[dict]</span>
+              <span class="method-desc">structured events</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Sync wrappers</div>
+            <div class="method-row">
+              <span class="method-name">run(message, timeout)</span>
+              <span class="method-ret">→ str</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">stream(message)</span>
+              <span class="method-ret">→ list[str]</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">dispatch(message)</span>
+              <span class="method-ret">→ Thread</span>
+              <span class="method-desc">fire-and-forget</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">status()</span>
+              <span class="method-ret">→ dict</span>
+              <span class="method-desc">sync agent metadata</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Sandbox filesystem</div>
+            <div class="method-row">
+              <span class="method-name">list_dir(path)</span>
+              <span class="method-ret">→ list[dict]</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">read_file(path)</span>
+              <span class="method-ret">→ str</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">write_file(path, content)</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">exec(command, args, cwd)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">shell(command, cwd)</span>
+              <span class="method-ret">→ str</span>
+              <span class="method-desc">raises on non-zero exit</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">delete_file(path, recursive)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">mkdir(path)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">move_file(src, dst)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">stat(path)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">upload_files(files, base_path)</span>
+              <span class="method-desc">tar archive upload</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Sandbox desktop</div>
+            <div class="method-row is-new">
+              <span class="method-name">screenshot(region)</span>
+              <span class="method-ret">→ bytes</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">mouse_click(x, y, button)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">keyboard_type(text)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">keyboard_press(key)</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Sandbox processes</div>
+            <div class="method-row is-new">
+              <span class="method-name">start_process(command, args, cwd)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">list_processes()</span>
+              <span class="method-ret">→ list[dict]</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">stop_process(process_id)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">get_process_logs(process_id)</span>
+              <span class="method-ret">→ str</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Session introspection</div>
+            <div class="method-row is-new">
+              <span class="method-name">get_log(limit)</span>
+              <span class="method-ret">→ list[dict]</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">get_conversation(limit)</span>
+              <span class="method-ret">→ list[dict]</span>
+              <span class="method-desc">structured messages</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">get_status()</span>
+              <span class="method-ret">→ dict</span>
+              <span class="method-desc">idle time, busy state</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">wait_until_idle(idle_threshold, poll_interval, timeout)</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">observe(duration, callback)</span>
+              <span class="method-ret">→ list[dict]</span>
+              <span class="method-desc">read-only SSE watch</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">health_check()</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">list_sandbox_agents()</span>
+              <span class="method-ret">→ list[dict]</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">configure(**kwargs)</span>
+              <span class="method-desc">mode, model, thought_level</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">cancel()</span>
+              <span class="method-desc">cancel running prompt</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Lifecycle</div>
+            <div class="method-row is-new">
+              <span class="method-name">resume()</span>
+              <span class="method-ret">→ dict</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">aclose()</span>
+              <span class="method-desc">cleanup</span>
+            </div>
+            <div class="relation-note">Auto-provisions via <code style="font-family:monospace;color:#22d3ee;">POST /agents/quick</code>. Session persistence via SqliteSessionDriver. Resume via native <code style="font-family:monospace;color:#22d3ee;">session/load</code>.</div>
+          </div>
+        </div>
+
+        <!-- SessionState -->
+        <div class="card">
+          <div class="card-header ch-purple">
+            <div class="table-name">
+              <span class="dot dot-purple"></span>
+              SessionState
+            </div>
+            <div class="badges">
+              <span class="badge badge-purple">in-memory</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name" style="min-width:150px;">SESSIONS</span>
+              <span class="field-type">dict[str, SessionState]</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">session_id</span>
+              <span class="field-type">str</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">agent_id</span>
+              <span class="field-type">str</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">sandbox_id</span>
+              <span class="field-type">str</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name" style="min-width:150px;">acp_session_id</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">ephemeral, created on connect</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name" style="min-width:150px;">inner_session_id</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">ephemeral, created on connect</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">client</span>
+              <span class="field-type">object?</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">shutdown</span>
+              <span class="field-type">asyncio.Event</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">errors</span>
+              <span class="field-type">list[str]</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">last_event_id</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">SSE cursor — skip replay events</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">last_activity</span>
+              <span class="field-type">float</span>
+              <span class="field-desc">time.time() — updated on activity</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">agent_busy</span>
+              <span class="field-type">bool</span>
+              <span class="field-desc">True between prompt and stopReason</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">turn_completed_at</span>
+              <span class="field-type">float?</span>
+              <span class="field-desc">when last stopReason arrived</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Pub/sub fan-out</div>
+            <div class="method-row is-new">
+              <span class="method-name">subscribe()</span>
+              <span class="method-ret">→ asyncio.Queue</span>
+              <span class="method-desc">register + replay buffer</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">unsubscribe(q)</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">broadcast(item)</span>
+              <span class="method-desc">push to all subscribers</span>
+            </div>
+            <div class="relation-note">In-memory runtime state. Persistent SSE reader connects once at session creation, fans out to subscribers via replay buffer (maxlen=5000). ACP/inner session IDs are ephemeral — recreated on connect, restored via native <code style="font-family:monospace;color:#f472b6;">session/load</code> on resume.</div>
+          </div>
+        </div>
+
+      </div><!-- /right col -->
+    </div>
+  </div>
+
+
+  <hr class="section-divider">
+
+
+  <!-- ═══════════════════════════════════════════════
+       SECTION 2: REST API ENDPOINTS
+  ═══════════════════════════════════════════════ -->
+  <div class="section">
+    <div class="section-header">
+      <h2>REST API Endpoints</h2>
+      <p class="section-sub" style="color:#8b949e;">HTTP interface — agent management, hive proxy, and UI routes</p>
+    </div>
+
+    <div class="endpoints-card">
+      <div class="endpoints-card-header">API Reference</div>
+      <div class="endpoints-body">
+
+        <!-- Agent endpoints -->
+        <div class="endpoint-group-label">Agent Endpoints</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/health</span>
+          <span class="endpoint-desc">server health check</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/agents</span>
+          <span class="endpoint-desc">list all agents</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/agents</span>
+          <span class="endpoint-desc">create agent config</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/agents/{agent_id}</span>
+          <span class="endpoint-desc">get agent</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-delete">DELETE</span>
+          <span class="endpoint-path">/agents/{agent_id}</span>
+          <span class="endpoint-desc">delete agent</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/agents/quick</span>
+          <span class="endpoint-desc">create agent + sandbox + connect</span>
+        </div>
+
+        <!-- Sandbox endpoints -->
+        <div class="endpoint-group-label">Sandbox Endpoints</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes</span>
+          <span class="endpoint-desc">provision sandbox</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes</span>
+          <span class="endpoint-desc">list all sandboxes</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}</span>
+          <span class="endpoint-desc">get sandbox</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-delete">DELETE</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}</span>
+          <span class="endpoint-desc">destroy sandbox</span>
+        </div>
+
+        <!-- Session endpoints -->
+        <div class="endpoint-group-label">Session Endpoints</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/connect</span>
+          <span class="endpoint-desc">connect agent to sandbox</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/resume</span>
+          <span class="endpoint-desc">resume via session/load</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{session_id}/resume</span>
+          <span class="endpoint-desc">resume by session_id only</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/message</span>
+          <span class="endpoint-desc">send prompt</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/events</span>
+          <span class="endpoint-desc">SSE stream</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{session_id}/log</span>
+          <span class="endpoint-desc">session telemetry</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/agents/{agent_id}/log</span>
+          <span class="endpoint-desc">agent activity log</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions</span>
+          <span class="endpoint-desc">list all sessions</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{session_id}/status</span>
+          <span class="endpoint-desc">session status (idle time, busy)</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/cancel</span>
+          <span class="endpoint-desc">cancel running prompt</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/config</span>
+          <span class="endpoint-desc">set session config</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/health</span>
+          <span class="endpoint-desc">sandbox-agent health</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/agents</span>
+          <span class="endpoint-desc">list sandbox agents</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+
+        <!-- Sandbox Operations -->
+        <div class="endpoint-group-label">Sandbox Filesystem</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs</span>
+          <span class="endpoint-desc">list directory</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/file</span>
+          <span class="endpoint-desc">read file</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-put">PUT</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/file</span>
+          <span class="endpoint-desc">write file</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-delete">DELETE</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/file</span>
+          <span class="endpoint-desc">delete file or directory</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/mkdir</span>
+          <span class="endpoint-desc">create directory</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/move</span>
+          <span class="endpoint-desc">move / rename</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/stat</span>
+          <span class="endpoint-desc">file metadata</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/upload</span>
+          <span class="endpoint-desc">upload tar archive</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/exec</span>
+          <span class="endpoint-desc">run command</span>
+        </div>
+
+        <!-- Processes -->
+        <div class="endpoint-group-label">Sandbox Processes</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes</span>
+          <span class="endpoint-desc">start persistent process</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes</span>
+          <span class="endpoint-desc">list processes</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}/stop</span>
+          <span class="endpoint-desc">stop process</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}/logs</span>
+          <span class="endpoint-desc">process logs</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+
+        <!-- Desktop -->
+        <div class="endpoint-group-label">Sandbox Desktop</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/screenshot</span>
+          <span class="endpoint-desc">capture screenshot (PNG)</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/click</span>
+          <span class="endpoint-desc">mouse click at x, y</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/type</span>
+          <span class="endpoint-desc">type text</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/press</span>
+          <span class="endpoint-desc">press key</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+
+        <!-- Hive proxy -->
+        <div class="endpoint-group-label">Hive Proxy</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/hive/items?task=</span>
+          <span class="endpoint-desc">list hive items</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/hive/items/{id}?task=</span>
+          <span class="endpoint-desc">get hive item</span>
+        </div>
+
+        <!-- UI -->
+        <div class="endpoint-group-label">UI</div>
+
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/chat</span>
+          <span class="endpoint-desc">chat interface</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/kanban</span>
+          <span class="endpoint-desc">kanban board</span>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
