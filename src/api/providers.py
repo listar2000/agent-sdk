@@ -189,8 +189,8 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
     if not api_key:
         raise RuntimeError("DAYTONA_API_KEY not set")
 
-    # Collect credentials to inject into sandbox
-    env_vars: dict[str, str] = {}
+    # Collect credentials and config to inject into sandbox
+    env_vars: dict[str, str] = {"IS_SANDBOX": "1"}
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if anthropic_key:
         env_vars["ANTHROPIC_API_KEY"] = anthropic_key
