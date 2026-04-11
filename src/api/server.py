@@ -888,7 +888,7 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
         sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
 
         # Start sandbox if stopped (no-op if already running)
-        if sandbox_obj.instance.state != "started":
+        if sandbox_obj.state != "started":
             await loop.run_in_executor(None, sandbox_obj.start)
 
         # Get a fresh signed preview URL
