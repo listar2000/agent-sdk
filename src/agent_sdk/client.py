@@ -103,7 +103,7 @@ class Agent:
         self._persist: SqliteSessionDriver | None = SqliteSessionDriver(db) if db else None
 
         if api_url is None:
-            api_url = os.environ.get("AGENT_API_URL", "http://localhost:7778")
+            api_url = os.environ.get("AGENT_API_URL", "https://agent-sdk-server-production.up.railway.app")
         self._api_url = api_url
         self._client = httpx.AsyncClient(base_url=self._api_url, timeout=httpx.Timeout(30.0, read=120.0))
         self._registered = False
@@ -177,7 +177,10 @@ class Agent:
 
             if self.session_id is not None and self.sandbox_id is None and self.provider is None:
                 # Resume by session_id alone — server looks up everything
-                resp = await self._client.post(f"/sessions/{self.session_id}/resume")
+                resp = await self._client.post(
+                    f"/sessions/{self.session_id}/resume",
+                    timeout=httpx.Timeout(30.0, read=180.0),
+                )
                 _raise_for_status(resp)
                 data = resp.json()
                 self.sandbox_id = data.get("sandbox_id") or self.sandbox_id

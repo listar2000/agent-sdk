@@ -264,6 +264,50 @@ async def _flush_text_parts(state: SessionState, parts: list[str]) -> None:
         pass
 
 
+def _maybe_auto_approve_permission(block: str, state: SessionState) -> None:
+    """If the SSE block is a session/request_permission, auto-approve it."""
+    from .sse import parse_sse_data
+    payload = parse_sse_data(block)
+    if not payload or payload.get("method") != "session/request_permission":
+        return
+    rpc_id = payload.get("id")
+    if rpc_id is None:
+        return
+    params = payload.get("params", {})
+    options = params.get("options", [])
+    # Pick "allow_always" > "allow" > first option
+    option_id = None
+    for opt in options:
+        if opt.get("kind") == "allow_always":
+            option_id = opt["optionId"]
+            break
+    if not option_id:
+        for opt in options:
+            if opt.get("kind") == "allow_once":
+                option_id = opt["optionId"]
+                break
+    if not option_id and options:
+        option_id = options[0].get("optionId")
+    if not option_id:
+        return
+
+    async def _grant():
+        try:
+            # Send JSON-RPC response (not request) back to the ACP endpoint
+            url = f"/v1/acp/{state.acp_session_id}"
+            resp_payload = {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": {"optionId": option_id},
+            }
+            resp = await state.client._client.post(url, json=resp_payload)
+            log.info("auto-approved permission for session %s (status=%d)", state.session_id, resp.status_code)
+        except Exception as e:
+            log.warning("auto-approve permission failed for session %s: %s", state.session_id, e)
+
+    asyncio.create_task(_grant())
+
+
 def _start_sse_reader(state: SessionState) -> None:
     """Start a background task that reads SSE from the sandbox-agent and
     broadcasts chunks to all subscriber queues. Called at session creation
@@ -294,6 +338,8 @@ def _start_sse_reader(state: SessionState) -> None:
                     while "\n\n" in reader_buffer:
                         block, reader_buffer = reader_buffer.split("\n\n", 1)
                         _process_sse_block(block, state, text_parts, log_events=True)
+                        # Auto-approve permission requests for headless operation
+                        _maybe_auto_approve_permission(block, state)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -821,31 +867,47 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             return new_instance.url
 
     # For daytona: health-check the URL, restart via Daytona SDK if down
-    url = instance.url if instance else sandbox_record.derive_url()
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{url}/v1/health")
-            if r.status_code == 200:
-                return url
-    except Exception:
-        pass
+    daytona_sandbox_id = sandbox_record.sandbox_ref  # Daytona's own sandbox ID
 
-    # Daytona sandbox is down — try to restart it
-    log.info("auto-restarting daytona sandbox %s", sandbox_id)
+    if instance and instance.url:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{instance.url}/v1/health")
+                if r.status_code == 200:
+                    return instance.url
+        except Exception:
+            pass
+
+    # Daytona sandbox URL lost or stale — get fresh signed URL, start sandbox if stopped
+    log.info("recovering daytona sandbox %s (daytona_id=%s)", sandbox_id, daytona_sandbox_id)
     try:
         from daytona_sdk import Daytona, DaytonaConfig
-        daytona = Daytona(DaytonaConfig(api_key=os.environ.get("DAYTONA_API_KEY", "")))
+        from .providers import SANDBOX_AGENT_PORT, _wait_for_health
+        daytona_client = Daytona(DaytonaConfig(api_key=os.environ.get("DAYTONA_API_KEY", "")))
         loop = asyncio.get_running_loop()
-        sandbox_obj = await loop.run_in_executor(None, lambda: daytona.get(sandbox_id))
-        await loop.run_in_executor(None, sandbox_obj.start)
-        # Wait for health after restart
-        from .providers import _wait_for_health
-        if not await _wait_for_health(url, max_retries=30, interval=1.0):
-            raise RuntimeError("Daytona sandbox failed to restart")
+        sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
+
+        # Start sandbox if stopped (no-op if already running)
+        if sandbox_obj.instance.state != "started":
+            await loop.run_in_executor(None, sandbox_obj.start)
+
+        # Get a fresh signed preview URL
+        signed = await loop.run_in_executor(None, lambda: sandbox_obj.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
+        url = signed.url
+
+        # If sandbox-agent isn't responding, re-launch it
+        if not await _wait_for_health(url, max_retries=5, interval=1.0):
+            await loop.run_in_executor(None, lambda: sandbox_obj.process.exec(
+                f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
+            ))
+            if not await _wait_for_health(url, max_retries=20, interval=1.0):
+                raise RuntimeError("Daytona sandbox-agent failed to respond after restart")
+
+        _INSTANCES[sandbox_id] = ProviderInstance(provider="daytona", url=url, sandbox_id=daytona_sandbox_id)
     except ImportError:
         raise RuntimeError("daytona-sdk not installed, cannot restart sandbox")
     except Exception as e:
-        raise RuntimeError(f"Failed to restart daytona sandbox: {e}")
+        raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
 
     return url
 
@@ -1100,7 +1162,14 @@ async def sandbox_events(sandbox_id: str, session_id: str = Query(...)):
             await _cancel_task(heartbeat_task)
             state.unsubscribe(my_q)
 
-    return StreamingResponse(_proxy_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _proxy_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1368,7 +1437,7 @@ async def list_sessions_route():
             "session_id": s.session_id,
             "agent_id": s.agent_id,
             "sandbox_id": s.sandbox_id,
-            "idle_seconds": round(now - s.last_activity, 1),
+            "idle_seconds": round(now - (s.turn_completed_at or s.last_activity), 1),
             "shutdown_requested": s.shutdown.is_set(),
         }
         for s in SESSIONS.values()
