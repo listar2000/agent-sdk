@@ -1,179 +1,180 @@
 # Agent SDK
 
-Python SDK and orchestration server for running AI agents in sandboxes. Supports Claude Code, Codex, OpenCode, and any agent that speaks the ACP protocol.
+Python SDK and orchestration server for running Claude Code, Codex, OpenCode, and other ACP-compatible agents in sandboxes (local, Docker, or Daytona cloud).
 
-Agents run inside isolated sandboxes (local subprocess, Docker, or Daytona cloud). The SDK handles provisioning, session management, streaming responses, and multi-agent orchestration.
-
-## Quick start
+## Run the server with Docker
 
 ```bash
-pip install agent-sdk
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+# Optional for cloud sandboxes:
+echo "DAYTONA_API_KEY=dtn_..." >> .env
+
+docker compose up --build -d
+
+curl http://localhost:7778/health
+# {"status":"ok"}
+```
+
+This starts:
+- Postgres on port 5433
+- API server on port 7778
+
+Stop with `docker compose down`. Delete the database volume with `docker compose down -v`.
+
+See [`docs/local-dev.md`](docs/local-dev.md) for more.
+
+## Deploy to Railway
+
+The repo has a `Dockerfile` and `railway.toml` ready for Railway.
+
+1. Create a new Railway project pointing at this repo
+2. Add a Postgres service — Railway sets `DATABASE_URL` automatically
+3. Set env vars on the API service:
+   - `ANTHROPIC_API_KEY`
+   - `DAYTONA_API_KEY` (if using cloud sandboxes)
+   - `SANDBOX_IDLE_TIMEOUT` (optional, seconds — default 300)
+4. Deploy
+
+For production you'll want `provider="daytona"` for sandboxes since Railway containers are ephemeral. Local/Docker sandboxes only work for dev.
+
+## Database
+
+The server uses Postgres. On every startup, `init_db()` runs:
+1. `CREATE TABLE IF NOT EXISTS` for fresh setups
+2. Idempotent `ALTER TABLE` migrations to bring existing databases up to date
+
+Migrations live in `_MIGRATIONS` in `src/api/db.py`. Each must use `IF EXISTS` / `IF NOT EXISTS` so they're safe to run repeatedly. Add new ones to the bottom of the list — they run automatically on the next deploy.
+
+Tables: `agents`, `sandboxes`, `sessions`, `session_log`.
+
+## Use the SDK
+
+```bash
+pip install httpx fastapi uvicorn psycopg[binary] psycopg_pool
 ```
 
 ```python
 from agent_sdk import Agent
 
-agent = Agent("my-agent", provider="local")
-response = agent.run("Say hello and create a file called hello.py")
-print(response)
-```
-
-### Async
-
-```python
-import asyncio
-from agent_sdk import Agent
-
-async def main():
-    agent = Agent("my-agent", provider="local")
-    async for chunk in agent.astream("Analyze this codebase"):
-        print(chunk, end="", flush=True)
-
-asyncio.run(main())
-```
-
-### Daytona (cloud sandboxes)
-
-```bash
-export DAYTONA_API_KEY=...
-export ANTHROPIC_API_KEY=...
-```
-
-```python
-agent = Agent("cloud-agent", provider="daytona")
-response = agent.run("What OS am I running on?")
-```
-
-## Architecture
-
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Your code  │────▶│  API server      │────▶│  sandbox-agent  │
-│  (SDK)      │     │  (orchestrator)  │     │  (in sandbox)   │
-└─────────────┘     └──────────────────┘     └─────────────────┘
-                           │                         │
-                    Provisions sandbox          Runs Claude/Codex
-                    Manages sessions            Streams via SSE
-                    Routes messages             Executes tools
-```
-
-- **SDK** (`agent_sdk/`) — async Python client. `Agent` class with `run()`, `arun()`, `astream()`, `dispatch()`.
-- **Server** (`api/`) — FastAPI orchestration layer. Manages agents, sandboxes, and sessions. Proxies ACP protocol to sandbox-agent instances.
-- **Providers** — local (subprocess), Docker, Daytona (cloud). Pluggable via `provider=` param.
-
-## SDK reference
-
-### Agent
-
-```python
 agent = Agent(
-    "name",
-    provider="local",           # "local", "docker", or "daytona"
-    tools=["Bash", "Read"],     # limit available tools
-    prompt="You are helpful.",   # system prompt
-    model="sonnet",             # model override
-    skills={...},               # Claude Code skills config
-    dockerfile="path/to/Dockerfile",  # custom sandbox image
+    "worker",
+    provider="local",
+    tools=["Bash", "Read", "Write"],
+    prompt="You are a helpful agent.",
 )
 
-# Sync
-response = agent.run("do something")
+# async (recommended)
+response = await agent.arun("Create a file called hello.py")
 
-# Async
-response = await agent.arun("do something")
+# streaming
+async for chunk in agent.astream("Analyze this codebase"):
+    print(chunk, end="", flush=True)
 
-# Streaming
-async for chunk in agent.astream("do something"):
-    print(chunk, end="")
-
-# Fire-and-forget (background thread)
-thread = agent.dispatch("do something")
-
-# Session persists across calls
-agent.run("remember the number 42")
-agent.run("what number did I say?")  # same session, remembers context
+# sync wrapper
+response = agent.run("Say hello")
 ```
 
-### Multi-agent orchestration
+The SDK talks to the server at `http://localhost:7778` by default. Override with `api_url=` or `AGENT_API_URL=`.
+
+## Session persistence
+
+Sessions survive server restarts. The server persists `{session_id, agent_id, sandbox_id, inner_session_id}` to Postgres. Resume from another process with just the session_id:
 
 ```python
-from agent_sdk import Agent, chain, parallel, race, map_reduce, Pipeline
-
-# Chain: output of each feeds into next
-result = await chain([analyzer, fixer], "Review src/main.py")
-
-# Parallel: all run concurrently
-results = await parallel([reviewer1, reviewer2], "Review this PR")
-
-# Race: first to finish wins
-result = await race([fast_agent, thorough_agent], "Solve this")
-
-# Map-reduce: distribute work, combine results
-result = await map_reduce(workers, items, reducer=combiner)
-
-# Pipeline: named stages
-p = Pipeline()
-p.add("analyze", analyzer)
-p.add("fix", fixer)
-result = await p.run("Fix bugs in src/")
+agent = Agent("restored", session_id="abc123")
+response = await agent.arun("What were we discussing?")
 ```
 
-### Sandbox operations
+The server looks up the session in the DB, restarts the sandbox if stopped, and replays the conversation history via `session/load`.
+
+## Sandbox operations
+
+Agents can interact with their sandbox directly without going through Claude:
 
 ```python
 # Filesystem
 files = await agent.list_dir("/app")
 content = await agent.read_file("/app/main.py")
-await agent.write_file("/app/main.py", "print('hello')")
-await agent.upload_files({"main.py": "print('hi')", "data.csv": csv_bytes})
+await agent.write_file("/app/main.py", "print('hi')")
 
 # Execute commands
 result = await agent.exec("python", args=["main.py"])
-output = await agent.shell("ls -la /app")
+output = await agent.shell("ls -la")
 
-# Persistent processes
+# Processes
 proc = await agent.start_process("python", args=["server.py"])
 logs = await agent.get_process_logs(proc["id"])
 await agent.stop_process(proc["id"])
+
+# Desktop (when sandbox has a display)
+png = await agent.screenshot()
+await agent.mouse_click(100, 200)
+await agent.keyboard_type("hello")
 ```
 
-## Running the server
-
-```bash
-# Local development
-uvicorn src.api.server:app --port 7778
-
-# Docker
-docker build -t agent-sdk .
-docker run -p 7778:7778 agent-sdk
-
-# The SDK connects to http://localhost:7778 by default
-# Override with: Agent(..., api_url="https://your-server.com")
-```
-
-## Repo layout
+## Architecture
 
 ```
-src/
-  agent_sdk/         Python SDK client
-    client.py          Agent class
-    orchestrate.py     chain, parallel, race, map_reduce, Pipeline
-    persist.py         SQLite session persistence
-  api/               Orchestration server
-    server.py          FastAPI endpoints
-    providers.py       Sandbox lifecycle (local, Docker, Daytona)
-    sandbox_agent_client.py  Low-level ACP client
-    sse.py             SSE stream parser
-scripts/
-  mention_dispatcher.py  Hive inbox polling dispatcher
-examples/            Demo scripts
-docs/                API spec, architecture docs, diagrams
-assets/              Data model diagram
+┌───────────┐      ┌──────────────────┐      ┌─────────────────┐
+│ SDK       │─────▶│ API server       │─────▶│ sandbox-agent   │
+│ (Agent)   │      │ (orchestrator)   │      │ (in sandbox)    │
+└───────────┘      └──────────────────┘      └─────────────────┘
+      │                    │                        │
+      │              Postgres (sessions,     Runs Claude/Codex,
+      │               agents, sandboxes)     streams via SSE
+      │
+   /sessions/*   — conversation (message, events, resume)
+   /sandboxes/*  — infrastructure (fs, exec, desktop, processes)
 ```
+
+- **Sessions** hold conversation state (agent config, message history). Auto-recover from the DB when reaped.
+- **Sandboxes** are infrastructure. Provider-pluggable (local subprocess, Docker, Daytona).
+- **Providers**: `local` (subprocess on host), `docker` (container), `daytona` (cloud workspace).
+
+## Providers
+
+| Provider | How it works | Survives reap? |
+|---|---|---|
+| `local` | Subprocess on the host | No — process killed |
+| `docker` | Docker container | No — container removed |
+| `daytona` | Daytona cloud workspace | Yes — workspace stopped, filesystem preserved |
+
+For persistent sessions that survive long idle periods, use Daytona.
 
 ## Docs
 
-- [API Reference](docs/api.md)
-- [Sandbox-Agent SDK Reference](docs/rivet_sandbox_agent_sdk_reference.md)
-- [Sandbox Integration Design](docs/sandbox-integration-design.md)
-- [Multi-Agent Workspace Design](docs/multi-agent-workspace-design.md)
+- [API reference](docs/api.md) — REST endpoints
+- [Local dev](docs/local-dev.md) — Docker setup, env vars
+- [Rivet sandbox-agent SDK reference](docs/rivet_sandbox_agent_sdk_reference.md) — upstream ACP protocol details
+
+## Layout
+
+```
+src/
+  agent_sdk/         Python SDK client (Agent class)
+    client.py
+    errors.py
+    persist.py       SQLite session persistence
+  api/               Orchestration server
+    server.py          FastAPI endpoints
+    sandbox.py         Sandbox layer (stateless wrapper around providers)
+    providers.py       local / docker / daytona
+    sandbox_agent_client.py  ACP client
+    db.py              Postgres CRUD
+    sse.py             SSE parsing
+    models.py          Dataclasses
+    redact.py          Secret redaction for logs
+tests/               pytest
+examples/            Demo scripts
+docs/                Docs
+docker-compose.yml   Postgres + API server
+Dockerfile
+```
+
+## Tests
+
+```bash
+PYTHONPATH=src python -m pytest tests/ -q
+```
+
+Tests use mocked DB and sandbox providers — no Docker or Postgres needed.

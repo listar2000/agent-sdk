@@ -1,63 +1,39 @@
-# AFE REST API
+# REST API
 
 Base URL: `http://localhost:7778`
 
-## Agents (config only)
+The API has two resource groups:
+- **Sandboxes** — infrastructure (container/workspace, filesystem, exec, desktop)
+- **Sessions** — agent conversation (messages, events, resume)
 
-### Create agent
+## Health
+
 ```
-POST /agents
+GET /health  →  {"status": "ok"}
 ```
+
+## Sessions
+
+### Create agent + sandbox + session in one call
+
+```
+POST /sessions/quick
+```
+
 ```json
 {
   "name": "worker",
-  "agent_type": "claude",
-  "config": {
-    "model": "claude-sonnet-4-6",
-    "cwd": "/tmp",
-    "prompt": "You are a helpful agent.",
-    "tools": ["Read", "Bash"],
-    "mcp_servers": {"my-mcp": {"type": "local", "command": "...", "args": []}},
-    "skills": {"my-skill": {"sources": [{"source": "...", "type": "..."}]}}
-  }
-}
-```
-Returns `{id, name, config}`. Agent config is stored — no sandbox is provisioned yet.
-
-### List / Get / Delete agents
-```
-GET    /agents
-GET    /agents/{agent_id}
-DELETE /agents/{agent_id}
-```
-
-### Quick create (agent + sandbox + session in one call)
-```
-POST /agents/quick
-```
-```json
-{
-  "name": "worker",
-  "agent_type": "claude",
   "provider": "local",
-  "cwd": "/tmp",
+  "agent_type": "claude",
   "model": "claude-sonnet-4-6",
-  "tools": ["Bash", "Read", "Write", "Glob", "Grep"],
-  "mcp_servers": {
-    "filesystem": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
-    }
-  },
-  "skills": {
-    "default": {
-      "sources": [{"type": "local", "source": "/path/to/skills"}]
-    }
-  }
+  "cwd": "/tmp",
+  "prompt": "You are a helpful agent.",
+  "tools": ["Bash", "Read", "Write"],
+  "mcp_servers": {"name": {"type": "local", "command": "...", "args": []}},
+  "skills": {"name": {"sources": [{"source": "...", "type": "github"}]}}
 }
 ```
-Fields can be at top level (as shown above, used by the Agent SDK) or nested under `"config"`. MCP servers are passed to `session/new` in ACP array format. Skills are deployed to `{cwd}/.claude/commands/` via the sandbox filesystem API.
+
 Returns:
 ```json
 {
@@ -69,51 +45,43 @@ Returns:
 }
 ```
 
-## Sandboxes
+### Send message (non-blocking)
 
-### Provision sandbox
 ```
-POST /sandboxes
+POST /sessions/{session_id}/message
 ```
 ```json
-{"provider": "local", "agent_type": "claude"}
-```
-Returns `{id, provider, sandbox_ref, status}`.
-
-### List / Get / Delete sandboxes
-```
-GET    /sandboxes
-GET    /sandboxes/{sandbox_id}
-DELETE /sandboxes/{sandbox_id}
+{"message": "analyze the dataset"}
 ```
 
-## Sessions
+Returns `{rpc_id, status}`. The actual response streams via SSE.
 
-### Connect agent to sandbox
-```
-POST /sandboxes/{sandbox_id}/connect
-```
-```json
-{"agent_id": "uuid"}
-```
-Creates ACP session + inner session. Returns `{session_id, inner_session_id, status}`.
+### SSE event stream
 
-### Resume session (by sandbox)
 ```
-POST /sandboxes/{sandbox_id}/resume
+GET /sessions/{session_id}/events
 ```
-```json
-{"agent_id": "uuid", "inner_session_id": "uuid", "session_id": "uuid"}
-```
-Uses ACP `session/load` to restore conversation. The `session_id` field is optional — if provided, the server reuses it instead of generating a new one.
 
-### Resume session (by session_id only)
+Event types inside `session/update` notifications:
+
+| sessionUpdate | Payload |
+|---|---|
+| `agent_message_delta` | `{content: {text: "..."}}` |
+| `tool_call` | `{_meta: {claudeCode: {toolName: "..."}}, rawInput: {...}}` |
+| `tool_call_update` | `{_meta: {claudeCode: {toolResponse: {...}}}}` |
+| `usage_updated` | `{cost: {amount, currency}}` |
+
+Prompt done: `{"jsonrpc": "2.0", "id": "<rpc_id>", "result": {"stopReason": "end_turn"}}`
+
+Heartbeats (`: heartbeat\n\n`) are sent every 30s to keep the connection alive during long-running prompts.
+
+### Resume session
+
 ```
 POST /sessions/{session_id}/resume
 ```
-No body required. Looks up agent_id, sandbox_id, and inner_session_id from the server DB. This is the simplest way to resume — the user only needs the session_id.
 
-Returns:
+No body. Looks up everything from the DB and restarts the sandbox if stopped. Returns:
 ```json
 {
   "session_id": "uuid",
@@ -124,91 +92,88 @@ Returns:
 }
 ```
 
-### Send message
-```
-POST /sandboxes/{sandbox_id}/message
-```
-```json
-{"session_id": "uuid", "message": "analyze the dataset"}
-```
-**Non-blocking.** Fires prompt in background. Response arrives via SSE.
+All session endpoints auto-recover reaped sessions — if a session was removed from memory by the idle reaper, the server transparently looks it up in the DB and rebuilds state. You don't need to call resume explicitly.
 
-Returns `{run_id, rpc_id, status}`.
+### Cancel running prompt
 
-### SSE event stream
 ```
-GET /sandboxes/{sandbox_id}/events?session_id=uuid
+POST /sessions/{session_id}/cancel
 ```
-Proxies ACP SSE from sandbox-agent. Key event types inside `session/update` notifications:
-
-| sessionUpdate | Payload |
-|---|---|
-| `agent_message_delta` | `{content: {text: "..."}}` |
-| `tool_call` | `{_meta: {claudeCode: {toolName: "Read"}}, rawInput: {...}}` |
-| `tool_call_update` | `{_meta: {claudeCode: {toolResponse: {...}}}}` |
-| `usage_updated` | `{cost: {amount, currency}}` |
-
-Prompt done: `{"jsonrpc": "2.0", "id": "<rpc_id>", "result": {"stopReason": "end_turn"}}`
-
-Supports `Last-Event-ID` for reconnection. After resume, replay events are skipped via the stored event cursor.
-
-## Session Log (telemetry)
-
-### Get session log
-```
-GET /sessions/{session_id}/log?limit=500
-```
-Returns full trace of agent actions for a session:
-```json
-[
-  {"id": 1, "event_type": "user_message", "payload": {"text": "..."}, "created_at": 1712444800.0},
-  {"id": 2, "event_type": "tool_call", "payload": {"tool": "Read", "args": {"file_path": "/tmp/f.txt"}}, "created_at": 1712444801.0},
-  {"id": 3, "event_type": "tool_result", "payload": {"tool": "Read", "result": {"file": {...}}}, "created_at": 1712444802.0},
-  {"id": 4, "event_type": "usage", "payload": {"amount": 0.05, "currency": "USD"}, "created_at": 1712444803.0},
-  {"id": 5, "event_type": "assistant_message", "payload": {"text": "The file contains..."}, "created_at": 1712444804.0}
-]
-```
-
-Event types: `user_message`, `assistant_message`, `tool_call`, `tool_result`, `usage`, `error`.
-
-### Get agent log
-```
-GET /agents/{agent_id}/log?limit=100
-```
-Recent activity across all sessions for an agent. Same format, also includes `session_id` and `sandbox_id`.
-
-## Sandbox Operations
-
-### Filesystem
-```
-GET /sandboxes/{sandbox_id}/fs?path=/
-GET /sandboxes/{sandbox_id}/fs/file?path=/file.txt
-PUT /sandboxes/{sandbox_id}/fs/file?path=/file.txt
-```
-
-### Run command
-```
-POST /sandboxes/{sandbox_id}/exec
-```
-```json
-{"command": "ls", "args": ["-la"], "cwd": "/tmp"}
-```
-Returns `{exitCode, stdout, stderr}`.
 
 ### Set session config
+
 ```
-POST /sandboxes/{sandbox_id}/config
+POST /sessions/{session_id}/config
 ```
 ```json
 {"mode": "bypassPermissions", "model": "claude-sonnet-4-6", "thought_level": "high"}
 ```
 
-## Other
+### Other
 
-| Endpoint | Description |
-|---|---|
-| `GET /health` | `{"status": "ok"}` |
-| `GET /chat` | Chat UI |
-| `GET /kanban` | Kanban board |
-| `GET /hive/items?task=` | Proxy for hive items |
-| `GET /hive/items/{id}?task=` | Proxy for hive item detail |
+```
+GET /sessions                        — list active sessions
+GET /sessions/{id}/status            — runtime status
+GET /sessions/{id}/log?limit=500     — event log
+```
+
+## Sandboxes
+
+Sandbox endpoints don't require a session. They operate directly on the sandbox infrastructure.
+
+### Lifecycle
+
+```
+POST   /sandboxes                    — create (provider, dockerfile)
+GET    /sandboxes                    — list
+GET    /sandboxes/{id}               — get info
+DELETE /sandboxes/{id}               — destroy permanently
+POST   /sandboxes/{id}/stop          — stop (preserves filesystem on Daytona)
+POST   /sandboxes/{id}/start         — resume stopped sandbox
+GET    /sandboxes/{id}/health        — health check
+```
+
+### Filesystem
+
+```
+GET    /sandboxes/{id}/fs?path=/              — list directory
+GET    /sandboxes/{id}/fs/file?path=/f.txt    — read file
+PUT    /sandboxes/{id}/fs/file?path=/f.txt    — write file
+DELETE /sandboxes/{id}/fs/file?path=/f.txt    — delete
+POST   /sandboxes/{id}/fs/mkdir?path=/dir     — mkdir
+POST   /sandboxes/{id}/fs/move                — move/rename
+GET    /sandboxes/{id}/fs/stat?path=/f.txt    — stat
+POST   /sandboxes/{id}/fs/upload?path=/       — upload tar archive
+```
+
+### Exec / Processes
+
+```
+POST /sandboxes/{id}/exec                     — run command, returns {exitCode, stdout, stderr}
+POST /sandboxes/{id}/processes                — start persistent process
+GET  /sandboxes/{id}/processes                — list
+POST /sandboxes/{id}/processes/{pid}/stop     — stop
+POST /sandboxes/{id}/processes/{pid}/kill     — kill
+GET  /sandboxes/{id}/processes/{pid}/logs     — logs
+```
+
+### Desktop (when sandbox has a display)
+
+```
+GET  /sandboxes/{id}/desktop/screenshot       — returns PNG
+POST /sandboxes/{id}/desktop/click            — {x, y, button}
+POST /sandboxes/{id}/desktop/type             — {text}
+POST /sandboxes/{id}/desktop/press            — {key}
+POST /sandboxes/{id}/desktop/drag             — {startX, startY, endX, endY}
+POST /sandboxes/{id}/desktop/scroll           — {x, y, scrollX, scrollY}
+```
+
+## Agents (config only)
+
+```
+POST   /agents                     — register agent config (no sandbox)
+GET    /agents                     — list
+GET    /agents/{id}                — get
+DELETE /agents/{id}                — delete
+GET    /agents/{id}/log?limit=100  — event log across all sessions
+```

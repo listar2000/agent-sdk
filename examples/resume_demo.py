@@ -44,7 +44,7 @@ async def main():
 
     # Step 3: Resume with just session_id
     print("\n=== Step 3: Resume via session_id and ask for the number ===\n")
-    agent2 = Agent("resume-demo", session_id=saved_session)
+    agent2 = Agent("different-name", session_id=saved_session)
 
     resp2 = await agent2.arun("What secret number did I tell you to remember?")
     print(f"\nResponse: {resp2}")

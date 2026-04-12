@@ -43,7 +43,17 @@ async def _wait_for_health(url: str, max_retries: int = 30, interval: float = 0.
     return False
 
 
-load_dotenv()  # once at import time
+load_dotenv()
+
+
+def _get_sandbox_env_vars() -> dict[str, str]:
+    """Collect API keys and sandbox config from environment."""
+    env: dict[str, str] = {"IS_SANDBOX": "1"}
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        val = os.environ.get(var)
+        if val:
+            env[var] = val
+    return env
 
 
 @dataclass
@@ -53,7 +63,7 @@ class ProviderInstance:
     url: str                   # base URL for the sandbox-agent server
     sandbox_id: str | None = None  # Daytona sandbox ID (if daytona)
     process: asyncio.subprocess.Process | None = None  # local subprocess
-    port: int = 0              # local port (if local or docker)
+    port: int | None = 0       # local port (if local or docker)
     container_id: str | None = None  # Docker container ID (if docker)
 
 
@@ -92,11 +102,13 @@ async def create_local(agent_type: str = "claude") -> ProviderInstance:
 
     port = await _find_free_port()
 
+    env = {**os.environ, **_get_sandbox_env_vars()}
     try:
         proc = await asyncio.create_subprocess_exec(
             binary, "server", "--no-token", "--port", str(port),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except Exception:
         async with _port_lock:
@@ -121,11 +133,25 @@ async def create_local(agent_type: str = "claude") -> ProviderInstance:
 
 
 def _get_child_pids(ppid: int) -> list[int]:
-    """Return direct child PIDs of *ppid* (best-effort, non-blocking)."""
+    """Return all descendant PIDs of *ppid* (best-effort, non-blocking).
+
+    Uses /proc to avoid dependency on pgrep (not in slim images).
+    """
     try:
-        import subprocess
-        out = subprocess.check_output(["pgrep", "-P", str(ppid)], text=True, timeout=2)
-        return [int(p) for p in out.split() if p.strip()]
+        children = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    parts = f.read().split()
+                    if int(parts[3]) == ppid:
+                        child = int(entry)
+                        children.append(child)
+                        children.extend(_get_child_pids(child))
+            except (OSError, IndexError, ValueError):
+                continue
+        return children
     except Exception:
         return []
 
@@ -190,13 +216,7 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         raise RuntimeError("DAYTONA_API_KEY not set")
 
     # Collect credentials and config to inject into sandbox
-    env_vars: dict[str, str] = {"IS_SANDBOX": "1"}
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    if anthropic_key:
-        env_vars["ANTHROPIC_API_KEY"] = anthropic_key
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if openai_key:
-        env_vars["OPENAI_API_KEY"] = openai_key
+    env_vars = _get_sandbox_env_vars()
 
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
@@ -239,54 +259,45 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
     return ProviderInstance(provider="daytona", url=url, sandbox_id=sandbox.id)
 
 
-async def destroy_daytona(instance: ProviderInstance) -> None:
-    """Delete a Daytona sandbox."""
-    if not instance.sandbox_id:
-        return
-
-    try:
-        from daytona_sdk import Daytona, DaytonaConfig
-    except ImportError:
-        log.warning("daytona-sdk not installed, cannot delete sandbox %s", instance.sandbox_id)
-        return
-
+def _get_daytona_client():
+    """Get a Daytona SDK client. Raises ImportError or RuntimeError on failure."""
+    from daytona_sdk import Daytona, DaytonaConfig
     api_key = os.environ.get("DAYTONA_API_KEY")
     if not api_key:
+        raise RuntimeError("DAYTONA_API_KEY not set")
+    return Daytona(DaytonaConfig(api_key=api_key))
+
+
+async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
+    """Shared logic for destroy/stop Daytona sandbox."""
+    if not instance.sandbox_id:
+        return
+    try:
+        daytona = _get_daytona_client()
+    except (ImportError, RuntimeError) as e:
+        log.warning("cannot %s daytona sandbox %s: %s", op, instance.sandbox_id, e)
         return
 
     loop = asyncio.get_running_loop()
-    daytona = Daytona(DaytonaConfig(api_key=api_key))
     try:
         sandbox = await loop.run_in_executor(None, lambda: daytona.get(instance.sandbox_id))
-        await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
-        log.info("daytona sandbox deleted: %s", instance.sandbox_id)
+        if op == "delete":
+            await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
+        else:
+            await loop.run_in_executor(None, sandbox.stop)
+        log.info("daytona sandbox %sd: %s", op, instance.sandbox_id)
     except Exception as e:
-        log.warning("failed to delete daytona sandbox %s: %s", instance.sandbox_id, e)
+        log.warning("failed to %s daytona sandbox %s: %s", op, instance.sandbox_id, e)
+
+
+async def destroy_daytona(instance: ProviderInstance) -> None:
+    """Delete a Daytona sandbox."""
+    await _daytona_sandbox_op(instance, "delete")
 
 
 async def stop_daytona(instance: ProviderInstance) -> None:
     """Stop (not delete) a Daytona sandbox so it can be resumed later."""
-    if not instance.sandbox_id:
-        return
-
-    try:
-        from daytona_sdk import Daytona, DaytonaConfig
-    except ImportError:
-        log.warning("daytona-sdk not installed, cannot stop sandbox %s", instance.sandbox_id)
-        return
-
-    api_key = os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        return
-
-    loop = asyncio.get_running_loop()
-    daytona = Daytona(DaytonaConfig(api_key=api_key))
-    try:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(instance.sandbox_id))
-        await loop.run_in_executor(None, sandbox.stop)
-        log.info("daytona sandbox stopped: %s", instance.sandbox_id)
-    except Exception as e:
-        log.warning("failed to stop daytona sandbox %s: %s", instance.sandbox_id, e)
+    await _daytona_sandbox_op(instance, "stop")
 
 
 # ── Docker provider ──
@@ -342,13 +353,10 @@ async def create_docker(agent_type: str = "claude", dockerfile: str | None = Non
             image = SANDBOX_AGENT_IMAGE
 
         # Collect env vars to inject
+        env_vars = _get_sandbox_env_vars()
         env_args: list[str] = []
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-        if anthropic_key:
-            env_args += ["-e", f"ANTHROPIC_API_KEY={anthropic_key}"]
-        openai_key = os.environ.get("OPENAI_API_KEY")
-        if openai_key:
-            env_args += ["-e", f"OPENAI_API_KEY={openai_key}"]
+        for k, v in env_vars.items():
+            env_args += ["-e", f"{k}={v}"]
 
         cmd = [
             docker, "run", "-d", "--rm",

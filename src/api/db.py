@@ -32,17 +32,7 @@ _PG_SCHEMA = [
         provider        TEXT NOT NULL,
         sandbox_ref     TEXT NOT NULL,
         status          TEXT DEFAULT 'stopped',
-        name            TEXT UNIQUE,
-        image           TEXT DEFAULT 'python:3.12-slim',
-        auto_stop_min   INTEGER DEFAULT 15,
-        labels          JSONB DEFAULT '{}',
-        env_vars        JSONB DEFAULT '{}',
-        resources       JSONB DEFAULT '{}',
-        agent_count     INTEGER DEFAULT 0,
-        last_activity   TIMESTAMPTZ,
-        error_message   TEXT,
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     """CREATE TABLE IF NOT EXISTS sessions (
         id                  TEXT PRIMARY KEY,
@@ -66,17 +56,46 @@ _PG_SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_session_log_agent ON session_log(agent_id, created_at DESC)",
 ]
 
+# ---------------------------------------------------------------------------
+# Migrations — idempotent ALTER statements applied after DDL on every startup.
+# Use IF EXISTS / IF NOT EXISTS so they're safe to run repeatedly and on
+# fresh databases alike. Append new migrations to the bottom.
+# ---------------------------------------------------------------------------
+_MIGRATIONS = [
+    # 2026-04-12: drop unused sandboxes columns from earlier design
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS name",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS image",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS auto_stop_min",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS labels",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS env_vars",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS resources",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS agent_count",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS last_activity",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS error_message",
+    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS updated_at",
+]
+
 
 # ---------------------------------------------------------------------------
 # Init + pool lifecycle
 # ---------------------------------------------------------------------------
 
 def init_db() -> None:
-    """Run DDL. Call once before workers start (sync)."""
+    """Run DDL and migrations. Called once on server startup (sync).
+
+    DDL creates tables if missing (fresh setups).
+    Migrations ALTER existing tables to the current schema (upgrades).
+    Both use IF EXISTS / IF NOT EXISTS so they're idempotent.
+    """
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     try:
         for stmt in _PG_SCHEMA:
             conn.execute(stmt)
+        for stmt in _MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except Exception as e:
+                log.warning("migration failed: %s — %s", stmt, e)
         conn.commit()
     finally:
         conn.close()

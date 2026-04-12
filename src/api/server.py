@@ -14,11 +14,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
-from .models import AgentConfig, AgentRecord, SandboxRecord, SessionState
+from .models import (
+    AgentConfig, AgentRecord, SandboxRecord, SessionState,
+    EVT_USER_MESSAGE, EVT_ASSISTANT_MESSAGE, EVT_TOOL_CALL, EVT_TOOL_RESULT, EVT_USAGE, EVT_ERROR,
+    STATUS_RUNNING,
+)
 from .db import (
     init_db, init_pool, close_pool,
     upsert_agent, get_agent, list_agents, delete_agent,
@@ -32,9 +36,22 @@ from .sse import (
     UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK, UT_TOOL_CALL, UT_TOOL_STARTED,
     UT_TOOL_CALL_UPDATE, UT_USAGE_UPDATED, UT_USAGE_UPDATE,
 )
-from .providers import PORT_BASED_PROVIDERS, ProviderInstance, create_instance, destroy_instance, stop_instance
+from .providers import PORT_BASED_PROVIDERS, ProviderInstance, create_instance, destroy_instance, stop_instance, stop_daytona
+from .redact import redact_secrets
+from .sandbox import get_sandbox_client, ensure_sandbox_running
 
+# Configure logging for the api namespace so uvicorn displays our logs.
+# Level can be overridden via LOG_LEVEL env var.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("api").setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger(__name__)
+
+_UI_DIR = Path(__file__).parent.parent.parent / "ui"
+_CHAT_HTML: str | None = None
+_KANBAN_HTML: str | None = None
 
 # ---------------------------------------------------------------------------
 # DB + in-memory state
@@ -71,33 +88,20 @@ async def _cancel_task(task) -> None:
 
 
 async def _close_session_gracefully(state: "SessionState", *, background: bool = False) -> None:
-    """Best-effort: tell sandbox-agent to terminate the ACP session, then close the HTTP socket.
+    """Close the HTTP connection to sandbox-agent.
 
-    If *background* is True, the DELETE + close runs in a fire-and-forget task
-    so the caller is not blocked by the (potentially slow) sandbox-agent response.
+    We just drop the connection — sandbox-agent detects the disconnect
+    and cleans up child processes. The old DELETE /v1/acp/{id} approach
+    hangs because sandbox-agent blocks waiting for Claude to shut down.
     """
     client = state.client
     if not client:
         return
     state.client = None
-
-    async def _do_close():
-        try:
-            if state.acp_session_id:
-                await asyncio.wait_for(
-                    client.close_session(state.acp_session_id), timeout=5,
-                )
-        except Exception as e:
-            log.warning("close_session DELETE failed for acp %s: %s", state.acp_session_id, type(e).__name__)
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-
-    if background:
-        asyncio.create_task(_do_close())
-    else:
-        await _do_close()
+    try:
+        await client.aclose()
+    except Exception:
+        pass
 
 
 async def _shutdown_session_state(
@@ -117,6 +121,7 @@ async def _shutdown_session_state(
     await _close_session_gracefully(state, background=background_close)
     if remove and SESSIONS.get(state.session_id) is state:
         SESSIONS.pop(state.session_id, None)
+        _session_locks.pop(state.session_id, None)
 
 
 def _mark_turn_finished(state: SessionState, at: float | None = None) -> float:
@@ -141,58 +146,35 @@ IDLE_TIMEOUT_S = int(os.environ.get("SANDBOX_IDLE_TIMEOUT", "300"))  # 5 min def
 
 
 async def _idle_reaper():
-    """Background task: stop sandboxes where all agents have finished work."""
+    """Background task: close idle sessions that have been inactive too long."""
     while True:
         await asyncio.sleep(60)
         now = time.time()
-        log.info("idle reaper tick: sessions=%d, instances=%d", len(SESSIONS), len(_INSTANCES))
-        # Group sessions by sandbox_id
-        sandbox_sessions: dict[str, list[SessionState]] = {}
-        for s in list(SESSIONS.values()):
-            sandbox_sessions.setdefault(s.sandbox_id, []).append(s)
+        log.info("idle reaper tick: sessions=%d", len(SESSIONS))
 
-        for sandbox_id, sessions in sandbox_sessions.items():
-            instance = _INSTANCES.get(sandbox_id)
-            if not instance:
+        for state in list(SESSIONS.values()):
+            if state.agent_busy:
                 continue
-            # Check if sandbox is alive
-            if instance.process is not None:
-                process_alive = instance.process.returncode is None
-            elif instance.url:
-                try:
-                    async with httpx.AsyncClient(timeout=3) as hc:
-                        r = await hc.get(f"{instance.url}/v1/health")
-                        process_alive = r.status_code == 200
-                except Exception:
-                    process_alive = False
-            else:
-                process_alive = False
-
-            if not process_alive:
-                continue  # already dead, nothing to reap
-            if any(s.agent_busy for s in sessions) and process_alive:
+            idle_since = _session_idle_since(state)
+            if now - idle_since < IDLE_TIMEOUT_S:
                 continue
-
-            # Sessions with no completed turn should still be reaped based on inactivity.
-            latest_idle = max(_session_idle_since(s) for s in sessions)
-            if now - latest_idle < IDLE_TIMEOUT_S:
-                continue
-
-            # All agents idle for >IDLE_TIMEOUT_S — stop the sandbox
-            log.info("idle reaper: stopping sandbox %s (idle %.0fs since last agent activity)",
-                     sandbox_id, now - latest_idle)
-            async with _get_sandbox_lock(sandbox_id):
-                for s in sessions:
-                    await _shutdown_session_state(s, remove=True, mark_idle_at=now)
-                # Re-read instance under the lock — _ensure_sandbox_alive may
-                # have replaced it while we were checking health above.
-                current_instance = _INSTANCES.get(sandbox_id)
-                if current_instance is not None:
+            log.info("idle reaper: closing session %s (idle %.0fs)",
+                     state.session_id, now - idle_since)
+            sandbox_id = state.sandbox_id
+            await _shutdown_session_state(state, remove=True, mark_idle_at=now)
+            # If no other sessions use this sandbox, stop the sandbox-agent.
+            # For local/docker: kills the process (no filesystem to preserve).
+            # For daytona: stops the workspace (filesystem preserved for resume).
+            if not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+                instance = _INSTANCES.pop(sandbox_id, None)
+                if instance:
+                    log.info("idle reaper: stopping sandbox %s (provider=%s)",
+                             sandbox_id, instance.provider)
                     try:
-                        await stop_instance(current_instance)
+                        await stop_instance(instance)
+                        log.info("idle reaper: sandbox %s stopped", sandbox_id)
                     except Exception as e:
-                        log.warning("idle reaper cleanup failed: %s", e)
-                    _INSTANCES.pop(sandbox_id, None)
+                        log.warning("reaper: failed to stop sandbox %s: %s", sandbox_id, e)
 
 
 @asynccontextmanager
@@ -202,14 +184,19 @@ async def lifespan(app):
     reaper = asyncio.create_task(_idle_reaper())
     yield
     await _cancel_task(reaper)
-    for session in list(SESSIONS.values()):
-        await _shutdown_session_state(session, remove=False)
+    # Parallel session shutdown
+    await asyncio.gather(
+        *[_shutdown_session_state(s, remove=False) for s in SESSIONS.values()],
+        return_exceptions=True,
+    )
     SESSIONS.clear()
-    for instance in list(_INSTANCES.values()):
+    # Parallel instance teardown
+    async def _safe_destroy(inst):
         try:
-            await destroy_instance(instance)
+            await destroy_instance(inst)
         except Exception as e:
             log.warning("shutdown cleanup failed: %s", e)
+    await asyncio.gather(*[_safe_destroy(i) for i in _INSTANCES.values()])
     _INSTANCES.clear()
     await close_pool()
 
@@ -257,8 +244,8 @@ async def _flush_text_parts(state: SessionState, parts: list[str]) -> None:
         await log_event(
             session_id=state.session_id, agent_id=state.agent_id,
             sandbox_id=state.sandbox_id,
-            event_type="assistant_message",
-            payload={"text": "".join(parts)},
+            event_type=EVT_ASSISTANT_MESSAGE,
+            payload={"text": redact_secrets("".join(parts))},
         )
     except Exception:
         pass
@@ -266,7 +253,6 @@ async def _flush_text_parts(state: SessionState, parts: list[str]) -> None:
 
 def _maybe_auto_approve_permission(block: str, state: SessionState) -> None:
     """If the SSE block is a session/request_permission, auto-approve it."""
-    from .sse import parse_sse_data
     payload = parse_sse_data(block)
     if not payload or payload.get("method") != "session/request_permission":
         return
@@ -403,97 +389,42 @@ async def _apply_config_and_initialize(
 
 
 # ---------------------------------------------------------------------------
-# Agent CRUD (config only, no sandbox)
+# Request helpers
 # ---------------------------------------------------------------------------
 
-@app.post("/agents/quick")
-async def quick_create(request: Request):
-    """Create agent + provision sandbox + connect in one call.
+_CONFIG_KEYS = ("model", "prompt", "tools", "mcp_servers", "skills", "agent_type", "cwd", "dockerfile", "dockerfile_content")
 
-    Returns {agent_id, sandbox_id, session_id, connected: true}.
-    """
-    data = await request.json()
-    provider = data.get("provider", "local")
-    agent_type = data.get("agent_type", "claude")
-    name = data.get("name")
-    config_data = data.get("config", {})
-    # SDK sends mcp_servers, skills, etc. at top level — merge them in
-    for key in ("model", "prompt", "tools", "mcp_servers", "skills", "agent_type", "cwd", "dockerfile", "dockerfile_content"):
+
+def _merge_top_level_config(data: dict, config_data: dict) -> None:
+    """Merge SDK top-level keys into config_data if not already present."""
+    for key in _CONFIG_KEYS:
         if key in data and key not in config_data:
             config_data[key] = data[key]
-    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
-    dockerfile = config_data.get("dockerfile")
-    # dockerfile_content: client sends Dockerfile text for remote servers
-    if not dockerfile and config_data.get("dockerfile_content"):
-        tmp = tempfile.NamedTemporaryFile(suffix=".Dockerfile", delete=False, mode="w")
-        tmp.write(config_data["dockerfile_content"])
-        tmp.close()
-        dockerfile = tmp.name
 
-    # 1. Create agent record
-    agent_id = str(uuid.uuid4())
-    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type, "cwd": cwd})
-    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
 
-    # 2. Provision sandbox
-    sandbox_id = str(uuid.uuid4())
-    try:
-        instance = await create_instance(provider, agent_type, dockerfile=dockerfile)
-    except Exception as e:
-        await delete_agent(agent_id)
-        return JSONResponse({"error": f"Provider '{provider}' failed: {e}"}, status_code=502)
+def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
+    """Write dockerfile_content from request data to a temp file. Returns path or None."""
+    path = data.get(key)
+    if path:
+        return path
+    content = data.get("dockerfile_content")
+    if not content:
+        return None
+    tmp = tempfile.NamedTemporaryFile(suffix=".Dockerfile", delete=False, mode="w")
+    tmp.write(content)
+    tmp.close()
+    return tmp.name
 
+
+def _derive_sandbox_ref(instance: ProviderInstance, provider: str, sandbox_id: str) -> str:
     if provider in PORT_BASED_PROVIDERS:
-        sandbox_ref = str(instance.port)
-    else:
-        sandbox_ref = instance.sandbox_id or sandbox_id
+        return str(instance.port)
+    return instance.sandbox_id or sandbox_id
 
-    _INSTANCES[sandbox_id] = instance
-    await upsert_sandbox(SandboxRecord(id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status="running"))
 
-    # 3. Connect session
-    url = instance.url
-    acp_session_id = str(uuid.uuid4())
-    session_id = str(uuid.uuid4())
-
-    client = SandboxAgentClient(url)
-    try:
-        await _apply_config_and_initialize(client, config, acp_session_id, cwd)
-    except Exception as e:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        await delete_agent(agent_id)
-        await delete_sandbox(sandbox_id)
-        _INSTANCES.pop(sandbox_id, None)
-        try:
-            await destroy_instance(instance)
-        except Exception as de:
-            log.warning("quick_create cleanup: destroy_instance failed: %s", de)
-        return JSONResponse({"error": f"Failed to connect to sandbox-agent: {e}"}, status_code=502)
-
-    inner_session_id = client.get_inner_session_id(acp_session_id)
-    state = SessionState(
-        session_id=session_id,
-        agent_id=agent_id,
-        sandbox_id=sandbox_id,
-        acp_session_id=acp_session_id,
-        inner_session_id=inner_session_id,
-        client=client,
-    )
-    SESSIONS[session_id] = state
-    _start_sse_reader(state)
-    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
-
-    return {
-        "agent_id": agent_id,
-        "sandbox_id": sandbox_id,
-        "session_id": session_id,
-        "inner_session_id": inner_session_id,
-        "connected": True,
-    }
-
+# ---------------------------------------------------------------------------
+# Agent CRUD (config only, no sandbox)
+# ---------------------------------------------------------------------------
 
 @app.post("/agents")
 async def create_agent(request: Request):
@@ -501,15 +432,10 @@ async def create_agent(request: Request):
     agent_id = str(uuid.uuid4())
     name = data.get("name")
     config_data = data.get("config", {})
-    for key in ("model", "prompt", "tools", "mcp_servers", "skills", "agent_type", "cwd", "dockerfile", "dockerfile_content"):
-        if key in data and key not in config_data:
-            config_data[key] = data[key]
-    # Materialize dockerfile_content to a temp file
-    if not config_data.get("dockerfile") and config_data.get("dockerfile_content"):
-        tmp = tempfile.NamedTemporaryFile(suffix=".Dockerfile", delete=False, mode="w")
-        tmp.write(config_data["dockerfile_content"])
-        tmp.close()
-        config_data["dockerfile"] = tmp.name
+    _merge_top_level_config(data, config_data)
+    materialized = _materialize_dockerfile(config_data)
+    if materialized:
+        config_data["dockerfile"] = materialized
     config = AgentConfig.from_dict(config_data)
     record = AgentRecord(id=agent_id, name=name, config=config)
     await upsert_agent(record)
@@ -548,25 +474,17 @@ async def create_sandbox(request: Request):
     data = await request.json()
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
-    dockerfile = data.get("dockerfile")
-    if not dockerfile and data.get("dockerfile_content"):
-        tmp = tempfile.NamedTemporaryFile(suffix=".Dockerfile", delete=False, mode="w")
-        tmp.write(data["dockerfile_content"])
-        tmp.close()
-        dockerfile = tmp.name
+    dockerfile = _materialize_dockerfile(data)
     sandbox_id = str(uuid.uuid4())
     try:
         instance = await create_instance(provider, agent_type, dockerfile=dockerfile)
     except Exception as e:
         return JSONResponse({"error": f"Provider '{provider}' failed: {e}"}, status_code=502)
 
-    if provider in PORT_BASED_PROVIDERS:
-        sandbox_ref = str(instance.port)
-    else:
-        sandbox_ref = instance.sandbox_id or sandbox_id
+    sandbox_ref = _derive_sandbox_ref(instance, provider, sandbox_id)
 
     _INSTANCES[sandbox_id] = instance
-    record = SandboxRecord(id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status="running")
+    record = SandboxRecord(id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status=STATUS_RUNNING)
     await upsert_sandbox(record)
     return {"id": sandbox_id, "provider": provider, "sandbox_ref": sandbox_ref, "status": "running"}
 
@@ -607,6 +525,7 @@ async def delete_sandbox_route(sandbox_id: str):
                 await _shutdown_session_state(state, remove=True)
 
         instance = _INSTANCES.pop(sandbox_id, None)
+        _sandbox_locks.pop(sandbox_id, None)
         await delete_sandbox(sandbox_id)
 
     # Teardown the process/container outside the lock (may be slow)
@@ -619,6 +538,42 @@ async def delete_sandbox_route(sandbox_id: str):
     return {"status": "deleted"}
 
 
+@app.post("/sandboxes/{sandbox_id}/stop")
+async def stop_sandbox_route(sandbox_id: str):
+    record = await get_sandbox(sandbox_id)
+    if record is None:
+        return JSONResponse({"error": "sandbox not found"}, status_code=404)
+
+    # Hold the sandbox lock to prevent concurrent _ensure_sandbox_alive
+    # from auto-restarting the sandbox while we're stopping it.
+    async with _get_sandbox_lock(sandbox_id):
+        instance = _INSTANCES.pop(sandbox_id, None)
+        record.status = "stopped"
+        await upsert_sandbox(record)
+
+    # Stop the sandbox outside the lock (may be slow)
+    if instance and record.provider == "daytona":
+        await stop_daytona(instance)
+
+    return {"status": "stopped"}
+
+
+@app.post("/sandboxes/{sandbox_id}/start")
+async def start_sandbox_route(sandbox_id: str):
+    record = await get_sandbox(sandbox_id)
+    if record is None:
+        return JSONResponse({"error": "sandbox not found"}, status_code=404)
+
+    try:
+        url = await ensure_sandbox_running(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=500)
+
+    record.status = "running"
+    await upsert_sandbox(record)
+    return {"status": "running", "url": url}
+
+
 # ---------------------------------------------------------------------------
 # Session operations (on sandbox)
 # ---------------------------------------------------------------------------
@@ -627,6 +582,8 @@ async def _bg_log(session_id: str, agent_id: str, sandbox_id: str,
                   event_type: str, payload: dict) -> None:
     """Fire-and-forget DB log — suppresses all exceptions."""
     try:
+        if "text" in payload:
+            payload = {**payload, "text": redact_secrets(payload["text"])}
         await log_event(session_id=session_id, agent_id=agent_id,
                         sandbox_id=sandbox_id, event_type=event_type, payload=payload)
     except Exception:
@@ -672,7 +629,7 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
                 tool_payload["args"] = raw_input
             asyncio.create_task(_bg_log(
                 state.session_id, state.agent_id, state.sandbox_id,
-                "tool_call", tool_payload,
+                EVT_TOOL_CALL, tool_payload,
             ))
 
         elif log_events and ut == UT_TOOL_CALL_UPDATE:
@@ -681,18 +638,18 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
             if tool_response:
                 asyncio.create_task(_bg_log(
                     state.session_id, state.agent_id, state.sandbox_id,
-                    "tool_result", {"tool": meta.get("toolName", "unknown"), "result": tool_response},
+                    EVT_TOOL_RESULT, {"tool": meta.get("toolName", "unknown"), "result": tool_response},
                 ))
             elif update.get("rawInput"):
                 asyncio.create_task(_bg_log(
                     state.session_id, state.agent_id, state.sandbox_id,
-                    "tool_call", {"tool": meta.get("toolName", "unknown"), "args": update["rawInput"]},
+                    EVT_TOOL_CALL, {"tool": meta.get("toolName", "unknown"), "args": update["rawInput"]},
                 ))
 
         elif log_events and ut in (UT_USAGE_UPDATED, UT_USAGE_UPDATE):
             asyncio.create_task(_bg_log(
                 state.session_id, state.agent_id, state.sandbox_id,
-                "usage", update.get("cost", update),
+                EVT_USAGE, update.get("cost", update),
             ))
         return
 
@@ -706,7 +663,7 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
             if log_events:
                 asyncio.create_task(_bg_log(
                     state.session_id, state.agent_id, state.sandbox_id,
-                    "assistant_message", {"text": text},
+                    EVT_ASSISTANT_MESSAGE, {"text": text},
                 ))
         return
 
@@ -715,7 +672,7 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
         err = data or {}
         asyncio.create_task(_bg_log(
             state.session_id, state.agent_id, state.sandbox_id,
-            "error", {"message": err.get("message", str(err))[:500]},
+            EVT_ERROR, {"message": err.get("message", str(err))[:500]},
         ))
 
 
@@ -753,72 +710,6 @@ async def _find_last_replay_event_id(
     except Exception as e:
         log.warning("find last replay event failed: %s", e)
         return None
-
-
-def _get_sandbox_url(record: SandboxRecord) -> str | None:
-    instance = _INSTANCES.get(record.id)
-    if instance:
-        return instance.url
-    if record.provider in PORT_BASED_PROVIDERS:
-        try:
-            return record.derive_url()
-        except Exception:
-            return None
-    return None
-
-
-@app.post("/sandboxes/{sandbox_id}/connect")
-async def connect_to_sandbox(sandbox_id: str, request: Request):
-    """Accepts {agent_id}, creates ACP + inner session, returns {session_id, status}."""
-    data = await request.json()
-    agent_id = data.get("agent_id")
-    if not agent_id:
-        return JSONResponse({"error": "agent_id required"}, status_code=400)
-
-    agent_record = await get_agent(agent_id)
-    if agent_record is None:
-        return JSONResponse({"error": "agent not found"}, status_code=404)
-
-    sandbox_record = await get_sandbox(sandbox_id)
-    if sandbox_record is None:
-        return JSONResponse({"error": "sandbox not found"}, status_code=404)
-
-    url = _get_sandbox_url(sandbox_record)
-    if not url:
-        return JSONResponse({"error": "cannot derive sandbox URL"}, status_code=400)
-
-    cwd = agent_record.config.cwd or "/tmp"
-
-    session_id = str(uuid.uuid4())
-    acp_session_id = str(uuid.uuid4())
-
-    client = SandboxAgentClient(url)
-    try:
-        await _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd)
-    except Exception as e:
-        try:
-            await client.close_session(acp_session_id)
-        except Exception:
-            pass
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        return JSONResponse({"error": f"Failed to connect to sandbox-agent: {e}"}, status_code=502)
-
-    inner_session_id = client.get_inner_session_id(acp_session_id)
-    state = SessionState(
-        session_id=session_id,
-        agent_id=agent_id,
-        sandbox_id=sandbox_id,
-        acp_session_id=acp_session_id,
-        inner_session_id=inner_session_id,
-        client=client,
-    )
-    SESSIONS[session_id] = state
-    _start_sse_reader(state)
-    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
-    return {"session_id": session_id, "inner_session_id": inner_session_id, "status": "connected"}
 
 
 async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
@@ -862,7 +753,7 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             _INSTANCES[sandbox_id] = new_instance
             new_ref = str(new_instance.port) if new_instance.port is not None else sandbox_id
             await upsert_sandbox(SandboxRecord(
-                id=sandbox_id, provider=provider, sandbox_ref=new_ref, status="running",
+                id=sandbox_id, provider=provider, sandbox_ref=new_ref, status=STATUS_RUNNING,
             ))
             return new_instance.url
 
@@ -881,14 +772,16 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
     # Daytona sandbox URL lost or stale — get fresh signed URL, start sandbox if stopped
     log.info("recovering daytona sandbox %s (daytona_id=%s)", sandbox_id, daytona_sandbox_id)
     try:
-        from daytona_sdk import Daytona, DaytonaConfig
-        from .providers import SANDBOX_AGENT_PORT, _wait_for_health
-        daytona_client = Daytona(DaytonaConfig(api_key=os.environ.get("DAYTONA_API_KEY", "")))
+        from .providers import SANDBOX_AGENT_PORT, _wait_for_health, _get_daytona_client
+        daytona_client = _get_daytona_client()
         loop = asyncio.get_running_loop()
         sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
 
         # Start sandbox if stopped (no-op if already running)
-        if sandbox_obj.state != "started":
+        # sandbox_obj.state may be an enum — compare .value for string check
+        raw_state = sandbox_obj.state
+        state_str = raw_state.value if hasattr(raw_state, 'value') else str(raw_state)
+        if state_str != "started":
             await loop.run_in_executor(None, sandbox_obj.start)
 
         # Get a fresh signed preview URL
@@ -936,10 +829,12 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
 
         agent_record = await get_agent(agent_id)
         if agent_record is None:
+            log.error("_do_resume: agent %s not found in DB", agent_id)
             return JSONResponse({"error": "agent not found"}, status_code=404)
 
         sandbox_record = await get_sandbox(sandbox_id)
         if sandbox_record is None:
+            log.error("_do_resume: sandbox %s not found in DB", sandbox_id)
             return JSONResponse({"error": "sandbox not found"}, status_code=404)
 
         # Auto-restart sandbox if the process died (idle reaper or crash)
@@ -950,6 +845,7 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
                 dockerfile=agent_record.config.dockerfile,
             )
         except RuntimeError as e:
+            log.error("_do_resume: _ensure_sandbox_alive failed for sandbox %s: %s", sandbox_id, e)
             return JSONResponse({"error": str(e)}, status_code=502)
 
         cwd = agent_record.config.cwd or "/tmp"
@@ -969,6 +865,8 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
                 client.set_inner_session_id(acp_session_id, inner_session_id)
             await asyncio.wait_for(_init_and_load(), timeout=120)
         except Exception as e:
+            log.error("_do_resume: session/load failed for sandbox %s inner %s: %s: %s",
+                      sandbox_id, inner_session_id, type(e).__name__, e)
             try:
                 await client.close_session(acp_session_id)
             except Exception:
@@ -1006,49 +904,741 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
         }
 
 
-@app.post("/sandboxes/{sandbox_id}/resume")
-async def resume_sandbox_session(sandbox_id: str, request: Request):
-    """Resume a previous session using session/load."""
-    data = await request.json()
-    agent_id = data.get("agent_id")
-    inner_session_id = data.get("inner_session_id")
-    client_session_id = data.get("session_id")
-    if not agent_id or not inner_session_id:
-        return JSONResponse({"error": "agent_id and inner_session_id required"}, status_code=400)
-    return await _do_resume(
-        sandbox_id=sandbox_id, agent_id=agent_id,
-        inner_session_id=inner_session_id, client_session_id=client_session_id,
-    )
+async def get_or_recover_session(session_id: str) -> SessionState:
+    """Get a live session, recovering from DB if it was reaped.
 
+    This is the single entry point for all session endpoints. Checks
+    in-memory SESSIONS first, then falls back to DB lookup + _do_resume
+    to restart the sandbox and reload conversation state.
 
-@app.post("/sessions/{session_id}/resume")
-async def resume_session(session_id: str):
-    """Resume a session by session_id alone — looks up everything from DB."""
+    Raises HTTPException(404) if the session doesn't exist anywhere.
+    Raises HTTPException(502) if recovery fails.
+    """
+    state = SESSIONS.get(session_id)
+    if state and not state.shutdown.is_set():
+        return state
+
     rec = await get_session(session_id)
     if rec is None:
-        return JSONResponse({"error": "session not found"}, status_code=404)
-    if not rec.get("inner_session_id"):
-        return JSONResponse({"error": "session has no inner_session_id — cannot resume"}, status_code=400)
-    return await _do_resume(
-        sandbox_id=rec["sandbox_id"],
-        agent_id=rec["agent_id"],
-        inner_session_id=rec["inner_session_id"],
+        log.warning("session %s not found in DB", session_id)
+        raise HTTPException(status_code=404, detail="session not found")
+
+    agent_id = rec.get("agent_id")
+    inner_session_id = rec.get("inner_session_id")
+    sandbox_id = rec.get("sandbox_id")
+    if not agent_id or not inner_session_id or not sandbox_id:
+        log.warning("session %s record incomplete: %s", session_id, rec)
+        raise HTTPException(status_code=404, detail="session record incomplete")
+
+    log.info("recovering session %s (sandbox=%s, inner=%s)",
+             session_id, sandbox_id, inner_session_id)
+    result = await _do_resume(
+        sandbox_id=sandbox_id,
+        agent_id=agent_id,
+        inner_session_id=inner_session_id,
         client_session_id=session_id,
     )
 
+    if isinstance(result, JSONResponse):
+        body = bytes(result.body).decode("utf-8", errors="replace")
+        log.error("session %s recovery failed: status=%d body=%s",
+                  session_id, result.status_code, body[:500])
+        raise HTTPException(
+            status_code=502,
+            detail=f"session recovery failed: {body[:200]}",
+        )
 
-@app.post("/sandboxes/{sandbox_id}/message")
-async def post_sandbox_message(sandbox_id: str, request: Request):
-    """Accepts {session_id, message}, sends prompt via ACP (non-blocking, background task)."""
+    recovered = SESSIONS.get(session_id)
+    if recovered is None:
+        log.error("session %s recovery succeeded but SESSIONS lookup returned None", session_id)
+        raise HTTPException(status_code=502, detail="session recovery failed: state missing after resume")
+
+    log.info("session %s recovered successfully", session_id)
+    return recovered
+
+
+# ---------------------------------------------------------------------------
+# Sandbox filesystem / exec / config proxy endpoints
+# ---------------------------------------------------------------------------
+
+async def _proxy(coro):
+    """Run a sandbox-agent call with standard 502 error handling."""
+    try:
+        return await coro
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/fs")
+async def sandbox_list_dir(sandbox_id: str, path: str = "/"):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.list_dir(path))
+
+
+@app.get("/sandboxes/{sandbox_id}/fs/file")
+async def sandbox_read_file(sandbox_id: str, path: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        content = await client.read_file(path)
+        return PlainTextResponse(content)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.put("/sandboxes/{sandbox_id}/fs/file")
+async def sandbox_write_file(sandbox_id: str, path: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        body = await request.body()
+        await client.write_file(path, body.decode("utf-8", errors="replace"))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/exec")
+async def sandbox_run_command(sandbox_id: str, request: Request):
+    try:
+        data = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid JSON body: {e}"}, status_code=400)
+    command = data.get("command")
+    if not command:
+        return JSONResponse({"error": "Missing required field: command"}, status_code=400)
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        result = await client.run_command(command, args=data.get("args"), cwd=data.get("cwd"))
+        return result
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/processes")
+async def sandbox_start_process(sandbox_id: str, request: Request):
+    try:
+        data = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid JSON body: {e}"}, status_code=400)
+    command = data.get("command")
+    if not command:
+        return JSONResponse({"error": "Missing required field: command"}, status_code=400)
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        result = await client.start_process(command, args=data.get("args"), cwd=data.get("cwd"))
+        return result
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/processes")
+async def sandbox_list_processes(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.list_processes())
+
+
+@app.post("/sandboxes/{sandbox_id}/processes/{process_id}/stop")
+async def sandbox_stop_process(sandbox_id: str, process_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        await client.stop_process(process_id)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/processes/{process_id}")
+async def sandbox_process_info(sandbox_id: str, process_id: str):
+    """Get detailed process info."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.get_process_info(process_id))
+
+
+@app.post("/sandboxes/{sandbox_id}/processes/{process_id}/input")
+async def sandbox_send_input(sandbox_id: str, process_id: str, request: Request):
+    """Send stdin input to a process."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        body = await request.body()
+        await client.send_process_input(process_id, body.decode())
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/processes/{process_id}/kill")
+async def sandbox_kill_process(sandbox_id: str, process_id: str):
+    """Kill a process (SIGKILL)."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        await client.kill_process(process_id)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.delete("/sandboxes/{sandbox_id}/processes/{process_id}")
+async def sandbox_delete_process(sandbox_id: str, process_id: str):
+    """Delete a process record."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        await client.delete_process(process_id)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/processes/{process_id}/logs")
+async def sandbox_process_logs(sandbox_id: str, process_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        logs = await client.get_process_logs(process_id)
+        return PlainTextResponse(logs)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/screenshot")
+async def sandbox_screenshot(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        png_bytes = await client.screenshot()
+        return Response(content=png_bytes, media_type="image/png")
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/desktop/screenshot")
+async def sandbox_desktop_screenshot(sandbox_id: str, region: str | None = None):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        region_dict = json.loads(region) if region else None
+        png_bytes = await client.screenshot(region=region_dict)
+        return Response(content=png_bytes, media_type="image/png")
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/click")
+async def sandbox_mouse_click(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.mouse_click(data.get("x", 0), data.get("y", 0), data.get("button", "left"))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/type")
+async def sandbox_keyboard_type(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.keyboard_type(data.get("text", ""))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/press")
+async def sandbox_keyboard_press(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.keyboard_press(data.get("key", ""))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/mouse/down")
+async def sandbox_mouse_down(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.mouse_down(data.get("x", 0), data.get("y", 0), data.get("button", "left"))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.post("/sandboxes/{sandbox_id}/desktop/mouse/up")
+async def sandbox_mouse_up(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.mouse_up(data.get("x", 0), data.get("y", 0), data.get("button", "left"))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.post("/sandboxes/{sandbox_id}/desktop/mouse/move")
+async def sandbox_mouse_move(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.mouse_move(data.get("x", 0), data.get("y", 0))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.post("/sandboxes/{sandbox_id}/desktop/keyboard/down")
+async def sandbox_key_down(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.key_down(data.get("key", ""))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.post("/sandboxes/{sandbox_id}/desktop/keyboard/up")
+async def sandbox_key_up(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.key_up(data.get("key", ""))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/desktop/clipboard")
+async def sandbox_clipboard_read(sandbox_id: str):
+    """Read clipboard content."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        text = await client.clipboard_read()
+        return PlainTextResponse(text)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.post("/sandboxes/{sandbox_id}/desktop/clipboard")
+async def sandbox_clipboard_write(sandbox_id: str, request: Request):
+    """Write to clipboard."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.clipboard_write(data.get("text", ""))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/desktop/windows")
+async def sandbox_list_windows(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.list_windows())
+
+@app.post("/sandboxes/{sandbox_id}/desktop/windows/{window_id}/focus")
+async def sandbox_focus_window(sandbox_id: str, window_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        await client.focus_window(window_id)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.post("/sandboxes/{sandbox_id}/desktop/start")
+async def sandbox_desktop_start(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.desktop_start())
+
+@app.post("/sandboxes/{sandbox_id}/desktop/stop")
+async def sandbox_desktop_stop(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        await client.desktop_stop()
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+@app.get("/sandboxes/{sandbox_id}/desktop/status")
+async def sandbox_desktop_status(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.desktop_status())
+
+@app.get("/sandboxes/{sandbox_id}/desktop/recordings")
+async def sandbox_list_recordings(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.list_recordings())
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/drag")
+async def sandbox_drag_mouse(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.drag_mouse(data.get("startX", 0), data.get("startY", 0), data.get("endX", 0), data.get("endY", 0), data.get("button", "left"))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/scroll")
+async def sandbox_scroll_mouse(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        await client.scroll_mouse(data.get("x", 0), data.get("y", 0), data.get("scrollX", 0), data.get("scrollY", 0))
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/launch")
+async def sandbox_launch_app(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
     data = await request.json()
-    session_id = data.get("session_id")
-    message = data.get("message")
-    if not session_id or not message:
-        return JSONResponse({"error": "session_id and message required"}, status_code=400)
+    return await _proxy(client.launch_app(data.get("appName", "")))
 
+
+@app.post("/sandboxes/{sandbox_id}/desktop/recordings/start")
+async def sandbox_start_recording(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.start_recording())
+
+
+@app.post("/sandboxes/{sandbox_id}/desktop/recordings/stop")
+async def sandbox_stop_recording(sandbox_id: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.stop_recording())
+
+
+@app.get("/sandboxes/{sandbox_id}/desktop/display")
+async def sandbox_display_info(sandbox_id: str):
+    """Get display/resolution info from the sandbox desktop."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.get_display_info())
+
+
+@app.get("/sandboxes/{sandbox_id}/processes/config")
+async def sandbox_process_config(sandbox_id: str):
+    """Get process limits configuration."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        resp = await client._client.get("/v1/processes/config")
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/fs/upload")
+async def sandbox_upload_files(sandbox_id: str, request: Request, path: str = "/"):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        body = await request.body()
+        await client.upload_files_raw(path, body)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.delete("/sandboxes/{sandbox_id}/fs/file")
+async def sandbox_delete_path(sandbox_id: str, path: str, recursive: bool = False):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        await client.delete_path(path, recursive=recursive)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/fs/mkdir")
+async def sandbox_mkdir(sandbox_id: str, path: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        await client.mkdir(path)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/fs/move")
+async def sandbox_move_file(sandbox_id: str, request: Request):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        src = data.get("source")
+        dst = data.get("destination")
+        if not src or not dst:
+            return JSONResponse({"error": "source and destination required"}, status_code=400)
+        await client.move_file(src, dst)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/fs/stat")
+async def sandbox_stat(sandbox_id: str, path: str):
+    try:
+        client = await get_sandbox_client(sandbox_id)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return await _proxy(client.stat(path))
+
+
+@app.get("/sandboxes/{sandbox_id}/health")
+async def sandbox_health(sandbox_id: str):
+    """Check if the sandbox-agent process is alive."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        result = await client.health()
+        return result
+    except Exception as e:
+        return JSONResponse({"error": str(e), "healthy": False}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/agents")
+async def sandbox_list_agents(sandbox_id: str):
+    """List agents available in the sandbox."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        agents = await client.list_agents()
+        return [{"id": a.id, "installed": a.installed,
+                 "credentials_available": a.credentials_available,
+                 "capabilities": a.capabilities} for a in agents]
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sandboxes/{sandbox_id}/capabilities")
+async def sandbox_agent_capabilities(sandbox_id: str, agent_type: str = Query(default="claude")):
+    """Get capabilities for a specific agent type in this sandbox."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        info = await client.get_agent_info(agent_type)
+        return {"agent_type": agent_type, "capabilities": info.get("capabilities", {})}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/install-agent")
+async def sandbox_install_agent(sandbox_id: str, request: Request):
+    """Install an agent type in the sandbox (e.g. amp, pi, cursor)."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        agent_type = data.get("agent_type", "claude")
+        result = await client.install_agent(agent_type)
+        return result
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/sandboxes/{sandbox_id}/deploy-skill")
+async def sandbox_deploy_skill(sandbox_id: str, request: Request):
+    """Deploy a skill file to the sandbox."""
+    try:
+        client = await get_sandbox_client(sandbox_id)
+        data = await request.json()
+        name = data.get("name")
+        content = data.get("content")
+        cwd = data.get("cwd", "/tmp")
+        if not name or not content:
+            return JSONResponse({"error": "name and content required"}, status_code=400)
+        path = f"{cwd}/.claude/commands/{name}.md"
+        await client.write_file(path, content)
+        return {"status": "ok", "path": path}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/sessions")
+async def list_sessions_route():
+    """List all active in-memory sessions with status."""
+    now = time.time()
+    return [
+        {
+            "session_id": s.session_id,
+            "agent_id": s.agent_id,
+            "sandbox_id": s.sandbox_id,
+            "idle_seconds": round(now - (s.turn_completed_at or s.last_activity), 1),
+            "shutdown_requested": s.shutdown.is_set(),
+        }
+        for s in SESSIONS.values()
+    ]
+
+
+@app.get("/sessions/{session_id}/status")
+async def session_status(session_id: str):
+    """Get session runtime status including last activity timestamp."""
     state = SESSIONS.get(session_id)
-    if state is None or state.sandbox_id != sandbox_id:
+    if state is None:
         return JSONResponse({"error": "session not found"}, status_code=404)
+    now = time.time()
+    return {
+        "session_id": state.session_id,
+        "agent_id": state.agent_id,
+        "sandbox_id": state.sandbox_id,
+        "inner_session_id": state.inner_session_id,
+        "agent_busy": state.agent_busy,
+        "last_activity": state.last_activity,
+        "idle_seconds": round(now - (state.turn_completed_at or state.last_activity), 1),
+        "has_client": state.client is not None,
+        "shutdown_requested": state.shutdown.is_set(),
+        "pending_errors": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Session log read endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/sessions/{session_id}/log")
+async def get_session_log_route(session_id: str, limit: int = Query(default=500)):
+    entries = await get_session_log(session_id, limit=limit)
+    return [{"id": e.id, "event_type": e.event_type, "payload": e.payload,
+             "created_at": e.created_at} for e in entries]
+
+
+@app.get("/agents/{agent_id}/log")
+async def get_agent_log_route(agent_id: str, limit: int = Query(default=100)):
+    entries = await get_agent_log(agent_id, limit=limit)
+    return [{"id": e.id, "session_id": e.session_id, "sandbox_id": e.sandbox_id,
+             "event_type": e.event_type, "payload": e.payload,
+             "created_at": e.created_at} for e in entries]
+
+
+# ---------------------------------------------------------------------------
+# Session endpoints (new — keyed by session_id, use get_or_recover_session)
+# ---------------------------------------------------------------------------
+
+@app.post("/sessions/{session_id}/resume")
+async def session_resume(session_id: str):
+    """Resume a session by ID. Auto-recovers sandbox if stopped."""
+    try:
+        state = await get_or_recover_session(session_id)
+    except HTTPException as e:
+        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    return {
+        "session_id": state.session_id,
+        "agent_id": state.agent_id,
+        "sandbox_id": state.sandbox_id,
+        "inner_session_id": state.inner_session_id,
+        "status": "resumed",
+    }
+
+
+@app.post("/sessions/quick")
+async def sessions_quick_create(request: Request):
+    """Create agent + provision sandbox + connect in one call.
+
+    Returns {agent_id, sandbox_id, session_id, connected: true}.
+    """
+    data = await request.json()
+    provider = data.get("provider", "local")
+    agent_type = data.get("agent_type", "claude")
+    name = data.get("name")
+    config_data = data.get("config", {})
+    _merge_top_level_config(data, config_data)
+    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
+    dockerfile = _materialize_dockerfile(config_data)
+
+    agent_id = str(uuid.uuid4())
+    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type, "cwd": cwd})
+    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
+
+    sandbox_id = str(uuid.uuid4())
+    try:
+        instance = await create_instance(provider, agent_type, dockerfile=dockerfile)
+    except Exception as e:
+        await delete_agent(agent_id)
+        return JSONResponse({"error": f"Provider '{provider}' failed: {e}"}, status_code=502)
+
+    sandbox_ref = _derive_sandbox_ref(instance, provider, sandbox_id)
+
+    _INSTANCES[sandbox_id] = instance
+    await upsert_sandbox(SandboxRecord(id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status=STATUS_RUNNING))
+
+    url = instance.url
+    acp_session_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+
+    client = SandboxAgentClient(url)
+    try:
+        await _apply_config_and_initialize(client, config, acp_session_id, cwd)
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        await delete_agent(agent_id)
+        await delete_sandbox(sandbox_id)
+        _INSTANCES.pop(sandbox_id, None)
+        try:
+            await destroy_instance(instance)
+        except Exception as de:
+            log.warning("sessions_quick_create cleanup: destroy_instance failed: %s", de)
+        return JSONResponse({"error": f"Failed to connect to sandbox-agent: {e}"}, status_code=502)
+
+    inner_session_id = client.get_inner_session_id(acp_session_id)
+    state = SessionState(
+        session_id=session_id,
+        agent_id=agent_id,
+        sandbox_id=sandbox_id,
+        acp_session_id=acp_session_id,
+        inner_session_id=inner_session_id,
+        client=client,
+    )
+    SESSIONS[session_id] = state
+    _start_sse_reader(state)
+    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
+
+    return {
+        "agent_id": agent_id,
+        "sandbox_id": sandbox_id,
+        "session_id": session_id,
+        "inner_session_id": inner_session_id,
+        "connected": True,
+    }
+
+
+@app.post("/sessions/{session_id}/message")
+async def post_session_message(session_id: str, request: Request):
+    """Send a prompt to a session. Recovers reaped sessions automatically."""
+    data = await request.json()
+    message = data.get("message")
+    if not message:
+        return JSONResponse({"error": "message required"}, status_code=400)
+
+    try:
+        state = await get_or_recover_session(session_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
     if not state.client or not state.acp_session_id:
         return JSONResponse({"error": "session not connected"}, status_code=409)
@@ -1057,23 +1647,18 @@ async def post_sandbox_message(sandbox_id: str, request: Request):
         return JSONResponse({"error": "agent is busy processing a previous message"}, status_code=409)
 
     state.last_activity = time.time()
-    run_id = str(uuid.uuid4())
     rpc_id = str(uuid.uuid4())
 
     await log_event(
-        session_id=session_id, agent_id=state.agent_id, sandbox_id=sandbox_id,
-        event_type="user_message", payload={"text": message},
+        session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
+        event_type=EVT_USER_MESSAGE, payload={"text": message},
     )
 
     async def _run_prompt():
         try:
             await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
-            # Prompt accepted — safe to buffer events for the new turn now.
             state.resume_buffering()
         except Exception as e:
-            # Resume buffering even on failure so that any events the SSE
-            # reader delivers (e.g. an error chunk) are forwarded correctly,
-            # and so future turns are not permanently paused.
             state.resume_buffering()
             log.error("prompt failed for session %s: %s", session_id, e)
             state.errors.append(str(e))
@@ -1086,28 +1671,25 @@ async def post_sandbox_message(sandbox_id: str, request: Request):
                 state.broadcast(f"data: {error_payload}\n\n")
             await log_event(
                 session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
-                event_type="error", payload={"message": str(e)[:500]},
+                event_type=EVT_ERROR, payload={"message": str(e)[:500]},
             )
         finally:
-            # Always clear busy — don't rely solely on the SSE reader seeing
-            # the stopReason, because the reader may be dead (sandbox restart,
-            # network hiccup).  Setting False is idempotent if the reader
-            # already cleared it.
             state.agent_busy = False
             state.turn_completed_at = time.time()
 
-    state.new_turn()        # clear stale replay buffer before new turn
+    state.new_turn()
     state.agent_busy = True
     asyncio.create_task(_run_prompt())
-    return JSONResponse({"run_id": run_id, "rpc_id": rpc_id, "status": "ok"})
+    return JSONResponse({"rpc_id": rpc_id, "status": "ok"})
 
 
-@app.get("/sandboxes/{sandbox_id}/events")
-async def sandbox_events(sandbox_id: str, session_id: str = Query(...)):
-    """SSE proxy with session_id query param."""
-    state = SESSIONS.get(session_id)
-    if state is None or state.sandbox_id != sandbox_id:
-        return JSONResponse({"error": "session not found"}, status_code=404)
+@app.get("/sessions/{session_id}/events")
+async def session_events(session_id: str):
+    """SSE stream for a session. Recovers reaped sessions automatically."""
+    try:
+        state = await get_or_recover_session(session_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
     if not state.client or not state.acp_session_id:
         return JSONResponse({"error": "session not connected"}, status_code=409)
@@ -1172,316 +1754,41 @@ async def sandbox_events(sandbox_id: str, session_id: str = Query(...)):
     )
 
 
-# ---------------------------------------------------------------------------
-# Sandbox filesystem / exec / config proxy endpoints
-# ---------------------------------------------------------------------------
-
-def _get_session_state(sandbox_id: str, session_id: str) -> SessionState | None:
-    state = SESSIONS.get(session_id)
-    if state and state.sandbox_id == sandbox_id and state.client:
-        return state
-    return None
-
-
-def _get_any_session_for_sandbox(sandbox_id: str) -> SessionState | None:
-    for state in SESSIONS.values():
-        if state.sandbox_id == sandbox_id and state.client:
-            return state
-    return None
-
-
-def _require_sandbox_state(
-    sandbox_id: str,
-    session_id: str | None = Query(default=None),
-) -> SessionState:
-    """FastAPI dependency: resolve and validate sandbox session state."""
-    state = (_get_session_state(sandbox_id, session_id) if session_id
-             else _get_any_session_for_sandbox(sandbox_id))
-    if not state:
-        raise HTTPException(status_code=404, detail={"error": "sandbox not connected"})
-    return state
-
-
-@app.get("/sandboxes/{sandbox_id}/fs")
-async def sandbox_list_dir(path: str = "/", state: SessionState = Depends(_require_sandbox_state)):
+@app.post("/sessions/{session_id}/cancel")
+async def session_cancel(session_id: str):
+    """Cancel the currently running prompt for a session."""
     try:
-        return await state.client.list_dir(path)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
+        state = await get_or_recover_session(session_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
-
-@app.get("/sandboxes/{sandbox_id}/fs/file")
-async def sandbox_read_file(path: str, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        content = await state.client.read_file(path)
-        return PlainTextResponse(content)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.put("/sandboxes/{sandbox_id}/fs/file")
-async def sandbox_write_file(path: str, request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        body = await request.body()
-        await state.client.write_file(path, body.decode("utf-8", errors="replace"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/exec")
-async def sandbox_run_command(request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        data = await request.json()
-    except Exception as e:
-        return JSONResponse({"error": f"Invalid JSON body: {e}"}, status_code=400)
-    command = data.get("command")
-    if not command:
-        return JSONResponse({"error": "Missing required field: command"}, status_code=400)
-    try:
-        result = await state.client.run_command(command, args=data.get("args"), cwd=data.get("cwd"))
-        return result
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/processes")
-async def sandbox_start_process(request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        data = await request.json()
-    except Exception as e:
-        return JSONResponse({"error": f"Invalid JSON body: {e}"}, status_code=400)
-    command = data.get("command")
-    if not command:
-        return JSONResponse({"error": "Missing required field: command"}, status_code=400)
-    try:
-        result = await state.client.start_process(command, args=data.get("args"), cwd=data.get("cwd"))
-        return result
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/processes")
-async def sandbox_list_processes(state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        return await state.client.list_processes()
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/processes/{process_id}/stop")
-async def sandbox_stop_process(process_id: str, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        await state.client.stop_process(process_id)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/processes/{process_id}/logs")
-async def sandbox_process_logs(process_id: str, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        logs = await state.client.get_process_logs(process_id)
-        return PlainTextResponse(logs)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/screenshot")
-async def sandbox_screenshot(state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        png_bytes = await state.client.screenshot()
-        from fastapi.responses import Response
-        return Response(content=png_bytes, media_type="image/png")
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/click")
-async def sandbox_mouse_click(request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        data = await request.json()
-        await state.client.mouse_click(data.get("x", 0), data.get("y", 0), data.get("button", "left"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/type")
-async def sandbox_keyboard_type(request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        data = await request.json()
-        await state.client.keyboard_type(data.get("text", ""))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/press")
-async def sandbox_keyboard_press(request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        data = await request.json()
-        await state.client.keyboard_press(data.get("key", ""))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/fs/upload")
-async def sandbox_upload_files(request: Request, path: str = "/", state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        body = await request.body()
-        await state.client.upload_files_raw(path, body)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.delete("/sandboxes/{sandbox_id}/fs/file")
-async def sandbox_delete_path(path: str, recursive: bool = False, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        await state.client.delete_path(path, recursive=recursive)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/fs/mkdir")
-async def sandbox_mkdir(path: str, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        await state.client.mkdir(path)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/fs/move")
-async def sandbox_move_file(request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        data = await request.json()
-        src = data.get("source")
-        dst = data.get("destination")
-        if not src or not dst:
-            return JSONResponse({"error": "source and destination required"}, status_code=400)
-        await state.client.move_file(src, dst)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/fs/stat")
-async def sandbox_stat(path: str, state: SessionState = Depends(_require_sandbox_state)):
-    try:
-        return await state.client.stat(path)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/cancel")
-async def sandbox_cancel_prompt(state: SessionState = Depends(_require_sandbox_state)):
-    """Cancel the currently running prompt (best-effort)."""
-    acp_id = state.acp_session_id
-    if not acp_id:
+    if not state.acp_session_id:
         return JSONResponse({"error": "no active session"}, status_code=409)
-    await state.client.cancel_prompt(acp_id)
+    await state.client.cancel_prompt(state.acp_session_id)
     return {"status": "ok"}
 
 
-@app.post("/sandboxes/{sandbox_id}/config")
-async def sandbox_set_config(request: Request, state: SessionState = Depends(_require_sandbox_state)):
-    """Set session config: mode, model, or thought_level."""
-    acp_id = state.acp_session_id
-    if not acp_id:
+@app.post("/sessions/{session_id}/config")
+async def session_set_config(session_id: str, request: Request):
+    """Set mode/model/thought_level for a session."""
+    try:
+        state = await get_or_recover_session(session_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+    if not state.acp_session_id:
         return JSONResponse({"error": "no active session"}, status_code=409)
     try:
         data = await request.json()
         if "mode" in data:
-            await state.client.set_mode(acp_id, data["mode"])
+            await state.client.set_mode(state.acp_session_id, data["mode"])
         if "model" in data:
-            await state.client.set_model(acp_id, data["model"])
+            await state.client.set_model(state.acp_session_id, data["model"])
         if "thought_level" in data:
-            await state.client.set_thought_level(acp_id, data["thought_level"])
+            await state.client.set_thought_level(state.acp_session_id, data["thought_level"])
         return {"status": "ok"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/health")
-async def sandbox_health(state: SessionState = Depends(_require_sandbox_state)):
-    """Check if the sandbox-agent process is alive."""
-    try:
-        result = await state.client.health()
-        return result
-    except Exception as e:
-        return JSONResponse({"error": str(e), "healthy": False}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/agents")
-async def sandbox_list_agents(state: SessionState = Depends(_require_sandbox_state)):
-    """List agents available in the sandbox."""
-    try:
-        agents = await state.client.list_agents()
-        return [{"id": a.id, "installed": a.installed,
-                 "credentials_available": a.credentials_available,
-                 "capabilities": a.capabilities} for a in agents]
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sessions")
-async def list_sessions_route():
-    """List all active in-memory sessions with status."""
-    now = time.time()
-    return [
-        {
-            "session_id": s.session_id,
-            "agent_id": s.agent_id,
-            "sandbox_id": s.sandbox_id,
-            "idle_seconds": round(now - (s.turn_completed_at or s.last_activity), 1),
-            "shutdown_requested": s.shutdown.is_set(),
-        }
-        for s in SESSIONS.values()
-    ]
-
-
-@app.get("/sessions/{session_id}/status")
-async def session_status(session_id: str):
-    """Get session runtime status including last activity timestamp."""
-    state = SESSIONS.get(session_id)
-    if state is None:
-        return JSONResponse({"error": "session not found"}, status_code=404)
-    now = time.time()
-    return {
-        "session_id": state.session_id,
-        "agent_id": state.agent_id,
-        "sandbox_id": state.sandbox_id,
-        "inner_session_id": state.inner_session_id,
-        "agent_busy": state.agent_busy,
-        "last_activity": state.last_activity,
-        "idle_seconds": round(now - (state.turn_completed_at or state.last_activity), 1),
-        "has_client": state.client is not None,
-        "shutdown_requested": state.shutdown.is_set(),
-        "pending_errors": 0,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Session log read endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/sessions/{session_id}/log")
-async def get_session_log_route(session_id: str, limit: int = Query(default=500)):
-    entries = await get_session_log(session_id, limit=limit)
-    return [{"id": e.id, "event_type": e.event_type, "payload": e.payload,
-             "created_at": e.created_at} for e in entries]
-
-
-@app.get("/agents/{agent_id}/log")
-async def get_agent_log_route(agent_id: str, limit: int = Query(default=100)):
-    entries = await get_agent_log(agent_id, limit=limit)
-    return [{"id": e.id, "session_id": e.session_id, "sandbox_id": e.sandbox_id,
-             "event_type": e.event_type, "payload": e.payload,
-             "created_at": e.created_at} for e in entries]
 
 
 # ---------------------------------------------------------------------------
@@ -1490,37 +1797,41 @@ async def get_agent_log_route(agent_id: str, limit: int = Query(default=100)):
 
 @app.get("/chat")
 async def chat_ui():
-    html_path = Path(__file__).parent.parent.parent / "ui" / "chat.html"
-    return HTMLResponse(html_path.read_text())
+    global _CHAT_HTML
+    if _CHAT_HTML is None:
+        _CHAT_HTML = (_UI_DIR / "chat.html").read_text()
+    return HTMLResponse(_CHAT_HTML)
 
 
 @app.get("/kanban")
 async def kanban_ui():
-    html_path = Path(__file__).parent.parent.parent / "ui" / "kanban.html"
-    return HTMLResponse(html_path.read_text())
+    global _KANBAN_HTML
+    if _KANBAN_HTML is None:
+        _KANBAN_HTML = (_UI_DIR / "kanban.html").read_text()
+    return HTMLResponse(_KANBAN_HTML)
+
+
+async def _run_hive_command(*args: str, task: str) -> JSONResponse:
+    """Run a hive CLI command and return JSON response."""
+    env = {**os.environ, "HIVE_TASK": task}
+    proc = await asyncio.create_subprocess_exec(
+        "hive", *args, "--json",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return JSONResponse({"error": stderr.decode().strip()}, status_code=502)
+    try:
+        return JSONResponse(json.loads(stdout.decode()))
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "Invalid JSON from hive CLI", "raw": stdout.decode()[:500]}, status_code=502)
 
 
 @app.get("/hive/items")
 async def hive_items(task: str = "hello-world"):
-    env = {**os.environ, "HIVE_TASK": task}
-    proc = await asyncio.create_subprocess_exec(
-        "hive", "item", "list", "--json",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        return JSONResponse({"error": stderr.decode().strip()}, status_code=502)
-    return JSONResponse(json.loads(stdout.decode()))
+    return await _run_hive_command("item", "list", task=task)
 
 
 @app.get("/hive/items/{item_id}")
 async def hive_item_detail(item_id: str, task: str = "hello-world"):
-    env = {**os.environ, "HIVE_TASK": task}
-    proc = await asyncio.create_subprocess_exec(
-        "hive", "item", "view", item_id, "--json",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        return JSONResponse({"error": stderr.decode().strip()}, status_code=502)
-    return JSONResponse(json.loads(stdout.decode()))
+    return await _run_hive_command("item", "view", item_id, task=task)

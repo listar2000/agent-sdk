@@ -5,23 +5,14 @@ Wraps the sandbox-agent REST+SSE API for communicating with agent processes
 """
 
 import asyncio
-import json
 import logging
 import os
 import shlex
 import uuid
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Any
+from typing import Any
 
 import httpx
-
-from . import build_tar_archive
-from .sse import (
-    iter_sse_blocks, parse_sse_data, parse_acp_payload,
-    UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK, UT_MESSAGE_CREATED,
-    UT_TOOL_STARTED, UT_TOOL_COMPLETED, UT_USAGE_UPDATED, UT_USAGE_UPDATE,
-    UT_COMMANDS_UPDATE,
-)
 
 log = logging.getLogger(__name__)
 
@@ -70,15 +61,15 @@ class PromptResponse:
     usage: dict = field(default_factory=dict)
 
 
-@dataclass
-class SessionEvent:
-    """A parsed SSE event from the sandbox-agent."""
-    event_type: str          # "message_created", "message_delta", "tool_started", "tool_completed", "usage", "result", "error"
-    text: str | None = None  # for message_delta
-    tool_name: str | None = None  # for tool_started
-    tool_args: dict | None = None
-    usage: dict | None = None  # for usage events
-    raw: dict = field(default_factory=dict)  # full parsed payload
+def _build_exec_body(command: str, args: list[str] | None, cwd: str | None) -> dict:
+    """Build request body for process execution, auto-splitting command if no args given."""
+    if args is None:
+        parts = shlex.split(command)
+        command, args = parts[0], parts[1:]
+    body: dict = {"command": command, "args": args}
+    if cwd:
+        body["cwd"] = cwd
+    return body
 
 
 class SandboxAgentClient:
@@ -91,6 +82,8 @@ class SandboxAgentClient:
             timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
         )
         self._inner_session_ids: dict[str, str] = {}  # session_id -> agent's internal session ID
+        self._agent_capabilities: dict[str, set[str]] = {}  # agent_type -> capability set
+        self._set_mode_method: str | None = None
 
     def get_inner_session_id(self, session_id: str) -> str | None:
         return self._inner_session_ids.get(session_id)
@@ -129,6 +122,22 @@ class SandboxAgentClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_capabilities(self, agent_type: str) -> set[str]:
+        """Get cached capabilities for an agent type."""
+        if agent_type not in self._agent_capabilities:
+            try:
+                info = await self.get_agent_info(agent_type)
+                caps = info.get("capabilities", {})
+                self._agent_capabilities[agent_type] = {k for k, v in caps.items() if v}
+            except Exception:
+                self._agent_capabilities[agent_type] = set()
+        return self._agent_capabilities[agent_type]
+
+    async def has_capability(self, agent_type: str, capability: str) -> bool:
+        """Check if an agent type supports a specific capability."""
+        caps = await self.get_capabilities(agent_type)
+        return capability in caps
+
     async def _send_rpc(self, session_id: str, method: str, params: dict,
                          agent: str | None = None, rpc_id: str | None = None) -> dict:
         """Send a JSON-RPC 2.0 request to /v1/acp/{session_id}."""
@@ -150,34 +159,19 @@ class SandboxAgentClient:
             raise RuntimeError(f"ACP error [{data['error'].get('code')}]: {data['error'].get('message')}")
         return data.get("result", {})
 
-    async def resume(self, session_id: str, agent: str, inner_session_id: str, cwd: str = "/tmp") -> dict:
-        """Resume an existing ACP session with a known inner session ID.
-
-        Verifies the inner session still exists on the remote before claiming success.
-        Raises RuntimeError if the session is gone.
-        """
-        result = await self._send_rpc(session_id, "initialize",
-                                       {"protocolVersion": 1}, agent=agent)
-        # Verify the session still exists on the remote
-        try:
-            sessions = await self.list_sessions(session_id)
-            valid_ids = {s.get("sessionId") for s in sessions}
-            if inner_session_id not in valid_ids:
-                raise RuntimeError(f"Session {inner_session_id} no longer exists on remote")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"Failed to verify session: {e}") from e
-
-        self._inner_session_ids[session_id] = inner_session_id
-        await self.set_mode(session_id, "bypassPermissions")
-        return result
-
     async def initialize(self, session_id: str, agent: str, cwd: str = "/tmp",
                          mcp_servers: dict | None = None) -> dict:
         """Initialize ACP connection and create a fresh agent session."""
         result = await self._send_rpc(session_id, "initialize",
                                        {"protocolVersion": 1}, agent=agent)
+        # Auto-install agent if not pre-installed
+        try:
+            info = await self.get_agent_info(agent)
+            if not info.get("installed", True):
+                log.info("auto-installing agent %s", agent)
+                await self.install_agent(agent)
+        except Exception as e:
+            log.warning("agent install check failed for %s: %s", agent, e)
         # Create a fresh inner session and set bypassPermissions for headless execution
         try:
             # Convert mcp_servers dict to ACP array format:
@@ -189,7 +183,8 @@ class SandboxAgentClient:
             log.info("session/new result for %s: sessionId=%s keys=%s", session_id, inner_sid, list(new_result.keys()))
             if inner_sid:
                 self._inner_session_ids[session_id] = inner_sid
-                await self.set_mode(session_id, "bypassPermissions")
+                if await self.has_capability(agent, "permissions"):
+                    await self.set_mode(session_id, "bypassPermissions")
         except Exception as e:
             log.warning("session/new failed for %s, trying session/list: %s", session_id, e)
             try:
@@ -260,10 +255,18 @@ class SandboxAgentClient:
         inner_sid = self.get_inner_session_id(session_id)
         if not inner_sid:
             return
+        if self._set_mode_method:
+            try:
+                await self._send_rpc(session_id, self._set_mode_method,
+                                     {"sessionId": inner_sid, "modeId": mode})
+                return
+            except Exception:
+                self._set_mode_method = None  # reset cache on failure
         for method in ("session/set_mode", "session/setMode"):
             try:
                 await self._send_rpc(session_id, method,
                                      {"sessionId": inner_sid, "modeId": mode})
+                self._set_mode_method = method
                 return
             except Exception:
                 continue
@@ -283,72 +286,6 @@ class SandboxAgentClient:
             return
         await self._send_rpc(session_id, "session/set_config_option",
                              {"sessionId": inner_sid, "key": "thinking", "value": level})
-
-    async def stream_events(self, session_id: str) -> AsyncIterator[SessionEvent]:
-        """Stream SSE events from the agent. Connect this BEFORE calling prompt()."""
-        async with self._client.stream("GET", f"/v1/acp/{session_id}",
-                                        headers={"Accept": "text/event-stream"},
-                                        timeout=None) as resp:
-            async for block in iter_sse_blocks(resp):
-                event = self._parse_sse_block(block)
-                if event:
-                    yield event
-
-    def _parse_sse_block(self, block: str) -> SessionEvent | None:
-        """Parse an SSE block into a SessionEvent."""
-        payload = parse_sse_data(block)
-        if payload is None:
-            return None
-
-        # JSON-RPC response (result of a method call)
-        if "id" in payload and "result" in payload:
-            return SessionEvent(event_type="result", raw=payload)
-        if "id" in payload and "error" in payload:
-            error = payload["error"]
-            return SessionEvent(
-                event_type="error",
-                text=error.get("message", "Unknown error"),
-                raw=payload,
-            )
-
-        # JSON-RPC notification (session/update events)
-        kind, data = parse_acp_payload(payload, None)
-        if kind != "update":
-            method = payload.get("method", "")
-            return SessionEvent(event_type=method or "unknown", raw=payload)
-
-        update = data or {}
-        session_update = update.get("sessionUpdate", "")
-
-        if session_update == UT_MESSAGE_CREATED:
-            return SessionEvent(event_type="message_created", raw=payload)
-
-        if session_update in (UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK):
-            text = update.get("content", {}).get("text")
-            return SessionEvent(event_type="message_delta", text=text, raw=payload)
-
-        if session_update == UT_TOOL_STARTED:
-            meta = update.get("_meta", {}).get("claudeCode", {})
-            return SessionEvent(
-                event_type="tool_started",
-                tool_name=meta.get("toolName"),
-                raw=payload,
-            )
-
-        if session_update == UT_TOOL_COMPLETED:
-            return SessionEvent(event_type="tool_completed", raw=payload)
-
-        if session_update in (UT_USAGE_UPDATED, UT_USAGE_UPDATE):
-            return SessionEvent(
-                event_type="usage",
-                usage=update.get("cost"),
-                raw=payload,
-            )
-
-        if session_update == UT_COMMANDS_UPDATE:
-            return SessionEvent(event_type="commands_update", raw=payload)
-
-        return SessionEvent(event_type=session_update or "unknown", raw=payload)
 
     async def configure_mcp(self, name: str, config: dict, directory: str = "/") -> None:
         """Register an MCP server with the sandbox-agent.
@@ -446,12 +383,7 @@ class SandboxAgentClient:
         If *args* is None the command string is split into program + args
         automatically (shell-style splitting via shlex).
         """
-        if args is None:
-            parts = shlex.split(command)
-            command, args = parts[0], parts[1:]
-        body: dict = {"command": command, "args": args}
-        if cwd:
-            body["cwd"] = cwd
+        body = _build_exec_body(command, args, cwd)
         resp = await self._client.post("/v1/processes/run", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -461,12 +393,7 @@ class SandboxAgentClient:
     async def start_process(self, command: str, args: list[str] | None = None,
                            cwd: str | None = None) -> dict:
         """Start a persistent/long-running process. Returns {id, pid, ...}."""
-        if args is None:
-            parts = shlex.split(command)
-            command, args = parts[0], parts[1:]
-        body: dict = {"command": command, "args": args}
-        if cwd:
-            body["cwd"] = cwd
+        body = _build_exec_body(command, args, cwd)
         resp = await self._client.post("/v1/processes", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -506,6 +433,10 @@ class SandboxAgentClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def delete_process(self, process_id: str) -> None:
+        resp = await self._client.delete(f"/v1/processes/{process_id}")
+        resp.raise_for_status()
+
     # ── Extended Filesystem ──
 
     async def move_file(self, src: str, dst: str) -> None:
@@ -531,25 +462,6 @@ class SandboxAgentClient:
         resp = await self._client.get("/v1/desktop/screenshot", params=params)
         resp.raise_for_status()
         return resp.content
-
-    async def upload_files(self, files: dict[str, str | bytes], base_path: str = "/") -> None:
-        """Upload multiple files as a tar archive.
-
-        Args:
-            files: Dict of {remote_path: content} where content is str or bytes.
-                   Paths must not contain '..' traversal components.
-            base_path: Base directory on the sandbox.
-        """
-        if not files:
-            return
-        tar_data = build_tar_archive(files)
-        resp = await self._client.post(
-            "/v1/fs/upload-batch",
-            params={"path": base_path},
-            content=tar_data,
-            headers={"Content-Type": "application/gzip"},
-        )
-        resp.raise_for_status()
 
     async def upload_files_raw(self, base_path: str, tar_data: bytes) -> None:
         """Upload a tar.gz archive to the sandbox."""
@@ -604,12 +516,66 @@ class SandboxAgentClient:
                                        json={"key": key})
         resp.raise_for_status()
 
+    async def mouse_down(self, x: int, y: int, button: str = "left") -> None:
+        resp = await self._client.post("/v1/desktop/mouse/down", json={"x": x, "y": y, "button": button})
+        resp.raise_for_status()
+
+    async def mouse_up(self, x: int, y: int, button: str = "left") -> None:
+        resp = await self._client.post("/v1/desktop/mouse/up", json={"x": x, "y": y, "button": button})
+        resp.raise_for_status()
+
+    async def drag_mouse(self, start_x: int, start_y: int, end_x: int, end_y: int, button: str = "left") -> None:
+        resp = await self._client.post("/v1/desktop/mouse/drag", json={"startX": start_x, "startY": start_y, "endX": end_x, "endY": end_y, "button": button})
+        resp.raise_for_status()
+
+    async def scroll_mouse(self, x: int, y: int, scroll_x: int = 0, scroll_y: int = 0) -> None:
+        resp = await self._client.post("/v1/desktop/mouse/scroll", json={"x": x, "y": y, "scrollX": scroll_x, "scrollY": scroll_y})
+        resp.raise_for_status()
+
+    async def key_down(self, key: str) -> None:
+        resp = await self._client.post("/v1/desktop/keyboard/down", json={"key": key})
+        resp.raise_for_status()
+
+    async def key_up(self, key: str) -> None:
+        resp = await self._client.post("/v1/desktop/keyboard/up", json={"key": key})
+        resp.raise_for_status()
+
     async def list_windows(self) -> list[dict]:
         """List open desktop windows."""
         resp = await self._client.get("/v1/desktop/windows")
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else data.get("windows", [])
+
+    async def focus_window(self, window_id: str) -> None:
+        resp = await self._client.post(f"/v1/desktop/windows/{window_id}/focus")
+        resp.raise_for_status()
+
+    async def get_display_info(self) -> dict:
+        resp = await self._client.get("/v1/desktop/display/info")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def launch_app(self, app_name: str) -> dict:
+        resp = await self._client.post("/v1/desktop/launch", json={"appName": app_name})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def start_recording(self) -> dict:
+        resp = await self._client.post("/v1/desktop/recordings/start")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def stop_recording(self) -> dict:
+        resp = await self._client.post("/v1/desktop/recordings/stop")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def list_recordings(self) -> list[dict]:
+        resp = await self._client.get("/v1/desktop/recordings")
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else data.get("recordings", [])
 
     async def clipboard_read(self) -> str:
         """Read clipboard content."""
@@ -625,9 +591,3 @@ class SandboxAgentClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        await self.aclose()

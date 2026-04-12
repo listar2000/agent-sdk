@@ -30,6 +30,20 @@ class AgentConfig:
 
 _AGENT_CONFIG_FIELDS = frozenset(AgentConfig.__dataclass_fields__)
 
+# ── Session event type constants ──
+EVT_USER_MESSAGE = "user_message"
+EVT_ASSISTANT_MESSAGE = "assistant_message"
+EVT_TOOL_CALL = "tool_call"
+EVT_TOOL_RESULT = "tool_result"
+EVT_USAGE = "usage"
+EVT_ERROR = "error"
+
+# ── Sandbox status constants ──
+STATUS_RUNNING = "running"
+STATUS_STOPPED = "stopped"
+STATUS_ERROR = "error"
+STATUS_CREATING = "creating"
+
 
 @dataclass
 class AgentRecord:
@@ -75,7 +89,7 @@ class SessionState:
     _replay_buffer: deque = field(default_factory=lambda: deque(maxlen=5000), repr=False)
     _turn_gen: int = field(default=0, repr=False)  # incremented by new_turn(); tags buffered events
     _buffering_paused: bool = field(default=False, repr=False)  # True between new_turn() and resume_buffering()
-    errors: list = field(default_factory=list, repr=False)
+    errors: deque = field(default_factory=lambda: deque(maxlen=100), repr=False)
 
     def new_turn(self) -> None:
         """Mark the start of a new agent turn.
@@ -104,16 +118,21 @@ class SessionState:
         self._buffering_paused = False
 
     def subscribe(self) -> "asyncio.Queue":
-        """Register a new subscriber queue. Replays buffered events from the current turn."""
+        """Register a new subscriber queue. Replays buffered events from an in-progress turn only.
+
+        If no turn is in progress (agent not busy), no replay happens —
+        prevents old events from bleeding into the next turn.
+        """
         q: asyncio.Queue = asyncio.Queue(maxsize=10000)
-        current_gen = self._turn_gen
-        for gen, item in self._replay_buffer:
-            if gen != current_gen:
-                continue
-            try:
-                q.put_nowait(item)
-            except asyncio.QueueFull:
-                break
+        if self.agent_busy:
+            current_gen = self._turn_gen
+            for gen, item in self._replay_buffer:
+                if gen != current_gen:
+                    continue
+                try:
+                    q.put_nowait(item)
+                except asyncio.QueueFull:
+                    break
         self._subscribers.append(q)
         return q
 

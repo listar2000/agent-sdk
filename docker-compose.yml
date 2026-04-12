@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agent_sdk_server
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: .
+    ports:
+      - "7778:7778"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/agent_sdk_server
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
+      SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-300}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

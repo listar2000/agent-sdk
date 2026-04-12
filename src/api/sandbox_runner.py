@@ -15,7 +15,6 @@ Usage:
 import asyncio
 import json
 import sys
-import os
 
 
 async def run_query(message: str, options: dict) -> dict:
