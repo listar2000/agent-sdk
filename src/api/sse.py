@@ -117,6 +117,30 @@ def extract_tool_call_id(update: dict) -> str | None:
     return None
 
 
+def classify_message_content(content: object) -> tuple[str, str] | None:
+    """Classify a session/update content block.
+
+    Returns ``("text", value)``, ``("reasoning", value)``, or ``None``.
+    Handles both delta-style (``content.thinking``) and block-style
+    (``content.type == "thinking"``) reasoning emitted by claude-code.
+    Reasoning takes precedence over plain text.
+    """
+    if not isinstance(content, dict):
+        return None
+    thinking = content.get("thinking")
+    if isinstance(thinking, str) and thinking:
+        return "reasoning", thinking
+    text = content.get("text")
+    if not text:
+        return None
+    ctype = content.get("type")
+    if ctype == "thinking":
+        return "reasoning", text
+    if ctype is None or ctype == "text":
+        return "text", text
+    return None
+
+
 def extract_tool_response(update: dict) -> object | None:
     """Best-effort tool result/output extraction across adapters.
 
@@ -184,55 +208,16 @@ def extract_tool_name(update: dict) -> str:
     return "unknown"
 
 
-def parse_acp_text(block: str, rpc_id: str | None = None) -> dict | None:
-    """Parse an SSE block containing ACP JSON-RPC.
-
-    Returns {"type": "text"|"tool"|"done"|"error", "text": ...} or None.
-    """
-    payload = parse_sse_data(block)
-    if payload is None:
-        return None
-
-    kind, data = parse_acp_payload(payload, rpc_id)
-
-    if kind == "done_result":
-        return {"type": "done", "text": ""}
-    if kind == "error":
-        err_data = data.get("data") or {}
-        return {
-            "type": "error",
-            "text": data.get("message", "Unknown error"),
-            "kind": err_data.get("kind") if isinstance(err_data, dict) else None,
-            "data": err_data if isinstance(err_data, dict) else {},
-        }
-    if kind == "skip" or data is None:
-        return None
-
-    # kind == "update"
-    ut = data.get("sessionUpdate", "")
-
-    if ut in (UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK):
-        text = data.get("content", {}).get("text", "")
-        if text:
-            return {"type": "text", "text": text}
-
-    if ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
-        tool_name = extract_tool_name(data)
-        return {"type": "tool", "text": f"\n[tool: {tool_name}]\n"}
-
-    return None
-
-
 def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     """Parse an SSE block into a structured event dict for astream_events().
 
-    Returns richer event dicts than parse_acp_text:
-    - text:  {"type": "text", "text": "..."}
-    - tool:  {"type": "tool", "tool_name": "...", "args": ..., "raw": {...}}
-    - tool_result: {"type": "tool_result", "tool_name": "...", "result": ..., "raw": {...}}
-    - done:  {"type": "done", "stop_reason": "..."}
-    - error: {"type": "error", "text": "..."}
-    - usage: {"type": "usage", "usage": {...}}
+    - text:        {"type": "text", "text": "..."}
+    - reasoning:   {"type": "reasoning", "text": "..."}
+    - tool:        {"type": "tool", "tool_name": "...", "tool_call_id": "...", "args": ..., "raw": {...}}
+    - tool_result: {"type": "tool_result", "tool_name": "...", "tool_call_id": "...", "result": ..., "raw": {...}}
+    - done:        {"type": "done", "stop_reason": "..."}
+    - error:       {"type": "error", "text": "...", "kind": "...", "data": {...}}
+    - usage:       {"type": "usage", "usage": {...}}
     """
     payload = parse_sse_data(block)
     if payload is None:
@@ -257,9 +242,9 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     ut = data.get("sessionUpdate", "")
 
     if ut in (UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK):
-        text = data.get("content", {}).get("text", "")
-        if text:
-            return {"type": "text", "text": text}
+        classified = classify_message_content(data.get("content"))
+        if classified is not None:
+            return {"type": classified[0], "text": classified[1]}
 
     if ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
         return {

@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 
-from api.sse import iter_sse_blocks, parse_acp_text, parse_acp_event
+from api.sse import iter_sse_blocks, parse_acp_event
 from agent_sdk.errors import (
     AgentConnectionError, AgentNotRegisteredError, AgentBusyError,
     AgentTimeoutError, StreamError, PromptError,
@@ -312,24 +312,45 @@ class Agent:
             await sse_client.aclose()
 
     async def astream(self, message: str) -> AsyncIterator[str]:
-        """Send a message and yield text/tool chunks as they stream in."""
+        """Flatten astream_events into a printable text+tool-marker stream."""
+        async for ev in self.astream_events(message):
+            if ev["type"] == "text":
+                yield ev["text"]
+            elif ev["type"] == "tool":
+                yield f"\n[tool: {ev['tool_name']}]\n"
+
+    async def astream_events(self, message: str) -> AsyncIterator[dict]:
+        """Send a message and yield structured events as they stream in.
+
+        Yields dicts with these shapes:
+
+          ``{"type": "text", "text": "..."}``
+          ``{"type": "reasoning", "text": "..."}``
+          ``{"type": "tool", "tool_name", "tool_call_id", "args", "raw"}``
+          ``{"type": "tool_result", "tool_name", "tool_call_id", "result", "raw"}``
+          ``{"type": "usage", "usage": {...}}``
+          ``{"type": "done", "stop_reason": "..."}``  (terminal)
+
+        Raises ``PromptError`` on a server error frame, ``StreamError`` on
+        connection loss.
+        """
         await self._ensure_registered()
         async with self._sse_stream(message) as (blocks, rpc_id):
             try:
                 async for block in blocks:
-                    event = parse_acp_text(block, rpc_id)
+                    event = parse_acp_event(block, rpc_id)
                     if event is None:
                         continue
-                    if event["type"] in ("text", "tool"):
-                        yield event["text"]
-                    elif event["type"] == "done":
+                    if event["type"] == "done":
+                        yield event
                         return
-                    elif event["type"] == "error":
+                    if event["type"] == "error":
                         raise PromptError(
                             f"[{self.name}] {event['text']}",
                             kind=event.get("kind"),
                             data=event.get("data"),
                         )
+                    yield event
                 raise StreamError(f"[{self.name}] Connection closed before response completed")
             except httpx.ReadTimeout:
                 raise StreamError(f"[{self.name}] Connection lost (no heartbeat from server)")

@@ -34,6 +34,7 @@ from .db import (
 from .sandbox_agent_client import SandboxAgentClient, _mcp_dict_to_acp_array
 from .sse import (
     parse_sse_data, iter_sse_blocks, parse_acp_payload,
+    classify_message_content,
     extract_tool_name, extract_tool_call_id, extract_tool_response,
     UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK, UT_TOOL_CALL, UT_TOOL_STARTED,
     UT_TOOL_CALL_UPDATE, UT_USAGE_UPDATED, UT_USAGE_UPDATE,
@@ -642,16 +643,9 @@ def _flush_buffered_text(state: SessionState, text_parts: list,
 
 
 def _process_sse_block(block: str, state: SessionState, text_parts: list,
-                       thinking_parts: list | None = None,
+                       thinking_parts: list,
                        *, log_events: bool = False) -> None:
-    """Parse SSE block: accumulate text/thinking, update state, optionally log to DB.
-
-    The reader calls this with log_events=True (single writer).
-    Subscribers and replayers call with log_events=False (read-only).
-    """
-    if thinking_parts is None:
-        thinking_parts = []
-
+    """Parse SSE block: accumulate text/thinking, update state, optionally log to DB."""
     # Track the SSE cursor from the single reader only — multiple
     # proxy subscribers must not write last_event_id concurrently.
     if log_events:
@@ -673,20 +667,13 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
         ut = update.get("sessionUpdate", "")
 
         if ut in (UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK):
-            content = update.get("content") or {}
-            if isinstance(content, dict):
-                # Text segment
-                text = content.get("text") or ""
-                if text and content.get("type") in (None, "text"):
-                    text_parts.append(text)
-                # Reasoning / thinking segment — claude-code emits thinking
-                # blocks either as content.thinking (delta-style) or as
-                # content.text with type == "thinking".
-                thinking = content.get("thinking")
-                if isinstance(thinking, str) and thinking:
-                    thinking_parts.append(thinking)
-                elif content.get("type") == "thinking" and text:
-                    thinking_parts.append(text)
+            classified = classify_message_content(update.get("content"))
+            if classified is not None:
+                kind, value = classified
+                if kind == "text":
+                    text_parts.append(value)
+                elif kind == "reasoning":
+                    thinking_parts.append(value)
 
         elif log_events and ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
             # Flush any accumulated text/thinking before the tool call so the

@@ -77,7 +77,6 @@ from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
 from api.sse import (
     parse_sse_data,
     parse_acp_payload,
-    parse_acp_text,
     parse_acp_event,
     iter_sse_blocks,
     UT_MESSAGE_DELTA,
@@ -479,54 +478,6 @@ class TestModelConstants:
         from api.models import STATUS_RUNNING, STATUS_STOPPED
         assert STATUS_RUNNING == "running"
         assert STATUS_STOPPED == "stopped"
-
-    def test_parse_acp_text_returns_text(self):
-        """parse_acp_text extracts text from message delta."""
-        block = _text_update_block("hello world")
-        result = parse_acp_text(block, None)
-        assert result is not None
-        assert result["type"] == "text"
-        assert result["text"] == "hello world"
-
-    def test_parse_acp_text_returns_done(self):
-        """parse_acp_text returns done event from stopReason result."""
-        block = _done_block("rpc-1")
-        result = parse_acp_text(block, "rpc-1")
-        assert result is not None
-        assert result["type"] == "done"
-
-    def test_parse_acp_text_returns_error(self):
-        """parse_acp_text returns error event from JSON-RPC error."""
-        block = _error_block("rpc-1", "something failed")
-        result = parse_acp_text(block, "rpc-1")
-        assert result is not None
-        assert result["type"] == "error"
-        assert "something failed" in result["text"]
-
-    def test_parse_acp_text_tool_call(self):
-        """parse_acp_text recognises tool_call updates."""
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {"update": {
-                "sessionUpdate": UT_TOOL_CALL,
-                "_meta": {"claudeCode": {"toolName": "Bash"}},
-            }},
-        }
-        result = parse_acp_text(_sse_block(payload), None)
-        assert result is not None
-        assert result["type"] == "tool"
-        assert "Bash" in result["text"]
-
-    def test_parse_acp_text_unknown_update_returns_none(self):
-        """parse_acp_text returns None for unknown sessionUpdate types."""
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {"update": {"sessionUpdate": "totally_unknown_type"}},
-        }
-        result = parse_acp_text(_sse_block(payload), None)
-        assert result is None
 
     def test_parse_acp_event_all_types(self):
         """parse_acp_event handles all event types correctly."""
@@ -1920,7 +1871,8 @@ class TestErrorContext:
     def test_stream_error_includes_name(self):
         from agent_sdk.client import Agent
         import inspect
-        source = inspect.getsource(Agent.astream)
+        # Error formatting lives in astream_events; astream is a thin wrapper.
+        source = inspect.getsource(Agent.astream_events)
         assert "self.name" in source
 
 
