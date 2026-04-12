@@ -11,12 +11,11 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from .models import (
     AgentConfig, AgentRecord, SandboxRecord, SessionState,
@@ -48,10 +47,6 @@ logging.basicConfig(
 )
 logging.getLogger("api").setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger(__name__)
-
-_UI_DIR = Path(__file__).parent.parent.parent / "ui"
-_CHAT_HTML: str | None = None
-_KANBAN_HTML: str | None = None
 
 # ---------------------------------------------------------------------------
 # DB + in-memory state
@@ -1800,47 +1795,3 @@ async def session_set_config(session_id: str, request: Request):
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
-# ---------------------------------------------------------------------------
-# UI + Hive proxy (unchanged)
-# ---------------------------------------------------------------------------
-
-@app.get("/chat")
-async def chat_ui():
-    global _CHAT_HTML
-    if _CHAT_HTML is None:
-        _CHAT_HTML = (_UI_DIR / "chat.html").read_text()
-    return HTMLResponse(_CHAT_HTML)
-
-
-@app.get("/kanban")
-async def kanban_ui():
-    global _KANBAN_HTML
-    if _KANBAN_HTML is None:
-        _KANBAN_HTML = (_UI_DIR / "kanban.html").read_text()
-    return HTMLResponse(_KANBAN_HTML)
-
-
-async def _run_hive_command(*args: str, task: str) -> JSONResponse:
-    """Run a hive CLI command and return JSON response."""
-    env = {**os.environ, "HIVE_TASK": task}
-    proc = await asyncio.create_subprocess_exec(
-        "hive", *args, "--json",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        return JSONResponse({"error": stderr.decode().strip()}, status_code=502)
-    try:
-        return JSONResponse(json.loads(stdout.decode()))
-    except json.JSONDecodeError:
-        return JSONResponse({"error": "Invalid JSON from hive CLI", "raw": stdout.decode()[:500]}, status_code=502)
-
-
-@app.get("/hive/items")
-async def hive_items(task: str = "hello-world"):
-    return await _run_hive_command("item", "list", task=task)
-
-
-@app.get("/hive/items/{item_id}")
-async def hive_item_detail(item_id: str, task: str = "hello-world"):
-    return await _run_hive_command("item", "view", item_id, task=task)
