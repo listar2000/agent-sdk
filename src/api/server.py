@@ -863,6 +863,15 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
                     "mcpServers": _mcp_dict_to_acp_array(agent_record.config.mcp_servers) if agent_record.config.mcp_servers else [],
                 }, rpc_id=load_rpc_id)
                 client.set_inner_session_id(acp_session_id, inner_session_id)
+                # initialize() set bypassPermissions on the fresh inner session
+                # from session/new. After session/load swaps to the persistent
+                # inner session, we need to re-apply the mode so the resumed
+                # conversation also runs in bypassPermissions.
+                try:
+                    if await client.has_capability(agent_record.config.agent_type or "claude", "permissions"):
+                        await client.set_mode(acp_session_id, "bypassPermissions")
+                except Exception as e:
+                    log.warning("_do_resume: failed to set bypassPermissions after session/load: %s", e)
             await asyncio.wait_for(_init_and_load(), timeout=120)
         except Exception as e:
             log.error("_do_resume: session/load failed for sandbox %s inner %s: %s: %s",
