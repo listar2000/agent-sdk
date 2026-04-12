@@ -66,12 +66,34 @@ Event types inside `session/update` notifications:
 
 | sessionUpdate | Payload |
 |---|---|
-| `agent_message_delta` | `{content: {text: "..."}}` |
-| `tool_call` | `{_meta: {claudeCode: {toolName: "..."}}, rawInput: {...}}` |
-| `tool_call_update` | `{_meta: {claudeCode: {toolResponse: {...}}}}` |
+| `agent_message_delta` | `{content: {text: "...", type?: "text"}}` |
+| `agent_message_delta` (thinking) | `{content: {thinking: "...", type: "thinking"}}` |
+| `tool_call` | `{_meta: {claudeCode: {toolName, toolUseId}}, rawInput: {...}}` |
+| `tool_call_update` | `{_meta: {claudeCode: {toolResponse\|toolResult, toolName, toolUseId}}}` |
 | `usage_updated` | `{cost: {amount, currency}}` |
 
-Prompt done: `{"jsonrpc": "2.0", "id": "<rpc_id>", "result": {"stopReason": "end_turn"}}`
+Prompt done:
+```json
+{"jsonrpc": "2.0", "id": "<rpc_id>", "result": {"stopReason": "end_turn"}}
+```
+
+Prompt error:
+```json
+{
+  "jsonrpc": "2.0", "id": "<rpc_id>",
+  "error": {
+    "code": -32000,
+    "message": "<human-readable summary>",
+    "data": {
+      "kind": "sandbox_process_died | sandbox_internal_error | http_error | sandbox_unreachable | timeout | unknown",
+      "exception_type": "HTTPStatusError",
+      "http_status": 500,
+      "upstream_body": "...",
+      "rpc_id": "<rpc_id>"
+    }
+  }
+}
+```
 
 Heartbeats (`: heartbeat\n\n`) are sent every 30s to keep the connection alive during long-running prompts.
 
@@ -114,8 +136,26 @@ POST /sessions/{session_id}/config
 ```
 GET /sessions                        — list active sessions
 GET /sessions/{id}/status            — runtime status
-GET /sessions/{id}/log?limit=500     — event log
+GET /sessions/{id}/log?limit=500     — event log (newest first)
 ```
+
+#### Session log event types
+
+Each row has `event_type`, `payload`, `created_at`, and `session_id`.
+
+| event_type | Payload fields |
+|---|---|
+| `user_message` | `{text, prompt_id}` |
+| `assistant_message` | `{text, prompt_id}` |
+| `reasoning` | `{text, prompt_id}` — Claude's thinking/reasoning blocks |
+| `tool_call` | `{tool, tool_call_id, prompt_id, args?}` |
+| `tool_result` | `{tool, tool_call_id, prompt_id, result}` |
+| `usage` | `{prompt_id, ...cost fields from agent}` |
+| `error` | `{message, kind, prompt_id, traceback?}` |
+
+`prompt_id` is the `rpc_id` returned by `POST /sessions/{id}/message` and ties every event within a single prompt round-trip together.
+
+`tool_call_id` links a `tool_call` row to its corresponding `tool_result` row (matches the `id` field in Claude's `tool_use` content blocks).
 
 ## Sandboxes
 

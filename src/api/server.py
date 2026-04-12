@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 
@@ -19,7 +20,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 
 from .models import (
     AgentConfig, AgentRecord, SandboxRecord, SessionState,
-    EVT_USER_MESSAGE, EVT_ASSISTANT_MESSAGE, EVT_TOOL_CALL, EVT_TOOL_RESULT, EVT_USAGE, EVT_ERROR,
+    EVT_USER_MESSAGE, EVT_ASSISTANT_MESSAGE, EVT_REASONING,
+    EVT_TOOL_CALL, EVT_TOOL_RESULT, EVT_USAGE, EVT_ERROR,
     STATUS_RUNNING,
 )
 from .db import (
@@ -32,6 +34,7 @@ from .db import (
 from .sandbox_agent_client import SandboxAgentClient, _mcp_dict_to_acp_array
 from .sse import (
     parse_sse_data, iter_sse_blocks, parse_acp_payload,
+    extract_tool_name, extract_tool_call_id, extract_tool_response,
     UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK, UT_TOOL_CALL, UT_TOOL_STARTED,
     UT_TOOL_CALL_UPDATE, UT_USAGE_UPDATED, UT_USAGE_UPDATE,
 )
@@ -231,16 +234,21 @@ async def health():
 _SSE_SENTINEL = object()
 
 
-async def _flush_text_parts(state: SessionState, parts: list[str]) -> None:
+async def _flush_text_parts(state: SessionState, parts: list[str],
+                             event_type: str = EVT_ASSISTANT_MESSAGE,
+                             prompt_id: str | None = None) -> None:
     """Fire-and-forget: flush accumulated assistant text to the log."""
     if not parts:
         return
+    payload: dict = {"text": redact_secrets("".join(parts))}
+    if prompt_id is not None:
+        payload["prompt_id"] = prompt_id
     try:
         await log_event(
             session_id=state.session_id, agent_id=state.agent_id,
             sandbox_id=state.sandbox_id,
-            event_type=EVT_ASSISTANT_MESSAGE,
-            payload={"text": redact_secrets("".join(parts))},
+            event_type=event_type,
+            payload=payload,
         )
     except Exception:
         pass
@@ -300,6 +308,7 @@ def _start_sse_reader(state: SessionState) -> None:
     async def _reader():
         reader_buffer = ""
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
         sse_http = None
         try:
             headers = {"Accept": "text/event-stream"}
@@ -318,7 +327,8 @@ def _start_sse_reader(state: SessionState) -> None:
                     reader_buffer += chunk
                     while "\n\n" in reader_buffer:
                         block, reader_buffer = reader_buffer.split("\n\n", 1)
-                        _process_sse_block(block, state, text_parts, log_events=True)
+                        _process_sse_block(block, state, text_parts,
+                                            thinking_parts, log_events=True)
                         # Auto-approve permission requests for headless operation
                         _maybe_auto_approve_permission(block, state)
         except asyncio.CancelledError:
@@ -346,9 +356,8 @@ def _start_sse_reader(state: SessionState) -> None:
                             state.session_id)
                 state.agent_busy = False
                 state.turn_completed_at = time.time()
-            if text_parts:
-                asyncio.create_task(_flush_text_parts(state, list(text_parts)))
-                text_parts.clear()
+            _flush_buffered_text(state, text_parts, thinking_parts,
+                                  state.current_rpc_id)
             state.broadcast(_SSE_SENTINEL)
 
     state._reader_task = asyncio.create_task(_reader())
@@ -585,13 +594,64 @@ async def _bg_log(session_id: str, agent_id: str, sandbox_id: str,
         pass
 
 
+def _schedule_log(state: SessionState, event_type: str, payload: dict) -> None:
+    """Enqueue a DB log write that runs *after* any previously-scheduled
+    write for this session has completed.
+
+    The chain guarantees per-session ordering: ``id`` and ``created_at``
+    end up in the same order events were scheduled, so a UI sorting by
+    either field sees a faithful timeline.  Independent sessions still
+    write concurrently — the chain is per-state.
+    """
+    prev = state._log_chain
+
+    async def _runner():
+        if prev is not None:
+            try:
+                await prev
+            except Exception:
+                pass
+        await _bg_log(state.session_id, state.agent_id, state.sandbox_id,
+                       event_type, payload)
+
+    state._log_chain = asyncio.create_task(_runner())
+
+
+def _flush_buffered_text(state: SessionState, text_parts: list,
+                          thinking_parts: list, prompt_id: str | None) -> None:
+    """Flush any accumulated assistant text and reasoning as separate log rows.
+
+    Called at tool-call boundaries and at turn end so that text/tool ordering
+    within a turn is preserved chronologically.  Goes through the per-session
+    log chain so the rows land in the same order they were scheduled.
+    """
+    if text_parts:
+        text = redact_secrets("".join(text_parts))
+        text_parts.clear()
+        payload: dict = {"text": text}
+        if prompt_id is not None:
+            payload["prompt_id"] = prompt_id
+        _schedule_log(state, EVT_ASSISTANT_MESSAGE, payload)
+    if thinking_parts:
+        text = redact_secrets("".join(thinking_parts))
+        thinking_parts.clear()
+        payload = {"text": text}
+        if prompt_id is not None:
+            payload["prompt_id"] = prompt_id
+        _schedule_log(state, EVT_REASONING, payload)
+
+
 def _process_sse_block(block: str, state: SessionState, text_parts: list,
+                       thinking_parts: list | None = None,
                        *, log_events: bool = False) -> None:
-    """Parse SSE block: accumulate text, update state, optionally log to DB.
+    """Parse SSE block: accumulate text/thinking, update state, optionally log to DB.
 
     The reader calls this with log_events=True (single writer).
     Subscribers and replayers call with log_events=False (read-only).
     """
+    if thinking_parts is None:
+        thinking_parts = []
+
     # Track the SSE cursor from the single reader only — multiple
     # proxy subscribers must not write last_event_id concurrently.
     if log_events:
@@ -606,69 +666,85 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
         return
 
     kind, data = parse_acp_payload(payload, None)
+    prompt_id = state.current_rpc_id
 
     if kind == "update":
         update = data or {}
         ut = update.get("sessionUpdate", "")
 
         if ut in (UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK):
-            text = update.get("content", {}).get("text", "")
-            if text:
-                text_parts.append(text)
+            content = update.get("content") or {}
+            if isinstance(content, dict):
+                # Text segment
+                text = content.get("text") or ""
+                if text and content.get("type") in (None, "text"):
+                    text_parts.append(text)
+                # Reasoning / thinking segment — claude-code emits thinking
+                # blocks either as content.thinking (delta-style) or as
+                # content.text with type == "thinking".
+                thinking = content.get("thinking")
+                if isinstance(thinking, str) and thinking:
+                    thinking_parts.append(thinking)
+                elif content.get("type") == "thinking" and text:
+                    thinking_parts.append(text)
 
         elif log_events and ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
-            meta = update.get("_meta", {}).get("claudeCode", {})
-            tool_payload: dict = {"tool": meta.get("toolName", "unknown")}
+            # Flush any accumulated text/thinking before the tool call so the
+            # text-tool interleave within the turn is preserved.
+            _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
+            tool_payload: dict = {
+                "tool": extract_tool_name(update),
+                "tool_call_id": extract_tool_call_id(update),
+                "prompt_id": prompt_id,
+            }
             raw_input = update.get("rawInput")
             if raw_input:
                 tool_payload["args"] = raw_input
-            asyncio.create_task(_bg_log(
-                state.session_id, state.agent_id, state.sandbox_id,
-                EVT_TOOL_CALL, tool_payload,
-            ))
+            _schedule_log(state, EVT_TOOL_CALL, tool_payload)
 
         elif log_events and ut == UT_TOOL_CALL_UPDATE:
-            meta = update.get("_meta", {}).get("claudeCode", {})
-            tool_response = meta.get("toolResponse")
-            if tool_response:
-                asyncio.create_task(_bg_log(
-                    state.session_id, state.agent_id, state.sandbox_id,
-                    EVT_TOOL_RESULT, {"tool": meta.get("toolName", "unknown"), "result": tool_response},
-                ))
-            elif update.get("rawInput"):
-                asyncio.create_task(_bg_log(
-                    state.session_id, state.agent_id, state.sandbox_id,
-                    EVT_TOOL_CALL, {"tool": meta.get("toolName", "unknown"), "args": update["rawInput"]},
-                ))
+            # tool_call_update can carry either a tool result (most common
+            # — toolResponse / output / etc.) or a refined args set after
+            # the initial tool_call.  Persist whichever is present, but
+            # never re-emit a duplicate EVT_TOOL_CALL row.
+            tool_call_id = extract_tool_call_id(update)
+            tool_response = extract_tool_response(update)
+            if tool_response is not None:
+                _schedule_log(state, EVT_TOOL_RESULT, {
+                    "tool": extract_tool_name(update),
+                    "tool_call_id": tool_call_id,
+                    "result": tool_response,
+                    "prompt_id": prompt_id,
+                })
 
         elif log_events and ut in (UT_USAGE_UPDATED, UT_USAGE_UPDATE):
-            asyncio.create_task(_bg_log(
-                state.session_id, state.agent_id, state.sandbox_id,
-                EVT_USAGE, update.get("cost", update),
-            ))
+            usage_payload = dict(update.get("cost") or update)
+            usage_payload["prompt_id"] = prompt_id
+            _schedule_log(state, EVT_USAGE, usage_payload)
         return
 
     if kind == "done_result":
         # JSON-RPC result with stopReason → agent turn finished
         if log_events:
             _mark_turn_finished(state)
-        if text_parts:
-            text = "".join(text_parts)
+            _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
+        else:
+            # Subscribers/replayers — just clear the local buffers.
             text_parts.clear()
-            if log_events:
-                asyncio.create_task(_bg_log(
-                    state.session_id, state.agent_id, state.sandbox_id,
-                    EVT_ASSISTANT_MESSAGE, {"text": text},
-                ))
+            thinking_parts.clear()
         return
 
     if kind == "error" and log_events:
         _mark_turn_finished(state)
+        # Flush any in-flight text/thinking before the error frame.
+        _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
         err = data or {}
-        asyncio.create_task(_bg_log(
-            state.session_id, state.agent_id, state.sandbox_id,
-            EVT_ERROR, {"message": err.get("message", str(err))[:500]},
-        ))
+        err_data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        _schedule_log(state, EVT_ERROR, {
+            "message": err.get("message", str(err))[:500],
+            "kind": err_data.get("kind") if err_data else None,
+            "prompt_id": prompt_id,
+        })
 
 
 async def _find_last_replay_event_id(
@@ -1652,10 +1728,12 @@ async def post_session_message(session_id: str, request: Request):
 
     state.last_activity = time.time()
     rpc_id = str(uuid.uuid4())
+    state.current_rpc_id = rpc_id
 
     await log_event(
         session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
-        event_type=EVT_USER_MESSAGE, payload={"text": message},
+        event_type=EVT_USER_MESSAGE,
+        payload={"text": message, "prompt_id": rpc_id},
     )
 
     async def _run_prompt():
@@ -1664,18 +1742,75 @@ async def post_session_message(session_id: str, request: Request):
             state.resume_buffering()
         except Exception as e:
             state.resume_buffering()
-            log.error("prompt failed for session %s: %s", session_id, e)
-            state.errors.append(str(e))
+            tb = traceback.format_exc()
+            log.exception("prompt failed for session %s", session_id)
+
+            # Capture upstream HTTP body if it's a status error — that's where
+            # signatures like "agent process exited before responding" live.
+            body = ""
+            http_status: int | None = None
+            if isinstance(e, httpx.HTTPStatusError):
+                http_status = e.response.status_code
+                try:
+                    body = e.response.text[:1000]
+                except Exception:
+                    pass
+
+            # Classify into a stable kind clients can branch on.
+            if isinstance(e, httpx.HTTPStatusError) and http_status == 500 and (
+                "agent process exited" in body or "start a new session" in body
+            ):
+                kind = "sandbox_process_died"
+            elif isinstance(e, httpx.HTTPStatusError) and http_status == 500:
+                kind = "sandbox_internal_error"
+            elif isinstance(e, httpx.HTTPStatusError):
+                kind = "http_error"
+            elif isinstance(e, httpx.ConnectError):
+                kind = "sandbox_unreachable"
+            elif isinstance(e, httpx.ReadTimeout):
+                kind = "timeout"
+            else:
+                kind = "unknown"
+
+            summary = f"{type(e).__name__}: {e}"
+            if body:
+                summary += f" | {body}"
+
+            state.errors.append({
+                "ts": time.time(),
+                "rpc_id": rpc_id,
+                "kind": kind,
+                "error": summary,
+                "traceback": tb,
+            })
             _mark_turn_finished(state)
+
             error_payload = json.dumps({
                 "jsonrpc": "2.0", "id": rpc_id,
-                "error": {"code": -32000, "message": str(e)[:200]},
+                "error": {
+                    "code": -32000,
+                    "message": summary[:500],
+                    "data": {
+                        "kind": kind,
+                        "exception_type": type(e).__name__,
+                        "http_status": http_status,
+                        "upstream_body": body,
+                        "rpc_id": rpc_id,
+                    },
+                },
             })
             if not state.shutdown.is_set():
                 state.broadcast(f"data: {error_payload}\n\n")
+
             await log_event(
                 session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
-                event_type=EVT_ERROR, payload={"message": str(e)[:500]},
+                event_type=EVT_ERROR,
+                payload={
+                    "message": summary[:1000],
+                    "kind": kind,
+                    "traceback": tb[:5000],
+                    "rpc_id": rpc_id,
+                },
             )
         finally:
             state.agent_busy = False

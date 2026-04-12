@@ -33,6 +33,7 @@ _AGENT_CONFIG_FIELDS = frozenset(AgentConfig.__dataclass_fields__)
 # ── Session event type constants ──
 EVT_USER_MESSAGE = "user_message"
 EVT_ASSISTANT_MESSAGE = "assistant_message"
+EVT_REASONING = "reasoning"
 EVT_TOOL_CALL = "tool_call"
 EVT_TOOL_RESULT = "tool_result"
 EVT_USAGE = "usage"
@@ -82,6 +83,7 @@ class SessionState:
     last_activity: float = field(default_factory=time.time)
     agent_busy: bool = field(default=False)  # True while agent is processing (between prompt and stopReason)
     turn_completed_at: float | None = field(default=None)  # when the last stopReason arrived
+    current_rpc_id: str | None = field(default=None)  # rpc_id of the in-flight prompt; tags log events
     # Persistent SSE reader — connects once at session creation, fans out to subscribers
     _reader_task: object | None = field(default=None, repr=False)  # asyncio.Task
     _subscribers: list = field(default_factory=list, repr=False)  # list[asyncio.Queue]
@@ -89,6 +91,7 @@ class SessionState:
     _replay_buffer: deque = field(default_factory=lambda: deque(maxlen=5000), repr=False)
     _turn_gen: int = field(default=0, repr=False)  # incremented by new_turn(); tags buffered events
     _buffering_paused: bool = field(default=False, repr=False)  # True between new_turn() and resume_buffering()
+    _log_chain: object | None = field(default=None, repr=False)  # asyncio.Task — serializes log writes
     errors: deque = field(default_factory=lambda: deque(maxlen=100), repr=False)
 
     def new_turn(self) -> None:

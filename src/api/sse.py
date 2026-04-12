@@ -80,6 +80,71 @@ def parse_acp_payload(payload: dict, rpc_id: str | None) -> tuple[str, dict | No
     return "update", payload.get("params", {}).get("update", {})
 
 
+def extract_tool_call_id(update: dict) -> str | None:
+    """Best-effort tool-call id extraction across adapters.
+
+    Claude Code's native ``tool_use`` block carries an id like
+    ``toolu_01CxQuegzYETU618WAS5ofDJ`` that links tool calls to their
+    results.  Different adapters surface it in different places; check
+    the common ones.
+    """
+    if not isinstance(update, dict):
+        return None
+
+    # Top-level ACP fields
+    for key in ("toolCallId", "toolUseId", "tool_call_id", "tool_use_id", "id"):
+        v = update.get(key)
+        if isinstance(v, str) and v:
+            return v
+
+    # _meta.claudeCode.* (where extract_tool_name also looks)
+    meta = update.get("_meta", {})
+    claude_meta = meta.get("claudeCode", {}) if isinstance(meta, dict) else {}
+    if isinstance(claude_meta, dict):
+        for key in ("toolUseId", "toolCallId", "tool_use_id", "tool_call_id", "id"):
+            v = claude_meta.get(key)
+            if isinstance(v, str) and v:
+                return v
+
+    # rawInput sometimes echoes the original tool_use block
+    raw_input = update.get("rawInput")
+    if isinstance(raw_input, dict):
+        for key in ("toolUseId", "tool_use_id", "id"):
+            v = raw_input.get(key)
+            if isinstance(v, str) and v.startswith("toolu_"):
+                return v
+
+    return None
+
+
+def extract_tool_response(update: dict) -> object | None:
+    """Best-effort tool result/output extraction across adapters.
+
+    Returns whatever the adapter put in the result slot — string, dict,
+    list, etc. — or ``None`` if the update doesn't carry a result.
+    """
+    if not isinstance(update, dict):
+        return None
+
+    # Claude Code path
+    meta = update.get("_meta", {})
+    claude_meta = meta.get("claudeCode", {}) if isinstance(meta, dict) else {}
+    if isinstance(claude_meta, dict):
+        for key in ("toolResponse", "toolResult", "tool_response", "tool_result"):
+            v = claude_meta.get(key)
+            if v is not None:
+                return v
+
+    # Generic ACP fields
+    for key in ("toolResponse", "toolResult", "tool_response", "tool_result",
+                "output", "result", "content"):
+        v = update.get(key)
+        if v is not None:
+            return v
+
+    return None
+
+
 def extract_tool_name(update: dict) -> str:
     """Best-effort tool name extraction across different agent adapters."""
     meta = update.get("_meta", {})
@@ -133,7 +198,13 @@ def parse_acp_text(block: str, rpc_id: str | None = None) -> dict | None:
     if kind == "done_result":
         return {"type": "done", "text": ""}
     if kind == "error":
-        return {"type": "error", "text": data.get("message", "Unknown error")}
+        err_data = data.get("data") or {}
+        return {
+            "type": "error",
+            "text": data.get("message", "Unknown error"),
+            "kind": err_data.get("kind") if isinstance(err_data, dict) else None,
+            "data": err_data if isinstance(err_data, dict) else {},
+        }
     if kind == "skip" or data is None:
         return None
 
@@ -172,7 +243,13 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     if kind == "done_result":
         return {"type": "done", "stop_reason": data["stopReason"]}
     if kind == "error":
-        return {"type": "error", "text": data.get("message", "Unknown error")}
+        err_data = data.get("data") or {}
+        return {
+            "type": "error",
+            "text": data.get("message", "Unknown error"),
+            "kind": err_data.get("kind") if isinstance(err_data, dict) else None,
+            "data": err_data if isinstance(err_data, dict) else {},
+        }
     if kind == "skip" or data is None:
         return None
 
@@ -188,17 +265,18 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
         return {
             "type": "tool",
             "tool_name": extract_tool_name(data),
+            "tool_call_id": extract_tool_call_id(data),
             "args": data.get("rawInput"),
             "raw": data,
         }
 
     if ut == UT_TOOL_CALL_UPDATE:
-        meta = data.get("_meta", {}).get("claudeCode", {})
-        tool_response = meta.get("toolResponse")
-        if tool_response:
+        tool_response = extract_tool_response(data)
+        if tool_response is not None:
             return {
                 "type": "tool_result",
                 "tool_name": extract_tool_name(data),
+                "tool_call_id": extract_tool_call_id(data),
                 "result": tool_response,
                 "raw": data,
             }

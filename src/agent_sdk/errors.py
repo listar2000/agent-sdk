@@ -26,7 +26,18 @@ class AgentTimeoutError(AgentSDKError):
 
 
 class PromptError(AgentSDKError):
-    """Error while processing a prompt."""
+    """Error while processing a prompt.
+
+    Carries an optional ``kind`` discriminator and structured ``data`` dict
+    forwarded from the server's JSON-RPC error frame so callers can branch
+    on the failure mode (e.g. ``sandbox_process_died``, ``timeout``).
+    """
+
+    def __init__(self, message: str, *, kind: str | None = None,
+                 data: dict | None = None):
+        super().__init__(message)
+        self.kind = kind
+        self.data = data or {}
 
 
 class StreamError(AgentSDKError):

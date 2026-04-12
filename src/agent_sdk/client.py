@@ -325,7 +325,11 @@ class Agent:
                     elif event["type"] == "done":
                         return
                     elif event["type"] == "error":
-                        raise PromptError(f"[{self.name}] {event['text']}")
+                        raise PromptError(
+                            f"[{self.name}] {event['text']}",
+                            kind=event.get("kind"),
+                            data=event.get("data"),
+                        )
                 raise StreamError(f"[{self.name}] Connection closed before response completed")
             except httpx.ReadTimeout:
                 raise StreamError(f"[{self.name}] Connection lost (no heartbeat from server)")
