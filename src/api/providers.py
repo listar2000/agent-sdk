@@ -21,6 +21,7 @@ from . import load_dotenv
 log = logging.getLogger(__name__)
 
 SANDBOX_AGENT_IMAGE = "rivetdev/sandbox-agent:0.4.2-full"
+DEFAULT_DAYTONA_SNAPSHOT = "hive-large"
 SANDBOX_AGENT_PORT = 3000
 SANDBOX_AGENT_INSTALL_CMDS = [
     "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*",
@@ -205,9 +206,18 @@ def _build_daytona_image(dockerfile: str | None):
 
 
 def _get_daytona_snapshot() -> str | None:
-    """Return the snapshot override for Daytona sandboxes, if configured."""
-    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "").strip()
-    return snapshot or None
+    """Return the Daytona snapshot name for new sandboxes.
+
+    Defaults to DEFAULT_DAYTONA_SNAPSHOT. Set DAYTONA_SNAPSHOT to override, or to
+    empty /0 / false / image to use the legacy image/Dockerfile path instead.
+    """
+    raw = os.environ.get("DAYTONA_SNAPSHOT")
+    if raw is None:
+        return DEFAULT_DAYTONA_SNAPSHOT
+    s = raw.strip()
+    if not s or s.lower() in ("0", "false", "image"):
+        return None
+    return s
 
 
 async def create_daytona(agent_type: str = "claude", dockerfile: str | None = None) -> ProviderInstance:
@@ -234,7 +244,7 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
     snapshot = _get_daytona_snapshot()
     if snapshot:
         if dockerfile is not None:
-            log.info("DAYTONA_SNAPSHOT=%s set; ignoring dockerfile %s", snapshot, dockerfile)
+            log.info("using Daytona snapshot %s; ignoring dockerfile %s", snapshot, dockerfile)
         create_params = CreateSandboxFromSnapshotParams(
             snapshot=snapshot,
             auto_stop_interval=0,

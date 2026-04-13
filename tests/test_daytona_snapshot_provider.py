@@ -11,6 +11,57 @@ from api.providers import create_daytona
 
 
 @pytest.mark.asyncio
+async def test_create_daytona_uses_default_snapshot_when_env_unset(monkeypatch):
+    create_calls = []
+
+    class FakeCreateSandboxFromImageParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeCreateSandboxFromSnapshotParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeDaytonaConfig:
+        def __init__(self, api_key):
+            self.api_key = api_key
+
+    signed = SimpleNamespace(url="https://preview.example.com")
+    sandbox = MagicMock()
+    sandbox.id = "daytona-sandbox-default"
+    sandbox.process.exec = MagicMock()
+    sandbox.create_signed_preview_url = MagicMock(return_value=signed)
+
+    class FakeDaytona:
+        def __init__(self, config):
+            self.config = config
+
+        def create(self, params, timeout):
+            create_calls.append((params, timeout))
+            return sandbox
+
+    fake_daytona_sdk = SimpleNamespace(
+        Daytona=FakeDaytona,
+        DaytonaConfig=FakeDaytonaConfig,
+        CreateSandboxFromImageParams=FakeCreateSandboxFromImageParams,
+        CreateSandboxFromSnapshotParams=FakeCreateSandboxFromSnapshotParams,
+    )
+
+    monkeypatch.delenv("DAYTONA_SNAPSHOT", raising=False)
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_test")
+    monkeypatch.setattr("api.providers._wait_for_health", AsyncMock(return_value=True))
+    monkeypatch.setitem(sys.modules, "daytona_sdk", fake_daytona_sdk)
+
+    instance = await create_daytona(agent_type="claude", dockerfile=None)
+
+    assert instance.sandbox_id == "daytona-sandbox-default"
+    assert len(create_calls) == 1
+    params, _ = create_calls[0]
+    assert isinstance(params, FakeCreateSandboxFromSnapshotParams)
+    assert params.kwargs["snapshot"] == "hive-large"
+
+
+@pytest.mark.asyncio
 async def test_create_daytona_uses_snapshot_override(monkeypatch):
     create_calls = []
 
