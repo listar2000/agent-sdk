@@ -204,10 +204,21 @@ def _build_daytona_image(dockerfile: str | None):
     return Image.from_dockerfile(dockerfile).run_commands(*SANDBOX_AGENT_INSTALL_CMDS)
 
 
+def _get_daytona_snapshot() -> str | None:
+    """Return the snapshot override for Daytona sandboxes, if configured."""
+    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "").strip()
+    return snapshot or None
+
+
 async def create_daytona(agent_type: str = "claude", dockerfile: str | None = None) -> ProviderInstance:
     """Create a Daytona sandbox with sandbox-agent pre-installed."""
     try:
-        from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxFromImageParams
+        from daytona_sdk import (
+            Daytona,
+            DaytonaConfig,
+            CreateSandboxFromImageParams,
+            CreateSandboxFromSnapshotParams,
+        )
     except ImportError:
         raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
 
@@ -220,22 +231,35 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
 
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
-
-    image = _build_daytona_image(dockerfile)
-
-    # Create sandbox (custom images need longer timeout for build + agent install)
-    create_timeout = 300 if dockerfile else 60
-    sandbox = await loop.run_in_executor(None, lambda: daytona.create(
-        CreateSandboxFromImageParams(
+    snapshot = _get_daytona_snapshot()
+    if snapshot:
+        if dockerfile is not None:
+            log.info("DAYTONA_SNAPSHOT=%s set; ignoring dockerfile %s", snapshot, dockerfile)
+        create_params = CreateSandboxFromSnapshotParams(
+            snapshot=snapshot,
+            auto_stop_interval=0,
+            env_vars=env_vars,
+        )
+        create_timeout = 60
+    else:
+        image = _build_daytona_image(dockerfile)
+        create_params = CreateSandboxFromImageParams(
             image=image,
             auto_stop_interval=0,
             env_vars=env_vars,
-        ),
+        )
+        # Custom images need longer timeout for build + agent install.
+        create_timeout = 300 if dockerfile else 60
+
+    sandbox = await loop.run_in_executor(None, lambda: daytona.create(
+        create_params,
         timeout=create_timeout,
     ))
 
-    # For custom images, install agent processes at runtime (CDN unreachable during build)
-    if dockerfile is not None:
+    # For custom images, install agent processes at runtime (CDN unreachable during build).
+    # Snapshot-based sandboxes may also need the agent installed even if the snapshot
+    # already contains sandbox-agent itself.
+    if dockerfile is not None or snapshot is not None:
         await loop.run_in_executor(None, lambda: sandbox.process.exec(
             f"sandbox-agent install-agent {agent_type}"
         ))

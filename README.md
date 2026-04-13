@@ -32,6 +32,7 @@ The repo has a `Dockerfile` and `railway.toml` ready for Railway.
 3. Set env vars on the API service:
    - `ANTHROPIC_API_KEY`
    - `DAYTONA_API_KEY` (if using cloud sandboxes)
+   - `DAYTONA_SNAPSHOT` (optional, use a custom Daytona snapshot instead of the default image path)
    - `SANDBOX_IDLE_TIMEOUT` (optional, seconds — default 300)
 4. Deploy
 
