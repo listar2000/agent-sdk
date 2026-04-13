@@ -10,6 +10,7 @@ import logging
 import os
 import signal
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,31 @@ SNAPSHOT_BOOTSTRAP_CMDS = [
     *SANDBOX_AGENT_INSTALL_CMDS,
 ]
 PORT_BASED_PROVIDERS = frozenset({"local", "docker"})
+
+# ── Daytona circuit breaker ──
+# Prevents runaway sandbox creation when Daytona is failing.
+_daytona_failure_times: list[float] = []
+_DAYTONA_CB_WINDOW = 60       # look-back window (seconds)
+_DAYTONA_CB_THRESHOLD = 3     # failures within window to trip breaker
+_DAYTONA_CB_COOLDOWN = 30     # refuse new creations for this long after trip
+
+
+def _daytona_circuit_open() -> bool:
+    """Return True if too many recent Daytona creation failures."""
+    now = time.monotonic()
+    cutoff = now - _DAYTONA_CB_WINDOW
+    # prune old entries
+    while _daytona_failure_times and _daytona_failure_times[0] < cutoff:
+        _daytona_failure_times.pop(0)
+    if len(_daytona_failure_times) >= _DAYTONA_CB_THRESHOLD:
+        # still in cooldown from last failure?
+        if _daytona_failure_times and (now - _daytona_failure_times[-1]) < _DAYTONA_CB_COOLDOWN:
+            return True
+    return False
+
+
+def _daytona_record_failure() -> None:
+    _daytona_failure_times.append(time.monotonic())
 
 
 async def _wait_for_health(url: str, max_retries: int = 30, interval: float = 0.5) -> bool:
@@ -240,6 +266,12 @@ async def _exec_daytona_command(loop: asyncio.AbstractEventLoop, sandbox, comman
 
 async def create_daytona(agent_type: str = "claude", dockerfile: str | None = None) -> ProviderInstance:
     """Create a Daytona sandbox with sandbox-agent pre-installed."""
+    if _daytona_circuit_open():
+        raise RuntimeError(
+            "Daytona circuit breaker open: too many recent creation failures. "
+            f"Retry after {_DAYTONA_CB_COOLDOWN}s."
+        )
+
     try:
         from daytona_sdk import (
             Daytona,
@@ -311,6 +343,7 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         if not await _wait_for_health(url, max_retries=20, interval=1):
             raise RuntimeError(f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check")
     except Exception:
+        _daytona_record_failure()
         try:
             await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
         except Exception as delete_error:

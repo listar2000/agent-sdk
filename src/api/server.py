@@ -815,52 +815,76 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             ))
             return new_instance.url
 
-    # For daytona: health-check the URL, restart via Daytona SDK if down
-    daytona_sandbox_id = sandbox_record.sandbox_ref  # Daytona's own sandbox ID
+    # For daytona: health-check the URL, restart via Daytona SDK if down.
+    # Use sandbox lock to prevent concurrent recovery attempts from racing
+    # and creating duplicate sandboxes.
+    async with _get_sandbox_lock(sandbox_id):
+        # Re-check after acquiring lock — another request may have recovered it.
+        instance = _INSTANCES.get(sandbox_id)
+        if instance and instance.url:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get(f"{instance.url}/v1/health")
+                    if r.status_code == 200:
+                        return instance.url
+            except Exception:
+                pass
 
-    if instance and instance.url:
+        daytona_sandbox_id = sandbox_record.sandbox_ref  # Daytona's own sandbox ID
+
+        # Daytona sandbox URL lost or stale — get fresh signed URL, start sandbox if stopped
+        log.info("recovering daytona sandbox %s (daytona_id=%s)", sandbox_id, daytona_sandbox_id)
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(f"{instance.url}/v1/health")
-                if r.status_code == 200:
-                    return instance.url
-        except Exception:
-            pass
+            from .providers import SANDBOX_AGENT_PORT, _wait_for_health, _get_daytona_client
+            daytona_client = _get_daytona_client()
+            loop = asyncio.get_running_loop()
+            sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
 
-    # Daytona sandbox URL lost or stale — get fresh signed URL, start sandbox if stopped
-    log.info("recovering daytona sandbox %s (daytona_id=%s)", sandbox_id, daytona_sandbox_id)
-    try:
-        from .providers import SANDBOX_AGENT_PORT, _wait_for_health, _get_daytona_client
-        daytona_client = _get_daytona_client()
-        loop = asyncio.get_running_loop()
-        sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
+            # Start sandbox if stopped (no-op if already running)
+            # sandbox_obj.state may be an enum — compare .value for string check
+            raw_state = sandbox_obj.state
+            state_str = raw_state.value if hasattr(raw_state, 'value') else str(raw_state)
+            if state_str != "started":
+                await loop.run_in_executor(None, sandbox_obj.start)
 
-        # Start sandbox if stopped (no-op if already running)
-        # sandbox_obj.state may be an enum — compare .value for string check
-        raw_state = sandbox_obj.state
-        state_str = raw_state.value if hasattr(raw_state, 'value') else str(raw_state)
-        if state_str != "started":
-            await loop.run_in_executor(None, sandbox_obj.start)
+            # Get a fresh signed preview URL
+            signed = await loop.run_in_executor(None, lambda: sandbox_obj.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
+            url = signed.url
 
-        # Get a fresh signed preview URL
-        signed = await loop.run_in_executor(None, lambda: sandbox_obj.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
-        url = signed.url
+            # If sandbox-agent isn't responding, re-launch it
+            if not await _wait_for_health(url, max_retries=5, interval=1.0):
+                await loop.run_in_executor(None, lambda: sandbox_obj.process.exec(
+                    f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
+                ))
+                if not await _wait_for_health(url, max_retries=20, interval=1.0):
+                    raise RuntimeError("Daytona sandbox-agent failed to respond after restart")
 
-        # If sandbox-agent isn't responding, re-launch it
-        if not await _wait_for_health(url, max_retries=5, interval=1.0):
-            await loop.run_in_executor(None, lambda: sandbox_obj.process.exec(
-                f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
+            _INSTANCES[sandbox_id] = ProviderInstance(provider="daytona", url=url, sandbox_id=daytona_sandbox_id)
+            return url
+
+        except ImportError:
+            raise RuntimeError("daytona-sdk not installed, cannot restart sandbox")
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "not found" not in err_msg:
+                raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
+
+            # Daytona sandbox was permanently deleted — create a replacement.
+            log.warning(
+                "daytona sandbox %s gone (not found), creating replacement for sandbox %s",
+                daytona_sandbox_id, sandbox_id,
+            )
+            try:
+                new_instance = await create_instance("daytona", agent_type, dockerfile=dockerfile)
+            except Exception as create_err:
+                raise RuntimeError(f"Failed to create replacement daytona sandbox: {create_err}")
+
+            _INSTANCES[sandbox_id] = new_instance
+            new_ref = new_instance.sandbox_id or sandbox_id
+            await upsert_sandbox(SandboxRecord(
+                id=sandbox_id, provider="daytona", sandbox_ref=new_ref, status=STATUS_RUNNING,
             ))
-            if not await _wait_for_health(url, max_retries=20, interval=1.0):
-                raise RuntimeError("Daytona sandbox-agent failed to respond after restart")
-
-        _INSTANCES[sandbox_id] = ProviderInstance(provider="daytona", url=url, sandbox_id=daytona_sandbox_id)
-    except ImportError:
-        raise RuntimeError("daytona-sdk not installed, cannot restart sandbox")
-    except Exception as e:
-        raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
-
-    return url
+            return new_instance.url
 
 
 async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
@@ -1644,6 +1668,14 @@ async def sessions_quick_create(request: Request):
         instance = await create_instance(provider, agent_type, dockerfile=dockerfile)
     except Exception as e:
         await delete_agent(agent_id)
+        # Return 503 with Retry-After for circuit-breaker trips so callers
+        # know to back off instead of retrying immediately.
+        if "circuit breaker" in str(e).lower():
+            return JSONResponse(
+                {"error": str(e)},
+                status_code=503,
+                headers={"Retry-After": "30"},
+            )
         return JSONResponse({"error": f"Provider '{provider}' failed: {e}"}, status_code=502)
 
     sandbox_ref = _derive_sandbox_ref(instance, provider, sandbox_id)
@@ -1758,6 +1790,58 @@ async def post_session_message(session_id: str, request: Request):
                 kind = "timeout"
             else:
                 kind = "unknown"
+
+            # ── Auto-recovery: sandbox died → restart sandbox, reload
+            # session, retry the prompt once. ──
+            if kind in ("sandbox_unreachable", "sandbox_process_died"):
+                log.warning(
+                    "sandbox died for session %s (kind=%s), attempting auto-recovery",
+                    session_id, kind,
+                )
+                try:
+                    # Tear down the broken session so _do_resume performs a
+                    # full recovery instead of returning "already_active".
+                    await _shutdown_session_state(state, remove=True)
+
+                    result = await _do_resume(
+                        sandbox_id=state.sandbox_id,
+                        agent_id=state.agent_id,
+                        inner_session_id=state.inner_session_id,
+                        client_session_id=session_id,
+                    )
+                    if not isinstance(result, JSONResponse):
+                        new_state = SESSIONS.get(session_id)
+                        if new_state and not new_state.shutdown.is_set():
+                            log.info(
+                                "auto-recovery succeeded for session %s, retrying prompt",
+                                session_id,
+                            )
+                            new_state.new_turn()
+                            new_state.agent_busy = True
+                            new_state.current_rpc_id = rpc_id
+                            try:
+                                await new_state.client.prompt(
+                                    new_state.acp_session_id, message, rpc_id=rpc_id,
+                                )
+                                new_state.resume_buffering()
+                                return  # success — skip error reporting
+                            except Exception as retry_err:
+                                new_state.resume_buffering()
+                                log.error(
+                                    "retry after recovery failed for session %s: %s",
+                                    session_id, retry_err,
+                                )
+                            finally:
+                                new_state.agent_busy = False
+                                new_state.turn_completed_at = time.time()
+                    else:
+                        log.error("auto-recovery _do_resume returned error for session %s", session_id)
+                except Exception as recover_err:
+                    log.error(
+                        "auto-recovery failed for session %s: %s",
+                        session_id, recover_err,
+                    )
+                # Fall through to report the original error.
 
             summary = f"{type(e).__name__}: {e}"
             if body:
