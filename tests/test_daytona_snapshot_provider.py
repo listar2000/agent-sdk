@@ -125,3 +125,51 @@ async def test_create_daytona_uses_snapshot_override(monkeypatch):
     )
     sandbox.process.exec.assert_any_call("curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh")
     sandbox.process.exec.assert_any_call("sandbox-agent install-agent claude")
+
+
+@pytest.mark.asyncio
+async def test_create_daytona_deletes_sandbox_on_health_failure(monkeypatch):
+    class FakeCreateSandboxFromImageParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeCreateSandboxFromSnapshotParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeDaytonaConfig:
+        def __init__(self, api_key):
+            self.api_key = api_key
+
+    sandbox = MagicMock()
+    sandbox.id = "daytona-failed-sandbox"
+    sandbox.process.exec = MagicMock(return_value=SimpleNamespace(exit_code=0, result="ok"))
+    sandbox.create_signed_preview_url = MagicMock(return_value=SimpleNamespace(url="https://preview.example.com"))
+
+    class FakeDaytona:
+        last_instance = None
+
+        def __init__(self, config):
+            self.config = config
+            self.delete = MagicMock()
+            FakeDaytona.last_instance = self
+
+        def create(self, params, timeout):
+            return sandbox
+
+    fake_daytona_sdk = SimpleNamespace(
+        Daytona=FakeDaytona,
+        DaytonaConfig=FakeDaytonaConfig,
+        CreateSandboxFromImageParams=FakeCreateSandboxFromImageParams,
+        CreateSandboxFromSnapshotParams=FakeCreateSandboxFromSnapshotParams,
+    )
+
+    monkeypatch.delenv("DAYTONA_SNAPSHOT", raising=False)
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_test")
+    monkeypatch.setattr("api.providers._wait_for_health", AsyncMock(return_value=False))
+    monkeypatch.setitem(sys.modules, "daytona_sdk", fake_daytona_sdk)
+
+    with pytest.raises(RuntimeError, match="failed health check"):
+        await create_daytona(agent_type="claude", dockerfile=None)
+
+    FakeDaytona.last_instance.delete.assert_called_once_with(sandbox)

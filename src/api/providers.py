@@ -283,33 +283,39 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         create_params,
         timeout=create_timeout,
     ))
+    try:
+        # Snapshot-based sandboxes must recreate the runtime that the old Dockerfile path
+        # provided, because the snapshot path bypasses dockerfile/image setup entirely.
+        if snapshot is not None:
+            for command in SNAPSHOT_BOOTSTRAP_CMDS:
+                await _exec_daytona_command(loop, sandbox, command)
 
-    # Snapshot-based sandboxes must recreate the runtime that the old Dockerfile path
-    # provided, because the snapshot path bypasses dockerfile/image setup entirely.
-    if snapshot is not None:
-        for command in SNAPSHOT_BOOTSTRAP_CMDS:
-            await _exec_daytona_command(loop, sandbox, command)
+        # For custom images and snapshot-based sandboxes, install the requested agent runtime.
+        if dockerfile is not None or snapshot is not None:
+            await _exec_daytona_command(loop, sandbox, f"sandbox-agent install-agent {agent_type}")
 
-    # For custom images and snapshot-based sandboxes, install the requested agent runtime.
-    if dockerfile is not None or snapshot is not None:
-        await _exec_daytona_command(loop, sandbox, f"sandbox-agent install-agent {agent_type}")
+        # Start sandbox-agent server inside
+        await _exec_daytona_command(
+            loop,
+            sandbox,
+            f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &",
+        )
 
-    # Start sandbox-agent server inside
-    await _exec_daytona_command(
-        loop,
-        sandbox,
-        f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &",
-    )
+        # Wait for server to be ready
+        await asyncio.sleep(3)
 
-    # Wait for server to be ready
-    await asyncio.sleep(3)
+        # Get signed preview URL (max 24h per Daytona API limit)
+        signed = await loop.run_in_executor(None, lambda: sandbox.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
+        url = signed.url
 
-    # Get signed preview URL (max 24h per Daytona API limit)
-    signed = await loop.run_in_executor(None, lambda: sandbox.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
-    url = signed.url
-
-    if not await _wait_for_health(url, max_retries=20, interval=1):
-        raise RuntimeError(f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check")
+        if not await _wait_for_health(url, max_retries=20, interval=1):
+            raise RuntimeError(f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check")
+    except Exception:
+        try:
+            await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
+        except Exception as delete_error:
+            log.warning("failed to delete daytona sandbox %s after startup error: %s", getattr(sandbox, "id", "?"), delete_error)
+        raise
 
     log.info("daytona sandbox-agent ready: %s (sandbox %s)", url[:50], sandbox.id[:16])
     return ProviderInstance(provider="daytona", url=url, sandbox_id=sandbox.id)
