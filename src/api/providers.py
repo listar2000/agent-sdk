@@ -27,6 +27,10 @@ SANDBOX_AGENT_INSTALL_CMDS = [
     "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*",
     "curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh",
 ]
+SNAPSHOT_BOOTSTRAP_CMDS = [
+    "python3 -m pip install --no-cache-dir hive-evolve",
+    *SANDBOX_AGENT_INSTALL_CMDS,
+]
 PORT_BASED_PROVIDERS = frozenset({"local", "docker"})
 
 
@@ -220,6 +224,20 @@ def _get_daytona_snapshot() -> str | None:
     return s
 
 
+async def _exec_daytona_command(loop: asyncio.AbstractEventLoop, sandbox, command: str) -> None:
+    """Run a setup command in a Daytona sandbox and raise on failure."""
+    try:
+        result = await loop.run_in_executor(None, lambda: sandbox.process.exec(command))
+    except Exception as e:
+        raise RuntimeError(f"command failed in daytona sandbox: {command}: {e}") from e
+    exit_code = getattr(result, "exit_code", getattr(result, "exitCode", None))
+    if exit_code not in (None, 0):
+        output = getattr(result, "result", getattr(result, "output", ""))
+        raise RuntimeError(
+            f"command failed in daytona sandbox (exit {exit_code}): {command}\n{output}"
+        )
+
+
 async def create_daytona(agent_type: str = "claude", dockerfile: str | None = None) -> ProviderInstance:
     """Create a Daytona sandbox with sandbox-agent pre-installed."""
     try:
@@ -266,18 +284,22 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         timeout=create_timeout,
     ))
 
-    # For custom images, install agent processes at runtime (CDN unreachable during build).
-    # Snapshot-based sandboxes may also need the agent installed even if the snapshot
-    # already contains sandbox-agent itself.
+    # Snapshot-based sandboxes must recreate the runtime that the old Dockerfile path
+    # provided, because the snapshot path bypasses dockerfile/image setup entirely.
+    if snapshot is not None:
+        for command in SNAPSHOT_BOOTSTRAP_CMDS:
+            await _exec_daytona_command(loop, sandbox, command)
+
+    # For custom images and snapshot-based sandboxes, install the requested agent runtime.
     if dockerfile is not None or snapshot is not None:
-        await loop.run_in_executor(None, lambda: sandbox.process.exec(
-            f"sandbox-agent install-agent {agent_type}"
-        ))
+        await _exec_daytona_command(loop, sandbox, f"sandbox-agent install-agent {agent_type}")
 
     # Start sandbox-agent server inside
-    await loop.run_in_executor(None, lambda: sandbox.process.exec(
-        f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
-    ))
+    await _exec_daytona_command(
+        loop,
+        sandbox,
+        f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &",
+    )
 
     # Wait for server to be ready
     await asyncio.sleep(3)

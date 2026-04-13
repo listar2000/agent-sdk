@@ -29,7 +29,7 @@ async def test_create_daytona_uses_default_snapshot_when_env_unset(monkeypatch):
     signed = SimpleNamespace(url="https://preview.example.com")
     sandbox = MagicMock()
     sandbox.id = "daytona-sandbox-default"
-    sandbox.process.exec = MagicMock()
+    sandbox.process.exec = MagicMock(return_value=SimpleNamespace(exit_code=0, result="ok"))
     sandbox.create_signed_preview_url = MagicMock(return_value=signed)
 
     class FakeDaytona:
@@ -59,6 +59,12 @@ async def test_create_daytona_uses_default_snapshot_when_env_unset(monkeypatch):
     params, _ = create_calls[0]
     assert isinstance(params, FakeCreateSandboxFromSnapshotParams)
     assert params.kwargs["snapshot"] == "hive-large"
+    sandbox.process.exec.assert_any_call("python3 -m pip install --no-cache-dir hive-evolve")
+    sandbox.process.exec.assert_any_call(
+        "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*"
+    )
+    sandbox.process.exec.assert_any_call("curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh")
+    sandbox.process.exec.assert_any_call("sandbox-agent install-agent claude")
 
 
 @pytest.mark.asyncio
@@ -80,7 +86,7 @@ async def test_create_daytona_uses_snapshot_override(monkeypatch):
     signed = SimpleNamespace(url="https://preview.example.com")
     sandbox = MagicMock()
     sandbox.id = "daytona-sandbox-123"
-    sandbox.process.exec = MagicMock()
+    sandbox.process.exec = MagicMock(return_value=SimpleNamespace(exit_code=0, result="ok"))
     sandbox.create_signed_preview_url = MagicMock(return_value=signed)
 
     class FakeDaytona:
@@ -113,4 +119,9 @@ async def test_create_daytona_uses_snapshot_override(monkeypatch):
     assert isinstance(params, FakeCreateSandboxFromSnapshotParams)
     assert params.kwargs["snapshot"] == "hive-large"
     assert timeout == 60
+    sandbox.process.exec.assert_any_call("python3 -m pip install --no-cache-dir hive-evolve")
+    sandbox.process.exec.assert_any_call(
+        "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*"
+    )
+    sandbox.process.exec.assert_any_call("curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh")
     sandbox.process.exec.assert_any_call("sandbox-agent install-agent claude")
