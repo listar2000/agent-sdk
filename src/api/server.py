@@ -910,14 +910,19 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             url = signed.url
 
             # If sandbox-agent isn't responding, re-launch it. A freshly started
-            # sandbox won't have sandbox-agent running (it was spawned with nohup,
-            # not as a service), so this is the normal path after a stop/start.
+            # sandbox won't have sandbox-agent running (the process doesn't survive
+            # stop/start), so this is the normal path after a stop/start. Use the
+            # same persistent-session helper as create_daytona — plain process.exec
+            # with nohup would get SIGHUPed when the exec session ends.
             if not await _wait_for_health(url, max_retries=5, interval=1.0):
                 log.info("sandbox-agent not responding on %s, relaunching", daytona_sandbox_id)
                 try:
-                    await loop.run_in_executor(None, lambda: sandbox_obj.process.exec(
-                        f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
-                    ))
+                    from .providers import _start_daytona_background
+                    await _start_daytona_background(
+                        loop,
+                        sandbox_obj,
+                        f"sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT}",
+                    )
                 except Exception as exec_err:
                     raise RuntimeError(f"Failed to relaunch sandbox-agent: {exec_err}") from exec_err
                 if not await _wait_for_health(url, max_retries=30, interval=1.0):

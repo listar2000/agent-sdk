@@ -285,6 +285,38 @@ async def _exec_daytona_command(loop: asyncio.AbstractEventLoop, sandbox, comman
         )
 
 
+async def _start_daytona_background(loop: asyncio.AbstractEventLoop, sandbox, command: str,
+                                     session_id: str = "sandbox-agent") -> None:
+    """Start a long-running process in a Daytona sandbox that survives our disconnect.
+
+    `sandbox.process.exec()` is one-shot: when the exec call returns, the
+    remote shell session ends and any backgrounded processes (even with
+    nohup) get reaped. For a persistent server like sandbox-agent we must
+    use a named session + run_async=True, which keeps the process alive
+    independently of any API call lifetime.
+    """
+    try:
+        from daytona_api_client import SessionExecuteRequest
+    except ImportError:
+        raise RuntimeError("daytona-api-client not installed; cannot start background process")
+
+    def _run():
+        # create_session is idempotent-ish; if it already exists Daytona
+        # returns an error — we catch that and reuse the session.
+        try:
+            sandbox.process.create_session(session_id)
+        except Exception as create_err:
+            # Session may already exist from a previous call — that's fine.
+            log.debug("create_session(%s) non-fatal: %s", session_id, create_err)
+        req = SessionExecuteRequest(command=command, run_async=True)
+        return sandbox.process.execute_session_command(session_id, req)
+
+    try:
+        await loop.run_in_executor(None, _run)
+    except Exception as e:
+        raise RuntimeError(f"failed to start background command in daytona sandbox: {command}: {e}") from e
+
+
 async def create_daytona(agent_type: str = "claude", dockerfile: str | None = None) -> ProviderInstance:
     """Create a Daytona sandbox with sandbox-agent pre-installed."""
     if _daytona_circuit_open():
@@ -384,13 +416,17 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
                     agent_type, sandbox.id[:12], ia_err,
                 )
 
-        # Start sandbox-agent server inside
+        # Start sandbox-agent server inside. Use a persistent session + run_async
+        # so the process survives past this API call. (Plain `process.exec` with
+        # nohup & backgrounding lets the server start but then SIGHUPs it when
+        # the exec session ends — which is why every bootstrap ended with the
+        # sandbox being deleted by the health-check gate below.)
         log.info("daytona bootstrap (%s): starting sandbox-agent server", sandbox.id[:12])
         try:
-            await _exec_daytona_command(
+            await _start_daytona_background(
                 loop,
                 sandbox,
-                f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &",
+                f"sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT}",
             )
         except RuntimeError as start_err:
             # If the server command itself fails (e.g. port already bound by an

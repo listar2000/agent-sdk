@@ -97,12 +97,16 @@ async def _ensure_daytona_running(sandbox_id: str, record: "_SandboxRecord") -> 
         )
         url = signed.url
 
-        # Re-launch sandbox-agent if not responding
+        # Re-launch sandbox-agent if not responding. Use a persistent session
+        # (not process.exec + nohup) so the process survives past this call —
+        # see _start_daytona_background docstring for the SIGHUP rationale.
         if not await _wait_for_health_fn(url, max_retries=5, interval=1.0):
-            await loop.run_in_executor(None, lambda: sandbox_obj.process.exec(
-                f"nohup sandbox-agent server --no-token --host 0.0.0.0"
-                f" --port {_SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
-            ))
+            from .providers import _start_daytona_background as _start_bg
+            await _start_bg(
+                loop,
+                sandbox_obj,
+                f"sandbox-agent server --no-token --host 0.0.0.0 --port {_SANDBOX_AGENT_PORT}",
+            )
             if not await _wait_for_health_fn(url, max_retries=20, interval=1.0):
                 raise RuntimeError("Daytona sandbox-agent failed to respond after restart")
 
