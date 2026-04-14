@@ -10,7 +10,6 @@ import logging
 import os
 import signal
 import shutil
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,63 +21,12 @@ from . import load_dotenv
 log = logging.getLogger(__name__)
 
 SANDBOX_AGENT_IMAGE = "rivetdev/sandbox-agent:0.4.2-full"
-DEFAULT_DAYTONA_SNAPSHOT = "hive-large"
 SANDBOX_AGENT_PORT = 3000
 SANDBOX_AGENT_INSTALL_CMDS = [
-    # Used when building Docker images from scratch (runs as root during build).
     "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*",
     "curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh",
 ]
-SNAPSHOT_BOOTSTRAP_CMDS = [
-    # Used when creating from a pre-built snapshot (e.g. hive-large). These run
-    # inside the sandbox as a non-root user, so apt-get would fail with
-    # "Permission denied". Each command is idempotent and short-circuits when
-    # the dependency is already present — which is the expected case for
-    # hive-large, where everything is pre-baked.
-    #
-    # hive-evolve (Python package): pip install is idempotent; re-runs succeed
-    # fast if already installed. pip on hive-large installs to a user-writable
-    # location so root isn't required.
-    "python3 -m pip install --no-cache-dir hive-evolve",
-    # sandbox-agent is the gate for the rest. If it's already on PATH (snapshot
-    # case), skip the entire install chain. Otherwise attempt it — which only
-    # succeeds in a context where we have root (e.g. Dockerfile build), and
-    # fails loudly on a non-root snapshot that doesn't already have everything.
-    (
-        "command -v sandbox-agent >/dev/null 2>&1 || "
-        "("
-        "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm "
-        "&& rm -rf /var/lib/apt/lists/* "
-        "&& curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh"
-        ")"
-    ),
-]
 PORT_BASED_PROVIDERS = frozenset({"local", "docker"})
-
-# ── Daytona circuit breaker ──
-# Prevents runaway sandbox creation when Daytona is failing.
-_daytona_failure_times: list[float] = []
-_DAYTONA_CB_WINDOW = 60       # look-back window (seconds)
-_DAYTONA_CB_THRESHOLD = 3     # failures within window to trip breaker
-_DAYTONA_CB_COOLDOWN = 30     # refuse new creations for this long after trip
-
-
-def _daytona_circuit_open() -> bool:
-    """Return True if too many recent Daytona creation failures."""
-    now = time.monotonic()
-    cutoff = now - _DAYTONA_CB_WINDOW
-    # prune old entries
-    while _daytona_failure_times and _daytona_failure_times[0] < cutoff:
-        _daytona_failure_times.pop(0)
-    if len(_daytona_failure_times) >= _DAYTONA_CB_THRESHOLD:
-        # still in cooldown from last failure?
-        if _daytona_failure_times and (now - _daytona_failure_times[-1]) < _DAYTONA_CB_COOLDOWN:
-            return True
-    return False
-
-
-def _daytona_record_failure() -> None:
-    _daytona_failure_times.append(time.monotonic())
 
 
 async def _wait_for_health(url: str, max_retries: int = 30, interval: float = 0.5) -> bool:
@@ -256,113 +204,10 @@ def _build_daytona_image(dockerfile: str | None):
     return Image.from_dockerfile(dockerfile).run_commands(*SANDBOX_AGENT_INSTALL_CMDS)
 
 
-def _get_daytona_snapshot() -> str | None:
-    """Return the Daytona snapshot name for new sandboxes.
-
-    Defaults to DEFAULT_DAYTONA_SNAPSHOT. Set DAYTONA_SNAPSHOT to override, or to
-    empty /0 / false / image to use the legacy image/Dockerfile path instead.
-    """
-    raw = os.environ.get("DAYTONA_SNAPSHOT")
-    if raw is None:
-        return DEFAULT_DAYTONA_SNAPSHOT
-    s = raw.strip()
-    if not s or s.lower() in ("0", "false", "image"):
-        return None
-    return s
-
-
-async def _exec_daytona_command(loop: asyncio.AbstractEventLoop, sandbox, command: str) -> None:
-    """Run a setup command in a Daytona sandbox and raise on failure."""
-    try:
-        result = await loop.run_in_executor(None, lambda: sandbox.process.exec(command))
-    except Exception as e:
-        raise RuntimeError(f"command failed in daytona sandbox: {command}: {e}") from e
-    exit_code = getattr(result, "exit_code", getattr(result, "exitCode", None))
-    if exit_code not in (None, 0):
-        output = getattr(result, "result", getattr(result, "output", ""))
-        raise RuntimeError(
-            f"command failed in daytona sandbox (exit {exit_code}): {command}\n{output}"
-        )
-
-
-async def _start_daytona_background(loop: asyncio.AbstractEventLoop, sandbox, command: str,
-                                     session_id: str = "sandbox-agent") -> str | None:
-    """Start a long-running process in a Daytona sandbox that survives our disconnect.
-
-    `sandbox.process.exec()` is one-shot: when the exec call returns, the
-    remote shell session ends and any backgrounded processes (even with
-    nohup) get reaped. For a persistent server like sandbox-agent we must
-    use a named session + run_async=True, which keeps the process alive
-    independently of any API call lifetime.
-
-    Returns the command ID if available, so callers can fetch logs for
-    debugging via _fetch_daytona_session_logs.
-    """
-    try:
-        from daytona_api_client import SessionExecuteRequest
-    except ImportError:
-        raise RuntimeError("daytona-api-client not installed; cannot start background process")
-
-    def _run():
-        # create_session is idempotent-ish; if it already exists Daytona
-        # returns an error — we catch that and reuse the session.
-        try:
-            sandbox.process.create_session(session_id)
-        except Exception as create_err:
-            # Session may already exist from a previous call — that's fine.
-            log.debug("create_session(%s) non-fatal: %s", session_id, create_err)
-        req = SessionExecuteRequest(command=command, run_async=True)
-        return sandbox.process.execute_session_command(session_id, req)
-
-    try:
-        result = await loop.run_in_executor(None, _run)
-    except Exception as e:
-        raise RuntimeError(f"failed to start background command in daytona sandbox: {command}: {e}") from e
-
-    # Surface the command ID so the caller can pull logs if health check later fails.
-    return getattr(result, "cmd_id", getattr(result, "cmdId", getattr(result, "id", None)))
-
-
-async def _fetch_daytona_session_logs(loop: asyncio.AbstractEventLoop, sandbox,
-                                       session_id: str, cmd_id: str | None) -> str:
-    """Best-effort fetch of a session command's stdout/stderr for diagnostics.
-
-    Returns an empty string (not None) on any failure so callers can always
-    concatenate safely.
-    """
-    if not cmd_id:
-        return ""
-    try:
-        logs = await loop.run_in_executor(
-            None,
-            lambda: sandbox.process.get_session_command_logs(session_id, cmd_id),
-        )
-    except Exception as e:
-        return f"<failed to fetch logs: {e}>"
-    # Response shape: SessionCommandLogsResponse with .stdout/.stderr (or .output)
-    parts = []
-    for attr in ("output", "stdout", "stderr"):
-        val = getattr(logs, attr, None)
-        if val:
-            parts.append(f"--- {attr} ---\n{val}")
-    return "\n".join(parts) or "<no log output captured>"
-
-
 async def create_daytona(agent_type: str = "claude", dockerfile: str | None = None) -> ProviderInstance:
     """Create a Daytona sandbox with sandbox-agent pre-installed."""
-    if _daytona_circuit_open():
-        raise RuntimeError(
-            "Daytona circuit breaker open: too many recent creation failures. "
-            f"Retry after {_DAYTONA_CB_COOLDOWN}s."
-        )
-
     try:
-        from daytona_sdk import (
-            Daytona,
-            DaytonaConfig,
-            CreateSandboxFromImageParams,
-            CreateSandboxFromSnapshotParams,
-        )
+        from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxFromImageParams, Resources
     except ImportError:
         raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
 
@@ -375,127 +220,44 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
 
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
-    snapshot = _get_daytona_snapshot()
-    if snapshot:
-        if dockerfile is not None:
-            log.info("using Daytona snapshot %s; ignoring dockerfile %s", snapshot, dockerfile)
-        create_params = CreateSandboxFromSnapshotParams(
-            snapshot=snapshot,
-            auto_stop_interval=0,
-            env_vars=env_vars,
-        )
-        create_timeout = 60
-    else:
-        image = _build_daytona_image(dockerfile)
-        create_params = CreateSandboxFromImageParams(
+
+    image = _build_daytona_image(dockerfile)
+
+    # Resources allocated to each Daytona sandbox. CPU in cores, memory/disk in GiB.
+    resources = Resources(cpu=4, memory=8, disk=10)
+
+    # Create sandbox (custom images need longer timeout for build + agent install)
+    create_timeout = 300 if dockerfile else 60
+    sandbox = await loop.run_in_executor(None, lambda: daytona.create(
+        CreateSandboxFromImageParams(
             image=image,
             auto_stop_interval=0,
             env_vars=env_vars,
-        )
-        # Custom images need longer timeout for build + agent install.
-        create_timeout = 300 if dockerfile else 60
-
-    sandbox = await loop.run_in_executor(None, lambda: daytona.create(
-        create_params,
+            resources=resources,
+        ),
         timeout=create_timeout,
     ))
-    log.info("daytona sandbox %s created (snapshot=%s), bootstrapping...", sandbox.id, snapshot)
-    try:
-        # Get signed preview URL early so we can health-check at any point.
-        # (create_signed_preview_url is idempotent — calling it multiple times
-        # just returns URLs, it doesn't consume anything.)
-        signed = await loop.run_in_executor(None, lambda: sandbox.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
-        url = signed.url
 
-        # Fast path: hive-large pre-bakes sandbox-agent AND (depending on the
-        # snapshot generation) may already run it as a service. If the sandbox
-        # is already serving health, skip all bootstrap — it's just wasted work
-        # and can conflict with an already-running sandbox-agent.
-        already_serving = await _wait_for_health(url, max_retries=3, interval=1)
-        if already_serving:
-            log.info("daytona sandbox %s already serving; skipping bootstrap", sandbox.id[:12])
-            return ProviderInstance(provider="daytona", url=url, sandbox_id=sandbox.id)
+    # For custom images, install agent processes at runtime (CDN unreachable during build)
+    if dockerfile is not None:
+        await loop.run_in_executor(None, lambda: sandbox.process.exec(
+            f"sandbox-agent install-agent {agent_type}"
+        ))
 
-        # Snapshot-based sandboxes must recreate the runtime that the old Dockerfile path
-        # provided, because the snapshot path bypasses dockerfile/image setup entirely.
-        # Bootstrap commands are best-effort: on a well-prepared snapshot they are no-ops
-        # (idempotent), and even when a non-critical step fails (e.g. pip install of
-        # hive-evolve in an environment where hive-evolve is already present but pip
-        # complains about something unrelated), we'd rather try to start the server
-        # than fail the whole sandbox.
-        if snapshot is not None:
-            for command in SNAPSHOT_BOOTSTRAP_CMDS:
-                log.info("daytona bootstrap (%s): %s", sandbox.id[:12], command[:80])
-                try:
-                    await _exec_daytona_command(loop, sandbox, command)
-                except RuntimeError as boot_err:
-                    log.warning(
-                        "daytona bootstrap step failed for %s (continuing): %s",
-                        sandbox.id[:12], boot_err,
-                    )
+    # Start sandbox-agent server inside
+    await loop.run_in_executor(None, lambda: sandbox.process.exec(
+        f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
+    ))
 
-        # Install the requested agent runtime. For snapshot sandboxes, this
-        # often succeeds as a no-op (already installed) — tolerate failures
-        # because the final health check is the real gate.
-        if dockerfile is not None or snapshot is not None:
-            log.info("daytona bootstrap (%s): install-agent %s", sandbox.id[:12], agent_type)
-            try:
-                await _exec_daytona_command(loop, sandbox, f"sandbox-agent install-agent {agent_type}")
-            except RuntimeError as ia_err:
-                log.warning(
-                    "install-agent %s failed for %s (continuing — may already be installed): %s",
-                    agent_type, sandbox.id[:12], ia_err,
-                )
+    # Wait for server to be ready
+    await asyncio.sleep(3)
 
-        # Start sandbox-agent server inside. Use a persistent session + run_async
-        # so the process survives past this API call. (Plain `process.exec` with
-        # nohup & backgrounding lets the server start but then SIGHUPs it when
-        # the exec session ends.)
-        log.info("daytona bootstrap (%s): starting sandbox-agent server", sandbox.id[:12])
-        server_cmd_id: str | None = None
-        try:
-            server_cmd_id = await _start_daytona_background(
-                loop,
-                sandbox,
-                f"sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT}",
-            )
-        except RuntimeError as start_err:
-            # If the server command itself fails (e.g. port already bound by an
-            # existing sandbox-agent service), don't give up yet — let the
-            # health check decide whether we have a working server.
-            log.warning(
-                "sandbox-agent start command failed for %s (will still health-check): %s",
-                sandbox.id[:12], start_err,
-            )
+    # Get signed preview URL (max 24h per Daytona API limit)
+    signed = await loop.run_in_executor(None, lambda: sandbox.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
+    url = signed.url
 
-        # Wait for server to be ready
-        await asyncio.sleep(3)
-
-        # 30 retries × 1s = 30s — generous enough for slow cold-start of the
-        # sandbox-agent Node runtime, tight enough to fail a truly broken sandbox.
-        if not await _wait_for_health(url, max_retries=30, interval=1):
-            # Pull the server's stdout/stderr so the log tells us WHY it crashed
-            # — otherwise we're flying blind (prior versions piped everything to
-            # /dev/null, which is why every failure looked the same).
-            agent_logs = await _fetch_daytona_session_logs(
-                loop, sandbox, "sandbox-agent", server_cmd_id,
-            )
-            raise RuntimeError(
-                f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check after 30s\n"
-                f"sandbox-agent output:\n{agent_logs}"
-            )
-    except Exception as startup_err:
-        _daytona_record_failure()
-        # Don't delete the sandbox on failure. We used to, but that masked the
-        # root cause (whatever was running inside died with no trace) and the
-        # retry storm was the original bug. Leave the sandbox alive so operators
-        # can SSH in / inspect via the Daytona UI, and so Daytona's own
-        # lifecycle (auto_stop_interval/auto_archive_interval) cleans it up.
-        log.error(
-            "daytona sandbox %s startup failed (leaving alive for debug): %s",
-            getattr(sandbox, "id", "?"), startup_err,
-        )
-        raise
+    if not await _wait_for_health(url, max_retries=20, interval=1):
+        raise RuntimeError(f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check")
 
     log.info("daytona sandbox-agent ready: %s (sandbox %s)", url[:50], sandbox.id[:16])
     return ProviderInstance(provider="daytona", url=url, sandbox_id=sandbox.id)
