@@ -189,13 +189,16 @@ async def lifespan(app):
         return_exceptions=True,
     )
     SESSIONS.clear()
-    # Parallel instance teardown
-    async def _safe_destroy(inst):
+    # Parallel instance teardown. Use stop_instance (not destroy) so Daytona
+    # sandboxes are stopped — not permanently deleted — across server restarts.
+    # Without this, every container restart wipes all sandbox state, breaking
+    # session recovery for all active users.
+    async def _safe_stop(inst):
         try:
-            await destroy_instance(inst)
+            await stop_instance(inst)
         except Exception as e:
             log.warning("shutdown cleanup failed: %s", e)
-    await asyncio.gather(*[_safe_destroy(i) for i in _INSTANCES.values()])
+    await asyncio.gather(*[_safe_stop(i) for i in _INSTANCES.values()])
     _INSTANCES.clear()
     await close_pool()
 

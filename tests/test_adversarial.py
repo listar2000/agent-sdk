@@ -1790,11 +1790,14 @@ class TestParallelShutdown:
         assert "asyncio.gather" in source
 
     def test_safe_destroy_in_shutdown(self):
-        """Verify shutdown wraps destroy in safe error handling."""
+        """Verify shutdown wraps instance teardown in safe error handling."""
         import inspect
         from api.server import lifespan
         source = inspect.getsource(lifespan)
-        assert "_safe_destroy" in source
+        # Instance teardown at shutdown uses stop_instance (not destroy) to
+        # preserve Daytona sandboxes across server restarts.
+        assert "_safe_stop" in source
+        assert "stop_instance" in source
 
 
 
