@@ -338,32 +338,71 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
     ))
     log.info("daytona sandbox %s created (snapshot=%s), bootstrapping...", sandbox.id, snapshot)
     try:
+        # Get signed preview URL early so we can health-check at any point.
+        # (create_signed_preview_url is idempotent — calling it multiple times
+        # just returns URLs, it doesn't consume anything.)
+        signed = await loop.run_in_executor(None, lambda: sandbox.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
+        url = signed.url
+
+        # Fast path: hive-large pre-bakes sandbox-agent AND (depending on the
+        # snapshot generation) may already run it as a service. If the sandbox
+        # is already serving health, skip all bootstrap — it's just wasted work
+        # and can conflict with an already-running sandbox-agent.
+        already_serving = await _wait_for_health(url, max_retries=3, interval=1)
+        if already_serving:
+            log.info("daytona sandbox %s already serving; skipping bootstrap", sandbox.id[:12])
+            return ProviderInstance(provider="daytona", url=url, sandbox_id=sandbox.id)
+
         # Snapshot-based sandboxes must recreate the runtime that the old Dockerfile path
         # provided, because the snapshot path bypasses dockerfile/image setup entirely.
+        # Bootstrap commands are best-effort: on a well-prepared snapshot they are no-ops
+        # (idempotent), and even when a non-critical step fails (e.g. pip install of
+        # hive-evolve in an environment where hive-evolve is already present but pip
+        # complains about something unrelated), we'd rather try to start the server
+        # than fail the whole sandbox.
         if snapshot is not None:
             for command in SNAPSHOT_BOOTSTRAP_CMDS:
                 log.info("daytona bootstrap (%s): %s", sandbox.id[:12], command[:80])
-                await _exec_daytona_command(loop, sandbox, command)
+                try:
+                    await _exec_daytona_command(loop, sandbox, command)
+                except RuntimeError as boot_err:
+                    log.warning(
+                        "daytona bootstrap step failed for %s (continuing): %s",
+                        sandbox.id[:12], boot_err,
+                    )
 
-        # For custom images and snapshot-based sandboxes, install the requested agent runtime.
+        # Install the requested agent runtime. For snapshot sandboxes, this
+        # often succeeds as a no-op (already installed) — tolerate failures
+        # because the final health check is the real gate.
         if dockerfile is not None or snapshot is not None:
             log.info("daytona bootstrap (%s): install-agent %s", sandbox.id[:12], agent_type)
-            await _exec_daytona_command(loop, sandbox, f"sandbox-agent install-agent {agent_type}")
+            try:
+                await _exec_daytona_command(loop, sandbox, f"sandbox-agent install-agent {agent_type}")
+            except RuntimeError as ia_err:
+                log.warning(
+                    "install-agent %s failed for %s (continuing — may already be installed): %s",
+                    agent_type, sandbox.id[:12], ia_err,
+                )
 
         # Start sandbox-agent server inside
         log.info("daytona bootstrap (%s): starting sandbox-agent server", sandbox.id[:12])
-        await _exec_daytona_command(
-            loop,
-            sandbox,
-            f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &",
-        )
+        try:
+            await _exec_daytona_command(
+                loop,
+                sandbox,
+                f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &",
+            )
+        except RuntimeError as start_err:
+            # If the server command itself fails (e.g. port already bound by an
+            # existing sandbox-agent service), don't give up yet — let the
+            # health check decide whether we have a working server.
+            log.warning(
+                "sandbox-agent start command failed for %s (will still health-check): %s",
+                sandbox.id[:12], start_err,
+            )
 
         # Wait for server to be ready
         await asyncio.sleep(3)
-
-        # Get signed preview URL (max 24h per Daytona API limit)
-        signed = await loop.run_in_executor(None, lambda: sandbox.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
-        url = signed.url
 
         # 30 retries × 1s = 30s — generous enough for slow cold-start of the
         # sandbox-agent Node runtime, tight enough to fail a truly broken sandbox.

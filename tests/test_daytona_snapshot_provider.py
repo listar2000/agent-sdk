@@ -49,7 +49,8 @@ async def test_create_daytona_uses_default_snapshot_when_env_unset(monkeypatch):
 
     monkeypatch.delenv("DAYTONA_SNAPSHOT", raising=False)
     monkeypatch.setenv("DAYTONA_API_KEY", "dtn_test")
-    monkeypatch.setattr("api.providers._wait_for_health", AsyncMock(return_value=True))
+    # First health probe fails (forces full bootstrap path); second succeeds.
+    monkeypatch.setattr("api.providers._wait_for_health", AsyncMock(side_effect=[False, True]))
     monkeypatch.setitem(sys.modules, "daytona_sdk", fake_daytona_sdk)
 
     instance = await create_daytona(agent_type="claude", dockerfile=None)
@@ -67,6 +68,54 @@ async def test_create_daytona_uses_default_snapshot_when_env_unset(monkeypatch):
         f"expected guarded sandbox-agent install command, got: {exec_commands}"
     )
     sandbox.process.exec.assert_any_call("sandbox-agent install-agent claude")
+
+
+@pytest.mark.asyncio
+async def test_create_daytona_skips_bootstrap_when_already_serving(monkeypatch):
+    """hive-large snapshots that pre-run sandbox-agent should skip bootstrap entirely."""
+    class FakeCreateSandboxFromImageParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeCreateSandboxFromSnapshotParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeDaytonaConfig:
+        def __init__(self, api_key):
+            self.api_key = api_key
+
+    signed = SimpleNamespace(url="https://preview.example.com")
+    sandbox = MagicMock()
+    sandbox.id = "daytona-prebaked"
+    sandbox.process.exec = MagicMock(return_value=SimpleNamespace(exit_code=0, result="ok"))
+    sandbox.create_signed_preview_url = MagicMock(return_value=signed)
+
+    class FakeDaytona:
+        def __init__(self, config):
+            pass
+
+        def create(self, params, timeout):
+            return sandbox
+
+    fake_daytona_sdk = SimpleNamespace(
+        Daytona=FakeDaytona,
+        DaytonaConfig=FakeDaytonaConfig,
+        CreateSandboxFromImageParams=FakeCreateSandboxFromImageParams,
+        CreateSandboxFromSnapshotParams=FakeCreateSandboxFromSnapshotParams,
+    )
+
+    monkeypatch.delenv("DAYTONA_SNAPSHOT", raising=False)
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_test")
+    # First health probe succeeds — sandbox-agent is already running.
+    monkeypatch.setattr("api.providers._wait_for_health", AsyncMock(return_value=True))
+    monkeypatch.setitem(sys.modules, "daytona_sdk", fake_daytona_sdk)
+
+    instance = await create_daytona(agent_type="claude", dockerfile=None)
+
+    assert instance.sandbox_id == "daytona-prebaked"
+    # Bootstrap must not run when the server is already healthy.
+    sandbox.process.exec.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -108,7 +157,8 @@ async def test_create_daytona_uses_snapshot_override(monkeypatch):
 
     monkeypatch.setenv("DAYTONA_API_KEY", "dtn_test")
     monkeypatch.setenv("DAYTONA_SNAPSHOT", "hive-large")
-    monkeypatch.setattr("api.providers._wait_for_health", AsyncMock(return_value=True))
+    # First health probe fails (forces bootstrap path); second succeeds.
+    monkeypatch.setattr("api.providers._wait_for_health", AsyncMock(side_effect=[False, True]))
     monkeypatch.setitem(sys.modules, "daytona_sdk", fake_daytona_sdk)
 
     instance = await create_daytona(agent_type="claude", dockerfile="/tmp/ignored.Dockerfile")
