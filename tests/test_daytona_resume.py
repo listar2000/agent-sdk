@@ -58,11 +58,12 @@ class TestDaytonaResumeAfterRestart(unittest.TestCase):
             mock_client_instance.__aexit__ = AsyncMock(return_value=False)
             mock_http.return_value = mock_client_instance
 
-            url = asyncio.run(_ensure_sandbox_alive(
+            url, replaced = asyncio.run(_ensure_sandbox_alive(
                 self.sandbox_id, self.sandbox_record, agent_type="claude",
             ))
 
             assert url == "https://fake-daytona-url.example.com"
+            assert replaced is False
             # Verify it used sandbox_ref (Daytona ID), not the internal sandbox_id
             mock_daytona.get.assert_called_once_with(self.daytona_sandbox_id)
 
@@ -84,11 +85,13 @@ class TestDaytonaResumeAfterRestart(unittest.TestCase):
             mock_instance.url = "http://localhost:2500"
             mock_create.return_value = mock_instance
 
-            url = asyncio.run(_ensure_sandbox_alive(
+            url, replaced = asyncio.run(_ensure_sandbox_alive(
                 "local-sandbox", local_record, agent_type="claude",
             ))
 
             assert url == "http://localhost:2500"
+            # Local providers are ephemeral: restart == fresh state.
+            assert replaced is True
 
 
 if __name__ == "__main__":

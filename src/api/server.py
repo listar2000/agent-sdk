@@ -774,8 +774,14 @@ async def _find_last_replay_event_id(
 
 
 async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
-                                agent_type: str = "claude", dockerfile: str | None = None) -> str:
-    """Ensure the sandbox-agent is reachable. Restart if needed. Returns URL."""
+                                agent_type: str = "claude", dockerfile: str | None = None) -> tuple[str, bool]:
+    """Ensure the sandbox-agent is reachable. Restart if needed.
+
+    Returns (url, replaced) where replaced=True means a brand-new sandbox was
+    created (the old one was gone or unreachable). Callers must treat a
+    replaced sandbox as having NO prior session state on disk — any old
+    inner_session_id is invalid and session/load will fail.
+    """
     instance = _INSTANCES.get(sandbox_id)
     provider = sandbox_record.provider
 
@@ -791,12 +797,12 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             if instance:
                 if instance.process is not None:
                     if instance.process.returncode is None:
-                        return instance.url  # local: still running
+                        return instance.url, False  # local: still running
                 elif instance.container_id:
                     # Docker: health-check URL
                     from .providers import _wait_for_health
                     if await _wait_for_health(instance.url, max_retries=2, interval=0.5):
-                        return instance.url
+                        return instance.url, False
 
             # Clean up old container before creating replacement
             if instance:
@@ -816,7 +822,8 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             await upsert_sandbox(SandboxRecord(
                 id=sandbox_id, provider=provider, sandbox_ref=new_ref, status=STATUS_RUNNING,
             ))
-            return new_instance.url
+            # Local/docker sandboxes are ephemeral — restart always means fresh state.
+            return new_instance.url, True
 
     # For daytona: health-check the URL, restart via Daytona SDK if down.
     # Use sandbox lock to prevent concurrent recovery attempts from racing
@@ -829,7 +836,7 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
                 async with httpx.AsyncClient(timeout=5) as client:
                     r = await client.get(f"{instance.url}/v1/health")
                     if r.status_code == 200:
-                        return instance.url
+                        return instance.url, False
             except Exception:
                 pass
 
@@ -863,7 +870,8 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
                     raise RuntimeError("Daytona sandbox-agent failed to respond after restart")
 
             _INSTANCES[sandbox_id] = ProviderInstance(provider="daytona", url=url, sandbox_id=daytona_sandbox_id)
-            return url
+            # Resumed the same Daytona sandbox — filesystem and session files intact.
+            return url, False
 
         except ImportError:
             raise RuntimeError("daytona-sdk not installed, cannot restart sandbox")
@@ -887,7 +895,7 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             await upsert_sandbox(SandboxRecord(
                 id=sandbox_id, provider="daytona", sandbox_ref=new_ref, status=STATUS_RUNNING,
             ))
-            return new_instance.url
+            return new_instance.url, True
 
 
 async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
@@ -922,9 +930,11 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
             log.error("_do_resume: sandbox %s not found in DB", sandbox_id)
             return JSONResponse({"error": "sandbox not found"}, status_code=404)
 
-        # Auto-restart sandbox if the process died (idle reaper or crash)
+        # Auto-restart sandbox if the process died (idle reaper or crash).
+        # sandbox_replaced=True means a fresh sandbox was created — the old
+        # inner_session_id is now meaningless (no session file on disk).
         try:
-            url = await _ensure_sandbox_alive(
+            url, sandbox_replaced = await _ensure_sandbox_alive(
                 sandbox_id, sandbox_record,
                 agent_type=agent_record.config.agent_type,
                 dockerfile=agent_record.config.dockerfile,
@@ -939,9 +949,26 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
 
         client = SandboxAgentClient(url)
         load_rpc_id = str(uuid.uuid4())
+        # Track the inner session id actually in use post-resume. If we took
+        # the replacement path it's the fresh one from session/new; otherwise
+        # it's the original we loaded from disk.
+        effective_inner_session_id = inner_session_id
         try:
             async def _init_and_load():
+                nonlocal effective_inner_session_id
                 await _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd)
+                if sandbox_replaced:
+                    # Fresh sandbox — no session file exists. Keep the inner
+                    # session created by session/new inside initialize().
+                    fresh_inner = client.get_inner_session_id(acp_session_id)
+                    if not fresh_inner:
+                        raise RuntimeError("session/new returned no sessionId on replacement sandbox")
+                    effective_inner_session_id = fresh_inner
+                    log.warning(
+                        "sandbox %s was replaced; starting fresh inner session %s (old %s discarded)",
+                        sandbox_id, fresh_inner, inner_session_id,
+                    )
+                    return
                 await client._send_rpc(acp_session_id, "session/load", {
                     "sessionId": inner_session_id,
                     "cwd": cwd,
@@ -971,7 +998,12 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
                 pass
             return JSONResponse({"error": f"Failed to resume session: {e}"}, status_code=502)
 
-        last_event_id = await _find_last_replay_event_id(client.base_url, acp_session_id, load_rpc_id)
+        # Only poll for the session/load cursor when we actually ran session/load;
+        # replaced sandboxes have no prior events to replay.
+        last_event_id = (
+            None if sandbox_replaced
+            else await _find_last_replay_event_id(client.base_url, acp_session_id, load_rpc_id)
+        )
 
         # Shut down old session before replacing (atomic swap under sandbox lock
         # to prevent the idle reaper from popping the new session via stale refs)
@@ -984,17 +1016,17 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
                 agent_id=agent_id,
                 sandbox_id=sandbox_id,
                 acp_session_id=acp_session_id,
-                inner_session_id=inner_session_id,
+                inner_session_id=effective_inner_session_id,
                 client=client,
                 last_event_id=last_event_id,
             )
             SESSIONS[session_id] = new_state
             _start_sse_reader(new_state)
-        await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
+        await upsert_session(session_id, agent_id, sandbox_id, effective_inner_session_id)
         return {
             "session_id": session_id, "agent_id": agent_id,
-            "sandbox_id": sandbox_id, "inner_session_id": inner_session_id,
-            "status": "resumed",
+            "sandbox_id": sandbox_id, "inner_session_id": effective_inner_session_id,
+            "status": "resumed" if not sandbox_replaced else "replaced",
         }
 
 
