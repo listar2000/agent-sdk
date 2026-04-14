@@ -238,6 +238,13 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         timeout=create_timeout,
     ))
 
+    # Install hive-evolve — hive-specific Python runtime that agent skills/tools
+    # depend on. The Rivet sandbox image has Python + pip but doesn't bundle
+    # this hive-internal package.
+    await loop.run_in_executor(None, lambda: sandbox.process.exec(
+        "python3 -m pip install --no-cache-dir hive-evolve"
+    ))
+
     # For custom images, install agent processes at runtime (CDN unreachable during build)
     if dockerfile is not None:
         await loop.run_in_executor(None, lambda: sandbox.process.exec(
