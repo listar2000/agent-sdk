@@ -315,18 +315,22 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         create_params,
         timeout=create_timeout,
     ))
+    log.info("daytona sandbox %s created (snapshot=%s), bootstrapping...", sandbox.id, snapshot)
     try:
         # Snapshot-based sandboxes must recreate the runtime that the old Dockerfile path
         # provided, because the snapshot path bypasses dockerfile/image setup entirely.
         if snapshot is not None:
             for command in SNAPSHOT_BOOTSTRAP_CMDS:
+                log.info("daytona bootstrap (%s): %s", sandbox.id[:12], command[:80])
                 await _exec_daytona_command(loop, sandbox, command)
 
         # For custom images and snapshot-based sandboxes, install the requested agent runtime.
         if dockerfile is not None or snapshot is not None:
+            log.info("daytona bootstrap (%s): install-agent %s", sandbox.id[:12], agent_type)
             await _exec_daytona_command(loop, sandbox, f"sandbox-agent install-agent {agent_type}")
 
         # Start sandbox-agent server inside
+        log.info("daytona bootstrap (%s): starting sandbox-agent server", sandbox.id[:12])
         await _exec_daytona_command(
             loop,
             sandbox,
@@ -340,9 +344,17 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         signed = await loop.run_in_executor(None, lambda: sandbox.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
         url = signed.url
 
-        if not await _wait_for_health(url, max_retries=20, interval=1):
-            raise RuntimeError(f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check")
-    except Exception:
+        # 30 retries × 1s = 30s — generous enough for slow cold-start of the
+        # sandbox-agent Node runtime, tight enough to fail a truly broken sandbox.
+        if not await _wait_for_health(url, max_retries=30, interval=1):
+            raise RuntimeError(f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check after 30s")
+    except Exception as startup_err:
+        # Log the specific failure BEFORE attempting cleanup so the root cause
+        # isn't masked by a subsequent delete failure.
+        log.error(
+            "daytona sandbox %s startup failed, will delete: %s",
+            getattr(sandbox, "id", "?"), startup_err,
+        )
         _daytona_record_failure()
         try:
             await loop.run_in_executor(None, lambda: daytona.delete(sandbox))

@@ -844,29 +844,83 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
 
         # Daytona sandbox URL lost or stale — get fresh signed URL, start sandbox if stopped
         log.info("recovering daytona sandbox %s (daytona_id=%s)", sandbox_id, daytona_sandbox_id)
+        needs_replacement = False
+        replacement_reason = ""
         try:
             from .providers import SANDBOX_AGENT_PORT, _wait_for_health, _get_daytona_client
             daytona_client = _get_daytona_client()
             loop = asyncio.get_running_loop()
-            sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
+            try:
+                sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
+            except Exception as get_err:
+                err_msg = str(get_err).lower()
+                if "not found" in err_msg:
+                    needs_replacement = True
+                    replacement_reason = "daytona sandbox not found"
+                    raise RuntimeError(replacement_reason)
+                raise RuntimeError(f"Failed to fetch daytona sandbox: {get_err}") from get_err
 
-            # Start sandbox if stopped (no-op if already running)
-            # sandbox_obj.state may be an enum — compare .value for string check
+            # Read current state — Daytona enum values include: started, stopped,
+            # archived, starting, stopping, archiving, restoring, error,
+            # destroyed, destroying, unknown, creating, etc.
             raw_state = sandbox_obj.state
             state_str = raw_state.value if hasattr(raw_state, 'value') else str(raw_state)
+            log.info("daytona sandbox %s state=%s", daytona_sandbox_id, state_str)
+
+            # Terminal / broken states — no point trying to start, create a
+            # replacement instead.
+            if state_str in ("destroyed", "destroying", "error", "unknown"):
+                needs_replacement = True
+                replacement_reason = f"daytona sandbox in terminal state {state_str!r}"
+                raise RuntimeError(replacement_reason)
+
+            # Needs to be started (covers stopped, archived, and anything
+            # that's not already running). Daytona's start() handles the
+            # archived→restoring→started transition transparently. Give it
+            # plenty of time — archived sandboxes can take longer.
             if state_str != "started":
-                await loop.run_in_executor(None, sandbox_obj.start)
+                log.info("starting daytona sandbox %s (from state=%s)", daytona_sandbox_id, state_str)
+                try:
+                    await loop.run_in_executor(None, lambda: sandbox_obj.start(timeout=180))
+                except Exception as start_err:
+                    start_msg = str(start_err).lower()
+                    # If start says "not found" (race with external deletion)
+                    # or the sandbox is in an unrecoverable state, fall through
+                    # to creating a replacement.
+                    if "not found" in start_msg or state_str == "archived":
+                        needs_replacement = True
+                        replacement_reason = f"failed to start daytona sandbox (state={state_str}): {start_err}"
+                        raise RuntimeError(replacement_reason) from start_err
+                    raise RuntimeError(f"Failed to start daytona sandbox: {start_err}") from start_err
+
+            # Refresh and verify the sandbox is actually running now
+            try:
+                await loop.run_in_executor(None, sandbox_obj.refresh_data)
+                post_raw = sandbox_obj.state
+                post_state = post_raw.value if hasattr(post_raw, 'value') else str(post_raw)
+                if post_state != "started":
+                    raise RuntimeError(f"daytona sandbox did not reach 'started' state (got {post_state!r})")
+            except RuntimeError:
+                raise
+            except Exception as refresh_err:
+                log.warning("refresh_data failed for %s: %s — proceeding anyway", daytona_sandbox_id, refresh_err)
 
             # Get a fresh signed preview URL
             signed = await loop.run_in_executor(None, lambda: sandbox_obj.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
             url = signed.url
 
-            # If sandbox-agent isn't responding, re-launch it
+            # If sandbox-agent isn't responding, re-launch it. A freshly started
+            # sandbox won't have sandbox-agent running (it was spawned with nohup,
+            # not as a service), so this is the normal path after a stop/start.
             if not await _wait_for_health(url, max_retries=5, interval=1.0):
-                await loop.run_in_executor(None, lambda: sandbox_obj.process.exec(
-                    f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
-                ))
-                if not await _wait_for_health(url, max_retries=20, interval=1.0):
+                log.info("sandbox-agent not responding on %s, relaunching", daytona_sandbox_id)
+                try:
+                    await loop.run_in_executor(None, lambda: sandbox_obj.process.exec(
+                        f"nohup sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT} >/dev/null 2>&1 &"
+                    ))
+                except Exception as exec_err:
+                    raise RuntimeError(f"Failed to relaunch sandbox-agent: {exec_err}") from exec_err
+                if not await _wait_for_health(url, max_retries=30, interval=1.0):
                     raise RuntimeError("Daytona sandbox-agent failed to respond after restart")
 
             _INSTANCES[sandbox_id] = ProviderInstance(provider="daytona", url=url, sandbox_id=daytona_sandbox_id)
@@ -876,14 +930,13 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
         except ImportError:
             raise RuntimeError("daytona-sdk not installed, cannot restart sandbox")
         except Exception as e:
-            err_msg = str(e).lower()
-            if "not found" not in err_msg:
+            if not needs_replacement:
                 raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
 
-            # Daytona sandbox was permanently deleted — create a replacement.
+            # Sandbox is gone or unrecoverable — create a replacement.
             log.warning(
-                "daytona sandbox %s gone (not found), creating replacement for sandbox %s",
-                daytona_sandbox_id, sandbox_id,
+                "daytona sandbox %s unrecoverable (%s), creating replacement for sandbox %s",
+                daytona_sandbox_id, replacement_reason, sandbox_id,
             )
             try:
                 new_instance = await create_instance("daytona", agent_type, dockerfile=dockerfile)
