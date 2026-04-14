@@ -60,10 +60,12 @@ async def test_create_daytona_uses_default_snapshot_when_env_unset(monkeypatch):
     assert isinstance(params, FakeCreateSandboxFromSnapshotParams)
     assert params.kwargs["snapshot"] == "hive-large"
     sandbox.process.exec.assert_any_call("python3 -m pip install --no-cache-dir hive-evolve")
-    sandbox.process.exec.assert_any_call(
-        "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*"
+    # Snapshot bootstrap runs a single guarded install command that short-circuits
+    # if sandbox-agent is already present (the expected hive-large case).
+    exec_commands = [call.args[0] for call in sandbox.process.exec.call_args_list]
+    assert any("command -v sandbox-agent" in cmd for cmd in exec_commands), (
+        f"expected guarded sandbox-agent install command, got: {exec_commands}"
     )
-    sandbox.process.exec.assert_any_call("curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh")
     sandbox.process.exec.assert_any_call("sandbox-agent install-agent claude")
 
 
@@ -120,10 +122,12 @@ async def test_create_daytona_uses_snapshot_override(monkeypatch):
     assert params.kwargs["snapshot"] == "hive-large"
     assert timeout == 60
     sandbox.process.exec.assert_any_call("python3 -m pip install --no-cache-dir hive-evolve")
-    sandbox.process.exec.assert_any_call(
-        "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*"
+    # Snapshot bootstrap runs a single guarded install command that short-circuits
+    # if sandbox-agent is already present (the expected hive-large case).
+    exec_commands = [call.args[0] for call in sandbox.process.exec.call_args_list]
+    assert any("command -v sandbox-agent" in cmd for cmd in exec_commands), (
+        f"expected guarded sandbox-agent install command, got: {exec_commands}"
     )
-    sandbox.process.exec.assert_any_call("curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh")
     sandbox.process.exec.assert_any_call("sandbox-agent install-agent claude")
 
 

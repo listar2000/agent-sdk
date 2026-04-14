@@ -25,12 +25,33 @@ SANDBOX_AGENT_IMAGE = "rivetdev/sandbox-agent:0.4.2-full"
 DEFAULT_DAYTONA_SNAPSHOT = "hive-large"
 SANDBOX_AGENT_PORT = 3000
 SANDBOX_AGENT_INSTALL_CMDS = [
+    # Used when building Docker images from scratch (runs as root during build).
     "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*",
     "curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh",
 ]
 SNAPSHOT_BOOTSTRAP_CMDS = [
+    # Used when creating from a pre-built snapshot (e.g. hive-large). These run
+    # inside the sandbox as a non-root user, so apt-get would fail with
+    # "Permission denied". Each command is idempotent and short-circuits when
+    # the dependency is already present — which is the expected case for
+    # hive-large, where everything is pre-baked.
+    #
+    # hive-evolve (Python package): pip install is idempotent; re-runs succeed
+    # fast if already installed. pip on hive-large installs to a user-writable
+    # location so root isn't required.
     "python3 -m pip install --no-cache-dir hive-evolve",
-    *SANDBOX_AGENT_INSTALL_CMDS,
+    # sandbox-agent is the gate for the rest. If it's already on PATH (snapshot
+    # case), skip the entire install chain. Otherwise attempt it — which only
+    # succeeds in a context where we have root (e.g. Dockerfile build), and
+    # fails loudly on a non-root snapshot that doesn't already have everything.
+    (
+        "command -v sandbox-agent >/dev/null 2>&1 || "
+        "("
+        "apt-get update && apt-get install -y --no-install-recommends curl nodejs npm "
+        "&& rm -rf /var/lib/apt/lists/* "
+        "&& curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh"
+        ")"
+    ),
 ]
 PORT_BASED_PROVIDERS = frozenset({"local", "docker"})
 
