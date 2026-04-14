@@ -286,7 +286,7 @@ async def _exec_daytona_command(loop: asyncio.AbstractEventLoop, sandbox, comman
 
 
 async def _start_daytona_background(loop: asyncio.AbstractEventLoop, sandbox, command: str,
-                                     session_id: str = "sandbox-agent") -> None:
+                                     session_id: str = "sandbox-agent") -> str | None:
     """Start a long-running process in a Daytona sandbox that survives our disconnect.
 
     `sandbox.process.exec()` is one-shot: when the exec call returns, the
@@ -294,6 +294,9 @@ async def _start_daytona_background(loop: asyncio.AbstractEventLoop, sandbox, co
     nohup) get reaped. For a persistent server like sandbox-agent we must
     use a named session + run_async=True, which keeps the process alive
     independently of any API call lifetime.
+
+    Returns the command ID if available, so callers can fetch logs for
+    debugging via _fetch_daytona_session_logs.
     """
     try:
         from daytona_api_client import SessionExecuteRequest
@@ -312,9 +315,37 @@ async def _start_daytona_background(loop: asyncio.AbstractEventLoop, sandbox, co
         return sandbox.process.execute_session_command(session_id, req)
 
     try:
-        await loop.run_in_executor(None, _run)
+        result = await loop.run_in_executor(None, _run)
     except Exception as e:
         raise RuntimeError(f"failed to start background command in daytona sandbox: {command}: {e}") from e
+
+    # Surface the command ID so the caller can pull logs if health check later fails.
+    return getattr(result, "cmd_id", getattr(result, "cmdId", getattr(result, "id", None)))
+
+
+async def _fetch_daytona_session_logs(loop: asyncio.AbstractEventLoop, sandbox,
+                                       session_id: str, cmd_id: str | None) -> str:
+    """Best-effort fetch of a session command's stdout/stderr for diagnostics.
+
+    Returns an empty string (not None) on any failure so callers can always
+    concatenate safely.
+    """
+    if not cmd_id:
+        return ""
+    try:
+        logs = await loop.run_in_executor(
+            None,
+            lambda: sandbox.process.get_session_command_logs(session_id, cmd_id),
+        )
+    except Exception as e:
+        return f"<failed to fetch logs: {e}>"
+    # Response shape: SessionCommandLogsResponse with .stdout/.stderr (or .output)
+    parts = []
+    for attr in ("output", "stdout", "stderr"):
+        val = getattr(logs, attr, None)
+        if val:
+            parts.append(f"--- {attr} ---\n{val}")
+    return "\n".join(parts) or "<no log output captured>"
 
 
 async def create_daytona(agent_type: str = "claude", dockerfile: str | None = None) -> ProviderInstance:
@@ -419,11 +450,11 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         # Start sandbox-agent server inside. Use a persistent session + run_async
         # so the process survives past this API call. (Plain `process.exec` with
         # nohup & backgrounding lets the server start but then SIGHUPs it when
-        # the exec session ends — which is why every bootstrap ended with the
-        # sandbox being deleted by the health-check gate below.)
+        # the exec session ends.)
         log.info("daytona bootstrap (%s): starting sandbox-agent server", sandbox.id[:12])
+        server_cmd_id: str | None = None
         try:
-            await _start_daytona_background(
+            server_cmd_id = await _start_daytona_background(
                 loop,
                 sandbox,
                 f"sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT}",
@@ -443,19 +474,27 @@ async def create_daytona(agent_type: str = "claude", dockerfile: str | None = No
         # 30 retries × 1s = 30s — generous enough for slow cold-start of the
         # sandbox-agent Node runtime, tight enough to fail a truly broken sandbox.
         if not await _wait_for_health(url, max_retries=30, interval=1):
-            raise RuntimeError(f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check after 30s")
+            # Pull the server's stdout/stderr so the log tells us WHY it crashed
+            # — otherwise we're flying blind (prior versions piped everything to
+            # /dev/null, which is why every failure looked the same).
+            agent_logs = await _fetch_daytona_session_logs(
+                loop, sandbox, "sandbox-agent", server_cmd_id,
+            )
+            raise RuntimeError(
+                f"sandbox-agent in Daytona sandbox {sandbox.id} failed health check after 30s\n"
+                f"sandbox-agent output:\n{agent_logs}"
+            )
     except Exception as startup_err:
-        # Log the specific failure BEFORE attempting cleanup so the root cause
-        # isn't masked by a subsequent delete failure.
+        _daytona_record_failure()
+        # Don't delete the sandbox on failure. We used to, but that masked the
+        # root cause (whatever was running inside died with no trace) and the
+        # retry storm was the original bug. Leave the sandbox alive so operators
+        # can SSH in / inspect via the Daytona UI, and so Daytona's own
+        # lifecycle (auto_stop_interval/auto_archive_interval) cleans it up.
         log.error(
-            "daytona sandbox %s startup failed, will delete: %s",
+            "daytona sandbox %s startup failed (leaving alive for debug): %s",
             getattr(sandbox, "id", "?"), startup_err,
         )
-        _daytona_record_failure()
-        try:
-            await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
-        except Exception as delete_error:
-            log.warning("failed to delete daytona sandbox %s after startup error: %s", getattr(sandbox, "id", "?"), delete_error)
         raise
 
     log.info("daytona sandbox-agent ready: %s (sandbox %s)", url[:50], sandbox.id[:16])

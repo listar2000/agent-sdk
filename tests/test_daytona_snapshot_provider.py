@@ -182,7 +182,15 @@ async def test_create_daytona_uses_snapshot_override(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_create_daytona_deletes_sandbox_on_health_failure(monkeypatch):
+async def test_create_daytona_preserves_sandbox_on_health_failure(monkeypatch):
+    """Startup failures must NOT delete the sandbox — we want to debug it.
+
+    History: an earlier version deleted on any startup failure, which masked
+    the root cause (logs piped to /dev/null, sandbox gone) and contributed to
+    a retry storm that created thousands of orphaned sandboxes. Now we leave
+    the sandbox alive so operators can inspect it and Daytona's own lifecycle
+    (auto_archive_interval) reaps it.
+    """
     class FakeCreateSandboxFromImageParams:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -226,4 +234,5 @@ async def test_create_daytona_deletes_sandbox_on_health_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="failed health check"):
         await create_daytona(agent_type="claude", dockerfile=None)
 
-    FakeDaytona.last_instance.delete.assert_called_once_with(sandbox)
+    # Sandbox is left alive for debugging; no delete call expected.
+    FakeDaytona.last_instance.delete.assert_not_called()
