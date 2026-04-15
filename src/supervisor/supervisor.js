@@ -19,6 +19,7 @@
  */
 const http = require("node:http");
 const { spawn } = require("node:child_process");
+const SSE_HEARTBEAT_MS = 25000;
 
 function parseArgs(argv) {
     const out = { port: 9100, acp: null, host: "0.0.0.0", cwd: "/tmp", acpArgs: [] };
@@ -165,8 +166,16 @@ function handleSse(req, res) {
     }
     sseSubscribers.add(res);
     log(`sse subscribe (${sseSubscribers.size} total)`);
+    const heartbeat = setInterval(() => {
+        try {
+            res.write(": heartbeat\n\n");
+        } catch {
+            clearInterval(heartbeat);
+        }
+    }, SSE_HEARTBEAT_MS);
 
     req.on("close", () => {
+        clearInterval(heartbeat);
         sseSubscribers.delete(res);
         log(`sse unsubscribe (${sseSubscribers.size} total)`);
     });

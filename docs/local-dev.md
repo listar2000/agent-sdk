@@ -84,14 +84,6 @@ GET    /sandboxes/{id}               — get info
 DELETE /sandboxes/{id}               — destroy
 POST   /sandboxes/{id}/stop          — stop (preserves filesystem on Daytona)
 POST   /sandboxes/{id}/start         — resume stopped sandbox
-
-GET    /sandboxes/{id}/fs            — list directory
-GET    /sandboxes/{id}/fs/file       — read file
-PUT    /sandboxes/{id}/fs/file       — write file
-POST   /sandboxes/{id}/exec          — run command
-POST   /sandboxes/{id}/processes     — start process
-GET    /sandboxes/{id}/health        — health check
-...                                  — desktop, clipboard, etc.
 ```
 
 Sandbox endpoints operate directly on the infrastructure. No session required.
@@ -106,17 +98,20 @@ POST   /sessions/{id}/cancel         — cancel running prompt
 POST   /sessions/{id}/config         — set model, mode, thinking level
 GET    /sessions/{id}/status         — session status
 GET    /sessions/{id}/log            — event log
+POST   /sessions/{id}/sandbox/exec   — run a shell command in session sandbox
 ```
 
-Session endpoints manage agent conversations. They auto-recover if a session
-was reaped by the idle timeout — the server looks up the session in the DB,
-restarts the sandbox if stopped, and reloads the conversation.
+Conversation endpoints (`/sessions/{id}/message`, `/sessions/{id}/events`,
+`/sessions/{id}/cancel`, `/sessions/{id}/config`, `/sessions/{id}/resume`,
+`/sessions/{id}/sandbox/exec`) auto-recover if a session was reaped by the idle
+timeout — the server looks up the session in the DB, restarts the sandbox if
+stopped, and reloads the conversation.
 
 ## Database
 
 The server uses Postgres. Tables are created automatically on startup via
-`CREATE TABLE IF NOT EXISTS`. There is no migration system — schema changes
-require manual SQL or recreating the database (`docker compose down -v`).
+`CREATE TABLE IF NOT EXISTS`. Idempotent migrations in `src/api/db.py`
+(`_MIGRATIONS`) also run on startup to upgrade existing databases safely.
 
 Tables:
 - `agents` — agent configurations (id, name, config JSONB)
@@ -131,7 +126,8 @@ Tables:
 | `DATABASE_URL` | `postgresql://localhost:5432/agent_sdk_server` | Postgres connection string |
 | `ANTHROPIC_API_KEY` | — | Required for Claude agents |
 | `OPENAI_API_KEY` | — | Required for Codex agents |
-| `IDLE_TIMEOUT_S` | `300` | Seconds before idle sessions are reaped |
+| `SANDBOX_IDLE_TIMEOUT` | `300` | Seconds before idle sessions are reaped |
+| `SANDBOX_REAPER_TICK` | `60` | Idle reaper scan interval in seconds |
 | `SSE_HEARTBEAT_INTERVAL` | `30` | SSE heartbeat interval in seconds |
 
 ## Running Tests

@@ -32,7 +32,7 @@ from .db import (
     upsert_agent, get_agent, list_agents, delete_agent,
     upsert_sandbox, get_sandbox, list_sandboxes, delete_sandbox,
     upsert_session, get_session,
-    log_event, get_session_log,
+    log_event, get_session_log, session_has_log_entries,
 )
 from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .sse import (
@@ -298,6 +298,15 @@ def _on_sse_reader_death(state: SessionState) -> None:
     kick subscribers.  No-op if shutdown was already set (intentional shutdown)."""
     if state.shutdown.is_set():
         return
+    log.warning(
+        "[SSE-READER] fatal upstream reader loss for session %s; shutting down session "
+        "(busy=%s, pending=%d, session_subscribers=%d, rpc_subscribers=%d)",
+        state.session_id,
+        state.agent_busy,
+        len(state.pending_prompts),
+        len(state._session_subscribers),
+        sum(len(qs) for qs in state._rpc_subscribers.values()),
+    )
     # Shutdown set BEFORE cancelling so cancelled tasks' handlers short-circuit.
     state.shutdown.set()
     if state.agent_busy:
@@ -316,6 +325,15 @@ def _on_sse_reader_death(state: SessionState) -> None:
         state._kick_subscriber(q)
 
 
+def _sse_reader_disconnect_is_recoverable(state: SessionState) -> bool:
+    """Idle upstream SSE disconnects are recoverable; active-turn loss is not."""
+    return (
+        not state.shutdown.is_set()
+        and state.active_rpc_id is None
+        and not state.pending_prompts
+    )
+
+
 def _broadcast_one_block(state: SessionState, block: str, payload: dict | None,
                           text_parts: list[str], thinking_parts: list[str]) -> None:
     """Shared per-block attribution + processing + dispatch. Called from
@@ -325,6 +343,10 @@ def _broadcast_one_block(state: SessionState, block: str, payload: dict | None,
       - Terminal envelopes carry their own rpc id in `payload.id` — use it.
       - Non-terminals attribute to `active_rpc_id` (the currently executing prompt).
     """
+    # Ignore upstream SSE comments/heartbeats — they keep the transport alive
+    # but do not belong to any rpc and must not reset activity timestamps.
+    if payload is None:
+        return
     if (isinstance(payload, dict)
             and "id" in payload
             and isinstance(payload.get("result"), dict)
@@ -351,50 +373,124 @@ def _start_sse_reader(state: SessionState) -> None:
     Works with the supervisor which exposes the POST+SSE JSON-RPC surface.
     """
     if state._reader_alive:
+        log.info(
+            "[SSE-READER] start requested but reader already alive for session %s",
+            state.session_id,
+        )
         return
     state._reader_alive = True
+    log.info(
+        "[SSE-READER] starting upstream reader for session %s (acp_session=%s, base_url=%s, last_event_id=%s)",
+        state.session_id,
+        state.acp_session_id,
+        getattr(state.client, "base_url", "?"),
+        state.last_event_id or "-",
+    )
 
     async def _reader():
-        reader_buffer = ""
         text_parts: list[str] = []
         thinking_parts: list[str] = []
-        sse_http = None
+        reconnect_delay_s = 1.0
+        attempt = 0
         try:
-            headers = {"Accept": "text/event-stream"}
-            if state.last_event_id:
-                headers["Last-Event-ID"] = state.last_event_id
-            sse_http = httpx.AsyncClient(
-                base_url=state.client.base_url, timeout=None,
-            )
-            async with sse_http.stream(
-                "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
-            ) as resp:
-                async for chunk in resp.aiter_text():
-                    if state.shutdown.is_set():
-                        return
-                    reader_buffer += chunk
-                    while "\n\n" in reader_buffer:
-                        block, reader_buffer = reader_buffer.split("\n\n", 1)
-                        payload = parse_sse_data(block)
-                        _broadcast_one_block(state, block, payload, text_parts, thinking_parts)
+            while not state.shutdown.is_set():
+                reader_buffer = ""
+                sse_http = None
+                disconnect_reason = "upstream_eof"
+                try:
+                    attempt += 1
+                    headers = {"Accept": "text/event-stream"}
+                    if state.last_event_id:
+                        headers["Last-Event-ID"] = state.last_event_id
+                    log.info(
+                        "[SSE-READER] connecting upstream stream for session %s (attempt=%d, last_event_id=%s)",
+                        state.session_id,
+                        attempt,
+                        state.last_event_id or "-",
+                    )
+                    sse_http = httpx.AsyncClient(
+                        base_url=state.client.base_url, timeout=None,
+                    )
+                    async with sse_http.stream(
+                        "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
+                    ) as resp:
+                        resp.raise_for_status()
+                        reconnect_delay_s = 1.0
+                        log.info(
+                            "[SSE-READER] upstream stream connected for session %s (attempt=%d, status=%d)",
+                            state.session_id,
+                            attempt,
+                            resp.status_code,
+                        )
+                        async for chunk in resp.aiter_text():
+                            if state.shutdown.is_set():
+                                log.info(
+                                    "[SSE-READER] session %s shutting down; exiting reader loop",
+                                    state.session_id,
+                                )
+                                return
+                            reader_buffer += chunk
+                            while "\n\n" in reader_buffer:
+                                block, reader_buffer = reader_buffer.split("\n\n", 1)
+                                payload = parse_sse_data(block)
+                                _broadcast_one_block(state, block, payload, text_parts, thinking_parts)
+                except asyncio.CancelledError:
+                    log.info("[SSE-READER] reader task cancelled for session %s", state.session_id)
+                    raise
+                except Exception as e:
+                    disconnect_reason = f"{type(e).__name__}: {e}"
+                    log.warning(
+                        "[SSE-READER] upstream reader error for session %s on attempt %d: %s",
+                        state.session_id,
+                        attempt,
+                        disconnect_reason,
+                    )
+                else:
+                    log.warning(
+                        "[SSE-READER] upstream stream ended for session %s on attempt %d without an exception",
+                        state.session_id,
+                        attempt,
+                    )
+                finally:
+                    if sse_http is not None:
+                        try:
+                            await sse_http.aclose()
+                        except Exception:
+                            pass
+
+                if state.shutdown.is_set():
+                    return
+
+                if _sse_reader_disconnect_is_recoverable(state):
+                    log.warning(
+                        "[SSE-READER] recoverable upstream disconnect for session %s (%s); reconnecting in %.1fs",
+                        state.session_id,
+                        disconnect_reason,
+                        reconnect_delay_s,
+                    )
+                    await asyncio.sleep(reconnect_delay_s)
+                    reconnect_delay_s = min(reconnect_delay_s * 2, 10.0)
+                    continue
+
+                log.warning(
+                    "[SSE-READER] unrecoverable upstream disconnect for session %s (%s) "
+                    "(shutdown=%s, agent_busy=%s, pending=%d, in_SESSIONS=%s)",
+                    state.session_id,
+                    disconnect_reason,
+                    state.shutdown.is_set(),
+                    state.agent_busy,
+                    len(state.pending_prompts),
+                    state.session_id in SESSIONS,
+                )
+                _flush_buffered_text(state, text_parts, thinking_parts, state.active_rpc_id)
+                _on_sse_reader_death(state)
+                state.broadcast(_SSE_SENTINEL)
+                return
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            log.warning("SSE reader error for session %s: %s", state.session_id, e)
         finally:
-            if sse_http is not None:
-                try:
-                    await sse_http.aclose()
-                except Exception:
-                    pass
-            log.warning("[SSE-READER] reader exited for session %s (shutdown=%s, agent_busy=%s, in_SESSIONS=%s)",
-                     state.session_id, state.shutdown.is_set(), state.agent_busy,
-                     state.session_id in SESSIONS)
-            _flush_buffered_text(state, text_parts, thinking_parts,
-                                  state.active_rpc_id)
-            _on_sse_reader_death(state)
-            state.broadcast(_SSE_SENTINEL)
             state._reader_alive = False
+            log.info("[SSE-READER] reader task stopped for session %s", state.session_id)
 
     state._reader_task = asyncio.create_task(_reader())
 
@@ -945,6 +1041,21 @@ def _should_replace_daytona_sandbox(exc: Exception) -> bool:
     ))
 
 
+async def _session_has_logged_activity(session_id: str) -> bool:
+    """Whether this session has any persisted turn/activity logs yet.
+
+    Freshly created sessions can already have an inner_session_id before the
+    agent backend has durably materialized anything that `session/load` can
+    reopen. If the DB check fails, return True so recovery stays conservative
+    and never silently drops history.
+    """
+    try:
+        return await session_has_log_entries(session_id)
+    except Exception as e:
+        log.warning("session %s log-activity check failed: %s", session_id, e)
+        return True
+
+
 async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
                                 agent_type: str = "claude", dockerfile: str | None = None) -> tuple[str, bool]:
     """Ensure the supervisor is reachable. Restart if needed.
@@ -1080,6 +1191,7 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
             return JSONResponse({"error": str(e)}, status_code=502)
 
         cwd = agent_record.config.cwd or "/tmp"
+        session_has_history = await _session_has_logged_activity(session_id)
 
         acp_session_id = str(uuid.uuid4())
 
@@ -1090,7 +1202,12 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
         replay_sse: httpx.AsyncClient | None = None
         replay_stream: httpx.Response | None = None
         try:
-            if sandbox_replaced:
+            if sandbox_replaced or not session_has_history:
+                if not sandbox_replaced:
+                    log.info(
+                        "session %s has no logged activity; creating a fresh inner session",
+                        session_id,
+                    )
                 await asyncio.wait_for(
                     _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd),
                     timeout=120,
@@ -1433,6 +1550,11 @@ _CANCEL_DRAIN_TIMEOUT = 10  # seconds — safety cap so cancel doesn't hang
 
 def _start_session_tasks(state: SessionState) -> None:
     """Start SSE reader + scheduler loop for a session."""
+    log.info(
+        "[SSE-READER] initializing session tasks for session %s (reader_alive=%s)",
+        state.session_id,
+        state._reader_alive,
+    )
     _start_sse_reader(state)
     if state._scheduler_task is None or (hasattr(state._scheduler_task, 'done') and state._scheduler_task.done()):
         state._scheduler_task = asyncio.create_task(_scheduler_loop(state))
@@ -1574,6 +1696,17 @@ async def post_session_message(session_id: str, request: Request):
     if interrupt and state.agent_busy:
         await _cancel_and_drain(state)
 
+    # If the upstream SSE reader died while idle, recreate it before
+    # queuing the next prompt when subscribers are still waiting for events.
+    if state._session_subscribers and not state._reader_alive:
+        log.info(
+            "[SSE-READER] auto-restarting upstream reader from /message for session %s "
+            "(session_subscribers=%d)",
+            state.session_id,
+            len(state._session_subscribers),
+        )
+        _start_sse_reader(state)
+
     state.last_activity = time.time()
     rpc_id = str(uuid.uuid4())
     _submit_prompt(state, rpc_id, message)
@@ -1598,6 +1731,10 @@ async def session_events(session_id: str):
 
         # Restart persistent reader if it died (e.g., supervisor restart)
         if not state._reader_alive:
+            log.info(
+                "[SSE-READER] auto-restarting upstream reader from /events for session %s",
+                state.session_id,
+            )
             _start_sse_reader(state)
 
         my_q = state.subscribe_session()

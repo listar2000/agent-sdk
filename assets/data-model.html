@@ -592,7 +592,7 @@
               <div class="field-badges"></div>
               <span class="field-name">event_type</span>
               <span class="field-type">TEXT</span>
-              <span class="field-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | error</span>
+              <span class="field-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | turn_end | error</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -605,7 +605,7 @@
               <span class="field-type">TIMESTAMPTZ</span>
               <span class="field-desc">default now()</span>
             </div>
-            <div class="relation-note">Append-only telemetry. Query via <code style="font-family:monospace;color:#fb923c;">GET /sessions/{id}/log</code> or <code style="font-family:monospace;color:#fb923c;">GET /agents/{id}/log</code>.</div>
+            <div class="relation-note">Append-only telemetry. Query via <code style="font-family:monospace;color:#fb923c;">GET /sessions/{id}/log</code>.</div>
           </div>
         </div>
 
@@ -622,12 +622,13 @@
           </div>
           <div class="card-body">
             <div class="event-row">agent_message_delta | agent_message_chunk <span class="event-detail">{ content: { text } }</span></div>
+            <div class="event-row">agent_thought_chunk <span class="event-detail">{ content: { text|thinking } }</span></div>
             <div class="event-row">tool_call | execute_tool_started <span class="event-detail">{ _meta: { claudeCode: { toolName } }, rawInput }</span></div>
             <div class="event-row is-new">tool_call_update <span class="event-detail">{ _meta: { claudeCode: { toolResponse } } }</span></div>
             <div class="event-row">usage_updated | usage_update <span class="event-detail">{ cost }</span></div>
             <div class="event-row">JSON-RPC result <span class="event-detail">{ stopReason }</span> <span class="event-detail">— prompt done</span></div>
             <div class="event-row">JSON-RPC error <span class="event-detail">{ code, message }</span></div>
-            <div class="relation-note">Raw ACP events proxied from the supervisor via <code style="font-family:monospace;color:#f472b6;">GET /sessions/{session_id}/events</code></div>
+            <div class="relation-note">Raw ACP events proxied from the supervisor via <code style="font-family:monospace;color:#f472b6;">GET /sessions/{session_id}/events</code>. Attributed blocks are emitted with SSE tag <code style="font-family:monospace;color:#f472b6;">event: rpc:&lt;rpc_id&gt;</code>.</div>
           </div>
         </div>
 
@@ -928,31 +929,54 @@
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">_subscribers</span>
-              <span class="field-type">list[Queue]</span>
-            </div>
-            <div class="field">
-              <div class="field-badges"></div>
               <span class="field-name">_reader_alive</span>
               <span class="field-type">bool</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">_prompt_lock</span>
-              <span class="field-type">asyncio.Lock</span>
-              <span class="field-desc">serializes prompt submission</span>
-            </div>
-            <div class="field is-new">
-              <div class="field-badges"><span class="badge-field-new">new</span></div>
-              <span class="field-name">current_rpc_id</span>
-              <span class="field-type">str?</span>
-              <span class="field-desc">set under _prompt_lock; ghost anchor for SSE tagging</span>
+              <span class="field-name">_log_chain</span>
+              <span class="field-type">asyncio.Task?</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">_inflight_tasks</span>
-              <span class="field-type">dict[str, _InflightTask]</span>
-              <span class="field-desc">rpc_id → asyncio.Task for clean cancellation</span>
+              <span class="field-name">active_rpc_id</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">currently running prompt id</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">pending_prompts</span>
+              <span class="field-type">deque[PendingPrompt]</span>
+              <span class="field-desc">FIFO queue for submitted prompts</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">_prompt_ready</span>
+              <span class="field-type">asyncio.Event</span>
+              <span class="field-desc">wake scheduler when new prompt arrives</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">_prompt_done</span>
+              <span class="field-type">asyncio.Event</span>
+              <span class="field-desc">set when active prompt reaches terminal state</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">_scheduler_task</span>
+              <span class="field-type">asyncio.Task?</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">_session_subscribers</span>
+              <span class="field-type">list[Queue]</span>
+              <span class="field-desc">subscribers receiving all session events</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">_rpc_subscribers</span>
+              <span class="field-type">dict[str, list[Queue]]</span>
+              <span class="field-desc">per-rpc filtered subscriber queues</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -961,18 +985,30 @@
             </div>
             <div class="endpoint-group-label" style="padding-top:8px;">Methods</div>
             <div class="method-row">
-              <span class="method-name">subscribe()</span>
+              <span class="method-name">subscribe_session()</span>
               <span class="method-ret">→ asyncio.Queue</span>
-              <span class="method-desc">register subscriber queue</span>
+              <span class="method-desc">register session-scoped subscriber queue</span>
             </div>
             <div class="method-row">
-              <span class="method-name">unsubscribe(q)</span>
+              <span class="method-name">unsubscribe_session(q)</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">subscribe_rpc(rpc_id)</span>
+              <span class="method-ret">→ asyncio.Queue</span>
+              <span class="method-desc">register rpc-scoped subscriber queue</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">unsubscribe_rpc(rpc_id, q)</span>
+            </div>
+            <div class="method-row">
+              <span class="method-name">dispatch(tag, item)</span>
+              <span class="method-desc">route to rpc-scoped + session-scoped subscribers</span>
             </div>
             <div class="method-row">
               <span class="method-name">broadcast(item)</span>
               <span class="method-desc">push to all subscribers; kick-on-full</span>
             </div>
-            <div class="relation-note">In-memory runtime state. Persistent SSE reader connects once at session creation, fans out to all subscriber queues. Slow subscribers are kicked via _KICK_SENTINEL. ACP/inner session IDs are ephemeral — recreated on connect, restored via native <code style="font-family:monospace;color:#f472b6;">session/load</code> on resume.</div>
+            <div class="relation-note">In-memory runtime state. Persistent SSE reader connects once at session creation and fans out to both session-scoped and rpc-scoped queues. Slow subscribers are kicked via _KICK_SENTINEL. ACP/inner session IDs are ephemeral — recreated on connect, restored via native <code style="font-family:monospace;color:#f472b6;">session/load</code> on resume.</div>
           </div>
         </div>
 
@@ -990,7 +1026,7 @@
   <div class="section">
     <div class="section-header">
       <h2>REST API Endpoints</h2>
-      <p class="section-sub" style="color:#8b949e;">HTTP interface — agent management, hive proxy, and UI routes</p>
+      <p class="section-sub" style="color:#8b949e;">HTTP interface — agent management, session orchestration, and UI routes</p>
     </div>
 
     <div class="endpoints-card">
@@ -1113,6 +1149,12 @@
           <span class="endpoint-path">/sessions/{session_id}/config</span>
           <span class="endpoint-desc">set session config</span>
         </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{session_id}/sandbox/exec</span>
+          <span class="endpoint-desc">run command in the session sandbox</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
 
         <!-- Admin / UI -->
         <div class="endpoint-group-label">Admin &amp; UI</div>
@@ -1135,8 +1177,9 @@
           <span class="endpoint-new-badge">new</span>
         </div>
 
-        <!-- Sandbox operations (filesystem, exec, desktop) are accessed
-             via ACP tools within an agent turn, not direct REST endpoints. -->
+        <!-- Most sandbox operations (filesystem, desktop, clipboard) are exposed
+             through ACP tools inside an agent turn. The helper REST route
+             /sessions/{session_id}/sandbox/exec is available for shell commands. -->
       </div>
     </div>
   </div>

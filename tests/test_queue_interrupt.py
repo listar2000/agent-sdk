@@ -34,6 +34,7 @@ import types
 _stub_db = types.ModuleType("api.db")
 async def _noop(*a, **kw): return None
 async def _noop_list(*a, **kw): return []
+async def _noop_false(*a, **kw): return False
 from contextlib import asynccontextmanager as _asynccontextmanager
 @_asynccontextmanager
 async def _noop_get_db(*a, **kw):
@@ -52,6 +53,7 @@ _stub_db.get_db = _noop_get_db
 _stub_db.delete_sandbox = _noop
 _stub_db.upsert_session = _noop
 _stub_db.get_session = _noop
+_stub_db.session_has_log_entries = _noop_false
 _stub_db.log_event = _noop
 _stub_db.get_session_log = _noop_list
 _stub_db.get_agent_log = _noop_list
@@ -63,11 +65,13 @@ from api.server import (
     SESSIONS,
     _INSTANCES,
     _on_sse_reader_death,
+    _broadcast_one_block,
     _process_sse_block,
     _schedule_log,
     _SSE_SENTINEL,
     _shutdown_session_state,
     _session_idle_since,
+    _sse_reader_disconnect_is_recoverable,
     _mark_turn_finished,
     _idle_reaper,
     _start_session_tasks,
@@ -195,6 +199,20 @@ class TestSubmitPaths:
         assert state.active_rpc_id == rpc_id
         prompt_hold.set()
         await _stop_scheduler(state)
+
+    @pytest.mark.asyncio
+    async def test_submit_restarts_reader_when_dead(self):
+        """A new message should recreate the upstream reader if it is down."""
+        state = _make_state("sess-reader-restart")
+        state._reader_alive = False
+        state.subscribe_session()
+
+        with patch("api.server._start_sse_reader") as mock_start_reader, \
+             patch("api.server.log_event", _noop):
+            resp = await _post_message_via_asgi("sess-reader-restart", "wake up")
+
+        assert resp.status_code == 200
+        mock_start_reader.assert_called_once_with(state)
 class TestInflightTracking:
 
     @pytest.mark.asyncio
@@ -425,6 +443,33 @@ class TestSSEReaderDeathCleanup:
 
         # Subscriber should NOT be kicked on intentional shutdown
         assert q in state._session_subscribers
+
+    def test_idle_disconnect_is_recoverable(self):
+        """Idle reader disconnects should reconnect instead of shutting down."""
+        state = _make_state()
+
+        assert _sse_reader_disconnect_is_recoverable(state) is True
+
+    def test_busy_disconnect_is_not_recoverable(self):
+        """An in-flight turn cannot safely recover from reader loss."""
+        state = _make_state()
+        state.active_rpc_id = "rpc-live"
+
+        assert _sse_reader_disconnect_is_recoverable(state) is False
+
+    def test_pending_disconnect_is_not_recoverable(self):
+        """Queued work means the reader loss should still be treated as fatal."""
+        state = _make_state()
+        state.pending_prompts.append(PendingPrompt(rpc_id="rpc-q", message="queued"))
+
+        assert _sse_reader_disconnect_is_recoverable(state) is False
+
+    def test_shutdown_disconnect_is_not_recoverable(self):
+        """Intentional shutdown should not enter the reconnect path."""
+        state = _make_state()
+        state.shutdown.set()
+
+        assert _sse_reader_disconnect_is_recoverable(state) is False
 class TestLifecycleBugRegression:
 
     @pytest.mark.asyncio
@@ -623,6 +668,16 @@ def _sse(payload: dict) -> str:
 # ---------------------------------------------------------------------------
 
 class TestProcessSseBlock:
+
+    def test_heartbeat_comment_is_not_dispatched(self):
+        """Upstream SSE comments must not appear as rpc events."""
+        state = _make_state()
+        state.active_rpc_id = "rpc-heartbeat"
+        q = state.subscribe_session()
+
+        _broadcast_one_block(state, ": heartbeat", None, [], [])
+
+        assert q.empty()
 
     def test_text_delta_accumulates_in_text_parts(self):
         """Text delta content is appended to text_parts."""
@@ -938,3 +993,86 @@ class TestInterrupt:
 
         state.active_rpc_id = None
         state.pending_prompts.clear()
+
+
+class TestResumeRecovery:
+
+    @pytest.mark.asyncio
+    async def test_empty_reaped_session_starts_fresh_inner_session(self):
+        """A reaped session with no logged turns should not attempt session/load."""
+        from api import server as server_mod
+        from api.models import AgentConfig, AgentRecord, SandboxRecord
+
+        created_clients = []
+
+        class FakeAcpClient:
+            def __init__(self, base_url: str):
+                self.base_url = base_url
+                self.inner_ids = {}
+                self.sent_methods = []
+                created_clients.append(self)
+
+            def get_inner_session_id(self, session_id: str):
+                return self.inner_ids.get(session_id)
+
+            def set_inner_session_id(self, session_id: str, inner_id: str) -> None:
+                self.inner_ids[session_id] = inner_id
+
+            async def handshake(self, session_id: str, agent: str):
+                self.sent_methods.append(("handshake", session_id, agent))
+                return {}
+
+            async def _send_rpc(self, session_id: str, method: str, params: dict, agent=None, rpc_id=None):
+                self.sent_methods.append((method, session_id, params))
+                return {}
+
+            async def close_session(self, session_id: str) -> None:
+                return None
+
+            async def aclose(self) -> None:
+                return None
+
+            async def set_mode(self, session_id: str, mode: str) -> None:
+                return None
+
+        async def fake_apply(client, config, acp_session_id, cwd):
+            client.set_inner_session_id(acp_session_id, "fresh-inner")
+
+        with patch("api.server.get_agent", AsyncMock(return_value=AgentRecord(
+            id="agent-1",
+            name="agent",
+            config=AgentConfig(agent_type="claude", cwd="/tmp"),
+        ))), patch(
+            "api.server.get_sandbox",
+            AsyncMock(return_value=SandboxRecord(
+                id="sbx-1", provider="local", sandbox_ref="2469", status="running",
+            )),
+        ), patch(
+            "api.server._ensure_sandbox_alive",
+            AsyncMock(return_value=("http://sandbox", False)),
+        ), patch(
+            "api.server._session_has_logged_activity",
+            AsyncMock(return_value=False),
+        ), patch(
+            "api.server._apply_config_and_initialize",
+            side_effect=fake_apply,
+        ), patch(
+            "api.server.upsert_session",
+            AsyncMock(),
+        ), patch(
+            "api.server._start_session_tasks",
+        ), patch(
+            "api.server.AcpClient",
+            FakeAcpClient,
+        ):
+            result = await server_mod._do_resume(
+                sandbox_id="sbx-1",
+                agent_id="agent-1",
+                inner_session_id="old-inner",
+                client_session_id="sess-1",
+            )
+
+        assert result["status"] == "resumed"
+        assert result["inner_session_id"] == "fresh-inner"
+        assert server_mod.SESSIONS["sess-1"].inner_session_id == "fresh-inner"
+        assert not any(method == "session/load" for method, *_ in created_clients[0].sent_methods)

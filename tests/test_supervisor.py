@@ -24,6 +24,7 @@ import types
 _stub_db = types.ModuleType("api.db")
 async def _noop(*a, **kw): return None
 async def _noop_list(*a, **kw): return []
+async def _noop_false(*a, **kw): return False
 from contextlib import asynccontextmanager as _asynccontextmanager
 @_asynccontextmanager
 async def _noop_get_db(*a, **kw):
@@ -33,11 +34,12 @@ for name in [
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session", "log_event",
-    "get_session_log", "get_agent_log",
+    "get_session_log", "get_agent_log", "session_has_log_entries",
 ]:
     setattr(_stub_db, name, _noop if "list" not in name and "log" not in name else _noop_list)
 _stub_db.init_db = lambda: None
 _stub_db.get_db = _noop_get_db
+_stub_db.session_has_log_entries = _noop_false
 sys.modules.setdefault("api.db", _stub_db)
 
 from api.providers import create_instance, destroy_instance

@@ -3,8 +3,8 @@
 Base URL: `http://localhost:7778`
 
 The API has two resource groups:
-- **Sandboxes** — infrastructure (container/workspace, filesystem, exec, desktop)
-- **Sessions** — agent conversation (messages, events, resume)
+- **Sandboxes** — infrastructure lifecycle (create, list, get, destroy, stop, start)
+- **Sessions** — agent conversation (messages, events, resume, cancel, config, status, logs)
 
 ## Health
 
@@ -27,6 +27,7 @@ Serves a browser-based chat interface for interacting with agent sessions.
 ```
 POST /sessions/quick
 ```
+Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win.
 
 ```json
 {
@@ -78,16 +79,25 @@ When `interrupt: true`, the server cancels the currently running prompt, waits f
 ```
 GET /sessions/{session_id}/events
 ```
+The server proxies raw ACP SSE blocks and tags attributed prompt events with:
+```
+event: rpc:<rpc_id>
+```
+Untagged blocks are still possible (for example heartbeats or setup chatter).
 
 Event types inside `session/update` notifications:
+Some wrappers may emit `notifications/session/update`; clients should treat both forms equivalently.
 
 | sessionUpdate | Payload |
 |---|---|
 | `agent_message_delta` | `{content: {text: "...", type?: "text"}}` |
-| `agent_message_delta` (thinking) | `{content: {thinking: "...", type: "thinking"}}` |
+| `agent_message_chunk` | `{content: {text: "...", type?: "text"}}` |
+| `agent_message_delta` / `agent_message_chunk` (thinking) | `{content: {thinking: "...", type: "thinking"}}` |
+| `agent_thought_chunk` | `{content: {text\|thinking: "..."}}` |
 | `tool_call` | `{_meta: {claudeCode: {toolName, toolUseId}}, rawInput: {...}}` |
+| `execute_tool_started` | `{_meta: {claudeCode: {toolName, toolUseId}}, rawInput: {...}}` |
 | `tool_call_update` | `{_meta: {claudeCode: {toolResponse\|toolResult, toolName, toolUseId}}}` |
-| `usage_updated` | `{cost: {amount, currency}}` |
+| `usage_updated` / `usage_update` | `{cost: {amount, currency}}` |
 
 Prompt done:
 ```json
@@ -198,7 +208,7 @@ No body. Looks up everything from the DB and restarts the sandbox if stopped. Re
 }
 ```
 
-All session endpoints auto-recover reaped sessions — if a session was removed from memory by the idle reaper, the server transparently looks it up in the DB and rebuilds state. You don't need to call resume explicitly.
+Conversation endpoints (`/message`, `/events`, `/cancel`, `/config`, `/resume`, `/sandbox/exec`) auto-recover reaped sessions by looking up session metadata in Postgres and rebuilding runtime state. You don't need to call resume explicitly before those calls. In-memory introspection endpoints like `/sessions` and `/sessions/{id}/status` do not trigger recovery.
 
 ### Cancel running prompt
 
@@ -220,15 +230,26 @@ POST /sessions/{session_id}/config
 ```
 GET /sessions                        — list active sessions
 GET /sessions/{id}/status            — runtime status
-GET /sessions/{id}/log?limit=500     — event log (newest first)
+GET /sessions/{id}/log?limit=500     — event log (oldest first)
 ```
 
 `GET /sessions/{id}/status` includes the following fields:
 
 | Field | Description |
 |---|---|
-| `inflight_count` | Number of prompts currently in flight (interrupt or regular) |
-| `subscriber_count` | Number of active SSE event subscribers (`events()` connections) |
+| `session_id` | Session ID |
+| `agent_id` | Agent ID |
+| `sandbox_id` | Sandbox ID |
+| `inner_session_id` | Agent-native session ID used for resume/load |
+| `agent_busy` | Whether a prompt is currently active (`active_rpc_id != null`) |
+| `active_rpc_id` | Currently running prompt ID, if any |
+| `pending_count` | Number of queued prompts |
+| `session_subscriber_count` | Number of session-scoped SSE subscribers |
+| `rpc_subscriber_count` | Number of RPC-scoped SSE subscribers |
+| `last_activity` | Unix timestamp of last session activity |
+| `idle_seconds` | Seconds since last terminal turn completion or activity |
+| `has_client` | Whether an ACP client is currently attached |
+| `shutdown_requested` | Whether runtime shutdown is set |
 
 #### Session log event types
 
@@ -242,11 +263,36 @@ Each row has `event_type`, `payload`, `created_at`, and `session_id`.
 | `tool_call` | `{tool, tool_call_id, prompt_id, args?}` |
 | `tool_result` | `{tool, tool_call_id, prompt_id, result}` |
 | `usage` | `{prompt_id, ...cost fields from agent}` |
+| `turn_end` | `{stop_reason, prompt_id, usage?}` |
 | `error` | `{message, kind, prompt_id, traceback?}` |
 
 `prompt_id` is the `rpc_id` returned by `POST /sessions/{id}/message` and ties every event within a single prompt round-trip together.
 
 `tool_call_id` links a `tool_call` row to its corresponding `tool_result` row (matches the `id` field in Claude's `tool_use` content blocks).
+
+## Session sandbox helper
+
+```
+POST /sessions/{session_id}/sandbox/exec
+```
+
+```json
+{"command": "pwd", "timeout": 30}
+```
+
+Returns:
+
+```json
+{
+  "stdout": "...",
+  "stderr": "...",
+  "exit_code": 0,
+  "stdout_truncated": false,
+  "timed_out": false
+}
+```
+
+If the session's sandbox is stopped/reaped, the server auto-recovers it before running the command.
 
 ## Sandboxes
 

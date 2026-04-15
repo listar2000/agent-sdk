@@ -44,6 +44,7 @@ _stub_db = types.ModuleType("api.db")
 
 async def _noop(*a, **kw): return None
 async def _noop_list(*a, **kw): return []
+async def _noop_false(*a, **kw): return False
 async def _noop_agent(*a, **kw): return None
 async def _noop_sandbox(*a, **kw): return None
 async def _noop_session(*a, **kw): return None
@@ -66,6 +67,7 @@ _stub_db.get_db = _noop_get_db
 _stub_db.delete_sandbox = _noop
 _stub_db.upsert_session = _noop
 _stub_db.get_session = _noop_session
+_stub_db.session_has_log_entries = _noop_false
 _stub_db.log_event = _noop
 _stub_db.get_session_log = _noop_list
 _stub_db.get_agent_log = _noop_list
@@ -106,7 +108,7 @@ for _name in (
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session",
-    "log_event", "get_session_log",
+    "session_has_log_entries", "log_event", "get_session_log",
 ):
     setattr(_server_module, _name, getattr(_stub_db, _name))
 
