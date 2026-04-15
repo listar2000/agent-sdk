@@ -6,13 +6,15 @@ we wait 2 seconds then inject an interrupting message via agent.send().
 We observe that the output pivots to reflect the interrupting message.
 
 Prerequisites:
-  docker compose up --build -d
-  curl http://localhost:7778/health    # should return {"status":"ok"}
+  Ensure the API server is reachable.
+  curl https://agent-sdk-server-production.up.railway.app/health
 
 Usage:
   python examples/interrupt_demo.py
+  python examples/interrupt_demo.py --test
 """
 
+import argparse
 import asyncio
 import os
 import sys
@@ -23,21 +25,27 @@ from agent_sdk.client import Agent
 
 DIVIDER = "─" * 60
 
-API_URL = "http://localhost:7778"
+RAILWAY_API_URL = "https://agent-sdk-server-production.up.railway.app"
+LOCAL_TEST_API_URL = "http://localhost:7778"
 
 
 async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true", help="Use local http://localhost:7778 instead of Railway.")
+    args = parser.parse_args()
+    api_url = LOCAL_TEST_API_URL if args.test else RAILWAY_API_URL
+
     print(DIVIDER)
     print("INTERRUPT DEMO")
     print("Ask agent to write a long essay, then interrupt it mid-turn")
-    print(f"API: {API_URL}")
+    print(f"API: {api_url}")
     print(DIVIDER)
 
     agent = Agent(
         "interrupt-demo",
         provider="local",
         model="claude-haiku-4-5-20251001",
-        api_url=API_URL,
+        api_url=api_url,
     )
 
     # Event that fires once we've received the first streaming chunk,

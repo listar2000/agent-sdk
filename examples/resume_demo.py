@@ -19,13 +19,15 @@ endpoint reports `provider_stopped` and the agent still remembers the
 secret afterwards.
 
 Prerequisites:
-  docker compose up --build -d
-  curl http://localhost:7778/health
+  Ensure the API server is reachable.
+  curl https://agent-sdk-server-production.up.railway.app/health
 
 Usage:
   python examples/resume_demo.py [local|docker|daytona]
+  python examples/resume_demo.py [local|docker|daytona] --test
 """
 
+import argparse
 import asyncio
 import os
 import random
@@ -36,16 +38,22 @@ import httpx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk.client import Agent
 
-API_URL = "http://localhost:7778"
+RAILWAY_API_URL = "https://agent-sdk-server-production.up.railway.app"
+LOCAL_TEST_API_URL = "http://localhost:7778"
 
 
 async def main():
-    provider = sys.argv[1] if len(sys.argv) > 1 else "local"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("provider", nargs="?", default="local", choices=["local", "docker", "daytona"])
+    parser.add_argument("--test", action="store_true", help="Use local http://localhost:7778 instead of Railway.")
+    args = parser.parse_args()
+    provider = args.provider
+    api_url = LOCAL_TEST_API_URL if args.test else RAILWAY_API_URL
 
     print(f"=== Step 1: Tell agent a secret number (provider={provider}) ===\n")
     agent = Agent(
         "resume-demo", provider=provider, cwd="/tmp",
-        model="haiku", api_url=API_URL,
+        model="haiku", api_url=api_url,
     )
     num = random.randint(0, 100)
 
@@ -61,13 +69,13 @@ async def main():
     await agent.aclose()
 
     print("\n=== Step 2: Force-reap server-side (kills supervisor + ACP child) ===\n")
-    async with httpx.AsyncClient(base_url=API_URL, timeout=30.0) as adm:
+    async with httpx.AsyncClient(base_url=api_url, timeout=30.0) as adm:
         r = await adm.post(f"/admin/sessions/{saved_session}/reap")
         r.raise_for_status()
         print(f"Reap response: {r.json()}")
 
     print("\n=== Step 3: Resume via session_id and ask for the number ===\n")
-    agent2 = Agent("different-name", session_id=saved_session, api_url=API_URL)
+    agent2 = Agent("different-name", session_id=saved_session, api_url=api_url)
 
     resp2 = await agent2.arun("What secret number did I tell you to remember?")
     print(f"Response: {resp2}")

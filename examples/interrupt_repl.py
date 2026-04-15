@@ -5,11 +5,12 @@ can see exactly which prompt each chunk belongs to. A foreground input
 loop lets you fire normal prompts and interrupt injections concurrently.
 
 Prereqs:
-  docker compose up -d --build
-  curl http://localhost:7778/health
+  Ensure the API server is reachable.
+  curl https://agent-sdk-server-production.up.railway.app/health
 
 Usage:
   python examples/interrupt_repl.py
+  python examples/interrupt_repl.py --test
   python examples/interrupt_repl.py --session-id <uuid>   # resume an existing session
 
 Commands at the >>> prompt:
@@ -29,7 +30,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk.client import Agent
 from api.sse import extract_sse_tag, iter_sse_blocks, parse_acp_event
 
-API_URL = "http://localhost:7778"
+RAILWAY_API_URL = "https://agent-sdk-server-production.up.railway.app"
+LOCAL_TEST_API_URL = "http://localhost:7778"
 
 
 def short(s: str, n: int = 100) -> str:
@@ -88,13 +90,15 @@ async def main() -> None:
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--provider", default="local")
     parser.add_argument("--model", default="claude-sonnet-4-6")
+    parser.add_argument("--test", action="store_true", help="Use local http://localhost:7778 instead of Railway.")
     args = parser.parse_args()
+    api_url = LOCAL_TEST_API_URL if args.test else RAILWAY_API_URL
 
     if args.session_id:
-        agent = Agent("interrupt-repl", session_id=args.session_id, api_url=API_URL)
+        agent = Agent("interrupt-repl", session_id=args.session_id, api_url=api_url)
     else:
         agent = Agent("interrupt-repl", provider=args.provider, cwd="/tmp",
-                      model=args.model, api_url=API_URL)
+                      model=args.model, api_url=api_url)
 
     await agent._ensure_registered()
     print(f"session: {agent.session_id}")

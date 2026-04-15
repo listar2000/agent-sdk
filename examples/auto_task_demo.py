@@ -1,24 +1,28 @@
 """Demo: full auto-task pipeline — extract from trace, generate task, test in sandbox.
 
 Prerequisites:
-  docker compose up --build -d
-  curl http://localhost:7778/health
+  Ensure the API server is reachable.
+  curl https://agent-sdk-server-production.up.railway.app/health
 
 Usage:
   # Generate tasks from latest Claude Code session in current dir:
   python examples/auto_task_demo.py generate
+  python examples/auto_task_demo.py generate --test
 
   # Generate from a specific trace:
   python examples/auto_task_demo.py generate --trace ~/.claude/projects/-home-ubuntu/abc123.jsonl
 
   # Test a generated task by sending an agent into a sandbox:
   python examples/auto_task_demo.py solve ./tasks/some-task-id
+  python examples/auto_task_demo.py solve --test ./tasks/some-task-id
 
   # Validate a task (eval fails on broken state, passes after solution.sh):
   python examples/auto_task_demo.py validate ./tasks/some-task-id
+  python examples/auto_task_demo.py validate --test ./tasks/some-task-id
 
   # Full pipeline: generate + validate + solve
   python examples/auto_task_demo.py full --trace path/to/session.jsonl
+  python examples/auto_task_demo.py full --test --trace path/to/session.jsonl
 """
 
 import asyncio
@@ -30,6 +34,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from afe.auto_task import AutoTaskPipeline, create_task_agents, read_trace, _find_latest_trace
 from afe.task_runner import TaskRunner, validate_task
+
+RAILWAY_API_URL = "https://agent-sdk-server-production.up.railway.app"
+LOCAL_TEST_API_URL = "http://localhost:7778"
 
 
 async def demo_generate(trace_path: str | None = None, output: str = "./tasks"):
@@ -121,16 +128,23 @@ async def demo_full(trace_path: str | None = None, output: str = "./tasks"):
 
 
 def main():
-    if len(sys.argv) < 2:
+    argv = sys.argv[1:]
+    test_mode = False
+    if "--test" in argv:
+        argv.remove("--test")
+        test_mode = True
+    os.environ["AGENT_API_URL"] = LOCAL_TEST_API_URL if test_mode else RAILWAY_API_URL
+
+    if len(argv) < 1:
         print(__doc__)
         sys.exit(1)
 
-    command = sys.argv[1]
+    command = argv[0]
 
     if command == "generate":
         trace = None
         output = "./tasks"
-        args = sys.argv[2:]
+        args = argv[1:]
         i = 0
         while i < len(args):
             if args[i] == "--trace" and i + 1 < len(args):
@@ -142,20 +156,20 @@ def main():
         asyncio.run(demo_generate(trace_path=trace, output=output))
 
     elif command == "solve":
-        if len(sys.argv) < 3:
+        if len(argv) < 2:
             print("Usage: auto_task_demo.py solve <task-dir>")
             sys.exit(1)
-        asyncio.run(demo_solve(sys.argv[2]))
+        asyncio.run(demo_solve(argv[1]))
 
     elif command == "validate":
-        if len(sys.argv) < 3:
+        if len(argv) < 2:
             print("Usage: auto_task_demo.py validate <task-dir>")
             sys.exit(1)
-        asyncio.run(demo_validate(sys.argv[2]))
+        asyncio.run(demo_validate(argv[1]))
 
     elif command == "full":
         trace = None
-        args = sys.argv[2:]
+        args = argv[1:]
         i = 0
         while i < len(args):
             if args[i] == "--trace" and i + 1 < len(args):

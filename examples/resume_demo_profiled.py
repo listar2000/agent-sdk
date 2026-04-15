@@ -1,5 +1,6 @@
 """Profiled version of resume_demo.py — times every sub-operation."""
 
+import argparse
 import asyncio
 import os
 import random
@@ -12,7 +13,8 @@ import httpx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk.client import Agent
 
-API_URL = "http://localhost:7778"
+RAILWAY_API_URL = "https://agent-sdk-server-production.up.railway.app"
+LOCAL_TEST_API_URL = "http://localhost:7778"
 
 
 class Timer:
@@ -45,7 +47,12 @@ async def timed_request(client, method, url, **kwargs):
 
 
 async def main():
-    provider = sys.argv[1] if len(sys.argv) > 1 else "local"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("provider", nargs="?", default="local", choices=["local", "docker", "daytona"])
+    parser.add_argument("--test", action="store_true", help="Use local http://localhost:7778 instead of Railway.")
+    args = parser.parse_args()
+    provider = args.provider
+    api_url = LOCAL_TEST_API_URL if args.test else RAILWAY_API_URL
     num = random.randint(0, 100)
 
     print(f"\n{'='*60}")
@@ -60,7 +67,7 @@ async def main():
     with Timer("Agent.__init__"):
         agent = Agent(
             "resume-demo", provider=provider, cwd="/tmp",
-            model="haiku", api_url=API_URL,
+            model="haiku", api_url=api_url,
         )
 
     # Break down _ensure_registered (sessions/quick)
@@ -91,7 +98,7 @@ async def main():
 
     step2_t0 = time.monotonic()
 
-    async with httpx.AsyncClient(base_url=API_URL, timeout=30.0) as adm:
+    async with httpx.AsyncClient(base_url=api_url, timeout=30.0) as adm:
         with Timer("POST /admin/sessions/{id}/reap"):
             r = await adm.post(f"/admin/sessions/{saved_session}/reap")
             r.raise_for_status()
@@ -106,7 +113,7 @@ async def main():
     step3_t0 = time.monotonic()
 
     with Timer("Agent.__init__ (resume)"):
-        agent2 = Agent("different-name", session_id=saved_session, api_url=API_URL)
+        agent2 = Agent("different-name", session_id=saved_session, api_url=api_url)
 
     # Break down _ensure_registered (resume path)
     with Timer("sessions/{id}/resume (register)"):

@@ -7,14 +7,17 @@ immediately. That kills the `claude` Node.js process inside the sandbox
 while a `session/prompt` is in flight — the same path a real OOM hits.
 
 Prerequisites:
-  docker compose up --build -d
-  curl http://localhost:7778/health
+  Ensure the API server is reachable.
+  curl https://agent-sdk-server-production.up.railway.app/health
 
 Usage:
   python examples/crash_demo.py              # local provider (default)
+  python examples/crash_demo.py --test
   python examples/crash_demo.py daytona      # daytona provider
+  python examples/crash_demo.py daytona --test
 """
 
+import argparse
 import asyncio
 import os
 import sys
@@ -24,7 +27,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk import Agent
 from agent_sdk.errors import PromptError, StreamError
 
-API_URL = "http://localhost:7778"
+RAILWAY_API_URL = "https://agent-sdk-server-production.up.railway.app"
+LOCAL_TEST_API_URL = "http://localhost:7778"
 
 OOM_PROMPT = (
     "Please run this exact "
@@ -33,14 +37,14 @@ OOM_PROMPT = (
 )
 
 
-async def crash(provider: str, cwd: str = "/tmp") -> None:
+async def crash(provider: str, api_url: str, cwd: str = "/tmp") -> None:
     print(f"=== {provider} — asking agent to OOM itself ===\n")
     agent = Agent(
         f"crash-{provider}",
         provider=provider,
         cwd=cwd,
         model="haiku",
-        api_url=API_URL,
+        api_url=api_url,
     )
 
     try:
@@ -70,9 +74,14 @@ async def crash(provider: str, cwd: str = "/tmp") -> None:
 
 
 async def main() -> None:
-    provider = sys.argv[1] if len(sys.argv) > 1 else "local"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("provider", nargs="?", default="local", choices=["local", "daytona"])
+    parser.add_argument("--test", action="store_true", help="Use local http://localhost:7778 instead of Railway.")
+    args = parser.parse_args()
+    provider = args.provider
+    api_url = LOCAL_TEST_API_URL if args.test else RAILWAY_API_URL
     cwd = "/home/sandbox" if provider == "daytona" else "/tmp"
-    await crash(provider, cwd=cwd)
+    await crash(provider, api_url=api_url, cwd=cwd)
 
 
 if __name__ == "__main__":
