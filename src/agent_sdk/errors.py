@@ -14,7 +14,7 @@ class AgentNotRegisteredError(AgentSDKError):
 
 
 class SandboxError(AgentSDKError):
-    """Error from the sandbox or sandbox-agent process."""
+    """Error from the sandbox provider."""
 
 
 class AgentBusyError(AgentSDKError):

@@ -6,9 +6,13 @@ huge bytearray in Python, which the kernel OOM-killer will SIGKILL almost
 immediately. That kills the `claude` Node.js process inside the sandbox
 while a `session/prompt` is in flight — the same path a real OOM hits.
 
+Prerequisites:
+  docker compose up --build -d
+  curl http://localhost:7778/health
+
 Usage:
-  PYTHONPATH=src python examples/crash_demo.py local
-  PYTHONPATH=src python examples/crash_demo.py daytona
+  python examples/crash_demo.py              # local provider (default)
+  python examples/crash_demo.py daytona      # daytona provider
 """
 
 import asyncio
@@ -20,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk import Agent
 from agent_sdk.errors import PromptError, StreamError
 
-API_URL = os.environ.get("AGENT_API_URL", "http://localhost:7778")
+API_URL = "http://localhost:7778"
 
 OOM_PROMPT = (
     "Please run this exact "

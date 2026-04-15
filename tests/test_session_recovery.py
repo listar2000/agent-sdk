@@ -9,6 +9,7 @@ These tests FAIL against the buggy code (which just returns 404) and
 PASS once the auto-recovery fix is applied.
 """
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -211,6 +212,65 @@ class TestReaperThenResumeIntegration:
             recovered = SESSIONS[session_id]
             assert recovered.sandbox_id == sandbox_id
             assert recovered.inner_session_id == inner_session_id
+
+
+class TestConcurrentRecovery:
+    """Two concurrent requests for the same reaped session must not 404 or 502,
+    and must not double-resume — the per-session lock inside _do_resume guards this."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_to_reaped_session_all_succeed(self):
+        """5 concurrent POSTs to a reaped session: none should 404 or 502.
+
+        The first request triggers _do_resume, adds session to SESSIONS.
+        Subsequent concurrent requests may also enter _do_resume, but the
+        lock+already_active guard ensures they return without double-work.
+        All responses must be 200 or 409, never 404/502.
+        """
+        session_id = "sess-concurrent-1"
+        sandbox_id = "sbx-concurrent-1"
+        agent_id = "agt-concurrent-1"
+        inner_session_id = "inner-concurrent-1"
+
+        resume_invocations = []
+
+        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+            resume_invocations.append(client_session_id)
+            # Yield to let other coroutines race in before we populate SESSIONS
+            await asyncio.sleep(0)
+            if client_session_id not in SESSIONS:
+                new_state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
+                new_state.client.prompt = AsyncMock()
+                SESSIONS[client_session_id] = new_state
+            return {
+                "session_id": client_session_id, "agent_id": agent_id,
+                "sandbox_id": sandbox_id, "inner_session_id": inner_session_id,
+                "status": "resumed",
+            }
+
+        db_record = {
+            "id": session_id, "agent_id": agent_id,
+            "sandbox_id": sandbox_id, "inner_session_id": inner_session_id,
+        }
+
+        with patch("api.server.get_session", AsyncMock(return_value=db_record)), \
+             patch("api.server._do_resume", side_effect=fake_do_resume), \
+             patch("api.server.log_event", AsyncMock()):
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                responses = await asyncio.gather(*[
+                    client.post(f"/sessions/{session_id}/message",
+                                json={"message": f"concurrent-{i}"})
+                    for i in range(5)
+                ])
+
+        status_codes = [r.status_code for r in responses]
+        bad = [s for s in status_codes if s not in (200, 409)]
+        assert not bad, (
+            f"concurrent recovery produced unexpected status codes: {status_codes}\n"
+            f"_do_resume was called {len(resume_invocations)} times"
+        )
 
 
 class TestNoRecoveryNeeded:

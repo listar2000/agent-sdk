@@ -2,16 +2,17 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install Node.js (required by sandbox-agent for Claude/Codex agents)
-RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm && rm -rf /var/lib/apt/lists/*
-
-# Install sandbox-agent binary
-RUN curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh
+# Install Node.js (required for ACP supervisor)
+RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm git && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml .
 COPY src/ src/
+COPY ui/ ui/
 
 RUN pip install --no-cache-dir .
+
+# Preinstall supervisor Node deps so first-session startup doesn't wait on npm.
+RUN cd src/supervisor && npm install --silent
 
 EXPOSE 7778
 

@@ -7,7 +7,9 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import tempfile
+from pathlib import Path
 import time
 import traceback
 import uuid
@@ -20,37 +22,39 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 
 from .models import (
     AgentConfig, AgentRecord, SandboxRecord, SessionState,
+    PendingPrompt,
     EVT_USER_MESSAGE, EVT_ASSISTANT_MESSAGE, EVT_REASONING,
     EVT_TOOL_CALL, EVT_TOOL_RESULT, EVT_USAGE, EVT_ERROR,
-    STATUS_RUNNING,
+    STATUS_RUNNING, _KICK_SENTINEL,
 )
 from .db import (
     init_db, init_pool, close_pool,
     upsert_agent, get_agent, list_agents, delete_agent,
     upsert_sandbox, get_sandbox, list_sandboxes, delete_sandbox,
     upsert_session, get_session,
-    log_event, get_session_log, get_agent_log,
+    log_event, get_session_log,
 )
-from .sandbox_agent_client import SandboxAgentClient, _mcp_dict_to_acp_array
+from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .sse import (
     parse_sse_data, iter_sse_blocks, parse_acp_payload,
     classify_message_content,
     extract_tool_name, extract_tool_call_id, extract_tool_response,
-    UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK, UT_TOOL_CALL, UT_TOOL_STARTED,
+    UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK, UT_THOUGHT_CHUNK,
+    UT_TOOL_CALL, UT_TOOL_STARTED,
     UT_TOOL_CALL_UPDATE, UT_USAGE_UPDATED, UT_USAGE_UPDATE,
 )
-from .providers import PORT_BASED_PROVIDERS, ProviderInstance, create_instance, destroy_instance, stop_instance, stop_daytona
+from .providers import PORT_BASED_PROVIDERS, ProviderInstance, create_instance, destroy_instance, stop_instance, stop_daytona, exec_in_instance
 from .redact import redact_secrets
-from .sandbox import get_sandbox_client, ensure_sandbox_running
 
-# Configure logging for the api namespace so uvicorn displays our logs.
-# Level can be overridden via LOG_LEVEL env var.
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logging.getLogger("api").setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger(__name__)
+
+
+def _configure_logging() -> None:
+    """Set up logging. Called once at server startup, not on import."""
+    level = os.environ.get("LOG_LEVEL", "INFO")
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("api").setLevel(level)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # DB + in-memory state
@@ -87,11 +91,11 @@ async def _cancel_task(task) -> None:
 
 
 async def _close_session_gracefully(state: "SessionState", *, background: bool = False) -> None:
-    """Close the HTTP connection to sandbox-agent.
+    """Close the HTTP connection to the ACP supervisor.
 
-    We just drop the connection — sandbox-agent detects the disconnect
+    We just drop the connection — the supervisor detects the disconnect
     and cleans up child processes. The old DELETE /v1/acp/{id} approach
-    hangs because sandbox-agent blocks waiting for Claude to shut down.
+    hangs because the ACP process blocks waiting for the agent to shut down.
     """
     client = state.client
     if not client:
@@ -112,10 +116,16 @@ async def _shutdown_session_state(
 ) -> None:
     """Close a runtime session and optionally remove it from the active registry."""
     state.shutdown.set()
-    state.agent_busy = False
+    # Re-check: new work may have arrived between the caller's idle check and here.
+    if state.active_rpc_id is not None or state.pending_prompts or state._session_subscribers:
+        state.shutdown.clear()
+        return
     idle_at = time.time() if mark_idle_at is None else mark_idle_at
     state.turn_completed_at = idle_at
     state.last_activity = idle_at
+    state.active_rpc_id = None
+    state.pending_prompts.clear()
+    await _cancel_task(state._scheduler_task)
     await _cancel_task(state._reader_task)
     await _close_session_gracefully(state, background=background_close)
     if remove and SESSIONS.get(state.session_id) is state:
@@ -126,7 +136,6 @@ async def _shutdown_session_state(
 def _mark_turn_finished(state: SessionState, at: float | None = None) -> float:
     """Mark a session turn as terminal so idle reaping can proceed."""
     finished_at = time.time() if at is None else at
-    state.agent_busy = False
     state.turn_completed_at = finished_at
     state.last_activity = finished_at
     return finished_at
@@ -142,17 +151,18 @@ def _session_idle_since(state: SessionState) -> float:
 # ---------------------------------------------------------------------------
 
 IDLE_TIMEOUT_S = int(os.environ.get("SANDBOX_IDLE_TIMEOUT", "300"))  # 5 min default
+REAPER_TICK_S = int(os.environ.get("SANDBOX_REAPER_TICK", "60"))
 
 
 async def _idle_reaper():
     """Background task: close idle sessions that have been inactive too long."""
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(REAPER_TICK_S)
         now = time.time()
         log.info("idle reaper tick: sessions=%d", len(SESSIONS))
 
         for state in list(SESSIONS.values()):
-            if state.agent_busy:
+            if state.active_rpc_id is not None or state.pending_prompts or state._session_subscribers:
                 continue
             idle_since = _session_idle_since(state)
             if now - idle_since < IDLE_TIMEOUT_S:
@@ -161,10 +171,11 @@ async def _idle_reaper():
                      state.session_id, now - idle_since)
             sandbox_id = state.sandbox_id
             await _shutdown_session_state(state, remove=True, mark_idle_at=now)
-            # If no other sessions use this sandbox, stop the sandbox-agent.
+            # If no other sessions use this sandbox, stop the supervisor.
             # For local/docker: kills the process (no filesystem to preserve).
             # For daytona: stops the workspace (filesystem preserved for resume).
             if not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+                _sandbox_locks.pop(sandbox_id, None)
                 instance = _INSTANCES.pop(sandbox_id, None)
                 if instance:
                     log.info("idle reaper: stopping sandbox %s (provider=%s)",
@@ -178,6 +189,7 @@ async def _idle_reaper():
 
 @asynccontextmanager
 async def lifespan(app):
+    _configure_logging()
     init_db()
     await init_pool()
     reaper = asyncio.create_task(_idle_reaper())
@@ -232,35 +244,15 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Persistent SSE reader — connects to sandbox-agent once per session
+# Persistent SSE reader — connects to supervisor once per session
 # ---------------------------------------------------------------------------
 
 _SSE_SENTINEL = object()
 
 
-async def _flush_text_parts(state: SessionState, parts: list[str],
-                             event_type: str = EVT_ASSISTANT_MESSAGE,
-                             prompt_id: str | None = None) -> None:
-    """Fire-and-forget: flush accumulated assistant text to the log."""
-    if not parts:
-        return
-    payload: dict = {"text": redact_secrets("".join(parts))}
-    if prompt_id is not None:
-        payload["prompt_id"] = prompt_id
-    try:
-        await log_event(
-            session_id=state.session_id, agent_id=state.agent_id,
-            sandbox_id=state.sandbox_id,
-            event_type=event_type,
-            payload=payload,
-        )
-    except Exception:
-        pass
 
-
-def _maybe_auto_approve_permission(block: str, state: SessionState) -> None:
-    """If the SSE block is a session/request_permission, auto-approve it."""
-    payload = parse_sse_data(block)
+def _maybe_auto_approve_permission(payload: dict | None, state: SessionState) -> None:
+    """If the SSE payload is a session/request_permission, auto-approve it."""
     if not payload or payload.get("method") != "session/request_permission":
         return
     rpc_id = payload.get("id")
@@ -301,10 +293,63 @@ def _maybe_auto_approve_permission(block: str, state: SessionState) -> None:
     asyncio.create_task(_grant())
 
 
+def _on_sse_reader_death(state: SessionState) -> None:
+    """Handle unexpected SSE reader death: set shutdown, cancel inflight tasks,
+    kick subscribers.  No-op if shutdown was already set (intentional shutdown)."""
+    if state.shutdown.is_set():
+        return
+    # Shutdown set BEFORE cancelling so cancelled tasks' handlers short-circuit.
+    state.shutdown.set()
+    if state.agent_busy:
+        log.warning("[SSE-READER] reader died while agent_busy — clearing busy flag for session %s",
+                    state.session_id)
+        state.turn_completed_at = time.time()
+    state.active_rpc_id = None
+    state.pending_prompts.clear()
+    # Kick all subscribers (session + RPC-scoped)
+    kicked = list(state._session_subscribers)
+    state._session_subscribers.clear()
+    for rpc_qs in state._rpc_subscribers.values():
+        kicked.extend(rpc_qs)
+    state._rpc_subscribers.clear()
+    for q in kicked:
+        state._kick_subscriber(q)
+
+
+def _broadcast_one_block(state: SessionState, block: str, payload: dict | None,
+                          text_parts: list[str], thinking_parts: list[str]) -> None:
+    """Shared per-block attribution + processing + dispatch. Called from
+    both the HTTP and WebSocket reader paths.
+
+    Tagging rules:
+      - Terminal envelopes carry their own rpc id in `payload.id` — use it.
+      - Non-terminals attribute to `active_rpc_id` (the currently executing prompt).
+    """
+    if (isinstance(payload, dict)
+            and "id" in payload
+            and isinstance(payload.get("result"), dict)
+            and "stopReason" in payload["result"]):
+        tag = payload["id"]
+    else:
+        tag = state.active_rpc_id
+    _process_sse_block(block, state, text_parts, thinking_parts,
+                       log_events=True, payload=payload)
+    _maybe_auto_approve_permission(payload, state)
+    # Drop empty blocks (spurious \n\n separators from the upstream stream)
+    # and blocks we can't attribute to any rpc (session-setup chatter
+    # arriving after our reader subscribes but before any prompt).
+    if not block.strip() or tag is None:
+        return
+    state.dispatch(tag, (tag, block + "\n\n"))
+
+
 def _start_sse_reader(state: SessionState) -> None:
-    """Start a background task that reads SSE from the sandbox-agent and
-    broadcasts chunks to all subscriber queues. Called at session creation
-    so events are captured before any prompt is sent."""
+    """Start a background task that reads SSE from the upstream /v1/acp/{id}
+    endpoint and broadcasts chunks to subscriber queues. Called at session
+    creation so events are captured before any prompt is sent.
+
+    Works with the supervisor which exposes the POST+SSE JSON-RPC surface.
+    """
     if state._reader_alive:
         return
     state._reader_alive = True
@@ -327,42 +372,29 @@ def _start_sse_reader(state: SessionState) -> None:
                 async for chunk in resp.aiter_text():
                     if state.shutdown.is_set():
                         return
-                    state.broadcast(chunk)
                     reader_buffer += chunk
                     while "\n\n" in reader_buffer:
                         block, reader_buffer = reader_buffer.split("\n\n", 1)
-                        _process_sse_block(block, state, text_parts,
-                                            thinking_parts, log_events=True)
-                        # Auto-approve permission requests for headless operation
-                        _maybe_auto_approve_permission(block, state)
+                        payload = parse_sse_data(block)
+                        _broadcast_one_block(state, block, payload, text_parts, thinking_parts)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             log.warning("SSE reader error for session %s: %s", state.session_id, e)
         finally:
-            # Explicit httpx cleanup — safety net in case CancelledError
-            # interrupted the async-with context manager's __aexit__.
             if sse_http is not None:
                 try:
                     await sse_http.aclose()
                 except Exception:
                     pass
-            state._reader_alive = False
             log.warning("[SSE-READER] reader exited for session %s (shutdown=%s, agent_busy=%s, in_SESSIONS=%s)",
                      state.session_id, state.shutdown.is_set(), state.agent_busy,
                      state.session_id in SESSIONS)
-            # If the reader died while the agent was busy (e.g., sandbox-agent
-            # crash), the stopReason will never arrive. Clear agent_busy so the
-            # session isn't permanently stuck.  Skip this on intentional shutdown
-            # since _shutdown_session_state already handles cleanup.
-            if state.agent_busy and not state.shutdown.is_set():
-                log.warning("[SSE-READER] reader died while agent_busy — clearing busy flag for session %s",
-                            state.session_id)
-                state.agent_busy = False
-                state.turn_completed_at = time.time()
             _flush_buffered_text(state, text_parts, thinking_parts,
-                                  state.current_rpc_id)
+                                  state.active_rpc_id)
+            _on_sse_reader_death(state)
             state.broadcast(_SSE_SENTINEL)
+            state._reader_alive = False
 
     state._reader_task = asyncio.create_task(_reader())
 
@@ -372,28 +404,68 @@ def _start_sse_reader(state: SessionState) -> None:
 # ---------------------------------------------------------------------------
 
 async def _apply_config_and_initialize(
-    client: SandboxAgentClient,
+    client: AcpClient,
     config: AgentConfig,
     acp_session_id: str,
     cwd: str,
 ) -> None:
-    """Configure MCP servers + deploy skills, then initialize the ACP session."""
-    setup_tasks = []
-    for mcp_name, mcp_cfg in (config.mcp_servers or {}).items():
-        setup_tasks.append(client.configure_mcp(mcp_name, mcp_cfg, directory=cwd))
-    for skill_name, skill_cfg in (config.skills or {}).items():
-        setup_tasks.append(client.configure_skills(skill_name, skill_cfg, directory=cwd))
-    if setup_tasks:
-        results = await asyncio.gather(*setup_tasks, return_exceptions=True)
-        errors = [r for r in results if isinstance(r, Exception)]
-        if errors:
-            raise errors[0]
-    if config.skills:
-        await client.deploy_skills_from_config(config.skills, cwd=cwd)
+    """Initialize the ACP session with MCP server config."""
     await client.initialize(
         acp_session_id, config.agent_type or "claude",
         cwd=cwd, mcp_servers=config.mcp_servers,
     )
+
+
+# ---------------------------------------------------------------------------
+# Skills provisioning (npx skills)
+# ---------------------------------------------------------------------------
+
+def _normalize_skills(skills) -> list[str]:
+    """Normalize skills config into a list of source strings for ``npx skills add``.
+
+    Accepts:
+      - list[str]:  ["rllm-org/hive#staging", "vercel-labs/agent-skills"]
+      - dict:       {"hive": {"source": "rllm-org/hive#staging"}, ...}
+    """
+    if skills is None:
+        return []
+    if isinstance(skills, list):
+        return [str(s) for s in skills]
+    if isinstance(skills, dict):
+        sources = []
+        for name, cfg in skills.items():
+            if isinstance(cfg, str):
+                sources.append(cfg)
+            elif isinstance(cfg, dict):
+                src = cfg.get("source", "")
+                ref = cfg.get("ref")
+                if ref and "#" not in src:
+                    src = f"{src}#{ref}"
+                if src:
+                    sources.append(src)
+        return sources
+    return []
+
+
+def _skills_install_commands(skills) -> list[str]:
+    """Return shell commands to install skills via ``npx skills add``."""
+    sources = _normalize_skills(skills)
+    return [f"npx -y skills add {shlex.quote(source)} --all -g" for source in sources]
+
+
+async def _install_skills_locally(skills) -> None:
+    """Install skills on the local host (for the local provider)."""
+    for cmd in _skills_install_commands(skills):
+        log.info("installing skill (local): %s", cmd)
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError(f"skill install failed: {stderr.decode()[:500]}")
+        log.info("skill installed: %s", stdout.decode()[-200:].strip())
 
 
 # ---------------------------------------------------------------------------
@@ -573,13 +645,90 @@ async def start_sandbox_route(sandbox_id: str):
         return JSONResponse({"error": "sandbox not found"}, status_code=404)
 
     try:
-        url = await ensure_sandbox_running(sandbox_id)
+        agent_type = "claude"
+        url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type=agent_type)
     except Exception as e:
         return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=500)
 
     record.status = "running"
     await upsert_sandbox(record)
     return {"status": "running", "url": url}
+
+
+# ---------------------------------------------------------------------------
+# Admin
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/sessions")
+async def admin_list_sessions():
+    """List in-memory sessions and instances. Useful for debugging cleanup."""
+    return {
+        "sessions": [
+            {
+                "session_id": s.session_id,
+                "agent_id": s.agent_id,
+                "sandbox_id": s.sandbox_id,
+                "inner_session_id": s.inner_session_id,
+                "agent_busy": s.agent_busy,
+                "active_rpc_id": s.active_rpc_id,
+                "pending_count": len(s.pending_prompts),
+                "session_subscribers": len(s._session_subscribers),
+                "rpc_subscribers": sum(len(qs) for qs in s._rpc_subscribers.values()),
+                "shutdown": s.shutdown.is_set(),
+            }
+            for s in SESSIONS.values()
+        ],
+        "instances": [
+            {
+                "sandbox_id": sid,
+                "provider": inst.provider,
+                "url": inst.url,
+                "port": inst.port,
+                "container_id": inst.container_id[:12] if inst.container_id else None,
+                "process_alive": (
+                    inst.process is not None and inst.process.returncode is None
+                ),
+            }
+            for sid, inst in _INSTANCES.items()
+        ],
+    }
+
+
+@app.post("/admin/sessions/{session_id}/reap")
+async def admin_reap_session(session_id: str):
+    """Force-reap a session synchronously: same teardown the idle reaper does
+    but without idle-time gating. Cancels the SSE reader, drops the session
+    from SESSIONS, and stops the underlying provider instance (kills the
+    supervisor + ACP child for local/docker; stops the workspace for daytona).
+
+    The session_id remains valid afterwards — POST /sessions/{id}/resume
+    will hit the recovery path: a fresh supervisor + ACP child get spawned
+    and AcpClient.initialize runs session/load against the stored
+    inner_session_id to restore conversation history.
+    """
+    state = SESSIONS.get(session_id)
+    if state is None:
+        return JSONResponse({"error": "session not in memory"}, status_code=404)
+
+    sandbox_id = state.sandbox_id
+    await _shutdown_session_state(state, remove=True, mark_idle_at=time.time())
+
+    stopped_provider: str | None = None
+    if sandbox_id and not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+        instance = _INSTANCES.pop(sandbox_id, None)
+        if instance is not None:
+            stopped_provider = instance.provider
+            try:
+                await stop_instance(instance)
+            except Exception as e:
+                log.warning("admin reap: stop_instance failed for %s: %s", sandbox_id, e)
+
+    return {
+        "session_id": session_id,
+        "sandbox_id": sandbox_id,
+        "provider_stopped": stopped_provider,
+        "status": "reaped",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -629,26 +778,27 @@ def _flush_buffered_text(state: SessionState, text_parts: list,
     within a turn is preserved chronologically.  Goes through the per-session
     log chain so the rows land in the same order they were scheduled.
     """
-    if text_parts:
-        text = redact_secrets("".join(text_parts))
-        text_parts.clear()
+    for parts, evt_type in ((text_parts, EVT_ASSISTANT_MESSAGE),
+                            (thinking_parts, EVT_REASONING)):
+        if not parts:
+            continue
+        text = redact_secrets("".join(parts))
+        parts.clear()
         payload: dict = {"text": text}
         if prompt_id is not None:
             payload["prompt_id"] = prompt_id
-        _schedule_log(state, EVT_ASSISTANT_MESSAGE, payload)
-    if thinking_parts:
-        text = redact_secrets("".join(thinking_parts))
-        thinking_parts.clear()
-        payload = {"text": text}
-        if prompt_id is not None:
-            payload["prompt_id"] = prompt_id
-        _schedule_log(state, EVT_REASONING, payload)
+        _schedule_log(state, evt_type, payload)
 
 
 def _process_sse_block(block: str, state: SessionState, text_parts: list,
                        thinking_parts: list,
-                       *, log_events: bool = False) -> None:
-    """Parse SSE block: accumulate text/thinking, update state, optionally log to DB."""
+                       *, log_events: bool = False,
+                       payload: dict | None = None) -> None:
+    """Parse SSE block: accumulate text/thinking, update state, optionally log to DB.
+
+    `payload` can be passed in pre-parsed to avoid a second json.loads on the
+    hot path (the reader loop already parses each block to decide the tag).
+    """
     # Track the SSE cursor from the single reader only — multiple
     # proxy subscribers must not write last_event_id concurrently.
     if log_events:
@@ -658,12 +808,13 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
                 break
         state.last_activity = time.time()
 
-    payload = parse_sse_data(block)
+    if payload is None:
+        payload = parse_sse_data(block)
     if payload is None:
         return
 
     kind, data = parse_acp_payload(payload, None)
-    prompt_id = state.current_rpc_id
+    prompt_id = state.active_rpc_id
 
     if kind == "update":
         update = data or {}
@@ -677,6 +828,12 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
                     text_parts.append(value)
                 elif kind == "reasoning":
                     thinking_parts.append(value)
+
+        elif ut == UT_THOUGHT_CHUNK:
+            content = update.get("content", {})
+            text = content.get("text") or content.get("thinking") or ""
+            if text:
+                thinking_parts.append(text)
 
         elif log_events and ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
             # Flush any accumulated text/thinking before the tool call so the
@@ -714,12 +871,19 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
         return
 
     if kind == "done_result":
-        # JSON-RPC result with stopReason → agent turn finished
         if log_events:
             _mark_turn_finished(state)
             _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
+            result = data or {}
+            done_payload: dict = {
+                "stop_reason": result.get("stopReason"),
+                "prompt_id": prompt_id,
+            }
+            usage = result.get("usage")
+            if usage:
+                done_payload["usage"] = usage
+            _schedule_log(state, "turn_end", done_payload)
         else:
-            # Subscribers/replayers — just clear the local buffers.
             text_parts.clear()
             thinking_parts.clear()
         return
@@ -737,30 +901,25 @@ def _process_sse_block(block: str, state: SessionState, text_parts: list,
         })
 
 
-async def _find_last_replay_event_id(
-    base_url: str, acp_session_id: str, load_rpc_id: str, timeout_s: float = 60,
+async def _find_last_replay_event_id_from_stream(
+    resp: httpx.Response, load_rpc_id: str, timeout_s: float = 30,
 ) -> str | None:
-    """Read SSE events until the session/load RPC response appears, return its event ID.
+    """Read an already-open SSE stream until the session/load RPC response appears.
 
-    After session/load, the ACP server replays the old conversation as SSE events,
-    ending with a JSON-RPC response whose id matches load_rpc_id.
-    Times out after ``timeout_s`` seconds to avoid blocking the event loop forever.
+    The stream must have been opened BEFORE session/load was sent so the
+    replay events are captured.  Returns the last SSE event ID seen up to
+    and including the load response.
     """
     async def _scan() -> str | None:
         last_id = None
-        async with httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(30, read=timeout_s + 10, pool=30)) as h:
-            async with h.stream(
-                "GET", f"/v1/acp/{acp_session_id}",
-                headers={"Accept": "text/event-stream"},
-            ) as resp:
-                async for block in iter_sse_blocks(resp):
-                    for line in block.split("\n"):
-                        if line.startswith("id:"):
-                            last_id = line[3:].strip()
-                    payload = parse_sse_data(block)
-                    if payload is not None:
-                        if str(payload.get("id", "")) == load_rpc_id and "result" in payload:
-                            return last_id
+        async for block in iter_sse_blocks(resp):
+            for line in block.split("\n"):
+                if line.startswith("id:"):
+                    last_id = line[3:].strip()
+            payload = parse_sse_data(block)
+            if payload is not None:
+                if str(payload.get("id", "")) == load_rpc_id and "result" in payload:
+                    return last_id
         return last_id
 
     try:
@@ -773,14 +932,25 @@ async def _find_last_replay_event_id(
         return None
 
 
+def _should_replace_daytona_sandbox(exc: Exception) -> bool:
+    """True when a Daytona recovery error means the old sandbox is gone for good."""
+    text = str(exc).lower()
+    return any(token in text for token in (
+        "not found",
+        "destroyed",
+        "destroying",
+        "terminal state",
+        "unrecoverable",
+        "unknown",
+    ))
+
+
 async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
                                 agent_type: str = "claude", dockerfile: str | None = None) -> tuple[str, bool]:
-    """Ensure the sandbox-agent is reachable. Restart if needed.
+    """Ensure the supervisor is reachable. Restart if needed.
 
-    Returns (url, replaced) where replaced=True means a brand-new sandbox was
-    created (the old one was gone or unreachable). Callers must treat a
-    replaced sandbox as having NO prior session state on disk — any old
-    inner_session_id is invalid and session/load will fail.
+    Returns ``(url, replaced)`` where ``replaced=True`` means a fresh Daytona
+    sandbox had to be created because the old one was unrecoverable.
     """
     instance = _INSTANCES.get(sandbox_id)
     provider = sandbox_record.provider
@@ -822,14 +992,11 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             await upsert_sandbox(SandboxRecord(
                 id=sandbox_id, provider=provider, sandbox_ref=new_ref, status=STATUS_RUNNING,
             ))
-            # Local/docker sandboxes are ephemeral — restart always means fresh state.
-            return new_instance.url, True
+            return new_instance.url, False
 
-    # For daytona: health-check the URL, restart via Daytona SDK if down.
-    # Use sandbox lock to prevent concurrent recovery attempts from racing
-    # and creating duplicate sandboxes.
+    # For daytona: health-check the URL; if down, restart the supervisor
+    # inside the existing sandbox (preserves filesystem + acp session state).
     async with _get_sandbox_lock(sandbox_id):
-        # Re-check after acquiring lock — another request may have recovered it.
         instance = _INSTANCES.get(sandbox_id)
         if instance and instance.url:
             try:
@@ -840,120 +1007,31 @@ async def _ensure_sandbox_alive(sandbox_id: str, sandbox_record: SandboxRecord,
             except Exception:
                 pass
 
-        daytona_sandbox_id = sandbox_record.sandbox_ref  # Daytona's own sandbox ID
-
-        # Daytona sandbox URL lost or stale — get fresh signed URL, start sandbox if stopped
+        daytona_sandbox_id = sandbox_record.sandbox_ref
         log.info("recovering daytona sandbox %s (daytona_id=%s)", sandbox_id, daytona_sandbox_id)
-        needs_replacement = False
-        replacement_reason = ""
+        replaced = False
         try:
-            from .providers import SANDBOX_AGENT_PORT, _wait_for_health, _get_daytona_client
-            daytona_client = _get_daytona_client()
-            loop = asyncio.get_running_loop()
-            try:
-                sandbox_obj = await loop.run_in_executor(None, lambda: daytona_client.get(daytona_sandbox_id))
-            except Exception as get_err:
-                err_msg = str(get_err).lower()
-                if "not found" in err_msg:
-                    needs_replacement = True
-                    replacement_reason = "daytona sandbox not found"
-                    raise RuntimeError(replacement_reason)
-                raise RuntimeError(f"Failed to fetch daytona sandbox: {get_err}") from get_err
-
-            # Read current state — Daytona enum values include: started, stopped,
-            # archived, starting, stopping, archiving, restoring, error,
-            # destroyed, destroying, unknown, creating, etc.
-            raw_state = sandbox_obj.state
-            state_str = raw_state.value if hasattr(raw_state, 'value') else str(raw_state)
-            log.info("daytona sandbox %s state=%s", daytona_sandbox_id, state_str)
-
-            # Terminal / broken states — no point trying to start, create a
-            # replacement instead.
-            if state_str in ("destroyed", "destroying", "error", "unknown"):
-                needs_replacement = True
-                replacement_reason = f"daytona sandbox in terminal state {state_str!r}"
-                raise RuntimeError(replacement_reason)
-
-            # Needs to be started (covers stopped, archived, and anything
-            # that's not already running). Daytona's start() handles the
-            # archived→restoring→started transition transparently. Give it
-            # plenty of time — archived sandboxes can take longer.
-            if state_str != "started":
-                log.info("starting daytona sandbox %s (from state=%s)", daytona_sandbox_id, state_str)
-                try:
-                    await loop.run_in_executor(None, lambda: sandbox_obj.start(timeout=180))
-                except Exception as start_err:
-                    start_msg = str(start_err).lower()
-                    # If start says "not found" (race with external deletion)
-                    # or the sandbox is in an unrecoverable state, fall through
-                    # to creating a replacement.
-                    if "not found" in start_msg or state_str == "archived":
-                        needs_replacement = True
-                        replacement_reason = f"failed to start daytona sandbox (state={state_str}): {start_err}"
-                        raise RuntimeError(replacement_reason) from start_err
-                    raise RuntimeError(f"Failed to start daytona sandbox: {start_err}") from start_err
-
-            # Refresh and verify the sandbox is actually running now
-            try:
-                await loop.run_in_executor(None, sandbox_obj.refresh_data)
-                post_raw = sandbox_obj.state
-                post_state = post_raw.value if hasattr(post_raw, 'value') else str(post_raw)
-                if post_state != "started":
-                    raise RuntimeError(f"daytona sandbox did not reach 'started' state (got {post_state!r})")
-            except RuntimeError:
-                raise
-            except Exception as refresh_err:
-                log.warning("refresh_data failed for %s: %s — proceeding anyway", daytona_sandbox_id, refresh_err)
-
-            # Get a fresh signed preview URL
-            signed = await loop.run_in_executor(None, lambda: sandbox_obj.create_signed_preview_url(SANDBOX_AGENT_PORT, 24 * 3600))
-            url = signed.url
-
-            # If sandbox-agent isn't responding, re-launch it. A freshly started
-            # sandbox won't have sandbox-agent running (the process doesn't survive
-            # stop/start), so this is the normal path after a stop/start. Use the
-            # same persistent-session helper as create_daytona — plain process.exec
-            # with nohup would get SIGHUPed when the exec session ends.
-            if not await _wait_for_health(url, max_retries=5, interval=1.0):
-                log.info("sandbox-agent not responding on %s, relaunching", daytona_sandbox_id)
-                try:
-                    from .providers import _start_daytona_background
-                    await _start_daytona_background(
-                        loop,
-                        sandbox_obj,
-                        f"sandbox-agent server --no-token --host 0.0.0.0 --port {SANDBOX_AGENT_PORT}",
-                    )
-                except Exception as exec_err:
-                    raise RuntimeError(f"Failed to relaunch sandbox-agent: {exec_err}") from exec_err
-                if not await _wait_for_health(url, max_retries=30, interval=1.0):
-                    raise RuntimeError("Daytona sandbox-agent failed to respond after restart")
-
-            _INSTANCES[sandbox_id] = ProviderInstance(provider="daytona", url=url, sandbox_id=daytona_sandbox_id)
-            # Resumed the same Daytona sandbox — filesystem and session files intact.
-            return url, False
-
-        except ImportError:
-            raise RuntimeError("daytona-sdk not installed, cannot restart sandbox")
+            from .providers import restart_daytona_supervisor
+            new_instance = await restart_daytona_supervisor(daytona_sandbox_id, agent_type)
         except Exception as e:
-            if not needs_replacement:
+            if not _should_replace_daytona_sandbox(e):
                 raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
-
-            # Sandbox is gone or unrecoverable — create a replacement.
             log.warning(
-                "daytona sandbox %s unrecoverable (%s), creating replacement for sandbox %s",
-                daytona_sandbox_id, replacement_reason, sandbox_id,
+                "daytona sandbox %s unrecoverable for sandbox %s: %s; creating replacement",
+                daytona_sandbox_id, sandbox_id, e,
             )
             try:
                 new_instance = await create_instance("daytona", agent_type, dockerfile=dockerfile)
             except Exception as create_err:
                 raise RuntimeError(f"Failed to create replacement daytona sandbox: {create_err}")
+            replaced = True
 
-            _INSTANCES[sandbox_id] = new_instance
-            new_ref = new_instance.sandbox_id or sandbox_id
-            await upsert_sandbox(SandboxRecord(
-                id=sandbox_id, provider="daytona", sandbox_ref=new_ref, status=STATUS_RUNNING,
-            ))
-            return new_instance.url, True
+        _INSTANCES[sandbox_id] = new_instance
+        await upsert_sandbox(SandboxRecord(
+            id=sandbox_id, provider="daytona", sandbox_ref=new_instance.sandbox_id or sandbox_id,
+            status=STATUS_RUNNING,
+        ))
+        return new_instance.url, replaced
 
 
 async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
@@ -1005,47 +1083,60 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
 
         acp_session_id = str(uuid.uuid4())
 
-        client = SandboxAgentClient(url)
+        client = AcpClient(url)
         load_rpc_id = str(uuid.uuid4())
-        # Track the inner session id actually in use post-resume. If we took
-        # the replacement path it's the fresh one from session/new; otherwise
-        # it's the original we loaded from disk.
         effective_inner_session_id = inner_session_id
+        last_event_id = None
+        replay_sse: httpx.AsyncClient | None = None
+        replay_stream: httpx.Response | None = None
         try:
-            async def _init_and_load():
-                nonlocal effective_inner_session_id
-                await _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd)
-                if sandbox_replaced:
-                    # Fresh sandbox — no session file exists. Keep the inner
-                    # session created by session/new inside initialize().
-                    fresh_inner = client.get_inner_session_id(acp_session_id)
-                    if not fresh_inner:
-                        raise RuntimeError("session/new returned no sessionId on replacement sandbox")
-                    effective_inner_session_id = fresh_inner
-                    log.warning(
-                        "sandbox %s was replaced; starting fresh inner session %s (old %s discarded)",
-                        sandbox_id, fresh_inner, inner_session_id,
-                    )
-                    return
+            if sandbox_replaced:
+                await asyncio.wait_for(
+                    _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd),
+                    timeout=120,
+                )
+                effective_inner_session_id = client.get_inner_session_id(acp_session_id)
+                if not effective_inner_session_id:
+                    raise RuntimeError("session/new returned no sessionId on replacement sandbox")
+            else:
+                await asyncio.wait_for(
+                    client.handshake(acp_session_id, agent_record.config.agent_type or "claude"),
+                    timeout=30,
+                )
+                replay_sse = httpx.AsyncClient(
+                    base_url=client.base_url,
+                    timeout=httpx.Timeout(30, read=60, pool=30),
+                )
+                replay_stream = await replay_sse.send(
+                    replay_sse.build_request(
+                        "GET", f"/v1/acp/{acp_session_id}",
+                        headers={"Accept": "text/event-stream"},
+                    ),
+                    stream=True,
+                )
                 await client._send_rpc(acp_session_id, "session/load", {
                     "sessionId": inner_session_id,
                     "cwd": cwd,
                     "mcpServers": _mcp_dict_to_acp_array(agent_record.config.mcp_servers) if agent_record.config.mcp_servers else [],
                 }, rpc_id=load_rpc_id)
                 client.set_inner_session_id(acp_session_id, inner_session_id)
-                # initialize() set bypassPermissions on the fresh inner session
-                # from session/new. After session/load swaps to the persistent
-                # inner session, we need to re-apply the mode so the resumed
-                # conversation also runs in bypassPermissions.
                 try:
-                    if await client.has_capability(agent_record.config.agent_type or "claude", "permissions"):
-                        await client.set_mode(acp_session_id, "bypassPermissions")
+                    await client.set_mode(acp_session_id, "bypassPermissions")
                 except Exception as e:
                     log.warning("_do_resume: failed to set bypassPermissions after session/load: %s", e)
-            await asyncio.wait_for(_init_and_load(), timeout=120)
         except Exception as e:
-            log.error("_do_resume: session/load failed for sandbox %s inner %s: %s: %s",
+            log.error("_do_resume: failed for sandbox %s inner %s: %s: %s",
                       sandbox_id, inner_session_id, type(e).__name__, e)
+            if replay_stream is not None:
+                try:
+                    await replay_stream.aclose()
+                except Exception:
+                    pass
+            if replay_sse is not None:
+                try:
+                    await replay_sse.aclose()
+                except Exception:
+                    pass
             try:
                 await client.close_session(acp_session_id)
             except Exception:
@@ -1055,13 +1146,16 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
             except Exception:
                 pass
             return JSONResponse({"error": f"Failed to resume session: {e}"}, status_code=502)
-
-        # Only poll for the session/load cursor when we actually ran session/load;
-        # replaced sandboxes have no prior events to replay.
-        last_event_id = (
-            None if sandbox_replaced
-            else await _find_last_replay_event_id(client.base_url, acp_session_id, load_rpc_id)
-        )
+        if replay_stream is not None:
+            last_event_id = await _find_last_replay_event_id_from_stream(replay_stream, load_rpc_id)
+            try:
+                await replay_stream.aclose()
+            except Exception:
+                pass
+            try:
+                await replay_sse.aclose()
+            except Exception:
+                pass
 
         # Shut down old session before replacing (atomic swap under sandbox lock
         # to prevent the idle reaper from popping the new session via stale refs)
@@ -1075,16 +1169,18 @@ async def _do_resume(*, sandbox_id: str, agent_id: str, inner_session_id: str,
                 sandbox_id=sandbox_id,
                 acp_session_id=acp_session_id,
                 inner_session_id=effective_inner_session_id,
+                agent_type=agent_record.config.agent_type or "claude",
                 client=client,
                 last_event_id=last_event_id,
             )
             SESSIONS[session_id] = new_state
-            _start_sse_reader(new_state)
+            _start_session_tasks(new_state)
         await upsert_session(session_id, agent_id, sandbox_id, effective_inner_session_id)
         return {
             "session_id": session_id, "agent_id": agent_id,
             "sandbox_id": sandbox_id, "inner_session_id": effective_inner_session_id,
-            "status": "resumed" if not sandbox_replaced else "replaced",
+            "status": "resumed",
+            "status": "resumed",
         }
 
 
@@ -1142,523 +1238,9 @@ async def get_or_recover_session(session_id: str) -> SessionState:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox filesystem / exec / config proxy endpoints
+# (sandbox proxy endpoints removed — use ACP tools inside a turn instead)
 # ---------------------------------------------------------------------------
 
-async def _proxy(coro):
-    """Run a sandbox-agent call with standard 502 error handling."""
-    try:
-        return await coro
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/fs")
-async def sandbox_list_dir(sandbox_id: str, path: str = "/"):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.list_dir(path))
-
-
-@app.get("/sandboxes/{sandbox_id}/fs/file")
-async def sandbox_read_file(sandbox_id: str, path: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        content = await client.read_file(path)
-        return PlainTextResponse(content)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.put("/sandboxes/{sandbox_id}/fs/file")
-async def sandbox_write_file(sandbox_id: str, path: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        body = await request.body()
-        await client.write_file(path, body.decode("utf-8", errors="replace"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/exec")
-async def sandbox_run_command(sandbox_id: str, request: Request):
-    try:
-        data = await request.json()
-    except Exception as e:
-        return JSONResponse({"error": f"Invalid JSON body: {e}"}, status_code=400)
-    command = data.get("command")
-    if not command:
-        return JSONResponse({"error": "Missing required field: command"}, status_code=400)
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        result = await client.run_command(command, args=data.get("args"), cwd=data.get("cwd"))
-        return result
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/processes")
-async def sandbox_start_process(sandbox_id: str, request: Request):
-    try:
-        data = await request.json()
-    except Exception as e:
-        return JSONResponse({"error": f"Invalid JSON body: {e}"}, status_code=400)
-    command = data.get("command")
-    if not command:
-        return JSONResponse({"error": "Missing required field: command"}, status_code=400)
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        result = await client.start_process(command, args=data.get("args"), cwd=data.get("cwd"))
-        return result
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/processes")
-async def sandbox_list_processes(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.list_processes())
-
-
-@app.post("/sandboxes/{sandbox_id}/processes/{process_id}/stop")
-async def sandbox_stop_process(sandbox_id: str, process_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        await client.stop_process(process_id)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/processes/{process_id}")
-async def sandbox_process_info(sandbox_id: str, process_id: str):
-    """Get detailed process info."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.get_process_info(process_id))
-
-
-@app.post("/sandboxes/{sandbox_id}/processes/{process_id}/input")
-async def sandbox_send_input(sandbox_id: str, process_id: str, request: Request):
-    """Send stdin input to a process."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        body = await request.body()
-        await client.send_process_input(process_id, body.decode())
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/processes/{process_id}/kill")
-async def sandbox_kill_process(sandbox_id: str, process_id: str):
-    """Kill a process (SIGKILL)."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        await client.kill_process(process_id)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.delete("/sandboxes/{sandbox_id}/processes/{process_id}")
-async def sandbox_delete_process(sandbox_id: str, process_id: str):
-    """Delete a process record."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        await client.delete_process(process_id)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/processes/{process_id}/logs")
-async def sandbox_process_logs(sandbox_id: str, process_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        logs = await client.get_process_logs(process_id)
-        return PlainTextResponse(logs)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/screenshot")
-async def sandbox_screenshot(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        png_bytes = await client.screenshot()
-        return Response(content=png_bytes, media_type="image/png")
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/desktop/screenshot")
-async def sandbox_desktop_screenshot(sandbox_id: str, region: str | None = None):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        region_dict = json.loads(region) if region else None
-        png_bytes = await client.screenshot(region=region_dict)
-        return Response(content=png_bytes, media_type="image/png")
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/click")
-async def sandbox_mouse_click(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.mouse_click(data.get("x", 0), data.get("y", 0), data.get("button", "left"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/type")
-async def sandbox_keyboard_type(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.keyboard_type(data.get("text", ""))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/press")
-async def sandbox_keyboard_press(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.keyboard_press(data.get("key", ""))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/mouse/down")
-async def sandbox_mouse_down(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.mouse_down(data.get("x", 0), data.get("y", 0), data.get("button", "left"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-@app.post("/sandboxes/{sandbox_id}/desktop/mouse/up")
-async def sandbox_mouse_up(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.mouse_up(data.get("x", 0), data.get("y", 0), data.get("button", "left"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-@app.post("/sandboxes/{sandbox_id}/desktop/mouse/move")
-async def sandbox_mouse_move(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.mouse_move(data.get("x", 0), data.get("y", 0))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-@app.post("/sandboxes/{sandbox_id}/desktop/keyboard/down")
-async def sandbox_key_down(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.key_down(data.get("key", ""))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-@app.post("/sandboxes/{sandbox_id}/desktop/keyboard/up")
-async def sandbox_key_up(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.key_up(data.get("key", ""))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/desktop/clipboard")
-async def sandbox_clipboard_read(sandbox_id: str):
-    """Read clipboard content."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        text = await client.clipboard_read()
-        return PlainTextResponse(text)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-@app.post("/sandboxes/{sandbox_id}/desktop/clipboard")
-async def sandbox_clipboard_write(sandbox_id: str, request: Request):
-    """Write to clipboard."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.clipboard_write(data.get("text", ""))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/desktop/windows")
-async def sandbox_list_windows(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.list_windows())
-
-@app.post("/sandboxes/{sandbox_id}/desktop/windows/{window_id}/focus")
-async def sandbox_focus_window(sandbox_id: str, window_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        await client.focus_window(window_id)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-@app.post("/sandboxes/{sandbox_id}/desktop/start")
-async def sandbox_desktop_start(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.desktop_start())
-
-@app.post("/sandboxes/{sandbox_id}/desktop/stop")
-async def sandbox_desktop_stop(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        await client.desktop_stop()
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-@app.get("/sandboxes/{sandbox_id}/desktop/status")
-async def sandbox_desktop_status(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.desktop_status())
-
-@app.get("/sandboxes/{sandbox_id}/desktop/recordings")
-async def sandbox_list_recordings(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.list_recordings())
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/drag")
-async def sandbox_drag_mouse(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.drag_mouse(data.get("startX", 0), data.get("startY", 0), data.get("endX", 0), data.get("endY", 0), data.get("button", "left"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/scroll")
-async def sandbox_scroll_mouse(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        await client.scroll_mouse(data.get("x", 0), data.get("y", 0), data.get("scrollX", 0), data.get("scrollY", 0))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/launch")
-async def sandbox_launch_app(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    data = await request.json()
-    return await _proxy(client.launch_app(data.get("appName", "")))
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/recordings/start")
-async def sandbox_start_recording(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.start_recording())
-
-
-@app.post("/sandboxes/{sandbox_id}/desktop/recordings/stop")
-async def sandbox_stop_recording(sandbox_id: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.stop_recording())
-
-
-@app.get("/sandboxes/{sandbox_id}/desktop/display")
-async def sandbox_display_info(sandbox_id: str):
-    """Get display/resolution info from the sandbox desktop."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.get_display_info())
-
-
-@app.get("/sandboxes/{sandbox_id}/processes/config")
-async def sandbox_process_config(sandbox_id: str):
-    """Get process limits configuration."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        resp = await client._client.get("/v1/processes/config")
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/fs/upload")
-async def sandbox_upload_files(sandbox_id: str, request: Request, path: str = "/"):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        body = await request.body()
-        await client.upload_files_raw(path, body)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.delete("/sandboxes/{sandbox_id}/fs/file")
-async def sandbox_delete_path(sandbox_id: str, path: str, recursive: bool = False):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        await client.delete_path(path, recursive=recursive)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/fs/mkdir")
-async def sandbox_mkdir(sandbox_id: str, path: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        await client.mkdir(path)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/fs/move")
-async def sandbox_move_file(sandbox_id: str, request: Request):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        src = data.get("source")
-        dst = data.get("destination")
-        if not src or not dst:
-            return JSONResponse({"error": "source and destination required"}, status_code=400)
-        await client.move_file(src, dst)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/fs/stat")
-async def sandbox_stat(sandbox_id: str, path: str):
-    try:
-        client = await get_sandbox_client(sandbox_id)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-    return await _proxy(client.stat(path))
-
-
-@app.get("/sandboxes/{sandbox_id}/health")
-async def sandbox_health(sandbox_id: str):
-    """Check if the sandbox-agent process is alive."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        result = await client.health()
-        return result
-    except Exception as e:
-        return JSONResponse({"error": str(e), "healthy": False}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/agents")
-async def sandbox_list_agents(sandbox_id: str):
-    """List agents available in the sandbox."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        agents = await client.list_agents()
-        return [{"id": a.id, "installed": a.installed,
-                 "credentials_available": a.credentials_available,
-                 "capabilities": a.capabilities} for a in agents]
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.get("/sandboxes/{sandbox_id}/capabilities")
-async def sandbox_agent_capabilities(sandbox_id: str, agent_type: str = Query(default="claude")):
-    """Get capabilities for a specific agent type in this sandbox."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        info = await client.get_agent_info(agent_type)
-        return {"agent_type": agent_type, "capabilities": info.get("capabilities", {})}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/install-agent")
-async def sandbox_install_agent(sandbox_id: str, request: Request):
-    """Install an agent type in the sandbox (e.g. amp, pi, cursor)."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        agent_type = data.get("agent_type", "claude")
-        result = await client.install_agent(agent_type)
-        return result
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-@app.post("/sandboxes/{sandbox_id}/deploy-skill")
-async def sandbox_deploy_skill(sandbox_id: str, request: Request):
-    """Deploy a skill file to the sandbox."""
-    try:
-        client = await get_sandbox_client(sandbox_id)
-        data = await request.json()
-        name = data.get("name")
-        content = data.get("content")
-        cwd = data.get("cwd", "/tmp")
-        if not name or not content:
-            return JSONResponse({"error": "name and content required"}, status_code=400)
-        path = f"{cwd}/.claude/commands/{name}.md"
-        await client.write_file(path, content)
-        return {"status": "ok", "path": path}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
 
 
 @app.get("/sessions")
@@ -1690,11 +1272,14 @@ async def session_status(session_id: str):
         "sandbox_id": state.sandbox_id,
         "inner_session_id": state.inner_session_id,
         "agent_busy": state.agent_busy,
+        "active_rpc_id": state.active_rpc_id,
+        "pending_count": len(state.pending_prompts),
+        "session_subscriber_count": len(state._session_subscribers),
+        "rpc_subscriber_count": sum(len(qs) for qs in state._rpc_subscribers.values()),
         "last_activity": state.last_activity,
         "idle_seconds": round(now - (state.turn_completed_at or state.last_activity), 1),
         "has_client": state.client is not None,
         "shutdown_requested": state.shutdown.is_set(),
-        "pending_errors": 0,
     }
 
 
@@ -1704,17 +1289,18 @@ async def session_status(session_id: str):
 
 @app.get("/sessions/{session_id}/log")
 async def get_session_log_route(session_id: str, limit: int = Query(default=500)):
+    state = SESSIONS.get(session_id)
+    pending = state._log_chain if state else None
+    if pending is not None:
+        try:
+            await pending
+        except Exception:
+            pass
     entries = await get_session_log(session_id, limit=limit)
     return [{"id": e.id, "event_type": e.event_type, "payload": e.payload,
              "created_at": e.created_at} for e in entries]
 
 
-@app.get("/agents/{agent_id}/log")
-async def get_agent_log_route(agent_id: str, limit: int = Query(default=100)):
-    entries = await get_agent_log(agent_id, limit=limit)
-    return [{"id": e.id, "session_id": e.session_id, "sandbox_id": e.sandbox_id,
-             "event_type": e.event_type, "payload": e.payload,
-             "created_at": e.created_at} for e in entries]
 
 
 # ---------------------------------------------------------------------------
@@ -1756,9 +1342,25 @@ async def sessions_quick_create(request: Request):
     config = AgentConfig.from_dict({**config_data, "agent_type": agent_type, "cwd": cwd})
     await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
 
+    # Install skills BEFORE starting the supervisor — claude-agent-acp
+    # discovers skills at process startup, not at session creation time.
+    # For local: install on host before spawning the supervisor.
+    # For docker/daytona: pass install commands to run inside the sandbox
+    # before the supervisor process starts.
+    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
+    if skill_cmds and provider == "local":
+        try:
+            await _install_skills_locally(config.skills)
+        except Exception as e:
+            log.error("skill install failed, continuing without skills: %s", e)
+            skill_cmds = []  # don't pass to create_instance
+
     sandbox_id = str(uuid.uuid4())
     try:
-        instance = await create_instance(provider, agent_type, dockerfile=dockerfile)
+        instance = await create_instance(
+            provider, agent_type, dockerfile=dockerfile,
+            pre_start_commands=skill_cmds if provider != "local" else None,
+        )
     except Exception as e:
         await delete_agent(agent_id)
         # Return 503 with Retry-After for circuit-breaker trips so callers
@@ -1780,9 +1382,11 @@ async def sessions_quick_create(request: Request):
     acp_session_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
 
-    client = SandboxAgentClient(url)
+    client = AcpClient(url)
     try:
-        await _apply_config_and_initialize(client, config, acp_session_id, cwd)
+        await _apply_config_and_initialize(
+            client, config, acp_session_id, cwd,
+        )
     except Exception as e:
         try:
             await client.aclose()
@@ -1795,7 +1399,7 @@ async def sessions_quick_create(request: Request):
             await destroy_instance(instance)
         except Exception as de:
             log.warning("sessions_quick_create cleanup: destroy_instance failed: %s", de)
-        return JSONResponse({"error": f"Failed to connect to sandbox-agent: {e}"}, status_code=502)
+        return JSONResponse({"error": f"Failed to connect to ACP supervisor: {e}"}, status_code=502)
 
     inner_session_id = client.get_inner_session_id(acp_session_id)
     state = SessionState(
@@ -1804,10 +1408,11 @@ async def sessions_quick_create(request: Request):
         sandbox_id=sandbox_id,
         acp_session_id=acp_session_id,
         inner_session_id=inner_session_id,
+        agent_type=config.agent_type or "claude",
         client=client,
     )
     SESSIONS[session_id] = state
-    _start_sse_reader(state)
+    _start_session_tasks(state)
     await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
 
     return {
@@ -1819,13 +1424,144 @@ async def sessions_quick_create(request: Request):
     }
 
 
+# ---------------------------------------------------------------------------
+# Scheduler loop — single owner of active_rpc_id, no locks needed
+# ---------------------------------------------------------------------------
+
+_CANCEL_DRAIN_TIMEOUT = 10  # seconds — safety cap so cancel doesn't hang
+
+
+def _start_session_tasks(state: SessionState) -> None:
+    """Start SSE reader + scheduler loop for a session."""
+    _start_sse_reader(state)
+    if state._scheduler_task is None or (hasattr(state._scheduler_task, 'done') and state._scheduler_task.done()):
+        state._scheduler_task = asyncio.create_task(_scheduler_loop(state))
+
+
+async def _scheduler_loop(state: SessionState) -> None:
+    """Process prompts one at a time. Sole writer of active_rpc_id."""
+    try:
+        while not state.shutdown.is_set():
+            await state._prompt_ready.wait()
+            if state.shutdown.is_set():
+                return
+            while state.pending_prompts and not state.shutdown.is_set():
+                pending = state.pending_prompts.popleft()
+                state.active_rpc_id = pending.rpc_id
+                state._prompt_done.clear()
+                await _execute_one_prompt(state, pending.rpc_id, pending.message)
+                state.active_rpc_id = None
+                _mark_turn_finished(state)
+                state._prompt_done.set()
+            state._prompt_ready.clear()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        log.exception("scheduler loop died for session %s", state.session_id)
+
+
+async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) -> None:
+    """Execute a single prompt HTTP round-trip. Called only from the scheduler loop."""
+    session_id = state.session_id
+    await log_event(
+        session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
+        event_type=EVT_USER_MESSAGE,
+        payload={"text": message, "prompt_id": rpc_id},
+    )
+    try:
+        await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
+    except Exception as e:
+        tb = traceback.format_exc()
+        log.exception("prompt failed for session %s", session_id)
+
+        body = ""
+        http_status: int | None = None
+        if isinstance(e, httpx.HTTPStatusError):
+            http_status = e.response.status_code
+            try:
+                body = e.response.text[:1000]
+            except Exception:
+                pass
+
+        if isinstance(e, httpx.HTTPStatusError) and http_status == 500 and (
+            "agent process exited" in body or "start a new session" in body
+        ):
+            kind = "sandbox_process_died"
+        elif isinstance(e, httpx.HTTPStatusError) and http_status == 500:
+            kind = "sandbox_internal_error"
+        elif isinstance(e, httpx.HTTPStatusError):
+            kind = "http_error"
+        elif isinstance(e, httpx.ConnectError):
+            kind = "sandbox_unreachable"
+        elif isinstance(e, httpx.ReadTimeout):
+            kind = "timeout"
+        else:
+            kind = "unknown"
+
+        summary = f"{type(e).__name__}: {e}"
+        if body:
+            summary += f" | {body}"
+
+        state.errors.append({
+            "ts": time.time(), "rpc_id": rpc_id,
+            "kind": kind, "error": summary, "traceback": tb,
+        })
+        _mark_turn_finished(state)
+
+        error_payload = json.dumps({
+            "jsonrpc": "2.0", "id": rpc_id,
+            "error": {
+                "code": -32000, "message": summary[:500],
+                "data": {
+                    "kind": kind, "exception_type": type(e).__name__,
+                    "http_status": http_status, "upstream_body": body,
+                    "rpc_id": rpc_id,
+                },
+            },
+        })
+        if not state.shutdown.is_set():
+            state.dispatch(rpc_id, (rpc_id, f"data: {error_payload}\n\n"))
+
+        await log_event(
+            session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
+            event_type=EVT_ERROR,
+            payload={
+                "message": summary[:1000], "kind": kind,
+                "traceback": tb[:5000], "rpc_id": rpc_id,
+            },
+        )
+
+
+def _submit_prompt(state: SessionState, rpc_id: str, message: str) -> None:
+    """Enqueue a prompt and wake the scheduler loop. Returns immediately."""
+    state.pending_prompts.append(PendingPrompt(rpc_id=rpc_id, message=message))
+    state._prompt_ready.set()
+
+
+async def _cancel_and_drain(state: SessionState) -> None:
+    """Cancel the active prompt and wait for it to reach a terminal state."""
+    if not state.agent_busy:
+        return
+    await state.client.cancel_prompt(state.acp_session_id)
+    try:
+        await asyncio.wait_for(state._prompt_done.wait(), timeout=_CANCEL_DRAIN_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("_cancel_and_drain: timed out waiting for rpc %s", state.active_rpc_id)
+
+
 @app.post("/sessions/{session_id}/message")
 async def post_session_message(session_id: str, request: Request):
-    """Send a prompt to a session. Recovers reaped sessions automatically."""
+    """Submit a prompt. Queued behind the active prompt automatically.
+
+    Pass ``interrupt: true`` to cancel the running prompt and wait for it
+    to reach a terminal state before the new prompt starts.
+    """
     data = await request.json()
     message = data.get("message")
     if not message:
         return JSONResponse({"error": "message required"}, status_code=400)
+
+    interrupt = data.get("interrupt", False)
 
     try:
         state = await get_or_recover_session(session_id)
@@ -1835,154 +1571,12 @@ async def post_session_message(session_id: str, request: Request):
     if not state.client or not state.acp_session_id:
         return JSONResponse({"error": "session not connected"}, status_code=409)
 
-    if state.agent_busy:
-        return JSONResponse({"error": "agent is busy processing a previous message"}, status_code=409)
+    if interrupt and state.agent_busy:
+        await _cancel_and_drain(state)
 
     state.last_activity = time.time()
     rpc_id = str(uuid.uuid4())
-    state.current_rpc_id = rpc_id
-
-    await log_event(
-        session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
-        event_type=EVT_USER_MESSAGE,
-        payload={"text": message, "prompt_id": rpc_id},
-    )
-
-    async def _run_prompt():
-        try:
-            await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
-            state.resume_buffering()
-        except Exception as e:
-            state.resume_buffering()
-            tb = traceback.format_exc()
-            log.exception("prompt failed for session %s", session_id)
-
-            # Capture upstream HTTP body if it's a status error — that's where
-            # signatures like "agent process exited before responding" live.
-            body = ""
-            http_status: int | None = None
-            if isinstance(e, httpx.HTTPStatusError):
-                http_status = e.response.status_code
-                try:
-                    body = e.response.text[:1000]
-                except Exception:
-                    pass
-
-            # Classify into a stable kind clients can branch on.
-            if isinstance(e, httpx.HTTPStatusError) and http_status == 500 and (
-                "agent process exited" in body or "start a new session" in body
-            ):
-                kind = "sandbox_process_died"
-            elif isinstance(e, httpx.HTTPStatusError) and http_status == 500:
-                kind = "sandbox_internal_error"
-            elif isinstance(e, httpx.HTTPStatusError):
-                kind = "http_error"
-            elif isinstance(e, httpx.ConnectError):
-                kind = "sandbox_unreachable"
-            elif isinstance(e, httpx.ReadTimeout):
-                kind = "timeout"
-            else:
-                kind = "unknown"
-
-            # ── Auto-recovery: sandbox died → restart sandbox, reload
-            # session, retry the prompt once. ──
-            if kind in ("sandbox_unreachable", "sandbox_process_died"):
-                log.warning(
-                    "sandbox died for session %s (kind=%s), attempting auto-recovery",
-                    session_id, kind,
-                )
-                try:
-                    # Tear down the broken session so _do_resume performs a
-                    # full recovery instead of returning "already_active".
-                    await _shutdown_session_state(state, remove=True)
-
-                    result = await _do_resume(
-                        sandbox_id=state.sandbox_id,
-                        agent_id=state.agent_id,
-                        inner_session_id=state.inner_session_id,
-                        client_session_id=session_id,
-                    )
-                    if not isinstance(result, JSONResponse):
-                        new_state = SESSIONS.get(session_id)
-                        if new_state and not new_state.shutdown.is_set():
-                            log.info(
-                                "auto-recovery succeeded for session %s, retrying prompt",
-                                session_id,
-                            )
-                            new_state.new_turn()
-                            new_state.agent_busy = True
-                            new_state.current_rpc_id = rpc_id
-                            try:
-                                await new_state.client.prompt(
-                                    new_state.acp_session_id, message, rpc_id=rpc_id,
-                                )
-                                new_state.resume_buffering()
-                                return  # success — skip error reporting
-                            except Exception as retry_err:
-                                new_state.resume_buffering()
-                                log.error(
-                                    "retry after recovery failed for session %s: %s",
-                                    session_id, retry_err,
-                                )
-                            finally:
-                                new_state.agent_busy = False
-                                new_state.turn_completed_at = time.time()
-                    else:
-                        log.error("auto-recovery _do_resume returned error for session %s", session_id)
-                except Exception as recover_err:
-                    log.error(
-                        "auto-recovery failed for session %s: %s",
-                        session_id, recover_err,
-                    )
-                # Fall through to report the original error.
-
-            summary = f"{type(e).__name__}: {e}"
-            if body:
-                summary += f" | {body}"
-
-            state.errors.append({
-                "ts": time.time(),
-                "rpc_id": rpc_id,
-                "kind": kind,
-                "error": summary,
-                "traceback": tb,
-            })
-            _mark_turn_finished(state)
-
-            error_payload = json.dumps({
-                "jsonrpc": "2.0", "id": rpc_id,
-                "error": {
-                    "code": -32000,
-                    "message": summary[:500],
-                    "data": {
-                        "kind": kind,
-                        "exception_type": type(e).__name__,
-                        "http_status": http_status,
-                        "upstream_body": body,
-                        "rpc_id": rpc_id,
-                    },
-                },
-            })
-            if not state.shutdown.is_set():
-                state.broadcast(f"data: {error_payload}\n\n")
-
-            await log_event(
-                session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
-                event_type=EVT_ERROR,
-                payload={
-                    "message": summary[:1000],
-                    "kind": kind,
-                    "traceback": tb[:5000],
-                    "rpc_id": rpc_id,
-                },
-            )
-        finally:
-            state.agent_busy = False
-            state.turn_completed_at = time.time()
-
-    state.new_turn()
-    state.agent_busy = True
-    asyncio.create_task(_run_prompt())
+    _submit_prompt(state, rpc_id, message)
     return JSONResponse({"rpc_id": rpc_id, "status": "ok"})
 
 
@@ -2002,32 +1596,25 @@ async def session_events(session_id: str):
     async def _proxy_stream():
         heartbeat_interval = int(os.environ.get("SSE_HEARTBEAT_INTERVAL", "30"))
 
-        # Restart persistent reader if it died (e.g., sandbox-agent restart)
+        # Restart persistent reader if it died (e.g., supervisor restart)
         if not state._reader_alive:
             _start_sse_reader(state)
 
-        # Subscribe this client — each client gets its own queue via fan-out.
-        # Logging and state updates happen in the reader (single writer),
-        # so the proxy only forwards raw SSE blocks to the HTTP client.
-        my_q = state.subscribe()
+        my_q = state.subscribe_session()
 
         async def _heartbeat_loop():
             try:
                 while True:
                     await asyncio.sleep(heartbeat_interval)
-                    try:
-                        my_q.put_nowait(None)
-                    except asyncio.QueueFull:
-                        pass
+                    state.broadcast(None)  # heartbeat to all subscribers
             except asyncio.CancelledError:
                 pass
 
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
         try:
-            buffer = ""
             while True:
                 item = await my_q.get()
-                if item is _SSE_SENTINEL:
+                if item is _SSE_SENTINEL or item is _KICK_SENTINEL:
                     return
                 if shutdown.is_set():
                     return
@@ -2035,17 +1622,18 @@ async def session_events(session_id: str):
                     yield ": heartbeat\n\n"
                     continue
 
-                buffer += item
-                while "\n\n" in buffer:
-                    block, buffer = buffer.split("\n\n", 1)
-                    yield block + "\n\n"
+                tag, block = item
+                if tag is None:
+                    yield block
+                else:
+                    yield f"event: rpc:{tag}\n{block}"
         except asyncio.CancelledError:
             pass
         except Exception as e:
             log.warning("SSE proxy error for session %s: %s", session_id, e)
         finally:
             await _cancel_task(heartbeat_task)
-            state.unsubscribe(my_q)
+            state.unsubscribe_session(my_q)
 
     return StreamingResponse(
         _proxy_stream(),
@@ -2059,7 +1647,7 @@ async def session_events(session_id: str):
 
 @app.post("/sessions/{session_id}/cancel")
 async def session_cancel(session_id: str):
-    """Cancel the currently running prompt for a session."""
+    """Cancel the active prompt and wait for it to finish."""
     try:
         state = await get_or_recover_session(session_id)
     except HTTPException as exc:
@@ -2067,7 +1655,15 @@ async def session_cancel(session_id: str):
 
     if not state.acp_session_id:
         return JSONResponse({"error": "no active session"}, status_code=409)
+    if not state.agent_busy:
+        return {"status": "ok", "detail": "not busy"}
+
     await state.client.cancel_prompt(state.acp_session_id)
+    try:
+        await asyncio.wait_for(state._prompt_done.wait(), timeout=_CANCEL_DRAIN_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("session_cancel: timed out waiting for rpc %s", state.active_rpc_id)
+        return JSONResponse({"error": "cancel timed out"}, status_code=504)
     return {"status": "ok"}
 
 
@@ -2094,3 +1690,77 @@ async def session_set_config(session_id: str, request: Request):
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+# ---------------------------------------------------------------------------
+# Sandbox exec
+# ---------------------------------------------------------------------------
+
+@app.post("/sessions/{session_id}/sandbox/exec")
+async def session_sandbox_exec(session_id: str, request: Request):
+    """Run a command in the session's sandbox.
+
+    Body: {"command": "...", "timeout": 30}
+    Returns: {"stdout", "stderr", "exit_code", "stdout_truncated", "timed_out"}
+
+    Auto-recovers: if the sandbox was reaped or stopped, restarts it
+    before executing. Does not require an active ACP session.
+    """
+    data = await request.json()
+    command = data.get("command")
+    if not command:
+        return JSONResponse({"error": "command required"}, status_code=400)
+    timeout = min(data.get("timeout", 30), 300)
+
+    # Resolve sandbox_id from in-memory session or DB
+    state = SESSIONS.get(session_id)
+    if state:
+        sandbox_id = state.sandbox_id
+    else:
+        session_row = await get_session(session_id)
+        if not session_row:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        sandbox_id = session_row["sandbox_id"]
+
+    instance = _INSTANCES.get(sandbox_id)
+
+    # Auto-start if sandbox is not running
+    if not instance:
+        sandbox_record = await get_sandbox(sandbox_id)
+        if not sandbox_record:
+            return JSONResponse({"error": "sandbox not found"}, status_code=404)
+        agent_type = "claude"
+        if state:
+            agent_type = state.agent_type
+        try:
+            await _ensure_sandbox_alive(sandbox_id, sandbox_record, agent_type=agent_type)
+            instance = _INSTANCES.get(sandbox_id)
+        except Exception as e:
+            return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=502)
+
+    if not instance:
+        return JSONResponse({"error": "sandbox not running"}, status_code=409)
+
+    try:
+        result = await exec_in_instance(instance, command, timeout=timeout)
+        return result.to_dict()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+# ---------------------------------------------------------------------------
+# Static UI
+# ---------------------------------------------------------------------------
+
+_UI_INDEX = Path(__file__).parents[2] / "ui" / "index.html"
+_UI_HTML: str | None = None
+
+
+@app.get("/ui")
+async def serve_ui():
+    """Serve the chat UI."""
+    global _UI_HTML
+    if _UI_HTML is None:
+        try:
+            _UI_HTML = _UI_INDEX.read_text()
+        except FileNotFoundError:
+            return PlainTextResponse("UI not found", status_code=404)
+    return Response(content=_UI_HTML, media_type="text/html")

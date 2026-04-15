@@ -6,8 +6,8 @@ Works with any server implementing the agent orchestration REST API.
 __version__ = "0.5.0"
 
 from .client import (
-    Agent, UsageStats,
-    CLAUDE, CODEX, OPENCODE, AMP, PI, CURSOR, MOCK, AGENT_TYPES,
+    Agent, Event, Sandbox, UsageStats,
+    CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE, AGENT_TYPES,
     LOCAL, DOCKER, DAYTONA, PROVIDERS,
 )
 from .errors import (
@@ -19,8 +19,10 @@ from .persist import SessionRecord, SqliteSessionDriver
 __all__ = [
     "__version__",
     "Agent",
+    "Event",
+    "Sandbox",
     "UsageStats",
-    "CLAUDE", "CODEX", "OPENCODE", "AMP", "PI", "CURSOR", "MOCK", "AGENT_TYPES",
+    "CLAUDE", "CODEX", "OPENCODE", "GEMINI", "CLINE", "DEEPAGENTS", "OPENHANDS", "GOOSE", "AGENT_TYPES",
     "LOCAL", "DOCKER", "DAYTONA", "PROVIDERS",
     "AgentSDKError", "AgentConnectionError", "AgentNotRegisteredError",
     "SandboxError", "AgentBusyError", "AgentTimeoutError", "PromptError", "StreamError",

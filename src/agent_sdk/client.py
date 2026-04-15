@@ -1,7 +1,6 @@
 """Agent client SDK.
 
 Async-first Python client for the agent orchestration API.
-Supports any agent type (Claude, Codex, OpenCode) via sandbox-agent.
 
 Architecture note: The ACP protocol uses StreamableHTTP — the POST sends
 the JSON-RPC request but the response may arrive either in the POST body
@@ -10,9 +9,11 @@ by the proxy, so the SSE stream is the reliable channel for results.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import shlex
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -23,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from api.sse import iter_sse_blocks, parse_acp_event
+from api.sse import extract_sse_tag, iter_sse_blocks, parse_acp_event
 from agent_sdk.errors import (
     AgentConnectionError, AgentNotRegisteredError, AgentBusyError,
     AgentTimeoutError, StreamError, PromptError,
@@ -36,12 +37,13 @@ log = logging.getLogger(__name__)
 CLAUDE = "claude"
 CODEX = "codex"
 OPENCODE = "opencode"
-AMP = "amp"
-PI = "pi"
-CURSOR = "cursor"
-MOCK = "mock"
+GEMINI = "gemini"
+CLINE = "cline"
+DEEPAGENTS = "deepagents"
+OPENHANDS = "openhands"
+GOOSE = "goose"
 
-AGENT_TYPES = frozenset({CLAUDE, CODEX, OPENCODE, AMP, PI, CURSOR, MOCK})
+AGENT_TYPES = frozenset({CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE})
 
 # ── Provider constants ──
 LOCAL = "local"
@@ -49,6 +51,25 @@ DOCKER = "docker"
 DAYTONA = "daytona"
 
 PROVIDERS = frozenset({LOCAL, DOCKER, DAYTONA})
+
+
+class Event(dict):
+    """Structured event from an agent response.
+
+    Dict-like (``ev["type"]``, ``ev.get("text")``) but ``str(ev)``
+    returns the human-readable text so you can ``print(ev)`` directly.
+    """
+
+    def __str__(self) -> str:
+        t = self.get("type", "")
+        if t in ("text", "reasoning"):
+            return self.get("text", "")
+        if t == "tool":
+            return f"\n[tool: {self.get('tool_name', 'unknown')}]\n"
+        return ""
+
+    def __repr__(self) -> str:
+        return f"Event({dict.__repr__(self)})"
 
 
 @dataclass
@@ -91,6 +112,51 @@ def _raise_for_status(resp) -> None:
     )
 
 
+class Sandbox:
+    """Direct access to an agent's sandbox environment.
+
+    Provides exec, read_file, write_file, and ls without going through
+    the agent's conversation. Access via ``agent.sandbox``.
+    """
+
+    def __init__(self, agent: "Agent"):
+        self._agent = agent
+
+    async def exec(self, command: str, *, timeout: int = 30) -> dict:
+        """Run a command in the sandbox. Returns {stdout, stderr, exit_code, stdout_truncated, timed_out}."""
+        await self._agent._ensure_registered()
+        resp = await self._agent._client.post(
+            f"/sessions/{self._agent.session_id}/sandbox/exec",
+            json={"command": command, "timeout": timeout},
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    async def read_file(self, path: str, *, timeout: int = 30) -> str:
+        """Read a text file from the sandbox."""
+        result = await self.exec(f"cat {shlex.quote(path)}", timeout=timeout)
+        if result["exit_code"] != 0:
+            raise FileNotFoundError(result["stderr"].strip() or f"failed to read {path}")
+        return result["stdout"]
+
+    async def write_file(self, path: str, content: str, *, timeout: int = 30) -> None:
+        """Write a text file to the sandbox."""
+        encoded = base64.b64encode(content.encode()).decode()
+        result = await self.exec(
+            f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)}",
+            timeout=timeout,
+        )
+        if result.get("stderr", "").strip() and result.get("exit_code", 0) != 0:
+            raise OSError(result["stderr"].strip())
+
+    async def ls(self, path: str = ".", *, timeout: int = 10) -> str:
+        """List directory contents."""
+        result = await self.exec(f"ls -la {shlex.quote(path)}", timeout=timeout)
+        if result["exit_code"] != 0:
+            raise FileNotFoundError(result["stderr"].strip() or f"failed to list {path}")
+        return result["stdout"]
+
+
 class Agent:
     """Agent client — send messages, stream responses.
 
@@ -118,7 +184,7 @@ class Agent:
         api_url: str | None = None,
         tools: list[str] | None = None,
         mcp_servers: dict[str, dict] | None = None,  # name -> config dict
-        skills: dict[str, dict] | None = None,  # name -> config dict
+        skills: list[str] | dict[str, dict] | None = None,  # npx skills sources
         db: str | None = None,
         session_id: str | None = None,
         sandbox_id: str | None = None,
@@ -126,6 +192,8 @@ class Agent:
     ):
         self.name = name
         self.agent_type = agent_type
+        if self.agent_type not in AGENT_TYPES:
+            raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(AGENT_TYPES)}")
         self.provider = provider
         self.model = model
         self.cwd = cwd
@@ -141,7 +209,7 @@ class Agent:
         self._persist: SqliteSessionDriver | None = SqliteSessionDriver(db) if db else None
 
         if api_url is None:
-            api_url = os.environ.get("AGENT_API_URL", "https://agent-sdk-server-production.up.railway.app")
+            api_url = os.environ.get("AGENT_API_URL", "http://localhost:7778")
         self._api_url = api_url
         self._client = httpx.AsyncClient(base_url=self._api_url, timeout=httpx.Timeout(30.0, read=120.0))
         self._registered = False
@@ -149,6 +217,7 @@ class Agent:
         self._prompt_lock = asyncio.Lock()
         self._system_prompt_sent = False
         self.usage = UsageStats()
+        self.sandbox = Sandbox(self)
 
     @classmethod
     def from_config(cls, name: str, config: dict[str, Any], **kwargs) -> "Agent":
@@ -281,66 +350,98 @@ class Agent:
             )
         return message
 
-    async def _submit_message(self, message: str) -> str | None:
-        """Submit a prompt and return the correlated RPC id when available."""
+    async def _post_message(self, message: str, *, interrupt: bool = False) -> str:
+        """POST a prompt to /message. Returns rpc_id. Raises PromptError on HTTP error."""
         await self._ensure_registered()
-        async with self._prompt_lock:
-            prepared = self._prepare_message(message)
-            resp = await self._client.post(
-                f"/sessions/{self.session_id}/message",
-                json={"message": prepared},
-            )
-            _raise_for_status(resp)
-            return resp.json().get("rpc_id")
+        body = {"message": self._prepare_message(message), "interrupt": interrupt}
+        resp = await self._client.post(
+            f"/sessions/{self.session_id}/message",
+            json=body,
+        )
+        _raise_for_status(resp)
+        return resp.json().get("rpc_id")
+
+    async def send(self, message: str, *, interrupt: bool = False) -> str:
+        """Submit a message without waiting for the response.
+
+        Returns the ``rpc_id`` immediately. Use with ``events()`` to
+        listen for results.
+
+        When ``interrupt=True``, cancels the running prompt first, waits
+        for cancellation to complete, then queues the new message.
+        """
+        return await self._post_message(message, interrupt=interrupt)
+
+    @asynccontextmanager
+    async def _open_sse(self):
+        """Open SSE GET /events on the existing client. Yields the response object."""
+        async with self._client.stream(
+            "GET",
+            f"/sessions/{self.session_id}/events",
+            headers={"Accept": "text/event-stream"},
+            timeout=httpx.Timeout(30.0, read=90.0),
+        ) as sse:
+            yield sse
+
+    @asynccontextmanager
+    async def events(self):
+        """Open a long-lived SSE stream and yield an async iterator of parsed events.
+
+        Error events are yielded as ``{"type": "error", ...}`` dicts — never raised.
+        """
+        await self._ensure_registered()
+
+        async def _iter(sse):
+            try:
+                async for block in iter_sse_blocks(sse):
+                    ev = parse_acp_event(block, None)
+                    if ev is not None:
+                        yield ev
+            except httpx.ReadTimeout:
+                raise StreamError(f"[{self.name}] events() connection lost (no heartbeat)")
+
+        async with self._open_sse() as sse:
+            yield _iter(sse)
 
     # ── Core: astream ──
 
     @asynccontextmanager
-    async def _sse_stream(self, message: str):
+    async def _sse_stream(self, message: str, *, interrupt: bool = False):
         """Open SSE connection, submit message, yield (blocks, rpc_id)."""
-        # read=90s: server heartbeats every 30s, so 90s without ANY data means dead
-        sse_client = httpx.AsyncClient(base_url=self._api_url, timeout=httpx.Timeout(30.0, read=90.0))
-        try:
-            sse_url = f"/sessions/{self.session_id}/events"
-            async with sse_client.stream(
-                "GET", sse_url, params={},
-                headers={"Accept": "text/event-stream"},
-            ) as sse:
-                rpc_id = await self._submit_message(message)
-                yield iter_sse_blocks(sse), rpc_id
-        finally:
-            await sse_client.aclose()
+        async with self._open_sse() as sse:
+            async with self._prompt_lock:
+                rpc_id = await self._post_message(message, interrupt=interrupt)
+            yield iter_sse_blocks(sse), rpc_id
 
-    async def astream(self, message: str) -> AsyncIterator[str]:
-        """Flatten astream_events into a printable text+tool-marker stream."""
-        async for ev in self.astream_events(message):
-            if ev["type"] == "text":
-                yield ev["text"]
-            elif ev["type"] == "tool":
-                yield f"\n[tool: {ev['tool_name']}]\n"
+    async def astream(
+        self,
+        message: str,
+        *,
+        interrupt: bool = False,
+    ) -> AsyncIterator[Event]:
+        """Send a message and stream events.
 
-    async def astream_events(self, message: str) -> AsyncIterator[dict]:
-        """Send a message and yield structured events as they stream in.
+        Yields ``Event`` dicts. ``str(event)`` returns human-readable text,
+        so ``print(ev, end="")`` works naturally.  Access structured fields
+        via ``ev["type"]``, ``ev["text"]``, etc.
 
-        Yields dicts with these shapes:
-
-          ``{"type": "text", "text": "..."}``
-          ``{"type": "reasoning", "text": "..."}``
-          ``{"type": "tool", "tool_name", "tool_call_id", "args", "raw"}``
-          ``{"type": "tool_result", "tool_name", "tool_call_id", "result", "raw"}``
-          ``{"type": "usage", "usage": {...}}``
-          ``{"type": "done", "stop_reason": "..."}``  (terminal)
+        Event types: ``text``, ``reasoning``, ``tool``, ``tool_result``,
+        ``usage``, ``done`` (terminal).
 
         Raises ``PromptError`` on a server error frame, ``StreamError`` on
         connection loss.
         """
         await self._ensure_registered()
-        async with self._sse_stream(message) as (blocks, rpc_id):
+        async with self._sse_stream(message, interrupt=interrupt) as (blocks, rpc_id):
             try:
                 async for block in blocks:
-                    event = parse_acp_event(block, rpc_id)
-                    if event is None:
+                    tag = extract_sse_tag(block)
+                    if tag is not None and tag != rpc_id:
                         continue
+                    raw = parse_acp_event(block, rpc_id)
+                    if raw is None:
+                        continue
+                    event = Event(raw)
                     if event["type"] == "done":
                         yield event
                         return
@@ -357,11 +458,12 @@ class Agent:
 
     # ── Core: arun ──
 
-    async def arun(self, message: str) -> str:
+    async def arun(self, message: str, *, interrupt: bool = False) -> str:
         """Send a message and return the full response text."""
         parts = []
-        async for chunk in self.astream(message):
-            parts.append(chunk)
+        async for ev in self.astream(message, interrupt=interrupt):
+            if ev.get("type") == "text":
+                parts.append(ev.get("text", ""))
         self.usage.call_count += 1
         return "".join(parts)
 
@@ -383,159 +485,14 @@ class Agent:
                 await self._client.aclose()
         return asyncio.run(_run())
 
-    def run(self, message: str, timeout: float | None = None) -> str:
+    def run(self, message: str, timeout: float | None = None, *, interrupt: bool = False) -> str:
         """Sync wrapper: send message and return response."""
         def _factory():
-            if timeout is None:
-                return self.arun(message)
-            return asyncio.wait_for(self.arun(message), timeout=timeout)
+            coro = self.arun(message, interrupt=interrupt)
+            if timeout is not None:
+                coro = asyncio.wait_for(coro, timeout=timeout)
+            return coro
         return self._sync_call(_factory)
-
-    # ── Sandbox operations ──
-
-    async def _desktop_action(self, endpoint: str, json_body: dict | None = None, method: str = "POST") -> dict | bytes:
-        """Generic desktop operation helper."""
-        await self._ensure_registered()
-        url = f"/sandboxes/{self.sandbox_id}/desktop/{endpoint}"
-        if method == "GET":
-            resp = await self._client.get(url, params={})
-        else:
-            resp = await self._client.post(url, json=json_body or {}, params={})
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
-        if "image/" in content_type:
-            return resp.content
-        try:
-            return resp.json()
-        except Exception:
-            return {"status": "ok"}
-
-    async def list_dir(self, path: str = "/") -> list[dict]:
-        """List directory in the agent's sandbox."""
-        await self._ensure_registered()
-        resp = await self._client.get(f"/sandboxes/{self.sandbox_id}/fs",
-                                      params={"path": path})
-        resp.raise_for_status()
-        return resp.json()
-
-    async def read_file(self, path: str) -> str:
-        """Read a file from the agent's sandbox."""
-        await self._ensure_registered()
-        resp = await self._client.get(f"/sandboxes/{self.sandbox_id}/fs/file",
-                                      params={"path": path})
-        resp.raise_for_status()
-        return resp.text
-
-    async def write_file(self, path: str, content: str) -> None:
-        """Write a file to the agent's sandbox."""
-        await self._ensure_registered()
-        resp = await self._client.put(f"/sandboxes/{self.sandbox_id}/fs/file",
-                                      params={"path": path}, content=content)
-        resp.raise_for_status()
-
-    async def delete_file(self, path: str, recursive: bool = False) -> None:
-        """Delete a file or directory in the agent's sandbox."""
-        await self._ensure_registered()
-        params = {"path": path}
-        if recursive:
-            params["recursive"] = "true"
-        resp = await self._client.delete(f"/sandboxes/{self.sandbox_id}/fs/file", params=params)
-        resp.raise_for_status()
-
-    async def mkdir(self, path: str) -> None:
-        """Create a directory (and parents) in the agent's sandbox."""
-        await self._ensure_registered()
-        resp = await self._client.post(f"/sandboxes/{self.sandbox_id}/fs/mkdir",
-                                       params={"path": path})
-        resp.raise_for_status()
-
-    async def exec(self, command: str, args: list[str] | None = None, cwd: str | None = None) -> dict:
-        """Run a command in the agent's sandbox. Returns {exitCode, stdout, stderr}."""
-        await self._ensure_registered()
-        body: dict = {"command": command}
-        if args is not None:
-            body["args"] = args
-        if cwd is not None:
-            body["cwd"] = cwd
-        resp = await self._client.post(f"/sandboxes/{self.sandbox_id}/exec", json=body,
-                                       params={})
-        resp.raise_for_status()
-        return resp.json()
-
-    async def shell(self, command: str, cwd: str | None = None) -> str:
-        """Run a shell command and return stdout. Raises on non-zero exit."""
-        result = await self.exec(command, cwd=cwd)
-        if result.get("exitCode", 0) != 0:
-            stderr = result.get("stderr", "").strip()
-            raise RuntimeError(f"Command failed (exit {result['exitCode']}): {stderr}")
-        return result.get("stdout", "")
-
-    async def screenshot(self, region: dict | None = None) -> bytes:
-        """Take a desktop screenshot. Returns PNG bytes."""
-        params = {}
-        if region:
-            params["region"] = json.dumps(region)
-        await self._ensure_registered()
-        url = f"/sandboxes/{self.sandbox_id}/desktop/screenshot"
-        resp = await self._client.get(url, params=params)
-        resp.raise_for_status()
-        return resp.content
-
-    async def mouse_click(self, x: int, y: int, button: str = "left") -> None:
-        await self._desktop_action("click", {"x": x, "y": y, "button": button})
-
-    async def keyboard_type(self, text: str) -> None:
-        await self._desktop_action("type", {"text": text})
-
-    async def keyboard_press(self, key: str) -> None:
-        await self._desktop_action("press", {"key": key})
-
-    # ── Process management ──
-
-    async def start_process(self, command: str, args: list[str] | None = None,
-                           cwd: str | None = None) -> dict:
-        """Start a persistent process in the sandbox. Returns process info dict."""
-        await self._ensure_registered()
-        body: dict = {"command": command}
-        if args is not None:
-            body["args"] = args
-        if cwd is not None:
-            body["cwd"] = cwd
-        resp = await self._client.post(
-            f"/sandboxes/{self.sandbox_id}/processes", json=body,
-            params={},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    async def stop_process(self, process_id: str) -> None:
-        """Stop a running process in the sandbox."""
-        await self._ensure_registered()
-        resp = await self._client.post(
-            f"/sandboxes/{self.sandbox_id}/processes/{process_id}/stop",
-            params={},
-        )
-        resp.raise_for_status()
-
-    async def list_processes(self) -> list[dict]:
-        """List running processes in the sandbox."""
-        await self._ensure_registered()
-        resp = await self._client.get(
-            f"/sandboxes/{self.sandbox_id}/processes",
-            params={},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    async def get_process_logs(self, process_id: str) -> str:
-        """Get logs from a sandbox process."""
-        await self._ensure_registered()
-        resp = await self._client.get(
-            f"/sandboxes/{self.sandbox_id}/processes/{process_id}/logs",
-            params={},
-        )
-        resp.raise_for_status()
-        return resp.text
 
     # ── Session management ──
 

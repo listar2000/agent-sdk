@@ -1,9 +1,10 @@
 """Demo: full auto-task pipeline — extract from trace, generate task, test in sandbox.
 
-Usage:
-  # Start server first:
-  #   uvicorn src.api.server:app --port 7778
+Prerequisites:
+  docker compose up --build -d
+  curl http://localhost:7778/health
 
+Usage:
   # Generate tasks from latest Claude Code session in current dir:
   python examples/auto_task_demo.py generate
 

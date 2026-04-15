@@ -18,6 +18,7 @@ curl http://localhost:7778/health
 This starts:
 - Postgres on port 5433
 - API server on port 7778
+- Chat UI at http://localhost:7778/ui
 
 Stop with `docker compose down`. Delete the database volume with `docker compose down -v`.
 
@@ -64,16 +65,26 @@ agent = Agent(
     prompt="You are a helpful agent.",
 )
 
-# async (recommended)
+# full response
 response = await agent.arun("Create a file called hello.py")
 
-# streaming
-async for chunk in agent.astream("Analyze this codebase"):
-    print(chunk, end="", flush=True)
+# streaming — Event objects, str(ev) gives text
+async for ev in agent.astream("Analyze this codebase"):
+    print(ev, end="", flush=True)
+    # ev["type"] is "text", "reasoning", "tool", "done", etc.
 
 # sync wrapper
 response = agent.run("Say hello")
+
+# interrupt the running prompt and redirect
+response = await agent.arun("stop — focus on X instead", interrupt=True)
+
+# fire-and-forget submit (returns rpc_id, use events() to listen)
+rpc_id = await agent.send("do this next")
+rpc_id = await agent.send("cancel and do this", interrupt=True)
 ```
+
+All methods accept `interrupt=True` to cancel the running prompt before submitting. `send()` returns the `rpc_id` immediately without waiting for the response — pair it with `agent.events()` for a long-lived event listener.
 
 The SDK talks to the server at `http://localhost:7778` by default. Override with `api_url=` or `AGENT_API_URL=`.
 
@@ -88,49 +99,24 @@ response = await agent.arun("What were we discussing?")
 
 The server looks up the session in the DB, restarts the sandbox if stopped, and replays the conversation history via `session/load`.
 
-## Sandbox operations
-
-Agents can interact with their sandbox directly without going through Claude:
-
-```python
-# Filesystem
-files = await agent.list_dir("/app")
-content = await agent.read_file("/app/main.py")
-await agent.write_file("/app/main.py", "print('hi')")
-
-# Execute commands
-result = await agent.exec("python", args=["main.py"])
-output = await agent.shell("ls -la")
-
-# Processes
-proc = await agent.start_process("python", args=["server.py"])
-logs = await agent.get_process_logs(proc["id"])
-await agent.stop_process(proc["id"])
-
-# Desktop (when sandbox has a display)
-png = await agent.screenshot()
-await agent.mouse_click(100, 200)
-await agent.keyboard_type("hello")
-```
-
 ## Architecture
 
 ```
-┌───────────┐      ┌──────────────────┐      ┌─────────────────┐
-│ SDK       │─────▶│ API server       │─────▶│ sandbox-agent   │
-│ (Agent)   │      │ (orchestrator)   │      │ (in sandbox)    │
-└───────────┘      └──────────────────┘      └─────────────────┘
-      │                    │                        │
-      │              Postgres (sessions,     Runs Claude/Codex,
-      │               agents, sandboxes)     streams via SSE
-      │
-   /sessions/*   — conversation (message, events, resume)
-   /sandboxes/*  — infrastructure (fs, exec, desktop, processes)
+┌───────────┐      ┌──────────────────┐      ┌─────────────────────┐
+│ SDK       │─────▶│ API server       │─────▶│ supervisor.js       │
+│ (Agent)   │      │ (orchestrator)   │      │ (stdio ⇄ POST+SSE   │
+└───────────┘      └──────────────────┘      │  bridge to ACP)     │
+      │                    │                 └──────────┬──────────┘
+      │              Postgres                           │ stdio
+      │              (sessions, agents, sandboxes)      ▼
+      │                                        claude-agent-acp
+   /sessions/*   — conversation                  or codex-acp
+                  (message, events, resume)
 ```
 
 - **Sessions** hold conversation state (agent config, message history). Auto-recover from the DB when reaped.
-- **Sandboxes** are infrastructure. Provider-pluggable (local subprocess, Docker, Daytona).
-- **Providers**: `local` (subprocess on host), `docker` (container), `daytona` (cloud workspace).
+- **Supervisor** is a thin node process (`src/supervisor/supervisor.js`) that spawns the agent's ACP binary and exposes it over `/v1/acp/{id}` POST+SSE. One supervisor per provider-instance.
+- **Providers**: `local` (supervisor subprocess on host), `docker` (supervisor in ephemeral container), `daytona` (supervisor in a Daytona sandbox). Provider-pluggable, same HTTP surface across all three.
 
 ## Providers
 
@@ -146,7 +132,6 @@ For persistent sessions that survive long idle periods, use Daytona.
 
 - [API reference](docs/api.md) — REST endpoints
 - [Local dev](docs/local-dev.md) — Docker setup, env vars
-- [Rivet sandbox-agent SDK reference](docs/rivet_sandbox_agent_sdk_reference.md) — upstream ACP protocol details
 
 ## Layout
 
@@ -158,13 +143,16 @@ src/
     persist.py       SQLite session persistence
   api/               Orchestration server
     server.py          FastAPI endpoints
-    sandbox.py         Sandbox layer (stateless wrapper around providers)
-    providers.py       local / docker / daytona
-    sandbox_agent_client.py  ACP client
+    providers.py       local / docker / daytona supervisor bootstrap
+    acp_client.py      JSON-RPC ACP client (POST + SSE)
     db.py              Postgres CRUD
     sse.py             SSE parsing
     models.py          Dataclasses
     redact.py          Secret redaction for logs
+  supervisor/        Node stdio ⇄ HTTP bridge to claude-agent-acp / codex-acp
+    supervisor.js
+    package.json
+    Dockerfile
 tests/               pytest
 examples/            Demo scripts
 docs/                Docs

@@ -4,8 +4,8 @@
 """Adversarial tests for the agent SDK.
 
 Uses a fully in-process FastAPI TestClient / httpx.AsyncClient (ASGI transport)
-so no real server process is needed.  All Postgres DB calls and sandbox-agent
-provider calls are monkeypatched or mocked.
+so no real server process is needed.  All Postgres DB calls and provider calls
+are monkeypatched or mocked.
 """
 
 from __future__ import annotations
@@ -72,6 +72,7 @@ _stub_db.get_agent_log = _noop_list
 sys.modules["api.db"] = _stub_db
 
 # Now import server — lifespan calls init_db() / init_pool() which are no-ops
+import api.server as _server_module
 from api.server import app, SESSIONS, _INSTANCES
 from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
 from api.sse import (
@@ -87,7 +88,7 @@ from api.sse import (
     UT_USAGE_UPDATED,
     UT_USAGE_UPDATE,
 )
-from api.sandbox_agent_client import SandboxAgentClient, _mcp_dict_to_acp_array, _build_exec_body
+from api.acp_client import AcpClient, _mcp_dict_to_acp_array
 from api.providers import _get_sandbox_env_vars, PORT_BASED_PROVIDERS
 from api.server import (
     _materialize_dockerfile,
@@ -97,6 +98,17 @@ from api.server import (
 )
 from agent_sdk.client import Agent, _raise_for_status
 from agent_sdk.persist import SqliteSessionDriver, SessionRecord
+
+# If another test imported api.server first, overwrite its DB bindings here so
+# this file remains hermetic regardless of test collection/import order.
+for _name in (
+    "init_db", "init_pool", "close_pool",
+    "upsert_agent", "get_agent", "list_agents", "delete_agent",
+    "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
+    "upsert_session", "get_session",
+    "log_event", "get_session_log",
+):
+    setattr(_server_module, _name, getattr(_stub_db, _name))
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +187,7 @@ def _error_block(rpc_id: str, message: str = "boom") -> str:
 # ===========================================================================
 
 class TestAgentTypes:
-    VALID_TYPES = ["claude", "codex", "opencode", "amp", "pi", "cursor", "mock"]
+    VALID_TYPES = ["claude", "codex"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("agent_type", VALID_TYPES)
@@ -195,26 +207,18 @@ class TestAgentTypes:
         assert resp.json()["config"]["agent_type"] == "codex"
 
     @pytest.mark.asyncio
-    async def test_mock_agent_type_accepted(self, async_client):
-        """mock agent_type registers without error."""
-        resp = await async_client.post("/agents", json={"name": "mockbot", "agent_type": "mock"})
-        assert resp.status_code == 200
-        assert resp.json()["config"]["agent_type"] == "mock"
-
-    @pytest.mark.asyncio
     async def test_missing_agent_type_defaults_to_claude(self, async_client):
         """Omitting agent_type defaults to 'claude' via AgentConfig default."""
         resp = await async_client.post("/agents", json={"name": "default"})
         assert resp.status_code == 200
-        # AgentConfig defaults agent_type to "claude"
         cfg = resp.json().get("config", {})
         assert cfg.get("agent_type", "claude") == "claude"
 
     def test_agent_type_in_registration_payload(self):
         """SDK client includes agent_type in registration payload."""
-        agent = Agent("test", agent_type="opencode")
+        agent = Agent("test", agent_type="claude")
         payload = agent._registration_payload()
-        assert payload["agent_type"] == "opencode"
+        assert payload["agent_type"] == "claude"
 
     def test_invalid_agent_type_still_stored(self):
         """AgentConfig stores whatever string is given — validation is at the provider level."""
@@ -430,29 +434,15 @@ class TestSSEParsingEdgeCases:
 
 class TestMcpDictConversion:
     def test_stdio_conversion(self):
-        from api.sandbox_agent_client import _mcp_dict_to_acp_array
+        from api.acp_client import _mcp_dict_to_acp_array
         result = _mcp_dict_to_acp_array({"test": {"command": "echo", "args": ["hi"]}})
         assert len(result) == 1
         assert result[0]["name"] == "test"
         assert result[0]["type"] == "stdio"
 
     def test_empty_dict(self):
-        from api.sandbox_agent_client import _mcp_dict_to_acp_array
+        from api.acp_client import _mcp_dict_to_acp_array
         assert _mcp_dict_to_acp_array({}) == []
-
-class TestBuildExecBody:
-    def test_splits_command(self):
-        from api.sandbox_agent_client import _build_exec_body
-        body = _build_exec_body("ls -la /tmp", None, None)
-        assert body["command"] == "ls"
-        assert body["args"] == ["-la", "/tmp"]
-
-    def test_preserves_args(self):
-        from api.sandbox_agent_client import _build_exec_body
-        body = _build_exec_body("git", ["status"], "/workspace")
-        assert body["command"] == "git"
-        assert body["args"] == ["status"]
-        assert body["cwd"] == "/workspace"
 
 class TestProviderConstants:
     def test_port_based_providers(self):
@@ -592,10 +582,9 @@ class TestSessionState:
     def test_broadcast_to_multiple_subscribers(self):
         """broadcast() delivers items to all registered subscriber queues."""
         state = self._new_state()
-        state.resume_buffering()
-        q1 = state.subscribe()
-        q2 = state.subscribe()
-        q3 = state.subscribe()
+        q1 = state.subscribe_session()
+        q2 = state.subscribe_session()
+        q3 = state.subscribe_session()
 
         state.broadcast("hello")
         state.broadcast("world")
@@ -604,68 +593,11 @@ class TestSessionState:
             assert q.get_nowait() == "hello"
             assert q.get_nowait() == "world"
 
-    def test_new_turn_clears_replay_buffer(self):
-        """new_turn() clears the replay buffer."""
-        state = self._new_state()
-        state.resume_buffering()
-        state.broadcast("old event")
-        assert len(state._replay_buffer) == 1
-
-        state.new_turn()
-        assert len(state._replay_buffer) == 0
-
-    def test_new_turn_pauses_buffering(self):
-        """After new_turn(), broadcasts are not added to replay buffer."""
-        state = self._new_state()
-        state.resume_buffering()
-        state.new_turn()
-
-        state.broadcast("not buffered")
-        assert len(state._replay_buffer) == 0
-
-    def test_resume_buffering_allows_events_through(self):
-        """After resume_buffering(), events go into the replay buffer again."""
-        state = self._new_state()
-        state.new_turn()
-        state.resume_buffering()
-
-        state.broadcast("now buffered")
-        assert len(state._replay_buffer) == 1
-
-    def test_subscribe_replays_current_generation_only(self):
-        """subscribe() replays only events from the current turn generation when agent is busy."""
-        state = self._new_state()
-        state.resume_buffering()
-        state.broadcast("gen0 event")  # turn gen=0
-
-        state.new_turn()
-        state.resume_buffering()
-        state.broadcast("gen1 event")  # turn gen=1
-
-        # Mark turn as in-progress so replay fires (replay only happens for active turns)
-        state.agent_busy = True
-
-        # Late subscriber — should only get gen1
-        q = state.subscribe()
-        assert q.get_nowait() == "gen1 event"
-        assert q.empty()
-
-    def test_subscribe_replays_nothing_during_pause(self):
-        """subscribe() while buffering is paused replays nothing."""
-        state = self._new_state()
-        state.resume_buffering()
-        state.broadcast("pre-turn event")
-        state.new_turn()  # pauses buffering, clears buffer
-
-        q = state.subscribe()
-        assert q.empty()
-
     def test_unsubscribe_removes_queue(self):
         """unsubscribe() prevents future broadcasts from reaching the queue."""
         state = self._new_state()
-        state.resume_buffering()
-        q = state.subscribe()
-        state.unsubscribe(q)
+        q = state.subscribe_session()
+        state.unsubscribe_session(q)
 
         state.broadcast("after unsub")
         assert q.empty()
@@ -679,19 +611,16 @@ class TestSessionState:
         # Oldest items are dropped
         assert state.errors[0] == "err-50"
 
-    def test_replay_buffer_maxlen_5000(self):
-        """_replay_buffer caps at 5000 items."""
-        state = self._new_state()
-        state.resume_buffering()
-        for i in range(5100):
-            state.broadcast(str(i))
-        assert len(state._replay_buffer) == 5000
+    def test_broadcast_kicks_full_subscriber_queue(self):
+        """broadcast() kicks subscribers with full queues via _KICK_SENTINEL.
 
-    def test_broadcast_drops_full_subscriber_queue(self):
-        """broadcast() silently drops events for subscribers with full queues."""
+        B3 O(1) drain contract: _kick_subscriber discards ONE item to make room,
+        then appends the sentinel.  The queue still holds existing items; the
+        sentinel is at the END, not at the front.
+        """
+        from api.models import _KICK_SENTINEL
         state = self._new_state()
-        state.resume_buffering()
-        q = state.subscribe()
+        q = state.subscribe_session()
         # Fill the queue to capacity
         for i in range(10000):
             try:
@@ -699,8 +628,17 @@ class TestSessionState:
             except asyncio.QueueFull:
                 break
 
-        # This should not raise even though queue is full
+        # broadcast() should kick the full subscriber and remove it
         state.broadcast("overflow event")
+        # Subscriber should have been removed
+        assert q not in state._session_subscribers
+        # Drain existing items; sentinel must be the last item in the queue
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        assert items[-1] is _KICK_SENTINEL, "sentinel must be last item after O(1) kick"
+        # All items before sentinel are the original filler content
+        assert all(item == "fill" for item in items[:-1])
 
 
 # ===========================================================================
@@ -734,34 +672,6 @@ class TestProviderHelpers:
         result = _get_sandbox_env_vars()
         assert result.get("OPENAI_API_KEY") == "sk-openai-key"
 
-    def test_build_exec_body_no_args_splits_command(self):
-        """_build_exec_body auto-splits command string when args=None."""
-        body = _build_exec_body("ls -la /tmp", None, None)
-        assert body["command"] == "ls"
-        assert body["args"] == ["-la", "/tmp"]
-
-    def test_build_exec_body_with_explicit_args(self):
-        """_build_exec_body keeps command intact when args are provided."""
-        body = _build_exec_body("ls", ["-la", "/tmp"], None)
-        assert body["command"] == "ls"
-        assert body["args"] == ["-la", "/tmp"]
-
-    def test_build_exec_body_with_cwd(self):
-        """_build_exec_body includes cwd when provided."""
-        body = _build_exec_body("pwd", None, "/workspace")
-        assert body["cwd"] == "/workspace"
-
-    def test_build_exec_body_no_cwd_omits_key(self):
-        """_build_exec_body omits cwd when None."""
-        body = _build_exec_body("echo hello", None, None)
-        assert "cwd" not in body
-
-    def test_build_exec_body_complex_shell_command(self):
-        """_build_exec_body handles commands with quotes via shlex."""
-        body = _build_exec_body('python -c "print(1+1)"', None, None)
-        assert body["command"] == "python"
-        assert body["args"] == ["-c", "print(1+1)"]
-
     def test_port_based_providers_set(self):
         """PORT_BASED_PROVIDERS is a frozenset containing 'local' and 'docker'."""
         assert "local" in PORT_BASED_PROVIDERS
@@ -770,6 +680,7 @@ class TestProviderHelpers:
 
     def test_mcp_dict_to_acp_array_stdio(self):
         """_mcp_dict_to_acp_array converts stdio/local config correctly."""
+        from api.acp_client import _mcp_dict_to_acp_array as _fn
         mcp = {
             "my-tool": {
                 "type": "local",
@@ -778,7 +689,7 @@ class TestProviderHelpers:
                 "env": {"MY_KEY": "val"},
             }
         }
-        result = _mcp_dict_to_acp_array(mcp)
+        result = _fn(mcp)
         assert len(result) == 1
         entry = result[0]
         assert entry["name"] == "my-tool"
@@ -789,6 +700,7 @@ class TestProviderHelpers:
 
     def test_mcp_dict_to_acp_array_remote(self):
         """_mcp_dict_to_acp_array converts remote/sse config correctly."""
+        from api.acp_client import _mcp_dict_to_acp_array as _fn
         mcp = {
             "remote-tool": {
                 "type": "sse",
@@ -796,7 +708,7 @@ class TestProviderHelpers:
                 "headers": {"Authorization": "Bearer token"},
             }
         }
-        result = _mcp_dict_to_acp_array(mcp)
+        result = _fn(mcp)
         assert len(result) == 1
         entry = result[0]
         assert entry["type"] == "sse"
@@ -805,7 +717,100 @@ class TestProviderHelpers:
 
     def test_mcp_dict_to_acp_array_empty(self):
         """_mcp_dict_to_acp_array returns empty list for empty input."""
-        assert _mcp_dict_to_acp_array({}) == []
+        from api.acp_client import _mcp_dict_to_acp_array as _fn
+        assert _fn({}) == []
+
+
+# ===========================================================================
+# 7b. Skills normalization
+# ===========================================================================
+
+class TestNormalizeSkills:
+    def test_list_of_strings(self):
+        from api.server import _normalize_skills
+        result = _normalize_skills(["rllm-org/hive#staging", "vercel-labs/agent-skills"])
+        assert result == ["rllm-org/hive#staging", "vercel-labs/agent-skills"]
+
+    def test_dict_with_source(self):
+        from api.server import _normalize_skills
+        result = _normalize_skills({
+            "hive": {"source": "rllm-org/hive", "ref": "staging"},
+            "tools": {"source": "vercel-labs/agent-skills"},
+        })
+        assert "rllm-org/hive#staging" in result
+        assert "vercel-labs/agent-skills" in result
+
+    def test_dict_source_already_has_ref(self):
+        from api.server import _normalize_skills
+        result = _normalize_skills({
+            "hive": {"source": "rllm-org/hive#main", "ref": "staging"},
+        })
+        # should not double-append ref if # already present
+        assert result == ["rllm-org/hive#main"]
+
+    def test_dict_string_values(self):
+        from api.server import _normalize_skills
+        result = _normalize_skills({
+            "hive": "rllm-org/hive#staging",
+        })
+        assert result == ["rllm-org/hive#staging"]
+
+    def test_none(self):
+        from api.server import _normalize_skills
+        assert _normalize_skills(None) == []
+
+    def test_empty_list(self):
+        from api.server import _normalize_skills
+        assert _normalize_skills([]) == []
+
+    def test_empty_dict(self):
+        from api.server import _normalize_skills
+        assert _normalize_skills({}) == []
+
+
+class TestInstallSkills:
+    def test_skills_install_commands(self):
+        from api.server import _skills_install_commands
+        cmds = _skills_install_commands(["rllm-org/hive#staging"])
+        assert cmds == ["npx -y skills add 'rllm-org/hive#staging' --all -g"]
+
+    def test_skills_install_commands_empty(self):
+        from api.server import _skills_install_commands
+        assert _skills_install_commands(None) == []
+        assert _skills_install_commands([]) == []
+
+    def test_skills_install_commands_dict(self):
+        from api.server import _skills_install_commands
+        cmds = _skills_install_commands({"hive": {"source": "rllm-org/hive", "ref": "staging"}, "tools": "other/repo"})
+        assert len(cmds) == 2
+        assert "npx -y skills add 'rllm-org/hive#staging' --all -g" in cmds
+        assert "npx -y skills add other/repo --all -g" in cmds
+
+    @pytest.mark.asyncio
+    async def test_install_skills_locally(self):
+        from unittest.mock import AsyncMock, patch
+        from api.server import _install_skills_locally
+
+        with patch("api.server.asyncio.create_subprocess_shell", new_callable=AsyncMock) as mock_proc:
+            proc_mock = AsyncMock()
+            proc_mock.communicate.return_value = (b"Done!", b"")
+            proc_mock.returncode = 0
+            mock_proc.return_value = proc_mock
+            await _install_skills_locally(["rllm-org/hive#staging"])
+            mock_proc.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_install_skills_locally_raises_on_failure(self):
+        from unittest.mock import AsyncMock, patch
+        from api.server import _install_skills_locally
+
+        with patch("api.server.asyncio.create_subprocess_shell", new_callable=AsyncMock) as mock_proc:
+            proc_mock = AsyncMock()
+            proc_mock.communicate.return_value = (b"", b"error msg")
+            proc_mock.returncode = 1
+            mock_proc.return_value = proc_mock
+            with pytest.raises(RuntimeError, match="skill install failed"):
+                await _install_skills_locally(["bad/repo"])
 
 
 # ===========================================================================
@@ -993,21 +998,6 @@ class TestConcurrencyAdversarial:
 
         assert len(post_calls) == 1
 
-    @pytest.mark.asyncio
-    async def test_session_state_concurrent_broadcast(self):
-        """Concurrent broadcast() calls don't corrupt the replay buffer."""
-        state = SessionState(session_id="s1", agent_id="a1", sandbox_id="sbx1")
-        state.resume_buffering()
-
-        async def _broadcaster(n: int):
-            for i in range(100):
-                state.broadcast(f"msg-{n}-{i}")
-
-        await asyncio.gather(*[_broadcaster(i) for i in range(5)])
-
-        # Should have at most 5000 items (maxlen) with no duplicates in terms of corruption
-        assert len(state._replay_buffer) <= 5000
-
 
 # ===========================================================================
 # 12. Server endpoint adversarial cases
@@ -1027,6 +1017,19 @@ class TestServerEndpointAdversarial:
         # The server catches the exception and returns 502
         assert resp.status_code == 502
         assert "error" in resp.json()
+
+    @pytest.mark.asyncio
+    async def test_quick_create_circuit_breaker_returns_503(self, async_client):
+        """Circuit-breaker failures should tell clients to back off."""
+        with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")):
+            resp = await async_client.post("/sessions/quick", json={
+                "name": "test",
+                "provider": "daytona",
+                "agent_type": "claude",
+            })
+        assert resp.status_code == 503
+        assert resp.headers["Retry-After"] == "30"
+        assert "circuit breaker" in resp.json()["error"]
 
     @pytest.mark.asyncio
     async def test_create_agent_missing_name_still_works(self, async_client):
@@ -1131,65 +1134,6 @@ def _mock_response(status_code: int, body: dict) -> MagicMock:
 
 # ── Iteration 2: Tests for new features ──
 
-class TestNewDesktopAPIMethods:
-    """Test the 21 new sandbox_agent_client methods."""
-
-    def test_build_exec_body_quoted_args(self):
-        """Test _build_exec_body with args containing spaces."""
-        body = _build_exec_body("echo", ["hello world", "foo bar"], None)
-        assert body["command"] == "echo"
-        assert body["args"] == ["hello world", "foo bar"]
-
-    def test_build_exec_body_empty_command_raises(self):
-        """Test _build_exec_body with empty string raises."""
-        with pytest.raises((ValueError, IndexError)):
-            _build_exec_body("", None, None)
-
-    def test_build_exec_body_all_params(self):
-        body = _build_exec_body("ls", ["-la"], "/tmp")
-        assert body == {"command": "ls", "args": ["-la"], "cwd": "/tmp"}
-
-
-class TestNewServerProxyEndpoints:
-    """Test the new server proxy endpoints (drag, scroll, launch, recordings)."""
-
-    @pytest.fixture(autouse=True)
-    def _clear(self):
-        SESSIONS.clear()
-        _INSTANCES.clear()
-        yield
-        SESSIONS.clear()
-        _INSTANCES.clear()
-
-    @pytest.mark.asyncio
-    async def test_drag_endpoint_returns_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/drag", json={"startX": 0, "startY": 0, "endX": 1, "endY": 1})
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_scroll_endpoint_returns_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/scroll", json={"x": 0, "y": 0})
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_launch_endpoint_returns_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/launch", json={"appName": "firefox"})
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_recordings_start_returns_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/recordings/start")
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_recordings_stop_returns_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/recordings/stop")
-            assert r.status_code == 502
 
 
 class TestRedactionIntegration:
@@ -1324,17 +1268,6 @@ class TestDeriveSandboxRef:
 
 
 
-class TestAutoInstallIntegration:
-    """Test that auto-install is wired into initialization."""
-
-    def test_initialize_has_auto_install_logic(self):
-        """Verify the auto-install code exists in SandboxAgentClient.initialize."""
-        import inspect
-        from api.sandbox_agent_client import SandboxAgentClient
-        source = inspect.getsource(SandboxAgentClient.initialize)
-        assert "install_agent" in source
-        assert "auto-install" in source.lower() or "auto_install" in source.lower() or "auto-installing" in source.lower()
-
 
 # ── Iteration 4: Callbacks, broadcast, exports ──
 
@@ -1446,7 +1379,7 @@ class TestAgentFromFile:
         import json
         config = {
             "name": "full",
-            "agent_type": "mock",
+            "agent_type": "claude",
             "provider": "docker",
             "model": "haiku",
             "prompt": "You are a test bot",
@@ -1459,7 +1392,7 @@ class TestAgentFromFile:
         from agent_sdk.client import Agent
         agent = Agent.from_file(str(f))
         assert agent.name == "full"
-        assert agent.agent_type == "mock"
+        assert agent.agent_type == "claude"
         assert agent.prompt == "You are a test bot"
         assert agent.tools == ["Read", "Edit"]
 
@@ -1467,21 +1400,6 @@ class TestAgentFromFile:
 
 
 
-
-class TestSetModeCaching:
-    """Test that set_mode caches the working method name."""
-
-    def test_set_mode_method_initialized_none(self):
-        from api.sandbox_agent_client import SandboxAgentClient
-        client = SandboxAgentClient("http://localhost:9999")
-        assert client._set_mode_method is None
-
-    def test_set_mode_method_cache_field_exists(self):
-        """Verify the cache field exists in the source."""
-        import inspect
-        from api.sandbox_agent_client import SandboxAgentClient
-        source = inspect.getsource(SandboxAgentClient.set_mode)
-        assert "_set_mode_method" in source
 
 
 class TestRedactCaching:
@@ -1578,19 +1496,6 @@ class TestAgentClone:
         cloned = agent.clone()
         assert cloned._persist is None
 
-    def test_clone_preserves_env_vars(self):
-        from agent_sdk.client import Agent
-        agent = Agent("worker", env_vars={"KEY": "val"})
-        cloned = agent.clone()
-        assert cloned.env_vars == {"KEY": "val"}
-
-    def test_clone_with_env_var_override(self):
-        from agent_sdk.client import Agent
-        agent = Agent("worker", env_vars={"KEY": "old"})
-        cloned = agent.clone(env_vars={"KEY": "new"})
-        assert cloned.env_vars == {"KEY": "new"}
-        assert agent.env_vars == {"KEY": "old"}  # original unchanged
-
     def test_clone_has_fresh_usage(self):
         from agent_sdk.client import Agent
         agent = Agent("worker")
@@ -1639,21 +1544,16 @@ class TestAgentTypeConstants:
     """Test agent type and provider constants."""
 
     def test_all_agent_types_defined(self):
-        from agent_sdk import CLAUDE, CODEX, OPENCODE, AMP, PI, CURSOR, MOCK
+        from agent_sdk import CLAUDE, CODEX
         assert CLAUDE == "claude"
         assert CODEX == "codex"
-        assert OPENCODE == "opencode"
-        assert AMP == "amp"
-        assert PI == "pi"
-        assert CURSOR == "cursor"
-        assert MOCK == "mock"
 
     def test_agent_types_frozenset(self):
         from agent_sdk import AGENT_TYPES
         assert isinstance(AGENT_TYPES, frozenset)
-        assert len(AGENT_TYPES) == 7
-        assert "claude" in AGENT_TYPES
-        assert "mock" in AGENT_TYPES
+        assert len(AGENT_TYPES) == 8
+        for at in ("claude", "codex", "opencode", "gemini", "cline", "deepagents", "openhands", "goose"):
+            assert at in AGENT_TYPES
         assert "invalid" not in AGENT_TYPES
 
     def test_provider_constants_defined(self):
@@ -1708,8 +1608,8 @@ class TestEventTypeConstants:
 
     def test_constants_used_in_flush(self):
         import inspect
-        from api.server import _flush_text_parts
-        source = inspect.getsource(_flush_text_parts)
+        from api.server import _flush_buffered_text
+        source = inspect.getsource(_flush_buffered_text)
         assert "EVT_ASSISTANT_MESSAGE" in source
 
 
@@ -1723,13 +1623,6 @@ class TestEventTypeConstants:
 
 class TestDaytonaStateFix:
     """Test that Daytona state comparison handles enums properly."""
-
-    def test_ensure_sandbox_alive_handles_enum_state(self):
-        """Verify the state comparison uses .value for enum safety."""
-        import inspect
-        from api.server import _ensure_sandbox_alive
-        source = inspect.getsource(_ensure_sandbox_alive)
-        assert "hasattr" in source and "value" in source
 
     def test_daytona_client_factory_exists(self):
         """Verify shared _get_daytona_client exists in providers."""
@@ -1790,12 +1683,10 @@ class TestParallelShutdown:
         assert "asyncio.gather" in source
 
     def test_safe_destroy_in_shutdown(self):
-        """Verify shutdown wraps instance teardown in safe error handling."""
+        """Verify shutdown wraps stop_instance in safe error handling."""
         import inspect
         from api.server import lifespan
         source = inspect.getsource(lifespan)
-        # Instance teardown at shutdown uses stop_instance (not destroy) to
-        # preserve Daytona sandboxes across server restarts.
         assert "_safe_stop" in source
         assert "stop_instance" in source
 
@@ -1850,7 +1741,7 @@ class TestSDKVersion:
 
 
 
-# ── Iteration 26: Remaining sandbox-agent proxies ──
+# ── Iteration 26: Removed ──
 
 
 
@@ -1874,8 +1765,7 @@ class TestErrorContext:
     def test_stream_error_includes_name(self):
         from agent_sdk.client import Agent
         import inspect
-        # Error formatting lives in astream_events; astream is a thin wrapper.
-        source = inspect.getsource(Agent.astream_events)
+        source = inspect.getsource(Agent.astream)
         assert "self.name" in source
 
 
@@ -1890,13 +1780,6 @@ class TestErrorContext:
 
 
 # ── Iteration 34: Adversarial edge cases for later features ──
-
-
-
-        # Result may be None or "hello" depending on error handling
-        # The key test is it doesn't crash
-
-
 
 
 class TestUsageStatsEdgeCases:
@@ -2068,44 +1951,6 @@ class TestHealthEndpoint:
             assert r.json() == {"status": "ok"}
 
 
-class TestProxyEndpointErrors:
-    """Test that proxy endpoints return proper errors when not connected."""
-
-    @pytest.fixture(autouse=True)
-    def _clear(self):
-        SESSIONS.clear()
-        _INSTANCES.clear()
-        yield
-        SESSIONS.clear()
-        _INSTANCES.clear()
-
-    @pytest.mark.asyncio
-    async def test_fs_operations_return_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            endpoints = [
-                ("GET", "/sandboxes/x/fs", {}),
-                ("GET", "/sandboxes/x/fs/file?path=/tmp", {}),
-                ("GET", "/sandboxes/x/fs/stat?path=/tmp", {}),
-                ("POST", "/sandboxes/x/fs/mkdir?path=/tmp", {}),
-                ("POST", "/sandboxes/x/exec", {"command": "ls"}),
-            ]
-            for method, url, body in endpoints:
-                if method == "GET":
-                    r = await c.get(url)
-                else:
-                    r = await c.post(url, json=body)
-                assert r.status_code == 502, f"{method} {url} returned {r.status_code}"
-
-    @pytest.mark.asyncio
-    async def test_desktop_operations_return_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            endpoints = [
-                "/sandboxes/x/screenshot",
-                "/sandboxes/x/desktop/display",
-            ]
-            for url in endpoints:
-                r = await c.get(url)
-                assert r.status_code == 502, f"GET {url} returned {r.status_code}"
 
 # ── Iteration 40: SDK surface area validation ──
 
@@ -2336,27 +2181,6 @@ class TestValidationEdgeCases:
 
 # ── Iteration 86: Server proxy endpoints for process management ──
 
-class TestProcessProxyEndpoints:
-    @pytest.fixture(autouse=True)
-    def _clear(self):
-        SESSIONS.clear()
-        _INSTANCES.clear()
-        yield
-        SESSIONS.clear()
-        _INSTANCES.clear()
-
-    @pytest.mark.asyncio
-    async def test_process_info_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sandboxes/nope/processes/pid-1")
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_send_input_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/processes/pid-1/input", content="hello")
-            assert r.status_code == 502
-
 
 # ── Iteration 87: Final comprehensive validation ──
 
@@ -2383,55 +2207,9 @@ class TestProcessProxyEndpoints:
 
 # ── Iteration 94: Precision input server proxies ──
 
-class TestPrecisionInputEndpoints:
-    @pytest.fixture(autouse=True)
-    def _clear(self):
-        SESSIONS.clear()
-        _INSTANCES.clear()
-        yield
-        SESSIONS.clear()
-        _INSTANCES.clear()
-
-    @pytest.mark.asyncio
-    async def test_mouse_down_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/mouse/down", json={"x": 0, "y": 0})
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_key_down_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/keyboard/down", json={"key": "a"})
-            assert r.status_code == 502
 
 # ── Iteration 95: Window/desktop server proxies ──
 
-class TestDesktopServerProxies:
-    @pytest.fixture(autouse=True)
-    def _clear(self):
-        SESSIONS.clear()
-        _INSTANCES.clear()
-        yield
-        SESSIONS.clear()
-        _INSTANCES.clear()
-
-    @pytest.mark.asyncio
-    async def test_list_windows_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sandboxes/nope/desktop/windows")
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_desktop_start_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/start")
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_recordings_list_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sandboxes/nope/desktop/recordings")
-            assert r.status_code == 502
 
 
 # ── Iteration 96: Final edge cases ──
@@ -2473,26 +2251,6 @@ class TestAgentMethodExistence:
 
 # ── Iteration 102: Server proxies for mouse_move, desktop_status ──
 
-class TestMouseMoveDesktopStatusEndpoints:
-    @pytest.fixture(autouse=True)
-    def _clear(self):
-        SESSIONS.clear()
-        _INSTANCES.clear()
-        yield
-        SESSIONS.clear()
-        _INSTANCES.clear()
-
-    @pytest.mark.asyncio
-    async def test_mouse_move_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/nope/desktop/mouse/move", json={"x": 0, "y": 0})
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_desktop_status_endpoint_502(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sandboxes/nope/desktop/status")
-            assert r.status_code == 502
 
 
 # ── Iteration 103: More adversarial edge cases ──
@@ -2682,17 +2440,6 @@ class TestServerEndpointCount:
             r = await c.post("/sessions/nonexistent/resume")
             assert r.status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_deploy_skill_returns_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/x/deploy-skill", json={})
-            assert r.status_code == 502
-
-    @pytest.mark.asyncio
-    async def test_install_agent_returns_502_no_sandbox(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sandboxes/x/install-agent", json={"agent_type": "mock"})
-            assert r.status_code == 502
 
 # ── Iteration 111: More edge cases ──
 
@@ -2776,6 +2523,31 @@ class TestPrepareMessage:
         msg = a._prepare_message("second")
         assert "system-context" not in msg
         assert msg.startswith("second") or "second" in msg
+
+class TestAcpLaunchArgs:
+    def test_opencode_has_acp_subcommand(self):
+        from api.providers import _acp_launch_args
+        assert _acp_launch_args("opencode") == ["acp"]
+
+    def test_claude_has_no_extra_args(self):
+        from api.providers import _acp_launch_args
+        assert _acp_launch_args("claude") == []
+
+    def test_codex_has_no_extra_args(self):
+        from api.providers import _acp_launch_args
+        assert _acp_launch_args("codex") == []
+
+    def test_returns_fresh_list(self):
+        # Mutating the returned list must not affect the module-level dict.
+        from api.providers import _acp_launch_args
+        r = _acp_launch_args("opencode")
+        r.append("mutated")
+        assert _acp_launch_args("opencode") == ["acp"]
+
+    def test_bin_name_for_opencode(self):
+        from api.providers import _acp_bin_name
+        assert _acp_bin_name("opencode") == "opencode"
+
 
 class TestSessionRecordDataclass:
     def test_session_record_fields(self):

@@ -10,6 +10,15 @@ from typing import Any
 
 
 @dataclass
+class PendingPrompt:
+    """Queued prompt waiting for the active prompt to finish."""
+    rpc_id: str
+    message: str
+    submitted_at: float = field(default_factory=time.time)
+
+
+
+@dataclass
 class AgentConfig:
     agent_type: str = "claude"
     model: str | None = None
@@ -17,7 +26,7 @@ class AgentConfig:
     cwd: str | None = None
     tools: list[str] | None = None
     mcp_servers: dict | None = None
-    skills: dict | None = None
+    skills: list | dict | None = None  # npx skills sources
     dockerfile: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -29,6 +38,9 @@ class AgentConfig:
 
 
 _AGENT_CONFIG_FIELDS = frozenset(AgentConfig.__dataclass_fields__)
+
+# Sentinel pushed to slow subscribers when they are kicked off for being full
+_KICK_SENTINEL = object()
 
 # ── Session event type constants ──
 EVT_USER_MESSAGE = "user_message"
@@ -77,94 +89,108 @@ class SessionState:
     sandbox_id: str
     acp_session_id: str | None = None
     inner_session_id: str | None = None
-    client: object | None = None  # SandboxAgentClient, typed loosely to avoid circular import
+    agent_type: str = "claude"  # claude | codex (selects ProviderAdapter)
+    client: object | None = None  # AcpClient, typed loosely to avoid circular import
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     last_event_id: str | None = None  # SSE cursor — skip events before this ID
     last_activity: float = field(default_factory=time.time)
-    agent_busy: bool = field(default=False)  # True while agent is processing (between prompt and stopReason)
     turn_completed_at: float | None = field(default=None)  # when the last stopReason arrived
-    current_rpc_id: str | None = field(default=None)  # rpc_id of the in-flight prompt; tags log events
     # Persistent SSE reader — connects once at session creation, fans out to subscribers
     _reader_task: object | None = field(default=None, repr=False)  # asyncio.Task
-    _subscribers: list = field(default_factory=list, repr=False)  # list[asyncio.Queue]
     _reader_alive: bool = field(default=False, repr=False)
-    _replay_buffer: deque = field(default_factory=lambda: deque(maxlen=5000), repr=False)
-    _turn_gen: int = field(default=0, repr=False)  # incremented by new_turn(); tags buffered events
-    _buffering_paused: bool = field(default=False, repr=False)  # True between new_turn() and resume_buffering()
-    _log_chain: object | None = field(default=None, repr=False)  # asyncio.Task — serializes log writes
+    _log_chain: object | None = field(default=None, repr=False)
     errors: deque = field(default_factory=lambda: deque(maxlen=100), repr=False)
 
-    def new_turn(self) -> None:
-        """Mark the start of a new agent turn.
+    # ── Explicit scheduler ──
+    active_rpc_id: str | None = field(default=None, repr=False)
+    pending_prompts: deque = field(default_factory=deque, repr=False)  # deque[PendingPrompt]
+    _prompt_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _prompt_done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _scheduler_task: object | None = field(default=None, repr=False)  # asyncio.Task
+    # ── Subscribers ──
+    _session_subscribers: list = field(default_factory=list, repr=False)  # list[asyncio.Queue]
+    _rpc_subscribers: dict = field(default_factory=dict, repr=False)  # dict[str, list[asyncio.Queue]]
 
-        Increments the turn generation counter, clears the replay buffer,
-        and pauses buffering.  While paused, broadcast() forwards events
-        to live subscribers but does NOT add them to the replay buffer —
-        this prevents trailing chunks from the prior turn (delivered by
-        the SSE reader after new_turn() returns) from being tagged with
-        the new generation and replayed to future subscribers.
+    @property
+    def agent_busy(self) -> bool:
+        return self.active_rpc_id is not None
 
-        Call resume_buffering() once the prompt has been accepted by the
-        agent so that events from the new turn are captured correctly.
-        """
-        self._turn_gen += 1
-        self._replay_buffer.clear()
-        self._buffering_paused = True
+    # ── Session-scoped subscribers (receive all events) ──
 
-    def resume_buffering(self) -> None:
-        """Allow broadcast() to start filling the replay buffer again.
-
-        Must be called after new_turn() once it is safe to buffer events
-        for the current turn (i.e. the prompt call has been accepted and
-        any in-flight chunks from the prior turn have been flushed).
-        """
-        self._buffering_paused = False
-
-    def subscribe(self) -> "asyncio.Queue":
-        """Register a new subscriber queue. Replays buffered events from an in-progress turn only.
-
-        If no turn is in progress (agent not busy), no replay happens —
-        prevents old events from bleeding into the next turn.
-        """
+    def subscribe_session(self) -> "asyncio.Queue":
+        """Register a session-scoped subscriber queue."""
         q: asyncio.Queue = asyncio.Queue(maxsize=10000)
-        if self.agent_busy:
-            current_gen = self._turn_gen
-            for gen, item in self._replay_buffer:
-                if gen != current_gen:
-                    continue
-                try:
-                    q.put_nowait(item)
-                except asyncio.QueueFull:
-                    break
-        self._subscribers.append(q)
+        self._session_subscribers.append(q)
         return q
 
-    def unsubscribe(self, q: "asyncio.Queue") -> None:
-        """Remove a subscriber queue."""
+    def unsubscribe_session(self, q: "asyncio.Queue") -> None:
+        """Remove a session-scoped subscriber queue."""
         try:
-            self._subscribers.remove(q)
+            self._session_subscribers.remove(q)
         except ValueError:
             pass
 
-    def broadcast(self, item) -> None:
-        """Push item to all subscriber queues and replay buffer.
+    # ── RPC-scoped subscribers (receive events for one rpc_id only) ──
 
-        Events are always forwarded to live subscribers.  They are added
-        to the replay buffer only when buffering is active (i.e. after
-        resume_buffering() has been called following new_turn()).  This
-        prevents trailing chunks from a completed turn — which the SSE
-        reader may deliver after new_turn() bumps the generation — from
-        being stored under the new generation and replayed to future
-        subscribers.
-        """
-        # Only buffer when not paused; paused = between new_turn() and resume_buffering()
-        if isinstance(item, str) and not self._buffering_paused:
-            self._replay_buffer.append((self._turn_gen, item))
-        for q in self._subscribers:
+    def subscribe_rpc(self, rpc_id: str) -> "asyncio.Queue":
+        """Register an RPC-scoped subscriber queue for a specific prompt."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=10000)
+        self._rpc_subscribers.setdefault(rpc_id, []).append(q)
+        return q
+
+    def unsubscribe_rpc(self, rpc_id: str, q: "asyncio.Queue") -> None:
+        """Remove an RPC-scoped subscriber queue."""
+        qs = self._rpc_subscribers.get(rpc_id)
+        if qs is not None:
             try:
-                q.put_nowait(item)
-            except asyncio.QueueFull:
-                pass  # drop if subscriber is too slow
+                qs.remove(q)
+            except ValueError:
+                pass
+            if not qs:
+                self._rpc_subscribers.pop(rpc_id, None)
+
+    # ── Dispatch ──
+
+    def _kick_subscriber(self, q: "asyncio.Queue") -> None:
+        """Kick a subscriber by putting _KICK_SENTINEL. Makes one slot if needed."""
+        try:
+            q.put_nowait(_KICK_SENTINEL)
+        except asyncio.QueueFull:
+            try:
+                q.get_nowait()
+                q.put_nowait(_KICK_SENTINEL)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
+    def _send(self, queues: list, item) -> None:
+        """Push item to queues, kicking full ones."""
+        dead = [q for q in queues if not _try_put(q, item)]
+        for q in dead:
+            queues.remove(q)
+            self._kick_subscriber(q)
+
+    def dispatch(self, tag: str | None, item) -> None:
+        """Route to matching RPC subscribers + all session subscribers."""
+        if tag is not None:
+            rpc_qs = self._rpc_subscribers.get(tag)
+            if rpc_qs:
+                self._send(rpc_qs, item)
+        self._send(self._session_subscribers, item)
+
+    def broadcast(self, item) -> None:
+        """Push to ALL subscribers (session + all RPC). For sentinels/heartbeats."""
+        self._send(self._session_subscribers, item)
+        for rpc_qs in list(self._rpc_subscribers.values()):
+            self._send(rpc_qs, item)
+
+
+
+def _try_put(q: asyncio.Queue, item) -> bool:
+    try:
+        q.put_nowait(item)
+        return True
+    except asyncio.QueueFull:
+        return False
 
 
 @dataclass

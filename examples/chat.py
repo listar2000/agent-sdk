@@ -1,14 +1,14 @@
-"""Demo: reattach to an existing session by session_id and send a prompt.
+"""Demo: one-shot streaming chat against the docker server.
 
-Shows that you can reconstruct a session client from just the session_id —
-the server looks up agent/sandbox from the DB and rebuilds state if needed.
+Creates a fresh session and streams a single prompt's response. Useful for
+quickly verifying the docker stack is working end-to-end.
 
 Prerequisites:
   docker compose up --build -d
   curl http://localhost:7778/health
 
 Usage:
-  python examples/resume_demo2.py --session-id <uuid> -p "your prompt"
+  python examples/chat.py -p "hello, who are you?"
 """
 
 import argparse
@@ -23,11 +23,13 @@ API_URL = "http://localhost:7778"
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--session-id", required=True, help="Existing session UUID")
     parser.add_argument("-p", required=True, help="Prompt to send to the agent")
     args = parser.parse_args()
 
-    agent = Agent("resume-demo2", session_id=args.session_id, api_url=API_URL)
+    agent = Agent(
+        "chat-demo", provider="local", cwd="/tmp",
+        model="haiku", api_url=API_URL,
+    )
     async for resp in agent.astream(args.p):
         print(resp, end="", flush=True)
     print()

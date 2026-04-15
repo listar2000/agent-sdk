@@ -1,0 +1,1938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Panel</title>
+<style>
+  :root {
+    --app-bg: #0d0f13;
+    --chrome-bg: #12151b;
+    --panel-bg: #171b22;
+    --panel-elev: #1d222b;
+    --panel-elev-2: #222834;
+    --editor-bg: #101319;
+    --border: #2a303a;
+    --border-soft: #232934;
+    --text: #d9dee7;
+    --text-muted: #9ca5b4;
+    --text-faint: #7b8492;
+    --accent: #6b91ff;
+    --accent-strong: #7ca6ff;
+    --success: #4bb382;
+    --warning: #d2a254;
+    --danger: #d46b6b;
+    --shadow: 0 22px 70px rgba(0, 0, 0, 0.45);
+    --radius-xl: 18px;
+    --radius-lg: 13px;
+    --radius-md: 10px;
+    --radius-sm: 8px;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html, body {
+    height: 100%;
+  }
+
+  body {
+    font-family: "SF Pro Text", "Inter", "Segoe UI", sans-serif;
+    background:
+      radial-gradient(circle at top left, rgba(107, 145, 255, 0.12), transparent 28%),
+      radial-gradient(circle at bottom right, rgba(74, 104, 163, 0.15), transparent 26%),
+      linear-gradient(180deg, #0d1014 0%, #0a0c10 100%);
+    color: var(--text);
+    padding: 14px;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+    background-size: 24px 24px;
+    pointer-events: none;
+    opacity: 0.18;
+  }
+
+  #shell {
+    position: relative;
+    z-index: 1;
+    width: min(540px, 100%);
+    height: calc(100vh - 28px);
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 24%),
+      var(--panel-bg);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  #shell::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 8%),
+      radial-gradient(circle at top, rgba(124, 166, 255, 0.08), transparent 40%);
+    pointer-events: none;
+  }
+
+  .topbar {
+    position: relative;
+    padding: 10px 12px 9px;
+    border-bottom: 1px solid var(--border-soft);
+    background: rgba(12, 14, 18, 0.78);
+    backdrop-filter: blur(18px);
+  }
+
+  .topbar-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .title-stack {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+  }
+
+  .title-badge {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background:
+      linear-gradient(180deg, rgba(124, 166, 255, 0.18), rgba(124, 166, 255, 0.05)),
+      var(--panel-elev);
+    color: var(--accent-strong);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+
+  .title-copy {
+    min-width: 0;
+  }
+
+  .title-copy h1 {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .title-copy p {
+    margin-top: 1px;
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .topbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--panel-elev);
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .status-pill::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-faint);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.03);
+  }
+
+  .status-pill.connected::before {
+    background: var(--success);
+  }
+
+  .status-pill.busy::before {
+    background: var(--warning);
+  }
+
+  .status-pill.disconnected::before {
+    background: var(--danger);
+  }
+
+  .topbar button,
+  .queue-button,
+  .composer-button {
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--panel-elev);
+    color: var(--text);
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+  }
+
+  .topbar button:hover,
+  .queue-button:hover,
+  .composer-button:hover {
+    background: var(--panel-elev-2);
+    border-color: #364050;
+  }
+
+  .topbar button:active,
+  .queue-button:active,
+  .composer-button:active {
+    transform: translateY(1px);
+  }
+
+  .topbar button {
+    padding: 5px 8px;
+    font-size: 11px;
+  }
+
+  .session-controls {
+    display: grid;
+    grid-template-columns: 0.9fr 0.9fr 1.1fr 1.4fr;
+    gap: 8px;
+    margin-top: 9px;
+  }
+
+  .session-controls .wide {
+    grid-column: span 2;
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .field-label {
+    color: var(--text-faint);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .field input,
+  .field select {
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--editor-bg);
+    color: var(--text);
+    padding: 8px 9px;
+    font-size: 12px;
+    outline: none;
+  }
+
+  .field input:focus,
+  .field select:focus,
+  #composer:focus {
+    border-color: #4560a6;
+    box-shadow: 0 0 0 1px rgba(69, 96, 166, 0.35);
+  }
+
+  #thread {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 14px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  #thread::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  #thread::-webkit-scrollbar-thumb {
+    background: #252c36;
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background-clip: padding-box;
+  }
+
+  .empty-state {
+    margin: auto 0;
+    border: 1px solid var(--border-soft);
+    border-radius: 16px;
+    padding: 22px 18px;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 55%),
+      rgba(16, 19, 25, 0.8);
+  }
+
+  .empty-state h2 {
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .empty-state p {
+    margin-top: 8px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    font-size: 13px;
+  }
+
+  .empty-list {
+    margin-top: 14px;
+    display: grid;
+    gap: 8px;
+  }
+
+  .empty-list div {
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    background: var(--panel-elev);
+    padding: 10px 12px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .turn {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .turn-user-row {
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  .turn-user {
+    max-width: 88%;
+    border: 1px solid #2f3643;
+    border-radius: 14px 14px 6px 14px;
+    background:
+      linear-gradient(180deg, rgba(124, 166, 255, 0.07), transparent 65%),
+      var(--panel-elev-2);
+    padding: 11px 13px;
+    white-space: pre-wrap;
+    line-height: 1.5;
+    font-size: 14px;
+  }
+
+  .turn-user-row.hidden {
+    display: none;
+  }
+
+  .assistant-stream {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .message-card {
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    background: rgba(15, 18, 24, 0.9);
+    padding: 11px 13px;
+    line-height: 1.55;
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .message-card.assistant {
+    color: var(--text);
+    white-space: normal;
+  }
+
+  .message-card.assistant > :first-child {
+    margin-top: 0;
+  }
+
+  .message-card.assistant > :last-child {
+    margin-bottom: 0;
+  }
+
+  .message-card.assistant h1,
+  .message-card.assistant h2,
+  .message-card.assistant h3,
+  .message-card.assistant h4,
+  .message-card.assistant h5,
+  .message-card.assistant h6,
+  .message-card.assistant p,
+  .message-card.assistant ul,
+  .message-card.assistant ol,
+  .message-card.assistant pre,
+  .message-card.assistant blockquote,
+  .message-card.assistant hr {
+    margin: 0 0 0.85em;
+  }
+
+  .message-card.assistant h1,
+  .message-card.assistant h2,
+  .message-card.assistant h3,
+  .message-card.assistant h4,
+  .message-card.assistant h5,
+  .message-card.assistant h6 {
+    color: #eef3ff;
+    line-height: 1.3;
+  }
+
+  .message-card.assistant h1 {
+    font-size: 1.24rem;
+  }
+
+  .message-card.assistant h2 {
+    font-size: 1.15rem;
+  }
+
+  .message-card.assistant h3 {
+    font-size: 1.05rem;
+  }
+
+  .message-card.assistant ul,
+  .message-card.assistant ol {
+    padding-left: 1.35rem;
+  }
+
+  .message-card.assistant li + li {
+    margin-top: 0.3rem;
+  }
+
+  .message-card.assistant li > :last-child {
+    margin-bottom: 0;
+  }
+
+  .message-card.assistant blockquote {
+    padding-left: 12px;
+    border-left: 3px solid rgba(124, 166, 255, 0.35);
+    color: #c4cddd;
+  }
+
+  .message-card.assistant a {
+    color: var(--accent-strong);
+    text-decoration: none;
+  }
+
+  .message-card.assistant a:hover {
+    text-decoration: underline;
+  }
+
+  .message-card.assistant code {
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 12px;
+    padding: 0.15rem 0.35rem;
+    border-radius: 6px;
+    background: rgba(124, 166, 255, 0.1);
+    color: #eef3ff;
+  }
+
+  .message-card.assistant pre {
+    overflow-x: auto;
+    padding: 11px 12px;
+    border: 1px solid #2d3440;
+    border-radius: 10px;
+    background: #0f131a;
+    white-space: pre-wrap;
+  }
+
+  .message-card.assistant pre code {
+    display: block;
+    padding: 0;
+    background: none;
+    color: var(--text);
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+
+  .message-card.assistant hr {
+    border: 0;
+    border-top: 1px solid var(--border-soft);
+  }
+
+  .message-card.thinking {
+    color: #aeb7c5;
+    font-style: italic;
+    background: rgba(21, 24, 31, 0.9);
+  }
+
+  .message-card.error {
+    color: #f2bbbb;
+    border-color: rgba(212, 107, 107, 0.4);
+    background: rgba(73, 22, 22, 0.45);
+  }
+
+  .tool-card {
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    background: rgba(16, 19, 24, 0.95);
+    overflow: hidden;
+  }
+
+  .tool-card summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 10px 12px;
+    color: var(--accent-strong);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .tool-card summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .tool-card pre {
+    padding: 0 12px 12px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.55;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .turn-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    color: var(--text-faint);
+    font-size: 11px;
+    padding: 0 2px;
+  }
+
+  .turn-status.cancelled {
+    color: var(--warning);
+  }
+
+  .turn-status.error {
+    color: var(--danger);
+  }
+
+  .turn-status.done {
+    color: var(--success);
+  }
+
+  .cursor {
+    display: inline-block;
+    width: 8px;
+    height: 1.1em;
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    border-radius: 2px;
+    background: var(--accent-strong);
+    animation: blink 1s step-end infinite;
+  }
+
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+
+  .queue-panel {
+    border-top: 1px solid var(--border-soft);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 24%),
+      rgba(19, 22, 28, 0.98);
+    padding: 9px 12px 0;
+  }
+
+  .queue-panel.hidden {
+    display: none;
+  }
+
+  .queue-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+
+  .queue-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .queue-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--panel-elev);
+    color: var(--text);
+    font-size: 10px;
+  }
+
+  .queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding-bottom: 10px;
+  }
+
+  .queue-item {
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    background: var(--editor-bg);
+    padding: 9px 10px;
+  }
+
+  .queue-item-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .queue-item-title {
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  .queue-item-subtitle {
+    margin-top: 4px;
+    color: var(--text-faint);
+    font-size: 10px;
+  }
+
+  .queue-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+
+  .queue-button {
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+
+  .queue-button.primary,
+  .composer-button.primary,
+  .topbar button.primary {
+    border-color: rgba(107, 145, 255, 0.35);
+    background:
+      linear-gradient(180deg, rgba(107, 145, 255, 0.18), rgba(107, 145, 255, 0.08)),
+      var(--panel-elev);
+  }
+
+  .composer-shell {
+    border-top: 1px solid var(--border-soft);
+    background: rgba(13, 16, 21, 0.96);
+    padding: 9px 12px 11px;
+  }
+
+  .composer-frame {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 18%),
+      var(--editor-bg);
+    padding: 9px 10px;
+  }
+
+  #composer {
+    width: 100%;
+    min-height: 58px;
+    max-height: 160px;
+    border: none;
+    resize: none;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    line-height: 1.55;
+    outline: none;
+  }
+
+  #composer::placeholder {
+    color: var(--text-faint);
+  }
+
+  .composer-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .composer-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .composer-button {
+    padding: 5px 9px;
+    font-size: 11px;
+  }
+
+  .composer-button.stop {
+    border-color: rgba(210, 162, 84, 0.35);
+    color: #f1d09a;
+  }
+
+  .composer-button.danger {
+    border-color: rgba(212, 107, 107, 0.35);
+    color: #f0b1b1;
+  }
+
+  .hidden {
+    display: none !important;
+  }
+
+  @media (max-width: 620px) {
+    body {
+      padding: 0;
+    }
+
+    #shell {
+      width: 100%;
+      height: 100vh;
+      border: none;
+      border-radius: 0;
+    }
+
+    .topbar-row {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .topbar-actions {
+      width: 100%;
+      justify-content: space-between;
+    }
+
+    .session-controls {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .session-controls .wide {
+      grid-column: span 1;
+    }
+
+    .composer-actions {
+      width: 100%;
+      justify-content: flex-end;
+    }
+
+    #composer {
+      min-height: 52px;
+    }
+  }
+
+  @media (max-width: 460px) {
+    .session-controls {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
+</head>
+<body>
+<main id="shell">
+  <header class="topbar">
+    <div class="topbar-row">
+      <div class="title-stack">
+        <div class="title-badge">AI</div>
+        <div class="title-copy">
+          <h1>Agent Panel</h1>
+          <p id="session-label">No active session</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="status-pill" class="status-pill disconnected">Disconnected</span>
+        <button id="connect-btn" class="primary" type="button">Connect</button>
+        <button id="disconnect-btn" type="button">Disconnect</button>
+      </div>
+    </div>
+
+    <div class="session-controls">
+      <label class="field">
+        <span class="field-label">Provider</span>
+        <select id="provider">
+          <option value="local">Local</option>
+          <option value="docker">Docker</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="field-label">Agent</span>
+        <select id="agent-type">
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="field-label">Model</span>
+        <input id="model" type="text" placeholder="Optional model override">
+      </label>
+      <label class="field">
+        <span class="field-label">API</span>
+        <input id="api-url" type="text" value="http://localhost:7778">
+      </label>
+    </div>
+  </header>
+
+  <section id="thread">
+    <div id="empty-state" class="empty-state">
+      <h2>Zed-style queueing</h2>
+      <p>Messages sent while the agent is generating stay local by default. They run automatically after the current turn stops, and you can explicitly choose <strong>Send Now</strong> to interrupt.</p>
+      <div class="empty-list">
+        <div><strong>Enter</strong> sends when idle.</div>
+        <div><strong>Enter</strong> while generating queues locally.</div>
+        <div><strong>Empty editor + Enter</strong> fast-tracks the first queued message, matching Zed's send-now path.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="queue-panel" class="queue-panel hidden">
+    <div class="queue-header">
+      <div class="queue-title">
+        <span>Queued messages</span>
+        <span id="queue-count" class="queue-count">0</span>
+      </div>
+      <button id="clear-queue-btn" class="queue-button" type="button">Clear all</button>
+    </div>
+    <div id="queue-list" class="queue-list"></div>
+  </section>
+
+  <section class="composer-shell">
+    <div class="composer-frame">
+      <textarea id="composer" placeholder="Message the agent" rows="1"></textarea>
+      <div class="composer-footer">
+        <div class="composer-actions">
+          <button id="stop-btn" class="composer-button stop hidden" type="button">Stop</button>
+          <button id="send-btn" class="composer-button primary" type="button">Send</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  sessionId: null,
+  sseAbort: null,
+  queuedMessages: [],
+  nextQueueId: 1,
+  canFastTrackQueue: false,
+  remotePendingCount: 0,
+  turns: new Map(),
+};
+
+const EMPTY_STATE_HTML = $("thread").innerHTML;
+
+function apiBase() {
+  return $("api-url").value.replace(/\/+$/, "");
+}
+
+function escHtml(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function escAttr(text) {
+  return escHtml(text)
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function stashHtml(parts, html) {
+  const token = `\uE000${parts.length}\uE000`;
+  parts.push(html);
+  return token;
+}
+
+function restoreHtml(text, parts) {
+  return text.replace(/\uE000(\d+)\uE000/g, (_, index) => parts[Number(index)] || "");
+}
+
+function sanitizeUrl(text) {
+  const raw = text.trim();
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const url = new URL(raw, window.location.href);
+    if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
+      return url.href;
+    }
+  } catch (_error) {
+    return null;
+  }
+
+  return null;
+}
+
+function renderInlineMarkdown(text) {
+  const parts = [];
+  let html = escHtml(text);
+
+  html = html.replace(/`([^`\n]+)`/g, (_, code) => stashHtml(parts, `<code>${code}</code>`));
+
+  html = html.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_, label, rawTarget) => {
+    const match = rawTarget.trim().match(/^(\S+)(?:\s+"([^"]*)")?$/);
+    if (!match) {
+      return `[${label}](${rawTarget})`;
+    }
+    const href = sanitizeUrl(match[1]);
+    if (!href) {
+      return `[${label}](${rawTarget})`;
+    }
+    const title = match[2] ? ` title="${escAttr(match[2])}"` : "";
+    return stashHtml(
+      parts,
+      `<a href="${escAttr(href)}"${title} target="_blank" rel="noreferrer noopener">${label}</a>`,
+    );
+  });
+
+  html = html.replace(/(https?:\/\/[^\s<]+)/g, (rawUrl) => {
+    const href = sanitizeUrl(rawUrl);
+    if (!href) {
+      return rawUrl;
+    }
+    return stashHtml(
+      parts,
+      `<a href="${escAttr(href)}" target="_blank" rel="noreferrer noopener">${rawUrl}</a>`,
+    );
+  });
+
+  html = html.replace(/\*\*([^*\n][^*\n]*?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__([^_\n][^_\n]*?)__/g, "<strong>$1</strong>");
+  html = html.replace(/\*([^*\n][^*\n]*?)\*/g, "<em>$1</em>");
+  html = html.replace(/_([^_\n][^_\n]*?)_/g, "<em>$1</em>");
+  html = html.replace(/~~([^~\n][^~\n]*?)~~/g, "<del>$1</del>");
+  html = html.replace(/\n/g, "<br>");
+
+  return restoreHtml(html, parts);
+}
+
+function renderMarkdown(text) {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  let paragraph = [];
+  let quote = [];
+  let list = null;
+  let codeFence = null;
+
+  function flushParagraph() {
+    if (!paragraph.length) {
+      return;
+    }
+    blocks.push(`<p>${renderInlineMarkdown(paragraph.join("\n"))}</p>`);
+    paragraph = [];
+  }
+
+  function flushQuote() {
+    if (!quote.length) {
+      return;
+    }
+    blocks.push(`<blockquote>${renderMarkdown(quote.join("\n"))}</blockquote>`);
+    quote = [];
+  }
+
+  function flushList() {
+    if (!list) {
+      return;
+    }
+    const items = list.items
+      .map((itemLines) => `<li>${renderMarkdown(itemLines.join("\n")) || "<p></p>"}</li>`)
+      .join("");
+    blocks.push(`<${list.type}>${items}</${list.type}>`);
+    list = null;
+  }
+
+  function flushCodeFence() {
+    if (!codeFence) {
+      return;
+    }
+    const className = codeFence.lang ? ` class="language-${escAttr(codeFence.lang.toLowerCase())}"` : "";
+    blocks.push(`<pre><code${className}>${escHtml(codeFence.lines.join("\n"))}</code></pre>`);
+    codeFence = null;
+  }
+
+  for (const line of lines) {
+    if (codeFence) {
+      if (/^```\s*$/.test(line)) {
+        flushCodeFence();
+      } else {
+        codeFence.lines.push(line);
+      }
+      continue;
+    }
+
+    const fenceMatch = line.match(/^```([^\s`]+)?\s*$/);
+    if (fenceMatch) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      codeFence = { lang: fenceMatch[1] || "", lines: [] };
+      continue;
+    }
+
+    const quoteMatch = line.match(/^>\s?(.*)$/);
+    if (quoteMatch) {
+      flushParagraph();
+      flushList();
+      quote.push(quoteMatch[1]);
+      continue;
+    }
+    flushQuote();
+
+    if (/^\s*$/.test(line)) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      flushParagraph();
+      flushList();
+      const level = headingMatch[1].length;
+      blocks.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushParagraph();
+      flushList();
+      blocks.push("<hr>");
+      continue;
+    }
+
+    const unorderedMatch = line.match(/^[-*+]\s+(.*)$/);
+    const orderedMatch = line.match(/^\d+\.\s+(.*)$/);
+    if (unorderedMatch || orderedMatch) {
+      flushParagraph();
+      const type = unorderedMatch ? "ul" : "ol";
+      if (!list || list.type !== type) {
+        flushList();
+        list = { type, items: [] };
+      }
+      list.items.push([(unorderedMatch || orderedMatch)[1]]);
+      continue;
+    }
+
+    if (list && /^\s{2,}\S/.test(line)) {
+      list.items[list.items.length - 1].push(line.replace(/^\s+/, ""));
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+  flushQuote();
+  flushCodeFence();
+  return blocks.join("");
+}
+
+function renderMessageBlock(block, kind) {
+  if (kind === "assistant") {
+    block.innerHTML = renderMarkdown(block.dataset.content);
+    return;
+  }
+  block.innerHTML = escHtml(block.dataset.content);
+}
+
+function isBusy() {
+  return state.remotePendingCount > 0;
+}
+
+function setStatus(kind, text) {
+  const pill = $("status-pill");
+  pill.className = `status-pill ${kind}`;
+  pill.textContent = text;
+}
+
+function updateSessionLabel() {
+  if (!state.sessionId) {
+    $("session-label").textContent = "No active session";
+    return;
+  }
+  const queueCount = state.queuedMessages.length;
+  const suffix = queueCount ? `, ${queueCount} queued` : "";
+  $("session-label").textContent = `${state.sessionId.slice(0, 8)}${suffix}`;
+}
+
+function scrollThread() {
+  const thread = $("thread");
+  thread.scrollTop = thread.scrollHeight;
+}
+
+function setEmptyStateVisible(visible) {
+  const empty = $("empty-state");
+  if (empty) {
+    empty.classList.toggle("hidden", !visible);
+  }
+}
+
+function restoreEmptyState() {
+  $("thread").innerHTML = EMPTY_STATE_HTML;
+  setEmptyStateVisible(true);
+}
+
+function makeTurn(rpcId) {
+  const root = document.createElement("article");
+  root.className = "turn";
+
+  const userRow = document.createElement("div");
+  userRow.className = "turn-user-row hidden";
+
+  const user = document.createElement("div");
+  user.className = "turn-user";
+  userRow.appendChild(user);
+
+  const stream = document.createElement("div");
+  stream.className = "assistant-stream";
+
+  const meta = document.createElement("div");
+  meta.className = "turn-meta";
+
+  const source = document.createElement("span");
+  source.textContent = "assistant";
+
+  const status = document.createElement("span");
+  status.className = "turn-status";
+  status.textContent = "Generating";
+
+  meta.append(source, status);
+  root.append(userRow, stream, meta);
+  $("thread").appendChild(root);
+  setEmptyStateVisible(false);
+  scrollThread();
+
+  const turn = {
+    rpcId,
+    root,
+    userRow,
+    user,
+    stream,
+    status,
+    activeBlock: null,
+    activeKind: null,
+    toolCards: new Map(),
+    toolSequence: 0,
+  };
+  state.turns.set(rpcId, turn);
+  return turn;
+}
+
+function ensureTurn(rpcId) {
+  return state.turns.get(rpcId) || makeTurn(rpcId);
+}
+
+function setTurnUserText(turn, text) {
+  turn.user.textContent = text;
+  turn.userRow.classList.remove("hidden");
+}
+
+function setTurnStatus(turn, text, tone = "") {
+  turn.status.textContent = text;
+  turn.status.className = "turn-status";
+  if (tone) {
+    turn.status.classList.add(tone);
+  }
+}
+
+function removeCursor(block) {
+  if (!block) {
+    return;
+  }
+  const cursor = block.querySelector(".cursor");
+  if (cursor) {
+    cursor.remove();
+  }
+}
+
+function appendCursor(block) {
+  removeCursor(block);
+  const cursor = document.createElement("span");
+  cursor.className = "cursor";
+  block.appendChild(cursor);
+}
+
+function appendTextBlock(turn, kind, text) {
+  if (!text) {
+    return;
+  }
+
+  if (turn.activeKind !== kind || !turn.activeBlock) {
+    removeCursor(turn.activeBlock);
+    const block = document.createElement("div");
+    block.className = `message-card ${kind === "thinking" ? "thinking" : "assistant"}`;
+    block.dataset.content = "";
+    turn.stream.appendChild(block);
+    turn.activeBlock = block;
+    turn.activeKind = kind;
+  }
+
+  turn.activeBlock.dataset.content += text;
+  renderMessageBlock(turn.activeBlock, kind);
+  appendCursor(turn.activeBlock);
+  setTurnStatus(turn, "Generating");
+  scrollThread();
+}
+
+function extractToolCallId(update) {
+  if (!update || typeof update !== "object") {
+    return null;
+  }
+
+  for (const key of ["toolCallId", "toolUseId", "tool_call_id", "tool_use_id", "id"]) {
+    const value = update[key];
+    if (typeof value === "string" && value) {
+      return value;
+    }
+  }
+
+  const meta = update._meta;
+  const claudeMeta = meta && typeof meta === "object" ? meta.claudeCode : null;
+  if (claudeMeta && typeof claudeMeta === "object") {
+    for (const key of ["toolUseId", "toolCallId", "tool_use_id", "tool_call_id", "id"]) {
+      const value = claudeMeta[key];
+      if (typeof value === "string" && value) {
+        return value;
+      }
+    }
+  }
+
+  const rawInput = update.rawInput;
+  if (rawInput && typeof rawInput === "object") {
+    for (const key of ["toolUseId", "tool_use_id", "id"]) {
+      const value = rawInput[key];
+      if (typeof value === "string" && value) {
+        return value;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractToolName(update) {
+  if (!update || typeof update !== "object") {
+    return "tool";
+  }
+
+  const meta = update._meta;
+  const claudeMeta = meta && typeof meta === "object" ? meta.claudeCode : null;
+  if (claudeMeta && typeof claudeMeta.toolName === "string" && claudeMeta.toolName) {
+    return claudeMeta.toolName;
+  }
+
+  for (const key of ["toolName", "tool", "name", "kind"]) {
+    const value = update[key];
+    if (typeof value === "string" && value) {
+      return value;
+    }
+  }
+
+  const rawInput = update.rawInput;
+  if (rawInput && typeof rawInput === "object") {
+    for (const key of ["toolName", "tool", "name", "kind"]) {
+      const value = rawInput[key];
+      if (typeof value === "string" && value) {
+        return value;
+      }
+    }
+  }
+
+  return "tool";
+}
+
+function extractToolResult(update) {
+  if (!update || typeof update !== "object") {
+    return undefined;
+  }
+
+  const meta = update._meta;
+  const claudeMeta = meta && typeof meta === "object" ? meta.claudeCode : null;
+  if (claudeMeta && typeof claudeMeta === "object") {
+    for (const key of ["toolResponse", "toolResult", "tool_response", "tool_result"]) {
+      if (claudeMeta[key] !== undefined) {
+        return claudeMeta[key];
+      }
+    }
+  }
+
+  for (const key of ["toolResponse", "toolResult", "tool_response", "tool_result", "output", "result", "content"]) {
+    if (update[key] !== undefined) {
+      return update[key];
+    }
+  }
+
+  return undefined;
+}
+
+function buildToolPayload(card) {
+  const payload = {};
+  if (card.toolCallId) {
+    payload.tool_call_id = card.toolCallId;
+  }
+  if (card.args !== undefined) {
+    payload.args = card.args;
+  }
+  if (card.result !== undefined) {
+    payload.result = card.result;
+  } else {
+    payload.status = card.status;
+  }
+  if (card.args === undefined && card.result === undefined && card.lastUpdate) {
+    payload.raw = card.lastUpdate;
+  }
+  return payload;
+}
+
+function renderToolCard(card) {
+  card.details.dataset.toolStatus = card.status;
+  card.summary.textContent = `${card.name} · ${card.status}`;
+  card.pre.textContent = JSON.stringify(buildToolPayload(card), null, 2);
+  card.details.open = card.status === "waiting";
+}
+
+function createToolCard(turn, name, toolCallId) {
+  const details = document.createElement("details");
+  details.className = "tool-card";
+
+  const summary = document.createElement("summary");
+  const pre = document.createElement("pre");
+
+  details.append(summary, pre);
+  turn.stream.appendChild(details);
+
+  const key = toolCallId || `anon-tool-${++turn.toolSequence}`;
+  const card = {
+    key,
+    name,
+    toolCallId: toolCallId || null,
+    details,
+    summary,
+    pre,
+    args: undefined,
+    result: undefined,
+    lastUpdate: null,
+    status: "waiting",
+  };
+  turn.toolCards.set(key, card);
+  return card;
+}
+
+function findToolCard(turn, toolCallId, name) {
+  if (toolCallId && turn.toolCards.has(toolCallId)) {
+    return turn.toolCards.get(toolCallId);
+  }
+
+  const cards = Array.from(turn.toolCards.values());
+  for (let i = cards.length - 1; i >= 0; i -= 1) {
+    const card = cards[i];
+    if (card.status === "waiting" && card.name === name) {
+      return card;
+    }
+  }
+
+  return null;
+}
+
+function appendToolBlock(turn, update, kind) {
+  removeCursor(turn.activeBlock);
+  turn.activeBlock = null;
+  turn.activeKind = null;
+
+  const name = extractToolName(update);
+  const toolCallId = extractToolCallId(update);
+  const result = extractToolResult(update);
+  let card = findToolCard(turn, toolCallId, name);
+
+  if (!card) {
+    card = createToolCard(turn, name, toolCallId);
+  } else if (toolCallId && card.key !== toolCallId && !turn.toolCards.has(toolCallId)) {
+    turn.toolCards.delete(card.key);
+    card.key = toolCallId;
+    card.toolCallId = toolCallId;
+    turn.toolCards.set(toolCallId, card);
+  }
+
+  card.name = name;
+  card.lastUpdate = update;
+  if (toolCallId) {
+    card.toolCallId = toolCallId;
+  }
+  if (update.rawInput !== undefined) {
+    card.args = update.rawInput;
+  }
+
+  if (result !== undefined) {
+    card.result = result;
+    card.status = "done";
+  } else if (kind === "execute_tool_completed") {
+    card.status = "done";
+  } else {
+    card.status = "waiting";
+  }
+
+  renderToolCard(card);
+  if (card.status === "waiting") {
+    setTurnStatus(turn, "Running tools");
+  }
+  scrollThread();
+}
+
+function appendErrorBlock(turn, message) {
+  removeCursor(turn.activeBlock);
+  turn.activeBlock = null;
+  turn.activeKind = null;
+
+  const block = document.createElement("div");
+  block.className = "message-card error";
+  block.textContent = message;
+  turn.stream.appendChild(block);
+  setTurnStatus(turn, "Error", "error");
+  scrollThread();
+}
+
+function finalizeTurn(rpcId, stopReason) {
+  const turn = ensureTurn(rpcId);
+  removeCursor(turn.activeBlock);
+  turn.activeBlock = null;
+  turn.activeKind = null;
+  const terminalToolStatus = stopReason === "cancelled" ? "cancelled" : "done";
+  turn.toolCards.forEach((card) => {
+    if (card.status === "waiting") {
+      card.status = terminalToolStatus;
+      renderToolCard(card);
+    }
+  });
+  if (stopReason === "cancelled") {
+    setTurnStatus(turn, "Cancelled", "cancelled");
+  } else {
+    setTurnStatus(turn, stopReason || "Done", "done");
+  }
+}
+
+function noteCard(message, tone = "") {
+  const card = document.createElement("div");
+  card.className = `message-card ${tone}`.trim();
+  card.textContent = message;
+  $("thread").appendChild(card);
+  setEmptyStateVisible(false);
+  scrollThread();
+}
+
+function syncBusyUi() {
+  const busy = isBusy();
+  const connected = Boolean(state.sessionId);
+
+  if (!connected) {
+    setStatus("disconnected", "Disconnected");
+  } else if (busy) {
+    setStatus("busy", "Generating");
+  } else {
+    setStatus("connected", "Idle");
+  }
+
+  $("connect-btn").textContent = connected ? "New Session" : "Connect";
+  $("disconnect-btn").disabled = !connected;
+  $("stop-btn").classList.toggle("hidden", !busy);
+  updateSessionLabel();
+  updateQueuePanel();
+  updateComposerUi();
+}
+
+function updateComposerUi() {
+  const connected = Boolean(state.sessionId);
+  const busy = isBusy();
+  const composer = $("composer");
+  const sendBtn = $("send-btn");
+
+  if (!connected) {
+    sendBtn.textContent = "Send";
+    sendBtn.disabled = true;
+    return;
+  }
+
+  const hasText = Boolean(composer.value.trim());
+  const hasQueue = state.queuedMessages.length > 0;
+  const fastTrackReady = busy && !hasText && hasQueue && state.canFastTrackQueue;
+
+  sendBtn.disabled = false;
+  if (fastTrackReady) {
+    sendBtn.textContent = "Send Now";
+    return;
+  }
+
+  if (busy) {
+    sendBtn.textContent = hasText ? "Queue" : "Queue";
+    return;
+  }
+
+  sendBtn.textContent = "Send";
+}
+
+function updateQueuePanel() {
+  const panel = $("queue-panel");
+  const list = $("queue-list");
+  const count = $("queue-count");
+  const hasQueue = state.queuedMessages.length > 0;
+
+  panel.classList.toggle("hidden", !hasQueue);
+  count.textContent = String(state.queuedMessages.length);
+  $("clear-queue-btn").disabled = !hasQueue;
+
+  list.innerHTML = "";
+
+  state.queuedMessages.forEach((item, index) => {
+    const entry = document.createElement("div");
+    entry.className = "queue-item";
+
+    const head = document.createElement("div");
+    head.className = "queue-item-head";
+
+    const title = document.createElement("div");
+    title.className = "queue-item-title";
+    title.textContent = item.text.length > 180 ? `${item.text.slice(0, 180)}...` : item.text;
+
+    const badge = document.createElement("span");
+    badge.className = "queue-count";
+    badge.textContent = String(index + 1);
+
+    head.append(title, badge);
+
+    const subtitle = document.createElement("div");
+    subtitle.className = "queue-item-subtitle";
+    subtitle.textContent = isBusy()
+      ? "Held locally until the current turn stops."
+      : "Ready to send next.";
+
+    const actions = document.createElement("div");
+    actions.className = "queue-actions";
+
+    const sendNow = document.createElement("button");
+    sendNow.className = "queue-button primary";
+    sendNow.type = "button";
+    sendNow.textContent = isBusy() ? "Send Now" : "Send";
+    sendNow.addEventListener("click", () => sendQueuedNow(index));
+
+    const edit = document.createElement("button");
+    edit.className = "queue-button";
+    edit.type = "button";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", () => moveQueuedToComposer(index));
+
+    const remove = document.createElement("button");
+    remove.className = "queue-button";
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => removeQueued(index));
+
+    actions.append(sendNow, edit, remove);
+    entry.append(head, subtitle, actions);
+    list.appendChild(entry);
+  });
+}
+
+function queueMessage(text) {
+  state.queuedMessages.push({
+    id: state.nextQueueId++,
+    text,
+  });
+  state.canFastTrackQueue = true;
+  updateQueuePanel();
+  updateComposerUi();
+  updateSessionLabel();
+}
+
+function removeQueued(index) {
+  if (index < 0 || index >= state.queuedMessages.length) {
+    return;
+  }
+  state.queuedMessages.splice(index, 1);
+  if (!state.queuedMessages.length) {
+    state.canFastTrackQueue = false;
+  }
+  updateQueuePanel();
+  updateComposerUi();
+  updateSessionLabel();
+}
+
+function moveQueuedToComposer(index) {
+  if (index < 0 || index >= state.queuedMessages.length) {
+    return;
+  }
+  const [item] = state.queuedMessages.splice(index, 1);
+  if (!item) {
+    return;
+  }
+  $("composer").value = item.text;
+  autoSizeComposer();
+  $("composer").focus();
+  if (!state.queuedMessages.length) {
+    state.canFastTrackQueue = false;
+  }
+  updateQueuePanel();
+  updateComposerUi();
+  updateSessionLabel();
+}
+
+function clearQueue() {
+  state.queuedMessages = [];
+  state.canFastTrackQueue = false;
+  updateQueuePanel();
+  updateComposerUi();
+  updateSessionLabel();
+}
+
+function autoSizeComposer() {
+  const composer = $("composer");
+  composer.style.height = "auto";
+  composer.style.height = `${Math.min(composer.scrollHeight, 160)}px`;
+}
+
+async function connect() {
+  const provider = $("provider").value;
+  const agentType = $("agent-type").value;
+  const model = $("model").value.trim();
+
+  disconnect({ silent: true });
+  noteCard(`Connecting ${provider}/${agentType}...`);
+
+  try {
+    const body = {
+      provider,
+      agent_type: agentType,
+    };
+    if (model) {
+      body.model = model;
+    }
+
+    const resp = await fetch(`${apiBase()}/sessions/quick`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || resp.statusText);
+    }
+
+    const data = await resp.json();
+    state.sessionId = data.session_id;
+    noteCard(`Connected to session ${state.sessionId.slice(0, 8)}.`);
+    startEventStream();
+    syncBusyUi();
+  } catch (error) {
+    noteCard(`Connection failed: ${error.message}`, "error");
+    disconnect({ silent: true });
+    syncBusyUi();
+  }
+}
+
+function disconnect(options = {}) {
+  if (state.sseAbort) {
+    state.sseAbort.abort();
+  }
+  state.sseAbort = null;
+  state.sessionId = null;
+  state.remotePendingCount = 0;
+  state.turns.clear();
+  state.queuedMessages = [];
+  state.canFastTrackQueue = false;
+  restoreEmptyState();
+  if (!options.silent) {
+    noteCard("Disconnected.");
+  }
+  syncBusyUi();
+}
+
+function startEventStream() {
+  if (state.sseAbort) {
+    state.sseAbort.abort();
+  }
+
+  state.sseAbort = new AbortController();
+
+  (async () => {
+    try {
+      const resp = await fetch(`${apiBase()}/sessions/${state.sessionId}/events`, {
+        headers: { Accept: "text/event-stream" },
+        signal: state.sseAbort.signal,
+      });
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        while (buffer.includes("\n\n")) {
+          const idx = buffer.indexOf("\n\n");
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+
+          const lines = block.split("\n");
+          let dataStr = "";
+          let eventName = "";
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith("data: ")) {
+              dataStr += line.slice(6);
+            } else if (line.startsWith("data:")) {
+              dataStr += line.slice(5);
+            }
+          }
+
+          if (dataStr) {
+            handleSseBlock(dataStr, eventName);
+          }
+        }
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        noteCard(`Stream error: ${error.message}`, "error");
+        syncBusyUi();
+      }
+    }
+  })();
+}
+
+function handleSseBlock(raw, eventName) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  const rpcTag = eventName.startsWith("rpc:") ? eventName.slice(4) : null;
+
+  if (data.id && data.result && data.result.stopReason) {
+    finalizeTurn(data.id, data.result.stopReason);
+    state.remotePendingCount = Math.max(0, state.remotePendingCount - 1);
+    syncBusyUi();
+    maybeProcessQueue();
+    return;
+  }
+
+  if (data.id && data.error) {
+    const turn = ensureTurn(data.id);
+    appendErrorBlock(turn, data.error.message || JSON.stringify(data.error));
+    state.remotePendingCount = Math.max(0, state.remotePendingCount - 1);
+    syncBusyUi();
+    maybeProcessQueue();
+    return;
+  }
+
+  // ACP uses "session/update", some wrappers use "notifications/session/update"
+  const isUpdate = (data.method === "session/update" || data.method === "notifications/session/update")
+    && data.params && data.params.update;
+  if (!isUpdate) return;
+  if (!rpcTag) return;
+
+  const turn = ensureTurn(rpcTag);
+  const update = data.params.update;
+  // ACP wire uses "sessionUpdate" field; normalize to match
+  const kind = update.sessionUpdate || update.kind || "";
+
+  if (kind === "agent_message_delta" || kind === "agent_message_chunk") {
+    appendTextBlock(turn, "assistant", update.content?.text || update.text || "");
+    return;
+  }
+
+  if (kind === "agent_thought_chunk" || kind === "thinking_delta") {
+    appendTextBlock(turn, "thinking", update.content?.text || update.thinking || update.text || "");
+    return;
+  }
+
+  if (
+    kind === "tool_call" ||
+    kind === "execute_tool_started" ||
+    kind === "execute_tool_completed" ||
+    kind === "tool_call_update"
+  ) {
+    appendToolBlock(turn, update, kind);
+  }
+}
+
+async function submitRemoteMessage(text, options = {}) {
+  const interrupt = Boolean(options.interrupt);
+  const queueItem = options.queueItem || null;
+  const restoreIndex = options.restoreIndex ?? 0;
+
+  try {
+    const resp = await fetch(`${apiBase()}/sessions/${state.sessionId}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, interrupt }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || resp.statusText);
+    }
+
+    const data = await resp.json();
+    const turn = ensureTurn(data.rpc_id);
+    setTurnUserText(turn, text);
+    setTurnStatus(turn, interrupt ? "Send Now" : "Queued for agent");
+    state.remotePendingCount += 1;
+    syncBusyUi();
+    return true;
+  } catch (error) {
+    if (queueItem) {
+      state.queuedMessages.splice(restoreIndex, 0, queueItem);
+      updateQueuePanel();
+      updateSessionLabel();
+    } else {
+      $("composer").value = text;
+      autoSizeComposer();
+      $("composer").focus();
+    }
+    noteCard(`Send failed: ${error.message}`, "error");
+    syncBusyUi();
+    return false;
+  }
+}
+
+async function maybeProcessQueue() {
+  if (!state.sessionId || isBusy() || !state.queuedMessages.length) {
+    return;
+  }
+
+  state.canFastTrackQueue = false;
+  const next = state.queuedMessages.shift();
+  updateQueuePanel();
+  updateSessionLabel();
+  await submitRemoteMessage(next.text, {
+    interrupt: false,
+    queueItem: next,
+    restoreIndex: 0,
+  });
+}
+
+async function sendQueuedNow(index) {
+  if (index < 0 || index >= state.queuedMessages.length || !state.sessionId) {
+    return;
+  }
+
+  const [item] = state.queuedMessages.splice(index, 1);
+  state.canFastTrackQueue = false;
+  updateQueuePanel();
+  updateSessionLabel();
+  await submitRemoteMessage(item.text, {
+    interrupt: isBusy(),
+    queueItem: item,
+    restoreIndex: index,
+  });
+}
+
+async function stopCurrentTurn() {
+  if (!state.sessionId || !isBusy()) {
+    return;
+  }
+
+  try {
+    const resp = await fetch(`${apiBase()}/sessions/${state.sessionId}/cancel`, {
+      method: "POST",
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || resp.statusText);
+    }
+  } catch (error) {
+    noteCard(`Stop failed: ${error.message}`, "error");
+  }
+}
+
+async function handleComposerSubmit() {
+  const text = $("composer").value.trim();
+
+  if (!state.sessionId) {
+    noteCard("Connect first.");
+    return;
+  }
+
+  if (!text) {
+    if (isBusy() && state.canFastTrackQueue && state.queuedMessages.length) {
+      await sendQueuedNow(0);
+    }
+    return;
+  }
+
+  $("composer").value = "";
+  autoSizeComposer();
+
+  if (isBusy()) {
+    queueMessage(text);
+    return;
+  }
+
+  state.canFastTrackQueue = false;
+  await submitRemoteMessage(text);
+}
+
+$("connect-btn").addEventListener("click", connect);
+$("disconnect-btn").addEventListener("click", () => disconnect());
+$("clear-queue-btn").addEventListener("click", clearQueue);
+$("stop-btn").addEventListener("click", stopCurrentTurn);
+$("send-btn").addEventListener("click", handleComposerSubmit);
+
+$("composer").addEventListener("input", updateComposerUi);
+$("composer").addEventListener("input", autoSizeComposer);
+$("composer").addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" || event.shiftKey) {
+    return;
+  }
+  event.preventDefault();
+  await handleComposerSubmit();
+});
+
+syncBusyUi();
+autoSizeComposer();
+</script>
+</body>
+</html>

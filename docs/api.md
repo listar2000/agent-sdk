@@ -12,6 +12,14 @@ The API has two resource groups:
 GET /health  →  {"status": "ok"}
 ```
 
+## Chat UI
+
+```
+GET /ui
+```
+
+Serves a browser-based chat interface for interacting with agent sessions.
+
 ## Sessions
 
 ### Create agent + sandbox + session in one call
@@ -30,7 +38,7 @@ POST /sessions/quick
   "prompt": "You are a helpful agent.",
   "tools": ["Bash", "Read", "Write"],
   "mcp_servers": {"name": {"type": "local", "command": "...", "args": []}},
-  "skills": {"name": {"sources": [{"source": "...", "type": "github"}]}}
+  "skills": ["rllm-org/hive#staging", "vercel-labs/agent-skills"]
 }
 ```
 
@@ -56,6 +64,15 @@ POST /sessions/{session_id}/message
 
 Returns `{rpc_id, status}`. The actual response streams via SSE.
 
+**Interrupt flag** — cancel the running prompt and submit a new one:
+
+```json
+{"message": "stop — focus on X instead", "interrupt": true}
+```
+
+When `interrupt: true`, the server cancels the currently running prompt, waits for it to drain (`stopReason: cancelled`), then submits the new message. Already-queued prompts are not affected. Use `GET /sessions/{id}/events` (or `Agent.events()`) to receive the response events.
+
+
 ### SSE event stream
 
 ```
@@ -77,6 +94,11 @@ Prompt done:
 {"jsonrpc": "2.0", "id": "<rpc_id>", "result": {"stopReason": "end_turn"}}
 ```
 
+When interrupted, the cancelled prompt completes with:
+```json
+{"jsonrpc": "2.0", "id": "<rpc_id>", "result": {"stopReason": "cancelled"}}
+```
+
 Prompt error:
 ```json
 {
@@ -96,6 +118,68 @@ Prompt error:
 ```
 
 Heartbeats (`: heartbeat\n\n`) are sent every 30s to keep the connection alive during long-running prompts.
+
+### Prompt queue and interrupt
+
+The server uses an explicit per-session scheduler.
+
+Each `SessionState` carries:
+
+- `active_rpc_id`: the prompt currently executing upstream, or `None`
+- `pending_prompts: deque[PendingPrompt]`: FIFO queue of submitted work
+- `_prompt_ready`: wakes the scheduler when new prompts arrive
+- `_prompt_done`: signals that the active prompt reached a terminal state
+
+`POST /sessions/{session_id}/message` always allocates a new `rpc_id`,
+appends a `PendingPrompt`, and returns immediately. The background
+scheduler loop is the only owner of `active_rpc_id`:
+
+1. wait for `_prompt_ready`
+2. pop the next pending prompt
+3. set `active_rpc_id`
+4. send `session/prompt` upstream
+5. wait for a terminal response or terminal error
+6. clear `active_rpc_id`, set `_prompt_done`, and continue
+
+`agent_busy` is therefore just `active_rpc_id is not None`.
+
+#### Interrupt flow
+
+`interrupt: true` on `/sessions/{session_id}/message` means:
+
+1. if a prompt is active, send `session/cancel`
+2. wait for `_prompt_done` with a 10 second safety timeout
+3. append the new prompt to the tail of `pending_prompts`
+
+Interrupt preserves queue order. It cancels the running turn, but it
+does not reorder or drop already-queued prompts. The standalone
+`POST /sessions/{session_id}/cancel` endpoint performs the same
+cancel-and-wait step without submitting a replacement prompt.
+
+#### Event delivery
+
+Each session has one long-lived upstream SSE reader. That reader:
+
+- keeps the ACP stream open
+- updates runtime state such as `last_event_id`
+- logs parsed events to the database
+- fans out raw SSE blocks to downstream subscribers
+
+Downstream subscribers attach to the server fan-out, not directly to ACP:
+
+- session-scoped subscribers receive every event for the session
+- RPC-scoped subscribers receive only events tagged for one `rpc_id`
+
+This keeps parsing and state transitions centralized while still letting
+multiple clients watch the same session concurrently.
+
+#### One important latency edge case
+
+If a prompt launches a background task, ACP may delay the terminal
+`done_result` until that background task reports completion. In that
+window, text and usage may already be finished but the prompt is still
+considered active, so the next queued prompt cannot start yet. See
+`tests/test_acp_invariants.py::TestDoneHeldForBackgroundTasks`.
 
 ### Resume session
 
@@ -139,6 +223,13 @@ GET /sessions/{id}/status            — runtime status
 GET /sessions/{id}/log?limit=500     — event log (newest first)
 ```
 
+`GET /sessions/{id}/status` includes the following fields:
+
+| Field | Description |
+|---|---|
+| `inflight_count` | Number of prompts currently in flight (interrupt or regular) |
+| `subscriber_count` | Number of active SSE event subscribers (`events()` connections) |
+
 #### Session log event types
 
 Each row has `event_type`, `payload`, `created_at`, and `session_id`.
@@ -161,8 +252,6 @@ Each row has `event_type`, `payload`, `created_at`, and `session_id`.
 
 Sandbox endpoints don't require a session. They operate directly on the sandbox infrastructure.
 
-### Lifecycle
-
 ```
 POST   /sandboxes                    — create (provider, dockerfile)
 GET    /sandboxes                    — list
@@ -170,42 +259,6 @@ GET    /sandboxes/{id}               — get info
 DELETE /sandboxes/{id}               — destroy permanently
 POST   /sandboxes/{id}/stop          — stop (preserves filesystem on Daytona)
 POST   /sandboxes/{id}/start         — resume stopped sandbox
-GET    /sandboxes/{id}/health        — health check
-```
-
-### Filesystem
-
-```
-GET    /sandboxes/{id}/fs?path=/              — list directory
-GET    /sandboxes/{id}/fs/file?path=/f.txt    — read file
-PUT    /sandboxes/{id}/fs/file?path=/f.txt    — write file
-DELETE /sandboxes/{id}/fs/file?path=/f.txt    — delete
-POST   /sandboxes/{id}/fs/mkdir?path=/dir     — mkdir
-POST   /sandboxes/{id}/fs/move                — move/rename
-GET    /sandboxes/{id}/fs/stat?path=/f.txt    — stat
-POST   /sandboxes/{id}/fs/upload?path=/       — upload tar archive
-```
-
-### Exec / Processes
-
-```
-POST /sandboxes/{id}/exec                     — run command, returns {exitCode, stdout, stderr}
-POST /sandboxes/{id}/processes                — start persistent process
-GET  /sandboxes/{id}/processes                — list
-POST /sandboxes/{id}/processes/{pid}/stop     — stop
-POST /sandboxes/{id}/processes/{pid}/kill     — kill
-GET  /sandboxes/{id}/processes/{pid}/logs     — logs
-```
-
-### Desktop (when sandbox has a display)
-
-```
-GET  /sandboxes/{id}/desktop/screenshot       — returns PNG
-POST /sandboxes/{id}/desktop/click            — {x, y, button}
-POST /sandboxes/{id}/desktop/type             — {text}
-POST /sandboxes/{id}/desktop/press            — {key}
-POST /sandboxes/{id}/desktop/drag             — {startX, startY, endX, endY}
-POST /sandboxes/{id}/desktop/scroll           — {x, y, scrollX, scrollY}
 ```
 
 ## Agents (config only)
@@ -215,5 +268,67 @@ POST   /agents                     — register agent config (no sandbox)
 GET    /agents                     — list
 GET    /agents/{id}                — get
 DELETE /agents/{id}                — delete
-GET    /agents/{id}/log?limit=100  — event log across all sessions
 ```
+
+## Client API (Python SDK)
+
+### `Event` class
+
+All streaming methods yield `Event` objects (a dict subclass). `str(ev)` returns the human-readable text, so `print(ev, end="")` works naturally. Structured access via `ev["type"]`, `ev["text"]`, etc.
+
+Event types: `text`, `reasoning`, `tool`, `tool_result`, `usage`, `done` (terminal), `error`.
+
+### `Agent.arun(message, *, interrupt=False) -> str`
+
+Send a message and return the full response text. If `interrupt=True`, cancels the running prompt first.
+
+```python
+response = await agent.arun("analyze this")
+response = await agent.arun("redirect", interrupt=True)
+```
+
+### `Agent.astream(message, *, interrupt=False) -> AsyncIterator[Event]`
+
+Send a message and stream events. If `interrupt=True`, cancels the running prompt first.
+
+```python
+async for ev in agent.astream("explain X"):
+    print(ev, end="")                     # text output via str(ev)
+    if ev["type"] == "tool":              # structured access
+        print(f"calling {ev['tool_name']}")
+```
+
+### `Agent.run(message, timeout=None, *, interrupt=False) -> str`
+
+Sync wrapper for `arun`.
+
+### `Agent.send(message, *, interrupt=False) -> str`
+
+Submit a message without waiting for the response. Returns the `rpc_id` immediately. Use with `events()` to listen for results.
+
+```python
+rpc_id = await agent.send("do this next")
+rpc_id = await agent.send("stop, do this", interrupt=True)
+```
+
+### `Agent.cancel()`
+
+Cancel the running prompt (best-effort).
+
+### `Agent.configure(**kwargs)`
+
+Set session config dynamically. Accepts: `mode`, `model`, `thought_level`.
+
+### `Agent.events()` — async context manager
+
+Open a long-lived SSE subscription and iterate over all session events. Each event is an `Event` dict. Error events are **yielded**, not raised.
+
+```python
+async with agent.events() as stream:
+    async for ev in stream:
+        print(ev, end="")
+        if ev["type"] == "done":
+            break
+```
+
+Multiple concurrent `events()` contexts are allowed; each gets a fan-out copy. On connection failure, the generator raises `StreamError`.

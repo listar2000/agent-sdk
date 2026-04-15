@@ -20,7 +20,6 @@ class TestDaytonaResumeAfterRestart(unittest.TestCase):
     """Simulate a server restart where _INSTANCES is empty but DB has Daytona sessions."""
 
     def setUp(self):
-        # Clear in-memory state to simulate a fresh server
         _INSTANCES.clear()
 
         self.sandbox_id = "test-sandbox-id"
@@ -34,120 +33,74 @@ class TestDaytonaResumeAfterRestart(unittest.TestCase):
 
     def test_no_derive_url_crash(self):
         """_ensure_sandbox_alive must not call derive_url() for Daytona provider."""
-        # Mock the Daytona SDK so we don't need real credentials.
-        # state must be a real string so our enum-vs-str state handling
-        # doesn't choke on a MagicMock.
-        mock_sandbox = MagicMock()
-        mock_sandbox.state = "started"
-        mock_signed = MagicMock()
-        mock_signed.url = "https://fake-daytona-url.example.com"
-        mock_sandbox.create_signed_preview_url.return_value = mock_signed
+        from api.providers import ProviderInstance
 
-        mock_daytona = MagicMock()
-        mock_daytona.get.return_value = mock_sandbox
+        mock_instance = MagicMock(spec=ProviderInstance)
+        mock_instance.url = "https://fake-daytona-url.example.com"
+        mock_instance.sandbox_id = self.daytona_sandbox_id
 
-        with patch("api.server.httpx.AsyncClient") as mock_http, \
-             patch.dict(os.environ, {"DAYTONA_API_KEY": "fake-key"}), \
-             patch("daytona_sdk.Daytona", return_value=mock_daytona), \
-             patch("daytona_sdk.DaytonaConfig"):
-
-            # Health check succeeds on the fresh URL
-            mock_resp = AsyncMock()
-            mock_resp.status_code = 200
-            mock_client_instance = AsyncMock()
-            mock_client_instance.get.return_value = mock_resp
-            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
-            mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-            mock_http.return_value = mock_client_instance
-
+        with patch(
+            "api.providers.restart_daytona_supervisor",
+            new_callable=AsyncMock,
+            return_value=mock_instance,
+        ), patch("api.server.upsert_sandbox", new_callable=AsyncMock):
             url, replaced = asyncio.run(_ensure_sandbox_alive(
                 self.sandbox_id, self.sandbox_record, agent_type="claude",
             ))
 
             assert url == "https://fake-daytona-url.example.com"
             assert replaced is False
-            # Verify it used sandbox_ref (Daytona ID), not the internal sandbox_id
-            mock_daytona.get.assert_called_once_with(self.daytona_sandbox_id)
 
-    def test_stopped_sandbox_gets_started(self):
-        """Stopped Daytona sandboxes must be started via sandbox.start()."""
-        _INSTANCES.clear()
+    def test_daytona_not_found_creates_replacement(self):
+        """If the Daytona sandbox is gone, create a replacement."""
+        from api.providers import ProviderInstance
 
-        mock_sandbox = MagicMock()
-        # Simulate: initially stopped, becomes started after .start() is called
-        state_holder = {"value": "stopped"}
+        mock_instance = MagicMock(spec=ProviderInstance)
+        mock_instance.url = "https://replacement-daytona.example.com"
+        mock_instance.sandbox_id = "daytona-new456"
 
-        def _get_state():
-            return state_holder["value"]
-
-        type(mock_sandbox).state = property(lambda self: _get_state())
-
-        def _do_start(timeout=None):
-            state_holder["value"] = "started"
-
-        mock_sandbox.start = MagicMock(side_effect=_do_start)
-        mock_sandbox.refresh_data = MagicMock()
-
-        mock_signed = MagicMock()
-        mock_signed.url = "https://fake-daytona-url.example.com"
-        mock_sandbox.create_signed_preview_url.return_value = mock_signed
-
-        mock_daytona = MagicMock()
-        mock_daytona.get.return_value = mock_sandbox
-
-        with patch("api.server.httpx.AsyncClient") as mock_http, \
-             patch.dict(os.environ, {"DAYTONA_API_KEY": "fake-key"}), \
-             patch("daytona_sdk.Daytona", return_value=mock_daytona), \
-             patch("daytona_sdk.DaytonaConfig"):
-
-            mock_resp = AsyncMock()
-            mock_resp.status_code = 200
-            mock_client_instance = AsyncMock()
-            mock_client_instance.get.return_value = mock_resp
-            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
-            mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-            mock_http.return_value = mock_client_instance
-
+        with patch(
+            "api.providers.restart_daytona_supervisor",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("Sandbox with ID or name daytona-abc123 not found"),
+        ), patch(
+            "api.server.create_instance",
+            new_callable=AsyncMock,
+            return_value=mock_instance,
+        ), patch("api.server.upsert_sandbox", new_callable=AsyncMock):
             url, replaced = asyncio.run(_ensure_sandbox_alive(
                 self.sandbox_id, self.sandbox_record, agent_type="claude",
             ))
 
-            assert url == "https://fake-daytona-url.example.com"
-            assert replaced is False, "stopped sandbox should resume, not be replaced"
-            # Must have called start to bring it out of the stopped state
-            mock_sandbox.start.assert_called_once()
+            assert url == "https://replacement-daytona.example.com"
+            assert replaced is True
 
-    def test_terminal_state_triggers_replacement(self):
-        """A sandbox in 'error' state should be replaced, not retried."""
-        _INSTANCES.clear()
+    def test_daytona_terminal_state_creates_replacement(self):
+        """Terminal-state recovery errors should create a replacement sandbox."""
+        from api.providers import ProviderInstance
 
-        mock_bad_sandbox = MagicMock()
-        mock_bad_sandbox.state = "error"
+        mock_instance = MagicMock(spec=ProviderInstance)
+        mock_instance.url = "https://replacement-daytona.example.com"
+        mock_instance.sandbox_id = "daytona-new456"
 
-        mock_daytona = MagicMock()
-        mock_daytona.get.return_value = mock_bad_sandbox
-
-        # The replacement goes through create_instance
-        mock_new_instance = MagicMock()
-        mock_new_instance.url = "https://new-sandbox.example.com"
-        mock_new_instance.sandbox_id = "daytona-new456"
-
-        with patch.dict(os.environ, {"DAYTONA_API_KEY": "fake-key"}), \
-             patch("daytona_sdk.Daytona", return_value=mock_daytona), \
-             patch("daytona_sdk.DaytonaConfig"), \
-             patch("api.server.create_instance", new_callable=AsyncMock, return_value=mock_new_instance), \
-             patch("api.server.upsert_sandbox", new_callable=AsyncMock):
-
+        with patch(
+            "api.providers.restart_daytona_supervisor",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("daytona sandbox in terminal state 'error'"),
+        ), patch(
+            "api.server.create_instance",
+            new_callable=AsyncMock,
+            return_value=mock_instance,
+        ), patch("api.server.upsert_sandbox", new_callable=AsyncMock):
             url, replaced = asyncio.run(_ensure_sandbox_alive(
                 self.sandbox_id, self.sandbox_record, agent_type="claude",
             ))
 
-            assert url == "https://new-sandbox.example.com"
-            assert replaced is True, "terminal state should trigger replacement"
+            assert url == "https://replacement-daytona.example.com"
+            assert replaced is True
 
     def test_local_provider_still_works(self):
-        """Local provider should still work with empty _INSTANCES (creates new subprocess)."""
-        _INSTANCES.clear()
+        """Local provider should still work with empty _INSTANCES."""
         local_record = SandboxRecord(
             id="local-sandbox",
             provider="local",
@@ -168,8 +121,7 @@ class TestDaytonaResumeAfterRestart(unittest.TestCase):
             ))
 
             assert url == "http://localhost:2500"
-            # Local providers are ephemeral: restart == fresh state.
-            assert replaced is True
+            assert replaced is False
 
 
 if __name__ == "__main__":

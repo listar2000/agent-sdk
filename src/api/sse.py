@@ -10,6 +10,7 @@ import httpx
 UT_MESSAGE_DELTA = "agent_message_delta"
 UT_MESSAGE_CHUNK = "agent_message_chunk"
 UT_MESSAGE_CREATED = "agent_message_created"
+UT_THOUGHT_CHUNK = "agent_thought_chunk"
 UT_TOOL_STARTED = "execute_tool_started"
 UT_TOOL_COMPLETED = "execute_tool_completed"
 UT_TOOL_CALL = "tool_call"
@@ -48,6 +49,20 @@ def parse_sse_data(block: str) -> dict[str, Any] | None:
         return json.loads("\n".join(data_lines))
     except json.JSONDecodeError:
         return None
+
+
+def extract_sse_tag(block: str) -> str | None:
+    """Read the server-side rpc_id tag from an SSE block.
+
+    The server stamps each block with ``event: rpc:<rpc_id>`` before the
+    ``data:`` line (see `/sessions/{id}/events` handler). Returns the rpc_id,
+    or None if the block is untagged (heartbeat, bootstrap, or a consumer
+    that bypassed the proxy).
+    """
+    for line in block.split("\n"):
+        if line.startswith("event: rpc:"):
+            return line[len("event: rpc:"):].strip()
+    return None
 
 
 def parse_acp_payload(payload: dict, rpc_id: str | None) -> tuple[str, dict | None]:
@@ -209,7 +224,7 @@ def extract_tool_name(update: dict) -> str:
 
 
 def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
-    """Parse an SSE block into a structured event dict for astream_events().
+    """Parse an SSE block into a structured event dict for astream().
 
     - text:        {"type": "text", "text": "..."}
     - reasoning:   {"type": "reasoning", "text": "..."}
@@ -245,6 +260,12 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
         classified = classify_message_content(data.get("content"))
         if classified is not None:
             return {"type": classified[0], "text": classified[1]}
+
+    if ut == UT_THOUGHT_CHUNK:
+        content = data.get("content", {})
+        text = content.get("text") or content.get("thinking") or ""
+        if text:
+            return {"type": "reasoning", "text": text}
 
     if ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
         return {

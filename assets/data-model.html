@@ -58,7 +58,7 @@
   /* ── Two-column grid ── */
   .two-col {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 40px;
     align-items: start;
   }
@@ -163,7 +163,8 @@
     font-size: 11px;
     margin-left: auto;
     text-align: right;
-    white-space: nowrap;
+    min-width: 0;
+    overflow-wrap: break-word;
   }
 
   /* NEW field highlight */
@@ -421,7 +422,7 @@
   <div class="section">
     <div class="section-header">
       <h2>Data Model</h2>
-      <p class="section-sub" style="color:#8b949e;">Three layers: Postgres on the server (durable agent/sandbox/session records + event log), in-memory SessionState (live runtime), and SQLite on the client (resume hints). The SDK Agent class is intentionally minimal — for full sandbox capabilities use SandboxAgentClient directly.</p>
+      <p class="section-sub" style="color:#8b949e;">Three layers: Postgres on the server (durable agent/sandbox/session records + event log), in-memory SessionState (live runtime), and SQLite on the client (resume hints).</p>
     </div>
 
     <div class="two-col">
@@ -483,7 +484,7 @@
               <div class="field-badges"></div>
               <span class="field-name">provider</span>
               <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">"local" | "daytona"</span>
+              <span class="field-desc">"local" | "daytona" | "docker"</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -591,7 +592,7 @@
               <div class="field-badges"></div>
               <span class="field-name">event_type</span>
               <span class="field-type">TEXT</span>
-              <span class="field-desc">user_message | assistant_message | tool_call | tool_result | usage | error</span>
+              <span class="field-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | error</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -626,81 +627,63 @@
             <div class="event-row">usage_updated | usage_update <span class="event-detail">{ cost }</span></div>
             <div class="event-row">JSON-RPC result <span class="event-detail">{ stopReason }</span> <span class="event-detail">— prompt done</span></div>
             <div class="event-row">JSON-RPC error <span class="event-detail">{ code, message }</span></div>
-            <div class="relation-note">Raw ACP events proxied from sandbox-agent via <code style="font-family:monospace;color:#f472b6;">GET /sessions/{session_id}/events</code></div>
+            <div class="relation-note">Raw ACP events proxied from the supervisor via <code style="font-family:monospace;color:#f472b6;">GET /sessions/{session_id}/events</code></div>
           </div>
         </div>
 
-        <!-- SandboxAgentClient -->
+        <!-- AcpClient -->
         <div class="card">
           <div class="card-header ch-amber">
             <div class="table-name">
               <span class="dot dot-amber"></span>
-              SandboxAgentClient
+              AcpClient
             </div>
             <div class="badges">
-              <span class="badge badge-amber">sandbox API</span>
+              <span class="badge badge-amber">JSON-RPC 2.0</span>
             </div>
           </div>
           <div class="card-body">
             <div class="endpoint-group-label">Session lifecycle</div>
             <div class="method-row">
-              <span class="method-name">initialize / prompt / list_sessions / cancel_prompt</span>
+              <span class="method-name">initialize(session_id, agent, cwd, mcp_servers)</span>
+              <span class="method-ret">→ dict</span>
             </div>
             <div class="method-row">
-              <span class="method-name">close_session / set_mode / set_model / set_thought_level</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Filesystem</div>
-            <div class="method-row">
-              <span class="method-name">list_dir / read_file / write_file / delete_path / mkdir</span>
+              <span class="method-name">prompt(session_id, message, rpc_id)</span>
+              <span class="method-ret">→ (rpc_id, PromptResponse)</span>
             </div>
             <div class="method-row">
-              <span class="method-name">move_file / stat / upload_files_raw</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Exec / Processes</div>
-            <div class="method-row">
-              <span class="method-name">run_command / start_process / list_processes / stop_process</span>
+              <span class="method-name">cancel_prompt(session_id)</span>
             </div>
             <div class="method-row">
-              <span class="method-name">kill_process / get_process_logs / send_process_input</span>
+              <span class="method-name">close_session(session_id)</span>
             </div>
             <div class="method-row">
-              <span class="method-name">get_process_info / delete_process</span>
+              <span class="method-name">list_sessions(session_id)</span>
+              <span class="method-ret">→ list[dict]</span>
             </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Desktop input</div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Configuration</div>
             <div class="method-row">
-              <span class="method-name">screenshot / mouse_click / mouse_move / mouse_down / mouse_up</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">drag_mouse / scroll_mouse / keyboard_type / keyboard_press</span>
+              <span class="method-name">set_mode(session_id, mode)</span>
             </div>
             <div class="method-row">
-              <span class="method-name">key_down / key_up</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Desktop lifecycle</div>
-            <div class="method-row">
-              <span class="method-name">desktop_start / desktop_stop / desktop_status / list_windows</span>
+              <span class="method-name">set_model(session_id, model)</span>
             </div>
             <div class="method-row">
-              <span class="method-name">focus_window / get_display_info / launch_app</span>
+              <span class="method-name">set_thought_level(session_id, level)</span>
+            </div>
+            <div class="endpoint-group-label" style="padding-top:8px;">Internal</div>
+            <div class="method-row">
+              <span class="method-name">health()</span>
+              <span class="method-ret">→ dict</span>
             </div>
             <div class="method-row">
-              <span class="method-name">start_recording / stop_recording / list_recordings</span>
+              <span class="method-name">get_inner_session_id / set_inner_session_id</span>
             </div>
             <div class="method-row">
-              <span class="method-name">clipboard_read / clipboard_write</span>
+              <span class="method-name">aclose()</span>
             </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Agent introspection</div>
-            <div class="method-row">
-              <span class="method-name">health / list_agents / install_agent / get_agent_info</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">get_capabilities / has_capability</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">MCP / Skills</div>
-            <div class="method-row">
-              <span class="method-name">configure_mcp / configure_skills / deploy_skills_from_config</span>
-            </div>
-            <div class="relation-note">Wraps the sandbox-agent REST API. The SDK Agent class only exposes a subset; use SandboxAgentClient directly for full sandbox capabilities.</div>
+            <div class="relation-note">Thin async Python client for a JSON-RPC 2.0 ACP agent over POST+SSE. One instance per supervisor process; talks to <code style="font-family:monospace;color:#22d3ee;">POST /v1/acp/{session_id}</code>.</div>
           </div>
         </div>
 
@@ -725,7 +708,7 @@
               <div class="field-badges"></div>
               <span class="field-name">agent_type</span>
               <span class="field-type">str</span>
-              <span class="field-desc">"claude" | "codex" | "opencode"</span>
+              <span class="field-desc">claude | codex | opencode | gemini | cline | deepagents | openhands | goose</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -758,8 +741,8 @@
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">skills</span>
-              <span class="field-type">dict?</span>
-              <span class="field-desc">name → config</span>
+              <span class="field-type">list | dict?</span>
+              <span class="field-desc">npx skills sources</span>
             </div>
             <div class="field is-new">
               <div class="field-badges"><span class="badge-field-new">new</span></div>
@@ -804,78 +787,30 @@
               <span class="method-name">__repr__()</span>
             </div>
             <div class="endpoint-group-label" style="padding-top:8px;">Messaging</div>
-            <div class="method-row">
-              <span class="method-name">arun(message)</span>
+            <div class="method-row is-new">
+              <span class="method-name">arun(message, *, interrupt=False)</span>
               <span class="method-ret">→ str</span>
               <span class="method-desc">async, full response</span>
             </div>
-            <div class="method-row">
-              <span class="method-name">astream(message)</span>
-              <span class="method-ret">→ AsyncIterator[str]</span>
-              <span class="method-desc">async streaming</span>
+            <div class="method-row is-new">
+              <span class="method-name">astream(message, *, interrupt=False)</span>
+              <span class="method-ret">→ AsyncIterator[Event]</span>
+              <span class="method-desc">yields Event dicts, str(ev) = text</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">send(message, *, interrupt=False)</span>
+              <span class="method-ret">→ str</span>
+              <span class="method-desc">fire-and-forget, returns rpc_id</span>
+            </div>
+            <div class="method-row is-new">
+              <span class="method-name">events()</span>
+              <span class="method-ret">→ ctx[AsyncIterator[Event]]</span>
+              <span class="method-desc">long-lived SSE stream</span>
             </div>
             <div class="method-row">
-              <span class="method-name">run(message, timeout=None)</span>
+              <span class="method-name">run(message, timeout=None, *, interrupt=False)</span>
               <span class="method-ret">→ str</span>
               <span class="method-desc">sync wrapper</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Filesystem</div>
-            <div class="method-row">
-              <span class="method-name">list_dir(path="/")</span>
-              <span class="method-ret">→ list[dict]</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">read_file(path)</span>
-              <span class="method-ret">→ str</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">write_file(path, content)</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">delete_file(path, recursive=False)</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">mkdir(path)</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Exec</div>
-            <div class="method-row">
-              <span class="method-name">exec(command, args=None, cwd=None)</span>
-              <span class="method-ret">→ dict</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">shell(command, cwd=None)</span>
-              <span class="method-ret">→ str</span>
-              <span class="method-desc">raises on non-zero exit</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Processes</div>
-            <div class="method-row">
-              <span class="method-name">start_process(command, args=None, cwd=None)</span>
-              <span class="method-ret">→ dict</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">stop_process(process_id)</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">list_processes()</span>
-              <span class="method-ret">→ list[dict]</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">get_process_logs(process_id)</span>
-              <span class="method-ret">→ str</span>
-            </div>
-            <div class="endpoint-group-label" style="padding-top:8px;">Desktop</div>
-            <div class="method-row">
-              <span class="method-name">screenshot(region=None)</span>
-              <span class="method-ret">→ bytes</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">mouse_click(x, y, button="left")</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">keyboard_type(text)</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">keyboard_press(key)</span>
             </div>
             <div class="endpoint-group-label" style="padding-top:8px;">Session management</div>
             <div class="method-row">
@@ -936,6 +871,12 @@
             </div>
             <div class="field">
               <div class="field-badges"></div>
+              <span class="field-name">agent_type</span>
+              <span class="field-type">str</span>
+              <span class="field-desc">default "claude"</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
               <span class="field-name" style="min-width:150px;">acp_session_id</span>
               <span class="field-type">str?</span>
               <span class="field-desc">ephemeral, created on connect</span>
@@ -988,7 +929,7 @@
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">_subscribers</span>
-              <span class="field-type">set[Queue]</span>
+              <span class="field-type">list[Queue]</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -997,19 +938,21 @@
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">_replay_buffer</span>
-              <span class="field-type">deque(maxlen=5000)</span>
+              <span class="field-name">_prompt_lock</span>
+              <span class="field-type">asyncio.Lock</span>
+              <span class="field-desc">serializes prompt submission</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">current_rpc_id</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">set under _prompt_lock; ghost anchor for SSE tagging</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">_turn_gen</span>
-              <span class="field-type">int</span>
-              <span class="field-desc">turn generation counter</span>
-            </div>
-            <div class="field">
-              <div class="field-badges"></div>
-              <span class="field-name">_buffering_paused</span>
-              <span class="field-type">bool</span>
+              <span class="field-name">_inflight_tasks</span>
+              <span class="field-type">dict[str, _InflightTask]</span>
+              <span class="field-desc">rpc_id → asyncio.Task for clean cancellation</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -1018,24 +961,18 @@
             </div>
             <div class="endpoint-group-label" style="padding-top:8px;">Methods</div>
             <div class="method-row">
-              <span class="method-name">new_turn()</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">resume_buffering()</span>
-            </div>
-            <div class="method-row">
               <span class="method-name">subscribe()</span>
               <span class="method-ret">→ asyncio.Queue</span>
-              <span class="method-desc">register + replay buffer</span>
+              <span class="method-desc">register subscriber queue</span>
             </div>
             <div class="method-row">
               <span class="method-name">unsubscribe(q)</span>
             </div>
             <div class="method-row">
               <span class="method-name">broadcast(item)</span>
-              <span class="method-desc">push to all subscribers</span>
+              <span class="method-desc">push to all subscribers; kick-on-full</span>
             </div>
-            <div class="relation-note">In-memory runtime state. Persistent SSE reader connects once at session creation, fans out to subscribers via replay buffer (maxlen=5000). ACP/inner session IDs are ephemeral — recreated on connect, restored via native <code style="font-family:monospace;color:#f472b6;">session/load</code> on resume.</div>
+            <div class="relation-note">In-memory runtime state. Persistent SSE reader connects once at session creation, fans out to all subscriber queues. Slow subscribers are kicked via _KICK_SENTINEL. ACP/inner session IDs are ephemeral — recreated on connect, restored via native <code style="font-family:monospace;color:#f472b6;">session/load</code> on resume.</div>
           </div>
         </div>
 
@@ -1155,11 +1092,6 @@
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/agents/{agent_id}/log</span>
-          <span class="endpoint-desc">agent activity log</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/sessions</span>
           <span class="endpoint-desc">list all sessions</span>
           <span class="endpoint-new-badge">new</span>
@@ -1182,296 +1114,29 @@
           <span class="endpoint-desc">set session config</span>
         </div>
 
-        <!-- Sandbox Operations -->
-        <div class="endpoint-group-label">Sandbox Filesystem</div>
-
+        <!-- Admin / UI -->
+        <div class="endpoint-group-label">Admin &amp; UI</div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs</span>
-          <span class="endpoint-desc">list directory</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/file</span>
-          <span class="endpoint-desc">read file</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-put">PUT</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/file</span>
-          <span class="endpoint-desc">write file</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-delete">DELETE</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/file</span>
-          <span class="endpoint-desc">delete file or directory</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/mkdir</span>
-          <span class="endpoint-desc">create directory</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/move</span>
-          <span class="endpoint-desc">move / rename</span>
+          <span class="endpoint-path">/ui</span>
+          <span class="endpoint-desc">chat UI</span>
           <span class="endpoint-new-badge">new</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/stat</span>
-          <span class="endpoint-desc">file metadata</span>
+          <span class="endpoint-path">/admin/sessions</span>
+          <span class="endpoint-desc">debug: list all sessions</span>
           <span class="endpoint-new-badge">new</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/fs/upload</span>
-          <span class="endpoint-desc">upload tar archive</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/exec</span>
-          <span class="endpoint-desc">run command</span>
-        </div>
-
-        <!-- Processes -->
-        <div class="endpoint-group-label">Sandbox Processes</div>
-
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes</span>
-          <span class="endpoint-desc">start persistent process</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes</span>
-          <span class="endpoint-desc">list processes</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}/stop</span>
-          <span class="endpoint-desc">stop process</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}/logs</span>
-          <span class="endpoint-desc">process logs</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}</span>
-          <span class="endpoint-desc">process info</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}/input</span>
-          <span class="endpoint-desc">send stdin input</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}/kill</span>
-          <span class="endpoint-desc">kill process (SIGKILL)</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-delete">DELETE</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/{id}</span>
-          <span class="endpoint-desc">delete process record</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/processes/config</span>
-          <span class="endpoint-desc">process configuration</span>
+          <span class="endpoint-path">/admin/sessions/{id}/reap</span>
+          <span class="endpoint-desc">force-reap a session</span>
           <span class="endpoint-new-badge">new</span>
         </div>
 
-        <!-- Desktop -->
-        <div class="endpoint-group-label">Sandbox Desktop</div>
-
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/screenshot</span>
-          <span class="endpoint-desc">capture screenshot (PNG)</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/click</span>
-          <span class="endpoint-desc">mouse click at x, y</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/type</span>
-          <span class="endpoint-desc">type text</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/press</span>
-          <span class="endpoint-desc">press key</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/screenshot</span>
-          <span class="endpoint-desc">desktop screenshot with region</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/mouse/down</span>
-          <span class="endpoint-desc">mouse button down</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/mouse/up</span>
-          <span class="endpoint-desc">mouse button up</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/mouse/move</span>
-          <span class="endpoint-desc">move mouse</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/keyboard/down</span>
-          <span class="endpoint-desc">key down</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/keyboard/up</span>
-          <span class="endpoint-desc">key up</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/clipboard</span>
-          <span class="endpoint-desc">read clipboard</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/clipboard</span>
-          <span class="endpoint-desc">write clipboard</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/windows</span>
-          <span class="endpoint-desc">list windows</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/windows/{id}/focus</span>
-          <span class="endpoint-desc">focus window</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/start</span>
-          <span class="endpoint-desc">start desktop</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/stop</span>
-          <span class="endpoint-desc">stop desktop</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/status</span>
-          <span class="endpoint-desc">desktop status</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/recordings</span>
-          <span class="endpoint-desc">list recordings</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/drag</span>
-          <span class="endpoint-desc">drag mouse</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/scroll</span>
-          <span class="endpoint-desc">scroll</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/launch</span>
-          <span class="endpoint-desc">launch application</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/recordings/start</span>
-          <span class="endpoint-desc">start recording</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/recordings/stop</span>
-          <span class="endpoint-desc">stop recording</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/desktop/display</span>
-          <span class="endpoint-desc">display info</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-
-        <!-- Sandbox Agent Management -->
-        <div class="endpoint-group-label">Sandbox Agent Management</div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/health</span>
-          <span class="endpoint-desc">sandbox-agent liveness</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/agents</span>
-          <span class="endpoint-desc">list agents in sandbox</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/capabilities</span>
-          <span class="endpoint-desc">agent type capabilities</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/install-agent</span>
-          <span class="endpoint-desc">install agent type</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{sandbox_id}/deploy-skill</span>
-          <span class="endpoint-desc">deploy skill to sandbox</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-
+        <!-- Sandbox operations (filesystem, exec, desktop) are accessed
+             via ACP tools within an agent turn, not direct REST endpoints. -->
       </div>
     </div>
   </div>

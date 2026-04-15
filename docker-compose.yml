@@ -22,8 +22,12 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/agent_sdk_server
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-300}
+      SANDBOX_REAPER_TICK: ${SANDBOX_REAPER_TICK:-60}
     depends_on:
       db:
         condition: service_healthy
