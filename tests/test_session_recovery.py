@@ -11,16 +11,22 @@ PASS once the auto-recovery fix is applied.
 
 import asyncio
 import json
+import os
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-import os
 os.environ.setdefault("DATABASE_URL", "sqlite:///test_recovery.db")
+
+_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 from api.server import app, SESSIONS, _INSTANCES
 from api.models import SessionState, SandboxRecord
+from api.providers import ProviderInstance
 
 
 @pytest.fixture(autouse=True)
@@ -189,6 +195,89 @@ class TestSessionRecoveryAfterReap:
         mock_resume.assert_awaited_once()
         assert recovered is not stale_state
         assert recovered.client is not stale_state.client
+
+    @pytest.mark.asyncio
+    async def test_status_endpoint_recovers_stale_live_session(self):
+        """GET /sessions/{id}/status must not trust a stale live Daytona session."""
+        session_id = "sess-stale-status"
+        sandbox_id = "sandbox-stale-status"
+        agent_id = "agent-stale-status"
+        inner_session_id = "inner-stale-status"
+
+        stale_state = _fake_session_state(session_id, agent_id, sandbox_id, inner_session_id)
+        stale_state.client.base_url = "https://old-daytona-url.example.com"
+        SESSIONS[session_id] = stale_state
+
+        db_record = {
+            "id": session_id,
+            "agent_id": agent_id,
+            "sandbox_id": sandbox_id,
+            "inner_session_id": inner_session_id,
+        }
+
+        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+            new_state = _fake_session_state(
+                client_session_id, agent_id, sandbox_id, inner_session_id
+            )
+            new_state.client.base_url = "https://new-daytona-url.example.com"
+            SESSIONS[client_session_id] = new_state
+            return {
+                "session_id": client_session_id,
+                "agent_id": agent_id,
+                "sandbox_id": sandbox_id,
+                "inner_session_id": inner_session_id,
+                "status": "resumed",
+            }
+
+        with patch("api.server.get_session", AsyncMock(return_value=db_record)), \
+             patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
+                 id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
+             ))), \
+             patch("api.server._ensure_sandbox_alive", AsyncMock(return_value=(
+                 "https://new-daytona-url.example.com", False,
+             ))), \
+             patch("api.server._do_resume", side_effect=fake_do_resume) as mock_resume:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get(f"/sessions/{session_id}/status")
+
+        assert resp.status_code == 200
+        assert resp.json()["session_id"] == session_id
+        mock_resume.assert_awaited_once()
+        assert SESSIONS[session_id] is not stale_state
+
+
+class TestSandboxResolution:
+    """Sandbox resolution must not trust stale Daytona preview URLs."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_sandbox_instance_refreshes_stale_daytona_instance(self):
+        from api.server import _resolve_sandbox_instance
+
+        sandbox_id = "sandbox-stale-instance"
+        stale = ProviderInstance(
+            provider="daytona",
+            url="https://old-daytona-url.example.com",
+            sandbox_id="daytona-old",
+        )
+        fresh = ProviderInstance(
+            provider="daytona",
+            url="https://new-daytona-url.example.com",
+            sandbox_id="daytona-new",
+        )
+        _INSTANCES[sandbox_id] = stale
+
+        async def fake_ensure(*args, **kwargs):
+            _INSTANCES[sandbox_id] = fresh
+            return fresh.url, False
+
+        with patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
+            id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
+        ))), patch("api.server._ensure_sandbox_alive", AsyncMock(side_effect=fake_ensure)) as mock_ensure:
+            resolved = await _resolve_sandbox_instance(sandbox_id)
+
+        assert resolved is fresh
+        mock_ensure.assert_awaited_once()
 
 
 class TestReaperThenResumeIntegration:

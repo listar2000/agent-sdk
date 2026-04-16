@@ -1567,7 +1567,41 @@ async def get_or_recover_session(session_id: str) -> SessionState:
     """
     state = SESSIONS.get(session_id)
     if state and not state.shutdown.is_set():
-        return state
+        try:
+            sandbox_record = await get_sandbox(state.sandbox_id)
+        except Exception as e:
+            log.warning(
+                "session %s live sandbox lookup failed for %s: %s; using live state",
+                session_id,
+                state.sandbox_id,
+                e,
+            )
+            return state
+        if sandbox_record is None:
+            return state
+        if sandbox_record.provider != "daytona":
+            return state
+        try:
+            current_url, _ = await _ensure_sandbox_alive(
+                state.sandbox_id,
+                sandbox_record,
+                agent_type=state.agent_type,
+            )
+        except Exception as e:
+            log.warning(
+                "session %s Daytona liveness refresh failed for %s: %s; forcing recovery",
+                session_id,
+                state.sandbox_id,
+                e,
+            )
+            current_url = ""
+        client_base_url = str(getattr(state.client, "base_url", "")).rstrip("/")
+        if client_base_url == current_url.rstrip("/"):
+            return state
+        log.info(
+            "session %s has stale Daytona preview URL; forcing recovery",
+            session_id,
+        )
 
     rec = await get_session(session_id)
     if rec is None:
@@ -1646,9 +1680,10 @@ async def list_sessions_route():
 @app.get("/sessions/{session_id}/status")
 async def session_status(session_id: str):
     """Get session runtime status including last activity timestamp."""
-    state = SESSIONS.get(session_id)
-    if state is None:
-        return JSONResponse({"error": "session not found"}, status_code=404)
+    try:
+        state = await get_or_recover_session(session_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
     now = time.time()
     return {
         "session_id": state.session_id,
@@ -2161,10 +2196,26 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
     differs, and file browsing doesn't need ACP at all.
     """
     instance = _INSTANCES.get(sandbox_id)
+    sandbox_record = None
     if instance:
+        if instance.provider in PORT_BASED_PROVIDERS:
+            return instance
+        # Daytona preview URLs can expire while the in-memory instance stays
+        # cached. Refresh through the normal liveness path before tree/read.
+        sandbox_record = await get_sandbox(sandbox_id)
+        if not sandbox_record:
+            raise HTTPException(status_code=404, detail="sandbox not found")
+        try:
+            await _ensure_sandbox_alive(sandbox_id, sandbox_record)
+            instance = _INSTANCES.get(sandbox_id)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"failed to start sandbox: {e}")
+        if not instance:
+            raise HTTPException(status_code=409, detail="sandbox not running")
         return instance
 
-    sandbox_record = await get_sandbox(sandbox_id)
+    if sandbox_record is None:
+        sandbox_record = await get_sandbox(sandbox_id)
     if not sandbox_record:
         raise HTTPException(status_code=404, detail="sandbox not found")
     try:

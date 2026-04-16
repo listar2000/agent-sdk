@@ -89,7 +89,11 @@ from api.models import (
 
 @pytest.fixture(autouse=True)
 def clear_server_state():
-    with patch("api.server._live_session_looks_healthy", AsyncMock(return_value=True)):
+    with patch(
+        "api.server._live_session_looks_healthy",
+        AsyncMock(return_value=True),
+        create=True,
+    ):
         SESSIONS.clear()
         _INSTANCES.clear()
         yield
