@@ -154,6 +154,22 @@ async def _close_session_gracefully(
         pass
 
 
+async def _retire_session_state_for_resume(state: SessionState) -> None:
+    """Force-retire a stale live session so a replacement can take ownership.
+
+    This path is narrower than the idle reaper shutdown: it deliberately kicks
+    live subscribers off the stale session, clears queued work, closes the old
+    ACP client, and removes the state from SESSIONS without dropping the
+    session lock that the caller is already holding.
+    """
+    _on_sse_reader_death(state)
+    await _cancel_task(state._scheduler_task)
+    await _cancel_task(state._reader_task)
+    await _close_session_gracefully(state, background=True)
+    if SESSIONS.get(state.session_id) is state:
+        SESSIONS.pop(state.session_id, None)
+
+
 async def _shutdown_session_state(
     state: SessionState,
     *,
@@ -1360,6 +1376,7 @@ async def _do_resume(
     agent_id: str,
     inner_session_id: str,
     client_session_id: str | None = None,
+    force_replace_live_state: bool = False,
 ):
     """Core resume logic shared by both resume endpoints.
 
@@ -1374,13 +1391,16 @@ async def _do_resume(
         # If a previous resume already created a live session, return it.
         existing = SESSIONS.get(session_id)
         if existing and not existing.shutdown.is_set():
-            return {
-                "session_id": session_id,
-                "agent_id": existing.agent_id,
-                "sandbox_id": existing.sandbox_id,
-                "inner_session_id": existing.inner_session_id,
-                "status": "already_active",
-            }
+            if force_replace_live_state:
+                await _retire_session_state_for_resume(existing)
+            else:
+                return {
+                    "session_id": session_id,
+                    "agent_id": existing.agent_id,
+                    "sandbox_id": existing.sandbox_id,
+                    "inner_session_id": existing.inner_session_id,
+                    "status": "already_active",
+                }
 
         agent_record = await get_agent(agent_id)
         if agent_record is None:
@@ -1626,6 +1646,7 @@ async def get_or_recover_session(session_id: str) -> SessionState:
         agent_id=agent_id,
         inner_session_id=inner_session_id,
         client_session_id=session_id,
+        force_replace_live_state=state is not None and not state.shutdown.is_set(),
     )
 
     if isinstance(result, JSONResponse):

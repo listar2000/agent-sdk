@@ -25,7 +25,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from api.server import app, SESSIONS, _INSTANCES
-from api.models import SessionState, SandboxRecord
+from api.models import AgentConfig, AgentRecord, SessionState, SandboxRecord
 from api.providers import ProviderInstance
 
 
@@ -87,7 +87,14 @@ class TestSessionRecoveryAfterReap:
         }
 
         # _do_resume would restart sandbox and rebuild session state
-        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+        async def fake_do_resume(
+            *,
+            sandbox_id,
+            agent_id,
+            inner_session_id,
+            client_session_id,
+            force_replace_live_state=False,
+        ):
             state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
             state.client.prompt = AsyncMock()
             SESSIONS[client_session_id] = state
@@ -129,7 +136,14 @@ class TestSessionRecoveryAfterReap:
             "inner_session_id": "inner-1",
         }
 
-        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+        async def fake_do_resume(
+            *,
+            sandbox_id,
+            agent_id,
+            inner_session_id,
+            client_session_id,
+            force_replace_live_state=False,
+        ):
             state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
             SESSIONS[client_session_id] = state
             return {"session_id": client_session_id, "status": "resumed"}
@@ -160,7 +174,10 @@ class TestSessionRecoveryAfterReap:
 
         stale_state = _fake_session_state(session_id, agent_id, sandbox_id, inner_session_id)
         stale_state.client.base_url = "https://old-daytona-url.example.com"
-        stale_state.client.list_sessions = AsyncMock(return_value=[])
+        stale_state._reader_task = asyncio.create_task(asyncio.sleep(3600))
+        stale_state._scheduler_task = asyncio.create_task(asyncio.sleep(3600))
+        stale_state._session_subscribers.append(asyncio.Queue())
+        SESSIONS[session_id] = stale_state
 
         db_record = {
             "id": session_id,
@@ -168,33 +185,35 @@ class TestSessionRecoveryAfterReap:
             "sandbox_id": sandbox_id,
             "inner_session_id": inner_session_id,
         }
+        agent_record = AgentRecord(
+            id=agent_id,
+            name="agent",
+            config=AgentConfig(agent_type="claude", cwd="/tmp"),
+        )
 
-        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
-            new_state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
-            new_state.client.prompt = AsyncMock()
-            SESSIONS[client_session_id] = new_state
-            return {
-                "session_id": client_session_id,
-                "agent_id": agent_id,
-                "sandbox_id": sandbox_id,
-                "inner_session_id": inner_session_id,
-                "status": "resumed",
-            }
+        async def fake_initialize(client, config, acp_session_id, cwd):
+            client.set_inner_session_id(acp_session_id, "inner-recovered")
 
         with patch("api.server.get_session", AsyncMock(return_value=db_record)), \
+             patch("api.server.get_agent", AsyncMock(return_value=agent_record)), \
              patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
                  id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
              ))), \
              patch("api.server._ensure_sandbox_alive", AsyncMock(return_value=(
-                 "https://new-daytona-url.example.com", False,
+                 "https://new-daytona-url.example.com", True,
              ))), \
-             patch("api.server._do_resume", side_effect=fake_do_resume) as mock_resume:
+             patch("api.server._apply_config_and_initialize", side_effect=fake_initialize), \
+             patch("api.server.upsert_session", AsyncMock()), \
+             patch("api.server._start_session_tasks"):
             recovered = await get_or_recover_session(session_id)
 
         assert recovered is SESSIONS[session_id]
-        mock_resume.assert_awaited_once()
         assert recovered is not stale_state
         assert recovered.client is not stale_state.client
+        assert recovered.client.base_url == "https://new-daytona-url.example.com"
+        assert recovered.inner_session_id == "inner-recovered"
+        assert stale_state.shutdown.is_set()
+        assert stale_state.client is None
 
     @pytest.mark.asyncio
     async def test_status_endpoint_recovers_stale_live_session(self):
@@ -215,7 +234,14 @@ class TestSessionRecoveryAfterReap:
             "inner_session_id": inner_session_id,
         }
 
-        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+        async def fake_do_resume(
+            *,
+            sandbox_id,
+            agent_id,
+            inner_session_id,
+            client_session_id,
+            force_replace_live_state=False,
+        ):
             new_state = _fake_session_state(
                 client_session_id, agent_id, sandbox_id, inner_session_id
             )
@@ -316,7 +342,14 @@ class TestReaperThenResumeIntegration:
             "inner_session_id": inner_session_id,
         }
 
-        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+        async def fake_do_resume(
+            *,
+            sandbox_id,
+            agent_id,
+            inner_session_id,
+            client_session_id,
+            force_replace_live_state=False,
+        ):
             new_state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
             new_state.client.prompt = AsyncMock()
             SESSIONS[client_session_id] = new_state
@@ -371,7 +404,14 @@ class TestConcurrentRecovery:
 
         resume_invocations = []
 
-        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+        async def fake_do_resume(
+            *,
+            sandbox_id,
+            agent_id,
+            inner_session_id,
+            client_session_id,
+            force_replace_live_state=False,
+        ):
             resume_invocations.append(client_session_id)
             # Yield to let other coroutines race in before we populate SESSIONS
             await asyncio.sleep(0)
