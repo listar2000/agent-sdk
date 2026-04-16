@@ -35,6 +35,52 @@ async def _wait_for_health(url: str, max_retries: int = 30, interval: float = 0.
 load_dotenv()
 
 
+def _detect_vertex_proxy() -> None:
+    """Auto-detect a local Vertex proxy and configure env vars if a managed
+    apiKeyHelper is present but CLAUDE_CODE_USE_VERTEX is not yet set."""
+    helper = "/usr/local/bin/claude_code/api-key-helper"
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_API_KEY"):
+        return  # already configured or using direct API key
+    if not os.path.isfile(helper):
+        return
+    import subprocess, socket
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if "claude" not in line.lower():
+                continue
+            parts = line.split()
+            for p in parts:
+                if p.startswith("*:") or p.startswith("127.0.0.1:") or p.startswith("[::1]:"):
+                    port = p.rsplit(":", 1)[-1]
+                    if port.isdigit():
+                        host = "127.0.0.1"
+                        try:
+                            s = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
+                            s.close()
+                        except OSError:
+                            try:
+                                s = socket.create_connection(("::1", int(port)), timeout=1)
+                                s.close()
+                                host = "[::1]"
+                            except OSError:
+                                continue
+                        os.environ.setdefault("CLAUDE_CODE_USE_VERTEX", "1")
+                        os.environ.setdefault("ANTHROPIC_VERTEX_BASE_URL", f"http://{host}:{port}/v1")
+                        os.environ.setdefault("ANTHROPIC_VERTEX_PROJECT_ID", "devai-mea-egeit")
+                        os.environ.setdefault("CLAUDE_CODE_SKIP_VERTEX_AUTH", "true")
+                        log.info("auto-detected Vertex proxy on %s:%s", host, port)
+                        return
+    except Exception as e:
+        log.debug("vertex proxy auto-detect failed: %s", e)
+
+
+_detect_vertex_proxy()
+
+
 def _get_sandbox_env_vars() -> dict[str, str]:
     """Collect API keys and sandbox config from environment."""
     env: dict[str, str] = {"IS_SANDBOX": "1"}

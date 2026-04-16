@@ -28,9 +28,12 @@ services:
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-300}
       SANDBOX_REAPER_TICK: ${SANDBOX_REAPER_TICK:-60}
+    volumes:
+      - claude_config:/root/.claude
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   pgdata:
+  claude_config:

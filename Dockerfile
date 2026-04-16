@@ -5,6 +5,9 @@ WORKDIR /app
 # Install Node.js (required for ACP supervisor)
 RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm git && rm -rf /var/lib/apt/lists/*
 
+# Install agent CLIs
+RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
+
 COPY pyproject.toml .
 COPY src/ src/
 COPY ui/ ui/
