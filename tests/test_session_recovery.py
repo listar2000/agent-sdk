@@ -20,7 +20,7 @@ import os
 os.environ.setdefault("DATABASE_URL", "sqlite:///test_recovery.db")
 
 from api.server import app, SESSIONS, _INSTANCES
-from api.models import SessionState
+from api.models import SessionState, SandboxRecord
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +141,54 @@ class TestSessionRecoveryAfterReap:
                 "BUG: Events endpoint returned 404 for a reaped session instead of "
                 "auto-recovering from the DB."
             )
+
+    @pytest.mark.asyncio
+    async def test_stale_live_session_forces_recovery(self):
+        """A stale in-memory session must not bypass the recovery path."""
+        from api.server import get_or_recover_session
+
+        session_id = "sess-stale-live"
+        sandbox_id = "sandbox-stale-live"
+        agent_id = "agent-stale-live"
+        inner_session_id = "inner-stale-live"
+
+        stale_state = _fake_session_state(session_id, agent_id, sandbox_id, inner_session_id)
+        stale_state.client.base_url = "https://old-daytona-url.example.com"
+        stale_state.client.list_sessions = AsyncMock(return_value=[])
+
+        db_record = {
+            "id": session_id,
+            "agent_id": agent_id,
+            "sandbox_id": sandbox_id,
+            "inner_session_id": inner_session_id,
+        }
+
+        async def fake_do_resume(*, sandbox_id, agent_id, inner_session_id, client_session_id):
+            new_state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
+            new_state.client.prompt = AsyncMock()
+            SESSIONS[client_session_id] = new_state
+            return {
+                "session_id": client_session_id,
+                "agent_id": agent_id,
+                "sandbox_id": sandbox_id,
+                "inner_session_id": inner_session_id,
+                "status": "resumed",
+            }
+
+        with patch("api.server.get_session", AsyncMock(return_value=db_record)), \
+             patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
+                 id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
+             ))), \
+             patch("api.server._ensure_sandbox_alive", AsyncMock(return_value=(
+                 "https://new-daytona-url.example.com", False,
+             ))), \
+             patch("api.server._do_resume", side_effect=fake_do_resume) as mock_resume:
+            recovered = await get_or_recover_session(session_id)
+
+        assert recovered is SESSIONS[session_id]
+        mock_resume.assert_awaited_once()
+        assert recovered is not stale_state
+        assert recovered.client is not stale_state.client
 
 
 class TestReaperThenResumeIntegration:

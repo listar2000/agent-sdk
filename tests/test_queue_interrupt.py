@@ -89,19 +89,20 @@ from api.models import (
 
 @pytest.fixture(autouse=True)
 def clear_server_state():
-    SESSIONS.clear()
-    _INSTANCES.clear()
-    yield
-    # Cancel all background tasks (scheduler + reader) to prevent hangs
-    for state in list(SESSIONS.values()):
-        state.shutdown.set()
-        state._prompt_ready.set()  # unblock scheduler loop
-        for task_attr in ('_scheduler_task', '_reader_task'):
-            task = getattr(state, task_attr, None)
-            if task and not task.done():
-                task.cancel()
-    SESSIONS.clear()
-    _INSTANCES.clear()
+    with patch("api.server._live_session_looks_healthy", AsyncMock(return_value=True)):
+        SESSIONS.clear()
+        _INSTANCES.clear()
+        yield
+        # Cancel all background tasks (scheduler + reader) to prevent hangs
+        for state in list(SESSIONS.values()):
+            state.shutdown.set()
+            state._prompt_ready.set()  # unblock scheduler loop
+            for task_attr in ('_scheduler_task', '_reader_task'):
+                task = getattr(state, task_attr, None)
+                if task and not task.done():
+                    task.cancel()
+        SESSIONS.clear()
+        _INSTANCES.clear()
 def _make_state(session_id: str | None = None) -> SessionState:
     """Create a minimal connected SessionState."""
     session_id = session_id or str(uuid.uuid4())

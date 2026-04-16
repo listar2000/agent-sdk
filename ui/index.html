@@ -782,6 +782,7 @@
         <select id="provider">
           <option value="local">Local</option>
           <option value="docker">Docker</option>
+          <option value="daytona">Daytona</option>
         </select>
       </label>
       <label class="field">
@@ -844,6 +845,8 @@ const $ = (id) => document.getElementById(id);
 const state = {
   sessionId: null,
   sseAbort: null,
+  sseGeneration: 0,
+  streamStatus: "disconnected",
   queuedMessages: [],
   nextQueueId: 1,
   canFastTrackQueue: false,
@@ -1462,6 +1465,10 @@ function syncBusyUi() {
 
   if (!connected) {
     setStatus("disconnected", "Disconnected");
+  } else if (state.streamStatus === "connecting") {
+    setStatus("busy", "Connecting");
+  } else if (state.streamStatus === "reconnecting") {
+    setStatus("busy", "Reconnecting");
   } else if (busy) {
     setStatus("busy", "Generating");
   } else {
@@ -1670,6 +1677,8 @@ function disconnect(options = {}) {
     state.sseAbort.abort();
   }
   state.sseAbort = null;
+  state.sseGeneration += 1;
+  state.streamStatus = "disconnected";
   state.sessionId = null;
   state.remotePendingCount = 0;
   state.turns.clear();
@@ -1683,58 +1692,107 @@ function disconnect(options = {}) {
 }
 
 function startEventStream() {
+  if (!state.sessionId) {
+    return;
+  }
   if (state.sseAbort) {
     state.sseAbort.abort();
   }
 
-  state.sseAbort = new AbortController();
+  const sessionId = state.sessionId;
+  const generation = state.sseGeneration + 1;
+  const abort = new AbortController();
+  state.sseGeneration = generation;
+  state.sseAbort = abort;
+  state.streamStatus = "connecting";
+  syncBusyUi();
 
   (async () => {
-    try {
-      const resp = await fetch(`${apiBase()}/sessions/${state.sessionId}/events`, {
-        headers: { Accept: "text/event-stream" },
-        signal: state.sseAbort.signal,
-      });
+    let attempt = 0;
+    let hadError = false;
 
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+    while (
+      state.sessionId === sessionId &&
+      state.sseGeneration === generation &&
+      !abort.signal.aborted
+    ) {
+      try {
+        const resp = await fetch(`${apiBase()}/sessions/${sessionId}/events`, {
+          headers: { Accept: "text/event-stream" },
+          signal: abort.signal,
+        });
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          break;
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.error || resp.statusText || `HTTP ${resp.status}`);
         }
-        buffer += decoder.decode(value, { stream: true });
+        if (!resp.body) {
+          throw new Error("empty stream body");
+        }
 
-        while (buffer.includes("\n\n")) {
-          const idx = buffer.indexOf("\n\n");
-          const block = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
+        state.streamStatus = "connected";
+        if (hadError) {
+          // The stream dropped while a prompt was in flight — the terminal
+          // event was lost.  Reset pending count so the UI doesn't stay
+          // stuck on "Queued / Generating" after reconnection.
+          state.remotePendingCount = 0;
+          noteCard(`Reconnected to session ${sessionId.slice(0, 8)}.`);
+          hadError = false;
+        }
+        syncBusyUi();
+        attempt = 0;
 
-          const lines = block.split("\n");
-          let dataStr = "";
-          let eventName = "";
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
 
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              eventName = line.slice(6).trim();
-            } else if (line.startsWith("data: ")) {
-              dataStr += line.slice(6);
-            } else if (line.startsWith("data:")) {
-              dataStr += line.slice(5);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            throw new Error("stream closed");
+          }
+          buffer += decoder.decode(value, { stream: true });
+
+          while (buffer.includes("\n\n")) {
+            const idx = buffer.indexOf("\n\n");
+            const block = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+
+            const lines = block.split("\n");
+            let dataStr = "";
+            let eventName = "";
+
+            for (const line of lines) {
+              if (line.startsWith("event:")) {
+                eventName = line.slice(6).trim();
+              } else if (line.startsWith("data: ")) {
+                dataStr += line.slice(6);
+              } else if (line.startsWith("data:")) {
+                dataStr += line.slice(5);
+              }
+            }
+
+            if (dataStr) {
+              handleSseBlock(dataStr, eventName);
             }
           }
-
-          if (dataStr) {
-            handleSseBlock(dataStr, eventName);
-          }
         }
-      }
-    } catch (error) {
-      if (error.name !== "AbortError") {
-        noteCard(`Stream error: ${error.message}`, "error");
+      } catch (error) {
+        if (error.name === "AbortError") {
+          return;
+        }
+        if (state.sessionId !== sessionId || state.sseGeneration !== generation) {
+          return;
+        }
+        attempt += 1;
+        hadError = true;
+        state.streamStatus = "reconnecting";
         syncBusyUi();
+        const delayMs = Math.min(1000 * (2 ** (attempt - 1)), 10000);
+        if (attempt === 1) {
+          noteCard(`Stream error: ${error.message}. Reconnecting...`, "error");
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
       }
     }
   })();
