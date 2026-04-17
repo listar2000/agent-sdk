@@ -558,6 +558,7 @@
         <div class="title-badge">📁</div>
         <div class="title-copy">
           <h1>Sandbox Files</h1>
+          <p id="root-label" style="font-size:11px;color:var(--text-faint);margin-top:1px;"></p>
         </div>
       </div>
     </div>
@@ -587,8 +588,17 @@
 
     <section id="viewer">
       <div id="viewer-header" style="display: none;">
-        <h2 id="file-name"></h2>
-        <p id="file-meta"></p>
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <div>
+            <h2 id="file-name"></h2>
+            <p id="file-meta"></p>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button id="edit-btn" onclick="toggleEdit()" style="font-size:11px;padding:5px 10px;">Edit</button>
+            <button id="save-btn" onclick="saveEdit()" class="primary" style="font-size:11px;padding:5px 10px;display:none;">Save</button>
+            <button id="cancel-btn" onclick="cancelEdit()" style="font-size:11px;padding:5px 10px;display:none;">Cancel</button>
+          </div>
+        </div>
       </div>
       <div id="viewer-content">
         <div class="empty-state">Select a file to view its contents</div>
@@ -603,11 +613,14 @@ const $ = (id) => document.getElementById(id);
 const state = {
   apiUrl: '',
   sandboxId: '',
+  root: '',
   tree: null,
   expanded: new Set(),
   selectedPath: null,
+  selectedContent: null,
   treeWidth: 260,
   refreshInterval: null,
+  editing: false,
 };
 
 // Initialize API URL to current origin
@@ -766,6 +779,16 @@ async function loadTree() {
     state.tree = await resp.json();
     renderTree();
 
+    // Fetch sandbox root
+    try {
+      const sbResp = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}`);
+      if (sbResp.ok) {
+        const sb = await sbResp.json();
+        state.root = sb.root || '';
+        $('root-label').textContent = state.root ? `root: ${state.root}` : '';
+      }
+    } catch (_) {}
+
     // Start auto-refresh
     if (state.refreshInterval) {
       clearInterval(state.refreshInterval);
@@ -816,6 +839,11 @@ async function loadFile(path, name, size) {
     }
 
     const data = await resp.json();
+    state.selectedContent = data;
+    state.editing = false;
+    $('edit-btn').style.display = (data.binary) ? 'none' : '';
+    $('save-btn').style.display = 'none';
+    $('cancel-btn').style.display = 'none';
     renderFileContent(data);
 
   } catch (error) {
@@ -880,6 +908,109 @@ function renderFileContent(data) {
       </div>
     </div>
   `;
+}
+
+// ── Edit mode ──
+
+function toggleEdit() {
+  if (!state.selectedContent || state.selectedContent.binary) return;
+  state.editing = true;
+  $('edit-btn').style.display = 'none';
+  $('save-btn').style.display = '';
+  $('cancel-btn').style.display = '';
+
+  const viewerContent = $('viewer-content');
+  const textarea = document.createElement('textarea');
+  textarea.id = 'edit-textarea';
+  textarea.value = state.selectedContent.content;
+  textarea.style.cssText = `
+    width:100%;height:100%;border:none;background:var(--editor-bg);color:var(--text);
+    font-family:"SF Mono","Fira Code","Consolas",monospace;font-size:12px;line-height:1.6;
+    padding:14px;resize:none;outline:none;tab-size:4;
+  `;
+  textarea.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      textarea.value = textarea.value.substring(0, start) + '  ' + textarea.value.substring(end);
+      textarea.selectionStart = textarea.selectionEnd = start + 2;
+    }
+    if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      saveEdit();
+    }
+    if (e.key === 'Escape') {
+      cancelEdit();
+    }
+  });
+  viewerContent.innerHTML = '';
+  viewerContent.appendChild(textarea);
+  textarea.focus();
+}
+
+async function saveEdit() {
+  const textarea = $('edit-textarea');
+  if (!textarea || !state.selectedPath) return;
+
+  const newContent = textarea.value;
+  const oldContent = state.selectedContent.content;
+
+  $('save-btn').disabled = true;
+  $('save-btn').textContent = 'Saving...';
+
+  try {
+    const resp = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}/files/edit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: state.selectedPath,
+        old_string: oldContent,
+        new_string: newContent,
+      }),
+    });
+
+    const result = await resp.json();
+    if (!resp.ok) {
+      // If old content changed underneath us, try write mode (overwrite)
+      const retry = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}/files/edit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: state.selectedPath,
+          old_string: '',
+          new_string: newContent,
+        }),
+      });
+      const retryResult = await retry.json();
+      if (!retry.ok) {
+        alert('Save failed: ' + (retryResult.error || 'unknown error'));
+        $('save-btn').disabled = false;
+        $('save-btn').textContent = 'Save';
+        return;
+      }
+    }
+
+    // Reload the file to show updated content
+    state.editing = false;
+    await loadFile(state.selectedPath, state.selectedContent.name, null);
+    loadTreeSilent();
+  } catch (error) {
+    alert('Save failed: ' + error.message);
+  } finally {
+    $('save-btn').disabled = false;
+    $('save-btn').textContent = 'Save';
+  }
+}
+
+function cancelEdit() {
+  state.editing = false;
+  $('edit-btn').style.display = '';
+  $('save-btn').style.display = 'none';
+  $('cancel-btn').style.display = 'none';
+  if (state.selectedContent) {
+    renderFileContent(state.selectedContent);
+  }
 }
 
 // Drag handle for resizing

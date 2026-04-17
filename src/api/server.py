@@ -824,6 +824,7 @@ async def list_sandboxes_route():
             "provider": s.provider,
             "sandbox_ref": s.sandbox_ref,
             "status": s.status,
+            "root": s.root,
         }
         for s in sandboxes
     ]
@@ -839,6 +840,7 @@ async def get_sandbox_route(sandbox_id: str):
         "provider": record.provider,
         "sandbox_ref": record.sandbox_ref,
         "status": record.status,
+        "root": record.root,
     }
     if record.provider in PORT_BASED_PROVIDERS:
         try:
@@ -2360,6 +2362,31 @@ async def sandbox_files_read(sandbox_id: str, path: str):
             r = await client.get(
                 f"{instance.url}/v1/files/read",
                 params={"path": path},
+            )
+            return Response(
+                content=r.content,
+                status_code=r.status_code,
+                media_type="application/json",
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+@app.post("/sandboxes/{sandbox_id}/files/edit")
+async def sandbox_files_edit(sandbox_id: str, request: Request):
+    """Edit or create a file in the sandbox filesystem.
+
+    Body: {"path": "relative/path", "old_string": "...", "new_string": "...", "replace_all": false}
+    When old_string is empty, writes/creates the file with new_string as content.
+    The supervisor enforces path traversal protection.
+    """
+    instance = await _resolve_sandbox_instance(sandbox_id)
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{instance.url}/v1/files/edit",
+                json=body,
             )
             return Response(
                 content=r.content,
