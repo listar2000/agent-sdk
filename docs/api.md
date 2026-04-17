@@ -54,6 +54,24 @@ Returns:
 }
 ```
 
+### Create session on an existing sandbox
+
+```
+POST /sessions
+```
+
+Same config fields as `POST /sessions/quick`, plus a required `sandbox_id` (from a prior `/sessions/quick` or sandbox create). Provisions **no** new sandbox — starts a new agent + ACP session attached to the supervisor already running in that sandbox. Response shape matches `/sessions/quick`.
+
+```json
+{
+  "sandbox_id": "uuid-from-existing-workspace",
+  "name": "worker-2",
+  "agent_type": "claude",
+  "model": "claude-sonnet-4-6",
+  "cwd": "/home/daytona"
+}
+```
+
 ### Send message (non-blocking)
 
 ```

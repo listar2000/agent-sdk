@@ -1782,6 +1782,99 @@ async def session_resume(session_id: str):
     }
 
 
+@app.post("/sessions")
+async def sessions_create_on_existing_sandbox(request: Request):
+    """Create agent + new session on an existing sandbox (no new container).
+
+    Body requires ``sandbox_id``; other fields match ``POST /sessions/quick``.
+    Returns the same shape as ``/sessions/quick``.
+    """
+    data = await request.json()
+    sandbox_id = data.get("sandbox_id")
+    if not sandbox_id or not isinstance(sandbox_id, str):
+        return JSONResponse(
+            {"error": "sandbox_id is required"}, status_code=400
+        )
+
+    sandbox_record = await get_sandbox(sandbox_id)
+    if sandbox_record is None:
+        return JSONResponse({"error": "sandbox not found"}, status_code=404)
+
+    agent_type = data.get("agent_type", "claude")
+    name = data.get("name")
+    config_data = data.get("config", {})
+    _merge_top_level_config(data, config_data)
+    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
+    dockerfile = _materialize_dockerfile(config_data)
+
+    agent_id = str(uuid.uuid4())
+    config = AgentConfig.from_dict(
+        {**config_data, "agent_type": agent_type, "cwd": cwd}
+    )
+    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
+
+    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
+    if skill_cmds and sandbox_record.provider == "local":
+        try:
+            await _install_skills_locally(config.skills)
+        except Exception as e:
+            log.error("skill install failed, continuing without skills: %s", e)
+
+    try:
+        url, _replaced = await _ensure_sandbox_alive(
+            sandbox_id,
+            sandbox_record,
+            agent_type=config.agent_type or "claude",
+            dockerfile=dockerfile,
+        )
+    except RuntimeError as e:
+        await delete_agent(agent_id)
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+    acp_session_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+
+    client = AcpClient(url)
+    try:
+        await _apply_config_and_initialize(
+            client,
+            config,
+            acp_session_id,
+            cwd,
+        )
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        await delete_agent(agent_id)
+        return JSONResponse(
+            {"error": f"Failed to connect to ACP supervisor: {e}"}, status_code=502
+        )
+
+    inner_session_id = client.get_inner_session_id(acp_session_id)
+    state = SessionState(
+        session_id=session_id,
+        agent_id=agent_id,
+        sandbox_id=sandbox_id,
+        acp_session_id=acp_session_id,
+        inner_session_id=inner_session_id,
+        agent_type=config.agent_type or "claude",
+        client=client,
+    )
+    SESSIONS[session_id] = state
+    _start_session_tasks(state)
+    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
+
+    return {
+        "agent_id": agent_id,
+        "sandbox_id": sandbox_id,
+        "session_id": session_id,
+        "inner_session_id": inner_session_id,
+        "connected": True,
+    }
+
+
 @app.post("/sessions/quick")
 async def sessions_quick_create(request: Request):
     """Create agent + provision sandbox + connect in one call.
