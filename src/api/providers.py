@@ -35,6 +35,52 @@ async def _wait_for_health(url: str, max_retries: int = 30, interval: float = 0.
 load_dotenv()
 
 
+def _detect_vertex_proxy() -> None:
+    """Auto-detect a local Vertex proxy and configure env vars if a managed
+    apiKeyHelper is present but CLAUDE_CODE_USE_VERTEX is not yet set."""
+    helper = "/usr/local/bin/claude_code/api-key-helper"
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_API_KEY"):
+        return  # already configured or using direct API key
+    if not os.path.isfile(helper):
+        return
+    import subprocess, socket
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if "claude" not in line.lower():
+                continue
+            parts = line.split()
+            for p in parts:
+                if p.startswith("*:") or p.startswith("127.0.0.1:") or p.startswith("[::1]:"):
+                    port = p.rsplit(":", 1)[-1]
+                    if port.isdigit():
+                        host = "127.0.0.1"
+                        try:
+                            s = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
+                            s.close()
+                        except OSError:
+                            try:
+                                s = socket.create_connection(("::1", int(port)), timeout=1)
+                                s.close()
+                                host = "[::1]"
+                            except OSError:
+                                continue
+                        os.environ.setdefault("CLAUDE_CODE_USE_VERTEX", "1")
+                        os.environ.setdefault("ANTHROPIC_VERTEX_BASE_URL", f"http://{host}:{port}/v1")
+                        os.environ.setdefault("ANTHROPIC_VERTEX_PROJECT_ID", "devai-mea-egeit")
+                        os.environ.setdefault("CLAUDE_CODE_SKIP_VERTEX_AUTH", "true")
+                        log.info("auto-detected Vertex proxy on %s:%s", host, port)
+                        return
+    except Exception as e:
+        log.debug("vertex proxy auto-detect failed: %s", e)
+
+
+_detect_vertex_proxy()
+
+
 def _get_sandbox_env_vars() -> dict[str, str]:
     """Collect API keys and sandbox config from environment."""
     env: dict[str, str] = {"IS_SANDBOX": "1"}
@@ -50,6 +96,7 @@ class ProviderInstance:
     """A running ACP supervisor instance."""
     provider: str              # "local", "daytona", or "docker"
     url: str                   # http:// base URL
+    root: str = "/tmp"         # filesystem root for the sandbox
     sandbox_id: str | None = None  # Daytona sandbox ID (if daytona)
     process: asyncio.subprocess.Process | None = None  # local subprocess
     port: int | None = 0       # local port (if local or docker)
@@ -169,7 +216,7 @@ async def _ensure_local_supervisor_deps(agent_type: str) -> str:
         return str(acp_bin)
 
 
-async def create_local(agent_type: str = "claude") -> ProviderInstance:
+async def create_local(agent_type: str = "claude", root: str = "/tmp") -> ProviderInstance:
     """Spawn a local supervisor.js subprocess that bridges stdio ↔ HTTP
     (POST + SSE) for the given agent's ACP binary."""
     node = shutil.which("node")
@@ -190,7 +237,7 @@ async def create_local(agent_type: str = "claude") -> ProviderInstance:
             "--port", str(port),
             "--acp", acp_bin,
             *extra,
-            "--cwd", "/tmp",
+            "--root", root,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -215,6 +262,7 @@ async def create_local(agent_type: str = "claude") -> ProviderInstance:
     return ProviderInstance(
         provider="local",
         url=url,
+        root=root,
         process=proc,
         port=port,
     )
@@ -277,6 +325,7 @@ _SUPERVISOR_REMOTE_PORT = 9100
 async def _bootstrap_supervisor_in_daytona_sandbox(
     sandbox, agent_type: str, *, install_deps: bool,
     pre_start_commands: list[str] | None = None,
+    root: str = "/tmp",
 ) -> ProviderInstance:
     """Install (optionally) + start the supervisor inside an existing daytona
     sandbox object. Returns a fresh ProviderInstance with a new signed URL.
@@ -342,7 +391,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
         f"sh -c \"cd {_SUPERVISOR_REMOTE_DIR} && "
         f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' "
         f"setsid node supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_REMOTE_PORT} "
-        f"--acp {acp_bin}{acp_arg_flags} --cwd /tmp "
+        f"--acp {acp_bin}{acp_arg_flags} --root {root} "
         f"> {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1 </dev/null & echo started\""
     )
     await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
@@ -363,11 +412,12 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     return ProviderInstance(
         provider="daytona",
         url=url,
+        root=root,
         sandbox_id=sandbox.id,
     )
 
 
-async def restart_daytona_supervisor(daytona_sandbox_id: str, agent_type: str = "claude") -> ProviderInstance:
+async def restart_daytona_supervisor(daytona_sandbox_id: str, agent_type: str = "claude", root: str = "/tmp") -> ProviderInstance:
     """Re-attach to an existing daytona sandbox and respawn the supervisor
     inside it. Used by the resume path after the sandbox was stopped (or
     after the supervisor process was killed in place). Preserves the
@@ -392,13 +442,14 @@ async def restart_daytona_supervisor(daytona_sandbox_id: str, agent_type: str = 
         log.info("starting stopped daytona sandbox %s", daytona_sandbox_id)
         await loop.run_in_executor(None, sandbox.start)
 
-    return await _bootstrap_supervisor_in_daytona_sandbox(sandbox, agent_type, install_deps=False)
+    return await _bootstrap_supervisor_in_daytona_sandbox(sandbox, agent_type, install_deps=False, root=root)
 
 
 async def create_daytona(
     agent_type: str = "claude",
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
+    root: str = "/tmp",
 ) -> ProviderInstance:
     """Create a fresh Daytona sandbox, install + start a supervisor inside it."""
     try:
@@ -454,6 +505,7 @@ async def create_daytona(
     try:
         return await _bootstrap_supervisor_in_daytona_sandbox(
             sandbox, agent_type, install_deps=True, pre_start_commands=pre_start_commands,
+            root=root,
         )
     except BaseException:
         try:
@@ -547,6 +599,7 @@ async def create_docker(
     agent_type: str = "claude",
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
+    root: str = "/tmp",
 ) -> ProviderInstance:
     """Run the supervisor Docker image as a per-session container."""
     docker = shutil.which("docker")
@@ -570,7 +623,7 @@ async def create_docker(
         # Override entrypoint: run pre-start commands, then start supervisor
         setup = " && ".join(pre_start_commands)
         acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-        shell_cmd = f"{setup} && node /app/supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_DOCKER_PORT} --cwd /tmp --acp {acp_path}{acp_arg_flags}"
+        shell_cmd = f"{setup} && node /app/supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_DOCKER_PORT} --root {root} --acp {acp_path}{acp_arg_flags}"
         cmd = [
             docker, "run", "-d", "--rm",
             "-p", f"{port}:{_SUPERVISOR_DOCKER_PORT}",
@@ -588,6 +641,7 @@ async def create_docker(
             "-p", f"{port}:{_SUPERVISOR_DOCKER_PORT}",
             *env_args,
             image,
+            "--root", root,
             "--acp", acp_path,
             *extra,
         ]
@@ -616,6 +670,7 @@ async def create_docker(
         return ProviderInstance(
             provider="docker",
             url=url,
+            root=root,
             port=port,
             container_id=container_id,
         )
@@ -659,6 +714,7 @@ async def create_instance(
     agent_type: str = "claude",
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
+    root: str = "/tmp",
 ) -> ProviderInstance:
     """Create an ACP supervisor instance using the specified provider.
 
@@ -668,11 +724,11 @@ async def create_instance(
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(_ACP_BIN_NAMES)}")
     if provider == "local":
-        return await create_local(agent_type)
+        return await create_local(agent_type, root=root)
     if provider == "docker":
-        return await create_docker(agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands)
+        return await create_docker(agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands, root=root)
     if provider == "daytona":
-        return await create_daytona(agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands)
+        return await create_daytona(agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands, root=root)
     raise ValueError(f"Unknown provider: {provider!r}. Use 'local', 'docker', or 'daytona'.")
 
 

@@ -28,7 +28,7 @@ function parseArgs(argv) {
     port: 9100,
     acp: null,
     host: "0.0.0.0",
-    cwd: "/tmp",
+    root: "/tmp",
     acpArgs: [],
   };
   for (let i = 2; i < argv.length; i++) {
@@ -36,7 +36,7 @@ function parseArgs(argv) {
     if (a === "--port") out.port = parseInt(argv[++i], 10);
     else if (a === "--host") out.host = argv[++i];
     else if (a === "--acp") out.acp = argv[++i];
-    else if (a === "--cwd") out.cwd = argv[++i];
+    else if (a === "--root" || a === "--cwd") out.root = argv[++i];
     else if (a === "--acp-arg") out.acpArgs.push(argv[++i]);
   }
   if (!out.acp) {
@@ -56,7 +56,7 @@ const args = parseArgs(process.argv);
 const acp = spawn(args.acp, args.acpArgs, {
   stdio: ["pipe", "pipe", "pipe"],
   env: process.env,
-  cwd: args.cwd,
+  cwd: args.root,
 });
 log("spawned acp pid=" + acp.pid);
 
@@ -303,6 +303,121 @@ const MIME_MAP = {
 };
 const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
 
+async function handleFilesEdit(req, res) {
+  let raw = "";
+  req.setEncoding("utf8");
+  for await (const chunk of req) raw += chunk;
+
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch (e) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid JSON body: " + e.message }));
+    return;
+  }
+
+  const filePath = body.path;
+  const oldString = body.old_string;
+  const newString = body.new_string;
+  const replaceAll = body.replace_all === true;
+
+  if (typeof filePath !== "string" || !filePath) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path required" }));
+    return;
+  }
+  if (typeof oldString !== "string" || typeof newString !== "string") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "old_string and new_string required" }));
+    return;
+  }
+
+  const resolvedRoot = path.resolve(args.root);
+  const fullPath = path.resolve(resolvedRoot, filePath);
+
+  // Path traversal guard
+  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path traversal denied" }));
+    return;
+  }
+
+  // old_string === "" means write/create the entire file
+  if (oldString === "") {
+    // Create parent directories if needed
+    const dir = path.dirname(fullPath);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(fullPath, newString, "utf8");
+    const stat = fs.statSync(fullPath);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, path: filePath, size: stat.size, created: true }));
+    return;
+  }
+
+  // Regular edit — file must exist
+  let content;
+  try {
+    content = fs.readFileSync(fullPath, "utf8");
+  } catch {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "file not found" }));
+    return;
+  }
+
+  if (oldString === newString) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "old_string and new_string are identical" }));
+    return;
+  }
+
+  // Count occurrences
+  let count = 0;
+  let idx = 0;
+  while ((idx = content.indexOf(oldString, idx)) !== -1) {
+    count++;
+    idx += oldString.length;
+  }
+
+  if (count === 0) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "old_string not found in file" }));
+    return;
+  }
+
+  if (count > 1 && !replaceAll) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: `old_string matches ${count} locations; provide more context to make it unique, or set replace_all: true`,
+        matches: count,
+      }),
+    );
+    return;
+  }
+
+  // Perform replacement
+  let updated;
+  if (replaceAll) {
+    updated = content.split(oldString).join(newString);
+  } else {
+    const pos = content.indexOf(oldString);
+    updated = content.slice(0, pos) + newString + content.slice(pos + oldString.length);
+  }
+
+  fs.writeFileSync(fullPath, updated, "utf8");
+  const stat = fs.statSync(fullPath);
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(
+    JSON.stringify({
+      ok: true,
+      path: filePath,
+      size: stat.size,
+      replacements: replaceAll ? count : 1,
+    }),
+  );
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === "/v1/health" || req.url === "/health") {
     const body = JSON.stringify({
@@ -311,7 +426,7 @@ const server = http.createServer((req, res) => {
       acp_alive: acp.exitCode === null,
       sse_subscribers: sseSubscribers.size,
       pending_responses: pendingResponses.size,
-      cwd: args.cwd,
+      cwd: args.root,
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(body);
@@ -335,7 +450,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.url && req.url.startsWith("/v1/files/tree") && req.method === "GET") {
     const u = new URL(req.url, `http://${req.headers.host}`);
-    const root = u.searchParams.get("root") || args.cwd || "/tmp";
+    const root = u.searchParams.get("root") || args.root || "/tmp";
     const resolved = path.resolve(root);
     if (!fs.existsSync(resolved)) {
       res.writeHead(404, { "content-type": "application/json" });
@@ -350,7 +465,7 @@ const server = http.createServer((req, res) => {
   if (req.url && req.url.startsWith("/v1/files/read") && req.method === "GET") {
     const u = new URL(req.url, `http://${req.headers.host}`);
     const filePath = u.searchParams.get("path");
-    const root = u.searchParams.get("root") || args.cwd || "/tmp";
+    const root = u.searchParams.get("root") || args.root || "/tmp";
     if (!filePath) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "path query param required" }));
@@ -421,6 +536,16 @@ const server = http.createServer((req, res) => {
     };
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(result));
+    return;
+  }
+  if (req.url && req.url.startsWith("/v1/files/edit") && req.method === "POST") {
+    handleFilesEdit(req, res).catch((e) => {
+      log("files/edit handler crashed: " + e.stack);
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      } catch {}
+    });
     return;
   }
   res.writeHead(404, { "content-type": "text/plain" });

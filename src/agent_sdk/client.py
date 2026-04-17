@@ -180,6 +180,7 @@ class Agent:
         provider: str | None = None,
         model: str | None = None,
         cwd: str | None = None,
+        root: str | None = None,
         prompt: str | None = None,
         api_url: str | None = None,
         tools: list[str] | None = None,
@@ -197,6 +198,7 @@ class Agent:
         self.provider = provider
         self.model = model
         self.cwd = cwd
+        self.root = root
         self.prompt = prompt
         self.tools = tools
         self.mcp_servers = mcp_servers
@@ -222,7 +224,7 @@ class Agent:
     @classmethod
     def from_config(cls, name: str, config: dict[str, Any], **kwargs) -> "Agent":
         """Create an agent from a config dict."""
-        valid_keys = {"agent_type", "model", "prompt", "cwd", "tools",
+        valid_keys = {"agent_type", "model", "prompt", "cwd", "root", "tools",
                       "mcp_servers", "skills", "dockerfile", "provider"}
         agent_kwargs = {k: v for k, v in config.items() if k in valid_keys}
         agent_kwargs.update(kwargs)
@@ -253,6 +255,7 @@ class Agent:
             "provider": self.provider,
             "model": self.model,
             "cwd": self.cwd,
+            "root": self.root,
             "prompt": self.prompt,
             "api_url": self._api_url,
             "tools": self.tools,
@@ -267,7 +270,7 @@ class Agent:
 
     def _registration_payload(self) -> dict[str, Any]:
         config: dict[str, Any] = {"name": self.name, "agent_type": self.agent_type}
-        for key in ("provider", "model", "cwd", "prompt", "tools"):
+        for key in ("provider", "model", "cwd", "root", "prompt", "tools"):
             val = getattr(self, key)
             if val is not None:
                 config[key] = val
