@@ -71,6 +71,7 @@ class SandboxRecord:
     provider: str
     sandbox_ref: str
     status: str = "stopped"
+    root: str = "/tmp"
 
     def derive_url(self) -> str:
         from .providers import PORT_BASED_PROVIDERS

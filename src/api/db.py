@@ -32,6 +32,7 @@ _PG_SCHEMA = [
         provider        TEXT NOT NULL,
         sandbox_ref     TEXT NOT NULL,
         status          TEXT DEFAULT 'stopped',
+        root            TEXT NOT NULL DEFAULT '/tmp',
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     """CREATE TABLE IF NOT EXISTS sessions (
@@ -73,6 +74,8 @@ _MIGRATIONS = [
     "ALTER TABLE sandboxes DROP COLUMN IF EXISTS last_activity",
     "ALTER TABLE sandboxes DROP COLUMN IF EXISTS error_message",
     "ALTER TABLE sandboxes DROP COLUMN IF EXISTS updated_at",
+    # 2026-04-16: add root column for sandbox filesystem boundary
+    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS root TEXT NOT NULL DEFAULT '/tmp'",
 ]
 
 
@@ -190,11 +193,13 @@ async def delete_agent(agent_id: str) -> None:
 async def upsert_sandbox(sandbox: SandboxRecord) -> None:
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO sandboxes (id, provider, sandbox_ref, status)"
-            " VALUES (%s, %s, %s, %s)"
+            "INSERT INTO sandboxes (id, provider, sandbox_ref, status, root)"
+            " VALUES (%s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
-            " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status",
-            (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status),
+            " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
+            " root=EXCLUDED.root",
+            (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status,
+             sandbox.root),
         )
 
 
@@ -208,6 +213,7 @@ async def get_sandbox(sandbox_id: str) -> SandboxRecord | None:
     return SandboxRecord(
         id=row["id"], provider=row["provider"],
         sandbox_ref=row["sandbox_ref"], status=row["status"],
+        root=row.get("root", "/tmp"),
     )
 
 
@@ -216,7 +222,8 @@ async def list_sandboxes() -> list[SandboxRecord]:
         rows = await (await conn.execute("SELECT * FROM sandboxes")).fetchall()
     return [
         SandboxRecord(id=r["id"], provider=r["provider"],
-                      sandbox_ref=r["sandbox_ref"], status=r["status"])
+                      sandbox_ref=r["sandbox_ref"], status=r["status"],
+                      root=r.get("root", "/tmp"))
         for r in rows
     ]
 

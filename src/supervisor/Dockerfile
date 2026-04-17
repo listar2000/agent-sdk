@@ -15,5 +15,5 @@ COPY supervisor.js ./
 
 EXPOSE 9100
 
-ENTRYPOINT ["node", "/app/supervisor.js", "--host", "0.0.0.0", "--port", "9100", "--cwd", "/tmp"]
+ENTRYPOINT ["node", "/app/supervisor.js", "--host", "0.0.0.0", "--port", "9100"]
 CMD ["--acp", "/app/node_modules/.bin/claude-agent-acp"]

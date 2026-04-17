@@ -699,6 +699,7 @@ _CONFIG_KEYS = (
     "skills",
     "agent_type",
     "cwd",
+    "root",
     "dockerfile",
     "dockerfile_content",
 )
@@ -787,10 +788,11 @@ async def create_sandbox(request: Request):
     data = await request.json()
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
+    root = data.get("root", "/tmp")
     dockerfile = _materialize_dockerfile(data)
     sandbox_id = str(uuid.uuid4())
     try:
-        instance = await create_instance(provider, agent_type, dockerfile=dockerfile)
+        instance = await create_instance(provider, agent_type, dockerfile=dockerfile, root=root)
     except Exception as e:
         return JSONResponse(
             {"error": f"Provider '{provider}' failed: {e}"}, status_code=502
@@ -800,7 +802,8 @@ async def create_sandbox(request: Request):
 
     _INSTANCES[sandbox_id] = instance
     record = SandboxRecord(
-        id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status=STATUS_RUNNING
+        id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status=STATUS_RUNNING,
+        root=root,
     )
     await upsert_sandbox(record)
     return {
@@ -808,6 +811,7 @@ async def create_sandbox(request: Request):
         "provider": provider,
         "sandbox_ref": sandbox_ref,
         "status": "running",
+        "root": root,
     }
 
 
@@ -1294,7 +1298,8 @@ async def _ensure_sandbox_alive(
             log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
             try:
                 new_instance = await create_instance(
-                    provider, agent_type, dockerfile=dockerfile
+                    provider, agent_type, dockerfile=dockerfile,
+                    root=sandbox_record.root,
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to restart sandbox: {e}")
@@ -1309,6 +1314,7 @@ async def _ensure_sandbox_alive(
                     provider=provider,
                     sandbox_ref=new_ref,
                     status=STATUS_RUNNING,
+                    root=sandbox_record.root,
                 )
             )
             return new_instance.url, False
@@ -1337,7 +1343,7 @@ async def _ensure_sandbox_alive(
             from .providers import restart_daytona_supervisor
 
             new_instance = await restart_daytona_supervisor(
-                daytona_sandbox_id, agent_type
+                daytona_sandbox_id, agent_type, root=sandbox_record.root,
             )
         except Exception as e:
             if not _should_replace_daytona_sandbox(e):
@@ -1350,7 +1356,8 @@ async def _ensure_sandbox_alive(
             )
             try:
                 new_instance = await create_instance(
-                    "daytona", agent_type, dockerfile=dockerfile
+                    "daytona", agent_type, dockerfile=dockerfile,
+                    root=sandbox_record.root,
                 )
             except Exception as create_err:
                 raise RuntimeError(
@@ -1365,6 +1372,7 @@ async def _ensure_sandbox_alive(
                 provider="daytona",
                 sandbox_ref=new_instance.sandbox_id or sandbox_id,
                 status=STATUS_RUNNING,
+                root=sandbox_record.root,
             )
         )
         return new_instance.url, replaced
@@ -1785,6 +1793,7 @@ async def sessions_quick_create(request: Request):
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
     cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
+    root = config_data.get("root", data.get("root", cwd))
     dockerfile = _materialize_dockerfile(config_data)
 
     agent_id = str(uuid.uuid4())
@@ -1813,6 +1822,7 @@ async def sessions_quick_create(request: Request):
             agent_type,
             dockerfile=dockerfile,
             pre_start_commands=skill_cmds if provider != "local" else None,
+            root=root,
         )
     except Exception as e:
         await delete_agent(agent_id)
@@ -1837,6 +1847,7 @@ async def sessions_quick_create(request: Request):
             provider=provider,
             sandbox_ref=sandbox_ref,
             status=STATUS_RUNNING,
+            root=root,
         )
     )
 
@@ -2320,7 +2331,7 @@ async def session_sandbox_exec(session_id: str, request: Request):
 async def sandbox_files_tree(sandbox_id: str):
     """Return the recursive directory tree of the sandbox filesystem.
 
-    Always browses the supervisor's configured --cwd (typically /tmp).
+    Browses the supervisor's configured --root (the sandbox root).
     The root is not caller-controlled — the supervisor owns that decision.
     """
     instance = await _resolve_sandbox_instance(sandbox_id)
@@ -2340,7 +2351,7 @@ async def sandbox_files_tree(sandbox_id: str):
 async def sandbox_files_read(sandbox_id: str, path: str):
     """Read a single file from the sandbox filesystem.
 
-    The `path` is relative to the supervisor's --cwd. The supervisor
+    The `path` is relative to the sandbox root. The supervisor
     enforces path traversal protection — callers cannot escape the root.
     """
     instance = await _resolve_sandbox_instance(sandbox_id)

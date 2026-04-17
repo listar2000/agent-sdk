@@ -28,7 +28,7 @@ function parseArgs(argv) {
     port: 9100,
     acp: null,
     host: "0.0.0.0",
-    cwd: "/tmp",
+    root: "/tmp",
     acpArgs: [],
   };
   for (let i = 2; i < argv.length; i++) {
@@ -36,7 +36,7 @@ function parseArgs(argv) {
     if (a === "--port") out.port = parseInt(argv[++i], 10);
     else if (a === "--host") out.host = argv[++i];
     else if (a === "--acp") out.acp = argv[++i];
-    else if (a === "--cwd") out.cwd = argv[++i];
+    else if (a === "--root" || a === "--cwd") out.root = argv[++i];
     else if (a === "--acp-arg") out.acpArgs.push(argv[++i]);
   }
   if (!out.acp) {
@@ -56,7 +56,7 @@ const args = parseArgs(process.argv);
 const acp = spawn(args.acp, args.acpArgs, {
   stdio: ["pipe", "pipe", "pipe"],
   env: process.env,
-  cwd: args.cwd,
+  cwd: args.root,
 });
 log("spawned acp pid=" + acp.pid);
 
@@ -311,7 +311,7 @@ const server = http.createServer((req, res) => {
       acp_alive: acp.exitCode === null,
       sse_subscribers: sseSubscribers.size,
       pending_responses: pendingResponses.size,
-      cwd: args.cwd,
+      cwd: args.root,
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(body);
@@ -335,7 +335,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.url && req.url.startsWith("/v1/files/tree") && req.method === "GET") {
     const u = new URL(req.url, `http://${req.headers.host}`);
-    const root = u.searchParams.get("root") || args.cwd || "/tmp";
+    const root = u.searchParams.get("root") || args.root || "/tmp";
     const resolved = path.resolve(root);
     if (!fs.existsSync(resolved)) {
       res.writeHead(404, { "content-type": "application/json" });
@@ -350,7 +350,7 @@ const server = http.createServer((req, res) => {
   if (req.url && req.url.startsWith("/v1/files/read") && req.method === "GET") {
     const u = new URL(req.url, `http://${req.headers.host}`);
     const filePath = u.searchParams.get("path");
-    const root = u.searchParams.get("root") || args.cwd || "/tmp";
+    const root = u.searchParams.get("root") || args.root || "/tmp";
     if (!filePath) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "path query param required" }));
