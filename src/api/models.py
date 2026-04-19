@@ -108,6 +108,8 @@ class SessionState:
     _prompt_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _prompt_done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _scheduler_task: object | None = field(default=None, repr=False)  # asyncio.Task
+    # ── Cached ACP state ──
+    available_commands: list | None = field(default=None, repr=False)
     # ── Subscribers ──
     _session_subscribers: list = field(default_factory=list, repr=False)  # list[asyncio.Queue]
     _rpc_subscribers: dict = field(default_factory=dict, repr=False)  # dict[str, list[asyncio.Queue]]

@@ -71,6 +71,7 @@ from .providers import (
 )
 from .redact import redact_secrets
 from .sse import (
+    UT_COMMANDS_UPDATE,
     UT_MESSAGE_CHUNK,
     UT_MESSAGE_DELTA,
     UT_THOUGHT_CHUNK,
@@ -1148,6 +1149,11 @@ def _process_sse_block(
                     },
                 )
 
+        elif ut == UT_COMMANDS_UPDATE:
+            cmds = update.get("availableCommands")
+            if isinstance(cmds, list):
+                state.available_commands = cmds
+
         elif log_events and ut in (UT_USAGE_UPDATED, UT_USAGE_UPDATE):
             usage_payload = dict(update.get("cost") or update)
             usage_payload["prompt_id"] = prompt_id
@@ -1732,6 +1738,7 @@ async def session_status(session_id: str):
         ),
         "has_client": state.client is not None,
         "shutdown_requested": state.shutdown.is_set(),
+        "available_commands": state.available_commands,
     }
 
 
