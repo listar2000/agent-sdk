@@ -1501,20 +1501,55 @@ async def _do_resume(
         # Auto-restart sandbox if the process died (idle reaper or crash).
         # sandbox_replaced=True means a fresh sandbox was created — the old
         # inner_session_id is now meaningless (no session file on disk).
-        try:
-            url, sandbox_replaced = await _ensure_sandbox_alive(
-                sandbox_id,
-                sandbox_record,
-                agent_type=agent_record.config.agent_type,
-                dockerfile=agent_record.config.dockerfile,
-            )
-        except RuntimeError as e:
-            log.error(
-                "_do_resume: _ensure_sandbox_alive failed for sandbox %s: %s",
-                sandbox_id,
-                e,
-            )
-            return JSONResponse({"error": str(e)}, status_code=502)
+        sandbox_replaced = False
+        supervisor_url = None
+        supervisor_port = None
+
+        if sandbox_record.provider == "daytona":
+            # Per-session supervisor: start a new one on a new port
+            try:
+                from daytona_sdk import Daytona, DaytonaConfig
+                api_key = os.environ.get("DAYTONA_API_KEY")
+                if not api_key:
+                    raise RuntimeError("DAYTONA_API_KEY not set")
+                loop = asyncio.get_running_loop()
+                daytona_client = Daytona(DaytonaConfig(api_key=api_key))
+                sandbox = await loop.run_in_executor(
+                    None, lambda: daytona_client.get(sandbox_id)
+                )
+                raw_state = sandbox.state
+                state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
+                if state_str != "started":
+                    await loop.run_in_executor(None, sandbox.start)
+                    sandbox_replaced = True
+
+                root = sandbox_record.root or agent_record.config.cwd or "/tmp"
+                supervisor_port = allocate_sandbox_port(sandbox_id)
+                supervisor_url = await start_supervisor_in_sandbox(
+                    sandbox, agent_record.config.agent_type or "claude",
+                    supervisor_port, root=root,
+                )
+                url = supervisor_url
+            except RuntimeError as e:
+                log.error("_do_resume: failed to start per-session supervisor: %s", e)
+                if supervisor_port is not None:
+                    free_sandbox_port(sandbox_id, supervisor_port)
+                return JSONResponse({"error": str(e)}, status_code=502)
+        else:
+            try:
+                url, sandbox_replaced = await _ensure_sandbox_alive(
+                    sandbox_id,
+                    sandbox_record,
+                    agent_type=agent_record.config.agent_type,
+                    dockerfile=agent_record.config.dockerfile,
+                )
+            except RuntimeError as e:
+                log.error(
+                    "_do_resume: _ensure_sandbox_alive failed for sandbox %s: %s",
+                    sandbox_id,
+                    e,
+                )
+                return JSONResponse({"error": str(e)}, status_code=502)
 
         cwd = agent_record.config.cwd or "/tmp"
         session_has_history = await _session_has_logged_activity(session_id)
@@ -1645,6 +1680,8 @@ async def _do_resume(
                 agent_type=agent_record.config.agent_type or "claude",
                 client=client,
                 last_event_id=last_event_id,
+                supervisor_url=supervisor_url,
+                supervisor_port=supervisor_port,
             )
             SESSIONS[session_id] = new_state
             _start_session_tasks(new_state)
@@ -1687,23 +1724,36 @@ async def get_or_recover_session(session_id: str) -> SessionState:
             return state
         if sandbox_record.provider != "daytona":
             return state
-        try:
-            current_url, _ = await _ensure_sandbox_alive(
-                state.sandbox_id,
-                sandbox_record,
-                agent_type=state.agent_type,
-            )
-        except Exception as e:
-            log.warning(
-                "session %s Daytona liveness refresh failed for %s: %s; forcing recovery",
-                session_id,
-                state.sandbox_id,
-                e,
-            )
-            current_url = ""
-        client_base_url = str(getattr(state.client, "base_url", "")).rstrip("/")
-        if client_base_url == current_url.rstrip("/"):
-            return state
+
+        # For per-session supervisors, health-check the session's own supervisor
+        if state.supervisor_url:
+            from .providers import _wait_for_health
+            try:
+                healthy = await _wait_for_health(state.supervisor_url, max_retries=3, interval=1)
+                if healthy:
+                    return state
+            except Exception:
+                pass
+            # Per-session supervisor is down — recovery will start a new one
+        else:
+            # Legacy shared supervisor path
+            try:
+                current_url, _ = await _ensure_sandbox_alive(
+                    state.sandbox_id,
+                    sandbox_record,
+                    agent_type=state.agent_type,
+                )
+            except Exception as e:
+                log.warning(
+                    "session %s Daytona liveness refresh failed for %s: %s; forcing recovery",
+                    session_id,
+                    state.sandbox_id,
+                    e,
+                )
+                current_url = ""
+            client_base_url = str(getattr(state.client, "base_url", "")).rstrip("/")
+            if client_base_url == current_url.rstrip("/"):
+                return state
         log.info(
             "session %s has stale Daytona preview URL; forcing recovery",
             session_id,
