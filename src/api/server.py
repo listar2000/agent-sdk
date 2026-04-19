@@ -1809,6 +1809,8 @@ async def session_status(session_id: str):
         "has_client": state.client is not None,
         "shutdown_requested": state.shutdown.is_set(),
         "available_commands": state.available_commands,
+        "supervisor_url": state.supervisor_url,
+        "supervisor_port": state.supervisor_port,
     }
 
 
