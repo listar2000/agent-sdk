@@ -76,8 +76,19 @@ const pendingResponses = new Map();
 // SSE subscribers — every line of acp stdout is fanned out to these.
 const sseSubscribers = new Set();
 
+// Cache the last available_commands_update so late SSE subscribers receive it.
+let lastCommandsEvent = null;
+
 function broadcastSse(line) {
   const block = `data: ${line}\n\n`;
+  // Cache available_commands_update for late subscribers
+  try {
+    const msg = JSON.parse(line);
+    if (msg && msg.params && msg.params.update &&
+        msg.params.update.sessionUpdate === "available_commands_update") {
+      lastCommandsEvent = block;
+    }
+  } catch { /* not JSON, ignore */ }
   for (const res of sseSubscribers) {
     try {
       res.write(block);
@@ -176,6 +187,10 @@ function handleSse(req, res) {
   // that subscribe before session/load replay to hang on connect.
   if (typeof res.flushHeaders === "function") {
     res.flushHeaders();
+  }
+  // Replay cached commands event for late subscribers
+  if (lastCommandsEvent) {
+    try { res.write(lastCommandsEvent); } catch { /* noop */ }
   }
   sseSubscribers.add(res);
   log(`sse subscribe (${sseSubscribers.size} total)`);
