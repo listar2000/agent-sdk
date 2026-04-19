@@ -108,6 +108,9 @@ class SessionState:
     _prompt_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _prompt_done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _scheduler_task: object | None = field(default=None, repr=False)  # asyncio.Task
+    # ── Per-session supervisor ──
+    supervisor_url: str | None = field(default=None, repr=False)
+    supervisor_port: int | None = field(default=None, repr=False)
     # ── Cached ACP state ──
     available_commands: list | None = field(default=None, repr=False)
     # ── Subscribers ──

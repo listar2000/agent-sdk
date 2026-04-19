@@ -173,6 +173,26 @@ async def _find_free_port() -> int:
         return port
 
 
+# ---------------------------------------------------------------------------
+# Per-sandbox port allocation (for multiple supervisors in one sandbox)
+# ---------------------------------------------------------------------------
+_sandbox_port_counters: dict[str, int] = {}
+_sandbox_freed_ports: dict[str, list[int]] = {}
+
+def allocate_sandbox_port(sandbox_id: str) -> int:
+    """Allocate a port for a new supervisor inside an existing sandbox."""
+    freed = _sandbox_freed_ports.get(sandbox_id)
+    if freed:
+        return freed.pop()
+    port = _sandbox_port_counters.get(sandbox_id, _SUPERVISOR_REMOTE_PORT)
+    _sandbox_port_counters[sandbox_id] = port + 1
+    return port
+
+def free_sandbox_port(sandbox_id: str, port: int) -> None:
+    """Return a port to the pool when a supervisor is shut down."""
+    _sandbox_freed_ports.setdefault(sandbox_id, []).append(port)
+
+
 async def _ensure_local_supervisor_deps(agent_type: str) -> str:
     """Ensure the ACP binary for *agent_type* is available.
 
@@ -415,6 +435,180 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
         root=root,
         sandbox_id=sandbox.id,
     )
+
+
+async def start_supervisor_in_sandbox(
+    sandbox, agent_type: str, port: int, root: str = "/tmp",
+) -> str:
+    """Start a NEW supervisor on a specific port inside an existing sandbox.
+
+    Deps (node, npm, ACP binary) must already be installed.
+    Returns the signed preview URL for this supervisor.
+    """
+    bin_name = _acp_bin_name(agent_type)
+    loop = asyncio.get_running_loop()
+
+    def _exec(cmd: str, timeout: int = 120) -> str:
+        r = sandbox.process.exec(cmd, timeout=timeout)
+        return (r.result if hasattr(r, "result") else str(r)) or ""
+
+    import shlex as _shlex
+    acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
+    launch_args = _acp_launch_args(agent_type)
+    acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
+    ak = os.environ.get("ANTHROPIC_API_KEY", "")
+    ok = os.environ.get("OPENAI_API_KEY", "")
+    log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
+    start_cmd = (
+        f"sh -c \"cd {_SUPERVISOR_REMOTE_DIR} && "
+        f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' "
+        f"setsid node supervisor.js --host 0.0.0.0 --port {port} "
+        f"--acp {acp_bin}{acp_arg_flags} --root {root} "
+        f"> {log_file} 2>&1 </dev/null & echo started\""
+    )
+    await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
+    await asyncio.sleep(3)
+
+    signed = await loop.run_in_executor(
+        None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
+    )
+    url = signed.url.rstrip("/")
+
+    if not await _wait_for_health(url, max_retries=20, interval=1):
+        log_out = await loop.run_in_executor(None, lambda: _exec(f"tail -40 {log_file} 2>&1"))
+        raise RuntimeError(
+            f"supervisor on port {port} in sandbox {sandbox.id} failed health check; log:\n{log_out[:800]}"
+        )
+
+    log.info("supervisor on port %d ready: %s (sandbox %s)", port, url[:60], sandbox.id[:16])
+    return url
+
+
+async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
+    """Kill a supervisor process by port inside a Daytona sandbox."""
+    loop = asyncio.get_running_loop()
+    try:
+        def _exec(cmd: str) -> str:
+            r = sandbox.process.exec(cmd, timeout=10)
+            return (r.result if hasattr(r, "result") else str(r)) or ""
+        await loop.run_in_executor(None, lambda: _exec(f"fuser -k {port}/tcp 2>/dev/null || true"))
+    except Exception as e:
+        log.warning("kill_supervisor_in_sandbox port=%d failed: %s", port, e)
+
+
+async def provision_daytona_sandbox(
+    agent_type: str = "claude",
+    dockerfile: str | None = None,
+    pre_start_commands: list[str] | None = None,
+    root: str = "/tmp",
+) -> ProviderInstance:
+    """Create a Daytona sandbox and install deps, but do NOT start a supervisor.
+
+    Returns a ProviderInstance with sandbox_id but no usable supervisor URL.
+    Supervisors are started per-session via start_supervisor_in_sandbox().
+    """
+    try:
+        from daytona_sdk import (
+            Daytona, DaytonaConfig, CreateSandboxFromImageParams,
+            CreateSandboxFromSnapshotParams,
+        )
+    except ImportError:
+        raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
+
+    api_key = os.environ.get("DAYTONA_API_KEY")
+    if not api_key:
+        raise RuntimeError("DAYTONA_API_KEY not set")
+
+    env_vars = _get_sandbox_env_vars()
+    loop = asyncio.get_running_loop()
+    daytona = Daytona(DaytonaConfig(api_key=api_key))
+
+    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
+    use_snapshot = dockerfile is None and snapshot.lower() not in {"", "0", "false", "image"}
+
+    if dockerfile is not None:
+        if not Path(dockerfile).exists():
+            raise FileNotFoundError(f"Dockerfile not found: {dockerfile}")
+        from daytona_sdk import Image
+        image = Image.from_dockerfile(dockerfile)
+    elif not use_snapshot:
+        image = "node:22-slim"
+
+    create_timeout = 300 if dockerfile else 60
+    if use_snapshot:
+        sandbox = await loop.run_in_executor(None, lambda: daytona.create(
+            CreateSandboxFromSnapshotParams(
+                snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
+            ), timeout=create_timeout,
+        ))
+    else:
+        sandbox = await loop.run_in_executor(None, lambda: daytona.create(
+            CreateSandboxFromImageParams(
+                image=image, auto_stop_interval=0, env_vars=env_vars,
+            ), timeout=create_timeout,
+        ))
+
+    try:
+        # Install deps only (no supervisor start)
+        bin_name = _acp_bin_name(agent_type)
+        npm_spec = _ACP_NPM_SPECS[agent_type]
+
+        def _exec(cmd: str, timeout: int = 120) -> str:
+            r = sandbox.process.exec(cmd, timeout=timeout)
+            return (r.result if hasattr(r, "result") else str(r)) or ""
+
+        await loop.run_in_executor(None, lambda: _exec(
+            "apt-get update >/dev/null 2>&1 && "
+            "apt-get install -y --no-install-recommends libssl3 ca-certificates >/dev/null 2>&1 || true",
+            timeout=120,
+        ))
+        await loop.run_in_executor(None, lambda: _exec(
+            f"mkdir -p {_SUPERVISOR_REMOTE_DIR} && cd {_SUPERVISOR_REMOTE_DIR} && "
+            "npm init -y >/dev/null 2>&1"
+        ))
+        await loop.run_in_executor(None, lambda: _exec(
+            f"cd {_SUPERVISOR_REMOTE_DIR} && "
+            f"npm install --silent {npm_spec} 2>&1 | tail -5",
+            timeout=240,
+        ))
+
+        # Upload supervisor.js
+        import base64 as _b64
+        with open(_SUPERVISOR_DIR / "supervisor.js", "rb") as f:
+            b64 = _b64.b64encode(f.read()).decode()
+
+        def _upload():
+            _exec(f"rm -f {_SUPERVISOR_REMOTE_DIR}/supervisor.js {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64")
+            chunk = 4096
+            for i in range(0, len(b64), chunk):
+                seg = b64[i:i + chunk]
+                _exec(f"printf '%s' '{seg}' >> {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64")
+            _exec(
+                f"base64 -d {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64 > "
+                f"{_SUPERVISOR_REMOTE_DIR}/supervisor.js && "
+                f"rm {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64"
+            )
+        await loop.run_in_executor(None, _upload)
+
+        # Run pre-start commands (skills, CLI install, etc.)
+        if pre_start_commands:
+            for cmd in pre_start_commands:
+                log.info("provision pre-start: %s", cmd)
+                await loop.run_in_executor(None, lambda c=cmd: _exec(c, timeout=120))
+
+        log.info("sandbox provisioned: %s (no supervisor yet)", sandbox.id[:16])
+        return ProviderInstance(
+            provider="daytona",
+            url="",  # no supervisor URL yet
+            root=root,
+            sandbox_id=sandbox.id,
+        )
+    except BaseException:
+        try:
+            await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
+        except Exception:
+            pass
+        raise
 
 
 async def restart_daytona_supervisor(daytona_sandbox_id: str, agent_type: str = "claude", root: str = "/tmp") -> ProviderInstance:

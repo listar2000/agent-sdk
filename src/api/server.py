@@ -63,9 +63,14 @@ from .models import (
 from .providers import (
     PORT_BASED_PROVIDERS,
     ProviderInstance,
+    allocate_sandbox_port,
     create_instance,
     destroy_instance,
     exec_in_instance,
+    free_sandbox_port,
+    kill_supervisor_in_sandbox,
+    provision_daytona_sandbox,
+    start_supervisor_in_sandbox,
     stop_daytona,
     stop_instance,
 )
@@ -196,6 +201,22 @@ async def _shutdown_session_state(
     await _cancel_task(state._scheduler_task)
     await _cancel_task(state._reader_task)
     await _close_session_gracefully(state, background=background_close)
+    # Kill per-session supervisor if this session has its own
+    if state.supervisor_port is not None:
+        try:
+            from daytona_sdk import Daytona, DaytonaConfig
+            api_key = os.environ.get("DAYTONA_API_KEY")
+            if api_key:
+                loop = asyncio.get_running_loop()
+                daytona_client = Daytona(DaytonaConfig(api_key=api_key))
+                sandbox = await loop.run_in_executor(
+                    None, lambda: daytona_client.get(state.sandbox_id)
+                )
+                await kill_supervisor_in_sandbox(sandbox, state.supervisor_port)
+                free_sandbox_port(state.sandbox_id, state.supervisor_port)
+        except Exception as e:
+            log.warning("failed to kill supervisor port %d for session %s: %s",
+                        state.supervisor_port, state.session_id, e)
     if remove and SESSIONS.get(state.session_id) is state:
         SESSIONS.pop(state.session_id, None)
         _session_locks.pop(state.session_id, None)
@@ -878,6 +899,52 @@ async def delete_sandbox_route(sandbox_id: str):
             log.warning("teardown failed for sandbox %s: %s", sandbox_id, e)
 
     return {"status": "deleted"}
+
+
+@app.post("/sandboxes/provision")
+async def provision_sandbox_route(request: Request):
+    """Provision a sandbox with deps installed, but no supervisor started.
+
+    Returns sandbox_id. Supervisors are started per-session via POST /sessions.
+    """
+    data = await request.json()
+    agent_type = data.get("agent_type", "claude")
+    config_data = data.get("config", {})
+    _merge_top_level_config(data, config_data)
+    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
+    root = config_data.get("root", data.get("root", cwd))
+    dockerfile = _materialize_dockerfile(config_data)
+    config = AgentConfig.from_dict(
+        {**config_data, "agent_type": agent_type, "cwd": cwd}
+    )
+
+    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
+    pre_start_commands = skill_cmds + (data.get("pre_start_commands") or [])
+
+    try:
+        instance = await provision_daytona_sandbox(
+            agent_type=agent_type,
+            dockerfile=dockerfile,
+            pre_start_commands=pre_start_commands if pre_start_commands else None,
+            root=root,
+        )
+    except Exception as e:
+        if "circuit breaker" in str(e).lower():
+            return JSONResponse(
+                {"error": str(e)}, status_code=503,
+                headers={"Retry-After": "30"},
+            )
+        return JSONResponse({"error": f"Failed to provision sandbox: {e}"}, status_code=502)
+
+    sandbox_id = instance.sandbox_id
+    _INSTANCES[sandbox_id] = instance
+    await upsert_sandbox(SandboxRecord(
+        id=sandbox_id, provider="daytona",
+        sandbox_ref=sandbox_id, status=STATUS_RUNNING,
+        root=root,
+    ))
+
+    return {"sandbox_id": sandbox_id, "status": "provisioned"}
 
 
 @app.post("/sandboxes/{sandbox_id}/stop")
@@ -1830,16 +1897,50 @@ async def sessions_create_on_existing_sandbox(request: Request):
         except Exception as e:
             log.error("skill install failed, continuing without skills: %s", e)
 
-    try:
-        url, _replaced = await _ensure_sandbox_alive(
-            sandbox_id,
-            sandbox_record,
-            agent_type=config.agent_type or "claude",
-            dockerfile=dockerfile,
-        )
-    except RuntimeError as e:
-        await delete_agent(agent_id)
-        return JSONResponse({"error": str(e)}, status_code=502)
+    # For Daytona: start a per-session supervisor on a unique port
+    # For local/docker: use the existing shared supervisor
+    root = config_data.get("root", data.get("root", cwd))
+    supervisor_url = None
+    supervisor_port = None
+
+    if sandbox_record.provider == "daytona":
+        try:
+            # Get sandbox object to start supervisor inside it
+            from daytona_sdk import Daytona, DaytonaConfig
+            api_key = os.environ.get("DAYTONA_API_KEY")
+            if not api_key:
+                raise RuntimeError("DAYTONA_API_KEY not set")
+            loop = asyncio.get_running_loop()
+            daytona_client = Daytona(DaytonaConfig(api_key=api_key))
+            sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(sandbox_id))
+
+            # Ensure sandbox is running
+            raw_state = sandbox.state
+            state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
+            if state_str != "started":
+                await loop.run_in_executor(None, sandbox.start)
+
+            supervisor_port = allocate_sandbox_port(sandbox_id)
+            supervisor_url = await start_supervisor_in_sandbox(
+                sandbox, config.agent_type or "claude", supervisor_port, root=root,
+            )
+            url = supervisor_url
+        except Exception as e:
+            await delete_agent(agent_id)
+            if supervisor_port is not None:
+                free_sandbox_port(sandbox_id, supervisor_port)
+            return JSONResponse({"error": f"Failed to start supervisor: {e}"}, status_code=502)
+    else:
+        try:
+            url, _replaced = await _ensure_sandbox_alive(
+                sandbox_id,
+                sandbox_record,
+                agent_type=config.agent_type or "claude",
+                dockerfile=dockerfile,
+            )
+        except RuntimeError as e:
+            await delete_agent(agent_id)
+            return JSONResponse({"error": str(e)}, status_code=502)
 
     acp_session_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
@@ -1858,6 +1959,8 @@ async def sessions_create_on_existing_sandbox(request: Request):
         except Exception:
             pass
         await delete_agent(agent_id)
+        if supervisor_port is not None:
+            free_sandbox_port(sandbox_id, supervisor_port)
         return JSONResponse(
             {"error": f"Failed to connect to ACP supervisor: {e}"}, status_code=502
         )
@@ -1871,6 +1974,8 @@ async def sessions_create_on_existing_sandbox(request: Request):
         inner_session_id=inner_session_id,
         agent_type=config.agent_type or "claude",
         client=client,
+        supervisor_url=supervisor_url,
+        supervisor_port=supervisor_port,
     )
     SESSIONS[session_id] = state
     _start_session_tasks(state)
