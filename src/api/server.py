@@ -1125,6 +1125,9 @@ def _process_sse_block(
                 "tool_call_id": extract_tool_call_id(update),
                 "prompt_id": prompt_id,
             }
+            title = update.get("title")
+            if title:
+                tool_payload["title"] = title
             raw_input = update.get("rawInput")
             if raw_input:
                 tool_payload["args"] = raw_input
