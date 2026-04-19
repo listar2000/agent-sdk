@@ -524,6 +524,15 @@ class Agent:
     # ── Lifecycle ──
 
     async def aclose(self) -> None:
+        if self.session_id and self._registered:
+            try:
+                await self._client.post(
+                    f"/admin/sessions/{self.session_id}/reap",
+                    timeout=httpx.Timeout(5.0, read=10.0),
+                )
+            except Exception as exc:
+                log.debug("aclose: reap session %s failed (ignored): %s", self.session_id, exc)
+            self._registered = False
         await self._client.aclose()
 
     async def __aenter__(self):
