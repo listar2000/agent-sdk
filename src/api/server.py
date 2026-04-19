@@ -1208,16 +1208,16 @@ def _process_sse_block(
             tool_call_id = extract_tool_call_id(update)
             tool_response = extract_tool_response(update)
             if tool_response is not None:
-                _schedule_log(
-                    state,
-                    EVT_TOOL_RESULT,
-                    {
-                        "tool": extract_tool_name(update),
-                        "tool_call_id": tool_call_id,
-                        "result": tool_response,
-                        "prompt_id": prompt_id,
-                    },
-                )
+                result_payload: dict = {
+                    "tool": extract_tool_name(update),
+                    "tool_call_id": tool_call_id,
+                    "result": tool_response,
+                    "prompt_id": prompt_id,
+                }
+                title = update.get("title")
+                if title:
+                    result_payload["title"] = title
+                _schedule_log(state, EVT_TOOL_RESULT, result_payload)
 
         elif ut == UT_COMMANDS_UPDATE:
             cmds = update.get("availableCommands")
