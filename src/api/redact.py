@@ -28,7 +28,7 @@ _PATTERNS = [
     # Connection strings with embedded passwords
     re.compile(r'(?:mongodb|postgres|mysql|redis)://[^:]+:[^@]+@\S+'),
     # Generic key=value for common secret env var names
-    re.compile(r'(?:API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|PASSWORD|DB_PASSWORD|DATABASE_URL)\s*[=:]\s*\S{8,}', re.IGNORECASE),
+    re.compile(r'(?:API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|OAUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|PRIVATE_KEY|PASSWORD|DB_PASSWORD|DATABASE_URL)\s*[=:]\s*\S{8,}', re.IGNORECASE),
 ]
 
 _REDACTED = "[REDACTED]"

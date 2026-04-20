@@ -88,6 +88,23 @@ All methods accept `interrupt=True` to cancel the running prompt before submitti
 
 The SDK talks to the server at `http://localhost:7778` by default. Override with `api_url=` or `AGENT_API_URL=`.
 
+## Bring your own Claude login
+
+By default the server authenticates Claude with its own `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`. To have each agent run on *your* Claude subscription instead, log in once:
+
+```python
+from agent_sdk import Agent
+
+Agent.login_claude()   # runs `claude setup-token`, caches the token to ~/.config/agent_sdk/oauth_token (0600)
+
+agent = Agent("worker", provider="daytona")   # token auto-read from the cache
+await agent.arun("Hello")
+```
+
+You can also pass credentials explicitly (`Agent(..., oauth_token="...")` or `Agent(..., api_key="sk-ant-...")`), or set `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` in the environment and the SDK will pick them up. When credentials are present the SDK refuses to send them to a plaintext-HTTP server; use `https://` or a `localhost` URL.
+
+Credentials travel in the request body to `/sessions/quick` (and resume), are applied as per-sandbox env vars inside the supervisor, and are never persisted to the database. When the caller supplies OAuth, the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback to the shared server credentials.
+
 ## Session persistence
 
 Sessions survive server restarts. The server persists `{session_id, agent_id, sandbox_id, inner_session_id}` to Postgres. Resume from another process with just the session_id:

@@ -81,13 +81,25 @@ def _detect_vertex_proxy() -> None:
 _detect_vertex_proxy()
 
 
-def _get_sandbox_env_vars() -> dict[str, str]:
-    """Collect API keys and sandbox config from environment."""
+def _get_sandbox_env_vars(user_creds: dict[str, str] | None = None) -> dict[str, str]:
+    """Collect API keys and sandbox config from environment.
+
+    If ``user_creds`` is supplied, its values override anything in the server
+    env. When the caller supplies OAuth we scrub the server's API key (and
+    vice versa) so ``claude-agent-acp`` never sees a mixed pair with
+    ambiguous precedence.
+    """
     env: dict[str, str] = {"IS_SANDBOX": "1"}
     for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"):
         val = os.environ.get(var)
         if val:
             env[var] = val
+    if user_creds:
+        if "CLAUDE_CODE_OAUTH_TOKEN" in user_creds:
+            env.pop("ANTHROPIC_API_KEY", None)
+        if "ANTHROPIC_API_KEY" in user_creds:
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        env.update(user_creds)
     return env
 
 
@@ -236,7 +248,11 @@ async def _ensure_local_supervisor_deps(agent_type: str) -> str:
         return str(acp_bin)
 
 
-async def create_local(agent_type: str = "claude", root: str = "/tmp") -> ProviderInstance:
+async def create_local(
+    agent_type: str = "claude",
+    root: str = "/tmp",
+    user_creds: dict[str, str] | None = None,
+) -> ProviderInstance:
     """Spawn a local supervisor.js subprocess that bridges stdio ↔ HTTP
     (POST + SSE) for the given agent's ACP binary."""
     node = shutil.which("node")
@@ -246,7 +262,11 @@ async def create_local(agent_type: str = "claude", root: str = "/tmp") -> Provid
     launch_args = _acp_launch_args(agent_type)
 
     port = await _find_free_port()
-    env = {**os.environ, **_get_sandbox_env_vars()}
+    env = {**os.environ, **_get_sandbox_env_vars(user_creds)}
+    if user_creds and "CLAUDE_CODE_OAUTH_TOKEN" in user_creds:
+        env.pop("ANTHROPIC_API_KEY", None)
+    if user_creds and "ANTHROPIC_API_KEY" in user_creds:
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     extra: list[str] = []
     for arg in launch_args:
         extra += ["--acp-arg", arg]
@@ -346,6 +366,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     sandbox, agent_type: str, *, install_deps: bool,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
+    user_creds: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Install (optionally) + start the supervisor inside an existing daytona
     sandbox object. Returns a fresh ProviderInstance with a new signed URL.
@@ -405,16 +426,15 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    ak = os.environ.get("ANTHROPIC_API_KEY", "")
-    ok = os.environ.get("OPENAI_API_KEY", "")
-    oat = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    start_cmd = (
-        f"sh -c \"cd {_SUPERVISOR_REMOTE_DIR} && "
-        f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' CLAUDE_CODE_OAUTH_TOKEN='{oat}' "
-        f"setsid node supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_REMOTE_PORT} "
+    env_vars = _get_sandbox_env_vars(user_creds)
+    env_prefix = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
+    inner = (
+        f"cd {_SUPERVISOR_REMOTE_DIR} && "
+        f"setsid env {env_prefix} node supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_REMOTE_PORT} "
         f"--acp {acp_bin}{acp_arg_flags} --root {root} "
-        f"> {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1 </dev/null & echo started\""
+        f"> {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1 </dev/null & echo started"
     )
+    start_cmd = f"sh -c {_shlex.quote(inner)}"
     await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
     await asyncio.sleep(3)
 
@@ -440,6 +460,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
 
 async def start_supervisor_in_sandbox(
     sandbox, agent_type: str, port: int, root: str = "/tmp",
+    user_creds: dict[str, str] | None = None,
 ) -> str:
     """Start a NEW supervisor on a specific port inside an existing sandbox.
 
@@ -457,17 +478,16 @@ async def start_supervisor_in_sandbox(
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    ak = os.environ.get("ANTHROPIC_API_KEY", "")
-    ok = os.environ.get("OPENAI_API_KEY", "")
-    oat = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    env_vars = _get_sandbox_env_vars(user_creds)
+    env_prefix = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
     log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
-    start_cmd = (
-        f"sh -c \"cd {_SUPERVISOR_REMOTE_DIR} && "
-        f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' CLAUDE_CODE_OAUTH_TOKEN='{oat}' "
-        f"setsid node supervisor.js --host 0.0.0.0 --port {port} "
+    inner = (
+        f"cd {_SUPERVISOR_REMOTE_DIR} && "
+        f"setsid env {env_prefix} node supervisor.js --host 0.0.0.0 --port {port} "
         f"--acp {acp_bin}{acp_arg_flags} --root {root} "
-        f"> {log_file} 2>&1 </dev/null & echo started\""
+        f"> {log_file} 2>&1 </dev/null & echo started"
     )
+    start_cmd = f"sh -c {_shlex.quote(inner)}"
     await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
     await asyncio.sleep(3)
 
@@ -613,7 +633,10 @@ async def provision_daytona_sandbox(
         raise
 
 
-async def restart_daytona_supervisor(daytona_sandbox_id: str, agent_type: str = "claude", root: str = "/tmp") -> ProviderInstance:
+async def restart_daytona_supervisor(
+    daytona_sandbox_id: str, agent_type: str = "claude", root: str = "/tmp",
+    user_creds: dict[str, str] | None = None,
+) -> ProviderInstance:
     """Re-attach to an existing daytona sandbox and respawn the supervisor
     inside it. Used by the resume path after the sandbox was stopped (or
     after the supervisor process was killed in place). Preserves the
@@ -638,7 +661,9 @@ async def restart_daytona_supervisor(daytona_sandbox_id: str, agent_type: str = 
         log.info("starting stopped daytona sandbox %s", daytona_sandbox_id)
         await loop.run_in_executor(None, sandbox.start)
 
-    return await _bootstrap_supervisor_in_daytona_sandbox(sandbox, agent_type, install_deps=False, root=root)
+    return await _bootstrap_supervisor_in_daytona_sandbox(
+        sandbox, agent_type, install_deps=False, root=root, user_creds=user_creds,
+    )
 
 
 async def create_daytona(
@@ -646,6 +671,7 @@ async def create_daytona(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
+    user_creds: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Create a fresh Daytona sandbox, install + start a supervisor inside it."""
     try:
@@ -660,7 +686,7 @@ async def create_daytona(
     if not api_key:
         raise RuntimeError("DAYTONA_API_KEY not set")
 
-    env_vars = _get_sandbox_env_vars()
+    env_vars = _get_sandbox_env_vars(user_creds)
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
 
@@ -701,7 +727,7 @@ async def create_daytona(
     try:
         return await _bootstrap_supervisor_in_daytona_sandbox(
             sandbox, agent_type, install_deps=True, pre_start_commands=pre_start_commands,
-            root=root,
+            root=root, user_creds=user_creds,
         )
     except BaseException:
         try:
@@ -796,6 +822,7 @@ async def create_docker(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
+    user_creds: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Run the supervisor Docker image as a per-session container."""
     docker = shutil.which("docker")
@@ -805,7 +832,7 @@ async def create_docker(
     image = await _ensure_supervisor_docker_image()
     port = await _find_free_port()
 
-    env_vars = _get_sandbox_env_vars()
+    env_vars = _get_sandbox_env_vars(user_creds)
     env_args: list[str] = []
     for k, v in env_vars.items():
         env_args += ["-e", f"{k}={v}"]
@@ -911,20 +938,31 @@ async def create_instance(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
+    user_creds: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Create an ACP supervisor instance using the specified provider.
 
     pre_start_commands are shell commands to run inside the sandbox BEFORE
     the supervisor process starts (used for skill installation).
+
+    user_creds optionally overrides the server's own ANTHROPIC_API_KEY /
+    CLAUDE_CODE_OAUTH_TOKEN for this one sandbox, so the caller's Claude
+    subscription is billed instead of the server's.
     """
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(_ACP_BIN_NAMES)}")
     if provider == "local":
-        return await create_local(agent_type, root=root)
+        return await create_local(agent_type, root=root, user_creds=user_creds)
     if provider == "docker":
-        return await create_docker(agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands, root=root)
+        return await create_docker(
+            agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands,
+            root=root, user_creds=user_creds,
+        )
     if provider == "daytona":
-        return await create_daytona(agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands, root=root)
+        return await create_daytona(
+            agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands,
+            root=root, user_creds=user_creds,
+        )
     raise ValueError(f"Unknown provider: {provider!r}. Use 'local', 'docker', or 'daytona'.")
 
 

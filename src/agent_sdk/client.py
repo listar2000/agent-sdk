@@ -13,7 +13,10 @@ import base64
 import json
 import logging
 import os
+import re
 import shlex
+import shutil
+import subprocess
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -21,6 +24,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -51,6 +55,57 @@ DOCKER = "docker"
 DAYTONA = "daytona"
 
 PROVIDERS = frozenset({LOCAL, DOCKER, DAYTONA})
+
+
+# ── Claude OAuth token cache ──
+_OAUTH_TOKEN_PATH = Path.home() / ".config" / "agent_sdk" / "oauth_token"
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_TOKEN_LINE_RE = re.compile(r"^[A-Za-z0-9._\-]{40,}$")
+
+
+def _load_cached_oauth_token() -> str | None:
+    """Read the cached Claude OAuth token from ~/.config/agent_sdk/oauth_token."""
+    try:
+        token = _OAUTH_TOKEN_PATH.read_text().strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    return token or None
+
+
+def _save_oauth_token(token: str) -> None:
+    """Persist the OAuth token to disk with mode 0600."""
+    _OAUTH_TOKEN_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(
+        str(_OAUTH_TOKEN_PATH),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(fd, "w") as fh:
+        fh.write(token)
+    os.chmod(_OAUTH_TOKEN_PATH, 0o600)
+
+
+def _parse_setup_token_output(stdout: str) -> str | None:
+    """Extract the OAuth token from the stdout of `claude setup-token`."""
+    if not stdout:
+        return None
+    cleaned = _ANSI_RE.sub("", stdout)
+    for line in reversed([ln.strip() for ln in cleaned.splitlines() if ln.strip()]):
+        if _TOKEN_LINE_RE.match(line):
+            return line
+    return None
+
+
+def _is_remote_http(api_url: str) -> bool:
+    """Reject sending creds to any non-HTTPS, non-localhost server."""
+    try:
+        parsed = urlparse(api_url)
+    except Exception:
+        return False
+    if parsed.scheme != "http":
+        return False
+    host = (parsed.hostname or "").lower()
+    return host not in {"localhost", "127.0.0.1", "::1", ""}
 
 
 class Event(dict):
@@ -190,6 +245,8 @@ class Agent:
         session_id: str | None = None,
         sandbox_id: str | None = None,
         dockerfile: str | None = None,
+        oauth_token: str | None = None,
+        api_key: str | None = None,
     ):
         self.name = name
         self.agent_type = agent_type
@@ -213,6 +270,21 @@ class Agent:
         if api_url is None:
             api_url = os.environ.get("AGENT_API_URL", "https://agent-sdk-server-production.up.railway.app")
         self._api_url = api_url
+
+        # Resolve per-user Claude credentials. Priority: explicit arg > env > on-disk cache.
+        self._oauth_token = (
+            oauth_token
+            or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            or _load_cached_oauth_token()
+        )
+        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+
+        if (self._oauth_token or self._api_key) and _is_remote_http(self._api_url):
+            raise ValueError(
+                f"refusing to send credentials to {self._api_url!r} over plaintext HTTP; "
+                "use https:// or a localhost URL"
+            )
+
         self._client = httpx.AsyncClient(base_url=self._api_url, timeout=httpx.Timeout(30.0, read=120.0))
         self._registered = False
         self._register_lock = asyncio.Lock()
@@ -220,6 +292,48 @@ class Agent:
         self._system_prompt_sent = False
         self.usage = UsageStats()
         self.sandbox = Sandbox(self)
+
+    @classmethod
+    def login_claude(cls) -> str:
+        """Run ``claude setup-token`` to obtain a Claude OAuth token and cache it.
+
+        The token is stored at ``~/.config/agent_sdk/oauth_token`` (mode 0600)
+        and auto-loaded by future ``Agent(...)`` constructions, so every
+        subsequent agent runs against the caller's Claude subscription
+        instead of the server's shared credentials.
+
+        Returns the token string. Never prints the token itself.
+        """
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise RuntimeError(
+                "`claude` CLI not found on PATH. Install it from "
+                "https://docs.anthropic.com/claude/docs/claude-code"
+            )
+        try:
+            result = subprocess.run(
+                [claude_bin, "setup-token"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()[:500]
+            raise RuntimeError(
+                f"`claude setup-token` failed (exit {e.returncode}): {stderr}"
+            ) from e
+        token = _parse_setup_token_output(result.stdout)
+        if not token:
+            prompted = input(
+                "Could not auto-parse token from `claude setup-token` output. "
+                "Please paste the token printed above: "
+            ).strip()
+            token = prompted or None
+        if not token:
+            raise RuntimeError("no token produced by `claude setup-token`")
+        _save_oauth_token(token)
+        print(f"Claude OAuth token saved to {_OAUTH_TOKEN_PATH}")
+        return token
 
     @classmethod
     def from_config(cls, name: str, config: dict[str, Any], **kwargs) -> "Agent":
@@ -263,6 +377,8 @@ class Agent:
             "skills": self.skills,
             "db": None,  # don't share persistence
             "dockerfile": self.dockerfile,
+            "oauth_token": self._oauth_token,
+            "api_key": self._api_key,
         }
         kwargs.update(overrides)
         clone_name = name or f"{self.name}-clone"
@@ -281,6 +397,12 @@ class Agent:
             config["mcp_servers"] = self.mcp_servers
         if self.skills is not None:
             config["skills"] = self.skills
+        # Credentials ride at top level so the server can pop them before any
+        # merge into config/AgentConfig/DB. Never include inside the config dict.
+        if self._oauth_token:
+            config["oauth_token"] = self._oauth_token
+        if self._api_key:
+            config["api_key"] = self._api_key
         return config
 
     def __repr__(self) -> str:
@@ -294,9 +416,16 @@ class Agent:
                 return
 
             if self.session_id is not None and self.sandbox_id is None and self.provider is None:
-                # Resume by session_id alone
+                # Resume by session_id alone. Ship credentials so the respawned
+                # supervisor runs under the caller's Claude token, not the server's.
+                resume_body: dict[str, Any] = {}
+                if self._oauth_token:
+                    resume_body["oauth_token"] = self._oauth_token
+                if self._api_key:
+                    resume_body["api_key"] = self._api_key
                 resp = await self._client.post(
                     f"/sessions/{self.session_id}/resume",
+                    json=resume_body or None,
                     timeout=httpx.Timeout(30.0, read=180.0),
                 )
                 _raise_for_status(resp)

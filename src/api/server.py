@@ -734,6 +734,24 @@ def _merge_top_level_config(data: dict, config_data: dict) -> None:
             config_data[key] = data[key]
 
 
+def _pop_user_creds(data: dict) -> dict[str, str] | None:
+    """Extract per-request Claude credentials from the request body.
+
+    SECURITY: pops the keys in-place so they cannot flow into ``config_data``,
+    ``AgentConfig``, or any logger that later prints ``data``. Returns a dict
+    suitable for passing to ``create_instance(..., user_creds=...)``, or
+    ``None`` if the client did not supply credentials.
+    """
+    oauth_token = data.pop("oauth_token", None)
+    api_key = data.pop("api_key", None)
+    creds: dict[str, str] = {}
+    if isinstance(oauth_token, str) and oauth_token:
+        creds["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    if isinstance(api_key, str) and api_key:
+        creds["ANTHROPIC_API_KEY"] = api_key
+    return creds or None
+
+
 def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
     """Write dockerfile_content from request data to a temp file. Returns path or None."""
     path = data.get(key)
@@ -1463,6 +1481,7 @@ async def _do_resume(
     inner_session_id: str,
     client_session_id: str | None = None,
     force_replace_live_state: bool = False,
+    user_creds: dict[str, str] | None = None,
 ):
     """Core resume logic shared by both resume endpoints.
 
@@ -1527,7 +1546,7 @@ async def _do_resume(
                 supervisor_port = allocate_sandbox_port(sandbox_id)
                 supervisor_url = await start_supervisor_in_sandbox(
                     sandbox, agent_record.config.agent_type or "claude",
-                    supervisor_port, root=root,
+                    supervisor_port, root=root, user_creds=user_creds,
                 )
                 url = supervisor_url
             except RuntimeError as e:
@@ -1698,7 +1717,9 @@ async def _do_resume(
         }
 
 
-async def get_or_recover_session(session_id: str) -> SessionState:
+async def get_or_recover_session(
+    session_id: str, user_creds: dict[str, str] | None = None,
+) -> SessionState:
     """Get a live session, recovering from DB if it was reaped.
 
     This is the single entry point for all session endpoints. Checks
@@ -1783,6 +1804,7 @@ async def get_or_recover_session(session_id: str) -> SessionState:
         inner_session_id=inner_session_id,
         client_session_id=session_id,
         force_replace_live_state=state is not None and not state.shutdown.is_set(),
+        user_creds=user_creds,
     )
 
     if isinstance(result, JSONResponse):
@@ -1896,10 +1918,22 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 
 
 @app.post("/sessions/{session_id}/resume")
-async def session_resume(session_id: str):
-    """Resume a session by ID. Auto-recovers sandbox if stopped."""
+async def session_resume(session_id: str, request: Request):
+    """Resume a session by ID. Auto-recovers sandbox if stopped.
+
+    The body may optionally carry ``oauth_token`` / ``api_key`` so the
+    respawned supervisor runs with the caller's Claude credentials.
+    """
+    user_creds: dict[str, str] | None = None
     try:
-        state = await get_or_recover_session(session_id)
+        if request.headers.get("content-length", "0") != "0":
+            body = await request.json()
+            if isinstance(body, dict):
+                user_creds = _pop_user_creds(body)
+    except Exception:
+        user_creds = None
+    try:
+        state = await get_or_recover_session(session_id, user_creds=user_creds)
     except HTTPException as e:
         return JSONResponse({"error": e.detail}, status_code=e.status_code)
     return {
@@ -1919,6 +1953,8 @@ async def sessions_create_on_existing_sandbox(request: Request):
     Returns the same shape as ``/sessions/quick``.
     """
     data = await request.json()
+    # SECURITY: strip credentials before any merge, log, or DB write.
+    user_creds = _pop_user_creds(data)
     sandbox_id = data.get("sandbox_id")
     if not sandbox_id or not isinstance(sandbox_id, str):
         return JSONResponse(
@@ -1975,6 +2011,7 @@ async def sessions_create_on_existing_sandbox(request: Request):
             supervisor_port = allocate_sandbox_port(sandbox_id)
             supervisor_url = await start_supervisor_in_sandbox(
                 sandbox, config.agent_type or "claude", supervisor_port, root=root,
+                user_creds=user_creds,
             )
             url = supervisor_url
         except Exception as e:
@@ -2049,6 +2086,9 @@ async def sessions_quick_create(request: Request):
     Returns {agent_id, sandbox_id, session_id, connected: true}.
     """
     data = await request.json()
+    # SECURITY: strip credentials from the request body before any merge,
+    # log, or DB write so they can't leak into agents.config JSONB.
+    user_creds = _pop_user_creds(data)
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
     name = data.get("name")
@@ -2085,6 +2125,7 @@ async def sessions_quick_create(request: Request):
             dockerfile=dockerfile,
             pre_start_commands=skill_cmds if provider != "local" else None,
             root=root,
+            user_creds=user_creds,
         )
     except Exception as e:
         await delete_agent(agent_id)
