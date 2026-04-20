@@ -90,20 +90,28 @@ The SDK talks to the server at `http://localhost:7778` by default. Override with
 
 ## Bring your own Claude login
 
-By default the server authenticates Claude with its own `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`. To have each agent run on *your* Claude subscription instead, log in once:
+By default, the first time you create an agent against a remote server the SDK runs `claude setup-token` for you — a browser window opens, you approve access, and the returned token is cached at `~/.config/agent_sdk/oauth_token` (mode 0600). Every subsequent `Agent(...)` in any script picks it up automatically, and every sandbox spawned for you is authenticated with *your* Claude subscription instead of the server's shared credentials.
 
 ```python
 from agent_sdk import Agent
 
-Agent.login_claude()   # runs `claude setup-token`, caches the token to ~/.config/agent_sdk/oauth_token (0600)
+# First time only: opens the browser OAuth flow, saves the token.
+agent = Agent("worker", provider="daytona")
 
-agent = Agent("worker", provider="daytona")   # token auto-read from the cache
+# All later calls reuse the cached token — no prompt.
 await agent.arun("Hello")
 ```
 
-You can also pass credentials explicitly (`Agent(..., oauth_token="...")` or `Agent(..., api_key="sk-ant-...")`), or set `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` in the environment and the SDK will pick them up. When credentials are present the SDK refuses to send them to a plaintext-HTTP server; use `https://` or a `localhost` URL.
+Fine-grained control:
 
-Credentials travel in the request body to `/sessions/quick` (and resume), are applied as per-sandbox env vars inside the supervisor, and are never persisted to the database. When the caller supplies OAuth, the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback to the shared server credentials.
+- `Agent(..., oauth_token="...")` or `Agent(..., api_key="sk-ant-...")` — pass creds explicitly.
+- `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` env vars — picked up automatically.
+- `Agent.login_claude()` — trigger the OAuth flow manually (e.g. to rotate the token).
+- `Agent(..., auto_login=False)` or `AGENT_SDK_NO_AUTO_LOGIN=1` — opt out of the auto-prompt (falls back to the server's shared creds).
+
+Auto-login only fires when (a) `agent_type="claude"`, (b) no token is already cached or in the environment, (c) the target `api_url` is remote (not localhost), and (d) stdin is a TTY — so CI jobs and scripts with `api_url="http://localhost:..."` are never interrupted.
+
+When credentials are present the SDK refuses to send them to a plaintext-HTTP server; use `https://` or a `localhost` URL. Credentials travel in the request body to `/sessions/quick` (and resume), are applied as per-sandbox env vars inside the supervisor, and are never persisted to the database. When the caller supplies OAuth, the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback to shared credentials.
 
 ## Session persistence
 

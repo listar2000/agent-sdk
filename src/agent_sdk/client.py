@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -106,6 +107,30 @@ def _is_remote_http(api_url: str) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     return host not in {"localhost", "127.0.0.1", "::1", ""}
+
+
+def _is_localhost(api_url: str) -> bool:
+    """True if api_url targets localhost (no auto-login needed; dev server has its own creds)."""
+    try:
+        parsed = urlparse(api_url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _auto_login_allowed(api_url: str) -> bool:
+    """Gate auto-login so it only fires when interactive, targets a remote server,
+    has a `claude` CLI available, and hasn't been explicitly disabled."""
+    if os.environ.get("AGENT_SDK_NO_AUTO_LOGIN"):
+        return False
+    if _is_localhost(api_url):
+        return False
+    if not sys.stdin.isatty():
+        return False
+    if not shutil.which("claude"):
+        return False
+    return True
 
 
 class Event(dict):
@@ -247,6 +272,7 @@ class Agent:
         dockerfile: str | None = None,
         oauth_token: str | None = None,
         api_key: str | None = None,
+        auto_login: bool = True,
     ):
         self.name = name
         self.agent_type = agent_type
@@ -279,6 +305,26 @@ class Agent:
         )
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
 
+        # First-run auto-login: if no creds were found and we're in an interactive
+        # terminal talking to a remote Claude workspace, run `claude setup-token`
+        # now so the user authenticates with their own subscription instead of
+        # silently falling back to the server's shared credentials. Cached on
+        # disk so subsequent Agent(...) calls reuse it without re-prompting.
+        if (
+            auto_login
+            and self.agent_type == CLAUDE
+            and not self._oauth_token
+            and not self._api_key
+            and _auto_login_allowed(self._api_url)
+        ):
+            try:
+                self._oauth_token = type(self).login_claude()
+            except Exception as e:
+                log.warning(
+                    "auto-login via `claude setup-token` failed; falling back to "
+                    "server-supplied credentials. Error: %s", e,
+                )
+
         if (self._oauth_token or self._api_key) and _is_remote_http(self._api_url):
             raise ValueError(
                 f"refusing to send credentials to {self._api_url!r} over plaintext HTTP; "
@@ -310,6 +356,11 @@ class Agent:
                 "`claude` CLI not found on PATH. Install it from "
                 "https://docs.anthropic.com/claude/docs/claude-code"
             )
+        print(
+            "Launching Claude OAuth login. A browser window will open; "
+            "approve access to link your Claude subscription to this workspace.",
+            flush=True,
+        )
         try:
             result = subprocess.run(
                 [claude_bin, "setup-token"],
