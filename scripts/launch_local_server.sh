@@ -33,10 +33,10 @@ fi
 # are set by the managed claude binary in your shell. This script inherits
 # them automatically when run from such a shell. If they're missing and no
 # ANTHROPIC_API_KEY is set, warn the user.
-if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_USE_VERTEX:-}" ]; then
-    echo "WARNING: No ANTHROPIC_API_KEY or CLAUDE_CODE_USE_VERTEX found."
+if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${CLAUDE_CODE_USE_VERTEX:-}" ]; then
+    echo "WARNING: No ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CLAUDE_CODE_USE_VERTEX found."
     echo "  Run this script from a terminal managed by the claude binary,"
-    echo "  or set ANTHROPIC_API_KEY in ~/.env."
+    echo "  or set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in ~/.env."
 fi
 
 needs_install=0

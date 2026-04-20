@@ -39,7 +39,7 @@ def _detect_vertex_proxy() -> None:
     """Auto-detect a local Vertex proxy and configure env vars if a managed
     apiKeyHelper is present but CLAUDE_CODE_USE_VERTEX is not yet set."""
     helper = "/usr/local/bin/claude_code/api-key-helper"
-    if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_API_KEY"):
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         return  # already configured or using direct API key
     if not os.path.isfile(helper):
         return
@@ -84,7 +84,7 @@ _detect_vertex_proxy()
 def _get_sandbox_env_vars() -> dict[str, str]:
     """Collect API keys and sandbox config from environment."""
     env: dict[str, str] = {"IS_SANDBOX": "1"}
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+    for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"):
         val = os.environ.get(var)
         if val:
             env[var] = val
@@ -407,9 +407,10 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
     ak = os.environ.get("ANTHROPIC_API_KEY", "")
     ok = os.environ.get("OPENAI_API_KEY", "")
+    oat = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
     start_cmd = (
         f"sh -c \"cd {_SUPERVISOR_REMOTE_DIR} && "
-        f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' "
+        f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' CLAUDE_CODE_OAUTH_TOKEN='{oat}' "
         f"setsid node supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_REMOTE_PORT} "
         f"--acp {acp_bin}{acp_arg_flags} --root {root} "
         f"> {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1 </dev/null & echo started\""
@@ -458,10 +459,11 @@ async def start_supervisor_in_sandbox(
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
     ak = os.environ.get("ANTHROPIC_API_KEY", "")
     ok = os.environ.get("OPENAI_API_KEY", "")
+    oat = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
     log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
     start_cmd = (
         f"sh -c \"cd {_SUPERVISOR_REMOTE_DIR} && "
-        f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' "
+        f"ANTHROPIC_API_KEY='{ak}' OPENAI_API_KEY='{ok}' CLAUDE_CODE_OAUTH_TOKEN='{oat}' "
         f"setsid node supervisor.js --host 0.0.0.0 --port {port} "
         f"--acp {acp_bin}{acp_arg_flags} --root {root} "
         f"> {log_file} 2>&1 </dev/null & echo started\""
