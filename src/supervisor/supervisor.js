@@ -461,7 +461,7 @@ async function handleExec(req, res) {
   }
 
   await new Promise((resolve) => {
-    const child = spawn("sh", ["-c", command], {
+    const child = spawn("bash", ["-c", command], {
       cwd: args.root,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
