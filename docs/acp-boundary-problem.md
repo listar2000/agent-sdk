@@ -65,21 +65,6 @@ Unless upstream ACP starts emitting a stable per-chunk message id, or we
 replace the upstream adapter with something we own end-to-end, true
 mid-turn queueing and clean per-prompt event attribution are in tension.
 
-## Experiment harness
-
-`experiments/test_acp_ordering.py` is the characterization harness for
-this behavior. It talks directly to the supervisor and records how ACP
-behaves when multiple prompt RPCs overlap.
-
-Useful scenarios:
-
-- `1_fast_fast`
-- `5_cancel_mid_turn`
-- `7_tool_then_mid_submit`
-
-The `5_cancel_mid_turn` scenario is the closest match to the server's
-current `interrupt=True` semantics.
-
 ## Practical takeaway
 
 Queueing and interrupt are the public semantics the server can explain

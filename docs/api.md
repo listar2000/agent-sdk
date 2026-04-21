@@ -9,7 +9,16 @@ The API has two resource groups:
 ## Health
 
 ```
-GET /health  →  {"status": "ok"}
+GET /health
+```
+```json
+{
+  "status": "ok",
+  "sessions": 3,
+  "busy_sessions": 1,
+  "readers_alive": 3,
+  "instances": 2
+}
 ```
 
 ## Chat UI

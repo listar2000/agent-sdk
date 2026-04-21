@@ -4,14 +4,15 @@
 
 - Docker and Docker Compose
 - Python 3.11+
-- An `ANTHROPIC_API_KEY` (for running agents with Claude)
+- A `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` for running Claude agents
 
 ## Quick Start
 
 ### 1. Create `.env` file
 
 ```bash
-echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+echo "CLAUDE_CODE_OAUTH_TOKEN=..." > .env   # preferred
+# echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env  # fallback
 ```
 
 ### 2. Start the server
@@ -68,7 +69,7 @@ docker run -d --name agent-sdk-db \
 
 # Run the server
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/agent_sdk_server
-export ANTHROPIC_API_KEY=sk-ant-...
+export CLAUDE_CODE_OAUTH_TOKEN=...   # or ANTHROPIC_API_KEY=sk-ant-...
 pip install -e .
 uvicorn src.api.server:app --port 7778 --reload
 ```
@@ -124,7 +125,8 @@ Tables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgresql://localhost:5432/agent_sdk_server` | Postgres connection string |
-| `ANTHROPIC_API_KEY` | — | Required for Claude agents |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Preferred auth for Claude agents |
+| `ANTHROPIC_API_KEY` | — | Fallback auth for Claude agents |
 | `OPENAI_API_KEY` | — | Required for Codex agents |
 | `SANDBOX_IDLE_TIMEOUT` | `300` | Seconds before idle sessions are reaped |
 | `SANDBOX_REAPER_TICK` | `60` | Idle reaper scan interval in seconds |
