@@ -28,9 +28,13 @@ class AgentConfig:
     mcp_servers: dict | None = None
     skills: list | dict | None = None  # npx skills sources
     dockerfile: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        d = {k: v for k, v in asdict(self).items() if v is not None}
+        if not d.get("env"):
+            d.pop("env", None)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentConfig:

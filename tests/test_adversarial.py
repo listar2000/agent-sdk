@@ -67,6 +67,12 @@ _stub_db.get_db = _noop_get_db
 _stub_db.delete_sandbox = _noop
 _stub_db.upsert_session = _noop
 _stub_db.get_session = _noop_session
+_stub_db.get_session_env = _noop_list  # returns {} via empty list coerced upstream; stub returns []
+async def _noop_dict(*a, **kw): return {}
+_stub_db.get_session_env = _noop_dict
+_stub_db.get_session_secrets = _noop_dict
+_stub_db.update_session_env = _noop
+_stub_db.update_session_secrets = _noop
 _stub_db.session_has_log_entries = _noop_false
 _stub_db.log_event = _noop
 _stub_db.get_session_log = _noop_list
@@ -108,6 +114,8 @@ for _name in (
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session",
+    "get_session_env", "get_session_secrets",
+    "update_session_env", "update_session_secrets",
     "session_has_log_entries", "log_event", "get_session_log",
 ):
     setattr(_server_module, _name, getattr(_stub_db, _name))
@@ -456,7 +464,7 @@ class TestProviderConstants:
 class TestGetSandboxEnvVars:
     def test_always_has_is_sandbox(self):
         from api.providers import _get_sandbox_env_vars
-        env = _get_sandbox_env_vars()
+        env = _get_sandbox_env_vars({})
         assert env["IS_SANDBOX"] == "1"
 
 class TestModelConstants:
@@ -651,28 +659,28 @@ class TestProviderHelpers:
 
     def test_get_sandbox_env_vars_includes_is_sandbox(self):
         """_get_sandbox_env_vars always includes IS_SANDBOX=1."""
-        result = _get_sandbox_env_vars()
+        result = _get_sandbox_env_vars({})
         assert result.get("IS_SANDBOX") == "1"
 
-    def test_get_sandbox_env_vars_picks_up_anthropic_key(self, monkeypatch):
-        """_get_sandbox_env_vars includes ANTHROPIC_API_KEY when set."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
-        result = _get_sandbox_env_vars()
+    def test_get_sandbox_env_vars_passes_through_spawn_env(self):
+        """_get_sandbox_env_vars passes caller-provided keys through."""
+        result = _get_sandbox_env_vars({"ANTHROPIC_API_KEY": "sk-test-key"})
         assert result.get("ANTHROPIC_API_KEY") == "sk-test-key"
+        assert result.get("IS_SANDBOX") == "1"
 
-    def test_get_sandbox_env_vars_omits_missing_keys(self, monkeypatch):
-        """_get_sandbox_env_vars omits keys that aren't set in env."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        result = _get_sandbox_env_vars()
+    def test_get_sandbox_env_vars_ignores_ambient_keys(self, monkeypatch):
+        """Strict mode: ambient os.environ auth keys never leak into sandbox."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-should-be-ignored")
+        monkeypatch.setenv("OPENAI_API_KEY", "ambient-should-be-ignored")
+        result = _get_sandbox_env_vars({})
         assert "ANTHROPIC_API_KEY" not in result
         assert "OPENAI_API_KEY" not in result
 
-    def test_get_sandbox_env_vars_picks_up_openai_key(self, monkeypatch):
-        """_get_sandbox_env_vars includes OPENAI_API_KEY when set."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-key")
-        result = _get_sandbox_env_vars()
-        assert result.get("OPENAI_API_KEY") == "sk-openai-key"
+    def test_get_sandbox_env_vars_caller_wins_over_ambient(self, monkeypatch):
+        """Caller-supplied spawn_env values take precedence over ambient env."""
+        monkeypatch.setenv("OPENAI_API_KEY", "ambient-wrong")
+        result = _get_sandbox_env_vars({"OPENAI_API_KEY": "sk-caller"})
+        assert result.get("OPENAI_API_KEY") == "sk-caller"
 
     def test_port_based_providers_set(self):
         """PORT_BASED_PROVIDERS is a frozenset containing 'local' and 'docker'."""
@@ -1950,7 +1958,11 @@ class TestHealthEndpoint:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
             r = await c.get("/health")
             assert r.status_code == 200
-            assert r.json() == {"status": "ok"}
+            body = r.json()
+            assert body["status"] == "ok"
+            # Health payload carries runtime counters — verify shape, not counts.
+            for k in ("sessions", "busy_sessions", "readers_alive", "instances"):
+                assert k in body and isinstance(body[k], int)
 
 
 

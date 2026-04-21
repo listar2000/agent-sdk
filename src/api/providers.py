@@ -35,87 +35,44 @@ async def _wait_for_health(url: str, max_retries: int = 30, interval: float = 0.
 load_dotenv()
 
 
-def _detect_vertex_proxy() -> None:
-    """Auto-detect a local Vertex proxy and configure env vars if a managed
-    apiKeyHelper is present but CLAUDE_CODE_USE_VERTEX is not yet set."""
-    helper = "/usr/local/bin/claude_code/api-key-helper"
-    if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
-        return  # already configured or using direct API key
-    if not os.path.isfile(helper):
-        return
-    import subprocess, socket
-    try:
-        out = subprocess.check_output(
-            ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
-            text=True, timeout=5, stderr=subprocess.DEVNULL,
-        )
-        for line in out.splitlines():
-            if "claude" not in line.lower():
-                continue
-            parts = line.split()
-            for p in parts:
-                if p.startswith("*:") or p.startswith("127.0.0.1:") or p.startswith("[::1]:"):
-                    port = p.rsplit(":", 1)[-1]
-                    if port.isdigit():
-                        host = "127.0.0.1"
-                        try:
-                            s = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
-                            s.close()
-                        except OSError:
-                            try:
-                                s = socket.create_connection(("::1", int(port)), timeout=1)
-                                s.close()
-                                host = "[::1]"
-                            except OSError:
-                                continue
-                        os.environ.setdefault("CLAUDE_CODE_USE_VERTEX", "1")
-                        os.environ.setdefault("ANTHROPIC_VERTEX_BASE_URL", f"http://{host}:{port}/v1")
-                        os.environ.setdefault("ANTHROPIC_VERTEX_PROJECT_ID", "devai-mea-egeit")
-                        os.environ.setdefault("CLAUDE_CODE_SKIP_VERTEX_AUTH", "true")
-                        log.info("auto-detected Vertex proxy on %s:%s", host, port)
-                        return
-    except Exception as e:
-        log.debug("vertex proxy auto-detect failed: %s", e)
+# Auth/credential env vars that the server MUST NOT leak into sandboxes via
+# its own environment. When a sandbox spawns a supervisor, any of these keys
+# not explicitly provided by the caller are stripped or unset — no fallback
+# to ambient server credentials.
+_AUTH_KEYS = frozenset({
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_API_KEY",
+})
 
 
-_detect_vertex_proxy()
+def _get_sandbox_env_vars(spawn_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return the env to inject into a sandbox/supervisor.
 
-
-def _get_sandbox_env_vars(user_creds: dict[str, str] | None = None) -> dict[str, str]:
-    """Collect API keys and sandbox config from environment.
-
-    If ``user_creds`` is supplied, its values override anything in the server
-    env. When the caller supplies OAuth we scrub the server's API key (and
-    vice versa) so ``claude-agent-acp`` never sees a mixed pair with
-    ambiguous precedence.
+    No server-ambient fallback: the server never injects its own API keys or
+    auth config. Only IS_SANDBOX=1 plus whatever the caller supplied in
+    ``spawn_env`` (which comes from merging agent.env + session.env + secrets).
     """
     env: dict[str, str] = {"IS_SANDBOX": "1"}
-    for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"):
-        val = os.environ.get(var)
-        if val:
-            env[var] = val
-    if user_creds:
-        if "CLAUDE_CODE_OAUTH_TOKEN" in user_creds:
-            env.pop("ANTHROPIC_API_KEY", None)
-        if "ANTHROPIC_API_KEY" in user_creds:
-            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-        env.update(user_creds)
+    if spawn_env:
+        env.update(spawn_env)
     return env
 
 
-def _opposite_auth_vars_to_unset(user_creds: dict[str, str] | None) -> list[str]:
-    """When the caller supplies one auth mode, return the opposite auth vars
-    that MUST be unset in the spawned supervisor's env — otherwise whatever
-    was baked into the Daytona sandbox at provision time (server's shared
-    ANTHROPIC_API_KEY etc.) will be inherited by the node process and
-    override the caller's credentials."""
-    if not user_creds:
-        return []
-    if "CLAUDE_CODE_OAUTH_TOKEN" in user_creds:
-        return ["ANTHROPIC_API_KEY"]
-    if "ANTHROPIC_API_KEY" in user_creds:
-        return ["CLAUDE_CODE_OAUTH_TOKEN"]
-    return []
+def _auth_vars_to_unset(spawn_env: dict[str, str] | None) -> list[str]:
+    """Auth-related env vars that must be explicitly unset in the spawned
+    supervisor's env. Covers the case where a Daytona snapshot or Docker image
+    has credentials baked in at build time — even though the server doesn't
+    inject ambient creds, the sandbox itself might already have them.
+    We unset every known auth key the caller didn't explicitly provide."""
+    provided = set(spawn_env.keys()) if spawn_env else set()
+    return [k for k in _AUTH_KEYS if k not in provided]
 
 
 @dataclass
@@ -266,7 +223,7 @@ async def _ensure_local_supervisor_deps(agent_type: str) -> str:
 async def create_local(
     agent_type: str = "claude",
     root: str = "/tmp",
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Spawn a local supervisor.js subprocess that bridges stdio ↔ HTTP
     (POST + SSE) for the given agent's ACP binary."""
@@ -277,11 +234,11 @@ async def create_local(
     launch_args = _acp_launch_args(agent_type)
 
     port = await _find_free_port()
-    env = {**os.environ, **_get_sandbox_env_vars(user_creds)}
-    if user_creds and "CLAUDE_CODE_OAUTH_TOKEN" in user_creds:
-        env.pop("ANTHROPIC_API_KEY", None)
-    if user_creds and "ANTHROPIC_API_KEY" in user_creds:
-        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    # Start from os.environ (for PATH, HOME, LANG, etc.) but strip every
+    # credential key — the server never leaks its own API keys/tokens into
+    # a sandbox supervisor. Then overlay IS_SANDBOX + spawn_env.
+    env = {k: v for k, v in os.environ.items() if k not in _AUTH_KEYS}
+    env.update(_get_sandbox_env_vars(spawn_env))
     extra: list[str] = []
     for arg in launch_args:
         extra += ["--acp-arg", arg]
@@ -381,7 +338,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     sandbox, agent_type: str, *, install_deps: bool,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Install (optionally) + start the supervisor inside an existing daytona
     sandbox object. Returns a fresh ProviderInstance with a new signed URL.
@@ -441,9 +398,9 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    env_vars = _get_sandbox_env_vars(user_creds)
+    env_vars = _get_sandbox_env_vars(spawn_env)
     env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
-    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(user_creds))
+    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
     env_prefix = f"{env_unset} {env_set}".strip()
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
@@ -477,7 +434,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
 
 async def start_supervisor_in_sandbox(
     sandbox, agent_type: str, port: int, root: str = "/tmp",
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> str:
     """Start a NEW supervisor on a specific port inside an existing sandbox.
 
@@ -495,9 +452,9 @@ async def start_supervisor_in_sandbox(
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    env_vars = _get_sandbox_env_vars(user_creds)
+    env_vars = _get_sandbox_env_vars(spawn_env)
     env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
-    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(user_creds))
+    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
     env_prefix = f"{env_unset} {env_set}".strip()
     log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
     inner = (
@@ -654,7 +611,7 @@ async def provision_daytona_sandbox(
 
 async def restart_daytona_supervisor(
     daytona_sandbox_id: str, agent_type: str = "claude", root: str = "/tmp",
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Re-attach to an existing daytona sandbox and respawn the supervisor
     inside it. Used by the resume path after the sandbox was stopped (or
@@ -681,7 +638,7 @@ async def restart_daytona_supervisor(
         await loop.run_in_executor(None, sandbox.start)
 
     return await _bootstrap_supervisor_in_daytona_sandbox(
-        sandbox, agent_type, install_deps=False, root=root, user_creds=user_creds,
+        sandbox, agent_type, install_deps=False, root=root, spawn_env=spawn_env,
     )
 
 
@@ -690,7 +647,7 @@ async def create_daytona(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Create a fresh Daytona sandbox, install + start a supervisor inside it."""
     try:
@@ -705,7 +662,7 @@ async def create_daytona(
     if not api_key:
         raise RuntimeError("DAYTONA_API_KEY not set")
 
-    env_vars = _get_sandbox_env_vars(user_creds)
+    env_vars = _get_sandbox_env_vars(spawn_env)
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
 
@@ -746,7 +703,7 @@ async def create_daytona(
     try:
         return await _bootstrap_supervisor_in_daytona_sandbox(
             sandbox, agent_type, install_deps=True, pre_start_commands=pre_start_commands,
-            root=root, user_creds=user_creds,
+            root=root, spawn_env=spawn_env,
         )
     except BaseException:
         try:
@@ -841,7 +798,7 @@ async def create_docker(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Run the supervisor Docker image as a per-session container."""
     docker = shutil.which("docker")
@@ -851,7 +808,7 @@ async def create_docker(
     image = await _ensure_supervisor_docker_image()
     port = await _find_free_port()
 
-    env_vars = _get_sandbox_env_vars(user_creds)
+    env_vars = _get_sandbox_env_vars(spawn_env)
     env_args: list[str] = []
     for k, v in env_vars.items():
         env_args += ["-e", f"{k}={v}"]
@@ -957,30 +914,31 @@ async def create_instance(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Create an ACP supervisor instance using the specified provider.
 
     pre_start_commands are shell commands to run inside the sandbox BEFORE
     the supervisor process starts (used for skill installation).
 
-    user_creds optionally overrides the server's own ANTHROPIC_API_KEY /
-    CLAUDE_CODE_OAUTH_TOKEN for this one sandbox, so the caller's Claude
-    subscription is billed instead of the server's.
+    spawn_env is the merged env that should land in the supervisor process:
+    {IS_SANDBOX:1} ∪ agent.env ∪ session.env ∪ secrets. The server never
+    injects its own API keys — if spawn_env is empty, the supervisor runs
+    with no credentials.
     """
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(_ACP_BIN_NAMES)}")
     if provider == "local":
-        return await create_local(agent_type, root=root, user_creds=user_creds)
+        return await create_local(agent_type, root=root, spawn_env=spawn_env)
     if provider == "docker":
         return await create_docker(
             agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands,
-            root=root, user_creds=user_creds,
+            root=root, spawn_env=spawn_env,
         )
     if provider == "daytona":
         return await create_daytona(
             agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands,
-            root=root, user_creds=user_creds,
+            root=root, spawn_env=spawn_env,
         )
     raise ValueError(f"Unknown provider: {provider!r}. Use 'local', 'docker', or 'daytona'.")
 

@@ -94,6 +94,7 @@ class TestSessionRecoveryAfterReap:
             inner_session_id,
             client_session_id,
             force_replace_live_state=False,
+            spawn_env=None,
         ):
             state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
             state.client.prompt = AsyncMock()
@@ -143,6 +144,7 @@ class TestSessionRecoveryAfterReap:
             inner_session_id,
             client_session_id,
             force_replace_live_state=False,
+            spawn_env=None,
         ):
             state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
             SESSIONS[client_session_id] = state
@@ -194,7 +196,20 @@ class TestSessionRecoveryAfterReap:
         async def fake_initialize(client, config, acp_session_id, cwd):
             client.set_inner_session_id(acp_session_id, "inner-recovered")
 
-        with patch("api.server.get_session", AsyncMock(return_value=db_record)), \
+        # Daytona recovery path uses per-session supervisor via the Daytona SDK
+        # directly, not _ensure_sandbox_alive. Stub the SDK client and the
+        # supervisor startup so the test stays hermetic.
+        fake_daytona_sandbox = MagicMock()
+        fake_daytona_sandbox.state = "started"
+        fake_daytona_client = MagicMock()
+        fake_daytona_client.get.return_value = fake_daytona_sandbox
+
+        with patch.dict(os.environ, {"DAYTONA_API_KEY": "dummy"}), \
+             patch("daytona_sdk.Daytona", return_value=fake_daytona_client), \
+             patch("api.server.start_supervisor_in_sandbox",
+                   AsyncMock(return_value="https://new-daytona-url.example.com")), \
+             patch("api.server.allocate_sandbox_port", return_value=9000), \
+             patch("api.server.get_session", AsyncMock(return_value=db_record)), \
              patch("api.server.get_agent", AsyncMock(return_value=agent_record)), \
              patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
                  id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
@@ -241,6 +256,7 @@ class TestSessionRecoveryAfterReap:
             inner_session_id,
             client_session_id,
             force_replace_live_state=False,
+            spawn_env=None,
         ):
             new_state = _fake_session_state(
                 client_session_id, agent_id, sandbox_id, inner_session_id
@@ -349,6 +365,7 @@ class TestReaperThenResumeIntegration:
             inner_session_id,
             client_session_id,
             force_replace_live_state=False,
+            spawn_env=None,
         ):
             new_state = _fake_session_state(client_session_id, agent_id, sandbox_id, inner_session_id)
             new_state.client.prompt = AsyncMock()
@@ -411,6 +428,7 @@ class TestConcurrentRecovery:
             inner_session_id,
             client_session_id,
             force_replace_live_state=False,
+            spawn_env=None,
         ):
             resume_invocations.append(client_session_id)
             # Yield to let other coroutines race in before we populate SESSIONS

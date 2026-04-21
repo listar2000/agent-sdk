@@ -40,6 +40,8 @@ _PG_SCHEMA = [
         agent_id            TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
         sandbox_id          TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
         inner_session_id    TEXT,
+        env                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+        secrets             JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     """CREATE TABLE IF NOT EXISTS session_log (
@@ -76,6 +78,11 @@ _MIGRATIONS = [
     "ALTER TABLE sandboxes DROP COLUMN IF EXISTS updated_at",
     # 2026-04-16: add root column for sandbox filesystem boundary
     "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS root TEXT NOT NULL DEFAULT '/tmp'",
+    # 2026-04-21: per-session env (identity, non-secret) and secrets.
+    # Secrets are plaintext JSONB for now — see SECRETS_PLAINTEXT tech-debt
+    # note in models.py. Phase 2 adds envelope encryption.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS env JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secrets JSONB NOT NULL DEFAULT '{}'::jsonb",
 ]
 
 
@@ -238,13 +245,51 @@ async def delete_sandbox(sandbox_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def upsert_session(session_id: str, agent_id: str, sandbox_id: str,
-                         inner_session_id: str | None) -> None:
+                         inner_session_id: str | None,
+                         env: dict[str, str] | None = None,
+                         secrets: dict[str, str] | None = None) -> None:
+    """Upsert a session row.
+
+    PATCH-like semantics: ``env=None`` (and ``secrets=None``) means don't
+    touch the stored column on update. Pass ``{}`` to explicitly wipe.
+    """
+    cols = ["id", "agent_id", "sandbox_id", "inner_session_id"]
+    vals: list = [session_id, agent_id, sandbox_id, inner_session_id]
+    update_parts = ["inner_session_id=EXCLUDED.inner_session_id"]
+    if env is not None:
+        cols.append("env")
+        vals.append(Json(env))
+        update_parts.append("env=EXCLUDED.env")
+    if secrets is not None:
+        cols.append("secrets")
+        vals.append(Json(secrets))
+        update_parts.append("secrets=EXCLUDED.secrets")
+    placeholders = ", ".join(["%s"] * len(cols))
+    col_list = ", ".join(cols)
+    update_sql = ", ".join(update_parts)
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO sessions (id, agent_id, sandbox_id, inner_session_id)"
-            " VALUES (%s, %s, %s, %s)"
-            " ON CONFLICT(id) DO UPDATE SET inner_session_id=EXCLUDED.inner_session_id",
-            (session_id, agent_id, sandbox_id, inner_session_id),
+            f"INSERT INTO sessions ({col_list}) VALUES ({placeholders})"
+            f" ON CONFLICT(id) DO UPDATE SET {update_sql}",
+            tuple(vals),
+        )
+
+
+async def update_session_env(session_id: str, env: dict[str, str]) -> None:
+    """Replace stored session env. Used on resume when caller sends explicit env."""
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET env = %s WHERE id = %s",
+            (Json(env), session_id),
+        )
+
+
+async def update_session_secrets(session_id: str, secrets: dict[str, str]) -> None:
+    """Replace stored session secrets. Used on resume when caller sends explicit secrets."""
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET secrets = %s WHERE id = %s",
+            (Json(secrets), session_id),
         )
 
 
@@ -256,6 +301,33 @@ async def get_session(session_id: str) -> dict | None:
     if row is None:
         return None
     return dict(row)
+
+
+async def get_session_env(session_id: str) -> dict[str, str]:
+    """Return stored session env, or {} if session not found."""
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT env FROM sessions WHERE id = %s", (session_id,)
+        )).fetchone()
+    if row is None:
+        return {}
+    return row["env"] or {}
+
+
+async def get_session_secrets(session_id: str) -> dict[str, str]:
+    """Return stored session secrets, or {} if session not found.
+
+    SECURITY: never log the return value. Passed directly into supervisor
+    spawn env; never serialized to clients (GET /sessions/{id} returns only
+    key names, not values).
+    """
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT secrets FROM sessions WHERE id = %s", (session_id,)
+        )).fetchone()
+    if row is None:
+        return {}
+    return row["secrets"] or {}
 
 
 async def session_has_log_entries(session_id: str) -> bool:

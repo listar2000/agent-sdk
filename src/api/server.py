@@ -33,13 +33,17 @@ from .db import (
     get_agent,
     get_sandbox,
     get_session,
+    get_session_env,
     get_session_log,
+    get_session_secrets,
     init_db,
     init_pool,
     list_agents,
     list_sandboxes,
     log_event,
     session_has_log_entries,
+    update_session_env,
+    update_session_secrets,
     upsert_agent,
     upsert_sandbox,
     upsert_session,
@@ -747,22 +751,81 @@ def _merge_top_level_config(data: dict, config_data: dict) -> None:
             config_data[key] = data[key]
 
 
-def _pop_user_creds(data: dict) -> dict[str, str] | None:
-    """Extract per-request Claude credentials from the request body.
+# Sentinel distinguishing "env key not present" from "env: {}" in the request body.
+_ENV_MISSING = object()
 
-    SECURITY: pops the keys in-place so they cannot flow into ``config_data``,
-    ``AgentConfig``, or any logger that later prints ``data``. Returns a dict
-    suitable for passing to ``create_instance(..., user_creds=...)``, or
-    ``None`` if the client did not supply credentials.
+
+def _pop_env_and_secrets(
+    data: dict,
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Extract ``env`` (identity, stored) and ``secrets`` (auth material,
+    stored-but-redacted-on-read) from a request body.
+
+    PATCH-like semantics on both fields:
+        - key missing → ``None``  (caller should keep stored value unchanged)
+        - ``{}``       → ``{}``    (caller should wipe stored value)
+        - ``{…}``      → the dict (caller should replace stored value)
+
+    Any string/int/float value is coerced to str. No allowlist on key names —
+    it's the user's sandbox. SECURITY: both fields are popped in-place so they
+    can't flow into ``config_data``, ``AgentConfig``, or request logs.
     """
-    oauth_token = data.pop("oauth_token", None)
-    api_key = data.pop("api_key", None)
-    creds: dict[str, str] = {}
-    if isinstance(oauth_token, str) and oauth_token:
-        creds["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
-    if isinstance(api_key, str) and api_key:
-        creds["ANTHROPIC_API_KEY"] = api_key
-    return creds or None
+    def _coerce(d: object) -> dict[str, str]:
+        if not isinstance(d, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in d.items():
+            if isinstance(k, str) and isinstance(v, (str, int, float)):
+                out[k] = str(v)
+        return out
+
+    raw_env = data.pop("env", _ENV_MISSING)
+    raw_secrets = data.pop("secrets", _ENV_MISSING)
+    env = None if raw_env is _ENV_MISSING else _coerce(raw_env)
+    secrets = None if raw_secrets is _ENV_MISSING else _coerce(raw_secrets)
+    return env, secrets
+
+
+async def _build_spawn_env_for_session(session_id: str) -> dict[str, str]:
+    """Assemble the spawn_env dict for a stored session:
+    agent.env ∪ session.env ∪ session.secrets.
+
+    Looks up agent via session.agent_id. Returns ``{}`` if the session
+    doesn't exist (caller should handle that separately).
+    """
+    rec = await get_session(session_id)
+    if rec is None:
+        return {}
+    agent_id = rec.get("agent_id")
+    session_env = rec.get("env") or {}
+    session_secrets = rec.get("secrets") or {}
+    agent_env: dict[str, str] = {}
+    if agent_id:
+        agent_record = await get_agent(agent_id)
+        if agent_record is not None:
+            agent_env = agent_record.config.env or {}
+    return _merge_env(agent_env, session_env, session_secrets)
+
+
+def _merge_env(
+    agent_env: dict[str, str] | None,
+    session_env: dict[str, str] | None,
+    secrets: dict[str, str] | None,
+) -> dict[str, str]:
+    """Build the env dict that lands in a supervisor subprocess.
+
+    Precedence (later wins): agent.env → session.env → secrets.
+    Returns a fresh dict; never mutates inputs. Returns ``{}`` only if all
+    three are empty/None — caller can decide whether that's an error.
+    """
+    out: dict[str, str] = {}
+    if agent_env:
+        out.update(agent_env)
+    if session_env:
+        out.update(session_env)
+    if secrets:
+        out.update(secrets)
+    return out
 
 
 def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
@@ -1366,6 +1429,7 @@ async def _ensure_sandbox_alive(
     sandbox_record: SandboxRecord,
     agent_type: str = "claude",
     dockerfile: str | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> tuple[str, bool]:
     """Ensure the supervisor is reachable. Restart if needed.
 
@@ -1409,6 +1473,7 @@ async def _ensure_sandbox_alive(
                 new_instance = await create_instance(
                     provider, agent_type, dockerfile=dockerfile,
                     root=sandbox_record.root,
+                    spawn_env=spawn_env,
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to restart sandbox: {e}")
@@ -1453,6 +1518,7 @@ async def _ensure_sandbox_alive(
 
             new_instance = await restart_daytona_supervisor(
                 daytona_sandbox_id, agent_type, root=sandbox_record.root,
+                spawn_env=spawn_env,
             )
         except Exception as e:
             if not _should_replace_daytona_sandbox(e):
@@ -1467,6 +1533,7 @@ async def _ensure_sandbox_alive(
                 new_instance = await create_instance(
                     "daytona", agent_type, dockerfile=dockerfile,
                     root=sandbox_record.root,
+                    spawn_env=spawn_env,
                 )
             except Exception as create_err:
                 raise RuntimeError(
@@ -1494,7 +1561,7 @@ async def _do_resume(
     inner_session_id: str,
     client_session_id: str | None = None,
     force_replace_live_state: bool = False,
-    user_creds: dict[str, str] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ):
     """Core resume logic shared by both resume endpoints.
 
@@ -1559,7 +1626,7 @@ async def _do_resume(
                 supervisor_port = allocate_sandbox_port(sandbox_id)
                 supervisor_url = await start_supervisor_in_sandbox(
                     sandbox, agent_record.config.agent_type or "claude",
-                    supervisor_port, root=root, user_creds=user_creds,
+                    supervisor_port, root=root, spawn_env=spawn_env,
                 )
                 url = supervisor_url
             except RuntimeError as e:
@@ -1574,6 +1641,7 @@ async def _do_resume(
                     sandbox_record,
                     agent_type=agent_record.config.agent_type,
                     dockerfile=agent_record.config.dockerfile,
+                    spawn_env=spawn_env,
                 )
             except RuntimeError as e:
                 log.error(
@@ -1731,7 +1799,7 @@ async def _do_resume(
 
 
 async def get_or_recover_session(
-    session_id: str, user_creds: dict[str, str] | None = None,
+    session_id: str, spawn_env: dict[str, str] | None = None,
 ) -> SessionState:
     """Get a live session, recovering from DB if it was reaped.
 
@@ -1811,13 +1879,23 @@ async def get_or_recover_session(
         sandbox_id,
         inner_session_id,
     )
+    # If caller didn't supply spawn_env (e.g. /message auto-recovery),
+    # rebuild from stored agent.env ∪ session.env ∪ session.secrets.
+    if spawn_env is None:
+        try:
+            spawn_env = await _build_spawn_env_for_session(session_id)
+        except Exception as e:
+            log.warning(
+                "session %s: failed to rebuild spawn_env from DB: %s", session_id, e,
+            )
+            spawn_env = None
     result = await _do_resume(
         sandbox_id=sandbox_id,
         agent_id=agent_id,
         inner_session_id=inner_session_id,
         client_session_id=session_id,
         force_replace_live_state=state is not None and not state.shutdown.is_set(),
-        user_creds=user_creds,
+        spawn_env=spawn_env,
     )
 
     if isinstance(result, JSONResponse):
@@ -1867,6 +1945,29 @@ async def list_sessions_route():
         }
         for s in SESSIONS.values()
     ]
+
+
+@app.get("/sessions/{session_id}")
+async def get_session_route(session_id: str):
+    """Return stored session metadata. Redacts secret values — only keys.
+
+    ``env`` is returned in full (non-sensitive). ``secrets`` is returned as
+    ``{"keys": [...]}`` (names only) so callers can confirm what's stored
+    without leaking values. Values are never serialized to clients.
+    """
+    rec = await get_session(session_id)
+    if rec is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    env = rec.get("env") or {}
+    secrets = rec.get("secrets") or {}
+    return {
+        "session_id": rec.get("id"),
+        "agent_id": rec.get("agent_id"),
+        "sandbox_id": rec.get("sandbox_id"),
+        "inner_session_id": rec.get("inner_session_id"),
+        "env": env,
+        "secrets": {"keys": sorted(secrets.keys())},
+    }
 
 
 @app.get("/sessions/{session_id}/status")
@@ -1934,19 +2035,39 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 async def session_resume(session_id: str, request: Request):
     """Resume a session by ID. Auto-recovers sandbox if stopped.
 
-    The body may optionally carry ``oauth_token`` / ``api_key`` so the
-    respawned supervisor runs with the caller's Claude credentials.
+    Body may optionally carry ``env`` and ``secrets``:
+      - ``env``:     PATCH semantics (missing=keep stored, {}=wipe, {...}=replace).
+      - ``secrets``: same semantics — stored server-side (plaintext JSONB, see
+        SECRETS_PLAINTEXT note). Used for this respawn and future auto-recoveries.
     """
-    user_creds: dict[str, str] | None = None
+    body_env: dict[str, str] | None = None
+    body_secrets: dict[str, str] | None = None
     try:
         if request.headers.get("content-length", "0") != "0":
             body = await request.json()
             if isinstance(body, dict):
-                user_creds = _pop_user_creds(body)
+                body_env, body_secrets = _pop_env_and_secrets(body)
     except Exception:
-        user_creds = None
+        body_env = None
+        body_secrets = None
+
+    # Persist updated env/secrets if caller sent those fields.
+    if body_env is not None:
+        try:
+            await update_session_env(session_id, body_env)
+        except Exception as e:
+            log.warning("resume: update_session_env failed for %s: %s", session_id, e)
+    if body_secrets is not None:
+        try:
+            await update_session_secrets(session_id, body_secrets)
+        except Exception as e:
+            log.warning("resume: update_session_secrets failed for %s: %s", session_id, e)
+
+    # Build spawn_env from stored state (agent.env + session.env + session.secrets).
+    spawn_env = await _build_spawn_env_for_session(session_id)
+
     try:
-        state = await get_or_recover_session(session_id, user_creds=user_creds)
+        state = await get_or_recover_session(session_id, spawn_env=spawn_env)
     except HTTPException as e:
         return JSONResponse({"error": e.detail}, status_code=e.status_code)
     return {
@@ -1966,8 +2087,9 @@ async def sessions_create_on_existing_sandbox(request: Request):
     Returns the same shape as ``/sessions/quick``.
     """
     data = await request.json()
-    # SECURITY: strip credentials before any merge, log, or DB write.
-    user_creds = _pop_user_creds(data)
+    # SECURITY: strip env/secrets before any merge, log, or DB write so they
+    # can't leak into agents.config JSONB.
+    body_env, body_secrets = _pop_env_and_secrets(data)
     sandbox_id = data.get("sandbox_id")
     if not sandbox_id or not isinstance(sandbox_id, str):
         return JSONResponse(
@@ -1990,6 +2112,10 @@ async def sessions_create_on_existing_sandbox(request: Request):
         {**config_data, "agent_type": agent_type, "cwd": cwd}
     )
     await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
+
+    session_env = body_env or {}
+    session_secrets = body_secrets or {}
+    spawn_env = _merge_env(config.env, session_env, session_secrets)
 
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     if skill_cmds and sandbox_record.provider == "local":
@@ -2024,7 +2150,7 @@ async def sessions_create_on_existing_sandbox(request: Request):
             supervisor_port = allocate_sandbox_port(sandbox_id)
             supervisor_url = await start_supervisor_in_sandbox(
                 sandbox, config.agent_type or "claude", supervisor_port, root=root,
-                user_creds=user_creds,
+                spawn_env=spawn_env,
             )
             url = supervisor_url
         except Exception as e:
@@ -2039,6 +2165,7 @@ async def sessions_create_on_existing_sandbox(request: Request):
                 sandbox_record,
                 agent_type=config.agent_type or "claude",
                 dockerfile=dockerfile,
+                spawn_env=spawn_env,
             )
         except RuntimeError as e:
             await delete_agent(agent_id)
@@ -2081,7 +2208,10 @@ async def sessions_create_on_existing_sandbox(request: Request):
     )
     SESSIONS[session_id] = state
     _start_session_tasks(state)
-    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
+    await upsert_session(
+        session_id, agent_id, sandbox_id, inner_session_id,
+        env=session_env, secrets=session_secrets,
+    )
 
     return {
         "agent_id": agent_id,
@@ -2099,9 +2229,9 @@ async def sessions_quick_create(request: Request):
     Returns {agent_id, sandbox_id, session_id, connected: true}.
     """
     data = await request.json()
-    # SECURITY: strip credentials from the request body before any merge,
-    # log, or DB write so they can't leak into agents.config JSONB.
-    user_creds = _pop_user_creds(data)
+    # SECURITY: strip env/secrets before any merge, log, or DB write so they
+    # can't leak into agents.config JSONB.
+    body_env, body_secrets = _pop_env_and_secrets(data)
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
     name = data.get("name")
@@ -2116,6 +2246,10 @@ async def sessions_quick_create(request: Request):
         {**config_data, "agent_type": agent_type, "cwd": cwd}
     )
     await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
+
+    session_env = body_env or {}
+    session_secrets = body_secrets or {}
+    spawn_env = _merge_env(config.env, session_env, session_secrets)
 
     # Install skills BEFORE starting the supervisor — claude-agent-acp
     # discovers skills at process startup, not at session creation time.
@@ -2138,7 +2272,7 @@ async def sessions_quick_create(request: Request):
             dockerfile=dockerfile,
             pre_start_commands=skill_cmds if provider != "local" else None,
             root=root,
-            user_creds=user_creds,
+            spawn_env=spawn_env,
         )
     except Exception as e:
         await delete_agent(agent_id)
@@ -2209,7 +2343,10 @@ async def sessions_quick_create(request: Request):
     )
     SESSIONS[session_id] = state
     _start_session_tasks(state)
-    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
+    await upsert_session(
+        session_id, agent_id, sandbox_id, inner_session_id,
+        env=session_env, secrets=session_secrets,
+    )
 
     return {
         "agent_id": agent_id,
