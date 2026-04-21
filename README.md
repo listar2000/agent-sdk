@@ -5,7 +5,8 @@ Python SDK and orchestration server for running Claude Code, Codex, OpenCode, an
 ## Run the server with Docker
 
 ```bash
-echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+echo "CLAUDE_CODE_OAUTH_TOKEN=..." > .env   # preferred
+# echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env  # fallback if no OAuth token
 # Optional for cloud sandboxes:
 echo "DAYTONA_API_KEY=dtn_..." >> .env
 
@@ -31,7 +32,7 @@ The repo has a `Dockerfile` and `railway.toml` ready for Railway.
 1. Create a new Railway project pointing at this repo
 2. Add a Postgres service — Railway sets `DATABASE_URL` automatically
 3. Set env vars on the API service:
-   - `ANTHROPIC_API_KEY`
+   - `CLAUDE_CODE_OAUTH_TOKEN` (preferred) or `ANTHROPIC_API_KEY` (fallback)
    - `DAYTONA_API_KEY` (if using cloud sandboxes)
    - `DAYTONA_SNAPSHOT` (optional, defaults to `hive-large`; set another snapshot name to override, or `image` / empty / `0` / `false` to use the legacy Docker image / Dockerfile path)
    - `SANDBOX_IDLE_TIMEOUT` (optional, seconds — default 300)
@@ -90,19 +91,19 @@ The SDK talks to the server at `http://localhost:7778` by default. Override with
 
 ## Per-request Claude credentials
 
-If the caller wants a specific Claude account used for its sandbox (instead of the server's default `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`), pass the token on the `Agent`:
+The preferred credential is a Claude Code OAuth token. If the caller wants a specific account used for its sandbox (instead of the server's default), pass it on the `Agent`:
 
 ```python
 from agent_sdk import Agent
 
 agent = Agent("worker", provider="daytona", oauth_token=user_oauth_token)
-# or: api_key="sk-ant-..." / CLAUDE_CODE_OAUTH_TOKEN env var / ANTHROPIC_API_KEY env var
+# fallback order: oauth_token= > CLAUDE_CODE_OAUTH_TOKEN env > api_key= > ANTHROPIC_API_KEY env
 await agent.arun("Hello")
 ```
 
-Credentials travel in the request body to `/sessions/quick` (and resume), are applied as per-sandbox env vars inside the supervisor, and are never persisted to the agent-sdk database. When the caller supplies OAuth, the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback to shared credentials. The SDK refuses to send credentials to a plaintext-HTTP server — use `https://` or a `localhost` URL.
+Credentials travel in the request body to `/sessions/quick` (and resume), are applied as per-sandbox env vars inside the supervisor, and are never persisted to the agent-sdk database. When OAuth is supplied, the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback to shared credentials. The SDK refuses to send credentials to a plaintext-HTTP server — use `https://` or a `localhost` URL.
 
-Obtaining the token itself (running `claude setup-token` or an equivalent OAuth flow) is the caller's responsibility — the agent-sdk only forwards what it's handed.
+Obtaining the OAuth token (`claude setup-token` or equivalent) is the caller's responsibility — the agent-sdk only forwards what it's handed.
 
 ## Session persistence
 
