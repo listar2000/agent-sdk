@@ -103,6 +103,27 @@ def _get_sandbox_env_vars(user_creds: dict[str, str] | None = None) -> dict[str,
     return env
 
 
+async def _resolve_user_creds(
+    user_creds: dict[str, str] | None, sandbox_id: str | None,
+) -> dict[str, str] | None:
+    """If the caller passed explicit creds, use those. Otherwise look them up
+    from the sandbox row (encrypted at creation, decrypted here). Returns None
+    if neither source has anything — caller falls back to server env."""
+    if user_creds:
+        return user_creds
+    if not sandbox_id:
+        return None
+    try:
+        from .crypto import decrypt_user_creds
+        from .db import get_sandbox
+        rec = await get_sandbox(sandbox_id)
+    except Exception:
+        return None
+    if rec is None:
+        return None
+    return decrypt_user_creds(rec.encrypted_user_creds)
+
+
 def _opposite_auth_vars_to_unset(user_creds: dict[str, str] | None) -> list[str]:
     """When the caller supplies one auth mode, return the opposite auth vars
     that MUST be unset in the spawned supervisor's env — otherwise whatever
@@ -382,6 +403,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
     user_creds: dict[str, str] | None = None,
+    sandbox_id: str | None = None,
 ) -> ProviderInstance:
     """Install (optionally) + start the supervisor inside an existing daytona
     sandbox object. Returns a fresh ProviderInstance with a new signed URL.
@@ -441,9 +463,10 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    env_vars = _get_sandbox_env_vars(user_creds)
+    effective_creds = await _resolve_user_creds(user_creds, sandbox_id)
+    env_vars = _get_sandbox_env_vars(effective_creds)
     env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
-    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(user_creds))
+    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(effective_creds))
     env_prefix = f"{env_unset} {env_set}".strip()
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
@@ -478,6 +501,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
 async def start_supervisor_in_sandbox(
     sandbox, agent_type: str, port: int, root: str = "/tmp",
     user_creds: dict[str, str] | None = None,
+    sandbox_id: str | None = None,
 ) -> str:
     """Start a NEW supervisor on a specific port inside an existing sandbox.
 
@@ -495,9 +519,10 @@ async def start_supervisor_in_sandbox(
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    env_vars = _get_sandbox_env_vars(user_creds)
+    effective_creds = await _resolve_user_creds(user_creds, sandbox_id)
+    env_vars = _get_sandbox_env_vars(effective_creds)
     env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
-    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(user_creds))
+    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(effective_creds))
     env_prefix = f"{env_unset} {env_set}".strip()
     log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
     inner = (
@@ -655,6 +680,7 @@ async def provision_daytona_sandbox(
 async def restart_daytona_supervisor(
     daytona_sandbox_id: str, agent_type: str = "claude", root: str = "/tmp",
     user_creds: dict[str, str] | None = None,
+    sandbox_id: str | None = None,
 ) -> ProviderInstance:
     """Re-attach to an existing daytona sandbox and respawn the supervisor
     inside it. Used by the resume path after the sandbox was stopped (or
@@ -681,7 +707,8 @@ async def restart_daytona_supervisor(
         await loop.run_in_executor(None, sandbox.start)
 
     return await _bootstrap_supervisor_in_daytona_sandbox(
-        sandbox, agent_type, install_deps=False, root=root, user_creds=user_creds,
+        sandbox, agent_type, install_deps=False, root=root,
+        user_creds=user_creds, sandbox_id=sandbox_id,
     )
 
 

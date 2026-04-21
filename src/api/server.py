@@ -4,7 +4,6 @@ Run: uvicorn src.api.server:app --port 7778
 """
 
 import asyncio
-import contextvars
 import json
 import logging
 import os
@@ -27,11 +26,13 @@ from fastapi.responses import (
 )
 
 from .acp_client import AcpClient, _mcp_dict_to_acp_array
+from .crypto import encrypt_user_creds, decrypt_user_creds
 from .db import (
     close_pool,
     delete_agent,
     delete_sandbox,
     get_agent,
+    get_db,
     get_sandbox,
     get_session,
     get_session_log,
@@ -331,32 +332,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# Per-request user credentials: populated from X-Claude-Oauth-Token /
-# X-Anthropic-Api-Key headers so every endpoint that auto-recovers a
-# stopped sandbox (post_session_message, session_events, cancel, …)
-# can re-spawn its supervisor with the caller's token instead of
-# silently falling back to the server's shared env.
-_REQUEST_USER_CREDS: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
-    "request_user_creds", default=None,
-)
-
-
-@app.middleware("http")
-async def _capture_request_user_creds(request: Request, call_next):
-    oauth = request.headers.get("x-claude-oauth-token")
-    api_key = request.headers.get("x-anthropic-api-key")
-    creds: dict[str, str] = {}
-    if oauth:
-        creds["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
-    if api_key:
-        creds["ANTHROPIC_API_KEY"] = api_key
-    token = _REQUEST_USER_CREDS.set(creds or None)
-    try:
-        return await call_next(request)
-    finally:
-        _REQUEST_USER_CREDS.reset(token)
 
 
 @app.exception_handler(HTTPException)
@@ -953,6 +928,8 @@ async def provision_sandbox_route(request: Request):
     Returns sandbox_id. Supervisors are started per-session via POST /sessions.
     """
     data = await request.json()
+    # SECURITY: strip credentials before any merge, log, or DB write.
+    user_creds = _pop_user_creds(data)
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
@@ -987,6 +964,7 @@ async def provision_sandbox_route(request: Request):
         id=sandbox_id, provider="daytona",
         sandbox_ref=sandbox_id, status=STATUS_RUNNING,
         root=root,
+        encrypted_user_creds=encrypt_user_creds(user_creds),
     ))
 
     return {"sandbox_id": sandbox_id, "status": "provisioned"}
@@ -1027,6 +1005,33 @@ async def start_sandbox_route(sandbox_id: str):
     record.status = "running"
     await upsert_sandbox(record)
     return {"status": "running", "url": url}
+
+
+@app.put("/sandboxes/{sandbox_id}/creds")
+async def sandbox_rotate_creds(sandbox_id: str, request: Request):
+    """Update (or wipe) the user creds stored on this sandbox.
+
+    Body: ``{oauth_token, api_key}`` to set, or ``{}`` / null to clear.
+    Does NOT restart the running supervisor — the new creds take effect on
+    the next spawn (idle-resume, restart, or next supervisor session).
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    user_creds = _pop_user_creds(data) if data else None
+    record = await get_sandbox(sandbox_id)
+    if record is None:
+        return JSONResponse({"error": "sandbox not found"}, status_code=404)
+    ciphertext = encrypt_user_creds(user_creds) if user_creds else None
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sandboxes SET encrypted_user_creds = %s WHERE id = %s",
+            (ciphertext, sandbox_id),
+        )
+    return {"status": "rotated" if ciphertext else "cleared"}
 
 
 # ---------------------------------------------------------------------------
@@ -1467,6 +1472,7 @@ async def _ensure_sandbox_alive(
 
             new_instance = await restart_daytona_supervisor(
                 daytona_sandbox_id, agent_type, root=sandbox_record.root,
+                sandbox_id=sandbox_id,
             )
         except Exception as e:
             if not _should_replace_daytona_sandbox(e):
@@ -1574,6 +1580,7 @@ async def _do_resume(
                 supervisor_url = await start_supervisor_in_sandbox(
                     sandbox, agent_record.config.agent_type or "claude",
                     supervisor_port, root=root, user_creds=user_creds,
+                    sandbox_id=sandbox_id,
                 )
                 url = supervisor_url
             except RuntimeError as e:
@@ -1747,13 +1754,6 @@ async def _do_resume(
 async def get_or_recover_session(
     session_id: str, user_creds: dict[str, str] | None = None,
 ) -> SessionState:
-    # Fall back to request-scoped creds (from X-Claude-Oauth-Token header)
-    # when no explicit creds were provided. This makes every endpoint
-    # that triggers an auto-recover carry the caller's token forward —
-    # critical after an idle-reap cycle, otherwise the respawned
-    # supervisor would silently fall back to server env creds.
-    if user_creds is None:
-        user_creds = _REQUEST_USER_CREDS.get()
     """Get a live session, recovering from DB if it was reaped.
 
     This is the single entry point for all session endpoints. Checks
@@ -1999,6 +1999,14 @@ async def sessions_create_on_existing_sandbox(request: Request):
     if sandbox_record is None:
         return JSONResponse({"error": "sandbox not found"}, status_code=404)
 
+    # Persist (or update) the caller's creds on the sandbox row so later
+    # auto-recovery spawns can pick them up without hive re-sending.
+    if user_creds:
+        new_ciphertext = encrypt_user_creds(user_creds)
+        if new_ciphertext:
+            sandbox_record.encrypted_user_creds = new_ciphertext
+            await upsert_sandbox(sandbox_record)
+
     agent_type = data.get("agent_type", "claude")
     name = data.get("name")
     config_data = data.get("config", {})
@@ -2045,7 +2053,7 @@ async def sessions_create_on_existing_sandbox(request: Request):
             supervisor_port = allocate_sandbox_port(sandbox_id)
             supervisor_url = await start_supervisor_in_sandbox(
                 sandbox, config.agent_type or "claude", supervisor_port, root=root,
-                user_creds=user_creds,
+                user_creds=user_creds, sandbox_id=sandbox_id,
             )
             url = supervisor_url
         except Exception as e:
@@ -2185,6 +2193,7 @@ async def sessions_quick_create(request: Request):
             sandbox_ref=sandbox_ref,
             status=STATUS_RUNNING,
             root=root,
+            encrypted_user_creds=encrypt_user_creds(user_creds),
         )
     )
 

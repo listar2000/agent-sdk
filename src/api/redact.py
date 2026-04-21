@@ -29,6 +29,9 @@ _PATTERNS = [
     re.compile(r'(?:mongodb|postgres|mysql|redis)://[^:]+:[^@]+@\S+'),
     # Generic key=value for common secret env var names
     re.compile(r'(?:API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|OAUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|PRIVATE_KEY|PASSWORD|DB_PASSWORD|DATABASE_URL)\s*[=:]\s*\S{8,}', re.IGNORECASE),
+    # Fernet ciphertext — starts with gAAAA and is a long urlsafe-base64 run.
+    # Used for encrypted per-sandbox user creds in agent-sdk.
+    re.compile(r'\bgAAAA[A-Za-z0-9_\-=]{60,}\b'),
 ]
 
 _REDACTED = "[REDACTED]"

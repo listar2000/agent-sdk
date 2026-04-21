@@ -76,6 +76,8 @@ _MIGRATIONS = [
     "ALTER TABLE sandboxes DROP COLUMN IF EXISTS updated_at",
     # 2026-04-16: add root column for sandbox filesystem boundary
     "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS root TEXT NOT NULL DEFAULT '/tmp'",
+    # 2026-04-20: per-sandbox user credentials (Fernet ciphertext, see src/api/crypto.py)
+    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS encrypted_user_creds TEXT",
 ]
 
 
@@ -193,13 +195,14 @@ async def delete_agent(agent_id: str) -> None:
 async def upsert_sandbox(sandbox: SandboxRecord) -> None:
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO sandboxes (id, provider, sandbox_ref, status, root)"
-            " VALUES (%s, %s, %s, %s, %s)"
+            "INSERT INTO sandboxes (id, provider, sandbox_ref, status, root, encrypted_user_creds)"
+            " VALUES (%s, %s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
             " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
-            " root=EXCLUDED.root",
+            " root=EXCLUDED.root,"
+            " encrypted_user_creds=COALESCE(EXCLUDED.encrypted_user_creds, sandboxes.encrypted_user_creds)",
             (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status,
-             sandbox.root),
+             sandbox.root, sandbox.encrypted_user_creds),
         )
 
 
@@ -214,6 +217,7 @@ async def get_sandbox(sandbox_id: str) -> SandboxRecord | None:
         id=row["id"], provider=row["provider"],
         sandbox_ref=row["sandbox_ref"], status=row["status"],
         root=row.get("root", "/tmp"),
+        encrypted_user_creds=row.get("encrypted_user_creds"),
     )
 
 
@@ -223,7 +227,8 @@ async def list_sandboxes() -> list[SandboxRecord]:
     return [
         SandboxRecord(id=r["id"], provider=r["provider"],
                       sandbox_ref=r["sandbox_ref"], status=r["status"],
-                      root=r.get("root", "/tmp"))
+                      root=r.get("root", "/tmp"),
+                      encrypted_user_creds=r.get("encrypted_user_creds"))
         for r in rows
     ]
 
