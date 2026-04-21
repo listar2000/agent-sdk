@@ -4,6 +4,7 @@ Run: uvicorn src.api.server:app --port 7778
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -330,6 +331,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Per-request user credentials: populated from X-Claude-Oauth-Token /
+# X-Anthropic-Api-Key headers so every endpoint that auto-recovers a
+# stopped sandbox (post_session_message, session_events, cancel, …)
+# can re-spawn its supervisor with the caller's token instead of
+# silently falling back to the server's shared env.
+_REQUEST_USER_CREDS: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "request_user_creds", default=None,
+)
+
+
+@app.middleware("http")
+async def _capture_request_user_creds(request: Request, call_next):
+    oauth = request.headers.get("x-claude-oauth-token")
+    api_key = request.headers.get("x-anthropic-api-key")
+    creds: dict[str, str] = {}
+    if oauth:
+        creds["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
+    if api_key:
+        creds["ANTHROPIC_API_KEY"] = api_key
+    token = _REQUEST_USER_CREDS.set(creds or None)
+    try:
+        return await call_next(request)
+    finally:
+        _REQUEST_USER_CREDS.reset(token)
 
 
 @app.exception_handler(HTTPException)
@@ -1720,6 +1747,13 @@ async def _do_resume(
 async def get_or_recover_session(
     session_id: str, user_creds: dict[str, str] | None = None,
 ) -> SessionState:
+    # Fall back to request-scoped creds (from X-Claude-Oauth-Token header)
+    # when no explicit creds were provided. This makes every endpoint
+    # that triggers an auto-recover carry the caller's token forward —
+    # critical after an idle-reap cycle, otherwise the respawned
+    # supervisor would silently fall back to server env creds.
+    if user_creds is None:
+        user_creds = _REQUEST_USER_CREDS.get()
     """Get a live session, recovering from DB if it was reaped.
 
     This is the single entry point for all session endpoints. Checks
