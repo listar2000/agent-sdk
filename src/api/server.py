@@ -251,7 +251,13 @@ async def _idle_reaper():
     while True:
         await asyncio.sleep(REAPER_TICK_S)
         now = time.time()
-        log.info("idle reaper tick: sessions=%d", len(SESSIONS))
+        busy = sum(1 for s in SESSIONS.values() if s.agent_busy)
+        readers = sum(1 for s in SESSIONS.values() if s._reader_alive)
+        subs = sum(len(s._session_subscribers) for s in SESSIONS.values())
+        log.info(
+            "idle reaper tick: sessions=%d busy=%d readers=%d subs=%d instances=%d",
+            len(SESSIONS), busy, readers, subs, len(_INSTANCES),
+        )
 
         for state in list(SESSIONS.values()):
             if (
@@ -348,7 +354,13 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "sessions": len(SESSIONS),
+        "busy_sessions": sum(1 for s in SESSIONS.values() if s.agent_busy),
+        "readers_alive": sum(1 for s in SESSIONS.values() if s._reader_alive),
+        "instances": len(_INSTANCES),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +546,7 @@ def _start_sse_reader(state: SessionState) -> None:
                     sse_http = httpx.AsyncClient(
                         base_url=state.client.base_url,
                         timeout=None,
+                        proxy=None,
                     )
                     async with sse_http.stream(
                         "GET",
@@ -2430,9 +2443,19 @@ async def session_events(session_id: str):
 
         async def _heartbeat_loop():
             try:
+                hb_count = 0
                 while True:
                     await asyncio.sleep(heartbeat_interval)
                     state.broadcast(None)  # heartbeat to all subscribers
+                    hb_count += 1
+                    if hb_count % 4 == 0:  # log every ~2 min
+                        log.debug(
+                            "[HEARTBEAT] session %s: sent %d heartbeats, "
+                            "busy=%s, subs=%d, reader=%s",
+                            state.session_id[:8], hb_count,
+                            state.agent_busy, len(state._session_subscribers),
+                            state._reader_alive,
+                        )
             except asyncio.CancelledError:
                 pass
 
@@ -2717,6 +2740,18 @@ async def serve_ui():
         except FileNotFoundError:
             return PlainTextResponse("UI not found", status_code=404)
     return Response(content=_UI_HTML, media_type="text/html")
+
+
+@app.get("/ui/dashboard")
+async def serve_dashboard():
+    """Serve the validation dashboard."""
+    try:
+        return Response(
+            content=(Path(__file__).parents[2] / "ui" / "dashboard.html").read_text(),
+            media_type="text/html",
+        )
+    except FileNotFoundError:
+        return PlainTextResponse("Dashboard not found", status_code=404)
 
 
 @app.get("/ui/files")

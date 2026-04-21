@@ -54,6 +54,7 @@ class AcpClient:
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
+            proxy=None,
         )
         self._inner_session_ids: dict[str, str] = {}  # session_id -> agent's internal session ID
 

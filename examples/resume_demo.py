@@ -66,7 +66,7 @@ async def main():
     print(f"Inner session: {agent.inner_session_id}")
 
     saved_session = agent.session_id
-    await agent.aclose()
+    await agent._client.aclose()  # close HTTP client without reaping
 
     print("\n=== Step 2: Force-reap server-side (kills supervisor + ACP child) ===\n")
     async with httpx.AsyncClient(base_url=api_url, timeout=30.0) as adm:
