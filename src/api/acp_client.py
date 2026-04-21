@@ -222,7 +222,7 @@ class AcpClient:
         if not inner_sid:
             return
         await self._send_rpc(session_id, "session/set_config_option",
-                             {"sessionId": inner_sid, "key": "model", "value": model})
+                             {"sessionId": inner_sid, "configId": "model", "value": model})
 
     async def set_thought_level(self, session_id: str, level: str) -> None:
         """Set thinking depth ('high', 'medium', 'low')."""
@@ -230,7 +230,7 @@ class AcpClient:
         if not inner_sid:
             return
         await self._send_rpc(session_id, "session/set_config_option",
-                             {"sessionId": inner_sid, "key": "thinking", "value": level})
+                             {"sessionId": inner_sid, "configId": "thinking", "value": level})
 
     async def aclose(self) -> None:
         await self._client.aclose()
