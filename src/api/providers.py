@@ -103,6 +103,21 @@ def _get_sandbox_env_vars(user_creds: dict[str, str] | None = None) -> dict[str,
     return env
 
 
+def _opposite_auth_vars_to_unset(user_creds: dict[str, str] | None) -> list[str]:
+    """When the caller supplies one auth mode, return the opposite auth vars
+    that MUST be unset in the spawned supervisor's env — otherwise whatever
+    was baked into the Daytona sandbox at provision time (server's shared
+    ANTHROPIC_API_KEY etc.) will be inherited by the node process and
+    override the caller's credentials."""
+    if not user_creds:
+        return []
+    if "CLAUDE_CODE_OAUTH_TOKEN" in user_creds:
+        return ["ANTHROPIC_API_KEY"]
+    if "ANTHROPIC_API_KEY" in user_creds:
+        return ["CLAUDE_CODE_OAUTH_TOKEN"]
+    return []
+
+
 @dataclass
 class ProviderInstance:
     """A running ACP supervisor instance."""
@@ -427,7 +442,9 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
     env_vars = _get_sandbox_env_vars(user_creds)
-    env_prefix = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
+    env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
+    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(user_creds))
+    env_prefix = f"{env_unset} {env_set}".strip()
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
         f"setsid env {env_prefix} node supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_REMOTE_PORT} "
@@ -479,7 +496,9 @@ async def start_supervisor_in_sandbox(
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
     env_vars = _get_sandbox_env_vars(user_creds)
-    env_prefix = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
+    env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
+    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _opposite_auth_vars_to_unset(user_creds))
+    env_prefix = f"{env_unset} {env_set}".strip()
     log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
