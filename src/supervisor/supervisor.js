@@ -11,6 +11,8 @@
  *   GET  /v1/acp/{session_id}   SSE stream of every line emitted by
  *                                claude-agent-acp's stdout, formatted as
  *                                `data: {json}\n\n` blocks.
+ *   POST /v1/exec               run a shell command — {command, timeout?}
+ *                                returns {stdout, stderr, exit_code, timed_out}
  *   GET  /v1/health             liveness — {status, acp_pid, acp_alive}
  *
  * One claude-agent-acp subprocess per supervisor, shared across all
@@ -433,6 +435,92 @@ async function handleFilesEdit(req, res) {
   );
 }
 
+const MAX_EXEC_OUTPUT = 1 * 1024 * 1024; // 1 MB
+
+async function handleExec(req, res) {
+  let raw = "";
+  req.setEncoding("utf8");
+  for await (const chunk of req) raw += chunk;
+
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch (e) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid JSON body: " + e.message }));
+    return;
+  }
+
+  const command = body.command;
+  const timeout = Math.min(parseInt(body.timeout, 10) || 30, 300) * 1000;
+
+  if (typeof command !== "string" || !command.trim()) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "command required" }));
+    return;
+  }
+
+  await new Promise((resolve) => {
+    const child = spawn("sh", ["-c", command], {
+      cwd: args.root,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill("SIGKILL"); } catch {}
+    }, timeout);
+
+    child.stdout.on("data", (chunk) => {
+      if (stdout.length < MAX_EXEC_OUTPUT) {
+        stdout += chunk.toString("utf8");
+        if (stdout.length >= MAX_EXEC_OUTPUT) {
+          stdout = stdout.slice(0, MAX_EXEC_OUTPUT);
+          stdoutTruncated = true;
+        }
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < MAX_EXEC_OUTPUT) {
+        stderr += chunk.toString("utf8");
+        if (stderr.length >= MAX_EXEC_OUTPUT) {
+          stderr = stderr.slice(0, MAX_EXEC_OUTPUT);
+          stderrTruncated = true;
+        }
+      }
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const result = {
+        stdout,
+        stderr,
+        exit_code: timedOut ? -1 : (code ?? -1),
+        timed_out: timedOut,
+      };
+      if (stdoutTruncated) result.stdout_truncated = true;
+      if (stderrTruncated) result.stderr_truncated = true;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(result));
+      resolve();
+    });
+
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: e.message, stdout: "", stderr: "", exit_code: -1 }));
+      resolve();
+    });
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === "/v1/health" || req.url === "/health") {
     const body = JSON.stringify({
@@ -556,6 +644,16 @@ const server = http.createServer((req, res) => {
   if (req.url && req.url.startsWith("/v1/files/edit") && req.method === "POST") {
     handleFilesEdit(req, res).catch((e) => {
       log("files/edit handler crashed: " + e.stack);
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      } catch {}
+    });
+    return;
+  }
+  if (req.url === "/v1/exec" && req.method === "POST") {
+    handleExec(req, res).catch((e) => {
+      log("exec handler crashed: " + e.stack);
       try {
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));
