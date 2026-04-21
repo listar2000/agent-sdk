@@ -107,7 +107,7 @@ def init_db() -> None:
 _pool: AsyncConnectionPool | None = None
 
 
-async def init_pool(min_size: int = 2, max_size: int = 10) -> None:
+async def init_pool(min_size: int = 2, max_size: int = 64) -> None:
     global _pool
     _pool = AsyncConnectionPool(
         DATABASE_URL,
