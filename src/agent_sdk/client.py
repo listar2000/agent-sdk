@@ -311,12 +311,17 @@ class Agent:
             config["mcp_servers"] = self.mcp_servers
         if self.skills is not None:
             config["skills"] = self.skills
-        # Credentials ride at top level so the server can pop them before any
-        # merge into config/AgentConfig/DB. Never include inside the config dict.
+        # Credentials ride through the standard ``secrets`` channel — the
+        # server pops env/secrets uniformly via ``_pop_env_and_secrets`` and
+        # merges them into the sandbox's ``spawn_env``. No special-case
+        # oauth_token / api_key handling anywhere.
+        secrets: dict[str, str] = {}
         if self._oauth_token:
-            config["oauth_token"] = self._oauth_token
+            secrets["CLAUDE_CODE_OAUTH_TOKEN"] = self._oauth_token
         if self._api_key:
-            config["api_key"] = self._api_key
+            secrets["ANTHROPIC_API_KEY"] = self._api_key
+        if secrets:
+            config["secrets"] = secrets
         return config
 
     def __repr__(self) -> str:

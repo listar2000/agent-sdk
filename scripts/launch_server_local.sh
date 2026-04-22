@@ -32,12 +32,17 @@ fi
 
 cd "${REPO_ROOT}"
 
-# Load env vars (API keys, SSL cert, etc.)
-if [ -f "${HOME}/.env" ]; then
-    set -a
-    source "${HOME}/.env"
-    set +a
-fi
+# Load env vars (API keys, SSL cert, etc.). Prefer the repo-local .env,
+# fall back to the user's ~/.env — this matches `set -a; source .env` that
+# users run manually before hitting the examples.
+for env_file in "${REPO_ROOT}/.env" "${HOME}/.env"; do
+    if [ -f "${env_file}" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${env_file}"
+        set +a
+    fi
+done
 
 # ── Python venv ─────────────────────────────────────────────────────────────
 needs_install=0

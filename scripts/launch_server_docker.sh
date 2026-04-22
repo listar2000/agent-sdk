@@ -22,12 +22,16 @@ fi
 
 cd "${REPO_ROOT}"
 
-# Load env vars (API keys, SSL cert, etc.)
-if [ -f "${HOME}/.env" ]; then
-    set -a
-    source "${HOME}/.env"
-    set +a
-fi
+# Load env vars (API keys, SSL cert, etc.). Prefer the repo-local .env,
+# fall back to the user's ~/.env.
+for env_file in "${REPO_ROOT}/.env" "${HOME}/.env"; do
+    if [ -f "${env_file}" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${env_file}"
+        set +a
+    fi
+done
 
 needs_install=0
 recreate_venv=0

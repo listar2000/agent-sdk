@@ -156,12 +156,33 @@ async def start_supervisor_in_sandbox(
         # Volume-cached mode: extract deps tarball to local ephemeral dir.
         # Reading one archive from the volume is fast; we never write
         # node_modules there.
-        await loop.run_in_executor(None, lambda: _exec(
+        extract_out = await loop.run_in_executor(None, lambda: _exec(
+            f"set -e && "
             f"mkdir -p {local_work} && "
-            f"tar -C {local_work} -xzf {vol_tarball} && "
-            f"cp {vol_supervisor} {local_work}/supervisor.js",
+            # Copy the tarball off the slow volume first; S3-backed FUSE
+            # reads block the tar streaming decode if a chunk hasn't been
+            # fetched yet and show up as silent tar data corruption.
+            f"cp {vol_tarball} /tmp/deps-{port}.tar.gz && "
+            f"ls -l /tmp/deps-{port}.tar.gz && "
+            f"echo '--- tarball content sample ---' && "
+            f"tar -tzf /tmp/deps-{port}.tar.gz | grep -c 'node_modules/.bin' && "
+            f"tar -C {local_work} -xzf /tmp/deps-{port}.tar.gz && "
+            f"cp {vol_supervisor} {local_work}/supervisor.js && "
+            f"rm -f /tmp/deps-{port}.tar.gz && "
+            f"echo '--- extracted .bin/ ---' && "
+            f"ls -la {local_work}/node_modules/.bin/{bin_name} 2>&1 && "
+            f"target=$(readlink -f {local_work}/node_modules/.bin/{bin_name}) && "
+            f"echo \"target=$target\" && "
+            f"ls -la \"$target\" && "
+            f"head -1 \"$target\" && "
+            # npm install should set +x on bin entries — but tar sometimes
+            # strips it when packing + extracting across hosts. Re-apply.
+            f"chmod +x \"$target\" && "
+            f"test -x \"$target\" && echo 'bin executable' || echo 'bin NOT executable'",
             120,
         ))
+        log.info("start_supervisor_in_sandbox: volume cache extract for sandbox %s:\n%s",
+                 sandbox.id[:16], extract_out)
         sup_dir = local_work
         log.info("start_supervisor_in_sandbox: using volume cache → %s (port %d, sandbox %s)",
                  local_work, port, sandbox.id[:16])
@@ -171,7 +192,16 @@ async def start_supervisor_in_sandbox(
         log.info("start_supervisor_in_sandbox: using legacy path %s (port %d, sandbox %s)",
                  _SUPERVISOR_REMOTE_DIR, port, sandbox.id[:16])
 
-    acp_bin = f"{sup_dir}/node_modules/.bin/{bin_name}"
+    # Resolve the symlink target explicitly. node.spawn() on a symlinked
+    # script occasionally surfaces ENOENT on the symlink path even when
+    # the target resolves fine — the node runtime's execve loop doesn't
+    # always follow symlinks for script-with-shebang reliably. Passing
+    # the concrete index.js target sidesteps the class of bugs.
+    acp_bin_resolved = await loop.run_in_executor(None, lambda: _exec(
+        f"readlink -f {sup_dir}/node_modules/.bin/{bin_name}"
+    ))
+    acp_bin = (acp_bin_resolved.strip()
+               or f"{sup_dir}/node_modules/.bin/{bin_name}")
     env_prefix = _build_env_prefix(spawn_env)
     log_file = f"{sup_dir}/sup-{port}.log"
     supervisor_argv = build_supervisor_argv(
@@ -179,7 +209,12 @@ async def start_supervisor_in_sandbox(
         acp_launch_args=_acp_launch_args(agent_type),
         port=port, root=root, quote_paths=False,
     )
+    # Ensure the agent's HOME (``root``) exists inside the sandbox before
+    # the supervisor spawns the ACP child with ``cwd=root``. If the volume
+    # subpath hasn't been pre-created, node.spawn() fails with a
+    # misleading ENOENT pointing at the binary rather than the cwd.
     inner = (
+        f"mkdir -p {shlex.quote(root)} && "
         f"cd {sup_dir} && "
         f"setsid env {env_prefix} {supervisor_argv} "
         f"> {log_file} 2>&1 </dev/null & echo started"

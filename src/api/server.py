@@ -2957,6 +2957,7 @@ async def sessions_quick_create(request: Request):
     # lazily. Fill in the supervisor URL now so AcpClient has a real endpoint.
     # Docker/Local already started the supervisor inside create_sandbox.
     url = instance.url
+    supervisor_port: int | None = None
     if not url:
         supervisor_port = allocate_sandbox_port(sandbox_id)
         try:
@@ -2978,6 +2979,8 @@ async def sessions_quick_create(request: Request):
             return JSONResponse(
                 {"error": f"Failed to start supervisor: {e}"}, status_code=502,
             )
+    else:
+        supervisor_port = instance.port
     acp_session_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
 
@@ -3016,6 +3019,8 @@ async def sessions_quick_create(request: Request):
         inner_session_id=inner_session_id,
         agent_type=config.agent_type or "claude",
         client=client,
+        supervisor_url=url,
+        supervisor_port=supervisor_port,
     )
     SESSIONS[session_id] = state
     _start_session_tasks(state)
