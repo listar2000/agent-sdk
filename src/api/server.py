@@ -2545,6 +2545,7 @@ async def sessions_quick_create(request: Request):
             skill_cmds = []  # don't pass to create_instance
 
     sandbox_id = str(uuid.uuid4())
+    subpath = f"agents/{agent_id}/home"
     try:
         instance = await create_instance(
             provider,
@@ -2553,6 +2554,8 @@ async def sessions_quick_create(request: Request):
             pre_start_commands=skill_cmds if provider != "local" else None,
             root=root,
             spawn_env=spawn_env,
+            volume_id=volume_record.provider_ref,
+            subpath=subpath,
         )
     except Exception as e:
         await delete_agent(agent_id)
@@ -2579,7 +2582,7 @@ async def sessions_quick_create(request: Request):
             status=STATUS_RUNNING,
             root=root,
             volume_id=volume_id,
-            subpath=f"agents/{agent_id}/home",
+            subpath=subpath,
         )
     )
 
