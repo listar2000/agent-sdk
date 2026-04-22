@@ -855,6 +855,24 @@ async def stop_daytona(instance: ProviderInstance) -> None:
     await _daytona_sandbox_op(instance, "stop")
 
 
+async def start_daytona(sandbox_ref: str) -> None:
+    """Start a stopped Daytona sandbox by its provider ref."""
+    try:
+        daytona = _get_daytona_client()
+    except (ImportError, RuntimeError) as e:
+        log.warning("cannot start daytona sandbox %s: %s", sandbox_ref, e)
+        return
+
+    loop = asyncio.get_running_loop()
+    try:
+        sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
+        await loop.run_in_executor(None, sandbox.start)
+        log.info("daytona sandbox started: %s", sandbox_ref)
+    except Exception as e:
+        log.warning("failed to start daytona sandbox %s: %s", sandbox_ref, e)
+        raise
+
+
 # ── Docker provider ──
 
 _SUPERVISOR_DOCKER_IMAGE = "agent-sdk-acp-supervisor:latest"

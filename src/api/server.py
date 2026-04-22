@@ -2116,6 +2116,100 @@ async def _do_resume(
         }
 
 
+async def ensure_sandbox(session_row: dict) -> SandboxRecord:
+    """Guarantees: returns a sandbox that is currently live on the provider.
+
+    Idempotent: safe to call multiple times in a row. Creates/restarts/replaces
+    as needed. Emits a ``sandbox_reattach`` event when the returned sandbox is
+    a replacement for a previously-recorded one.
+
+    Holds the per-session lock for the entire check-and-act sequence so
+    concurrent callers don't double-provision.
+    """
+    session_id = session_row["id"]
+    async with _get_session_lock(session_id):
+        return await _ensure_sandbox_locked(session_row)
+
+
+async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
+    session_id = session_row["id"]
+    # Re-read after acquiring lock in case a concurrent caller updated it.
+    fresh = await get_session(session_id)
+    if fresh is None:
+        raise HTTPException(404, "Session not found")
+    current_id = fresh.get("current_sandbox_id")
+
+    # Case A: no sandbox yet — create one.
+    if current_id is None:
+        return await _provision_new(fresh, previous_id=None)
+
+    sb = await get_sandbox(current_id)
+
+    # Case B: row was deleted — replace and emit reattach.
+    if sb is None:
+        await set_session_current_sandbox(session_id, None)
+        return await _provision_new(fresh, previous_id=current_id)
+
+    # Case C-F: row exists — probe provider state.
+    status = await _providers_mod.get_daytona_sandbox_status(sb.sandbox_ref)
+    if status == "running":
+        return sb
+    if status == "stopped":
+        await _providers_mod.start_daytona(sb.sandbox_ref)
+        sb.status = STATUS_RUNNING
+        await upsert_sandbox(sb)
+        return sb
+    if status in ("missing", "error"):
+        if status == "error":
+            try:
+                inst = ProviderInstance(provider="daytona", url="",
+                                        root=sb.root, sandbox_id=sb.sandbox_ref)
+                await _providers_mod.destroy_daytona(inst)
+            except Exception:
+                pass
+        await delete_sandbox(sb.id)
+        await set_session_current_sandbox(session_id, None)
+        return await _provision_new(fresh, previous_id=current_id)
+    raise HTTPException(500, f"Unknown sandbox status: {status}")
+
+
+async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxRecord:
+    """Create a fresh Daytona sandbox with session.volume + agents/<agent>/home."""
+    vol = await get_volume(session_row["volume_id"])
+    if vol is None:
+        raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
+    agent_id = session_row["agent_id"]
+    subpath = f"agents/{agent_id}/home"
+    agent = await get_agent(agent_id)
+    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+
+    inst = await _providers_mod.provision_daytona_sandbox(
+        agent_type=agent_type,
+        volume_id=vol.provider_ref,
+        subpath=subpath,
+    )
+    sb = SandboxRecord(
+        id=f"sb_{uuid.uuid4().hex[:12]}",
+        provider="daytona",
+        sandbox_ref=inst.sandbox_id,
+        status=STATUS_RUNNING,
+        root="/home/daytona",
+        volume_id=vol.id,
+        subpath=subpath,
+    )
+    await upsert_sandbox(sb)
+    await set_session_current_sandbox(session_row["id"], sb.id)
+    if previous_id is not None:
+        await log_event(
+            session_id=session_row["id"],
+            agent_id=agent_id,
+            sandbox_id=sb.id,
+            event_type="sandbox_reattach",
+            payload={"old_sandbox_id": previous_id, "new_sandbox_id": sb.id},
+        )
+    return sb
+
+
 async def _lazy_provision_sandbox_for_session(
     session_id: str,
     previous_sandbox_id: str | None = None,
