@@ -51,6 +51,7 @@ from .db import (
     session_has_log_entries,
     update_session_env,
     update_session_secrets,
+    set_session_current_sandbox,
     upsert_agent,
     upsert_sandbox,
     upsert_session,
@@ -2041,6 +2042,49 @@ async def _do_resume(
         }
 
 
+async def _lazy_provision_sandbox_for_session(session_id: str) -> SandboxRecord:
+    """Provision a new Daytona sandbox for a session that has no current one.
+
+    Uses the session's volume + agents/<agent_id>/home subpath. Persists the
+    sandbox row and sets sessions.current_sandbox_id. Returns the SandboxRecord.
+    """
+    sess = await get_session(session_id)
+    if sess is None:
+        raise HTTPException(404, "Session not found")
+    vol_id = sess.get("volume_id")
+    if vol_id is None:
+        raise HTTPException(500, "Session has no volume_id")
+    vol = await get_volume(vol_id)
+    if vol is None:
+        raise HTTPException(500, f"Session's volume {vol_id} no longer exists")
+    if vol.provider != "daytona":
+        raise HTTPException(501, f"Provider {vol.provider} not supported for lazy provisioning")
+
+    agent_id = sess["agent_id"]
+    agent = await get_agent(agent_id)
+    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+    subpath = f"agents/{agent_id}/home"
+
+    inst = await _providers_mod.create_daytona(
+        agent_type=agent_type,
+        volume_id=vol.provider_ref,
+        subpath=subpath,
+    )
+    import uuid as _uuid
+    sandbox = SandboxRecord(
+        id=f"sb_{_uuid.uuid4().hex[:12]}",
+        provider="daytona",
+        sandbox_ref=inst.sandbox_id,
+        status="running",
+        root="/home/daytona",
+        volume_id=vol.id,
+        subpath=subpath,
+    )
+    await upsert_sandbox(sandbox)
+    await set_session_current_sandbox(session_id, sandbox.id)
+    return sandbox
+
+
 async def get_or_recover_session(
     session_id: str, spawn_env: dict[str, str] | None = None,
 ) -> SessionState:
@@ -2109,9 +2153,14 @@ async def get_or_recover_session(
         log.warning("session %s not found in DB", session_id)
         raise HTTPException(status_code=404, detail="session not found")
 
+    if rec.get("current_sandbox_id") is None:
+        # Lazy session — provision on demand and re-read the row.
+        await _lazy_provision_sandbox_for_session(session_id)
+        rec = await get_session(session_id)
+
     agent_id = rec.get("agent_id")
     inner_session_id = rec.get("inner_session_id")
-    sandbox_id = rec.get("sandbox_id")
+    sandbox_id = rec.get("current_sandbox_id")
     if not agent_id or not inner_session_id or not sandbox_id:
         log.warning("session %s record incomplete: %s", session_id, rec)
         raise HTTPException(status_code=404, detail="session record incomplete")

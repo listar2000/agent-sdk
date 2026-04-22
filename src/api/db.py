@@ -405,6 +405,14 @@ async def update_session_secrets(session_id: str, secrets: dict[str, str]) -> No
         )
 
 
+async def set_session_current_sandbox(session_id: str, sandbox_id: str | None) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET current_sandbox_id = %s WHERE id = %s",
+            (sandbox_id, session_id),
+        )
+
+
 async def get_session(session_id: str) -> dict | None:
     async with get_db() as conn:
         row = await (await conn.execute(

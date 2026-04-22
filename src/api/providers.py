@@ -798,6 +798,25 @@ async def delete_daytona_volume(provider_ref: str) -> None:
     await asyncio.to_thread(volumes_api.delete_volume, provider_ref)
 
 
+async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
+    """Return one of: 'running' | 'stopped' | 'missing' | 'error'."""
+    try:
+        client = _get_daytona_client()
+        sb = await asyncio.to_thread(client.get, sandbox_ref)
+    except Exception as e:
+        msg = str(e).lower()
+        if "not found" in msg or "404" in msg:
+            return "missing"
+        return "error"
+    state = (getattr(sb, "state", None) or "")
+    state_str = (state.value if hasattr(state, "value") else str(state)).lower()
+    if state_str in ("started", "running"):
+        return "running"
+    if state_str in ("stopped", "paused"):
+        return "stopped"
+    return "error"
+
+
 async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
     """Shared logic for destroy/stop Daytona sandbox."""
     if not instance.sandbox_id:
