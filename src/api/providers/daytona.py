@@ -34,6 +34,15 @@ _SUPERVISOR_REMOTE_DIR = "/tmp/agent-sdk-sup"  # legacy path (pre-volume era)
 _SUPERVISOR_VOLUME_DIR = "/opt/supervisor"      # volume-mounted path (Phase 2+)
 _SUPERVISOR_REMOTE_PORT = 9100
 
+# Per-session Daytona sandboxes always mount the agent's volume subpath at
+# /home/daytona (see _build_volume_mounts). Any supervisor / ACP child that
+# wants Claude Code's session JSONL files to persist MUST run with
+# HOME=/home/daytona — otherwise the CLI writes to the VM-default /root/.claude
+# which is ephemeral, and session/load fails after stop/delete with
+# "No conversation found with session ID …". Keep this constant canonical so
+# ensure_supervisor_url / restart_daytona_supervisor agree.
+_DAYTONA_VOLUME_HOME = "/home/daytona"
+
 
 def _get_daytona_client():
     """Get a Daytona SDK client. Raises ImportError or RuntimeError on failure."""
@@ -397,9 +406,13 @@ async def restart_daytona_supervisor(
         # Volume-cached path. Uses the fixed supervisor port so the
         # signed URL is stable across restarts for an already-issued
         # session (Daytona maps preview URLs by port).
+        # Force HOME=/home/daytona for session persistence (see
+        # ensure_supervisor_url for the rationale).
+        effective_env = dict(spawn_env or {})
+        effective_env["HOME"] = _DAYTONA_VOLUME_HOME
         url = await start_supervisor_in_sandbox(
             sandbox, agent_type, _SUPERVISOR_REMOTE_PORT,
-            root=root, spawn_env=spawn_env,
+            root=_DAYTONA_VOLUME_HOME, spawn_env=effective_env,
         )
         return ProviderInstance(
             provider="daytona",
@@ -655,9 +668,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
 
 async def stop_sandbox(inst: ProviderInstance) -> None:
     return await stop_daytona(inst)
-
-
-_DAYTONA_VOLUME_HOME = "/home/daytona"
 
 
 async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,

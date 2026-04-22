@@ -79,6 +79,7 @@ from . import providers as _providers_mod
 from .providers import (
     PORT_BASED_PROVIDERS,
     ProviderInstance,
+    SandboxMissingError,
     allocate_sandbox_port,
     create_instance,
     destroy_instance,
@@ -2413,6 +2414,12 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
                 spawn_env=effective_spawn_env,
                 port=supervisor_port,
             )
+        except SandboxMissingError:
+            # Provider says the sandbox is gone (deleted out-of-band). Let the
+            # caller (ensure_session_live) re-provision a replacement rather
+            # than surfacing a 500.
+            free_sandbox_port(sandbox.id, supervisor_port)
+            raise
         except Exception as exc:
             free_sandbox_port(sandbox.id, supervisor_port)
             raise HTTPException(500, f"Failed to start supervisor: {exc}") from exc
@@ -2433,11 +2440,31 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
                 "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
             })
             client.set_inner_session_id(acp_session_id, inner_sid)
+            # Match the mode that session/new sets on a fresh session —
+            # otherwise a reloaded session inherits the default
+            # "ask-before-every-tool" mode and the agent starts refusing
+            # shell commands after any sandbox restart.
+            try:
+                await client.set_mode(acp_session_id, "bypassPermissions")
+            except Exception:
+                pass
         except Exception as load_err:
             log.warning(
-                "session/load failed for session %s (inner_sid=%s): %s; falling back to fresh session",
-                session_id, inner_sid, load_err,
+                "session/load failed for session %s (inner_sid=%s, cwd=%s): %r",
+                session_id, inner_sid, cwd, load_err, exc_info=True,
             )
+            # Dump supervisor log tail (Daytona only) so the next run-through
+            # has a real stack trace instead of the JSON-RPC "Internal error".
+            if vol.provider == "daytona":
+                try:
+                    tail = await _tail_daytona_supervisor_log(
+                        sandbox.sandbox_ref, supervisor_port, lines=120
+                    )
+                    log.warning("session/load sup.log tail (sandbox=%s):\n%s",
+                                sandbox.sandbox_ref[:16], tail)
+                except Exception as tail_err:
+                    log.warning("could not fetch sup.log: %s", tail_err)
+            log.warning("falling back to fresh session for %s", session_id)
             inner_sid = None
     if not inner_sid:
         # Fresh conversation — wrap in wait_for with generous timeout.
@@ -2463,11 +2490,67 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     return state
 
 
-async def ensure_session_live(session_id: str) -> tuple[dict, SandboxRecord, SessionState]:
-    """One-shot: session → sandbox → runtime. Most endpoints use this."""
+async def _tail_daytona_supervisor_log(
+    sandbox_ref: str, port: int | None, lines: int = 120
+) -> str:
+    """Best-effort: read the tail of the Daytona supervisor log via process.exec."""
+    if port is None:
+        return "(no supervisor port)"
+    from .providers.daytona import _get_daytona_client
+    loop = asyncio.get_running_loop()
+    client = _get_daytona_client()
+    sb = await loop.run_in_executor(None, lambda: client.get(sandbox_ref))
+    cmd = f"tail -n {lines} /tmp/sup-work-{port}/sup-{port}.log 2>&1 || echo '(no log)'"
+    r = await loop.run_in_executor(None, lambda: sb.process.exec(cmd, timeout=10))
+    return (r.result if hasattr(r, "result") else str(r)) or "(empty)"
+
+
+async def _recover_missing_sandbox(
+    session_id: str, stale: SandboxRecord
+) -> tuple[dict, SandboxRecord]:
+    """Clear stale sandbox state after the provider reports it's gone.
+
+    Called exactly once when ``ensure_runtime`` raises ``SandboxMissingError``
+    (i.e. Daytona says "sandbox not found" during supervisor spawn). Evicts
+    the in-memory caches, deletes the stale DB row, unlinks it from the
+    session, then re-reads and re-runs ``ensure_sandbox`` — which now takes
+    Case A in ``_ensure_sandbox_locked`` (``current_sandbox_id is None``) and
+    provisions a replacement on the same volume. Not a retry loop: one
+    recoverable failure, one recovery, one forward path.
+    """
+    log.warning(
+        "sandbox %s (ref=%s) missing on provider; provisioning replacement on same volume",
+        stale.id, stale.sandbox_ref,
+    )
+    SESSIONS.pop(session_id, None)
+    _INSTANCES.pop(stale.id, None)
+    try:
+        await delete_sandbox(stale.id)
+    except Exception as del_err:
+        log.warning("delete_sandbox(%s) failed: %s", stale.id, del_err)
+    await set_session_current_sandbox(session_id, None)
     session = await _require_session_row(session_id)
     sandbox = await ensure_sandbox(session)
-    runtime = await ensure_runtime(session, sandbox)
+    return session, sandbox
+
+
+async def ensure_session_live(session_id: str) -> tuple[dict, SandboxRecord, SessionState]:
+    """One-shot: session → sandbox → runtime. Most endpoints use this.
+
+    Handles the one recoverable lifecycle event that callers shouldn't have to
+    know about: ``SandboxMissingError`` from ``ensure_runtime`` means the
+    provider lost the sandbox out-of-band (e.g. external ``daytona.delete()``).
+    We provision a replacement on the same volume and try the runtime build
+    once more — a second failure is fatal, since it means provisioning itself
+    is broken, not just the stale handle.
+    """
+    session = await _require_session_row(session_id)
+    sandbox = await ensure_sandbox(session)
+    try:
+        runtime = await ensure_runtime(session, sandbox)
+    except SandboxMissingError:
+        session, sandbox = await _recover_missing_sandbox(session_id, sandbox)
+        runtime = await ensure_runtime(session, sandbox)
     return session, sandbox, runtime
 
 
