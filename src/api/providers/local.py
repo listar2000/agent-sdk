@@ -250,13 +250,27 @@ async def create_sandbox(
     if port is None:
         port = await _find_free_port()
 
-    # Build the supervisor env: strip server-side credentials, set HOME +
-    # CLAUDE_CONFIG_DIR to the per-sandbox volume path, overlay caller env.
-    base_env = {k: v for k, v in os.environ.items() if k not in AUTH_KEYS}
+    # Build the supervisor env. Local provider is by definition single-tenant
+    # on the user's own host — inherit the host's AUTH_KEYS (CLAUDE_CODE_OAUTH_TOKEN,
+    # ANTHROPIC_API_KEY, etc.) so the user's locally-configured Claude credentials
+    # flow naturally without the SDK having to re-forward them. Caller-supplied
+    # env in ``effective_env`` can still override.
+    base_env = dict(os.environ)
     base_env.update(_get_sandbox_env_vars(effective_env))
     base_env["HOME"] = str(home_dir)
     base_env["CLAUDE_CONFIG_DIR"] = str(home_dir / ".claude")
     base_env["AGENT_SHARED_DIR"] = str(vol / "shared")
+
+    # Bridge the host user's existing Claude credentials into the per-sandbox
+    # CLAUDE_CONFIG_DIR on first start. Makes ``claude setup-token`` done once
+    # on the host flow naturally to every sandbox without re-auth per session.
+    host_cred = Path.home() / ".claude" / ".credentials.json"
+    sandbox_cred = home_dir / ".claude" / ".credentials.json"
+    if host_cred.is_file() and not sandbox_cred.exists():
+        try:
+            shutil.copy(host_cred, sandbox_cred)
+        except Exception as e:
+            log.warning("could not bridge host .credentials.json: %s", e)
 
     launch_args = _acp_launch_args(agent_type)
     extra: list[str] = []
