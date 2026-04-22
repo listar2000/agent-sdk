@@ -343,10 +343,10 @@ async def test_cross_provider_volume_rejection_via_provision_endpoint(client):
 
 @pytest.mark.asyncio
 async def test_cross_provider_volume_rejection_via_sandboxes_endpoint(client):
-    """POST /sandboxes with provider != volume.provider must also reject.
+    """POST /sandboxes with provider != volume.provider must reject with 400.
 
-    Note: the review flagged this endpoint may silently accept the mismatch
-    today. If so, marking xfail records a source-side bug for cycle 3.
+    The guard landed at server.py:1178-1182 — hard assert the contract now
+    that the source path is in place.  Earlier cycles gated on xfail.
     """
     from api.models import VolumeRecord
     await dbmod.upsert_volume(
@@ -370,17 +370,9 @@ async def test_cross_provider_volume_rejection_via_sandboxes_endpoint(client):
             },
         )
 
-    # Strict expected contract: reject with 400 + provider in message. If the
-    # source agent hasn't added this guard yet, the test xfails, surfacing the
-    # gap explicitly.
-    if r.status_code == 400:
-        err = (r.json().get("error") or "").lower()
-        assert "provider" in err, f"error should mention provider mismatch: {r.text}"
-    else:
-        pytest.xfail(
-            f"POST /sandboxes still accepts provider mismatch "
-            f"(status={r.status_code}, body={r.text}) — source bug"
-        )
+    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text}"
+    err = (r.json().get("error") or "").lower()
+    assert "provider" in err, f"error should mention provider mismatch: {r.text}"
 
 
 # ---------------------------------------------------------------------------

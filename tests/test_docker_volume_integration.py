@@ -890,3 +890,81 @@ class TestDockerReconcile:
                 pass
             await dprov.delete_volume(vol_name)
             await dbmod.close_pool()
+
+    @pytest.mark.asyncio
+    async def test_stop_sandbox_preserves_on_reconcile(self):
+        """MT7: ``docker stop`` (non-destructive) must leave a container
+        that ``reconcile_on_startup`` subsequently preserves.  End-to-end:
+        provision → docker stop (persists as exited) → DB row status='stopped'
+        → reconcile must NOT rm -f the exited container.
+
+        This is the canonical "user stopped the sandbox, server restarted"
+        flow.  The MA3 fix (landed) teaches reconcile to treat a
+        ``status='stopped'`` row as a resumable pair, not an orphan."""
+        _DB = os.environ.get("TEST_DATABASE_URL")
+        if _DB is None:
+            pytest.skip("TEST_DATABASE_URL not set")
+        os.environ["DATABASE_URL"] = _DB
+
+        from api import db as dbmod, server as srv  # noqa: E402
+        from api.models import SandboxRecord, VolumeRecord  # noqa: E402
+
+        dbmod.init_db()
+        await dbmod.init_pool()
+        async with dbmod.get_db() as conn:
+            await conn.execute("DELETE FROM session_log")
+            await conn.execute("DELETE FROM sessions")
+            await conn.execute("DELETE FROM sandboxes")
+            await conn.execute("DELETE FROM volumes")
+
+        vol_name = _vol_name()
+        cid: str | None = None
+        try:
+            await dprov.create_volume(vol_name)
+            await _seed_fake_supervisor(vol_name)
+            await dbmod.upsert_volume(VolumeRecord(
+                id="v-mt7", name=vol_name, provider="docker",
+                provider_ref=vol_name,
+            ))
+
+            sb_id = f"sb_{uuid.uuid4().hex[:10]}"
+            inst = await TestDockerReconcile._seeded_container(
+                vol_name, "agents/mt7/home", sb_id,
+            )
+            cid = inst.container_id
+            assert cid
+
+            # Non-destructive stop — container exits, row persists.
+            await dprov.stop_sandbox(inst)
+            assert await dprov.get_sandbox_status(cid) == "stopped"
+
+            # Mimic stop_sandbox_route's DB flip: status='stopped'.
+            await dbmod.upsert_sandbox(SandboxRecord(
+                id=sb_id, provider="docker", sandbox_ref=cid,
+                status="stopped", root="/home/agent",
+                volume_id="v-mt7", subpath="agents/mt7/home",
+                listen_port=inst.port,
+            ))
+
+            # Cold-restart state: the in-process instance map is empty.
+            srv._INSTANCES.clear()
+
+            # Reconcile must preserve the container.
+            await dprov.reconcile_on_startup()
+
+            status = await dprov.get_sandbox_status(cid)
+            assert status == "stopped", (
+                f"reconcile destroyed a user-stopped container; status={status!r}"
+            )
+        finally:
+            if cid:
+                subprocess.run(
+                    ["docker", "rm", "-f", cid],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                )
+            try:
+                srv._INSTANCES.clear()
+            except Exception:
+                pass
+            await dprov.delete_volume(vol_name)
+            await dbmod.close_pool()
