@@ -1,5 +1,6 @@
 """Integration tests for session/volume decoupling."""
 from __future__ import annotations
+import asyncio
 import os, sys
 import pytest
 import pytest_asyncio
@@ -302,3 +303,49 @@ async def test_ensure_volume_supervisor_caches_installs(client):
         sess = await dbmod.get_session("sess-cache")
         await ensure_sandbox(sess)
         assert len(install_calls) == 1, f"Expected still 1 install call (cache hit), got {len(install_calls)}"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 4 — Concurrent ensure_volume_supervisor on fresh volume.
+# Two coroutines concurrently call ensure_volume_supervisor(v, "claude") on a
+# volume whose supervisor_agent_types cache is empty. The provider-level
+# install_supervisor should be invoked exactly once; both callers complete.
+# Behavioral test: works under asyncio.Lock OR pg_advisory_xact_lock.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ensure_volume_supervisor_installs_once(client):
+    from api.models import AgentConfig, AgentRecord, VolumeRecord
+
+    await dbmod.upsert_agent(AgentRecord(
+        id="a-conc", name="conc", config=AgentConfig(agent_type="claude"),
+    ))
+    await dbmod.upsert_volume(VolumeRecord(
+        id="v-conc", name="v-conc", provider="daytona", provider_ref="dt-conc",
+    ))
+
+    install_calls = 0
+
+    # The top-level wrapper (`api.providers.install_supervisor`) is
+    # ``install_supervisor(provider, volume_ref, agent_type)``.
+    async def fake_install(provider, volume_ref, agent_type):
+        nonlocal install_calls
+        install_calls += 1
+        # Yield so the second call can enter ensure_volume_supervisor
+        # and observe the lock; keep it short to avoid slowing the suite.
+        await asyncio.sleep(0.05)
+
+    with patch("api.providers.install_supervisor",
+               new=AsyncMock(side_effect=fake_install)):
+        await asyncio.gather(
+            srv.ensure_volume_supervisor("v-conc", "claude"),
+            srv.ensure_volume_supervisor("v-conc", "claude"),
+        )
+
+    assert install_calls == 1, f"expected 1 install, got {install_calls}"
+
+    # Cache row should reflect the installed agent type.
+    vol = await dbmod.get_volume("v-conc")
+    assert vol is not None
+    assert "claude" in (vol.supervisor_agent_types or [])

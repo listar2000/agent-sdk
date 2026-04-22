@@ -1,5 +1,6 @@
 """Unit tests for ensure_sandbox / ensure_runtime helpers."""
 from __future__ import annotations
+import asyncio
 import os, sys
 import pytest
 import pytest_asyncio
@@ -295,3 +296,49 @@ async def test_ensure_runtime_rebuilds_when_missing(setup):
     assert got.session_id == "s1"
     assert got.sandbox_id == "sb1"
     assert got.supervisor_url == "http://fresh"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 3 — Concurrent ensure_sandbox on fresh session.
+# Two coroutines racing into ensure_sandbox() on the same session with
+# current_sandbox_id=NULL must only result in ONE provider provision call;
+# both callers should see the same sandbox returned.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ensure_sandbox_provisions_once(setup):
+    await _mk_fixtures()
+    from api.providers import ProviderInstance
+
+    call_count = 0
+
+    async def fake_provision(**kw):
+        nonlocal call_count
+        call_count += 1
+        # Yield so a second caller has a chance to enter _ensure_sandbox_locked
+        # and hit the lock — which is exactly the scenario we want to exercise.
+        await asyncio.sleep(0.05)
+        return ProviderInstance(
+            provider="daytona", url="http://fake",
+            root="/home/daytona", sandbox_id=f"dt-{call_count}",
+        )
+
+    # Once T1 has committed a sandbox row, T2 acquires the lock, re-reads the
+    # session, and sees current_sandbox_id pointing at the new sandbox. The
+    # probe path then asks the provider for status; we stub that to 'running'
+    # so T2 returns the same sandbox instead of reprovisioning.
+    with patch("api.providers.daytona.provision_daytona_sandbox",
+               new=AsyncMock(side_effect=fake_provision)), \
+         patch("api.providers.daytona.get_daytona_sandbox_status",
+               new=AsyncMock(return_value="running")), \
+         patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
+        sess = await dbmod.get_session("s1")
+        sb_a, sb_b = await asyncio.gather(
+            srv.ensure_sandbox(sess),
+            srv.ensure_sandbox(sess),
+        )
+
+    # Exactly one provision, and both coroutines see the same sandbox.
+    assert call_count == 1, f"expected 1 provision, got {call_count}"
+    assert sb_a.id == sb_b.id
