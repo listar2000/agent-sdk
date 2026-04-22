@@ -1361,7 +1361,7 @@ async def admin_list_sessions():
             {
                 "session_id": s.session_id,
                 "agent_id": s.agent_id,
-                "sandbox_id": s.sandbox_id,
+                "current_sandbox_id": s.sandbox_id,
                 "inner_session_id": s.inner_session_id,
                 "agent_busy": s.agent_busy,
                 "active_rpc_id": s.active_rpc_id,
@@ -1860,7 +1860,7 @@ async def _do_resume(
                 return {
                     "session_id": session_id,
                     "agent_id": existing.agent_id,
-                    "sandbox_id": existing.sandbox_id,
+                    "current_sandbox_id": existing.sandbox_id,
                     "inner_session_id": existing.inner_session_id,
                     "status": "already_active",
                 }
@@ -2090,16 +2090,16 @@ async def _do_resume(
         # Preserve the existing session's volume_id: the INSERT half of
         # upsert must always provide it (NOT NULL) even though this call site
         # is really an UPDATE via ON CONFLICT.
-        _existing = await get_session(session_id)
-        _existing_volume_id = _existing.get("volume_id") if _existing else None
+        existing = await get_session(session_id)
+        existing_volume_id = existing.get("volume_id") if existing else None
         await upsert_session(
             session_id, agent_id, sandbox_id, effective_inner_session_id,
-            volume_id=_existing_volume_id,
+            volume_id=existing_volume_id,
         )
         return {
             "session_id": session_id,
             "agent_id": agent_id,
-            "sandbox_id": sandbox_id,
+            "current_sandbox_id": sandbox_id,
             "inner_session_id": effective_inner_session_id,
             "status": "resumed",
         }
@@ -2348,7 +2348,7 @@ async def list_sessions_route():
         {
             "session_id": s.session_id,
             "agent_id": s.agent_id,
-            "sandbox_id": s.sandbox_id,
+            "current_sandbox_id": s.sandbox_id,
             "idle_seconds": round(now - (s.turn_completed_at or s.last_activity), 1),
             "shutdown_requested": s.shutdown.is_set(),
         }
@@ -2391,7 +2391,7 @@ async def session_status(session_id: str):
     return {
         "session_id": state.session_id,
         "agent_id": state.agent_id,
-        "sandbox_id": state.sandbox_id,
+        "current_sandbox_id": state.sandbox_id,
         "inner_session_id": state.inner_session_id,
         "agent_busy": state.agent_busy,
         "active_rpc_id": state.active_rpc_id,
@@ -2483,7 +2483,7 @@ async def session_resume(session_id: str, request: Request):
     return {
         "session_id": state.session_id,
         "agent_id": state.agent_id,
-        "sandbox_id": state.sandbox_id,
+        "current_sandbox_id": state.sandbox_id,
         "inner_session_id": state.inner_session_id,
         "status": "resumed",
     }
@@ -2700,7 +2700,7 @@ async def sessions_quick_create(request: Request):
 
     return {
         "agent_id": agent_id,
-        "sandbox_id": sandbox_id,
+        "current_sandbox_id": sandbox_id,
         "session_id": session_id,
         "inner_session_id": inner_session_id,
         "connected": True,
