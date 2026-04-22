@@ -68,6 +68,7 @@ from .models import (
     EVT_USAGE,
     EVT_USER_MESSAGE,
     STATUS_RUNNING,
+    STATUS_STOPPED,
     AgentConfig,
     AgentRecord,
     PendingPrompt,
@@ -307,6 +308,10 @@ async def _idle_reaper():
                     try:
                         await stop_instance(instance)
                         log.info("idle reaper: sandbox %s stopped", sandbox_id)
+                        rec = await get_sandbox(sandbox_id)
+                        if rec is not None and rec.status != STATUS_STOPPED:
+                            rec.status = STATUS_STOPPED
+                            await upsert_sandbox(rec)
                     except Exception as e:
                         log.warning(
                             "reaper: failed to stop sandbox %s: %s", sandbox_id, e
