@@ -226,20 +226,18 @@ async def _shutdown_session_state(
     # docker/local always have one-supervisor-per-sandbox and teardown happens
     # via destroy_sandbox, not here.
     if state.supervisor_port is not None:
+        # Only Daytona runs per-session supervisors we need to tear down here;
+        # docker/local have one-supervisor-per-sandbox handled by destroy_sandbox.
         try:
             sb = await get_sandbox(state.sandbox_id)
-            provider = sb.provider if sb else None
-            if provider == "daytona":
+            if sb and sb.provider == "daytona":
                 from .providers.daytona import _get_daytona_client
                 loop = asyncio.get_running_loop()
-                daytona_client = _get_daytona_client()
                 sandbox = await loop.run_in_executor(
-                    None, lambda: daytona_client.get(sb.sandbox_ref)
+                    None, lambda: _get_daytona_client().get(sb.sandbox_ref)
                 )
                 await kill_supervisor_in_sandbox(sandbox, state.supervisor_port)
                 free_sandbox_port(state.sandbox_id, state.supervisor_port)
-            # For docker/local: no-op — the supervisor is the container/process
-            # itself, and destroy_sandbox tears it down.
         except Exception as e:
             log.warning("failed to kill supervisor port %d for session %s: %s",
                         state.supervisor_port, state.session_id, e)
@@ -583,18 +581,14 @@ def _start_sse_reader(state: SessionState) -> None:
     Works with the supervisor which exposes the POST+SSE JSON-RPC surface.
     """
     if state._reader_alive:
-        log.info(
-            "[SSE-READER] start requested but reader already alive for session %s",
-            state.session_id,
-        )
+        log.info("[SSE-READER] start requested but reader already alive for session %s",
+                 state.session_id)
         return
     state._reader_alive = True
     log.info(
         "[SSE-READER] starting upstream reader for session %s (acp_session=%s, base_url=%s, last_event_id=%s)",
-        state.session_id,
-        state.acp_session_id,
-        getattr(state.client, "base_url", "?"),
-        state.last_event_id or "-",
+        state.session_id, state.acp_session_id,
+        getattr(state.client, "base_url", "?"), state.last_event_id or "-",
     )
 
     async def _reader():
@@ -612,65 +606,46 @@ def _start_sse_reader(state: SessionState) -> None:
                     headers = {"Accept": "text/event-stream"}
                     if state.last_event_id:
                         headers["Last-Event-ID"] = state.last_event_id
-                    log.info(
-                        "[SSE-READER] connecting upstream stream for session %s (attempt=%d, last_event_id=%s)",
-                        state.session_id,
-                        attempt,
-                        state.last_event_id or "-",
-                    )
+                    log.info("[SSE-READER] connecting upstream stream for session %s "
+                             "(attempt=%d, last_event_id=%s)",
+                             state.session_id, attempt, state.last_event_id or "-")
                     sse_http = httpx.AsyncClient(
-                        base_url=state.client.base_url,
-                        timeout=None,
-                        proxy=None,
+                        base_url=state.client.base_url, timeout=None, proxy=None,
                     )
                     async with sse_http.stream(
-                        "GET",
-                        f"/v1/acp/{state.acp_session_id}",
-                        headers=headers,
+                        "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
                     ) as resp:
                         resp.raise_for_status()
                         reconnect_delay_s = 1.0
                         attempt = 0
-                        log.info(
-                            "[SSE-READER] upstream stream connected for session %s (attempt=%d, status=%d)",
-                            state.session_id,
-                            attempt,
-                            resp.status_code,
-                        )
+                        log.info("[SSE-READER] upstream stream connected for session %s "
+                                 "(attempt=%d, status=%d)",
+                                 state.session_id, attempt, resp.status_code)
                         async for chunk in resp.aiter_text():
                             if state.shutdown.is_set():
-                                log.info(
-                                    "[SSE-READER] session %s shutting down; exiting reader loop",
-                                    state.session_id,
-                                )
+                                log.info("[SSE-READER] session %s shutting down; "
+                                         "exiting reader loop", state.session_id)
                                 return
                             reader_buffer += chunk
                             while "\n\n" in reader_buffer:
                                 block, reader_buffer = reader_buffer.split("\n\n", 1)
-                                payload = parse_sse_data(block)
                                 _broadcast_one_block(
-                                    state, block, payload, text_parts, thinking_parts
+                                    state, block, parse_sse_data(block),
+                                    text_parts, thinking_parts,
                                 )
                 except asyncio.CancelledError:
-                    log.info(
-                        "[SSE-READER] reader task cancelled for session %s",
-                        state.session_id,
-                    )
+                    log.info("[SSE-READER] reader task cancelled for session %s",
+                             state.session_id)
                     raise
                 except Exception as e:
                     disconnect_reason = f"{type(e).__name__}: {e}"
-                    log.warning(
-                        "[SSE-READER] upstream reader error for session %s on attempt %d: %s",
-                        state.session_id,
-                        attempt,
-                        disconnect_reason,
-                    )
+                    log.warning("[SSE-READER] upstream reader error for session %s "
+                                "on attempt %d: %s",
+                                state.session_id, attempt, disconnect_reason)
                 else:
-                    log.warning(
-                        "[SSE-READER] upstream stream ended for session %s on attempt %d without an exception",
-                        state.session_id,
-                        attempt,
-                    )
+                    log.warning("[SSE-READER] upstream stream ended for session %s "
+                                "on attempt %d without an exception",
+                                state.session_id, attempt)
                 finally:
                     if sse_http is not None:
                         try:
@@ -681,18 +656,12 @@ def _start_sse_reader(state: SessionState) -> None:
                 if state.shutdown.is_set():
                     return
 
-                if (
-                    _sse_reader_disconnect_is_recoverable(state)
-                    and attempt <= _SSE_MAX_IDLE_RETRIES
-                ):
-                    log.warning(
-                        "[SSE-READER] recoverable upstream disconnect for session %s (%s); reconnecting in %.1fs (attempt %d/%d)",
-                        state.session_id,
-                        disconnect_reason,
-                        reconnect_delay_s,
-                        attempt,
-                        _SSE_MAX_IDLE_RETRIES,
-                    )
+                if (_sse_reader_disconnect_is_recoverable(state)
+                        and attempt <= _SSE_MAX_IDLE_RETRIES):
+                    log.warning("[SSE-READER] recoverable upstream disconnect for "
+                                "session %s (%s); reconnecting in %.1fs (attempt %d/%d)",
+                                state.session_id, disconnect_reason,
+                                reconnect_delay_s, attempt, _SSE_MAX_IDLE_RETRIES)
                     await asyncio.sleep(reconnect_delay_s)
                     reconnect_delay_s = min(reconnect_delay_s * 2, 10.0)
                     continue
@@ -700,16 +669,11 @@ def _start_sse_reader(state: SessionState) -> None:
                 log.warning(
                     "[SSE-READER] unrecoverable upstream disconnect for session %s (%s) "
                     "(shutdown=%s, agent_busy=%s, pending=%d, in_SESSIONS=%s)",
-                    state.session_id,
-                    disconnect_reason,
-                    state.shutdown.is_set(),
-                    state.agent_busy,
-                    len(state.pending_prompts),
+                    state.session_id, disconnect_reason, state.shutdown.is_set(),
+                    state.agent_busy, len(state.pending_prompts),
                     state.session_id in SESSIONS,
                 )
-                _flush_buffered_text(
-                    state, text_parts, thinking_parts, state.active_rpc_id
-                )
+                _flush_buffered_text(state, text_parts, thinking_parts, state.active_rpc_id)
                 _on_sse_reader_death(state)
                 state.broadcast(_SSE_SENTINEL)
                 return
@@ -717,9 +681,7 @@ def _start_sse_reader(state: SessionState) -> None:
             pass
         finally:
             state._reader_alive = False
-            log.info(
-                "[SSE-READER] reader task stopped for session %s", state.session_id
-            )
+            log.info("[SSE-READER] reader task stopped for session %s", state.session_id)
 
     state._reader_task = asyncio.create_task(_reader())
 
@@ -1258,36 +1220,23 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
                     "DELETE FROM sandboxes WHERE volume_id = %s", (vol.id,),
                 )
 
-    if vol.provider == "daytona":
-        try:
+    try:
+        if vol.provider == "daytona":
             await _providers_mod.delete_daytona_volume(vol.provider_ref)
-        except Exception as e:
-            # Tolerate 403 (delete-forbidden) and 404 (already gone): the
-            # user's intent is to remove this volume from our records;
-            # provider-side cleanup policies shouldn't block that.
-            msg = str(e).lower()
-            if "forbidden" not in msg and "not found" not in msg and "404" not in msg:
-                raise
-            log.warning("volume %s provider delete skipped: %s", vol.id, e)
-    else:
-        # Swallow only "not found"-class errors (volume already gone on the
-        # provider side; the DB row is the last copy). Let "in use" propagate:
-        # an out-of-band container mounting the volume is a real conflict.
-        try:
+        else:
             await _providers_mod.delete_volume(vol.provider, vol.provider_ref)
-        except Exception as e:
-            msg = str(e).lower()
-            if ("not found" in msg or "no such" in msg or "404" in msg
-                    or "does not exist" in msg):
-                log.warning(
-                    "volume %s (%s) already gone on provider: %s",
-                    vol.id, vol.provider, e,
-                )
-            else:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"provider-side volume delete failed: {e}",
-                )
+    except Exception as e:
+        # Swallow "gone already"-class errors (volume missing on provider side
+        # — the DB row is the last copy). For Daytona also swallow 403s: the
+        # user's intent is to remove this row; provider cleanup policy shouldn't
+        # block that. Let other failures (in-use, etc.) propagate as 409.
+        msg = str(e).lower()
+        forbidden_ok = vol.provider == "daytona" and "forbidden" in msg
+        gone_already = any(t in msg for t in ("not found", "no such", "404", "does not exist"))
+        if forbidden_ok or gone_already:
+            log.warning("volume %s (%s) provider delete skipped: %s", vol.id, vol.provider, e)
+        else:
+            raise HTTPException(409, f"provider-side volume delete failed: {e}")
     await delete_volume(vol.id)
 
 
@@ -2122,51 +2071,30 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
         provider_ref = row["provider_ref"]
 
     # Acquire a session-scoped advisory lock on a dedicated connection
-    # switched to autocommit so the connection isn't stuck in a
-    # long-running transaction while the slow provider call runs.
-    # ``pg_advisory_lock`` survives commits (it's session-scoped) and
-    # auto-releases on connection close, so a crashed worker can't
-    # wedge the key.
+    # switched to autocommit so it isn't stuck in a long-running transaction
+    # while the slow provider call runs. ``pg_advisory_lock`` survives commits
+    # and auto-releases on connection close, so a crashed worker can't wedge
+    # the key. We MUST restore autocommit=False before returning the connection
+    # to the pool — psycopg's pool has no reset callback.
     async with get_db() as lock_conn:
-        # Autocommit mode: queries commit immediately and the connection
-        # isn't parked "idle in transaction" during the slow install.
-        # ``pg_advisory_lock`` is still session-scoped so the lock
-        # outlives individual statement commits.  We MUST restore the
-        # original autocommit setting before the connection returns to
-        # the pool — psycopg's AsyncConnectionPool has no reset callback,
-        # so a leaked `autocommit=True` silently breaks the
-        # borrow-transaction-commit contract for every later borrower.
         _restore_autocommit = False
         try:
             await lock_conn.set_autocommit(True)
             _restore_autocommit = True
         except AttributeError:
-            # Some test fakes expose a shim that doesn't implement
-            # set_autocommit — tolerate it, the transaction-in-progress
-            # semantics then match the previous code.
-            pass
+            pass  # test fakes without set_autocommit
         except Exception as e:
-            # Real psycopg connection rejected the flip — log loudly so
-            # ops can investigate (advisory lock still works, but the
-            # connection will be "idle in transaction" during the slow
-            # install, which may trip idle-in-transaction timeouts).
-            log.error(
-                "ensure_volume_supervisor: set_autocommit(True) failed on "
-                "pooled conn (volume=%s agent=%s): %s; falling back to "
-                "transactional mode", volume_id, agent_type, e,
-            )
+            log.error("ensure_volume_supervisor: set_autocommit(True) failed "
+                      "(volume=%s agent=%s): %s; falling back to transactional mode",
+                      volume_id, agent_type, e)
         try:
             got_row = await (await lock_conn.execute(
                 "SELECT pg_try_advisory_lock(%s)", (lock_key,)
             )).fetchone()
             if not (got_row and got_row.get("pg_try_advisory_lock")):
-                log.info(
-                    "ensure_volume_supervisor: waiting for another worker "
-                    "(volume=%s agent=%s)", volume_id, agent_type,
-                )
-                await lock_conn.execute(
-                    "SELECT pg_advisory_lock(%s)", (lock_key,)
-                )
+                log.info("ensure_volume_supervisor: waiting for another worker "
+                         "(volume=%s agent=%s)", volume_id, agent_type)
+                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
 
             # Step 3: re-check cache while holding the session lock.
             row2 = await (await lock_conn.execute(
@@ -2177,18 +2105,11 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
             if agent_type in installed2:
                 return
 
-            log.info(
-                "ensure_volume_supervisor: installing %s on volume %s",
-                agent_type, volume_id,
-            )
-            # Step 4: slow provider call.  The DB connection is held (we
-            # need it to keep the session-scoped advisory lock alive) but
-            # it's in autocommit mode so it's NOT in a transaction — no
-            # "idle in transaction" timeout, no dirty buffers.
-            await _providers_mod.install_supervisor(
-                provider, provider_ref, agent_type,
-            )
-
+            log.info("ensure_volume_supervisor: installing %s on volume %s",
+                     agent_type, volume_id)
+            # Step 4: slow provider call with the connection in autocommit (not
+            # in a transaction) so idle-in-transaction timers don't fire.
+            await _providers_mod.install_supervisor(provider, provider_ref, agent_type)
             # Step 5: update the cache under the same session lock.
             await lock_conn.execute(
                 "UPDATE volumes SET supervisor_agent_types = "
@@ -2196,45 +2117,29 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
                 "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
                 (agent_type, volume_id, agent_type),
             )
-            log.info(
-                "ensure_volume_supervisor: done installing %s on volume %s",
-                agent_type, volume_id,
-            )
+            log.info("ensure_volume_supervisor: done installing %s on volume %s",
+                     agent_type, volume_id)
         finally:
-            # Release the session lock explicitly so the connection is
-            # clean when it returns to the pool.  A failure here is
-            # survivable — the lock auto-releases on connection close.
+            # Release the advisory lock explicitly — a failure here is survivable
+            # (the lock auto-releases on connection close).
             try:
-                await lock_conn.execute(
-                    "SELECT pg_advisory_unlock(%s)", (lock_key,)
-                )
+                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
             except Exception as e:
-                log.warning(
-                    "ensure_volume_supervisor: pg_advisory_unlock failed: %s", e,
-                )
-            # Restore the pre-borrow autocommit mode BEFORE the async
-            # context manager returns the connection to the pool. If the
-            # restore itself fails, we must NOT return this connection to
-            # the pool in autocommit=True — close it instead so the pool
-            # opens a fresh one. Leaving a leaked autocommit=True in the
-            # pool silently breaks every later borrower's commit contract.
+                log.warning("ensure_volume_supervisor: pg_advisory_unlock failed: %s", e)
+            # Restore autocommit=False before the conn returns to the pool; if
+            # restore fails, close the conn to prevent pool poisoning.
             if _restore_autocommit:
                 try:
                     await lock_conn.set_autocommit(False)
                 except Exception as e:
-                    log.error(
-                        "ensure_volume_supervisor: failed to restore "
-                        "autocommit=False on pooled conn: %s; closing to "
-                        "prevent pool poisoning", e,
-                    )
+                    log.error("ensure_volume_supervisor: failed to restore "
+                              "autocommit=False: %s; closing conn to prevent "
+                              "pool poisoning", e)
                     try:
                         await lock_conn.close()
                     except Exception as close_err:
-                        log.warning(
-                            "ensure_volume_supervisor: lock_conn.close() "
-                            "after failed autocommit restore failed: %s",
-                            close_err,
-                        )
+                        log.warning("ensure_volume_supervisor: lock_conn.close() "
+                                    "failed: %s", close_err)
 
 
 async def ensure_sandbox(session_row: dict) -> SandboxRecord:
