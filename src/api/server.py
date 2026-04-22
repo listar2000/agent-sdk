@@ -1186,6 +1186,7 @@ async def create_sandbox(request: Request):
         instance = await create_instance(
             provider, agent_type, dockerfile=dockerfile, root=root,
             volume_id=vol.provider_ref, subpath=subpath,
+            sandbox_id=sandbox_id,
         )
     except Exception as e:
         return JSONResponse(
@@ -1333,6 +1334,10 @@ async def provision_sandbox_route(request: Request):
             status_code=502,
         )
 
+    # Pre-allocate the DB sandbox_id so we can thread it to the provider as a
+    # container label — reconcile_on_startup cross-references live containers
+    # against DB rows by this id.
+    sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
     try:
         instance = await _providers_mod.provision_sandbox(
             provider,
@@ -1342,6 +1347,7 @@ async def provision_sandbox_route(request: Request):
             dockerfile=dockerfile,
             pre_start_commands=pre_start_commands if pre_start_commands else None,
             root=root,
+            sandbox_id=sandbox_id,
         )
     except Exception as e:
         if "circuit breaker" in str(e).lower():
@@ -1351,7 +1357,6 @@ async def provision_sandbox_route(request: Request):
             )
         return JSONResponse({"error": f"Failed to provision sandbox: {e}"}, status_code=502)
 
-    sandbox_id = instance.sandbox_id or f"sb_{uuid.uuid4().hex[:12]}"
     _INSTANCES[sandbox_id] = instance
     await upsert_sandbox(SandboxRecord(
         id=sandbox_id, provider=provider,
@@ -1824,6 +1829,7 @@ async def _ensure_sandbox_alive(
                     dockerfile=dockerfile,
                     root=sandbox_record.root,
                     spawn_env=spawn_env,
+                    sandbox_id=sandbox_id,
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to restart sandbox: {e}")
@@ -1896,6 +1902,7 @@ async def _ensure_sandbox_alive(
                     spawn_env=spawn_env,
                     volume_id=dt_volume_ref,
                     subpath=sandbox_record.subpath,
+                    sandbox_id=sandbox_id,
                 )
             except Exception as create_err:
                 raise RuntimeError(
@@ -2605,6 +2612,7 @@ async def sessions_quick_create(request: Request):
             spawn_env=spawn_env,
             volume_id=volume_record.provider_ref,
             subpath=subpath,
+            sandbox_id=sandbox_id,
         )
     except Exception as e:
         await delete_agent(agent_id)
