@@ -221,13 +221,10 @@ async def _shutdown_session_state(
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
     await _close_session_gracefully(state)
-    # Kill per-session supervisor if this session has its own.
-    # Only Daytona runs multiple supervisors per sandbox (one per session);
-    # docker/local always have one-supervisor-per-sandbox and teardown happens
-    # via destroy_sandbox, not here.
+    # Kill per-session supervisor if this session has its own. Only Daytona
+    # runs per-session supervisors here; docker/local have one-supervisor-per-
+    # sandbox handled by destroy_sandbox.
     if state.supervisor_port is not None:
-        # Only Daytona runs per-session supervisors we need to tear down here;
-        # docker/local have one-supervisor-per-sandbox handled by destroy_sandbox.
         try:
             sb = await get_sandbox(state.sandbox_id)
             if sb and sb.provider == "daytona":
@@ -1019,38 +1016,27 @@ class _VolumeCreateBody(BaseModel):
 def _validate_volume_name(name: str) -> None:
     """Reject volume names that could escape server-generated contexts.
 
-    ``name`` appears in: docker ``volume create <name>`` argv (argv, not
-    shell — so no shell injection), but also in the local provider as a
-    filesystem path component, where ``../`` or ``/`` would escape
-    ``AGENT_SDK_LOCAL_VOL_ROOT``. A tight allowlist keeps every provider
-    happy.
+    ``name`` appears in docker ``volume create`` argv (no shell injection) and
+    in the local provider as a filesystem path component where ``../`` or ``/``
+    would escape ``AGENT_SDK_LOCAL_VOL_ROOT``. A tight allowlist keeps every
+    provider happy.
     """
     if not isinstance(name, str) or not _VOLUME_NAME_RE.match(name):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "volume name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
-            ),
-        )
+        raise HTTPException(400, "volume name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def _validate_subpath(subpath: str) -> None:
-    """Reject subpaths that could inject into docker mount flags or escape.
-
-    Empty string is handled by the caller (caller returns 400 'required').
-    """
+    """Reject subpaths that could inject into docker mount flags or escape."""
     if not isinstance(subpath, str) or not _SUBPATH_RE.match(subpath):
         raise HTTPException(
-            status_code=400,
-            detail=(
-                "subpath must match [A-Za-z0-9][A-Za-z0-9._/-]{0,255} "
-                "(no traversal, commas, or whitespace)"
-            ),
+            400,
+            "subpath must match [A-Za-z0-9][A-Za-z0-9._/-]{0,255} "
+            "(no traversal, commas, or whitespace)",
         )
     # Defence-in-depth: reject ``..`` segment even though the regex already
-    # blocks the dot sequence as a whole-segment match.
+    # blocks that as a whole-segment match.
     if any(seg == ".." for seg in subpath.split("/")):
-        raise HTTPException(status_code=400, detail="subpath must not contain '..'")
+        raise HTTPException(400, "subpath must not contain '..'")
 
 
 async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
@@ -1767,38 +1753,33 @@ def _process_sse_block(
                 thinking_parts.append(text)
 
         elif log_events and ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
-            # Flush any accumulated text/thinking before the tool call so the
-            # text-tool interleave within the turn is preserved.
+            # Flush text/thinking before the tool call so the interleave
+            # within the turn is preserved.
             _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
             tool_payload: dict = {
                 "tool": extract_tool_name(update),
                 "tool_call_id": extract_tool_call_id(update),
                 "prompt_id": prompt_id,
             }
-            title = update.get("title")
-            if title:
+            if title := update.get("title"):
                 tool_payload["title"] = title
-            raw_input = update.get("rawInput")
-            if raw_input:
+            if raw_input := update.get("rawInput"):
                 tool_payload["args"] = raw_input
             _schedule_log(state, EVT_TOOL_CALL, tool_payload)
 
         elif log_events and ut == UT_TOOL_CALL_UPDATE:
-            # tool_call_update can carry either a tool result (most common
-            # — toolResponse / output / etc.) or a refined args set after
-            # the initial tool_call.  Persist whichever is present, but
-            # never re-emit a duplicate EVT_TOOL_CALL row.
-            tool_call_id = extract_tool_call_id(update)
+            # tool_call_update usually carries a tool result; sometimes a
+            # refined arg set. Persist result rows but never re-emit a
+            # duplicate EVT_TOOL_CALL.
             tool_response = extract_tool_response(update)
             if tool_response is not None:
                 result_payload: dict = {
                     "tool": extract_tool_name(update),
-                    "tool_call_id": tool_call_id,
+                    "tool_call_id": extract_tool_call_id(update),
                     "result": tool_response,
                     "prompt_id": prompt_id,
                 }
-                title = update.get("title")
-                if title:
+                if title := update.get("title"):
                     result_payload["title"] = title
                 _schedule_log(state, EVT_TOOL_RESULT, result_payload)
 
@@ -1814,21 +1795,17 @@ def _process_sse_block(
         return
 
     if kind == "done_result":
-        if log_events:
-            _mark_turn_finished(state)
-            _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
-            result = data or {}
-            done_payload: dict = {
-                "stop_reason": result.get("stopReason"),
-                "prompt_id": prompt_id,
-            }
-            usage = result.get("usage")
-            if usage:
-                done_payload["usage"] = usage
-            _schedule_log(state, "turn_end", done_payload)
-        else:
+        if not log_events:
             text_parts.clear()
             thinking_parts.clear()
+            return
+        _mark_turn_finished(state)
+        _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
+        result = data or {}
+        done_payload: dict = {"stop_reason": result.get("stopReason"), "prompt_id": prompt_id}
+        if usage := result.get("usage"):
+            done_payload["usage"] = usage
+        _schedule_log(state, "turn_end", done_payload)
         return
 
     if kind == "error" and log_events:
@@ -1837,31 +1814,23 @@ def _process_sse_block(
         _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
         err = data or {}
         err_data = err.get("data") if isinstance(err.get("data"), dict) else {}
-        _schedule_log(
-            state,
-            EVT_ERROR,
-            {
-                "message": err.get("message", str(err))[:500],
-                "kind": err_data.get("kind") if err_data else None,
-                "prompt_id": prompt_id,
-            },
-        )
+        _schedule_log(state, EVT_ERROR, {
+            "message": err.get("message", str(err))[:500],
+            "kind": err_data.get("kind") if err_data else None,
+            "prompt_id": prompt_id,
+        })
+
+
+_DAYTONA_UNRECOVERABLE_TOKENS = (
+    "not found", "destroyed", "destroying",
+    "terminal state", "unrecoverable", "unknown",
+)
 
 
 def _should_replace_daytona_sandbox(exc: Exception) -> bool:
     """True when a Daytona recovery error means the old sandbox is gone for good."""
     text = str(exc).lower()
-    return any(
-        token in text
-        for token in (
-            "not found",
-            "destroyed",
-            "destroying",
-            "terminal state",
-            "unrecoverable",
-            "unknown",
-        )
-    )
+    return any(token in text for token in _DAYTONA_UNRECOVERABLE_TOKENS)
 
 
 async def _ensure_sandbox_alive(
@@ -2321,25 +2290,21 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     session_id = session_row["id"]
     existing = SESSIONS.get(session_id)
 
-    # Reuse if the existing state is attached to this sandbox and the
-    # supervisor is reachable.
-    if (
-        existing
-        and not existing.shutdown.is_set()
-        and existing.sandbox_id == sandbox.id
-        and existing.supervisor_url
-    ):
-        try:
-            ok = await _wait_for_health(existing.supervisor_url, max_retries=2, interval=1)
-            if ok:
-                return existing
-        except Exception:
-            pass
-        # Supervisor dead — tear down and rebuild.
-        await _shutdown_session_state(existing, remove=True)
-
-    elif existing:
-        # Stale: different sandbox or no URL — shut it down before rebuilding.
+    # Reuse if the existing state is attached to this sandbox and its
+    # supervisor is reachable. Otherwise (stale sandbox, dead supervisor, or
+    # no URL) tear down before rebuilding.
+    if existing:
+        reusable = (
+            not existing.shutdown.is_set()
+            and existing.sandbox_id == sandbox.id
+            and existing.supervisor_url
+        )
+        if reusable:
+            try:
+                if await _wait_for_health(existing.supervisor_url, max_retries=2, interval=1):
+                    return existing
+            except Exception:
+                pass
         await _shutdown_session_state(existing, remove=True)
 
     # Build fresh.
@@ -2973,11 +2938,9 @@ async def session_events(session_id: str):
 
         async def _heartbeat_loop():
             # Per-connection heartbeat: put None directly on THIS subscriber's
-            # queue instead of ``state.broadcast(None)``. The previous impl was
-            # O(N^2): every SSE subscriber had its own heartbeat task that
-            # broadcast to every other subscriber, so N subscribers produced
-            # N*N heartbeat enqueues per tick. Each client only needs
-            # heartbeats on its own SSE connection.
+            # queue instead of ``state.broadcast(None)`` (which was O(N^2) across
+            # subscribers). Skip if the consumer is backlogged — real events in
+            # the queue are already keeping the connection warm.
             try:
                 hb_count = 0
                 while True:
@@ -2985,19 +2948,14 @@ async def session_events(session_id: str):
                     try:
                         my_q.put_nowait(None)
                     except asyncio.QueueFull:
-                        # If the consumer is backlogged, skip the heartbeat —
-                        # real events in the queue are already keeping the
-                        # connection warm.
                         pass
                     hb_count += 1
                     if hb_count % 4 == 0:  # log every ~2 min
-                        log.debug(
-                            "[HEARTBEAT] session %s: sent %d heartbeats, "
-                            "busy=%s, subs=%d, reader=%s",
-                            state.session_id[:8], hb_count,
-                            state.agent_busy, len(state._session_subscribers),
-                            state._reader_alive,
-                        )
+                        log.debug("[HEARTBEAT] session %s: sent %d heartbeats, "
+                                  "busy=%s, subs=%d, reader=%s",
+                                  state.session_id[:8], hb_count,
+                                  state.agent_busy, len(state._session_subscribers),
+                                  state._reader_alive)
             except asyncio.CancelledError:
                 pass
 
