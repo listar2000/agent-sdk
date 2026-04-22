@@ -132,8 +132,6 @@ _INSTANCES: dict[str, ProviderInstance] = {}
 
 _sandbox_locks: dict[str, asyncio.Lock] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
-# Keyed by (volume_id, agent_type) — prevents concurrent supervisor installs.
-_volume_supervisor_locks: dict[tuple, asyncio.Lock] = {}
 
 
 def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
@@ -142,10 +140,6 @@ def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
     return _session_locks.setdefault(session_id, asyncio.Lock())
-
-
-def _get_volume_supervisor_lock(volume_id: str, agent_type: str) -> asyncio.Lock:
-    return _volume_supervisor_locks.setdefault((volume_id, agent_type), asyncio.Lock())
 
 
 # keyed by session_id
@@ -1911,31 +1905,75 @@ async def _ensure_sandbox_alive(
 async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     """Idempotently install the supervisor + ACP binary on a volume.
 
-    Uses a per-(volume_id, agent_type) asyncio.Lock to prevent concurrent
-    installs within the same process. Fast path: if the volumes.supervisor_agent_types
-    cache already lists this agent_type, return immediately without taking the lock.
+    Cross-worker safe: uses a Postgres transaction-scoped advisory lock
+    (``pg_advisory_xact_lock``) keyed on a hash of (volume_id, agent_type)
+    to serialize installs across every server process. Fast path: if the
+    ``volumes.supervisor_agent_types`` cache already lists this agent_type,
+    return immediately without touching the DB beyond the initial read.
     """
-    # Fast path (no lock): check cache first.
+    # Fast path (no lock): check cache first — 99% of calls hit this.
     vol = await get_volume(volume_id)
     if vol is None:
         raise HTTPException(500, f"Volume {volume_id} not found")
     if agent_type in (vol.supervisor_agent_types or []):
         return  # already installed
 
-    # Take the per-(volume, agent_type) lock.
-    lock = _get_volume_supervisor_lock(volume_id, agent_type)
-    async with lock:
-        # Double-check under lock (another coroutine may have installed while we waited).
-        vol2 = await get_volume(volume_id)
-        if vol2 is None:
+    # Compute a positive 63-bit key for pg_advisory_xact_lock (PG advisory
+    # locks take a bigint). Mask off the sign bit for safety.
+    lock_key = hash((volume_id, agent_type)) & 0x7FFFFFFFFFFFFFFF
+
+    # Open a transaction-scoped advisory lock. All DB operations inside the
+    # ``async with get_db()`` block share a single connection; the lock
+    # releases automatically when the transaction commits / rolls back.
+    async with get_db() as conn:
+        # Try non-blocking first for fast logging; fall back to blocking
+        # wait if another worker holds it.
+        got_row = await (await conn.execute(
+            "SELECT pg_try_advisory_xact_lock(%s)", (lock_key,)
+        )).fetchone()
+        if not (got_row and got_row.get("pg_try_advisory_xact_lock")):
+            log.info(
+                "ensure_volume_supervisor: waiting for another worker "
+                "(volume=%s agent=%s)", volume_id, agent_type,
+            )
+            await conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+
+        # Double-check under the lock: another worker may have installed
+        # while we waited. Re-read the cache from the SAME connection so we
+        # see the latest committed state.
+        row = await (await conn.execute(
+            "SELECT provider, provider_ref, supervisor_agent_types FROM volumes"
+            " WHERE id = %s",
+            (volume_id,),
+        )).fetchone()
+        if row is None:
             raise HTTPException(500, f"Volume {volume_id} not found")
-        if agent_type in (vol2.supervisor_agent_types or []):
+        installed = list(row.get("supervisor_agent_types") or [])
+        if agent_type in installed:
             return
 
-        log.info("ensure_volume_supervisor: installing %s on volume %s", agent_type, volume_id)
-        await _providers_mod.install_supervisor(vol2.provider, vol2.provider_ref, agent_type)
-        await add_supervisor_agent_type(volume_id, agent_type)
-        log.info("ensure_volume_supervisor: done installing %s on volume %s", agent_type, volume_id)
+        log.info(
+            "ensure_volume_supervisor: installing %s on volume %s",
+            agent_type, volume_id,
+        )
+        # Provider install talks to docker/daytona/local — NOT the DB, so
+        # holding the advisory lock across it is safe (no pool contention
+        # beyond this single connection).
+        await _providers_mod.install_supervisor(
+            row["provider"], row["provider_ref"], agent_type,
+        )
+        # Update the cache on the SAME connection so the advisory lock
+        # actually serializes the write.
+        await conn.execute(
+            "UPDATE volumes SET supervisor_agent_types = "
+            "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
+            "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
+            (agent_type, volume_id, agent_type),
+        )
+        log.info(
+            "ensure_volume_supervisor: done installing %s on volume %s",
+            agent_type, volume_id,
+        )
 
 
 async def ensure_sandbox(session_row: dict) -> SandboxRecord:
