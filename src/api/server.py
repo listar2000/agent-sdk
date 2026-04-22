@@ -754,8 +754,8 @@ def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
     """
     if not env:
         return
-    from .providers import _AUTH_KEYS
-    offenders = sorted(k for k in env if k in _AUTH_KEYS)
+    from .providers import AUTH_KEYS
+    offenders = sorted(k for k in env if k in AUTH_KEYS)
     if offenders:
         raise HTTPException(
             status_code=400,
@@ -809,16 +809,9 @@ def _pop_env_and_secrets(
     return env, secrets
 
 
-async def _build_spawn_env_for_session(session_id: str) -> dict[str, str]:
-    """Assemble the spawn_env dict for a stored session:
-    agent.env ∪ session.env ∪ session.secrets.
-
-    Looks up agent via session.agent_id. Returns ``{}`` if the session
-    doesn't exist (caller should handle that separately).
-    """
-    rec = await get_session(session_id)
-    if rec is None:
-        return {}
+async def _build_spawn_env_from_row(rec: dict) -> dict[str, str]:
+    """Assemble spawn_env (agent.env ∪ session.env ∪ session.secrets) from a
+    session row already fetched from the DB."""
     agent_id = rec.get("agent_id")
     session_env = rec.get("env") or {}
     session_secrets = rec.get("secrets") or {}
@@ -828,6 +821,15 @@ async def _build_spawn_env_for_session(session_id: str) -> dict[str, str]:
         if agent_record is not None:
             agent_env = agent_record.config.env or {}
     return _merge_env(agent_env, session_env, session_secrets)
+
+
+async def _build_spawn_env_for_session(session_id: str) -> dict[str, str]:
+    """Assemble the spawn_env dict for a stored session. Returns ``{}`` if the
+    session doesn't exist (caller should handle that separately)."""
+    rec = await get_session(session_id)
+    if rec is None:
+        return {}
+    return await _build_spawn_env_from_row(rec)
 
 
 async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
@@ -841,7 +843,7 @@ async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
     rec = await get_any_session_for_sandbox(sandbox_id)
     if rec is None:
         return {}
-    return await _build_spawn_env_for_session(rec["id"])
+    return await _build_spawn_env_from_row(rec)
 
 
 def _merge_env(
@@ -1107,11 +1109,7 @@ async def start_sandbox_route(sandbox_id: str):
         return JSONResponse({"error": "sandbox not found"}, status_code=404)
 
     try:
-        agent_type = "claude"
-        spawn_env = await _spawn_env_for_sandbox(sandbox_id)
-        url, _ = await _ensure_sandbox_alive(
-            sandbox_id, record, agent_type=agent_type, spawn_env=spawn_env,
-        )
+        url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type="claude")
     except Exception as e:
         return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=500)
 
@@ -1511,6 +1509,8 @@ async def _ensure_sandbox_alive(
                     pass  # best-effort cleanup
 
             log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
+            if spawn_env is None:
+                spawn_env = await _spawn_env_for_sandbox(sandbox_id)
             try:
                 new_instance = await create_instance(
                     provider, agent_type, dockerfile=dockerfile,
@@ -1554,6 +1554,8 @@ async def _ensure_sandbox_alive(
             sandbox_id,
             daytona_sandbox_id,
         )
+        if spawn_env is None:
+            spawn_env = await _spawn_env_for_sandbox(sandbox_id)
         replaced = False
         try:
             from .providers import restart_daytona_supervisor
@@ -1882,12 +1884,10 @@ async def get_or_recover_session(
         else:
             # Legacy shared supervisor path
             try:
-                spawn_env_for_refresh = await _build_spawn_env_for_session(session_id)
                 current_url, _ = await _ensure_sandbox_alive(
                     state.sandbox_id,
                     sandbox_record,
                     agent_type=state.agent_type,
-                    spawn_env=spawn_env_for_refresh,
                 )
             except Exception as e:
                 log.warning(
@@ -2747,8 +2747,7 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
         if not sandbox_record:
             raise HTTPException(status_code=404, detail="sandbox not found")
         try:
-            spawn_env = await _spawn_env_for_sandbox(sandbox_id)
-            await _ensure_sandbox_alive(sandbox_id, sandbox_record, spawn_env=spawn_env)
+            await _ensure_sandbox_alive(sandbox_id, sandbox_record)
             instance = _INSTANCES.get(sandbox_id)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"failed to start sandbox: {e}")
@@ -2761,8 +2760,7 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
     if not sandbox_record:
         raise HTTPException(status_code=404, detail="sandbox not found")
     try:
-        spawn_env = await _spawn_env_for_sandbox(sandbox_id)
-        await _ensure_sandbox_alive(sandbox_id, sandbox_record, spawn_env=spawn_env)
+        await _ensure_sandbox_alive(sandbox_id, sandbox_record)
         instance = _INSTANCES.get(sandbox_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"failed to start sandbox: {e}")
@@ -2814,10 +2812,8 @@ async def session_sandbox_exec(session_id: str, request: Request):
         if state:
             agent_type = state.agent_type
         try:
-            spawn_env = await _build_spawn_env_for_session(session_id)
             await _ensure_sandbox_alive(
                 sandbox_id, sandbox_record, agent_type=agent_type,
-                spawn_env=spawn_env,
             )
             instance = _INSTANCES.get(sandbox_id)
         except Exception as e:

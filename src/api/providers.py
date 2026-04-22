@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import shlex
 import signal
 import shutil
 import uuid
@@ -39,7 +40,7 @@ load_dotenv()
 # its own environment. When a sandbox spawns a supervisor, any of these keys
 # not explicitly provided by the caller are stripped or unset — no fallback
 # to ambient server credentials.
-_AUTH_KEYS = frozenset({
+AUTH_KEYS = frozenset({
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
@@ -72,7 +73,19 @@ def _auth_vars_to_unset(spawn_env: dict[str, str] | None) -> list[str]:
     inject ambient creds, the sandbox itself might already have them.
     We unset every known auth key the caller didn't explicitly provide."""
     provided = set(spawn_env.keys()) if spawn_env else set()
-    return [k for k in _AUTH_KEYS if k not in provided]
+    return [k for k in AUTH_KEYS if k not in provided]
+
+
+def _build_env_prefix(spawn_env: dict[str, str] | None) -> str:
+    """Argv for ``env`` that unsets baked-in auth keys and sets spawn vars.
+
+    Returns a shlex-quoted string like ``-u K1 -u K2 X=v Y=w`` suitable for
+    appending after ``env`` (or ``setsid env``) in a shell command.
+    """
+    env_vars = _get_sandbox_env_vars(spawn_env)
+    unset = " ".join(f"-u {shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
+    setv = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
+    return f"{unset} {setv}".strip()
 
 
 @dataclass
@@ -237,7 +250,7 @@ async def create_local(
     # Start from os.environ (for PATH, HOME, LANG, etc.) but strip every
     # credential key — the server never leaks its own API keys/tokens into
     # a sandbox supervisor. Then overlay IS_SANDBOX + spawn_env.
-    env = {k: v for k, v in os.environ.items() if k not in _AUTH_KEYS}
+    env = {k: v for k, v in os.environ.items() if k not in AUTH_KEYS}
     env.update(_get_sandbox_env_vars(spawn_env))
     extra: list[str] = []
     for arg in launch_args:
@@ -394,21 +407,17 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
             log.info("daytona pre-start: %s", cmd)
             await loop.run_in_executor(None, lambda c=cmd: _exec(c, timeout=120))
 
-    import shlex as _shlex
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
-    acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    env_vars = _get_sandbox_env_vars(spawn_env)
-    env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
-    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
-    env_prefix = f"{env_unset} {env_set}".strip()
+    acp_arg_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in launch_args)
+    env_prefix = _build_env_prefix(spawn_env)
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
         f"setsid env {env_prefix} node supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_REMOTE_PORT} "
         f"--acp {acp_bin}{acp_arg_flags} --root {root} "
         f"> {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1 </dev/null & echo started"
     )
-    start_cmd = f"sh -c {_shlex.quote(inner)}"
+    start_cmd = f"sh -c {shlex.quote(inner)}"
     await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
     await asyncio.sleep(3)
 
@@ -448,14 +457,10 @@ async def start_supervisor_in_sandbox(
         r = sandbox.process.exec(cmd, timeout=timeout)
         return (r.result if hasattr(r, "result") else str(r)) or ""
 
-    import shlex as _shlex
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
-    acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-    env_vars = _get_sandbox_env_vars(spawn_env)
-    env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
-    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
-    env_prefix = f"{env_unset} {env_set}".strip()
+    acp_arg_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in launch_args)
+    env_prefix = _build_env_prefix(spawn_env)
     log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
@@ -463,7 +468,7 @@ async def start_supervisor_in_sandbox(
         f"--acp {acp_bin}{acp_arg_flags} --root {root} "
         f"> {log_file} 2>&1 </dev/null & echo started"
     )
-    start_cmd = f"sh -c {_shlex.quote(inner)}"
+    start_cmd = f"sh -c {shlex.quote(inner)}"
     await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
     await asyncio.sleep(3)
 
@@ -812,16 +817,12 @@ async def create_docker(
     acp_path = f"/app/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
 
-    import shlex as _shlex
-    env_vars = _get_sandbox_env_vars(spawn_env)
-    env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
-    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
-    env_prefix = f"env {env_unset} {env_set}".strip()
-    acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
+    env_prefix = _build_env_prefix(spawn_env)
+    acp_arg_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in launch_args)
     supervisor_cmd = (
-        f"{env_prefix} node /app/supervisor.js --host 0.0.0.0 "
-        f"--port {_SUPERVISOR_DOCKER_PORT} --root {_shlex.quote(root)} "
-        f"--acp {_shlex.quote(acp_path)}{acp_arg_flags}"
+        f"env {env_prefix} node /app/supervisor.js --host 0.0.0.0 "
+        f"--port {_SUPERVISOR_DOCKER_PORT} --root {shlex.quote(root)} "
+        f"--acp {shlex.quote(acp_path)}{acp_arg_flags}"
     )
     if pre_start_commands:
         setup = " && ".join(pre_start_commands)
