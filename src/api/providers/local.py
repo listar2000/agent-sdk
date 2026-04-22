@@ -190,7 +190,6 @@ async def create_sandbox(
     volume_ref: str,
     subpath: str,
     agent_type: str = "claude",
-    env: dict[str, str] | None = None,
     port: int | None = None,
     spawn_env: dict[str, str] | None = None,
     root: str | None = None,
@@ -208,11 +207,7 @@ async def create_sandbox(
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}")
 
-    # Accept both `env` and `spawn_env` for caller convenience; `spawn_env`
-    # wins (matches the rest of the provider API).
-    effective_env = dict(env or {})
-    if spawn_env:
-        effective_env.update(spawn_env)
+    effective_env = dict(spawn_env or {})
 
     node = shutil.which("node")
     if not node:

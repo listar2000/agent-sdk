@@ -2420,12 +2420,6 @@ async def ensure_session_live(session_id: str) -> tuple[dict, SandboxRecord, Ses
 
 
 
-
-# ---------------------------------------------------------------------------
-# (sandbox proxy endpoints removed — use ACP tools inside a turn instead)
-# ---------------------------------------------------------------------------
-
-
 @app.get("/sessions")
 async def list_sessions_route():
     """List all active in-memory sessions with status."""

@@ -266,7 +266,6 @@ async def create_sandbox(
     spawn_env: dict[str, str] | None = None,
     dockerfile: str | None = None,  # accepted but ignored — Docker uses _NODE_IMAGE
     pre_start_commands: list[str] | None = None,
-    image: str | None = None,
     port: int | None = None,  # accepted for parity with uniform API; always allocates
     sandbox_id: str | None = None,
     **_kw,
@@ -289,7 +288,6 @@ async def create_sandbox(
     agent_root = root or _AGENT_HOME_IN
     if port is None:
         port = await _find_free_port()
-    base_image = image or _NODE_IMAGE
 
     env_prefix = _build_env_prefix(spawn_env)
     acp_arg_flags = "".join(
@@ -332,7 +330,7 @@ async def create_sandbox(
             c += ["--label", f"{_LABEL_KEY}={sandbox_id}"]
         c += [
             "--entrypoint", "sh",
-            base_image,
+            _NODE_IMAGE,
             "-c", shell_cmd,
         ]
         return c
