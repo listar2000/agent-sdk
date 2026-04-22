@@ -115,17 +115,31 @@ class AcpClient:
         result = await self.handshake(session_id, agent)
         try:
             mcp_array = _mcp_dict_to_acp_array(mcp_servers) if mcp_servers else []
-            try:
-                new_result = await self._send_rpc(session_id, "session/new",
-                                                  {"cwd": cwd, "mcpServers": mcp_array})
-            except RuntimeError as e:
-                if "Authentication required" not in str(e):
-                    raise
-                log.info("%s requires authenticate; retrying with env-var auth", agent)
-                await self._send_rpc(session_id, "authenticate",
-                                     {"methodId": "openai-api-key"})
-                new_result = await self._send_rpc(session_id, "session/new",
-                                                  {"cwd": cwd, "mcpServers": mcp_array})
+            # Retry session/new to absorb transient CLI-not-fully-ready errors
+            # on freshly-provisioned sandboxes (observed as ACP -32603 Internal
+            # error even after the supervisor's health endpoint reports OK).
+            import asyncio as _asyncio
+            _last_exc = None
+            for _attempt in range(3):
+                try:
+                    new_result = await self._send_rpc(session_id, "session/new",
+                                                      {"cwd": cwd, "mcpServers": mcp_array})
+                    _last_exc = None
+                    break
+                except RuntimeError as e:
+                    if "Authentication required" in str(e):
+                        log.info("%s requires authenticate; retrying with env-var auth", agent)
+                        await self._send_rpc(session_id, "authenticate",
+                                             {"methodId": "openai-api-key"})
+                        new_result = await self._send_rpc(session_id, "session/new",
+                                                          {"cwd": cwd, "mcpServers": mcp_array})
+                        _last_exc = None
+                        break
+                    _last_exc = e
+                    if _attempt < 2:
+                        await _asyncio.sleep(1.0 * (_attempt + 1))
+            if _last_exc is not None:
+                raise _last_exc
             inner_sid = new_result.get("sessionId")
             log.info("session/new result for %s: sessionId=%s keys=%s", session_id, inner_sid, list(new_result.keys()))
             if inner_sid:
