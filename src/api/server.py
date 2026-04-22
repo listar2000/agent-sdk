@@ -2712,11 +2712,10 @@ async def session_resume(session_id: str, request: Request):
         except Exception as e:
             log.warning("resume: update_session_secrets failed for %s: %s", session_id, e)
 
-    # Build spawn_env from stored state (agent.env + session.env + session.secrets).
-    spawn_env = await _build_spawn_env_for_session(session_id)
-
+    # ensure_session_live reads spawn_env from the DB row (via _build_spawn_env_from_row),
+    # so the updated env/secrets persisted above are automatically picked up.
     try:
-        state = await get_or_recover_session(session_id, spawn_env=spawn_env)
+        _, sandbox, state = await ensure_session_live(session_id)
     except HTTPException as e:
         return JSONResponse({"error": e.detail}, status_code=e.status_code)
     return {
