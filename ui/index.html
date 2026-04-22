@@ -800,6 +800,10 @@
         <span class="field-label">API</span>
         <input id="api-url" type="text" value="http://localhost:7778">
       </label>
+      <label class="field">
+        <span class="field-label">OAuth Token</span>
+        <input id="oauth-token" type="password" placeholder="CLAUDE_CODE_OAUTH_TOKEN (required for remote providers)">
+      </label>
     </div>
   </header>
 
@@ -1641,13 +1645,13 @@ async function connect() {
   noteCard(`Connecting ${provider}/${agentType}...`);
 
   try {
+    const oauthToken = $("oauth-token").value.trim();
     const body = {
       provider,
       agent_type: agentType,
     };
-    if (model) {
-      body.model = model;
-    }
+    if (model) body.model = model;
+    if (oauthToken) body.secrets = { CLAUDE_CODE_OAUTH_TOKEN: oauthToken };
 
     const resp = await fetch(`${apiBase()}/sessions/quick`, {
       method: "POST",
