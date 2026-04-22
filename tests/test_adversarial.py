@@ -34,45 +34,30 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 # ---------------------------------------------------------------------------
-# Import server up-front — the FastAPI lifespan (init_db/init_pool) only fires
-# on app startup, so a plain import is safe. The DB module is swapped for an
-# in-memory stub via a module-scoped autouse fixture (see
-# _stub_api_db_module) so we never hit real Postgres during tests AND we
-# don't leak the stub to sibling test files that run after us.
+# If the harness exports TEST_DATABASE_URL (our Postgres test DB), mirror it
+# into DATABASE_URL before any api.* module is imported. api.db captures
+# DATABASE_URL at import time — if that happens to be the dev default, every
+# sibling test file that imports api.db after us (test_ensure_helpers,
+# test_volumes_db, etc.) will freeze on the wrong URL. Copying here makes
+# api.db pick up the test URL even when test_adversarial is the first file
+# pytest collects (alphabetical order).
+# ---------------------------------------------------------------------------
+_TEST_DB = os.environ.get("TEST_DATABASE_URL")
+if _TEST_DB and not os.environ.get("DATABASE_URL"):
+    os.environ["DATABASE_URL"] = _TEST_DB
+
+# ---------------------------------------------------------------------------
+# Install an in-memory api.db stub BEFORE importing api.server so that
+# ``from .db import ...`` inside api.server binds to stubbed functions
+# (no real DB roundtrips during these tests). The autouse
+# ``_stub_api_db_module`` fixture below tears the stub down on module
+# exit — popping api.db and api.server from sys.modules so later test files
+# get a freshly imported api.db (picking up their DATABASE_URL if any) and
+# a freshly imported api.server (re-binding to the real db functions).
 # ---------------------------------------------------------------------------
 
 import types
 from contextlib import asynccontextmanager as _asynccontextmanager
-
-import api.server as _server_module
-from api.server import app, SESSIONS, _INSTANCES
-from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
-from api.sse import (
-    parse_sse_data,
-    parse_acp_payload,
-    parse_acp_event,
-    iter_sse_blocks,
-    UT_MESSAGE_DELTA,
-    UT_MESSAGE_CHUNK,
-    UT_TOOL_CALL,
-    UT_TOOL_STARTED,
-    UT_TOOL_CALL_UPDATE,
-    UT_USAGE_UPDATED,
-    UT_USAGE_UPDATE,
-)
-from api.acp_client import AcpClient, _mcp_dict_to_acp_array
-from api.providers import _get_sandbox_env_vars, PORT_BASED_PROVIDERS
-from api.server import (
-    _materialize_dockerfile,
-    _merge_top_level_config,
-    _CONFIG_KEYS,
-)
-# NOTE: _derive_sandbox_ref was removed from api.server in the volume-refactor;
-# sandbox_ref now equals the allocated port for port-based providers and the
-# provider-native sandbox id for Daytona. Tests that referenced the helper
-# have been removed below.
-from agent_sdk.client import Agent, _raise_for_status
-from agent_sdk.persist import SqliteSessionDriver, SessionRecord
 
 
 def _build_stub_db() -> types.ModuleType:
@@ -126,9 +111,50 @@ def _build_stub_db() -> types.ModuleType:
     return stub
 
 
-# Names api.server imported via `from .db import ...` — we redirect each at
-# api.server so our stub is actually consulted, then restore the originals on
-# teardown so sibling test files (real DB) keep working.
+# Snapshot of any prior api.db / api.server entries in sys.modules. Usually
+# None at collection time; tracked so we can cleanly remove them on teardown.
+_prior_api_db = sys.modules.get("api.db")
+_prior_api_server = sys.modules.get("api.server")
+
+# Install stub into sys.modules BEFORE importing api.server so that
+# ``from .db import ...`` resolves to stubbed (no-connect) functions.
+_stub_db_module = _build_stub_db()
+sys.modules["api.db"] = _stub_db_module
+
+import api.server as _server_module
+from api.server import app, SESSIONS, _INSTANCES
+from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
+from api.sse import (
+    parse_sse_data,
+    parse_acp_payload,
+    parse_acp_event,
+    iter_sse_blocks,
+    UT_MESSAGE_DELTA,
+    UT_MESSAGE_CHUNK,
+    UT_TOOL_CALL,
+    UT_TOOL_STARTED,
+    UT_TOOL_CALL_UPDATE,
+    UT_USAGE_UPDATED,
+    UT_USAGE_UPDATE,
+)
+from api.acp_client import AcpClient, _mcp_dict_to_acp_array
+from api.providers import _get_sandbox_env_vars, PORT_BASED_PROVIDERS
+from api.server import (
+    _materialize_dockerfile,
+    _merge_top_level_config,
+    _CONFIG_KEYS,
+)
+# NOTE: _derive_sandbox_ref was removed from api.server in the volume-refactor;
+# sandbox_ref now equals the allocated port for port-based providers and the
+# provider-native sandbox id for Daytona. Tests that referenced the helper
+# have been removed below.
+from agent_sdk.client import Agent, _raise_for_status
+from agent_sdk.persist import SqliteSessionDriver, SessionRecord
+
+
+# Names api.server imported via `from .db import ...` — ensure every one
+# points at the stub (defensive: covers any that may have been reassigned
+# before our sys.modules swap took effect).
 _STUBBED_DB_NAMES = (
     "init_db", "init_pool", "close_pool",
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
@@ -142,34 +168,57 @@ _STUBBED_DB_NAMES = (
     "list_volumes", "delete_volume", "set_session_current_sandbox",
 )
 
+for _name in _STUBBED_DB_NAMES:
+    if hasattr(_stub_db_module, _name):
+        setattr(_server_module, _name, getattr(_stub_db_module, _name))
+
 
 @pytest.fixture(scope="module", autouse=True)
 def _stub_api_db_module():
-    """Swap api.db for a stub for the duration of this test module only.
+    """Keep the stub in place for this test module; restore on exit.
 
-    Uses patch.dict(sys.modules, ...) so sibling test files that run AFTER
-    this module see the real api.db again. Also redirects the already-bound
-    names on api.server (imported via `from .db import ...`) to the stub and
-    restores the originals on teardown.
+    The stub was installed at module-import above so api.server's
+    ``from .db import ...`` resolved to no-op stubs (otherwise api.db would
+    load with DATABASE_URL frozen to the dev default). On teardown we need
+    to transparently hand the real api.db back to sibling test files that
+    have already captured a reference at their own module-import time
+    (``from api import db as dbmod``).
+
+    Strategy: load the real api.db module, then mutate our stub module
+    in-place so every attribute points at the real function. Callers
+    holding ``dbmod = <stub>`` will see real DB behaviour the moment they
+    access any attribute. Also re-bind the names on api.server (shared via
+    sys.modules) to the real functions.
     """
-    stub = _build_stub_db()
-    _MISSING = object()
-    originals = {
-        name: getattr(_server_module, name, _MISSING) for name in _STUBBED_DB_NAMES
-    }
-    for name in _STUBBED_DB_NAMES:
-        if hasattr(stub, name):
-            setattr(_server_module, name, getattr(stub, name))
+    yield
+    # Step 1: pop stub from sys.modules so importlib.import_module re-reads
+    # the real module file.
+    sys.modules.pop("api.db", None)
+    import importlib
     try:
-        with patch.dict(sys.modules, {"api.db": stub}):
-            yield
-    finally:
-        for name, value in originals.items():
-            if value is _MISSING:
-                if hasattr(_server_module, name):
-                    delattr(_server_module, name)
-            else:
-                setattr(_server_module, name, value)
+        real_db = importlib.import_module("api.db")
+    except Exception:
+        real_db = None
+
+    # Step 2: mutate our stub to delegate to the real module. This lets
+    # sibling test files that already captured ``dbmod = <stub>`` at their
+    # own import time see real DB behaviour now.
+    if real_db is not None:
+        # Copy every public attribute from real_db onto our stub object.
+        for attr in dir(real_db):
+            if attr.startswith("__"):
+                continue
+            try:
+                setattr(_stub_db_module, attr, getattr(real_db, attr))
+            except Exception:
+                pass
+        # Re-register real_db in sys.modules — it IS the real module now.
+        sys.modules["api.db"] = real_db
+        # Step 3: rebind api.server's db-sourced names to the real
+        # functions so shared-module callers see the real DB.
+        for name in _STUBBED_DB_NAMES:
+            if hasattr(real_db, name):
+                setattr(_server_module, name, getattr(real_db, name))
 
 
 # ---------------------------------------------------------------------------
