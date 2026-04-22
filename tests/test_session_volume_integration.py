@@ -548,3 +548,98 @@ async def test_ensure_volume_supervisor_retry_after_cache_fail(client):
     vol = await dbmod.get_volume("v-retry")
     assert vol is not None
     assert "claude" in (vol.supervisor_agent_types or [])
+
+
+# ---------------------------------------------------------------------------
+# Scenario 15 — install_supervisor fault injection (no partial cache, retry).
+# The provider's install_supervisor raises mid-run (e.g., OSError("disk full"),
+# npm network failure). The volume's supervisor_agent_types cache must NOT be
+# populated — a half-installed volume is poisoned state that a subsequent
+# sandbox provision would silently trust. The next call must re-run install
+# and, on success, populate the cache.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_install_supervisor_fault_injection_no_partial_cache(client):
+    """First install raises mid-run; cache stays empty; next call succeeds.
+
+    Behavioral test: asserts the observable property (no cache poisoning +
+    retry works), not the internal mechanism. Compatible with both the
+    current implementation (direct install) and any future staging-dir +
+    atomic-rename refactor (M3) the parallel agent may land.
+    """
+    from api.models import AgentConfig, AgentRecord, VolumeRecord
+
+    await dbmod.upsert_agent(AgentRecord(
+        id="a-fault", name="fault", config=AgentConfig(agent_type="claude"),
+    ))
+    await dbmod.upsert_volume(VolumeRecord(
+        id="v-fault", name="v-fault", provider="daytona", provider_ref="dt-fault",
+    ))
+
+    install_calls = 0
+
+    # First call: provider raises mid-run with a disk-full style OSError.
+    # Second call: succeed.
+    async def flaky_install(provider, volume_ref, agent_type):
+        nonlocal install_calls
+        install_calls += 1
+        if install_calls == 1:
+            raise OSError(28, "No space left on device")
+
+    with patch("api.providers.install_supervisor",
+               new=AsyncMock(side_effect=flaky_install)):
+        with pytest.raises(OSError) as excinfo:
+            await srv.ensure_volume_supervisor("v-fault", "claude")
+    # Error surfaced cleanly (no wrapping that hides the errno).
+    assert "No space left on device" in str(excinfo.value) or excinfo.value.errno == 28
+
+    # --- Cache must NOT list 'claude' — half-install is poisoned state.
+    vol = await dbmod.get_volume("v-fault")
+    assert vol is not None
+    assert "claude" not in (vol.supervisor_agent_types or []), (
+        f"cache poisoned after failed install: {vol.supervisor_agent_types!r}"
+    )
+
+    # --- Retry: provider's install succeeds; cache is populated.
+    with patch("api.providers.install_supervisor",
+               new=AsyncMock(side_effect=flaky_install)):
+        await srv.ensure_volume_supervisor("v-fault", "claude")
+
+    assert install_calls == 2, (
+        f"retry must call install again; got {install_calls}"
+    )
+    vol = await dbmod.get_volume("v-fault")
+    assert "claude" in (vol.supervisor_agent_types or [])
+
+
+@pytest.mark.asyncio
+async def test_install_supervisor_fault_leaves_other_agents_untouched(client):
+    """Failed install of agent_type=X must not clobber a previously-cached
+    agent_type=Y on the same volume."""
+    from api.models import AgentConfig, AgentRecord, VolumeRecord
+
+    await dbmod.upsert_agent(AgentRecord(
+        id="a-ft2", name="ft2", config=AgentConfig(agent_type="claude"),
+    ))
+    await dbmod.upsert_volume(VolumeRecord(
+        id="v-ft2", name="v-ft2", provider="daytona", provider_ref="dt-ft2",
+        # Pre-populate supervisor cache with 'claude'.
+        supervisor_agent_types=["claude"],
+    ))
+
+    # codex install fails; claude cache must remain.
+    async def flaky(provider, volume_ref, agent_type):
+        if agent_type == "codex":
+            raise RuntimeError("npm install failed: network unreachable")
+
+    with patch("api.providers.install_supervisor",
+               new=AsyncMock(side_effect=flaky)):
+        with pytest.raises(RuntimeError):
+            await srv.ensure_volume_supervisor("v-ft2", "codex")
+
+    vol = await dbmod.get_volume("v-ft2")
+    cached = set(vol.supervisor_agent_types or [])
+    assert "claude" in cached, "claude cache must survive an unrelated failed install"
+    assert "codex" not in cached, "failed codex install must not populate the cache"
