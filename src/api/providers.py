@@ -504,6 +504,8 @@ async def provision_daytona_sandbox(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
+    volume_id: str | None = None,
+    subpath: str | None = None,
 ) -> ProviderInstance:
     """Create a Daytona sandbox and install deps, but do NOT start a supervisor.
 
@@ -513,7 +515,7 @@ async def provision_daytona_sandbox(
     try:
         from daytona_sdk import (
             Daytona, DaytonaConfig, CreateSandboxFromImageParams,
-            CreateSandboxFromSnapshotParams,
+            CreateSandboxFromSnapshotParams, VolumeMount,
         )
     except ImportError:
         raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
@@ -538,16 +540,30 @@ async def provision_daytona_sandbox(
         image = "node:22-slim"
 
     create_timeout = 300 if dockerfile else 60
+
+    # Build volumes list if volume_id + subpath are provided.
+    # NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
+    # spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
+    volumes = None
+    if volume_id and subpath:
+        volumes = [VolumeMount(
+            volume_id=volume_id,
+            mount_path="/home/daytona",
+            subpath=subpath,
+        )]
+
     if use_snapshot:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
+                volumes=volumes,
             ), timeout=create_timeout,
         ))
     else:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromImageParams(
                 image=image, auto_stop_interval=0, env_vars=env_vars,
+                volumes=volumes,
             ), timeout=create_timeout,
         ))
 
@@ -653,12 +669,14 @@ async def create_daytona(
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
+    volume_id: str | None = None,
+    subpath: str | None = None,
 ) -> ProviderInstance:
     """Create a fresh Daytona sandbox, install + start a supervisor inside it."""
     try:
         from daytona_sdk import (
             Daytona, DaytonaConfig, CreateSandboxFromImageParams,
-            CreateSandboxFromSnapshotParams,
+            CreateSandboxFromSnapshotParams, VolumeMount,
         )
     except ImportError:
         raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
@@ -686,12 +704,25 @@ async def create_daytona(
         image = "node:22-slim"
 
     create_timeout = 300 if dockerfile else 60
+
+    # Build volumes list if volume_id + subpath are provided.
+    # NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
+    # spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
+    volumes = None
+    if volume_id and subpath:
+        volumes = [VolumeMount(
+            volume_id=volume_id,
+            mount_path="/home/daytona",
+            subpath=subpath,
+        )]
+
     if use_snapshot:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot,
                 auto_stop_interval=0,
                 env_vars=env_vars,
+                volumes=volumes,
             ),
             timeout=create_timeout,
         ))
@@ -701,6 +732,7 @@ async def create_daytona(
                 image=image,
                 auto_stop_interval=0,
                 env_vars=env_vars,
+                volumes=volumes,
             ),
             timeout=create_timeout,
         ))
@@ -727,11 +759,35 @@ def _get_daytona_client():
     return Daytona(DaytonaConfig(api_key=api_key))
 
 
-async def create_daytona_volume(name: str) -> str:
-    """Create a Daytona volume and return its provider-native id."""
+async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str:
+    """Create a Daytona volume and return its provider-native id.
+
+    Polls until the volume reaches the 'ready' state before returning so that
+    callers can immediately attach the volume to a new sandbox.
+    """
+    from daytona_api_client import VolumesApi
+    from daytona_api_client.models import VolumeState
+
     client = _get_daytona_client()
     vol = await asyncio.to_thread(client.volume.create, name)
-    return vol.id
+    vol_id = vol.id
+
+    # Poll until ready (volume creation is async on the Daytona backend).
+    volumes_api = VolumesApi(client._api_client)
+    deadline = asyncio.get_running_loop().time() + wait_ready_timeout
+    while True:
+        dto = await asyncio.to_thread(volumes_api.get_volume, vol_id)
+        state = dto.state
+        state_val = state.value if hasattr(state, "value") else str(state)
+        if state_val == VolumeState.READY:
+            break
+        if state_val in {VolumeState.ERROR, VolumeState.DELETED, VolumeState.DELETING}:
+            raise RuntimeError(f"Daytona volume {vol_id} entered unexpected state: {state_val}")
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError(f"Daytona volume {vol_id} did not become ready within {wait_ready_timeout}s (last state: {state_val})")
+        await asyncio.sleep(3)
+
+    return vol_id
 
 
 async def delete_daytona_volume(provider_ref: str) -> None:
