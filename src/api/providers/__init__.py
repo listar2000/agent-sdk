@@ -2,25 +2,20 @@
 
 This package splits provider-specific code into sub-modules:
   - daytona.py   — Daytona sandbox management
-  - docker.py    — Docker container management (NotImplementedError stubs)
-  - local.py     — Local subprocess management (NotImplementedError stubs)
+  - docker.py    — Docker container management
+  - local.py     — Local subprocess management
   - _shared.py   — Shared types, constants, helpers
 
 providers/__init__.py:
   - Re-exports everything from _shared for backward compatibility
   - Re-exports Daytona-specific symbols for server.py compatibility
-  - Implements local/docker provider logic (create/destroy/exec)
   - Provides universal dispatch wrappers (create_instance, destroy_instance, etc.)
   - Provides new uniform-API dispatch helpers for Phase 1+ use
 """
 
 import asyncio
 import logging
-import os
-import shlex
 import shutil
-import signal
-from pathlib import Path
 
 from .. import load_dotenv
 
@@ -89,308 +84,6 @@ _PROVIDER_MODS = {
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Local provider implementation (kept in __init__.py for now)
-# ---------------------------------------------------------------------------
-
-_SUPERVISOR_DIR = Path(__file__).resolve().parent.parent.parent / "supervisor"
-_supervisor_deps_lock = asyncio.Lock()
-_supervisor_deps_ready = False
-
-
-async def _ensure_local_supervisor_deps(agent_type: str) -> str:
-    """Ensure the ACP binary for *agent_type* is available.
-
-    For npm-based agents: installs from src/supervisor/package.json.
-    For system-installed agents (openhands, etc.): looks up in PATH.
-    Returns the absolute path to the binary."""
-    global _supervisor_deps_ready
-    bin_name = _acp_bin_name(agent_type)
-
-    # Non-npm agents: look up in PATH
-    if agent_type not in _ACP_NPM_SPECS:
-        system_bin = shutil.which(bin_name)
-        if not system_bin:
-            raise RuntimeError(
-                f"{bin_name} not found in PATH. Install it first "
-                f"(e.g. 'uv tool install {bin_name}' or check the agent's docs)."
-            )
-        return system_bin
-
-    acp_bin = _SUPERVISOR_DIR / "node_modules" / ".bin" / bin_name
-    async with _supervisor_deps_lock:
-        if _supervisor_deps_ready and acp_bin.exists():
-            return str(acp_bin)
-        if not acp_bin.exists():
-            log.info("installing supervisor deps in %s", _SUPERVISOR_DIR)
-            npm = shutil.which("npm")
-            if not npm:
-                raise RuntimeError("npm not found; install Node.js >=18")
-            proc = await asyncio.create_subprocess_exec(
-                npm, "install", "--silent",
-                cwd=str(_SUPERVISOR_DIR),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(f"npm install failed: {stderr.decode()[:500]}")
-        if not acp_bin.exists():
-            raise RuntimeError(f"supervisor dep install succeeded but {bin_name} missing at {acp_bin}")
-        _supervisor_deps_ready = True
-        return str(acp_bin)
-
-
-async def create_local(
-    agent_type: str = "claude",
-    root: str = "/tmp",
-    spawn_env: dict[str, str] | None = None,
-) -> ProviderInstance:
-    """Spawn a local supervisor.js subprocess that bridges stdio ↔ HTTP
-    (POST + SSE) for the given agent's ACP binary."""
-    node = shutil.which("node")
-    if not node:
-        raise RuntimeError("node binary not found; install Node.js >=18")
-    acp_bin = await _ensure_local_supervisor_deps(agent_type)
-    launch_args = _acp_launch_args(agent_type)
-
-    port = await _find_free_port()
-    # Start from os.environ (for PATH, HOME, LANG, etc.) but strip every
-    # credential key — the server never leaks its own API keys/tokens into
-    # a sandbox supervisor. Then overlay IS_SANDBOX + spawn_env.
-    env = {k: v for k, v in os.environ.items() if k not in AUTH_KEYS}
-    env.update(_get_sandbox_env_vars(spawn_env))
-    extra: list[str] = []
-    for arg in launch_args:
-        extra += ["--acp-arg", arg]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            node, str(_SUPERVISOR_DIR / "supervisor.js"),
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--acp", acp_bin,
-            *extra,
-            "--root", root,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-    except Exception:
-        async with _port_lock:
-            _freed_ports.append(port)
-        raise
-
-    url = f"http://127.0.0.1:{port}"
-    try:
-        if not await _wait_for_health(url):
-            raise RuntimeError(f"supervisor failed to start on port {port}")
-    except BaseException:
-        proc.kill()
-        await proc.wait()
-        async with _port_lock:
-            _freed_ports.append(port)
-        raise
-
-    log.info("local supervisor started on port %d (pid %d)", port, proc.pid)
-    return ProviderInstance(
-        provider="local",
-        url=url,
-        root=root,
-        process=proc,
-        port=port,
-    )
-
-
-def _get_child_pids(ppid: int) -> list[int]:
-    """Return all descendant PIDs of *ppid* (best-effort, non-blocking)."""
-    try:
-        children = []
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/stat") as f:
-                    parts = f.read().split()
-                    if int(parts[3]) == ppid:
-                        child = int(entry)
-                        children.append(child)
-                        children.extend(_get_child_pids(child))
-            except (OSError, IndexError, ValueError):
-                continue
-        return children
-    except Exception:
-        return []
-
-
-async def destroy_local(instance: ProviderInstance) -> None:
-    """Kill a local supervisor subprocess and its ACP children."""
-    pid = instance.process.pid if instance.process else None
-
-    children = _get_child_pids(pid) if pid else []
-
-    if instance.process and instance.process.returncode is None:
-        instance.process.terminate()
-        try:
-            await asyncio.wait_for(instance.process.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            instance.process.kill()
-            await instance.process.wait()
-
-    for cpid in children:
-        try:
-            os.kill(cpid, signal.SIGINT)
-            log.warning("sent SIGINT to child pid %d of supervisor %s", cpid, pid)
-        except OSError:
-            pass
-
-    port = instance.port
-    await _recycle_port(instance)
-    if port is not None:
-        log.info("local supervisor stopped (port %d)", port)
-
-
-# ---------------------------------------------------------------------------
-# Docker provider implementation (kept in __init__.py for now)
-# ---------------------------------------------------------------------------
-
-_SUPERVISOR_DOCKER_IMAGE = "agent-sdk-acp-supervisor:latest"
-_SUPERVISOR_DOCKER_PORT = 9100
-_supervisor_image_lock = asyncio.Lock()
-_supervisor_image_ready = False
-
-
-async def _ensure_supervisor_docker_image() -> str:
-    """Build the supervisor Docker image once per process, cache the tag."""
-    global _supervisor_image_ready
-    docker = shutil.which("docker")
-    if not docker:
-        raise RuntimeError("docker binary not found. Install Docker: https://docs.docker.com/get-docker/")
-    async with _supervisor_image_lock:
-        if _supervisor_image_ready:
-            return _SUPERVISOR_DOCKER_IMAGE
-        inspect = await asyncio.create_subprocess_exec(
-            docker, "image", "inspect", _SUPERVISOR_DOCKER_IMAGE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await inspect.wait()
-        if inspect.returncode == 0:
-            _supervisor_image_ready = True
-            return _SUPERVISOR_DOCKER_IMAGE
-        log.info("building supervisor docker image %s", _SUPERVISOR_DOCKER_IMAGE)
-        build = await asyncio.create_subprocess_exec(
-            docker, "build", "-t", _SUPERVISOR_DOCKER_IMAGE, str(_SUPERVISOR_DIR),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await build.communicate()
-        if build.returncode != 0:
-            raise RuntimeError(f"supervisor docker build failed:\n{stderr.decode()[:800]}")
-        _supervisor_image_ready = True
-        return _SUPERVISOR_DOCKER_IMAGE
-
-
-async def create_docker(
-    agent_type: str = "claude",
-    dockerfile: str | None = None,
-    pre_start_commands: list[str] | None = None,
-    root: str = "/tmp",
-    spawn_env: dict[str, str] | None = None,
-) -> ProviderInstance:
-    """Run the supervisor Docker image as a per-session container."""
-    docker = shutil.which("docker")
-    if not docker:
-        raise RuntimeError("docker binary not found. Install Docker: https://docs.docker.com/get-docker/")
-
-    image = await _ensure_supervisor_docker_image()
-    port = await _find_free_port()
-
-    bin_name = _acp_bin_name(agent_type)
-    acp_path = f"/app/node_modules/.bin/{bin_name}"
-    launch_args = _acp_launch_args(agent_type)
-
-    env_prefix = _build_env_prefix(spawn_env)
-    acp_arg_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in launch_args)
-    supervisor_cmd = (
-        f"env {env_prefix} node /app/supervisor.js --host 0.0.0.0 "
-        f"--port {_SUPERVISOR_DOCKER_PORT} --root {shlex.quote(root)} "
-        f"--acp {shlex.quote(acp_path)}{acp_arg_flags}"
-    )
-    if pre_start_commands:
-        setup = " && ".join(pre_start_commands)
-        shell_cmd = f"{setup} && {supervisor_cmd}"
-    else:
-        shell_cmd = supervisor_cmd
-
-    cmd = [
-        docker, "run", "-d", "--rm",
-        "-p", f"{port}:{_SUPERVISOR_DOCKER_PORT}",
-        "--entrypoint", "sh",
-        image,
-        "-c", shell_cmd,
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"docker run failed: {stderr.decode().strip()}")
-        container_id = stdout.decode().strip()
-
-        url = f"http://localhost:{port}"
-        if not await _wait_for_health(url):
-            rm_proc = await asyncio.create_subprocess_exec(
-                docker, "rm", "-f", container_id,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await rm_proc.wait()
-            raise RuntimeError(f"supervisor container failed to start on port {port}")
-
-        log.info("docker supervisor started on port %d (container %s)", port, container_id[:12])
-        return ProviderInstance(
-            provider="docker",
-            url=url,
-            root=root,
-            port=port,
-            container_id=container_id,
-        )
-    except BaseException:
-        async with _port_lock:
-            _freed_ports.append(port)
-        raise
-
-
-async def destroy_docker(instance: ProviderInstance) -> None:
-    """Stop and remove a Docker container running a supervisor."""
-    if not instance.container_id:
-        return
-
-    docker = shutil.which("docker")
-    if not docker:
-        log.warning("docker not found, cannot remove container %s", instance.container_id[:12])
-        return
-    proc = await asyncio.create_subprocess_exec(
-        docker, "rm", "-f", instance.container_id,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await proc.communicate()
-    port = instance.port
-    cid = instance.container_id
-    if proc.returncode == 0:
-        await _recycle_port(instance)
-        instance.container_id = None
-        if port is not None:
-            log.info("docker container stopped (port %d, container %s)", port, (cid or "?")[:12])
-    else:
-        log.warning("docker rm -f failed (rc=%d) for container %s — port %d NOT freed",
-                     proc.returncode, (cid or "?")[:12], port or 0)
-
-
-# ---------------------------------------------------------------------------
 # Universal dispatch
 # ---------------------------------------------------------------------------
 
@@ -415,15 +108,20 @@ async def create_instance(
     with no credentials.
 
     volume_id + subpath are forwarded to providers that support volume
-    mounts. Only Daytona uses them today.
+    mounts.
     """
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(_ACP_BIN_NAMES)}")
     if provider == "local":
-        return await create_local(agent_type, root=root, spawn_env=spawn_env)
+        return await _local_mod.create_sandbox(
+            volume_ref=volume_id, subpath=subpath or "",
+            agent_type=agent_type, root=root, spawn_env=spawn_env,
+        )
     if provider == "docker":
-        return await create_docker(
-            agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands,
+        return await _docker_mod.create_sandbox(
+            volume_ref=volume_id, subpath=subpath or "",
+            agent_type=agent_type, dockerfile=dockerfile,
+            pre_start_commands=pre_start_commands,
             root=root, spawn_env=spawn_env,
         )
     if provider == "daytona":
@@ -438,21 +136,21 @@ async def create_instance(
 async def destroy_instance(instance: ProviderInstance) -> None:
     """Destroy a supervisor instance."""
     if instance.provider == "local":
-        await destroy_local(instance)
+        await _local_mod.destroy_sandbox(instance)
     elif instance.provider == "daytona":
         await destroy_daytona(instance)
     elif instance.provider == "docker":
-        await destroy_docker(instance)
+        await _docker_mod.destroy_sandbox(instance)
 
 
 async def stop_instance(instance: ProviderInstance) -> None:
     """Stop a supervisor instance (resumable). For local/docker, same as destroy."""
     if instance.provider == "local":
-        await destroy_local(instance)
+        await _local_mod.destroy_sandbox(instance)
     elif instance.provider == "daytona":
         await stop_daytona(instance)
     elif instance.provider == "docker":
-        await destroy_docker(instance)
+        await _docker_mod.destroy_sandbox(instance)
 
 
 async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
