@@ -3372,42 +3372,19 @@ async def session_sandbox_exec(session_id: str, request: Request):
         return JSONResponse({"error": "command required"}, status_code=400)
     timeout = min(data.get("timeout", 30), 300)
 
-    # Resolve sandbox_id from in-memory session or DB
-    state = SESSIONS.get(session_id)
-    if state:
-        sandbox_id = state.sandbox_id
-    else:
-        session_row = await get_session(session_id)
-        if not session_row:
-            return JSONResponse({"error": "session not found"}, status_code=404)
-        sandbox_id = session_row.get("current_sandbox_id")
-        if not sandbox_id:
-            return JSONResponse(
-                {"error": "session has no current sandbox"}, status_code=409,
-            )
+    try:
+        _, sandbox, _ = await ensure_session_live(session_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
-    instance = _INSTANCES.get(sandbox_id)
-
-    # Auto-start if sandbox is not running
-    if not instance:
-        sandbox_record = await get_sandbox(sandbox_id)
-        if not sandbox_record:
-            return JSONResponse({"error": "sandbox not found"}, status_code=404)
-        agent_type = "claude"
-        if state:
-            agent_type = state.agent_type
-        try:
-            await _ensure_sandbox_alive(
-                sandbox_id, sandbox_record, agent_type=agent_type,
-            )
-            instance = _INSTANCES.get(sandbox_id)
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"failed to start sandbox: {e}"}, status_code=502
-            )
-
-    if not instance:
-        return JSONResponse({"error": "sandbox not running"}, status_code=409)
+    # Build a ProviderInstance from the SandboxRecord for exec.
+    # exec_in_instance only needs provider + sandbox_id (=sandbox_ref) for Daytona.
+    instance = ProviderInstance(
+        provider=sandbox.provider,
+        url="",
+        root=sandbox.root,
+        sandbox_id=sandbox.sandbox_ref,
+    )
 
     try:
         result = await exec_in_instance(instance, command, timeout=timeout)
