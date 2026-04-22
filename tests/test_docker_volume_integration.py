@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import subprocess
 import sys
 import uuid
@@ -345,6 +346,94 @@ async def test_destroy_recreate_same_subpath_preserves_files():
 # ---------------------------------------------------------------------------
 # 3.3: install_supervisor (real npm install — slower, but gated by marker)
 # ---------------------------------------------------------------------------
+
+async def _read_system_tree(volume_ref: str) -> list[str]:
+    """Return the list of entries directly under ``<volume>/system/``.
+
+    ``volume_tree`` only reports files (``find -type f``), which would miss
+    the empty dir skeleton.  Use ``ls -1`` via the util container for a
+    complete picture.  Symlinks are reported with a trailing ``@`` so we
+    can distinguish the ``supervisor`` symlink from a real directory.
+    """
+    rc, out, err = await dprov._run_volume_shell(
+        volume_ref,
+        "cd /v/system 2>/dev/null && ls -1F || true",
+        timeout=30,
+    )
+    if rc != 0:
+        raise RuntimeError(err.decode(errors="replace").strip()[:400])
+    return [ln.strip() for ln in out.decode(errors="replace").splitlines() if ln.strip()]
+
+
+async def _read_symlink_target(volume_ref: str, link_rel: str) -> str:
+    """Return readlink(/v/<link_rel>) — empty if not a symlink."""
+    rc, out, _ = await dprov._run_volume_shell(
+        volume_ref,
+        f"readlink /v/{shlex.quote(link_rel)} || true",
+        timeout=30,
+    )
+    return out.decode(errors="replace").strip() if rc == 0 else ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("AGENT_SDK_SKIP_SLOW_DOCKER_TESTS") == "1",
+    reason="slow npm-install test skipped (AGENT_SDK_SKIP_SLOW_DOCKER_TESTS=1)",
+)
+async def test_install_supervisor_symlink_flip_preserves_old_version():
+    """MA2 regression guard: the docker install_supervisor replaces
+    ``system/supervisor`` with a symlink to a fresh ``supervisor.v<ts>/``
+    on each run.  The OLD versioned directory must linger (GC is 24 h old)
+    so a live container bind-mounting the previous symlink target keeps a
+    consistent view of the filesystem.
+
+    Reverting MA2 (rm -rf + rename) would pass the local provider's test
+    but FAIL here because the old v-dir would be gone.
+    """
+    name = _vol_name()
+    try:
+        await dprov.create_volume(name)
+
+        # First install.
+        await dprov.install_supervisor(name, agent_type="claude")
+        entries1 = await _read_system_tree(name)
+        # There should be a single supervisor.v* directory and a symlink.
+        v_dirs1 = [e.rstrip("/@*") for e in entries1 if e.startswith("supervisor.v")]
+        assert len(v_dirs1) == 1, f"expected one v-dir after install 1, got {entries1}"
+        v1 = v_dirs1[0]
+
+        link1 = await _read_symlink_target(name, "system/supervisor")
+        assert link1 == v1, (
+            f"expected symlink → {v1}, got {link1!r} (entries={entries1})"
+        )
+
+        # Second install — simulates a reinstall. Cache is bypassed since
+        # we call the provider function directly (not via ensure_volume_supervisor).
+        # The second v-name is monotonically larger (timestamp-based) so
+        # there's no collision with the first.
+        await dprov.install_supervisor(name, agent_type="claude")
+        entries2 = await _read_system_tree(name)
+        v_dirs2 = sorted(
+            e.rstrip("/@*") for e in entries2 if e.startswith("supervisor.v")
+        )
+        assert len(v_dirs2) == 2, (
+            f"expected OLD + NEW v-dirs after install 2, got {entries2}"
+        )
+        assert v1 in v_dirs2, (
+            f"OLD v-dir {v1!r} missing — MA2 revert would delete it before "
+            f"the symlink flip (entries={entries2})"
+        )
+        v2 = next(d for d in v_dirs2 if d != v1)
+
+        # Symlink now points at the NEW v-dir, not the old one.
+        link2 = await _read_symlink_target(name, "system/supervisor")
+        assert link2 == v2, (
+            f"expected symlink → new v-dir {v2!r}, got {link2!r}"
+        )
+        assert link2 != v1, "symlink should have flipped to the new v-dir"
+    finally:
+        await dprov.delete_volume(name)
+
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
