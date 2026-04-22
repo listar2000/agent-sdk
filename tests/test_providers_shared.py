@@ -157,3 +157,148 @@ async def test_find_free_port_os_fallback_when_counter_exhausted():
     finally:
         for s in occupied_socks:
             s.close()
+
+
+# ---------------------------------------------------------------------------
+# Security — shell-injection via spawn_env keys (Cycle 13)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "FOO;echo PWNED;BAR",          # classic command separator
+        "FOO=val BAR",                 # space inside the key
+        "FOO\nBAR",                    # newline
+        "FOO`id`",                     # backtick command sub
+        "FOO$(id)",                    # $() command sub
+        "FOO&whoami",                  # background + second cmd
+        "FOO|cat",                     # pipe
+        "FOO>&2",                      # redir
+        "1STARTS_WITH_DIGIT",          # POSIX rejects
+        "",                            # empty
+        "FOO BAR",                     # plain space
+        "-u FOO",                      # mimic env --unset flag
+    ],
+)
+def test_build_env_prefix_rejects_shell_metacharacter_keys(bad_key):
+    """``_build_env_prefix`` must refuse to interpolate a non-POSIX env var name.
+
+    Values are ``shlex.quote``-wrapped, but keys are emitted raw on the
+    left of ``K=V`` — a key like ``FOO;echo PWNED;BAR`` would break out of
+    ``env``'s arglist and run arbitrary commands inside the sandbox.
+    """
+    from api.providers._shared import _build_env_prefix
+
+    with pytest.raises(ValueError, match="invalid env var name"):
+        _build_env_prefix({bad_key: "safe-value"})
+
+
+def test_build_env_prefix_accepts_valid_keys():
+    """Sanity: legitimate POSIX names pass and the value is shlex-quoted."""
+    from api.providers._shared import _build_env_prefix
+
+    prefix = _build_env_prefix({"FOO": "bar", "_UNDERSCORE": "x", "A1": "y"})
+    # Values quoted, keys raw, no stray shell metas in the rendered output.
+    assert "FOO=bar" in prefix
+    assert "_UNDERSCORE=x" in prefix
+    assert "A1=y" in prefix
+    for meta in (";", "`", "$(", "&", "|"):
+        assert meta not in prefix, f"shell metacharacter {meta!r} leaked: {prefix}"
+
+
+def test_build_env_prefix_rejects_injection_attempt_end_to_end():
+    """Regression: exact payload that triggered the finding — ensure a ``;``
+    in a key can't land in the final rendered shell command."""
+    from api.providers._shared import _build_env_prefix
+
+    payload = {"FOO;touch /tmp/pwned;BAR": "v"}
+    with pytest.raises(ValueError):
+        _build_env_prefix(payload)
+
+
+# ---------------------------------------------------------------------------
+# Security — HTTP ingress rejects shell-metachar env keys + bad volume/subpath
+# ---------------------------------------------------------------------------
+
+
+def test_pop_env_and_secrets_rejects_shell_metachar_keys():
+    """``_pop_env_and_secrets`` (used by /sessions/new, /sessions/{id}/resume,
+    /sandboxes/provision) must 400 on any non-POSIX env or secrets key.
+    Defence-in-depth: ``_build_env_prefix`` rejects too, but we want the
+    error surfaced at the HTTP layer so clients get a clean 400."""
+    from fastapi import HTTPException
+
+    from api.server import _pop_env_and_secrets
+
+    for bad in ("FOO;evil", "FOO BAR", "FOO\nBAR", "-u EVIL", ""):
+        with pytest.raises(HTTPException) as exc:
+            _pop_env_and_secrets({"env": {bad: "v"}})
+        assert exc.value.status_code == 400
+        with pytest.raises(HTTPException) as exc:
+            _pop_env_and_secrets({"secrets": {bad: "v"}})
+        assert exc.value.status_code == 400
+
+
+def test_forbid_auth_keys_in_env_also_rejects_shell_metachars():
+    """``_forbid_auth_keys_in_env`` guards ``config.env`` for POST /agents
+    and POST /sandboxes/provision. Both auth-key smuggling and shell-metachar
+    keys must 400."""
+    from fastapi import HTTPException
+
+    from api.server import _forbid_auth_keys_in_env
+
+    with pytest.raises(HTTPException) as exc:
+        _forbid_auth_keys_in_env({"FOO;x": "v"}, "test")
+    assert exc.value.status_code == 400
+
+
+def test_validate_subpath_rejects_docker_mount_injection():
+    """Subpath flows into docker ``--mount ...,volume-subpath=<subpath>``.
+    A value like ``foo,readonly`` would inject a second mount flag."""
+    from fastapi import HTTPException
+
+    from api.server import _validate_subpath
+
+    # Valid paths pass.
+    _validate_subpath("agents/abc/home")
+    _validate_subpath("shared")
+
+    # Injection / traversal must 400.
+    for bad in (
+        "foo,readonly",     # docker mount kv injection
+        "foo readonly",     # whitespace
+        "foo\nbar",         # newline
+        "../etc/passwd",    # traversal
+        "foo/../bar",       # mid-path traversal
+        "",                 # empty
+        "/absolute",        # leading slash (regex rejects)
+        "foo;bar",          # shell-metachar (defence-in-depth)
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _validate_subpath(bad)
+        assert exc.value.status_code == 400, f"should 400 on {bad!r}"
+
+
+def test_validate_volume_name_rejects_path_escape():
+    """Volume name flows into local provider filesystem layout AND docker
+    argv. A ``../`` or ``/``-containing name could escape the volume root."""
+    from fastapi import HTTPException
+
+    from api.server import _validate_volume_name
+
+    _validate_volume_name("my-vol_1")
+    _validate_volume_name("abc")
+
+    for bad in (
+        "../etc",
+        "foo/bar",
+        "foo;rm",
+        ".hidden",        # leading dot — excluded by regex
+        "",
+        "a" * 200,        # too long
+        "foo bar",
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _validate_volume_name(bad)
+        assert exc.value.status_code == 400, f"should 400 on {bad!r}"

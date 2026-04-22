@@ -8,6 +8,7 @@ everything from here, and daytona.py imports from here directly.
 import asyncio
 import logging
 import os
+import re
 import shlex
 import socket
 from dataclasses import dataclass
@@ -15,6 +16,11 @@ from dataclasses import dataclass
 import httpx
 
 log = logging.getLogger(__name__)
+
+# POSIX env var name: letter/underscore followed by letters/digits/underscores.
+# Validated at _build_env_prefix() to prevent shell injection via spawn_env keys
+# when providers (daytona, docker) interpolate them into ``sh -c`` commands.
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # ---------------------------------------------------------------------------
 # Provider constants
@@ -147,8 +153,22 @@ def _build_env_prefix(spawn_env: dict[str, str] | None) -> str:
 
     Returns a shlex-quoted string like ``-u K1 -u K2 X=v Y=w`` suitable for
     appending after ``env`` (or ``setsid env``) in a shell command.
+
+    SECURITY: env *values* are shlex-quoted, but env *keys* are interpolated
+    unquoted on the ``K=V`` side — the ``=`` is syntactic and splitting on it
+    would break the shell form. We therefore reject any key that isn't a
+    POSIX env var name (``[A-Za-z_][A-Za-z0-9_]*``). Without this guard,
+    a key like ``FOO;rm -rf /;BAR`` would escape the ``env`` builtin's
+    argument list and execute arbitrary commands inside the sandbox.
+    Server-side ingress (``_pop_env_and_secrets``) also applies this filter
+    so the ValueError here is defence-in-depth only.
     """
     env_vars = _get_sandbox_env_vars(spawn_env)
+    for k in env_vars:
+        if not _ENV_KEY_RE.match(k):
+            raise ValueError(
+                f"invalid env var name {k!r}: must match [A-Za-z_][A-Za-z0-9_]*"
+            )
     unset = " ".join(f"-u {shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
     setv = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
     return f"{unset} {setv}".strip()

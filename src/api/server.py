@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shlex
 import tempfile
 import time
@@ -778,10 +779,17 @@ def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
     ``env`` is stored plaintext and returned plain by GET endpoints; credentials
     must go in ``secrets`` instead. Applies to both top-level ``env`` and
     nested ``config.env``.
+
+    Also enforces POSIX env var names — blocks shell-injection via the
+    provider-layer ``_build_env_prefix`` which interpolates keys into
+    ``sh -c`` commands (the value is shlex-quoted but the key is not, so a
+    key like ``FOO;cmd;X`` would break out of ``env``'s arglist).
     """
     if not env:
         return
     from .providers import AUTH_KEYS
+    from .providers._shared import _ENV_KEY_RE
+
     offenders = sorted(k for k in env if k in AUTH_KEYS)
     if offenders:
         raise HTTPException(
@@ -789,6 +797,15 @@ def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
             detail=(
                 f"{where}: auth keys {offenders} must be sent via 'secrets', "
                 "not 'env' (env is stored plain and returned by GET)."
+            ),
+        )
+    bad_names = sorted(k for k in env if not (isinstance(k, str) and _ENV_KEY_RE.match(k)))
+    if bad_names:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{where}: invalid env var name(s) {bad_names}; must match "
+                "[A-Za-z_][A-Za-z0-9_]*"
             ),
         )
 
@@ -815,23 +832,42 @@ def _pop_env_and_secrets(
         - ``{}``       → ``{}``    (caller should wipe stored value)
         - ``{…}``      → the dict (caller should replace stored value)
 
-    Any string/int/float value is coerced to str. No allowlist on key names —
-    it's the user's sandbox. SECURITY: both fields are popped in-place so they
-    can't flow into ``config_data``, ``AgentConfig``, or request logs.
+    Any string/int/float value is coerced to str. SECURITY: both fields
+    are popped in-place so they can't flow into ``config_data``,
+    ``AgentConfig``, or request logs.  Keys are validated against the
+    POSIX env var grammar — providers (daytona, docker) interpolate them
+    into ``sh -c`` commands, and a key like ``FOO;rm -rf /;BAR`` would
+    escape ``env``'s arglist and execute arbitrary commands inside the
+    sandbox.  The provider-layer ``_build_env_prefix`` re-validates as
+    defence-in-depth.
     """
-    def _coerce(d: object) -> dict[str, str]:
+    from .providers._shared import _ENV_KEY_RE
+
+    def _coerce(d: object, where: str) -> dict[str, str]:
         if not isinstance(d, dict):
             return {}
         out: dict[str, str] = {}
         for k, v in d.items():
-            if isinstance(k, str) and isinstance(v, (str, int, float)):
+            if not isinstance(k, str):
+                continue
+            if not _ENV_KEY_RE.match(k):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{where}: invalid env var name {k!r}; must match "
+                        "[A-Za-z_][A-Za-z0-9_]*"
+                    ),
+                )
+            if isinstance(v, (str, int, float)):
                 out[k] = str(v)
         return out
 
     raw_env = data.pop("env", _ENV_MISSING)
     raw_secrets = data.pop("secrets", _ENV_MISSING)
-    env = None if raw_env is _ENV_MISSING else _coerce(raw_env)
-    secrets = None if raw_secrets is _ENV_MISSING else _coerce(raw_secrets)
+    env = None if raw_env is _ENV_MISSING else _coerce(raw_env, "request body 'env'")
+    secrets = (
+        None if raw_secrets is _ENV_MISSING else _coerce(raw_secrets, "request body 'secrets'")
+    )
     _forbid_auth_keys_in_env(env, "request body 'env'")
     return env, secrets
 
@@ -958,9 +994,55 @@ async def delete_agent_route(agent_id: str):
 # ---------------------------------------------------------------------------
 
 
+_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Subpath: POSIX-ish relative path, no traversal, no shell/comma/newline.
+# Docker ``--mount`` parses the value as comma-separated k=v; a subpath of
+# ``foo,readonly`` would inject an unintended mount flag. Local provider
+# further runs ``_safe_path`` on it. We pre-filter at the HTTP layer so all
+# three providers see a path that can't smuggle metacharacters.
+_SUBPATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,255}$")
+
+
 class _VolumeCreateBody(BaseModel):
     name: str
     provider: str
+
+
+def _validate_volume_name(name: str) -> None:
+    """Reject volume names that could escape server-generated contexts.
+
+    ``name`` appears in: docker ``volume create <name>`` argv (argv, not
+    shell — so no shell injection), but also in the local provider as a
+    filesystem path component, where ``../`` or ``/`` would escape
+    ``AGENT_SDK_LOCAL_VOL_ROOT``. A tight allowlist keeps every provider
+    happy.
+    """
+    if not isinstance(name, str) or not _VOLUME_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "volume name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+            ),
+        )
+
+
+def _validate_subpath(subpath: str) -> None:
+    """Reject subpaths that could inject into docker mount flags or escape.
+
+    Empty string is handled by the caller (caller returns 400 'required').
+    """
+    if not isinstance(subpath, str) or not _SUBPATH_RE.match(subpath):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "subpath must match [A-Za-z0-9][A-Za-z0-9._/-]{0,255} "
+                "(no traversal, commas, or whitespace)"
+            ),
+        )
+    # Defence-in-depth: reject ``..`` segment even though the regex already
+    # blocks the dot sequence as a whole-segment match.
+    if any(seg == ".." for seg in subpath.split("/")):
+        raise HTTPException(status_code=400, detail="subpath must not contain '..'")
 
 
 def _gen_volume_id() -> str:
@@ -978,6 +1060,7 @@ async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
 
 @app.post("/volumes")
 async def create_volume(body: _VolumeCreateBody):
+    _validate_volume_name(body.name)
     # Reject duplicates up front so we never orphan a provider-side volume.
     if await get_volume_by_name(body.name) is not None:
         raise HTTPException(409, f"Volume '{body.name}' already exists")
@@ -1185,6 +1268,7 @@ async def create_sandbox(request: Request):
         return JSONResponse(
             {"error": "volume_id and subpath are required"}, status_code=400,
         )
+    _validate_subpath(subpath)
     # ``_resolve_volume`` raises HTTPException(404) on miss; ``vol`` is
     # always a VolumeRecord here. The defensive ``vol is not None`` guard
     # the old code had was dead. (MI5)
@@ -1328,6 +1412,7 @@ async def provision_sandbox_route(request: Request):
         return JSONResponse(
             {"error": "volume_id and subpath are required"}, status_code=400,
         )
+    _validate_subpath(subpath)
     vol = await _resolve_volume(volume_id)
     # Default the provider from the volume (so existing Daytona-only clients
     # don't have to pass it), but let an explicit body field override for tests.
