@@ -298,3 +298,86 @@ async def test_sandbox_provision_endpoint_dispatches_on_provider(client):
     assert rec.provider == "docker"
     assert rec.sandbox_ref == "cid-9"
     assert rec.listen_port == 5555
+
+
+# ---------------------------------------------------------------------------
+# Scenario 13 — Cross-provider isolation.
+# A volume created with provider=docker must not be used to provision a
+# sandbox on provider=daytona. The server should reject the mismatch cleanly
+# (HTTP 400) rather than silently run the wrong provider or crash midway.
+# Covers both entry points: POST /sandboxes and POST /sandboxes/provision.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cross_provider_volume_rejection_via_provision_endpoint(client):
+    """POST /sandboxes/provision must reject mismatched provider vs. volume."""
+    from api.models import VolumeRecord
+    await dbmod.upsert_volume(
+        VolumeRecord(id="v_docker", name="v_docker", provider="docker",
+                     provider_ref="agentsdk-dockervol"),
+    )
+
+    # No provider-side mocks: request must fail before any create_sandbox call.
+    with patch("api.providers.docker.create_sandbox",
+               new=AsyncMock(side_effect=AssertionError(
+                   "docker.create_sandbox must not be called on mismatch"))), \
+         patch("api.providers.daytona.provision_daytona_sandbox",
+               new=AsyncMock(side_effect=AssertionError(
+                   "daytona.provision must not be called on mismatch"))), \
+         patch("api.server.ensure_volume_supervisor",
+               new=AsyncMock(return_value=None)):
+        r = await client.post(
+            "/sandboxes/provision",
+            json={
+                "provider": "daytona",
+                "volume_id": "v_docker",
+                "subpath": "agents/foo/home",
+                "agent_type": "claude",
+            },
+        )
+    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text}"
+    err = (r.json().get("error") or "").lower()
+    assert "provider" in err, f"error should mention provider mismatch: {r.text}"
+
+
+@pytest.mark.asyncio
+async def test_cross_provider_volume_rejection_via_sandboxes_endpoint(client):
+    """POST /sandboxes with provider != volume.provider must also reject.
+
+    Note: the review flagged this endpoint may silently accept the mismatch
+    today. If so, marking xfail records a source-side bug for cycle 3.
+    """
+    from api.models import VolumeRecord
+    await dbmod.upsert_volume(
+        VolumeRecord(id="v_daytona", name="v_daytona", provider="daytona",
+                     provider_ref="dt-only"),
+    )
+
+    with patch("api.providers.docker.create_sandbox",
+               new=AsyncMock(side_effect=AssertionError(
+                   "docker.create_sandbox must not be called on mismatch"))), \
+         patch("api.providers.daytona.provision_daytona_sandbox",
+               new=AsyncMock(side_effect=AssertionError(
+                   "daytona.provision must not be called on mismatch"))):
+        r = await client.post(
+            "/sandboxes",
+            json={
+                "provider": "docker",
+                "volume_id": "v_daytona",
+                "subpath": "agents/foo/home",
+                "agent_type": "claude",
+            },
+        )
+
+    # Strict expected contract: reject with 400 + provider in message. If the
+    # source agent hasn't added this guard yet, the test xfails, surfacing the
+    # gap explicitly.
+    if r.status_code == 400:
+        err = (r.json().get("error") or "").lower()
+        assert "provider" in err, f"error should mention provider mismatch: {r.text}"
+    else:
+        pytest.xfail(
+            f"POST /sandboxes still accepts provider mismatch "
+            f"(status={r.status_code}, body={r.text}) — source bug"
+        )

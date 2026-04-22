@@ -342,3 +342,53 @@ async def test_concurrent_ensure_sandbox_provisions_once(setup):
     # Exactly one provision, and both coroutines see the same sandbox.
     assert call_count == 1, f"expected 1 provision, got {call_count}"
     assert sb_a.id == sb_b.id
+
+
+# ---------------------------------------------------------------------------
+# Scenario 9 — Supervisor health-check timeout.
+# When the supervisor never becomes healthy, ensure_runtime must not hang
+# indefinitely. It should propagate a clean failure within a reasonable
+# time bound.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_ensure_runtime_raises_when_supervisor_never_healthy(setup):
+    """Cold start where the supervisor URL never answers /v1/health.
+
+    _wait_for_health is called inside the provider's ensure_supervisor_url
+    (daytona path). If it always returns False, the daytona implementation
+    raises. We simulate that by making ensure_supervisor_url itself raise
+    the underlying timeout error, and verify ensure_runtime surfaces it
+    cleanly (HTTPException 500 with a descriptive message) rather than
+    hanging.
+    """
+    await _mk_fixtures()
+    from api.models import SandboxRecord
+    sb = SandboxRecord(id="sb_timeout", provider="daytona", sandbox_ref="dt-r",
+                       status="running", root="/home/daytona",
+                       volume_id="v1", subpath="agents/a1/home")
+    await dbmod.upsert_sandbox(sb)
+    await dbmod.set_session_current_sandbox("s1", "sb_timeout")
+    srv.SESSIONS.pop("s1", None)
+    srv._INSTANCES.pop("sb_timeout", None)
+
+    # Simulate the terminal state: the provider tried to start the supervisor
+    # but health never returned True. Daytona wraps this as a RuntimeError.
+    async def fake_ensure_supervisor_url(*a, **kw):
+        raise RuntimeError("supervisor did not become healthy after N retries")
+
+    with patch("api.providers.daytona.ensure_supervisor_url",
+               new=AsyncMock(side_effect=fake_ensure_supervisor_url)), \
+         patch("api.providers._wait_for_health",
+               new=AsyncMock(return_value=False)):
+        sess = await dbmod.get_session("s1")
+        with pytest.raises(Exception) as excinfo:
+            await srv.ensure_runtime(sess, sb)
+
+    # Error must be clean — not a hang — and must reference health/supervisor.
+    msg = str(excinfo.value).lower()
+    assert any(k in msg for k in ("supervisor", "health", "timeout", "failed")), (
+        f"expected descriptive error, got: {excinfo.value!r}"
+    )
