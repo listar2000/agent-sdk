@@ -150,3 +150,58 @@ async def test_ensure_sandbox_starts_stopped(setup):
         got = await srv.ensure_sandbox(sess)
     assert got.id == "sb1"
     assert start_calls == ["dt-paused"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_runtime_reuses_healthy_state(setup):
+    await _mk_fixtures()
+    from api.models import SandboxRecord, SessionState
+    sb = SandboxRecord(id="sb1", provider="daytona", sandbox_ref="dt-r",
+                       status="running", root="/home/daytona",
+                       volume_id="v1", subpath="agents/a1/home")
+    await dbmod.upsert_sandbox(sb)
+    await dbmod.set_session_current_sandbox("s1", "sb1")
+
+    # Pre-populate in-memory state
+    fake_client = AsyncMock()
+    fake_client.base_url = "http://existing"
+    state = SessionState(session_id="s1", agent_id="a1", sandbox_id="sb1",
+                         acp_session_id="acp1", inner_session_id="inner1",
+                         agent_type="claude", client=fake_client,
+                         supervisor_url="http://existing")
+    srv.SESSIONS["s1"] = state
+
+    with patch("api.providers._wait_for_health",
+               new=AsyncMock(return_value=True)):
+        sess = await dbmod.get_session("s1")
+        got = await srv.ensure_runtime(sess, sb)
+
+    assert got is state  # identity — no rebuild
+
+
+@pytest.mark.asyncio
+async def test_ensure_runtime_rebuilds_when_missing(setup):
+    await _mk_fixtures()
+    from api.models import SandboxRecord
+    sb = SandboxRecord(id="sb1", provider="daytona", sandbox_ref="dt-r",
+                       status="running", root="/home/daytona",
+                       volume_id="v1", subpath="agents/a1/home")
+    await dbmod.upsert_sandbox(sb)
+    await dbmod.set_session_current_sandbox("s1", "sb1")
+
+    srv.SESSIONS.pop("s1", None)  # no in-memory state
+
+    fake_client = AsyncMock()
+    with patch("api.server.start_supervisor_in_sandbox",
+               new=AsyncMock(return_value=("http://fresh", 9100))), \
+         patch("api.server.AcpClient", return_value=fake_client), \
+         patch("api.server._start_session_tasks"):
+        fake_client.initialize = AsyncMock(return_value={"sessionId": "inner-new"})
+        fake_client.get_inner_session_id = lambda *a: "inner-new"
+
+        sess = await dbmod.get_session("s1")
+        got = await srv.ensure_runtime(sess, sb)
+
+    assert got.session_id == "s1"
+    assert got.sandbox_id == "sb1"
+    assert got.supervisor_url == "http://fresh"

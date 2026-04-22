@@ -2210,6 +2210,93 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
     return sb
 
 
+async def ensure_runtime(session_row: dict, sandbox: SandboxRecord) -> SessionState:
+    """Guarantees: returns a SessionState with a connected, initialized client.
+
+    If the existing SESSIONS entry is healthy and attached to this sandbox,
+    reuse it. Otherwise tear down any stale state and build fresh.
+
+    Holds the per-session lock for the entire check-and-act sequence so
+    concurrent callers don't double-provision.
+    """
+    session_id = session_row["id"]
+    async with _get_session_lock(session_id):
+        return await _ensure_runtime_locked(session_row, sandbox)
+
+
+async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> SessionState:
+    session_id = session_row["id"]
+    existing = SESSIONS.get(session_id)
+
+    # Reuse if the existing state is attached to this sandbox and the
+    # supervisor is reachable.
+    if (
+        existing
+        and not existing.shutdown.is_set()
+        and existing.sandbox_id == sandbox.id
+        and existing.supervisor_url
+    ):
+        try:
+            from .providers import _wait_for_health
+            ok = await _wait_for_health(existing.supervisor_url, max_retries=2, interval=1)
+            if ok:
+                return existing
+        except Exception:
+            pass
+        # Supervisor dead — tear down and rebuild.
+        await _shutdown_session_state(existing, remove=True)
+
+    elif existing:
+        # Stale: different sandbox or no URL — shut it down before rebuilding.
+        await _shutdown_session_state(existing, remove=True)
+
+    # Build fresh.
+    agent_id = session_row["agent_id"]
+    agent_record = await get_agent(agent_id)
+    if agent_record is None:
+        raise HTTPException(500, f"Agent {agent_id} missing")
+    agent_type = agent_record.config.agent_type or "claude"
+
+    spawn_env = await _build_spawn_env_from_row(session_row)
+    supervisor_url, supervisor_port = await start_supervisor_in_sandbox(
+        sandbox, agent_type=agent_type, spawn_env=spawn_env,
+    )
+
+    client = AcpClient(supervisor_url)
+    acp_session_id = str(uuid.uuid4())
+    inner_sid = session_row.get("inner_session_id")
+    cwd = (agent_record.config.cwd or "/home/daytona/workspace") if agent_record.config else "/home/daytona/workspace"
+    mcp = agent_record.config.mcp_servers if agent_record.config else None
+
+    if inner_sid:
+        # Reconnect to existing conversation on disk.
+        await client.handshake(acp_session_id, agent_type)
+        await client._send_rpc(acp_session_id, "session/load", {
+            "sessionId": inner_sid, "cwd": cwd,
+            "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
+        })
+        client.set_inner_session_id(acp_session_id, inner_sid)
+    else:
+        # Fresh conversation.
+        await client.initialize(acp_session_id, agent_type, cwd=cwd, mcp_servers=mcp)
+        inner_sid = client.get_inner_session_id(acp_session_id)
+        if inner_sid:
+            await upsert_session(
+                session_id, agent_id, sandbox.id, inner_sid,
+                volume_id=session_row.get("volume_id"),
+            )
+
+    state = SessionState(
+        session_id=session_id, agent_id=agent_id, sandbox_id=sandbox.id,
+        acp_session_id=acp_session_id, inner_session_id=inner_sid,
+        agent_type=agent_type, client=client,
+        supervisor_url=supervisor_url, supervisor_port=supervisor_port,
+    )
+    SESSIONS[session_id] = state
+    _start_session_tasks(state)
+    return state
+
+
 async def _lazy_provision_sandbox_for_session(
     session_id: str,
     previous_sandbox_id: str | None = None,
