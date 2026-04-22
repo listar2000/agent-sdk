@@ -1030,15 +1030,42 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
         cur = await conn.execute(
             "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (vol.id,)
         )
-        row = await cur.fetchone()
-        session_count = row["n"]
-        if session_count > 0 and not force:
-            raise HTTPException(409, f"Volume has {session_count} session(s). Use ?force=true to cascade.")
-        if force and session_count > 0:
-            await conn.execute("DELETE FROM sessions WHERE volume_id = %s", (vol.id,))
+        session_count = (await cur.fetchone())["n"]
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM sandboxes WHERE volume_id = %s", (vol.id,)
+        )
+        sandbox_count = (await cur.fetchone())["n"]
+
+        if (session_count > 0 or sandbox_count > 0) and not force:
+            raise HTTPException(
+                409,
+                f"Volume has {session_count} session(s) and {sandbox_count} "
+                f"sandbox(es). Use ?force=true to cascade.",
+            )
+        if force:
+            # Sessions first (FK RESTRICT on sandbox is already SET NULL via
+            # Task 4), then sandboxes (FK RESTRICT on volume blocks the final
+            # delete unless we clear them).
+            if session_count > 0:
+                await conn.execute(
+                    "DELETE FROM sessions WHERE volume_id = %s", (vol.id,),
+                )
+            if sandbox_count > 0:
+                await conn.execute(
+                    "DELETE FROM sandboxes WHERE volume_id = %s", (vol.id,),
+                )
 
     if vol.provider == "daytona":
-        await _providers_mod.delete_daytona_volume(vol.provider_ref)
+        try:
+            await _providers_mod.delete_daytona_volume(vol.provider_ref)
+        except Exception as e:
+            # Tolerate 403 (delete-forbidden) and 404 (already gone): the
+            # user's intent is to remove this volume from our records;
+            # provider-side cleanup policies shouldn't block that.
+            msg = str(e).lower()
+            if "forbidden" not in msg and "not found" not in msg and "404" not in msg:
+                raise
+            log.warning("volume %s provider delete skipped: %s", vol.id, e)
     await delete_volume(vol.id)
 
 
