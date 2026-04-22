@@ -378,32 +378,20 @@ async def test_concurrent_start_sandbox_healthy_is_noop(client):
 
 
 # ---------------------------------------------------------------------------
-# xfail: start_sandbox_route writes a stale sandbox row post-restart.
+# Regression: start_sandbox_route must not clobber the DB row that
+# _ensure_sandbox_alive just updated with the new sandbox_ref/listen_port.
+# Fixed in cycle 9; re-fetches the sandbox row after the restart before
+# flipping status to "running".
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: start_sandbox_route (src/api/server.py ~L1453) reads the "
-        "sandbox row into a local `record`, calls _ensure_sandbox_alive "
-        "(which updates the DB row with the NEW sandbox_ref/listen_port "
-        "for the replacement container), then overwrites the DB with the "
-        "stale `record`. The new sandbox_ref is lost. Downstream "
-        "_INSTANCES lookups still work because they use sandbox_id not "
-        "sandbox_ref, but any code that resolves containers via "
-        "sandbox_ref (docker exec, reconcile_on_startup) will hit the "
-        "dead container. Fix: re-fetch the row after _ensure_sandbox_alive "
-        "returns, or have _ensure_sandbox_alive return the updated record."
-    ),
-)
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_start_sandbox_route_db_consistency_xfail(client):
-    """EXPECTED correct behavior: after a restart via /sandboxes/{id}/start,
-    the sandbox row's ``sandbox_ref`` points at the new container.
-    Currently fails — ``start_sandbox_route`` clobbers with a stale
-    record snapshot."""
+async def test_start_sandbox_route_db_consistency(client):
+    """After /sandboxes/{id}/start triggers a replacement (e.g., Daytona
+    terminal-state or docker missing), the sandbox row's ``sandbox_ref``
+    must point at the new container — not be clobbered back to the
+    pre-restart snapshot."""
     await dbmod.upsert_agent(AgentRecord(
         id="a_db", name="A", config=AgentConfig(agent_type="claude"),
     ))
