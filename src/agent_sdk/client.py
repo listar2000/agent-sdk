@@ -583,3 +583,74 @@ class Agent:
 
     async def __aexit__(self, *args):
         await self.aclose()
+
+
+# ── Volumes API ──
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class Volume:
+    id: str
+    name: str
+    provider: str
+    provider_ref: str
+    status: str
+
+
+class _VolumesAPI:
+    """Client-side wrapper for /volumes REST endpoints."""
+
+    def __init__(self, client: "Client"):
+        self._c = client
+
+    async def create(self, name: str, provider: str) -> Volume:
+        r = await self._c._http.post(f"{self._c.base_url}/volumes",
+                                     json={"name": name, "provider": provider})
+        r.raise_for_status()
+        return Volume(**r.json())
+
+    async def provision(self, name: str, provider: str) -> Volume:
+        r = await self._c._http.post(f"{self._c.base_url}/volumes/provision",
+                                     json={"name": name, "provider": provider})
+        r.raise_for_status()
+        return Volume(**r.json())
+
+    async def get(self, id_or_name: str) -> Volume:
+        r = await self._c._http.get(f"{self._c.base_url}/volumes/{id_or_name}")
+        r.raise_for_status()
+        return Volume(**r.json())
+
+    async def list(self, provider: str | None = None) -> list[Volume]:
+        params = {"provider": provider} if provider else None
+        r = await self._c._http.get(f"{self._c.base_url}/volumes", params=params)
+        r.raise_for_status()
+        return [Volume(**v) for v in r.json()]
+
+    async def delete(self, id_or_name: str, force: bool = False) -> None:
+        params = {"force": "true"} if force else None
+        r = await self._c._http.delete(f"{self._c.base_url}/volumes/{id_or_name}",
+                                       params=params)
+        r.raise_for_status()
+
+
+class Client:
+    """Top-level SDK client. For now only exposes .volumes — other resources
+    are still accessed via the Agent class."""
+
+    def __init__(self, base_url: str = "http://localhost:7778"):
+        self.base_url = base_url.rstrip("/")
+        # Lazy import to match the rest of the SDK's style.
+        import httpx
+        self._http = httpx.AsyncClient(timeout=30.0)
+        self.volumes = _VolumesAPI(self)
+
+    async def close(self) -> None:
+        await self._http.aclose()
+
+    async def __aenter__(self) -> "Client":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
