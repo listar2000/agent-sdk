@@ -1914,20 +1914,35 @@ async def _do_resume(
                     ),
                     stream=True,
                 )
-                await client._send_rpc(
-                    acp_session_id,
-                    "session/load",
-                    {
-                        "sessionId": inner_session_id,
-                        "cwd": cwd,
-                        "mcpServers": _mcp_dict_to_acp_array(
-                            agent_record.config.mcp_servers
+                # Retry session/load to absorb FUSE/S3 propagation lag on a freshly
+                # reattached sandbox: the transcript file may not yet be visible to
+                # the new CLI process when the previous sandbox was killed seconds
+                # earlier on an S3-backed volume.
+                _load_args = {
+                    "sessionId": inner_session_id,
+                    "cwd": cwd,
+                    "mcpServers": _mcp_dict_to_acp_array(
+                        agent_record.config.mcp_servers
+                    )
+                    if agent_record.config.mcp_servers
+                    else [],
+                }
+                _last_exc = None
+                for _attempt in range(3):
+                    try:
+                        await client._send_rpc(
+                            acp_session_id, "session/load", _load_args,
+                            rpc_id=load_rpc_id,
                         )
-                        if agent_record.config.mcp_servers
-                        else [],
-                    },
-                    rpc_id=load_rpc_id,
-                )
+                        _last_exc = None
+                        break
+                    except Exception as _e:
+                        _last_exc = _e
+                        if _attempt < 2:
+                            await asyncio.sleep(1.5 * (_attempt + 1))
+                            load_rpc_id = str(uuid.uuid4())
+                if _last_exc is not None:
+                    raise _last_exc
                 client.set_inner_session_id(acp_session_id, inner_session_id)
                 try:
                     await client.set_mode(acp_session_id, "bypassPermissions")
