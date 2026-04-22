@@ -113,6 +113,75 @@ async def test_provision_volume_waits_for_ready(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_path", [
+    "shared/foo\nbar",   # LF
+    "shared/foo\rbar",   # CR
+    "shared/foo\x00bar", # NUL
+])
+async def test_edit_rejects_control_chars(client, bad_path):
+    """MT5: ``POST /volumes/{id}/files/edit`` rejects paths containing
+    control characters (CR/LF/NUL) with a 400 whose body names the
+    violation.  The underlying sanitizer is
+    :func:`api.providers._shared._safe_path`; this test asserts the
+    behavior is wired through at the HTTP boundary, not just at the
+    provider layer."""
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_ctrl", name="files-ctrl",
+                     provider="daytona", provider_ref="dt-ctrl")
+    await dbmod.upsert_volume(v)
+
+    # Provider mocks — never reached on a 400, so any call is a bug.
+    async def blow_up(*a, **kw):
+        raise AssertionError(f"provider must not be called on invalid path {bad_path!r}")
+
+    with patch("api.providers.daytona.volume_write", new=AsyncMock(side_effect=blow_up)):
+        r = await client.post(f"/volumes/{v.id}/files/edit",
+                              json={"path": bad_path, "content": "data"})
+    assert r.status_code == 400, f"got {r.status_code}: {r.text}"
+    # Error body names the failure mode — operators grepping logs want to
+    # know "control chars" not "500 internal error".
+    detail = ""
+    try:
+        detail = (r.json().get("detail") or r.json().get("error") or "").lower()
+    except Exception:
+        detail = r.text.lower()
+    assert "control" in detail or "invalid" in detail, (
+        f"error should name the violation: {r.text}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_path", [
+    "foo\nbar",
+    "foo\rbar",
+    "foo\x00bar",
+])
+async def test_read_rejects_control_chars(client, bad_path):
+    """MT5: ``GET /volumes/{id}/files/read`` also rejects control-char
+    paths at the HTTP layer."""
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_ctr2", name="files-ctr2",
+                     provider="daytona", provider_ref="dt-ctr2")
+    await dbmod.upsert_volume(v)
+
+    async def blow_up(*a, **kw):
+        raise AssertionError(f"provider must not be called on invalid path {bad_path!r}")
+
+    with patch("api.providers.daytona.volume_read", new=AsyncMock(side_effect=blow_up)):
+        r = await client.get(f"/volumes/{v.id}/files/read",
+                             params={"path": bad_path})
+    assert r.status_code == 400, f"got {r.status_code}: {r.text}"
+    detail = ""
+    try:
+        detail = (r.json().get("detail") or r.json().get("error") or "").lower()
+    except Exception:
+        detail = r.text.lower()
+    assert "control" in detail or "invalid" in detail, (
+        f"error should name the violation: {r.text}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_volume_files_edit_and_read(client):
     """File ops dispatch through the volume's provider module."""
     from api.models import VolumeRecord
