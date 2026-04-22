@@ -1802,7 +1802,7 @@ async def _do_resume(
     *,
     sandbox_id: str,
     agent_id: str,
-    inner_session_id: str,
+    inner_session_id: str | None,
     client_session_id: str | None = None,
     force_replace_live_state: bool = False,
     spawn_env: dict[str, str] | None = None,
@@ -1857,8 +1857,9 @@ async def _do_resume(
                     raise RuntimeError("DAYTONA_API_KEY not set")
                 loop = asyncio.get_running_loop()
                 daytona_client = Daytona(DaytonaConfig(api_key=api_key))
+                daytona_sandbox_ref = sandbox_record.sandbox_ref or sandbox_id
                 sandbox = await loop.run_in_executor(
-                    None, lambda: daytona_client.get(sandbox_id)
+                    None, lambda: daytona_client.get(daytona_sandbox_ref)
                 )
                 raw_state = sandbox.state
                 state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
@@ -1868,9 +1869,15 @@ async def _do_resume(
 
                 root = sandbox_record.root or agent_record.config.cwd or "/tmp"
                 supervisor_port = allocate_sandbox_port(sandbox_id)
+                # Inject HOME=root so the agent CLI writes its session files
+                # (e.g. ~/.claude/projects/…) onto the volume-backed home dir.
+                # Without this, HOME may default to /root (node:22-slim) and
+                # the session transcript would not persist across sandbox restarts.
+                effective_spawn_env = dict(spawn_env) if spawn_env else {}
+                effective_spawn_env.setdefault("HOME", root)
                 supervisor_url = await start_supervisor_in_sandbox(
                     sandbox, agent_record.config.agent_type or "claude",
-                    supervisor_port, root=root, spawn_env=spawn_env,
+                    supervisor_port, root=root, spawn_env=effective_spawn_env,
                 )
                 url = supervisor_url
             except RuntimeError as e:
@@ -2071,7 +2078,12 @@ async def _lazy_provision_sandbox_for_session(
     agent_type = (agent.config.agent_type if agent and agent.config else "claude")
     subpath = f"agents/{agent_id}/home"
 
-    inst = await _providers_mod.create_daytona(
+    # Use provision_daytona_sandbox (install deps only, no supervisor start).
+    # The supervisor is started per-session by _do_resume / get_or_recover_session
+    # with the right spawn_env (including auth secrets).  Using create_daytona here
+    # would start a supervisor without auth and occupy port 9100, conflicting with
+    # the per-session supervisor started moments later by _do_resume.
+    inst = await _providers_mod.provision_daytona_sandbox(
         agent_type=agent_type,
         volume_id=vol.provider_ref,
         subpath=subpath,
@@ -2167,15 +2179,33 @@ async def get_or_recover_session(
         log.warning("session %s not found in DB", session_id)
         raise HTTPException(status_code=404, detail="session not found")
 
+    stale_sandbox_id: str | None = None
     if rec.get("current_sandbox_id") is None:
         # Lazy session — provision on demand and re-read the row.
         await _lazy_provision_sandbox_for_session(session_id)
         rec = await get_session(session_id)
+    else:
+        # Sandbox pointer is set — verify it still exists.  If it was explicitly
+        # deleted (DELETE /sandboxes/{id}), provision a fresh one and treat this
+        # as a sandbox-loss recovery (same as lazy provisioning).
+        sandbox_rec = await get_sandbox(rec["current_sandbox_id"])
+        if sandbox_rec is None:
+            stale_sandbox_id = rec["current_sandbox_id"]
+            log.warning(
+                "session %s: current_sandbox_id %s not found in DB — re-provisioning",
+                session_id,
+                stale_sandbox_id,
+            )
+            await set_session_current_sandbox(session_id, None)
+            await _lazy_provision_sandbox_for_session(
+                session_id, previous_sandbox_id=stale_sandbox_id
+            )
+            rec = await get_session(session_id)
 
     agent_id = rec.get("agent_id")
     inner_session_id = rec.get("inner_session_id")
     sandbox_id = rec.get("current_sandbox_id")
-    if not agent_id or not inner_session_id or not sandbox_id:
+    if not agent_id or not sandbox_id:
         log.warning("session %s record incomplete: %s", session_id, rec)
         raise HTTPException(status_code=404, detail="session record incomplete")
 
