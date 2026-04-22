@@ -1110,7 +1110,13 @@ async def _run_in_volume_sandbox(vol, cmd: str, timeout: int = 30):
     try:
         return await _providers_mod.exec_in_instance(inst, cmd, timeout=timeout)
     finally:
-        await _providers_mod.destroy_daytona(inst)
+        # Best-effort cleanup — never mask the original exception (if any)
+        # from exec_in_instance with a cleanup failure.
+        try:
+            await _providers_mod.destroy_daytona(inst)
+        except Exception as cleanup_err:
+            log.warning("utility sandbox %s cleanup failed: %s",
+                        getattr(inst, "sandbox_id", "?"), cleanup_err)
 
 
 @app.get("/volumes/{id_or_name}/files/tree")

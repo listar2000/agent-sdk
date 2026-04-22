@@ -757,7 +757,10 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     """Create a Daytona volume and return its provider-native id.
 
     Polls until the volume reaches the 'ready' state before returning so that
-    callers can immediately attach the volume to a new sandbox.
+    callers can immediately attach the volume to a new sandbox. If polling
+    fails (timeout or terminal error state), the just-created volume is
+    best-effort deleted so callers don't end up with an orphaned resource
+    they can't identify later.
     """
     from daytona_api_client import VolumesApi
     from daytona_api_client.models import VolumeState
@@ -766,20 +769,29 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     vol = await asyncio.to_thread(client.volume.create, name)
     vol_id = vol.id
 
-    # Poll until ready (volume creation is async on the Daytona backend).
     volumes_api = VolumesApi(client._api_client)
-    deadline = asyncio.get_running_loop().time() + wait_ready_timeout
-    while True:
-        dto = await asyncio.to_thread(volumes_api.get_volume, vol_id)
-        state = dto.state
-        state_val = state.value if hasattr(state, "value") else str(state)
-        if state_val == VolumeState.READY:
-            break
-        if state_val in {VolumeState.ERROR, VolumeState.DELETED, VolumeState.DELETING}:
-            raise RuntimeError(f"Daytona volume {vol_id} entered unexpected state: {state_val}")
-        if asyncio.get_running_loop().time() > deadline:
-            raise TimeoutError(f"Daytona volume {vol_id} did not become ready within {wait_ready_timeout}s (last state: {state_val})")
-        await asyncio.sleep(3)
+    try:
+        deadline = asyncio.get_running_loop().time() + wait_ready_timeout
+        while True:
+            dto = await asyncio.to_thread(volumes_api.get_volume, vol_id)
+            state = dto.state
+            state_val = state.value if hasattr(state, "value") else str(state)
+            if state_val == VolumeState.READY:
+                break
+            if state_val in {VolumeState.ERROR, VolumeState.DELETED, VolumeState.DELETING}:
+                raise RuntimeError(f"Daytona volume {vol_id} entered unexpected state: {state_val}")
+            if asyncio.get_running_loop().time() > deadline:
+                raise TimeoutError(f"Daytona volume {vol_id} did not become ready within {wait_ready_timeout}s (last state: {state_val})")
+            await asyncio.sleep(3)
+    except Exception:
+        try:
+            await asyncio.to_thread(volumes_api.delete_volume, vol_id)
+        except Exception as cleanup_err:
+            log.warning(
+                "orphaned daytona volume %s: cleanup delete failed: %s",
+                vol_id, cleanup_err,
+            )
+        raise
 
     return vol_id
 
