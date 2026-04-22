@@ -100,3 +100,13 @@ async def test_delete_volume_conflict_if_session_exists(client):
             "SELECT id FROM sessions WHERE id = %s", ("sess_1",)
         )).fetchone()
     assert row is None
+
+
+@pytest.mark.asyncio
+async def test_provision_volume_waits_for_ready(client):
+    with patch("api.providers.create_daytona_volume",
+               new=AsyncMock(return_value="dt-prov")):
+        r = await client.post("/volumes/provision",
+                              json={"name": "prov-test", "provider": "daytona"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "ready"

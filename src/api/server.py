@@ -979,6 +979,15 @@ async def create_volume(body: _VolumeCreateBody):
     return vol
 
 
+@app.post("/volumes/provision")
+async def provision_volume(body: _VolumeCreateBody):
+    """Create + wait for ready. For Daytona, create_daytona_volume already
+    polls until the backend volume is in 'ready' state, so this is equivalent
+    to POST /volumes today. Kept as a separate endpoint for API parity with
+    /sandboxes/provision."""
+    return await create_volume(body)
+
+
 @app.get("/volumes")
 async def list_volumes_route(provider: str | None = None):
     return await list_volumes(provider)
