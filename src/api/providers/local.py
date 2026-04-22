@@ -186,6 +186,7 @@ async def install_supervisor(ref: str, agent_type: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def create_sandbox(
+    *,
     volume_ref: str,
     subpath: str,
     agent_type: str = "claude",
@@ -195,6 +196,7 @@ async def create_sandbox(
     root: str | None = None,
     dockerfile: str | None = None,  # accepted for parity; no effect on local
     pre_start_commands: list[str] | None = None,  # accepted for parity
+    sandbox_id: str | None = None,  # accepted for parity; local has no labels
     **_: object,
 ) -> ProviderInstance:
     """Launch a supervisor subprocess rooted at ``<vol>/<subpath>``.
@@ -362,12 +364,12 @@ async def start_sandbox(ref: str) -> None:
     return None
 
 
-async def stop_sandbox(inst: ProviderInstance | object) -> None:
+async def stop_sandbox(inst: ProviderInstance) -> None:
     """For local, stop == destroy (nothing valuable lives in the process)."""
     await destroy_sandbox(inst)
 
 
-async def destroy_sandbox(inst: ProviderInstance | object) -> None:
+async def destroy_sandbox(inst: ProviderInstance) -> None:
     """Terminate the supervisor subprocess and drop it from the registry."""
     proc = None
     pid: int | None = None
@@ -440,13 +442,18 @@ async def ensure_supervisor_url(
 # Volume file ops (direct FS in-process, with realpath containment)
 # ---------------------------------------------------------------------------
 
-async def volume_tree(ref: str, subpath: str = "") -> str:
-    """Return a newline-separated tree listing of ``<ref>/<subpath>``.
+async def volume_tree(ref: str, path: str = "") -> str:
+    """Return a newline-separated tree listing of ``<ref>/<path>``.
 
     Symlinks are not followed; any path that resolves outside ``ref`` is
     rejected by ``_safe_join``.
+
+    ``path`` matches the uniform provider API (docker/daytona expose the
+    same name).  The previous ``subpath`` name is dropped — callers that
+    used the keyword will get a TypeError, which surfaces a clear mismatch
+    rather than a silent ``**kw``-swallowed pass-through.
     """
-    target = await asyncio.to_thread(_safe_join, ref, subpath or "")
+    target = await asyncio.to_thread(_safe_join, ref, path or "")
 
     def _walk() -> str:
         if not os.path.exists(target):
@@ -508,15 +515,24 @@ async def volume_read(ref: str, path: str) -> bytes:
     return await asyncio.to_thread(_read)
 
 
-async def volume_write(ref: str, path: str, content: bytes | str) -> None:
+async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write to the volume. Creates parent dirs. Symlink-escape is rejected.
 
     Hardened against TOCTOU: opens the target via ``openat(O_NOFOLLOW)``
     relative to a directory fd of the parent so a concurrent rename-over
     with a symlink can't redirect the write outside the volume.
+
+    ``content`` is bytes-only (matching docker/daytona).  Callers with a
+    ``str`` payload must encode() at the call site; leaving the implicit
+    encoding here diverged the local signature from the other providers
+    and defeated load-time arg checking.
     """
     target = await asyncio.to_thread(_safe_join, ref, path)
-    data = content.encode() if isinstance(content, str) else content
+    if not isinstance(content, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"volume_write: content must be bytes, got {type(content).__name__}"
+        )
+    data = bytes(content)
 
     def _write() -> None:
         parent_dir, basename = os.path.split(target)

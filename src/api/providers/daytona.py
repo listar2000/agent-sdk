@@ -668,17 +668,18 @@ async def start_sandbox(ref: str) -> None:
     return await start_daytona(ref)
 
 
-async def destroy_sandbox(inst) -> None:
+async def destroy_sandbox(inst: ProviderInstance) -> None:
     return await destroy_daytona(inst)
 
 
-async def stop_sandbox(inst) -> None:
+async def stop_sandbox(inst: ProviderInstance) -> None:
     return await stop_daytona(inst)
 
 
-async def ensure_supervisor_url(inst, *, agent_type: str, root: str = "/tmp",
+async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
+                                root: str = "/tmp",
                                 spawn_env: dict | None = None,
-                                port: int | None = None, **_kw) -> str:
+                                port: int | None = None) -> str:
     """Daytona: start a supervisor in the sandbox referenced by ``inst`` and
     return its URL.
 
@@ -692,7 +693,11 @@ async def ensure_supervisor_url(inst, *, agent_type: str, root: str = "/tmp",
     corresponding ``ensure_supervisor_url`` is effectively a no-op that
     just echoes ``inst.url``.  The dispatcher in
     ``providers.__init__.ensure_supervisor_url`` routes transparently to
-    whichever provider the instance belongs to."""
+    whichever provider the instance belongs to.
+
+    Mi3: the ``**_kw`` catch-all was removed so a mis-spelled kwarg
+    surfaces as TypeError instead of being silently swallowed — matching
+    the docker + local signatures."""
     from daytona_sdk import Daytona, DaytonaConfig
     import os as _os
     api_key = _os.environ.get("DAYTONA_API_KEY")
@@ -833,7 +838,7 @@ async def create_sandbox(
     root: str | None = None,
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
-    **_kw,
+    sandbox_id: str | None = None,  # accepted for parity; daytona has no labels
 ) -> ProviderInstance:
     """Uniform ``create_sandbox`` for the Daytona provider.
 
@@ -841,8 +846,9 @@ async def create_sandbox(
     the three volume mounts but does NOT start a supervisor; the caller must
     run ``ensure_supervisor_url`` before talking to the supervisor.
 
-    ``spawn_env`` / ``port`` are accepted for parity with docker/local but are
-    unused here — the supervisor is started later with its own env + port.
+    ``spawn_env`` / ``port`` / ``sandbox_id`` are accepted for parity with
+    docker/local but are unused here — the supervisor is started later with
+    its own env + port, and Daytona has no container-label concept.
     """
     return await provision_daytona_sandbox(
         agent_type=agent_type,
