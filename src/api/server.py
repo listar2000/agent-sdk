@@ -970,6 +970,10 @@ async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
 
 @app.post("/volumes")
 async def create_volume(body: _VolumeCreateBody):
+    # Reject duplicates up front so we never orphan a provider-side volume.
+    if await get_volume_by_name(body.name) is not None:
+        raise HTTPException(409, f"Volume '{body.name}' already exists")
+
     if body.provider == "daytona":
         provider_ref = await _providers_mod.create_daytona_volume(body.name)
     elif body.provider == "docker":
@@ -986,7 +990,16 @@ async def create_volume(body: _VolumeCreateBody):
         provider_ref=provider_ref,
         status="ready",
     )
-    await upsert_volume(vol)
+    try:
+        await upsert_volume(vol)
+    except Exception:
+        # Clean up the now-orphaned provider volume on DB failure.
+        if body.provider == "daytona":
+            try:
+                await _providers_mod.delete_daytona_volume(provider_ref)
+            except Exception:
+                pass
+        raise
     return vol
 
 
