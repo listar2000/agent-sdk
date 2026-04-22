@@ -82,6 +82,7 @@ from .providers import (
     SandboxMissingError,
     allocate_sandbox_port,
     create_instance,
+    default_cwd_for_provider,
     destroy_instance,
     exec_in_instance,
     free_sandbox_port,
@@ -2715,7 +2716,9 @@ async def sessions_create(request: Request):
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
     _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
-    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
+    # Default cwd lands on the volume mount (persistent), not /tmp — so
+    # the agent's ~/ and working-dir files survive sandbox restart/replace.
+    cwd = config_data.get("cwd", data.get("cwd", default_cwd_for_provider(default_provider)))
 
     agent_id = data.get("agent_id")
     if agent_id:
@@ -2764,7 +2767,9 @@ async def sessions_quick_create(request: Request):
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
     _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
-    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
+    # Default cwd lands on the volume mount (persistent), not /tmp — so
+    # the agent's ~/ and working-dir files survive sandbox restart/replace.
+    cwd = config_data.get("cwd", data.get("cwd", default_cwd_for_provider(provider)))
     root = config_data.get("root", data.get("root", cwd))
     dockerfile = _materialize_dockerfile(config_data)
 

@@ -73,6 +73,28 @@ _ACP_LAUNCH_ARGS: dict[str, list[str]] = {
 _SUPERVISOR_REMOTE_PORT = 9100
 
 
+# Per-provider "where the agent's persistent HOME lives". For sandboxed
+# providers the volume is mounted at this path, so setting HOME and cwd here
+# keeps Claude Code's session JSONLs, ~/.claude/, and anything the agent
+# writes via ~/file.txt on the durable volume. /tmp is explicitly NOT the
+# default — it's ephemeral in containers and the agent's file writes would
+# disappear on sandbox restart/replace.
+_PROVIDER_VOLUME_HOME: dict[str, str] = {
+    "daytona": "/home/daytona",
+    "docker": "/home/agent",
+}
+
+
+def default_cwd_for_provider(provider: str) -> str:
+    """Persistent default cwd / HOME for the given provider.
+
+    Returns the volume mount point where ~/.claude etc. will live for
+    daytona/docker. Falls back to "/tmp" for local (the host filesystem is
+    not ephemeral in the container sense) and for unknown providers.
+    """
+    return _PROVIDER_VOLUME_HOME.get(provider, "/tmp")
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------

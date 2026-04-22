@@ -33,6 +33,7 @@ from ._shared import (
     ProviderInstance,
     ExecResult,
     SandboxMissingError,
+    default_cwd_for_provider,
     _ACP_BIN_NAMES,
     _ACP_NPM_SPECS,
     _acp_bin_name,
