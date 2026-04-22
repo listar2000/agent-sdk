@@ -2258,14 +2258,42 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     agent_type = agent_record.config.agent_type or "claude"
 
     spawn_env = await _build_spawn_env_from_row(session_row)
-    supervisor_url, supervisor_port = await start_supervisor_in_sandbox(
-        sandbox, agent_type=agent_type, spawn_env=spawn_env,
-    )
+    root = sandbox.root or (agent_record.config.cwd if agent_record.config else None) or "/tmp"
+    supervisor_port = allocate_sandbox_port(sandbox.id)
+    effective_spawn_env = dict(spawn_env)
+    effective_spawn_env.setdefault("HOME", root)
+
+    # Need the live Daytona SDK sandbox object (not the SandboxRecord) to exec
+    # commands.  Fetch it by sandbox_ref, which is the provider-side identifier.
+    try:
+        from daytona_sdk import Daytona, DaytonaConfig
+        api_key = os.environ.get("DAYTONA_API_KEY")
+        if not api_key:
+            raise RuntimeError("DAYTONA_API_KEY not set")
+        loop = asyncio.get_running_loop()
+        daytona_client = Daytona(DaytonaConfig(api_key=api_key))
+        live_sandbox = await loop.run_in_executor(
+            None, lambda: daytona_client.get(sandbox.sandbox_ref)
+        )
+    except Exception as exc:
+        free_sandbox_port(sandbox.id, supervisor_port)
+        raise HTTPException(500, f"Failed to fetch Daytona sandbox: {exc}") from exc
+
+    try:
+        supervisor_url = await start_supervisor_in_sandbox(
+            live_sandbox, agent_type, supervisor_port, root=root,
+            spawn_env=effective_spawn_env,
+        )
+    except Exception as exc:
+        free_sandbox_port(sandbox.id, supervisor_port)
+        raise HTTPException(500, f"Failed to start supervisor: {exc}") from exc
 
     client = AcpClient(supervisor_url)
     acp_session_id = str(uuid.uuid4())
     inner_sid = session_row.get("inner_session_id")
-    cwd = (agent_record.config.cwd or "/home/daytona/workspace") if agent_record.config else "/home/daytona/workspace"
+    # Use the same cwd logic as _do_resume to avoid initializing into a
+    # directory that may not exist on the sandbox filesystem.
+    cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
     mcp = agent_record.config.mcp_servers if agent_record.config else None
 
     if inner_sid:
@@ -2277,8 +2305,11 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
         })
         client.set_inner_session_id(acp_session_id, inner_sid)
     else:
-        # Fresh conversation.
-        await client.initialize(acp_session_id, agent_type, cwd=cwd, mcp_servers=mcp)
+        # Fresh conversation — wrap in wait_for to match _do_resume's timeout.
+        await asyncio.wait_for(
+            _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd),
+            timeout=120,
+        )
         inner_sid = client.get_inner_session_id(acp_session_id)
         if inner_sid:
             await upsert_session(
@@ -3083,12 +3114,9 @@ async def post_session_message(session_id: str, request: Request):
     interrupt = data.get("interrupt", False)
 
     try:
-        state = await get_or_recover_session(session_id)
+        _, _, state = await ensure_session_live(session_id)
     except HTTPException as exc:
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
-
-    if not state.client or not state.acp_session_id:
-        return JSONResponse({"error": "session not connected"}, status_code=409)
 
     if interrupt and state.agent_busy:
         await _cancel_and_drain(state)
