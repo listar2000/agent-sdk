@@ -992,6 +992,8 @@ async def create_instance(
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
+    volume_id: str | None = None,
+    subpath: str | None = None,
 ) -> ProviderInstance:
     """Create an ACP supervisor instance using the specified provider.
 
@@ -1002,6 +1004,9 @@ async def create_instance(
     {IS_SANDBOX:1} ∪ agent.env ∪ session.env ∪ secrets. The server never
     injects its own API keys — if spawn_env is empty, the supervisor runs
     with no credentials.
+
+    volume_id + subpath are forwarded to providers that support volume
+    mounts. Only Daytona uses them today.
     """
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(_ACP_BIN_NAMES)}")
@@ -1016,6 +1021,7 @@ async def create_instance(
         return await create_daytona(
             agent_type, dockerfile=dockerfile, pre_start_commands=pre_start_commands,
             root=root, spawn_env=spawn_env,
+            volume_id=volume_id, subpath=subpath,
         )
     raise ValueError(f"Unknown provider: {provider!r}. Use 'local', 'docker', or 'daytona'.")
 

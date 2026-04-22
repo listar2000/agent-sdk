@@ -1109,10 +1109,20 @@ async def create_sandbox(request: Request):
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
     root = data.get("root", "/tmp")
+    volume_id = data.get("volume_id")
+    subpath = data.get("subpath")
+    if not volume_id or not subpath:
+        return JSONResponse(
+            {"error": "volume_id and subpath are required"}, status_code=400,
+        )
+    vol = await _resolve_volume(volume_id)
     dockerfile = _materialize_dockerfile(data)
     sandbox_id = str(uuid.uuid4())
     try:
-        instance = await create_instance(provider, agent_type, dockerfile=dockerfile, root=root)
+        instance = await create_instance(
+            provider, agent_type, dockerfile=dockerfile, root=root,
+            volume_id=vol.provider_ref, subpath=subpath,
+        )
     except Exception as e:
         return JSONResponse(
             {"error": f"Provider '{provider}' failed: {e}"}, status_code=502
@@ -1123,7 +1133,7 @@ async def create_sandbox(request: Request):
     _INSTANCES[sandbox_id] = instance
     record = SandboxRecord(
         id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status=STATUS_RUNNING,
-        root=root,
+        root=root, volume_id=vol.id, subpath=subpath,
     )
     await upsert_sandbox(record)
     return {
@@ -1132,6 +1142,8 @@ async def create_sandbox(request: Request):
         "sandbox_ref": sandbox_ref,
         "status": "running",
         "root": root,
+        "volume_id": vol.id,
+        "subpath": subpath,
     }
 
 
@@ -1217,6 +1229,14 @@ async def provision_sandbox_route(request: Request):
         {**config_data, "agent_type": agent_type, "cwd": cwd}
     )
 
+    volume_id = data.get("volume_id")
+    subpath = data.get("subpath")
+    if not volume_id or not subpath:
+        return JSONResponse(
+            {"error": "volume_id and subpath are required"}, status_code=400,
+        )
+    vol = await _resolve_volume(volume_id)
+
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     pre_start_commands = skill_cmds + (data.get("pre_start_commands") or [])
 
@@ -1226,6 +1246,8 @@ async def provision_sandbox_route(request: Request):
             dockerfile=dockerfile,
             pre_start_commands=pre_start_commands if pre_start_commands else None,
             root=root,
+            volume_id=vol.provider_ref,
+            subpath=subpath,
         )
     except Exception as e:
         if "circuit breaker" in str(e).lower():
@@ -1240,10 +1262,11 @@ async def provision_sandbox_route(request: Request):
     await upsert_sandbox(SandboxRecord(
         id=sandbox_id, provider="daytona",
         sandbox_ref=sandbox_id, status=STATUS_RUNNING,
-        root=root,
+        root=root, volume_id=vol.id, subpath=subpath,
     ))
 
-    return {"sandbox_id": sandbox_id, "status": "provisioned"}
+    return {"sandbox_id": sandbox_id, "status": "provisioned",
+            "volume_id": vol.id, "subpath": subpath}
 
 
 @app.post("/sandboxes/{sandbox_id}/stop")
@@ -1695,6 +1718,8 @@ async def _ensure_sandbox_alive(
                     sandbox_ref=new_ref,
                     status=STATUS_RUNNING,
                     root=sandbox_record.root,
+                    volume_id=sandbox_record.volume_id,
+                    subpath=sandbox_record.subpath,
                 )
             )
             return new_instance.url, False
