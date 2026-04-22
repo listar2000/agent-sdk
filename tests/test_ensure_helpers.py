@@ -56,7 +56,8 @@ async def test_ensure_sandbox_creates_when_none(setup):
         return ProviderInstance(provider="daytona", url="http://fake",
                                 root="/home/daytona", sandbox_id=f"dt-{len(created)}")
 
-    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)):
+    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)), \
+         patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
         sess = await dbmod.get_session("s1")
         sb = await srv.ensure_sandbox(sess)
 
@@ -111,6 +112,7 @@ async def test_ensure_sandbox_reprovisions_when_missing_emits_reattach(setup):
         return await original_get_sandbox(sb_id)
 
     with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)), \
+         patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
          patch("api.db.get_sandbox", new=AsyncMock(side_effect=fake_get_sandbox)), \
          patch("api.server.get_sandbox", new=AsyncMock(side_effect=fake_get_sandbox)):
         sess = await dbmod.get_session("s1")

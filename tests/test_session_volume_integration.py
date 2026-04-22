@@ -105,6 +105,7 @@ async def test_message_lazily_provisions_sandbox(client):
          patch("api.providers._wait_for_health", new=AsyncMock(side_effect=fake_wait_for_health)), \
          patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
          patch("api.server._submit_prompt", MagicMock(return_value=None)), \
+         patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
          patch("api.providers.daytona.ensure_supervisor_url",
                new=AsyncMock(return_value=("http://fake-supervisor:7000", 7000))), \
          patch("api.server.AcpClient", return_value=fake_acp):
@@ -149,6 +150,7 @@ async def test_start_sandbox_provisions_eagerly(client):
     with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
          patch("api.providers._wait_for_health", new=AsyncMock(return_value=True)), \
          patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
+         patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
          patch("api.providers.daytona.ensure_supervisor_url",
                new=AsyncMock(return_value=("http://fake:7000", 7000))), \
          patch("api.server.AcpClient", return_value=fake_acp), \
@@ -205,6 +207,7 @@ async def test_reset_sandbox_swaps(client):
                                 root="/home/daytona", sandbox_id="dt-new")
 
     with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
+         patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
          patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
         r = await client.post(f"/sessions/{sid}/reset-sandbox")
     assert r.status_code == 200
@@ -236,6 +239,7 @@ async def test_reset_sandbox_emits_reattach_event(client):
                                 root="/home/daytona", sandbox_id="dt-new")
 
     with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
+         patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
          patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
         r = await client.post(f"/sessions/{sid}/reset-sandbox")
     assert r.status_code == 200
@@ -252,3 +256,49 @@ async def test_reset_sandbox_emits_reattach_event(client):
     assert payload.get("old_sandbox_id") == "sb_old"
     assert payload.get("new_sandbox_id") is not None
     assert payload["new_sandbox_id"] != "sb_old"
+
+
+@pytest.mark.asyncio
+async def test_ensure_volume_supervisor_caches_installs(client):
+    """Second sandbox creation on same volume+agent skips install entirely."""
+    from api.models import AgentConfig, AgentRecord, VolumeRecord
+    from unittest.mock import AsyncMock, patch
+
+    await dbmod.upsert_agent(AgentRecord(id="a-cache", name="cache",
+                                         config=AgentConfig(agent_type="claude")))
+    await dbmod.upsert_volume(VolumeRecord(id="v-cache", name="v-cache",
+                                           provider="daytona", provider_ref="dt-cache"))
+    async with dbmod.get_db() as conn:
+        await conn.execute(
+            "INSERT INTO sessions (id, agent_id, volume_id) VALUES (%s,%s,%s)",
+            ("sess-cache", "a-cache", "v-cache"),
+        )
+
+    install_calls = []
+
+    async def fake_install(volume_ref, agent_type):
+        install_calls.append((volume_ref, agent_type))
+        # Simulate successful install — update the cache column.
+        await dbmod.add_supervisor_agent_type("v-cache", agent_type)
+
+    from api.providers import ProviderInstance
+
+    async def fake_provision(**kw):
+        return ProviderInstance(provider="daytona", url="",
+                                root="/home/daytona", sandbox_id="dt-sbx")
+
+    with patch("api.providers.daytona.install_supervisor", new=AsyncMock(side_effect=fake_install)), \
+         patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)):
+        # First run: should install
+        sess = await dbmod.get_session("sess-cache")
+        from api.server import ensure_sandbox
+        await ensure_sandbox(sess)
+        assert len(install_calls) == 1, f"Expected 1 install call, got {len(install_calls)}"
+
+        # Clear the current_sandbox_id so ensure_sandbox has to re-provision.
+        await dbmod.set_session_current_sandbox("sess-cache", None)
+
+        # Second run: should NOT install (cache hit).
+        sess = await dbmod.get_session("sess-cache")
+        await ensure_sandbox(sess)
+        assert len(install_calls) == 1, f"Expected still 1 install call (cache hit), got {len(install_calls)}"

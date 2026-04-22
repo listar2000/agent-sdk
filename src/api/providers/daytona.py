@@ -27,7 +27,8 @@ from ._shared import (
 )
 
 _SUPERVISOR_DIR = Path(__file__).resolve().parent.parent.parent / "supervisor"
-_SUPERVISOR_REMOTE_DIR = "/tmp/agent-sdk-sup"
+_SUPERVISOR_REMOTE_DIR = "/tmp/agent-sdk-sup"  # legacy path (pre-volume era)
+_SUPERVISOR_VOLUME_DIR = "/opt/supervisor"      # volume-mounted path (Phase 2+)
 _SUPERVISOR_REMOTE_PORT = 9100
 
 
@@ -140,7 +141,12 @@ async def start_supervisor_in_sandbox(
 ) -> str:
     """Start a NEW supervisor on a specific port inside an existing sandbox.
 
-    Deps (node, npm, ACP binary) must already be installed.
+    If the volume has a cached deps.tar.gz (Phase 2+), extract it to a local
+    ephemeral directory and run supervisor from there.  Extraction from a
+    single archive read is fast; writing thousands of node_modules to the
+    network volume at install time is avoided entirely.
+
+    Falls back to the legacy /tmp install path when no volume cache exists.
     Returns the signed preview URL for this supervisor.
     """
     bin_name = _acp_bin_name(agent_type)
@@ -150,13 +156,43 @@ async def start_supervisor_in_sandbox(
         r = sandbox.process.exec(cmd, timeout=timeout)
         return (r.result if hasattr(r, "result") else str(r)) or ""
 
-    acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
+    # Check for Phase-2 volume cache: a single deps.tar.gz written by
+    # install_supervisor.  If present, extract to a per-port local dir so
+    # we never write node_modules to the slow network volume.
+    vol_tarball = f"{_SUPERVISOR_VOLUME_DIR}/deps.tar.gz"
+    vol_supervisor = f"{_SUPERVISOR_VOLUME_DIR}/supervisor.js"
+    local_work = f"/tmp/sup-work-{port}"
+
+    check_result = await loop.run_in_executor(
+        None, lambda: _exec(f"test -f {vol_tarball} && echo yes || echo no")
+    )
+
+    if "yes" in check_result:
+        # Volume-cached mode: extract deps tarball to local ephemeral dir.
+        # Reading one archive from the volume is fast; we never write
+        # node_modules there.
+        await loop.run_in_executor(None, lambda: _exec(
+            f"mkdir -p {local_work} && "
+            f"tar -C {local_work} -xzf {vol_tarball} && "
+            f"cp {vol_supervisor} {local_work}/supervisor.js",
+            120,
+        ))
+        sup_dir = local_work
+        log.info("start_supervisor_in_sandbox: using volume cache → %s (port %d, sandbox %s)",
+                 local_work, port, sandbox.id[:16])
+    else:
+        # Legacy path: deps are installed directly in the sandbox.
+        sup_dir = _SUPERVISOR_REMOTE_DIR
+        log.info("start_supervisor_in_sandbox: using legacy path %s (port %d, sandbox %s)",
+                 _SUPERVISOR_REMOTE_DIR, port, sandbox.id[:16])
+
+    acp_bin = f"{sup_dir}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
     acp_arg_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in launch_args)
     env_prefix = _build_env_prefix(spawn_env)
-    log_file = f"{_SUPERVISOR_REMOTE_DIR}/sup-{port}.log"
+    log_file = f"{sup_dir}/sup-{port}.log"
     inner = (
-        f"cd {_SUPERVISOR_REMOTE_DIR} && "
+        f"cd {sup_dir} && "
         f"setsid env {env_prefix} node supervisor.js --host 0.0.0.0 --port {port} "
         f"--acp {acp_bin}{acp_arg_flags} --root {root} "
         f"> {log_file} 2>&1 </dev/null & echo started"
@@ -176,7 +212,7 @@ async def start_supervisor_in_sandbox(
             f"supervisor on port {port} in sandbox {sandbox.id} failed health check; log:\n{log_out[:800]}"
         )
 
-    log.info("supervisor on port %d ready: %s (sandbox %s)", port, url[:60], sandbox.id[:16])
+    log.info("supervisor on port %d ready: %s (sandbox %s, dir %s)", port, url[:60], sandbox.id[:16], sup_dir)
     return url
 
 
@@ -200,10 +236,14 @@ async def provision_daytona_sandbox(
     volume_id: str | None = None,
     subpath: str | None = None,
 ) -> ProviderInstance:
-    """Create a Daytona sandbox and install deps, but do NOT start a supervisor.
+    """Create a Daytona sandbox with 3 volume mounts, but do NOT install deps
+    or start a supervisor (those are handled by ensure_volume_supervisor and
+    ensure_supervisor_url respectively).
 
     Returns a ProviderInstance with sandbox_id but no usable supervisor URL.
     Supervisors are started per-session via start_supervisor_in_sandbox().
+    The supervisor binary + ACP package are expected to already be installed on
+    the volume at system/supervisor/ (mounted at /opt/supervisor).
     """
     try:
         from daytona_sdk import (
@@ -252,46 +292,9 @@ async def provision_daytona_sandbox(
         ))
 
     try:
-        # Install deps only (no supervisor start)
-        bin_name = _acp_bin_name(agent_type)
-        npm_spec = _ACP_NPM_SPECS[agent_type]
-
         def _exec(cmd: str, timeout: int = 120) -> str:
             r = sandbox.process.exec(cmd, timeout=timeout)
             return (r.result if hasattr(r, "result") else str(r)) or ""
-
-        await loop.run_in_executor(None, lambda: _exec(
-            "apt-get update >/dev/null 2>&1 && "
-            "apt-get install -y --no-install-recommends libssl3 ca-certificates >/dev/null 2>&1 || true",
-            timeout=120,
-        ))
-        await loop.run_in_executor(None, lambda: _exec(
-            f"mkdir -p {_SUPERVISOR_REMOTE_DIR} && cd {_SUPERVISOR_REMOTE_DIR} && "
-            "npm init -y >/dev/null 2>&1"
-        ))
-        await loop.run_in_executor(None, lambda: _exec(
-            f"cd {_SUPERVISOR_REMOTE_DIR} && "
-            f"npm install --silent {npm_spec} 2>&1 | tail -5",
-            timeout=240,
-        ))
-
-        # Upload supervisor.js
-        import base64 as _b64
-        with open(_SUPERVISOR_DIR / "supervisor.js", "rb") as f:
-            b64 = _b64.b64encode(f.read()).decode()
-
-        def _upload():
-            _exec(f"rm -f {_SUPERVISOR_REMOTE_DIR}/supervisor.js {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64")
-            chunk = 4096
-            for i in range(0, len(b64), chunk):
-                seg = b64[i:i + chunk]
-                _exec(f"printf '%s' '{seg}' >> {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64")
-            _exec(
-                f"base64 -d {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64 > "
-                f"{_SUPERVISOR_REMOTE_DIR}/supervisor.js && "
-                f"rm {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64"
-            )
-        await loop.run_in_executor(None, _upload)
 
         # Run pre-start commands (skills, CLI install, etc.)
         if pre_start_commands:
@@ -483,6 +486,9 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     fails (timeout or terminal error state), the just-created volume is
     best-effort deleted so callers don't end up with an orphaned resource
     they can't identify later.
+
+    After the volume is ready, a utility sandbox is spun up to pre-create
+    the directory structure: shared/ and system/supervisor/.
     """
     from daytona_api_client import VolumesApi
     from daytona_api_client.models import VolumeState
@@ -515,7 +521,58 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
             )
         raise
 
+    # Pre-create the standard directory layout on the volume.
+    await _init_volume_dirs(vol_id)
+
     return vol_id
+
+
+async def _init_volume_dirs(volume_ref: str) -> None:
+    """Spin a 1-shot sandbox to mkdir -p shared/ system/supervisor/ on the volume."""
+    from daytona_sdk import (
+        Daytona, DaytonaConfig, CreateSandboxFromSnapshotParams,
+        CreateSandboxFromImageParams, VolumeMount,
+    )
+
+    api_key = os.environ.get("DAYTONA_API_KEY")
+    if not api_key:
+        raise RuntimeError("DAYTONA_API_KEY not set")
+    daytona = Daytona(DaytonaConfig(api_key=api_key))
+    loop = asyncio.get_running_loop()
+
+    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
+    use_snapshot = snapshot.lower() not in {"", "0", "false", "image"}
+
+    # Mount the whole volume at /v (no subpath) so we can create dirs.
+    volumes = [VolumeMount(volume_id=volume_ref, mount_path="/v")]
+
+    if use_snapshot:
+        sb = await loop.run_in_executor(None, lambda: daytona.create(
+            CreateSandboxFromSnapshotParams(
+                snapshot=snapshot, auto_stop_interval=0,
+                env_vars=_get_sandbox_env_vars(), volumes=volumes,
+            ), timeout=120,
+        ))
+    else:
+        sb = await loop.run_in_executor(None, lambda: daytona.create(
+            CreateSandboxFromImageParams(
+                image="node:22-slim", auto_stop_interval=0,
+                env_vars=_get_sandbox_env_vars(), volumes=volumes,
+            ), timeout=120,
+        ))
+
+    try:
+        def _exec(cmd: str, timeout: int = 30) -> str:
+            r = sb.process.exec(cmd, timeout=timeout)
+            return (r.result if hasattr(r, "result") else str(r)) or ""
+
+        await loop.run_in_executor(None, lambda: _exec("mkdir -p /v/shared /v/system/supervisor"))
+        log.info("volume %s: initialized shared/ and system/supervisor/ dirs", volume_ref)
+    finally:
+        try:
+            await loop.run_in_executor(None, lambda: daytona.delete(sb))
+        except Exception:
+            pass
 
 
 async def delete_daytona_volume(provider_ref: str) -> None:
@@ -596,7 +653,91 @@ async def ensure_supervisor_url(inst, *, agent_type: str, root: str = "/tmp",
 
 
 async def install_supervisor(volume_ref: str, agent_type: str) -> None:
-    raise NotImplementedError("Phase 2 will implement this")
+    """Install supervisor.js + ACP binary on this volume at system/supervisor/.
+
+    Spins a 1-shot Daytona sandbox with the volume mounted
+    (subpath=system/supervisor at /work), runs npm install + uploads
+    supervisor.js, then tears down the sandbox.
+    """
+    from daytona_sdk import (
+        Daytona, DaytonaConfig, CreateSandboxFromSnapshotParams,
+        CreateSandboxFromImageParams, VolumeMount,
+    )
+
+    api_key = os.environ.get("DAYTONA_API_KEY")
+    if not api_key:
+        raise RuntimeError("DAYTONA_API_KEY not set")
+    daytona = Daytona(DaytonaConfig(api_key=api_key))
+    loop = asyncio.get_running_loop()
+
+    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
+    use_snapshot = snapshot.lower() not in {"", "0", "false", "image"}
+
+    volumes = [VolumeMount(volume_id=volume_ref, mount_path="/work", subpath="system/supervisor")]
+
+    if use_snapshot:
+        sb = await loop.run_in_executor(None, lambda: daytona.create(
+            CreateSandboxFromSnapshotParams(
+                snapshot=snapshot, auto_stop_interval=0,
+                env_vars=_get_sandbox_env_vars(), volumes=volumes,
+            ), timeout=120,
+        ))
+    else:
+        sb = await loop.run_in_executor(None, lambda: daytona.create(
+            CreateSandboxFromImageParams(
+                image="node:22-slim", auto_stop_interval=0,
+                env_vars=_get_sandbox_env_vars(), volumes=volumes,
+            ), timeout=120,
+        ))
+
+    try:
+        npm_spec = _ACP_NPM_SPECS[agent_type]
+
+        def _exec(cmd: str, timeout: int | None = 60) -> str:
+            r = sb.process.exec(cmd, timeout=timeout)
+            return (r.result if hasattr(r, "result") else str(r)) or ""
+
+        # Install to local ephemeral FS (fast SSD), create a single archive,
+        # then copy ONLY that archive to the volume.  Extracting thousands of
+        # node_modules files directly to a network volume is very slow and
+        # times out; writing one ~20 MB .tar.gz is fast.
+        # At start time, start_supervisor_in_sandbox extracts the archive
+        # to local ephemeral FS inside the session sandbox.
+        local_dir = "/tmp/sup-install"
+        await loop.run_in_executor(None, lambda: _exec(
+            f"mkdir -p {local_dir} && cd {local_dir} && "
+            "(test -f package.json || npm init -y >/dev/null 2>&1)"
+        ))
+        await loop.run_in_executor(None, lambda: _exec(
+            f"cd {local_dir} && npm install --omit=optional {npm_spec} 2>&1 | tail -5",
+            240,
+        ))
+
+        # Pack to a single archive on local FS, then copy to volume as one file.
+        # cp of a single ~20 MB file is fast (a few seconds); tar-extracting
+        # thousands of files is slow.
+        await loop.run_in_executor(None, lambda: _exec(
+            f"tar -C {local_dir} -czf /tmp/deps.tar.gz . && "
+            f"cp /tmp/deps.tar.gz /work/deps.tar.gz && "
+            f"rm -f /tmp/deps.tar.gz && rm -rf {local_dir}",
+            120,
+        ))
+
+        # Upload supervisor.js using the Daytona filesystem API — avoids the
+        # shell command length / printf append reliability issues.
+        with open(_SUPERVISOR_DIR / "supervisor.js", "rb") as f:
+            sup_js_bytes = f.read()
+
+        await loop.run_in_executor(
+            None, lambda: sb.fs.upload_file(sup_js_bytes, "/work/supervisor.js")
+        )
+
+        log.info("supervisor installed on volume %s for %s", volume_ref, agent_type)
+    finally:
+        try:
+            await loop.run_in_executor(None, lambda: daytona.delete(sb))
+        except Exception:
+            pass
 
 
 async def volume_tree(ref: str, path: str) -> str:

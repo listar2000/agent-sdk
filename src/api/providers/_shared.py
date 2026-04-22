@@ -224,13 +224,30 @@ def free_sandbox_port(sandbox_id: str, port: int) -> None:
 def _build_volume_mounts(volume_id: str | None, subpath: str | None):
     """Build the VolumeMount list for a Daytona sandbox. Returns None if no volume.
 
+    Per-session sandboxes (subpath is a non-empty string) get three mounts:
+      - /home/daytona  → volume subpath (agent's home directory)
+      - /mnt/shared    → volume shared/ (cross-session shared data)
+      - /opt/supervisor → volume system/supervisor/ (pre-installed supervisor)
+
+    Utility sandboxes (subpath is None or empty string) get a single whole-volume
+    mount at /v. This avoids the supervisor mount failing before system/supervisor/
+    has been created.
+
     NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
     spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
     """
     if not volume_id:
         return None
     from daytona_sdk import VolumeMount
-    return [VolumeMount(volume_id=volume_id, mount_path="/home/daytona", subpath=subpath)]
+    if not subpath:
+        # Utility sandbox: whole-volume mount so we can inspect/create any dir.
+        return [VolumeMount(volume_id=volume_id, mount_path="/v")]
+    # Regular per-session sandbox: three named mounts.
+    return [
+        VolumeMount(volume_id=volume_id, mount_path="/home/daytona", subpath=subpath),
+        VolumeMount(volume_id=volume_id, mount_path="/mnt/shared", subpath="shared"),
+        VolumeMount(volume_id=volume_id, mount_path="/opt/supervisor", subpath="system/supervisor"),
+    ]
 
 
 # ---------------------------------------------------------------------------

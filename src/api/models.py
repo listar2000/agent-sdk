@@ -95,6 +95,7 @@ class VolumeRecord:
     provider: str
     provider_ref: str
     status: str = "ready"
+    supervisor_agent_types: list[str] = field(default_factory=list)
 
 
 @dataclass

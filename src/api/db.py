@@ -183,6 +183,9 @@ _MIGRATIONS = [
             ALTER TABLE sandboxes ALTER COLUMN subpath SET NOT NULL;
         END IF;
     END $$""",
+    # 2026-04-22: cache which agent_types have their supervisor installed on each volume.
+    # Avoids a 30s utility-sandbox probe on every Daytona sandbox boot.
+    "ALTER TABLE volumes ADD COLUMN IF NOT EXISTS supervisor_agent_types JSONB NOT NULL DEFAULT '[]'::jsonb",
 ]
 
 
@@ -352,13 +355,22 @@ async def delete_sandbox(sandbox_id: str) -> None:
 async def upsert_volume(volume: VolumeRecord) -> None:
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO volumes (id, name, provider, provider_ref, status)"
-            " VALUES (%s, %s, %s, %s, %s)"
+            "INSERT INTO volumes (id, name, provider, provider_ref, status, supervisor_agent_types)"
+            " VALUES (%s, %s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,"
             " provider=EXCLUDED.provider, provider_ref=EXCLUDED.provider_ref,"
-            " status=EXCLUDED.status",
-            (volume.id, volume.name, volume.provider, volume.provider_ref, volume.status),
+            " status=EXCLUDED.status, supervisor_agent_types=EXCLUDED.supervisor_agent_types",
+            (volume.id, volume.name, volume.provider, volume.provider_ref, volume.status,
+             Json(volume.supervisor_agent_types)),
         )
+
+
+def _row_to_volume(row: dict) -> VolumeRecord:
+    return VolumeRecord(
+        id=row["id"], name=row["name"], provider=row["provider"],
+        provider_ref=row["provider_ref"], status=row["status"],
+        supervisor_agent_types=list(row.get("supervisor_agent_types") or []),
+    )
 
 
 async def get_volume(volume_id: str) -> VolumeRecord | None:
@@ -368,8 +380,7 @@ async def get_volume(volume_id: str) -> VolumeRecord | None:
         )).fetchone()
     if row is None:
         return None
-    return VolumeRecord(id=row["id"], name=row["name"], provider=row["provider"],
-                        provider_ref=row["provider_ref"], status=row["status"])
+    return _row_to_volume(row)
 
 
 async def get_volume_by_name(name: str) -> VolumeRecord | None:
@@ -379,8 +390,7 @@ async def get_volume_by_name(name: str) -> VolumeRecord | None:
         )).fetchone()
     if row is None:
         return None
-    return VolumeRecord(id=row["id"], name=row["name"], provider=row["provider"],
-                        provider_ref=row["provider_ref"], status=row["status"])
+    return _row_to_volume(row)
 
 
 async def list_volumes(provider: str | None = None) -> list[VolumeRecord]:
@@ -391,16 +401,23 @@ async def list_volumes(provider: str | None = None) -> list[VolumeRecord]:
             )).fetchall()
         else:
             rows = await (await conn.execute("SELECT * FROM volumes")).fetchall()
-    return [
-        VolumeRecord(id=r["id"], name=r["name"], provider=r["provider"],
-                     provider_ref=r["provider_ref"], status=r["status"])
-        for r in rows
-    ]
+    return [_row_to_volume(r) for r in rows]
 
 
 async def delete_volume(volume_id: str) -> None:
     async with get_db() as conn:
         await conn.execute("DELETE FROM volumes WHERE id = %s", (volume_id,))
+
+
+async def add_supervisor_agent_type(volume_id: str, agent_type: str) -> None:
+    """Idempotently append agent_type to volumes.supervisor_agent_types."""
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE volumes SET supervisor_agent_types = "
+            "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
+            "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
+            (agent_type, volume_id, agent_type),
+        )
 
 
 # ---------------------------------------------------------------------------

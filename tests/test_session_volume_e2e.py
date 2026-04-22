@@ -72,7 +72,7 @@ async def test_sandbox_loss_resume_end_to_end():
     transport = ASGITransport(app=srv.app)
     try:
         async with AsyncClient(transport=transport, base_url="http://test",
-                               timeout=300.0) as client:
+                               timeout=600.0) as client:
             vol_name = f"e2e-vol-{uuid.uuid4().hex[:6]}"
             r = await client.post("/volumes/provision",
                                   json={"name": vol_name, "provider": "daytona"})

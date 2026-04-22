@@ -29,6 +29,7 @@ from fastapi.responses import (
 
 from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .db import (
+    add_supervisor_agent_type,
     close_pool,
     delete_agent,
     delete_sandbox,
@@ -131,6 +132,8 @@ _INSTANCES: dict[str, ProviderInstance] = {}
 
 _sandbox_locks: dict[str, asyncio.Lock] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
+# Keyed by (volume_id, agent_type) — prevents concurrent supervisor installs.
+_volume_supervisor_locks: dict[tuple, asyncio.Lock] = {}
 
 
 def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
@@ -139,6 +142,10 @@ def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
     return _session_locks.setdefault(session_id, asyncio.Lock())
+
+
+def _get_volume_supervisor_lock(volume_id: str, agent_type: str) -> asyncio.Lock:
+    return _volume_supervisor_locks.setdefault((volume_id, agent_type), asyncio.Lock())
 
 
 # keyed by session_id
@@ -1843,6 +1850,36 @@ async def _ensure_sandbox_alive(
 
 
 
+async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
+    """Idempotently install the supervisor + ACP binary on a volume.
+
+    Uses a per-(volume_id, agent_type) asyncio.Lock to prevent concurrent
+    installs within the same process. Fast path: if the volumes.supervisor_agent_types
+    cache already lists this agent_type, return immediately without taking the lock.
+    """
+    # Fast path (no lock): check cache first.
+    vol = await get_volume(volume_id)
+    if vol is None:
+        raise HTTPException(500, f"Volume {volume_id} not found")
+    if agent_type in (vol.supervisor_agent_types or []):
+        return  # already installed
+
+    # Take the per-(volume, agent_type) lock.
+    lock = _get_volume_supervisor_lock(volume_id, agent_type)
+    async with lock:
+        # Double-check under lock (another coroutine may have installed while we waited).
+        vol2 = await get_volume(volume_id)
+        if vol2 is None:
+            raise HTTPException(500, f"Volume {volume_id} not found")
+        if agent_type in (vol2.supervisor_agent_types or []):
+            return
+
+        log.info("ensure_volume_supervisor: installing %s on volume %s", agent_type, volume_id)
+        await _providers_mod.install_supervisor(vol2.provider, vol2.provider_ref, agent_type)
+        await add_supervisor_agent_type(volume_id, agent_type)
+        log.info("ensure_volume_supervisor: done installing %s on volume %s", agent_type, volume_id)
+
+
 async def ensure_sandbox(session_row: dict) -> SandboxRecord:
     """Guarantees: returns a sandbox that is currently live on the provider.
 
@@ -1912,6 +1949,10 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
     subpath = f"agents/{agent_id}/home"
     agent = await get_agent(agent_id)
     agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+
+    # Ensure supervisor is installed on the volume before provisioning the sandbox.
+    # This is idempotent: fast-path if already installed (cache hit in volumes table).
+    await ensure_volume_supervisor(vol.id, agent_type)
 
     inst = await _providers_mod.provision_daytona_sandbox(
         agent_type=agent_type,
