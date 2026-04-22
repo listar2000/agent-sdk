@@ -289,12 +289,15 @@ async def create_sandbox(
     try:
         healthy = await _wait_for_health(url)
     except BaseException:
-        _kill_proc(proc)
+        # ``_kill_proc`` calls blocking ``proc.wait(timeout=5)`` twice; running
+        # it on the event-loop thread would stall every other coroutine for up
+        # to ten seconds.  Offload to a worker thread.
+        await asyncio.to_thread(_kill_proc, proc)
         async with _port_lock:
             _freed_ports.append(port)
         raise
     if not healthy:
-        _kill_proc(proc)
+        await asyncio.to_thread(_kill_proc, proc)
         async with _port_lock:
             _freed_ports.append(port)
         raise RuntimeError(f"local supervisor failed to become healthy on port {port}")
