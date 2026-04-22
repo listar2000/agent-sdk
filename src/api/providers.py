@@ -545,11 +545,11 @@ async def provision_daytona_sandbox(
     # NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
     # spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
     volumes = None
-    if volume_id and subpath:
+    if volume_id:
         volumes = [VolumeMount(
             volume_id=volume_id,
             mount_path="/home/daytona",
-            subpath=subpath,
+            subpath=subpath,  # None => mount whole volume
         )]
 
     if use_snapshot:
@@ -709,11 +709,11 @@ async def create_daytona(
     # NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
     # spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
     volumes = None
-    if volume_id and subpath:
+    if volume_id:
         volumes = [VolumeMount(
             volume_id=volume_id,
             mount_path="/home/daytona",
-            subpath=subpath,
+            subpath=subpath,  # None => mount whole volume
         )]
 
     if use_snapshot:

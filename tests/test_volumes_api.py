@@ -110,3 +110,25 @@ async def test_provision_volume_waits_for_ready(client):
                               json={"name": "prov-test", "provider": "daytona"})
     assert r.status_code == 200
     assert r.json()["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_volume_files_edit_and_read(client):
+    """File ops go through a short-lived sandbox with the volume mounted."""
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_f", name="files-test", provider="daytona", provider_ref="dt-f")
+    await dbmod.upsert_volume(v)
+
+    # Stub the utility-sandbox lifecycle to avoid provisioning real Daytona.
+    from api.providers import ExecResult, ProviderInstance
+    fake_inst = ProviderInstance(provider="daytona", url="", root="/", sandbox_id="util")
+
+    with patch("api.providers.create_daytona",
+               new=AsyncMock(return_value=fake_inst)), \
+         patch("api.providers.destroy_daytona",
+               new=AsyncMock(return_value=None)), \
+         patch("api.providers.exec_in_instance",
+               new=AsyncMock(return_value=ExecResult(exit_code=0, stdout="ok", stderr=""))):
+        r = await client.post(f"/volumes/{v.id}/files/edit",
+                              json={"path": "shared/x.txt", "content": "hi"})
+        assert r.status_code == 204

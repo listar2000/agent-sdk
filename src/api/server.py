@@ -1036,6 +1036,95 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Volume file operations (tree / read / edit)
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel as _BaseModel  # noqa: E402
+
+
+class _VolumeEditBody(_BaseModel):
+    path: str
+    content: str  # plain text for v1
+
+
+def _safe_path(p: str) -> str:
+    """Normalize a path: strip leading /, reject traversal."""
+    p = p.lstrip("/")
+    if ".." in p.split("/"):
+        raise HTTPException(400, "path traversal not allowed")
+    return p
+
+
+async def _with_utility_sandbox(vol):
+    """Spin up a short-lived sandbox with the whole volume mounted at /home/daytona."""
+    if vol.provider != "daytona":
+        raise HTTPException(501, f"File ops on {vol.provider} not implemented")
+    # subpath=None => mount the entire volume at /home/daytona
+    inst = await _providers_mod.create_daytona(
+        agent_type="claude",
+        volume_id=vol.provider_ref,
+        subpath=None,
+    )
+    return inst
+
+
+async def _destroy_utility_sandbox(inst):
+    await _providers_mod.destroy_daytona(inst)
+
+
+@app.get("/volumes/{id_or_name}/files/tree")
+async def volume_files_tree(id_or_name: str, path: str = ""):
+    vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
+    if not vol:
+        raise HTTPException(404, "Volume not found")
+    p = _safe_path(path)
+    inst = await _with_utility_sandbox(vol)
+    try:
+        cmd = f"find /home/daytona/{p} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null"
+        res = await _providers_mod.exec_in_instance(inst, cmd, timeout=30)
+        return {"tree": res.stdout}
+    finally:
+        await _destroy_utility_sandbox(inst)
+
+
+@app.get("/volumes/{id_or_name}/files/read")
+async def volume_files_read(id_or_name: str, path: str):
+    vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
+    if not vol:
+        raise HTTPException(404, "Volume not found")
+    p = _safe_path(path)
+    inst = await _with_utility_sandbox(vol)
+    try:
+        res = await _providers_mod.exec_in_instance(inst, f"cat /home/daytona/{p}", timeout=30)
+        if res.exit_code != 0:
+            raise HTTPException(404, f"File not found or unreadable: {res.stderr}")
+        return {"content": res.stdout}
+    finally:
+        await _destroy_utility_sandbox(inst)
+
+
+@app.post("/volumes/{id_or_name}/files/edit", status_code=204)
+async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
+    vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
+    if not vol:
+        raise HTTPException(404, "Volume not found")
+    p = _safe_path(body.path)
+    inst = await _with_utility_sandbox(vol)
+    try:
+        import base64 as _base64
+        b64 = _base64.b64encode(body.content.encode()).decode()
+        cmd = (
+            f"mkdir -p $(dirname /home/daytona/{p}) && "
+            f"echo '{b64}' | base64 -d > /home/daytona/{p}"
+        )
+        res = await _providers_mod.exec_in_instance(inst, cmd, timeout=30)
+        if res.exit_code != 0:
+            raise HTTPException(500, f"Edit failed: {res.stderr}")
+    finally:
+        await _destroy_utility_sandbox(inst)
+
+
+# ---------------------------------------------------------------------------
 # Sandbox CRUD
 # ---------------------------------------------------------------------------
 
