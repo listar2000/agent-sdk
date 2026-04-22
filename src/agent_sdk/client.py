@@ -364,7 +364,7 @@ class Agent:
             else:
                 # Plain agent registration (no sandbox)
                 resp = await self._client.post("/agents", json=self._registration_payload())
-                resp.raise_for_status()
+                _raise_for_status(resp)
                 data = resp.json()
                 self.id = data.get("id", self.name)
                 if self.session_id is None:
@@ -546,7 +546,7 @@ class Agent:
         """Set session config dynamically. Accepts: mode, model, thought_level."""
         await self._ensure_registered()
         resp = await self._client.post(f"/sessions/{self.session_id}/config", json=kwargs)
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     async def cancel(self) -> None:
         """Cancel the currently running prompt (best-effort)."""
@@ -554,7 +554,7 @@ class Agent:
         resp = await self._client.post(
             f"/sessions/{self.session_id}/cancel",
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def reset_session(self) -> None:
         """Clear session state so the agent re-registers on next call."""
@@ -587,7 +587,7 @@ class Agent:
 
 # ── Volumes API ──
 
-from dataclasses import dataclass as _dataclass
+from dataclasses import dataclass as _dataclass, fields
 
 
 @_dataclass
@@ -597,6 +597,20 @@ class Volume:
     provider: str
     provider_ref: str
     status: str
+
+    @classmethod
+    def _from_server(cls, payload: dict) -> "Volume":
+        """Build a ``Volume`` from a server response, tolerating extra keys.
+
+        The server's ``VolumeRecord`` has grown fields (``supervisor_agent_types``
+        as of the volume-aware supervisor rollout) that this lean SDK dataclass
+        does not model. Previously ``Volume(**payload)`` raised ``TypeError``
+        the moment the server started emitting those keys. Filtering to our
+        known slots keeps the SDK forward-compatible — new server fields are
+        silently ignored, no client release required.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in payload.items() if k in known})
 
 
 class _VolumesAPI:
@@ -608,31 +622,31 @@ class _VolumesAPI:
     async def create(self, name: str, provider: str) -> Volume:
         r = await self._c._http.post(f"{self._c.base_url}/volumes",
                                      json={"name": name, "provider": provider})
-        r.raise_for_status()
-        return Volume(**r.json())
+        _raise_for_status(r)
+        return Volume._from_server(r.json())
 
     async def provision(self, name: str, provider: str) -> Volume:
         r = await self._c._http.post(f"{self._c.base_url}/volumes/provision",
                                      json={"name": name, "provider": provider})
-        r.raise_for_status()
-        return Volume(**r.json())
+        _raise_for_status(r)
+        return Volume._from_server(r.json())
 
     async def get(self, id_or_name: str) -> Volume:
         r = await self._c._http.get(f"{self._c.base_url}/volumes/{id_or_name}")
-        r.raise_for_status()
-        return Volume(**r.json())
+        _raise_for_status(r)
+        return Volume._from_server(r.json())
 
     async def list(self, provider: str | None = None) -> list[Volume]:
         params = {"provider": provider} if provider else None
         r = await self._c._http.get(f"{self._c.base_url}/volumes", params=params)
-        r.raise_for_status()
-        return [Volume(**v) for v in r.json()]
+        _raise_for_status(r)
+        return [Volume._from_server(v) for v in r.json()]
 
     async def delete(self, id_or_name: str, force: bool = False) -> None:
         params = {"force": "true"} if force else None
         r = await self._c._http.delete(f"{self._c.base_url}/volumes/{id_or_name}",
                                        params=params)
-        r.raise_for_status()
+        _raise_for_status(r)
 
 
 class Client:
