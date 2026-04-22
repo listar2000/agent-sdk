@@ -26,6 +26,7 @@ from ._shared import (
     build_supervisor_argv,
     ProviderInstance,
     _build_volume_mounts,
+    normalize_find_output,
 )
 
 _SUPERVISOR_DIR = Path(__file__).resolve().parent.parent.parent / "supervisor"
@@ -374,6 +375,8 @@ async def restart_daytona_supervisor(
     if state_str != "started":
         log.info("starting stopped daytona sandbox %s", daytona_sandbox_id)
         await loop.run_in_executor(None, sandbox.start)
+        await _wait_for_daytona_sandbox_ready(daytona, daytona_sandbox_id)
+        sandbox = await loop.run_in_executor(None, lambda: daytona.get(daytona_sandbox_id))
 
     # Probe for the volume-cached deps tarball. If present, route through
     # start_supervisor_in_sandbox which extracts from the cache; otherwise
@@ -448,8 +451,38 @@ async def stop_daytona(instance: ProviderInstance) -> None:
     await _daytona_sandbox_op(instance, "stop")
 
 
+async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=None) -> None:
+    """Poll until the sandbox is "started" AND an exec succeeds (IP allocated).
+
+    sandbox.start() returns as soon as Daytona accepts the request, before the
+    container network is configured.  Subsequent exec calls fail with
+    "failed to resolve container IP" until the network stack is up.
+    """
+    loop = asyncio.get_running_loop()
+    for _attempt in range(30):
+        await asyncio.sleep(2)
+        sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
+        raw_state = sandbox.state
+        state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
+        if state_str != "started":
+            continue
+        try:
+            r = await loop.run_in_executor(
+                None, lambda: sandbox.process.exec("echo ready", timeout=5)
+            )
+            result = (r.result if hasattr(r, "result") else str(r)) or ""
+            if "ready" in result:
+                log.info("daytona sandbox %s is ready", sandbox_ref[:16])
+                return
+        except Exception:
+            pass
+    raise RuntimeError(
+        f"Daytona sandbox {sandbox_ref} did not become network-ready after start"
+    )
+
+
 async def start_daytona(sandbox_ref: str) -> None:
-    """Start a stopped Daytona sandbox by its provider ref."""
+    """Start a stopped Daytona sandbox and wait for it to be network-ready."""
     try:
         daytona = _get_daytona_client()
     except (ImportError, RuntimeError) as e:
@@ -461,6 +494,7 @@ async def start_daytona(sandbox_ref: str) -> None:
         sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
         await loop.run_in_executor(None, sandbox.start)
         log.info("daytona sandbox started: %s", sandbox_ref)
+        await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref)
     except Exception as e:
         log.warning("failed to start daytona sandbox %s: %s", sandbox_ref, e)
         raise
@@ -623,6 +657,9 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
     return await stop_daytona(inst)
 
 
+_DAYTONA_VOLUME_HOME = "/home/daytona"
+
+
 async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
                                 root: str = "/tmp",
                                 spawn_env: dict | None = None,
@@ -652,11 +689,39 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
         raise RuntimeError("DAYTONA_API_KEY not set")
     daytona_client = Daytona(DaytonaConfig(api_key=api_key))
     loop = asyncio.get_running_loop()
-    sandbox = await loop.run_in_executor(
-        None, lambda: daytona_client.get(inst.sandbox_id)
-    )
+    try:
+        sandbox = await loop.run_in_executor(
+            None, lambda: daytona_client.get(inst.sandbox_id)
+        )
+    except Exception as e:
+        # Daytona raises a plain Exception with "not found" in the message when
+        # the sandbox has been deleted out-of-band. Surface this as a typed
+        # error so the server can re-provision on the same volume.
+        if "not found" in str(e).lower():
+            from ._shared import SandboxMissingError
+            raise SandboxMissingError(
+                f"Daytona sandbox {inst.sandbox_id} not found (deleted externally)"
+            ) from e
+        raise
+    # If the sandbox was stopped externally (e.g. daytona.stop()), start it
+    # and wait for the container network to be ready before exec-ing.
+    raw_state = sandbox.state
+    state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
+    if state_str != "started":
+        log.info("ensure_supervisor_url: sandbox %s is %s; starting", inst.sandbox_id[:16], state_str)
+        await loop.run_in_executor(None, sandbox.start)
+        await _wait_for_daytona_sandbox_ready(daytona_client, inst.sandbox_id)
+        sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(inst.sandbox_id))
+    # Volume is mounted at /home/daytona (see _build_volume_mounts). Force
+    # HOME to that path — without it, the ACP child inherits HOME=/root from
+    # the Daytona VM default and Claude Code writes session files to the
+    # ephemeral /root/.claude, so session/load after stop/delete fails with
+    # "No conversation found with session ID". This invariant lives here
+    # (the single supervisor-spawn choke point) so every code path benefits.
+    effective_env = dict(spawn_env or {})
+    effective_env["HOME"] = _DAYTONA_VOLUME_HOME
     return await start_supervisor_in_sandbox(
-        sandbox, agent_type, port, root=root, spawn_env=spawn_env,
+        sandbox, agent_type, port, root=_DAYTONA_VOLUME_HOME, spawn_env=effective_env,
     )
 
 
@@ -823,11 +888,16 @@ async def create_sandbox(
     docker/local but are unused here — the supervisor is started later with
     its own env + port, and Daytona has no container-label concept.
     """
+    # For per-session sandboxes (subpath set), the volume is ALWAYS mounted
+    # at /home/daytona (see _build_volume_mounts). The ``root`` param is
+    # ignored in that case — using anything else breaks HOME-on-volume and
+    # causes Claude Code session files to land in ephemeral /root/.claude.
+    effective_root = "/home/daytona" if subpath else (root or "/home/daytona")
     return await provision_daytona_sandbox(
         agent_type=agent_type,
         dockerfile=dockerfile,
         pre_start_commands=pre_start_commands,
-        root=root or "/home/daytona",
+        root=effective_root,
         volume_id=volume_ref,
         subpath=subpath,
     )
@@ -856,17 +926,18 @@ async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
 
 
 async def volume_tree(ref: str, path: str) -> str:
-    """Tree listing of ``<volume>/<path>``.
-
-    Spins a utility sandbox with the whole volume at /v, lists files.
-    Paths are relative to the volume root (e.g. ``"shared"``, ``""`` for all).
-    """
+    """Tree listing of ``<volume>/<path>`` in the unified format (max depth 3)."""
     rel = _safe_path(None, path or "")
     target = "/v/" + rel if rel else "/v"
     res = await _run_in_utility_sandbox(
-        ref, f"find {shlex.quote(target)} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null"
+        ref,
+        f"find {shlex.quote(target)} -mindepth 1 -maxdepth 3 -printf '%y %P\\n' 2>/dev/null"
     )
-    return res.stdout
+    normalized = normalize_find_output(res.stdout)
+    if not rel or not normalized:
+        return normalized
+    lines = [f"{rel.rstrip('/')}/{ln}" for ln in normalized.splitlines()]
+    return "\n".join(sorted(lines))
 
 
 async def volume_read(ref: str, path: str) -> bytes:

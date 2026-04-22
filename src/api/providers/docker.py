@@ -34,6 +34,7 @@ from ._shared import (
     _safe_path,
     _wait_for_health,
     build_supervisor_argv,
+    normalize_find_output,
 )
 
 log = logging.getLogger(__name__)
@@ -630,16 +631,25 @@ async def _run_volume_shell(
 
 
 async def volume_tree(ref: str, path: str) -> str:
-    """Return a newline-separated list of files under ``<volume>/<path>``."""
+    """Tree listing of ``<volume>/<path>`` in the unified format.
+
+    Output: one entry per line, paths relative to the volume root, directories
+    end with ``/``, files do not, sorted. See ``_shared.normalize_find_output``.
+    """
     rel = _safe_rel(path)
     target = f"/v/{rel}" if rel else "/v"
-    shell = f"find {shlex.quote(target)} -type f 2>/dev/null | sort"
+    shell = f"find {shlex.quote(target)} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
     rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
     if rc != 0:
         raise RuntimeError(
             f"volume_tree failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
         )
-    return out.decode(errors="replace")
+    normalized = normalize_find_output(out.decode(errors="replace"))
+    if not rel or not normalized:
+        return normalized
+    # Re-anchor to volume root when a subpath was queried
+    lines = [f"{rel.rstrip('/')}/{ln}" for ln in normalized.splitlines()]
+    return "\n".join(sorted(lines))
 
 
 async def volume_read(ref: str, path: str) -> bytes:

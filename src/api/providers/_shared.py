@@ -74,6 +74,19 @@ _SUPERVISOR_REMOTE_PORT = 9100
 
 
 # ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class SandboxMissingError(Exception):
+    """Raised when a provider cannot find the sandbox (deleted out-of-band).
+
+    Distinct from "stopped" (recoverable by start). Callers should treat this
+    as "the sandbox record is stale; provision a new sandbox on the same
+    volume" rather than retry.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -372,6 +385,34 @@ def _safe_path(ref: str | None, rel_path: str) -> str:
         if candidate != root_real and not candidate.startswith(root_real + os.sep):
             raise ValueError("path escapes volume root")
     return normalized
+
+
+def normalize_find_output(raw: str) -> str:
+    """Normalize the output of ``find -printf '%y %P\\n'`` to the unified tree format.
+
+    Each non-empty line of *raw* must be ``"<type> <relpath>"`` where type is
+    one of ``d``/``f``/``l``. ``%P`` gives the path relative to the find root,
+    so no ``/v/`` stripping is needed. Output: one path per line, directories
+    end with ``/``, files do not, sorted.
+    """
+    entries: set[str] = set()
+    for line in (raw or "").splitlines():
+        line = line.rstrip("\r")
+        if not line:
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) != 2:
+            continue
+        type_char, path = parts
+        path = path.strip().lstrip("/")
+        if not path:
+            continue  # the find root itself — skip
+        if type_char == "d":
+            entries.add(path.rstrip("/") + "/")
+        elif type_char in ("f", "l"):
+            entries.add(path.rstrip("/"))
+        # other types (c, b, p, s) ignored
+    return "\n".join(sorted(entries))
 
 
 async def _exec_subprocess(proc, timeout: int) -> ExecResult:

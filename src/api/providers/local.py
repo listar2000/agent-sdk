@@ -483,6 +483,7 @@ async def volume_tree(ref: str, path: str = "") -> str:
                 lines.append((os.path.join(rel, d) + "/").lstrip("/"))
             for f in filenames:
                 lines.append(os.path.join(rel, f).lstrip("/"))
+        lines.sort()
         return "\n".join(lines)
 
     return await asyncio.to_thread(_walk)

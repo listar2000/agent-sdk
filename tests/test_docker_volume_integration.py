@@ -119,8 +119,8 @@ async def test_volume_tree_read_write_roundtrip():
         await dprov.volume_write(name, "a/b/d.bin", b"\x00\x01\x02\xff\xfe")
         tree = await dprov.volume_tree(name, "a")
         files = [ln for ln in tree.splitlines() if ln.strip()]
-        assert any(f.endswith("/a/b/c.txt") for f in files), files
-        assert any(f.endswith("/a/b/d.bin") for f in files), files
+        assert any("a/b/c.txt" in f for f in files), files
+        assert any("a/b/d.bin" in f for f in files), files
         assert await dprov.volume_read(name, "a/b/c.txt") == b"hello"
         assert await dprov.volume_read(name, "a/b/d.bin") == b"\x00\x01\x02\xff\xfe"
     finally:
@@ -449,11 +449,11 @@ async def test_install_supervisor_populates_system_supervisor():
         tree = await dprov.volume_tree(name, "system/supervisor")
         files = tree.splitlines()
         # supervisor.js copied.
-        assert any(f.endswith("system/supervisor/supervisor.js") for f in files), (
+        assert any("system/supervisor/supervisor.js" in f for f in files), (
             "expected supervisor.js in " + str(files)[:500]
         )
         # package.json created by `npm init`.
-        assert any(f.endswith("system/supervisor/package.json") for f in files), (
+        assert any("system/supervisor/package.json" in f for f in files), (
             "expected package.json in " + str(files)[:500]
         )
         # Claude ACP binary installed.

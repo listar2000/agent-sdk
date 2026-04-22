@@ -49,7 +49,7 @@ async def test_list_volumes_shape(client):
 
 @pytest.mark.asyncio
 async def test_tree_is_newline_string(client):
-    """UI parses tree as a newline-separated string; dirs end with '/'."""
+    """UI parses tree as newline-separated string; dirs end with '/', files don't."""
     with patch("api.providers.local.create_volume",
                new=AsyncMock(return_value="local-ui-tree")), \
          patch("api.providers.local.volume_tree",
@@ -59,8 +59,13 @@ async def test_tree_is_newline_string(client):
         r = await client.get("/volumes/ui-tree-vol/files/tree")
     assert r.status_code == 200
     body = r.json()
-    assert "tree" in body, "UI reads response.tree"
-    assert isinstance(body["tree"], str), "UI expects newline-separated string"
+    assert "tree" in body
+    assert isinstance(body["tree"], str)
+    lines = [l for l in body["tree"].splitlines() if l]
+    # Files: no trailing slash. Dirs: single trailing slash.
+    for ln in lines:
+        assert not ln.startswith("/"), f"expected relative path, got {ln!r}"
+        assert not ln.endswith("//"), f"double trailing slash in {ln!r}"
 
 
 @pytest.mark.asyncio
