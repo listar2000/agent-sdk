@@ -727,6 +727,20 @@ def _get_daytona_client():
     return Daytona(DaytonaConfig(api_key=api_key))
 
 
+async def create_daytona_volume(name: str) -> str:
+    """Create a Daytona volume and return its provider-native id."""
+    client = _get_daytona_client()
+    vol = await asyncio.to_thread(client.volume.create, name)
+    return vol.id
+
+
+async def delete_daytona_volume(provider_ref: str) -> None:
+    """Delete a Daytona volume by provider-native id."""
+    client = _get_daytona_client()
+    vol = await asyncio.to_thread(client.volume.get, provider_ref)
+    await asyncio.to_thread(client.volume.delete, vol)
+
+
 async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
     """Shared logic for destroy/stop Daytona sandbox."""
     if not instance.sandbox_id:
