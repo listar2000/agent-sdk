@@ -210,6 +210,15 @@ async def _shutdown_session_state(
     state.pending_prompts.clear()
     await _cancel_task(state._scheduler_task)
     await _cancel_task(state._reader_task)
+    # Flush any pending DB log writes so turn_end / tool_result events that
+    # were scheduled during the last prompt aren't silently dropped when the
+    # session is reaped.  Bounded wait so a hung writer can't block shutdown.
+    pending = state._log_chain
+    if pending is not None and not pending.done():
+        try:
+            await asyncio.wait_for(pending, timeout=5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
     await _close_session_gracefully(state)
     # Kill per-session supervisor if this session has its own.
     # Only Daytona runs multiple supervisors per sandbox (one per session);
