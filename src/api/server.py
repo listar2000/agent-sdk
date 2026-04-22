@@ -2088,8 +2088,29 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
         listen_port=inst.port,
     )
     _INSTANCES[sb.id] = inst
-    await upsert_sandbox(sb)
-    await set_session_current_sandbox(session_row["id"], sb.id)
+
+    # Atomic: insert the sandbox row + link session->sandbox in one
+    # transaction. A crash between the two writes would otherwise orphan
+    # the sandbox (row exists on the provider + in sandboxes, but no
+    # session points at it). Use a single pool connection so both
+    # statements commit (or roll back) together.
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO sandboxes"
+            " (id, provider, sandbox_ref, status, root, volume_id, subpath, listen_port)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
+            " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
+            " root=EXCLUDED.root, volume_id=EXCLUDED.volume_id,"
+            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port",
+            (sb.id, sb.provider, sb.sandbox_ref, sb.status,
+             sb.root, sb.volume_id, sb.subpath, sb.listen_port),
+        )
+        await conn.execute(
+            "UPDATE sessions SET current_sandbox_id = %s WHERE id = %s",
+            (sb.id, session_row["id"]),
+        )
+
     if previous_id is not None:
         await log_event(
             session_id=session_row["id"],
