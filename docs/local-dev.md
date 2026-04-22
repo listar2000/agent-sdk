@@ -54,9 +54,16 @@ docker compose down        # stop, keep data
 docker compose down -v     # stop, delete database
 ```
 
-## Without Docker (server only)
+## Helper scripts
 
-If you want to run the server directly (e.g., for debugging):
+`scripts/launch_server_docker.sh` and `scripts/launch_server_local.sh` bootstrap everything (venv, Postgres, uvicorn):
+
+- `launch_server_docker.sh` — Postgres via `docker compose`, server on `:7778`.
+- `launch_server_local.sh` — project-local conda-installed Postgres (no Docker needed), server on `:7778`.
+
+Both load env vars from `.env` (repo-local) or `~/.env` before starting.
+
+## Without Docker or the helper scripts
 
 ```bash
 # Start Postgres separately

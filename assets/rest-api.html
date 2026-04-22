@@ -426,7 +426,7 @@
           <span class="endpoint-desc">Start a stopped sandbox.</span>
         </div>
 
-        <div class="endpoint-group-label">File operations (unchanged)</div>
+        <div class="endpoint-group-label">File operations</div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/sandboxes/{id}/files/tree</span>
@@ -440,7 +440,27 @@
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sandboxes/{id}/files/edit</span>
-          <span class="endpoint-desc">Write a file.</span>
+          <span class="endpoint-desc">Write a file (edit or create).</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{id}/files/upload</span>
+          <span class="endpoint-desc">Upload a file — body <code>{path, content: base64}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{id}/files/delete</span>
+          <span class="endpoint-desc">Delete a file or directory — body <code>{path}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{id}/files/rename</span>
+          <span class="endpoint-desc">Rename/move — body <code>{path, new_path}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{id}/files/download</span>
+          <span class="endpoint-desc">Download a file as raw bytes (forwards content-type + disposition).</span>
         </div>
 
         <div class="relation-note">
@@ -532,7 +552,7 @@
         <div class="endpoint-row">
           <span class="method-badge method-sse">SSE</span>
           <span class="endpoint-path">/sessions/{id}/events</span>
-          <span class="endpoint-desc">Server-sent events — tool calls, tokens, plus new <code>sandbox_reattach</code> / <code>sandbox_lost</code>.</span>
+          <span class="endpoint-desc">Server-sent events — tool calls, tokens, plus new <code>sandbox_reattach</code>.</span>
         </div>
 
         <div class="endpoint-group-label">Sandbox control (new)</div>
@@ -655,9 +675,6 @@
       <div class="card-body">
         <div class="event-row is-new">
           sandbox_reattach <span class="event-detail"> — emitted before the first real event of a run when the session reprovisioned its sandbox transparently. Payload: <code>{old_sandbox_id, new_sandbox_id}</code>.</span>
-        </div>
-        <div class="event-row is-new">
-          sandbox_lost <span class="event-detail"> — emitted once on mid-run sandbox failure. Run aborts; caller decides whether to retry. Payload: <code>{sandbox_id, reason}</code>.</span>
         </div>
       </div>
     </div>

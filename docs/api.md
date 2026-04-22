@@ -153,7 +153,6 @@ In addition to ACP-proxied events, the server emits:
 | event | Payload |
 |---|---|
 | `sandbox_reattach` | `{old_sandbox_id, new_sandbox_id}` — emitted before the first real event of a run when the session transparently reprovisioned its sandbox against the same volume. |
-| `sandbox_lost` | `{sandbox_id, reason}` — emitted once on mid-run sandbox failure. The run aborts; caller decides whether to retry. |
 
 Prompt done:
 ```json
@@ -390,13 +389,20 @@ Returns the volume record including `{id, name, provider, provider_ref, status}`
 Sandbox endpoints don't require a session. They operate directly on the sandbox infrastructure. Every sandbox is `(volume_id, subpath)`-scoped at creation: the volume is mounted at `/home/daytona` and a read-only `shared/` subpath on the same volume is mounted at `/mnt/shared`.
 
 ```
-POST   /sandboxes                    — create (requires {provider, volume_id, subpath, …})
-POST   /sandboxes/provision          — create + wait for ready (same required fields)
-GET    /sandboxes                    — list
-GET    /sandboxes/{id}               — get info (includes volume_id, subpath)
-DELETE /sandboxes/{id}               — destroy (sessions survive with current_sandbox_id = NULL)
-POST   /sandboxes/{id}/stop          — stop (volume data preserved)
-POST   /sandboxes/{id}/start         — resume stopped sandbox
+POST   /sandboxes                           — create (provider + optional volume_id/subpath)
+POST   /sandboxes/provision                 — create + wait for ready
+GET    /sandboxes                           — list
+GET    /sandboxes/{id}                      — get info (includes volume_id, subpath)
+DELETE /sandboxes/{id}                      — destroy (sessions survive with current_sandbox_id = NULL)
+POST   /sandboxes/{id}/stop                 — stop (volume data preserved)
+POST   /sandboxes/{id}/start                — resume stopped sandbox
+GET    /sandboxes/{id}/files/tree           — browse the sandbox filesystem
+GET    /sandboxes/{id}/files/read?path=…    — read a file
+POST   /sandboxes/{id}/files/edit           — edit/create a file (body: {path, old_string, new_string, replace_all})
+POST   /sandboxes/{id}/files/upload         — upload a file (body: {path, content: base64})
+POST   /sandboxes/{id}/files/delete         — delete a file or directory (body: {path})
+POST   /sandboxes/{id}/files/rename         — rename/move (body: {path, new_path})
+GET    /sandboxes/{id}/files/download?path=…— download a file as raw bytes
 ```
 
 `POST /sandboxes` body:
@@ -411,7 +417,7 @@ POST   /sandboxes/{id}/start         — resume stopped sandbox
 }
 ```
 
-For session-driven creation, the server uses `subpath = agents/<agent_id>/home` so that all sessions of the same agent share HOME on the volume.
+`volume_id` is optional — omit to get/create `default-{provider}`. `subpath` is optional too; the server picks `sandboxes/<hex>/home` for direct `/sandboxes` callers. For session-driven creation, the server uses `subpath = agents/<agent_id>/home` so all sessions of the same agent share HOME on the volume.
 
 ## Agents (config only)
 

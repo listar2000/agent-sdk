@@ -23,7 +23,7 @@ This starts:
 
 Stop with `docker compose down`. Delete the database volume with `docker compose down -v`.
 
-See [`docs/local-dev.md`](docs/local-dev.md) for more.
+See [`docs/local-dev.md`](docs/local-dev.md) for more. For a managed venv + Postgres bootstrap, use `./scripts/launch_server_docker.sh` (Postgres via `docker compose`) or `./scripts/launch_server_local.sh` (project-local conda-installed Postgres, no Docker needed).
 
 ## Deploy to Railway
 

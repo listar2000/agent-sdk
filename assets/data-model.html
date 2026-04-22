@@ -507,6 +507,12 @@
             </div>
             <div class="field is-new">
               <div class="field-badges"></div>
+              <span class="field-name">supervisor_agent_types</span>
+              <span class="field-type">JSONB</span>
+              <span class="field-desc">cache of which agent_types have supervisor installed (skip redundant installs)</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
               <span class="field-name">created_at</span>
               <span class="field-type">TIMESTAMPTZ</span>
               <span class="field-desc">default now()</span>
@@ -569,6 +575,12 @@
               <span class="field-name">subpath</span>
               <span class="field-type">TEXT NOT NULL</span>
               <span class="field-desc">e.g. agents/&lt;agent_id&gt;/home — mounted at /home/daytona</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
+              <span class="field-name">listen_port</span>
+              <span class="field-type">INTEGER</span>
+              <span class="field-desc">Docker/Local port for URL reconstruction on cold-start</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
