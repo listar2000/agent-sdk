@@ -684,6 +684,40 @@ function selectVolume(vol) {
 
 // ── File tree ─────────────────────────────────────────────────────────────────
 
+function parseTree(treeStr) {
+  const lines = (treeStr || '').split('\n').filter(l => l.length > 0);
+  const root = { children: {} };
+  for (const line of lines) {
+    const isDir = line.endsWith('/');
+    const clean = isDir ? line.slice(0, -1) : line;
+    const parts = clean.split('/').filter(p => p.length > 0);
+    let node = root;
+    parts.forEach((part, i) => {
+      const isLeaf = i === parts.length - 1;
+      if (!node.children[part]) {
+        node.children[part] = {
+          name: part,
+          path: parts.slice(0, i + 1).join('/'),
+          type: (isLeaf && !isDir) ? 'file' : 'directory',
+          children: {},
+        };
+      } else if (isLeaf && isDir) {
+        node.children[part].type = 'directory';
+      }
+      node = node.children[part];
+    });
+  }
+  function finalize(node) {
+    const arr = Object.values(node.children).map(finalize);
+    arr.sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return { ...node, children: arr };
+  }
+  return finalize(root).children;
+}
+
 async function loadTree() {
   if (!state.selectedVolume) return;
   const volId = state.selectedVolume.id;
@@ -693,7 +727,8 @@ async function loadTree() {
   try {
     const resp = await fetch(`${state.apiUrl}/volumes/${encodeURIComponent(volId)}/files/tree`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    state.tree = await resp.json();
+    const data = await resp.json();
+    state.tree = parseTree(data.tree || '');
     renderTree();
 
     clearInterval(state.treeRefreshTimer);
@@ -709,7 +744,8 @@ async function loadTreeSilent() {
   try {
     const resp = await fetch(`${state.apiUrl}/volumes/${encodeURIComponent(volId)}/files/tree`);
     if (resp.ok) {
-      state.tree = await resp.json();
+      const data = await resp.json();
+      state.tree = parseTree(data.tree || '');
       renderTree();
     }
   } catch (_) {}
@@ -747,13 +783,6 @@ function renderTreeNode(node, depth, container) {
   nodeEl.appendChild(icon);
   nodeEl.appendChild(name);
 
-  if (!isDir && node.size) {
-    const size = document.createElement('span');
-    size.className = 'tree-size';
-    size.textContent = formatSize(node.size);
-    nodeEl.appendChild(size);
-  }
-
   nodeEl.addEventListener('click', (e) => {
     e.stopPropagation();
     if (isDir) {
@@ -761,7 +790,7 @@ function renderTreeNode(node, depth, container) {
       else state.expanded.add(node.path);
       renderTree();
     } else {
-      loadFile(node.path, node.name, node.size);
+      loadFile(node.path, node.name);
     }
   });
 
@@ -782,17 +811,16 @@ function resetViewer() {
   $('viewer-content').innerHTML = '<div class="empty-state">Select a file to view its contents</div>';
 }
 
-async function loadFile(path, name, size) {
+async function loadFile(path, name) {
   if (!state.selectedVolume) return;
   state.selectedPath = path;
   renderTree();
 
   const viewerContent = $('viewer-content');
   const viewerHeader = $('viewer-header');
-
   viewerHeader.style.display = 'block';
   $('file-name').textContent = name;
-  $('file-meta').textContent = formatSize(size) || '';
+  $('file-meta').textContent = '';
   viewerContent.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
 
   try {
@@ -802,57 +830,27 @@ async function loadFile(path, name, size) {
     );
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
     const data = await resp.json();
-    $('file-meta').textContent = formatSize(data.size) || '';
     renderFileContent(data);
   } catch (err) {
     viewerContent.innerHTML = `<div class="empty-state">Error loading file:<br>${escapeHtml(err.message)}</div>`;
   }
 }
 
-function renderMarkdown(text) {
-  let html = escapeHtml(text);
-  html = html.replace(/```([a-z]*)\n([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${code}</code></pre>`);
-  html = html.replace(/^### (.*$)/gm, '<h3>$1</h3>');
-  html = html.replace(/^## (.*$)/gm, '<h2>$1</h2>');
-  html = html.replace(/^# (.*$)/gm, '<h1>$1</h1>');
-  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  html = html.replace(/^\* (.*$)/gm, '<li>$1</li>');
-  html = html.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
-  html = html.replace(/^---$/gm, '<hr>');
-  html = html.split('\n\n').map(para => {
-    if (para.startsWith('<') || para.trim() === '') return para;
-    return `<p>${para}</p>`;
-  }).join('\n');
-  return html;
-}
-
 function renderFileContent(data) {
   const viewerContent = $('viewer-content');
+  const fileMeta = $('file-meta');
 
-  if (data.binary && !data.image && !data.pdf) {
-    viewerContent.innerHTML = `<div class="binary-placeholder"><h3>Binary file</h3><p>${formatSize(data.size)}</p></div>`;
+  if (typeof data.content_base64 === 'string') {
+    let sizeBytes = 0;
+    try { sizeBytes = atob(data.content_base64).length; } catch (_) {}
+    fileMeta.textContent = formatSize(sizeBytes);
+    viewerContent.innerHTML = `<div class="binary-placeholder"><h3>Binary file</h3><p>${formatSize(sizeBytes)}</p></div>`;
     return;
   }
 
-  if (data.image) {
-    viewerContent.innerHTML = `<div class="image-viewer"><img src="${data.content}" alt="${escapeHtml(data.name || '')}"></div>`;
-    return;
-  }
-
-  if (data.pdf) {
-    viewerContent.innerHTML = `<iframe style="width:100%;height:100%;border:none;" src="${data.content}"></iframe>`;
-    return;
-  }
-
-  if ((data.name || '').endsWith('.md')) {
-    viewerContent.innerHTML = `<div class="markdown-content">${renderMarkdown(data.content)}</div>`;
-    return;
-  }
-
-  const lines = (data.content || '').split('\n');
+  const content = typeof data.content === 'string' ? data.content : '';
+  fileMeta.textContent = formatSize(content.length);
+  const lines = content.split('\n');
   const codeHtml = lines.map((line, i) =>
     `<div class="code-line"><span class="line-number">${i + 1}</span><span class="line-content">${escapeHtml(line)}</span></div>`
   ).join('');
