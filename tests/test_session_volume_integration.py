@@ -349,3 +349,104 @@ async def test_concurrent_ensure_volume_supervisor_installs_once(client):
     vol = await dbmod.get_volume("v-conc")
     assert vol is not None
     assert "claude" in (vol.supervisor_agent_types or [])
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5 — ensure_volume_supervisor partial-failure retry.
+# Install succeeds on the provider but the cache update fails. The call
+# raises and the cache remains empty. The next call re-runs install
+# (idempotent at the provider level) and the cache is populated.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_volume_supervisor_retry_after_cache_fail(client):
+    """Install succeeds on provider, but cache update fails.
+
+    The cache write can be either:
+      - an inline ``UPDATE volumes ...`` on the advisory-lock connection
+        (current pg-advisory implementation), or
+      - a call to ``dbmod.add_supervisor_agent_type`` (older asyncio-Lock
+        implementation).
+
+    We patch BOTH to raise so the test is agnostic to the lock
+    implementation the source agent has landed.
+    """
+    import psycopg
+    from api.models import AgentConfig, AgentRecord, VolumeRecord
+
+    await dbmod.upsert_agent(AgentRecord(
+        id="a-retry", name="retry", config=AgentConfig(agent_type="claude"),
+    ))
+    await dbmod.upsert_volume(VolumeRecord(
+        id="v-retry", name="v-retry", provider="daytona", provider_ref="dt-retry",
+    ))
+
+    install_calls = 0
+
+    async def fake_install(provider, volume_ref, agent_type):
+        nonlocal install_calls
+        install_calls += 1
+
+    # Wrap get_db to intercept the cache-write UPDATE (inline or via helper).
+    # The wrapper yields a connection whose execute() raises specifically on
+    # UPDATE statements that write supervisor_agent_types. All other queries
+    # (SELECT, pg_advisory_xact_lock, etc.) pass through unmodified.
+    from contextlib import asynccontextmanager
+    real_get_db = dbmod.get_db
+    sabotage_active = {"on": True}
+
+    @asynccontextmanager
+    async def sabotaged_get_db():
+        async with real_get_db() as conn:
+            real_execute = conn.execute
+
+            async def fake_execute(sql, params=None, *a, **kw):
+                if (sabotage_active["on"]
+                    and "supervisor_agent_types" in (sql or "")
+                    and "UPDATE" in (sql or "").upper()):
+                    raise psycopg.OperationalError(
+                        "simulated cache-write failure"
+                    )
+                if params is None:
+                    return await real_execute(sql, *a, **kw)
+                return await real_execute(sql, params, *a, **kw)
+
+            conn.execute = fake_execute  # type: ignore[method-assign]
+            yield conn
+
+    # Call 1: install succeeds at the provider, cache write is sabotaged.
+    async def boom(*a, **kw):
+        raise psycopg.OperationalError("simulated cache-write failure")
+
+    patches = [
+        patch("api.providers.install_supervisor",
+              new=AsyncMock(side_effect=fake_install)),
+        patch("api.server.get_db", new=sabotaged_get_db),
+        # Older API — a no-op when the source uses the advisory-lock path,
+        # but guards against a regression to add_supervisor_agent_type.
+        patch("api.server.add_supervisor_agent_type", new=AsyncMock(side_effect=boom)),
+    ]
+    with patches[0], patches[1], patches[2]:
+        with pytest.raises(Exception) as excinfo:
+            await srv.ensure_volume_supervisor("v-retry", "claude")
+    assert "cache-write" in str(excinfo.value) or "failure" in str(excinfo.value).lower()
+
+    # Cache remained empty → next call must re-install.
+    vol = await dbmod.get_volume("v-retry")
+    assert vol is not None
+    assert "claude" not in (vol.supervisor_agent_types or [])
+    assert install_calls == 1
+
+    # Call 2: unpatch the cache writer; install should run again and succeed.
+    sabotage_active["on"] = False
+    with patch("api.providers.install_supervisor",
+               new=AsyncMock(side_effect=fake_install)):
+        await srv.ensure_volume_supervisor("v-retry", "claude")
+
+    assert install_calls == 2, (
+        f"expected 2 total install calls after retry, got {install_calls}"
+    )
+    vol = await dbmod.get_volume("v-retry")
+    assert vol is not None
+    assert "claude" in (vol.supervisor_agent_types or [])
