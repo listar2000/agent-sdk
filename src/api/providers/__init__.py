@@ -32,6 +32,7 @@ from ._shared import (
     AUTH_KEYS,
     ProviderInstance,
     ExecResult,
+    _ACP_BIN_NAMES,
     _ACP_NPM_SPECS,
     _acp_bin_name,
     _acp_launch_args,

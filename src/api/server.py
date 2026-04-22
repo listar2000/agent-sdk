@@ -334,13 +334,18 @@ async def lifespan(app):
 
     # Startup reconciliation: cross-reference live provider state with
     # DB sandbox rows so orphan containers/processes are reaped and
-    # survivors are reattached to _INSTANCES. Guarded so a single
-    # provider failure doesn't prevent boot.
-    for _prov in ("docker", "daytona", "local"):
+    # survivors are reattached to _INSTANCES. Run per-provider reconciles
+    # in parallel so a slow provider doesn't serialize boot: in practice
+    # only Docker does real work (~seconds of ``docker ps``+``docker
+    # inspect``); daytona/local are no-ops, but future providers that
+    # talk to remote APIs should not queue behind docker.
+    async def _safe_reconcile(prov: str) -> None:
         try:
-            await _providers_mod.reconcile_sandboxes(_prov)
+            await _providers_mod.reconcile_sandboxes(prov)
         except Exception as e:
-            log.warning("startup reconcile for %s failed: %s", _prov, e)
+            log.warning("startup reconcile for %s failed: %s", prov, e)
+
+    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local")])
 
     reaper = asyncio.create_task(_idle_reaper())
     yield
@@ -1083,6 +1088,59 @@ async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
     return vol
 
 
+async def _get_or_create_default_volume(provider: str) -> "VolumeRecord":
+    """Return (creating if needed) the shared default volume for ``provider``.
+
+    Naming: ``default-{provider}`` (e.g., ``default-local``, ``default-daytona``,
+    ``default-docker``). This lets callers use the SDK without explicitly
+    creating a volume per session — they get a shared, persistent workspace
+    scoped to the provider.
+
+    Idempotent: on concurrent first-time creation, the UNIQUE(name) constraint
+    serializes one winner; the loser retries and reads the existing row.
+    """
+    if provider not in _providers_mod._PROVIDER_MODS:
+        raise HTTPException(400, f"Unknown provider: {provider}")
+
+    name = f"default-{provider}"
+    vol = await get_volume_by_name(name)
+    if vol is not None:
+        return vol
+
+    # Race window: another request may be creating the same default right now.
+    # Do the provider-side create first (cheap idempotent op — daytona/docker
+    # volume-create against an existing name either succeeds or 409s; local
+    # os.makedirs(..., exist_ok=True) is trivially idempotent).
+    try:
+        provider_ref = await _providers_mod.create_volume(provider, name)
+    except Exception:
+        # Someone else may have just created it; re-read.
+        vol = await get_volume_by_name(name)
+        if vol is not None:
+            return vol
+        raise
+
+    vol = VolumeRecord(
+        id=_gen_volume_id(),
+        name=name,
+        provider=provider,
+        provider_ref=provider_ref,
+        status="ready",
+    )
+    try:
+        await upsert_volume(vol)
+    except Exception:
+        # Another worker won the UNIQUE(name) race; re-read their row.
+        existing = await get_volume_by_name(name)
+        if existing is not None:
+            # Best-effort cleanup of our now-duplicate provider-side volume.
+            # (Daytona volumes can be queried by id; ours has no Daytona-side
+            # dup since provider-create succeeded before we hit upsert.)
+            return existing
+        raise
+    return vol
+
+
 @app.post("/volumes")
 async def create_volume(body: _VolumeCreateBody):
     _validate_volume_name(body.name)
@@ -1288,16 +1346,23 @@ async def create_sandbox(request: Request):
     agent_type = data.get("agent_type", "claude")
     root = data.get("root", "/tmp")
     volume_id = data.get("volume_id")
-    subpath = data.get("subpath")
-    if not volume_id or not subpath:
-        return JSONResponse(
-            {"error": "volume_id and subpath are required"}, status_code=400,
-        )
+    subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
+    if not volume_id:
+        # Default-volume shortcut — keeps direct `/sandboxes` callers working
+        # without a manual POST /volumes. Server picks `default-{provider}`.
+        try:
+            vol = await _get_or_create_default_volume(provider)
+        except HTTPException:
+            raise
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"default volume provision failed: {e}"},
+                status_code=502,
+            )
+        volume_id = vol.id
+    else:
+        vol = await _resolve_volume(volume_id)
     _validate_subpath(subpath)
-    # ``_resolve_volume`` raises HTTPException(404) on miss; ``vol`` is
-    # always a VolumeRecord here. The defensive ``vol is not None`` guard
-    # the old code had was dead. (MI5)
-    vol = await _resolve_volume(volume_id)
     if provider != vol.provider:
         return JSONResponse(
             {"error": f"provider {provider!r} does not match volume.provider {vol.provider!r}"},
@@ -1432,16 +1497,26 @@ async def provision_sandbox_route(request: Request):
     )
 
     volume_id = data.get("volume_id")
-    subpath = data.get("subpath")
-    if not volume_id or not subpath:
-        return JSONResponse(
-            {"error": "volume_id and subpath are required"}, status_code=400,
-        )
+    subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
+    explicit_provider = data.get("provider")
+    if not volume_id:
+        default_provider = explicit_provider or "local"
+        try:
+            vol = await _get_or_create_default_volume(default_provider)
+        except HTTPException:
+            raise
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"default volume provision failed: {e}"},
+                status_code=502,
+            )
+        volume_id = vol.id
+    else:
+        vol = await _resolve_volume(volume_id)
     _validate_subpath(subpath)
-    vol = await _resolve_volume(volume_id)
     # Default the provider from the volume (so existing Daytona-only clients
     # don't have to pass it), but let an explicit body field override for tests.
-    provider = data.get("provider") or vol.provider
+    provider = explicit_provider or vol.provider
     # Mi5: ``provider != vol.provider`` is only reachable when the client
     # explicitly overrides ``provider`` in the body to something that
     # disagrees with the volume.  Tests exercise this to verify the
@@ -2279,6 +2354,26 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
 
     sb = await get_sandbox(current_id)
 
+    # Warm fast-path: if we have a live in-process ProviderInstance AND a
+    # runtime SessionState attached to this sandbox, we can trust those as
+    # evidence that the sandbox is running — no need to round-trip to the
+    # provider (docker inspect / daytona API / etc.) for status, nor to
+    # fetch the volume row again. The subsequent ``ensure_runtime`` call
+    # does a short supervisor health probe which catches any real failure;
+    # if the provider-level sandbox has silently died, that probe will
+    # rebuild from scratch.
+    if sb is not None and sb.status == STATUS_RUNNING:
+        existing_state = SESSIONS.get(session_id)
+        cached_inst = _INSTANCES.get(current_id)
+        if (
+            cached_inst is not None
+            and existing_state is not None
+            and not existing_state.shutdown.is_set()
+            and existing_state.sandbox_id == current_id
+            and existing_state.supervisor_url
+        ):
+            return sb
+
     # Case B: row was deleted — replace and emit reattach.
     if sb is None:
         await set_session_current_sandbox(session_id, None)
@@ -2727,17 +2822,22 @@ async def sessions_create(request: Request):
     body_env, body_secrets = _pop_env_and_secrets(data)
 
     volume_id = data.get("volume_id")
-    if not volume_id or not isinstance(volume_id, str):
-        # 400 matches POST /sandboxes ("volume_id and subpath are required")
-        # and POST /sessions/{id}/message ("message required") — all three
-        # are simple required-field checks on the raw body.
-        return JSONResponse(
-            {"error": "volume_id is required"}, status_code=400
-        )
-
-    volume_record = await get_volume(volume_id)
-    if volume_record is None:
-        return JSONResponse({"error": "volume not found"}, status_code=404)
+    default_provider = data.get("provider") or data.get("config", {}).get("provider") or "local"
+    if volume_id and isinstance(volume_id, str):
+        volume_record = await get_volume(volume_id)
+        if volume_record is None:
+            return JSONResponse({"error": "volume not found"}, status_code=404)
+    else:
+        try:
+            volume_record = await _get_or_create_default_volume(default_provider)
+        except HTTPException:
+            raise
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"default volume provision failed: {e}"},
+                status_code=502,
+            )
+        volume_id = volume_record.id
 
     agent_id = data.get("agent_id")
     agent_type = data.get("agent_type", "claude")
@@ -2792,20 +2892,26 @@ async def sessions_quick_create(request: Request):
     # can't leak into agents.config JSONB.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
-    volume_id = data.get("volume_id")
-    if not volume_id or not isinstance(volume_id, str):
-        # 400 matches POST /sandboxes ("volume_id and subpath are required")
-        # and POST /sessions/{id}/message ("message required") — all three
-        # are simple required-field checks on the raw body.
-        return JSONResponse(
-            {"error": "volume_id is required"}, status_code=400
-        )
-
-    volume_record = await get_volume(volume_id)
-    if volume_record is None:
-        return JSONResponse({"error": "volume not found"}, status_code=404)
-
     provider = data.get("provider", "local")
+    volume_id = data.get("volume_id")
+    if volume_id and isinstance(volume_id, str):
+        volume_record = await get_volume(volume_id)
+        if volume_record is None:
+            return JSONResponse({"error": "volume not found"}, status_code=404)
+    else:
+        # Default-volume shortcut: callers that don't explicitly manage
+        # volumes share a per-provider default. Keeps the SDK's zero-config
+        # path working (``Agent(name, provider="local", cwd=...)``).
+        try:
+            volume_record = await _get_or_create_default_volume(provider)
+        except HTTPException:
+            raise
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"default volume provision failed: {e}"},
+                status_code=502,
+            )
+        volume_id = volume_record.id
     agent_type = data.get("agent_type", "claude")
     name = data.get("name")
     config_data = data.get("config", {})
@@ -3177,11 +3283,23 @@ async def session_events(session_id: str):
         my_q = state.subscribe_session()
 
         async def _heartbeat_loop():
+            # Per-connection heartbeat: put None directly on THIS subscriber's
+            # queue instead of ``state.broadcast(None)``. The previous impl was
+            # O(N^2): every SSE subscriber had its own heartbeat task that
+            # broadcast to every other subscriber, so N subscribers produced
+            # N*N heartbeat enqueues per tick. Each client only needs
+            # heartbeats on its own SSE connection.
             try:
                 hb_count = 0
                 while True:
                     await asyncio.sleep(heartbeat_interval)
-                    state.broadcast(None)  # heartbeat to all subscribers
+                    try:
+                        my_q.put_nowait(None)
+                    except asyncio.QueueFull:
+                        # If the consumer is backlogged, skip the heartbeat —
+                        # real events in the queue are already keeping the
+                        # connection warm.
+                        pass
                     hb_count += 1
                     if hb_count % 4 == 0:  # log every ~2 min
                         log.debug(

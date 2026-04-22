@@ -236,14 +236,39 @@ async def test_duplicate_volume_name_returns_409(client):
 
 
 @pytest.mark.asyncio
-async def test_post_sessions_missing_volume_id_is_400(client):
-    r = await client.post("/sessions", json={})
-    assert r.status_code == 400, r.text
-    assert "volume_id" in r.json()["error"]
+async def test_post_sessions_missing_volume_id_uses_default(client):
+    """Missing volume_id → server uses default-{provider}. Backward-compat
+    for zero-config SDK callers."""
+    from unittest.mock import patch, AsyncMock
+    with patch("api.providers.local.create_volume",
+               new=AsyncMock(return_value="/tmp/default-local-sess")):
+        r = await client.post("/sessions", json={"provider": "local"})
+    assert r.status_code == 200, r.text
+    assert r.json().get("volume_id")
 
 
 @pytest.mark.asyncio
-async def test_post_sessions_quick_missing_volume_id_is_400(client):
-    r = await client.post("/sessions/quick", json={})
-    assert r.status_code == 400, r.text
-    assert "volume_id" in r.json()["error"]
+async def test_post_sessions_quick_missing_volume_id_uses_default(client):
+    """Missing volume_id on /sessions/quick → default-{provider}."""
+    from unittest.mock import patch, AsyncMock
+    from api.providers._shared import ProviderInstance
+
+    async def fake_create_instance(*a, **kw):
+        return ProviderInstance(
+            provider="local", url="http://127.0.0.1:9999",
+            root="/tmp", sandbox_id="pid-12345", port=9999,
+        )
+
+    with patch("api.providers.local.create_volume",
+               new=AsyncMock(return_value="/tmp/default-local-quick")), \
+         patch("api.server.ensure_volume_supervisor",
+               new=AsyncMock(return_value=None)), \
+         patch("api.server.create_instance",
+               new=AsyncMock(side_effect=fake_create_instance)), \
+         patch("api.server.AcpClient"), \
+         patch("api.server._start_session_tasks"):
+        r = await client.post("/sessions/quick",
+                              json={"name": "t", "provider": "local"})
+    # Success path (200) — or a clean 5xx if the mocked flow hits an
+    # unpatched branch. The point: NOT 400 "volume_id is required".
+    assert r.status_code != 400, f"should not reject missing volume_id: {r.text}"

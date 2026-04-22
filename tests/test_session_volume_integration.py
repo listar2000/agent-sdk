@@ -37,13 +37,24 @@ async def client():
 
 
 @pytest.mark.asyncio
-async def test_post_session_rejects_without_volume_id(client):
+async def test_post_session_without_volume_id_uses_default(client):
+    """Default-volume shortcut: POST /sessions without volume_id
+    auto-creates/reuses the ``default-{provider}`` volume. Keeps the SDK's
+    zero-config path working (Agent(name, provider="local", ...))."""
     from api.models import AgentConfig, AgentRecord
     await dbmod.upsert_agent(AgentRecord(id="agent_t", name="T", config=AgentConfig()))
 
-    r = await client.post("/sessions", json={"agent_id": "agent_t"})
-    # FastAPI's default validation returns 422 for missing required body fields.
-    assert r.status_code in (400, 422), f"got {r.status_code}: {r.text}"
+    with patch("api.providers.local.create_volume",
+               new=AsyncMock(return_value="/tmp/default-local")):
+        r = await client.post("/sessions",
+                              json={"agent_id": "agent_t", "provider": "local"})
+    assert r.status_code == 200, f"got {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("volume_id")
+    # The server should have created a volume named "default-local".
+    vol = await dbmod.get_volume_by_name("default-local")
+    assert vol is not None
+    assert vol.provider == "local"
 
 
 @pytest.mark.asyncio
