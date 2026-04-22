@@ -2882,6 +2882,51 @@ async def session_cancel(session_id: str):
     return {"status": "ok"}
 
 
+@app.post("/sessions/{session_id}/start-sandbox")
+async def start_session_sandbox(session_id: str):
+    """Eagerly provision a sandbox for a session (pre-warm)."""
+    sess = await get_session(session_id)
+    if sess is None:
+        raise HTTPException(404, "Session not found")
+    if sess.get("current_sandbox_id") is not None:
+        # Already has one — idempotent.
+        return {"sandbox_id": sess["current_sandbox_id"]}
+    sandbox = await _lazy_provision_sandbox_for_session(session_id)
+    return {"sandbox_id": sandbox.id}
+
+
+@app.post("/sessions/{session_id}/stop-sandbox", status_code=204)
+async def stop_session_sandbox(session_id: str):
+    """Kill the current sandbox. Next /message lazy-provisions a fresh one."""
+    sess = await get_session(session_id)
+    if sess is None:
+        raise HTTPException(404, "Session not found")
+    sbid = sess.get("current_sandbox_id")
+    if sbid is None:
+        return  # 204, no-op — already stopped
+    sb = await get_sandbox(sbid)
+    if sb and sb.provider == "daytona":
+        from .providers import ProviderInstance
+        inst = ProviderInstance(
+            provider="daytona", url="",
+            root=sb.root, sandbox_id=sb.sandbox_ref,
+        )
+        try:
+            await _providers_mod.destroy_daytona(inst)
+        except Exception:
+            pass  # best-effort
+    await set_session_current_sandbox(session_id, None)
+    await delete_sandbox(sbid)
+
+
+@app.post("/sessions/{session_id}/reset-sandbox")
+async def reset_session_sandbox(session_id: str):
+    """Kill current sandbox and provision a fresh one."""
+    await stop_session_sandbox(session_id)
+    sandbox = await _lazy_provision_sandbox_for_session(session_id)
+    return {"sandbox_id": sandbox.id}
+
+
 @app.post("/sessions/{session_id}/config")
 async def session_set_config(session_id: str, request: Request):
     """Set mode/model/thought_level for a session."""

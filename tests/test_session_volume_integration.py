@@ -111,3 +111,81 @@ async def test_message_lazily_provisions_sandbox(client):
     # DB was updated: session has a current_sandbox_id.
     sess = await dbmod.get_session(sid)
     assert sess["current_sandbox_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_start_sandbox_provisions_eagerly(client):
+    from api.models import AgentConfig, AgentRecord, VolumeRecord
+    from api.providers import ProviderInstance
+    await dbmod.upsert_agent(AgentRecord(id="agent_s", name="S", config=AgentConfig()))
+    await dbmod.upsert_volume(VolumeRecord(id="vol_s", name="vs", provider="daytona",
+                                           provider_ref="dt-s"))
+    r = await client.post("/sessions", json={"agent_id": "agent_s", "volume_id": "vol_s"})
+    sid = r.json()["id"]
+
+    async def fake_create(**kw):
+        return ProviderInstance(provider="daytona", url="http://fake:7000",
+                                root="/home/daytona", sandbox_id="sb-eager-1")
+
+    with patch("api.providers.create_daytona", new=AsyncMock(side_effect=fake_create)):
+        r = await client.post(f"/sessions/{sid}/start-sandbox")
+    assert r.status_code == 200, f"got {r.status_code}: {r.text}"
+    body = r.json()
+    assert "sandbox_id" in body and body["sandbox_id"] is not None
+
+    sess = await dbmod.get_session(sid)
+    assert sess["current_sandbox_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_stop_sandbox_clears_pointer(client):
+    from api.models import AgentConfig, AgentRecord, VolumeRecord, SandboxRecord
+    await dbmod.upsert_agent(AgentRecord(id="agent_k", name="K", config=AgentConfig()))
+    await dbmod.upsert_volume(VolumeRecord(id="vol_k", name="vk", provider="daytona",
+                                           provider_ref="dt-k"))
+    r = await client.post("/sessions", json={"agent_id": "agent_k", "volume_id": "vol_k"})
+    sid = r.json()["id"]
+    sb = SandboxRecord(id="sb_k", provider="daytona", sandbox_ref="dt-sb-k",
+                       status="running", root="/home/daytona",
+                       volume_id="vol_k", subpath="agents/agent_k/home")
+    await dbmod.upsert_sandbox(sb)
+    await dbmod.set_session_current_sandbox(sid, "sb_k")
+
+    with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)):
+        r = await client.post(f"/sessions/{sid}/stop-sandbox")
+    assert r.status_code == 204, f"got {r.status_code}: {r.text}"
+    sess = await dbmod.get_session(sid)
+    assert sess["current_sandbox_id"] is None
+    # Sandbox row should also be gone.
+    assert await dbmod.get_sandbox("sb_k") is None
+
+
+@pytest.mark.asyncio
+async def test_reset_sandbox_swaps(client):
+    from api.models import AgentConfig, AgentRecord, VolumeRecord, SandboxRecord
+    from api.providers import ProviderInstance
+    await dbmod.upsert_agent(AgentRecord(id="agent_x", name="X", config=AgentConfig()))
+    await dbmod.upsert_volume(VolumeRecord(id="vol_x", name="vx", provider="daytona",
+                                           provider_ref="dt-x"))
+    r = await client.post("/sessions", json={"agent_id": "agent_x", "volume_id": "vol_x"})
+    sid = r.json()["id"]
+    sb_old = SandboxRecord(id="sb_old", provider="daytona", sandbox_ref="dt-old",
+                           status="running", root="/home/daytona",
+                           volume_id="vol_x", subpath="agents/agent_x/home")
+    await dbmod.upsert_sandbox(sb_old)
+    await dbmod.set_session_current_sandbox(sid, "sb_old")
+
+    async def fake_create(**kw):
+        return ProviderInstance(provider="daytona", url="http://fake:7000",
+                                root="/home/daytona", sandbox_id="dt-new")
+
+    with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
+         patch("api.providers.create_daytona", new=AsyncMock(side_effect=fake_create)):
+        r = await client.post(f"/sessions/{sid}/reset-sandbox")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sandbox_id"] != "sb_old"
+    # Old row gone, new row present
+    assert await dbmod.get_sandbox("sb_old") is None
+    sess = await dbmod.get_session(sid)
+    assert sess["current_sandbox_id"] == body["sandbox_id"]
