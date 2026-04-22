@@ -330,6 +330,24 @@ async def get_session_secrets(session_id: str) -> dict[str, str]:
     return row["secrets"] or {}
 
 
+async def get_any_session_for_sandbox(sandbox_id: str) -> dict | None:
+    """Return one (most-recently updated) session row on this sandbox, or None.
+
+    Used to reconstruct spawn_env when restarting a sandbox without a specific
+    session_id in hand. All sessions on a sandbox share the same supervisor
+    process and thus the same spawn env.
+    """
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT * FROM sessions WHERE sandbox_id = %s"
+            " ORDER BY created_at DESC, id DESC LIMIT 1",
+            (sandbox_id,),
+        )).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
 async def session_has_log_entries(session_id: str) -> bool:
     """Whether the session has any persisted log entries yet."""
     async with get_db() as conn:

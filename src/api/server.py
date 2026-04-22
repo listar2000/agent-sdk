@@ -31,6 +31,7 @@ from .db import (
     delete_agent,
     delete_sandbox,
     get_agent,
+    get_any_session_for_sandbox,
     get_sandbox,
     get_session,
     get_session_env,
@@ -744,6 +745,27 @@ _CONFIG_KEYS = (
 )
 
 
+def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
+    """Raise 400 if a client tries to smuggle credential keys through ``env``.
+
+    ``env`` is stored plaintext and returned plain by GET endpoints; credentials
+    must go in ``secrets`` instead. Applies to both top-level ``env`` and
+    nested ``config.env``.
+    """
+    if not env:
+        return
+    from .providers import _AUTH_KEYS
+    offenders = sorted(k for k in env if k in _AUTH_KEYS)
+    if offenders:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{where}: auth keys {offenders} must be sent via 'secrets', "
+                "not 'env' (env is stored plain and returned by GET)."
+            ),
+        )
+
+
 def _merge_top_level_config(data: dict, config_data: dict) -> None:
     """Merge SDK top-level keys into config_data if not already present."""
     for key in _CONFIG_KEYS:
@@ -783,6 +805,7 @@ def _pop_env_and_secrets(
     raw_secrets = data.pop("secrets", _ENV_MISSING)
     env = None if raw_env is _ENV_MISSING else _coerce(raw_env)
     secrets = None if raw_secrets is _ENV_MISSING else _coerce(raw_secrets)
+    _forbid_auth_keys_in_env(env, "request body 'env'")
     return env, secrets
 
 
@@ -805,6 +828,20 @@ async def _build_spawn_env_for_session(session_id: str) -> dict[str, str]:
         if agent_record is not None:
             agent_env = agent_record.config.env or {}
     return _merge_env(agent_env, session_env, session_secrets)
+
+
+async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
+    """Best-effort spawn_env for a sandbox-level operation (start/exec/etc).
+
+    All sessions on a given sandbox share the same supervisor process, so any
+    session on the sandbox has the right env/secrets. If no session exists yet
+    (e.g. provisioned but unused), returns ``{}`` — strict-mode will still
+    strip auth keys, so auto-recovery simply has nothing extra to inject.
+    """
+    rec = await get_any_session_for_sandbox(sandbox_id)
+    if rec is None:
+        return {}
+    return await _build_spawn_env_for_session(rec["id"])
 
 
 def _merge_env(
@@ -862,6 +899,7 @@ async def create_agent(request: Request):
     name = data.get("name")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
     materialized = _materialize_dockerfile(config_data)
     if materialized:
         config_data["dockerfile"] = materialized
@@ -1005,6 +1043,7 @@ async def provision_sandbox_route(request: Request):
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
     cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
     root = config_data.get("root", data.get("root", cwd))
     dockerfile = _materialize_dockerfile(config_data)
@@ -1069,7 +1108,10 @@ async def start_sandbox_route(sandbox_id: str):
 
     try:
         agent_type = "claude"
-        url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type=agent_type)
+        spawn_env = await _spawn_env_for_sandbox(sandbox_id)
+        url, _ = await _ensure_sandbox_alive(
+            sandbox_id, record, agent_type=agent_type, spawn_env=spawn_env,
+        )
     except Exception as e:
         return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=500)
 
@@ -1840,10 +1882,12 @@ async def get_or_recover_session(
         else:
             # Legacy shared supervisor path
             try:
+                spawn_env_for_refresh = await _build_spawn_env_for_session(session_id)
                 current_url, _ = await _ensure_sandbox_alive(
                     state.sandbox_id,
                     sandbox_record,
                     agent_type=state.agent_type,
+                    spawn_env=spawn_env_for_refresh,
                 )
             except Exception as e:
                 log.warning(
@@ -2104,6 +2148,7 @@ async def sessions_create_on_existing_sandbox(request: Request):
     name = data.get("name")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
     cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
     dockerfile = _materialize_dockerfile(config_data)
 
@@ -2237,6 +2282,7 @@ async def sessions_quick_create(request: Request):
     name = data.get("name")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
     cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
     root = config_data.get("root", data.get("root", cwd))
     dockerfile = _materialize_dockerfile(config_data)
@@ -2701,7 +2747,8 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
         if not sandbox_record:
             raise HTTPException(status_code=404, detail="sandbox not found")
         try:
-            await _ensure_sandbox_alive(sandbox_id, sandbox_record)
+            spawn_env = await _spawn_env_for_sandbox(sandbox_id)
+            await _ensure_sandbox_alive(sandbox_id, sandbox_record, spawn_env=spawn_env)
             instance = _INSTANCES.get(sandbox_id)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"failed to start sandbox: {e}")
@@ -2714,7 +2761,8 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
     if not sandbox_record:
         raise HTTPException(status_code=404, detail="sandbox not found")
     try:
-        await _ensure_sandbox_alive(sandbox_id, sandbox_record)
+        spawn_env = await _spawn_env_for_sandbox(sandbox_id)
+        await _ensure_sandbox_alive(sandbox_id, sandbox_record, spawn_env=spawn_env)
         instance = _INSTANCES.get(sandbox_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"failed to start sandbox: {e}")
@@ -2766,8 +2814,10 @@ async def session_sandbox_exec(session_id: str, request: Request):
         if state:
             agent_type = state.agent_type
         try:
+            spawn_env = await _build_spawn_env_for_session(session_id)
             await _ensure_sandbox_alive(
-                sandbox_id, sandbox_record, agent_type=agent_type
+                sandbox_id, sandbox_record, agent_type=agent_type,
+                spawn_env=spawn_env,
             )
             instance = _INSTANCES.get(sandbox_id)
         except Exception as e:

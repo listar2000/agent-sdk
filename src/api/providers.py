@@ -808,42 +808,34 @@ async def create_docker(
     image = await _ensure_supervisor_docker_image()
     port = await _find_free_port()
 
-    env_vars = _get_sandbox_env_vars(spawn_env)
-    env_args: list[str] = []
-    for k, v in env_vars.items():
-        env_args += ["-e", f"{k}={v}"]
-
     bin_name = _acp_bin_name(agent_type)
     acp_path = f"/app/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
 
+    import shlex as _shlex
+    env_vars = _get_sandbox_env_vars(spawn_env)
+    env_set = " ".join(f"{k}={_shlex.quote(v)}" for k, v in env_vars.items())
+    env_unset = " ".join(f"-u {_shlex.quote(v)}" for v in _auth_vars_to_unset(spawn_env))
+    env_prefix = f"env {env_unset} {env_set}".strip()
+    acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
+    supervisor_cmd = (
+        f"{env_prefix} node /app/supervisor.js --host 0.0.0.0 "
+        f"--port {_SUPERVISOR_DOCKER_PORT} --root {_shlex.quote(root)} "
+        f"--acp {_shlex.quote(acp_path)}{acp_arg_flags}"
+    )
     if pre_start_commands:
-        import shlex as _shlex
-        # Override entrypoint: run pre-start commands, then start supervisor
         setup = " && ".join(pre_start_commands)
-        acp_arg_flags = "".join(f" --acp-arg {_shlex.quote(a)}" for a in launch_args)
-        shell_cmd = f"{setup} && node /app/supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_DOCKER_PORT} --root {root} --acp {acp_path}{acp_arg_flags}"
-        cmd = [
-            docker, "run", "-d", "--rm",
-            "-p", f"{port}:{_SUPERVISOR_DOCKER_PORT}",
-            *env_args,
-            "--entrypoint", "sh",
-            image,
-            "-c", shell_cmd,
-        ]
+        shell_cmd = f"{setup} && {supervisor_cmd}"
     else:
-        extra: list[str] = []
-        for arg in launch_args:
-            extra += ["--acp-arg", arg]
-        cmd = [
-            docker, "run", "-d", "--rm",
-            "-p", f"{port}:{_SUPERVISOR_DOCKER_PORT}",
-            *env_args,
-            image,
-            "--root", root,
-            "--acp", acp_path,
-            *extra,
-        ]
+        shell_cmd = supervisor_cmd
+
+    cmd = [
+        docker, "run", "-d", "--rm",
+        "-p", f"{port}:{_SUPERVISOR_DOCKER_PORT}",
+        "--entrypoint", "sh",
+        image,
+        "-c", shell_cmd,
+    ]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,

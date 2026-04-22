@@ -71,6 +71,7 @@ _stub_db.get_session_env = _noop_list  # returns {} via empty list coerced upstr
 async def _noop_dict(*a, **kw): return {}
 _stub_db.get_session_env = _noop_dict
 _stub_db.get_session_secrets = _noop_dict
+_stub_db.get_any_session_for_sandbox = _noop_session
 _stub_db.update_session_env = _noop
 _stub_db.update_session_secrets = _noop
 _stub_db.session_has_log_entries = _noop_false
@@ -114,7 +115,7 @@ for _name in (
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session",
-    "get_session_env", "get_session_secrets",
+    "get_session_env", "get_session_secrets", "get_any_session_for_sandbox",
     "update_session_env", "update_session_secrets",
     "session_has_log_entries", "log_event", "get_session_log",
 ):
