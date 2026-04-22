@@ -1172,6 +1172,11 @@ async def create_sandbox(request: Request):
             {"error": "volume_id and subpath are required"}, status_code=400,
         )
     vol = await _resolve_volume(volume_id)
+    if vol is not None and provider != vol.provider:
+        return JSONResponse(
+            {"error": f"provider {provider!r} does not match volume.provider {vol.provider!r}"},
+            status_code=400,
+        )
     dockerfile = _materialize_dockerfile(data)
     sandbox_id = str(uuid.uuid4())
     try:
