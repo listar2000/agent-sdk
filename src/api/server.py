@@ -2297,6 +2297,22 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     return state
 
 
+async def require_session(session_id: str) -> dict:
+    """Fetch session row or 404."""
+    rec = await get_session(session_id)
+    if rec is None:
+        raise HTTPException(404, f"Session {session_id} not found")
+    return rec
+
+
+async def ensure_session_live(session_id: str) -> tuple[dict, SandboxRecord, SessionState]:
+    """One-shot: session → sandbox → runtime. Most endpoints use this."""
+    session = await require_session(session_id)
+    sandbox = await ensure_sandbox(session)
+    runtime = await ensure_runtime(session, sandbox)
+    return session, sandbox, runtime
+
+
 async def _lazy_provision_sandbox_for_session(
     session_id: str,
     previous_sandbox_id: str | None = None,
