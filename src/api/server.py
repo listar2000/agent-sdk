@@ -3235,23 +3235,18 @@ async def session_cancel(session_id: str):
 
 @app.post("/sessions/{session_id}/start-sandbox")
 async def start_session_sandbox(session_id: str):
-    """Eagerly provision a sandbox for a session (pre-warm)."""
-    sess = await get_session(session_id)
-    if sess is None:
-        raise HTTPException(404, "Session not found")
-    if sess.get("current_sandbox_id") is not None:
-        # Already has one — idempotent.
-        return {"sandbox_id": sess["current_sandbox_id"]}
-    sandbox = await _lazy_provision_sandbox_for_session(session_id)
+    """Eagerly provision a sandbox for a session (pre-warm). Idempotent."""
+    try:
+        _, sandbox, _ = await ensure_session_live(session_id)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
     return {"sandbox_id": sandbox.id}
 
 
 @app.post("/sessions/{session_id}/stop-sandbox", status_code=204)
 async def stop_session_sandbox(session_id: str):
     """Kill the current sandbox. Next /message lazy-provisions a fresh one."""
-    sess = await get_session(session_id)
-    if sess is None:
-        raise HTTPException(404, "Session not found")
+    sess = await require_session(session_id)
     sbid = sess.get("current_sandbox_id")
     if sbid is None:
         return  # 204, no-op — already stopped
@@ -3273,12 +3268,15 @@ async def stop_session_sandbox(session_id: str):
 @app.post("/sessions/{session_id}/reset-sandbox")
 async def reset_session_sandbox(session_id: str):
     """Kill current sandbox and provision a fresh one."""
-    sess = await get_session(session_id)
-    if sess is None:
-        raise HTTPException(404, "Session not found")
+    sess = await require_session(session_id)
     old_sbid = sess.get("current_sandbox_id")
     await stop_session_sandbox(session_id)
-    sandbox = await _lazy_provision_sandbox_for_session(session_id, previous_sandbox_id=old_sbid)
+    # Re-read the row after stop (current_sandbox_id is now NULL), then provision
+    # a replacement.  Call _provision_new directly (inside the session lock) so
+    # the previous_id is passed through and the sandbox_reattach event is emitted.
+    fresh_sess = await require_session(session_id)
+    async with _get_session_lock(session_id):
+        sandbox = await _provision_new(fresh_sess, previous_id=old_sbid)
     return {"sandbox_id": sandbox.id}
 
 

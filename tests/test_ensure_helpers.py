@@ -191,11 +191,18 @@ async def test_ensure_runtime_rebuilds_when_missing(setup):
 
     srv.SESSIONS.pop("s1", None)  # no in-memory state
 
+    import os
     fake_client = AsyncMock()
+    fake_live_sandbox = AsyncMock()
+    from unittest.mock import MagicMock
+    fake_daytona_cls = MagicMock()
+    fake_daytona_cls.return_value.get = MagicMock(return_value=fake_live_sandbox)
     with patch("api.server.start_supervisor_in_sandbox",
-               new=AsyncMock(return_value=("http://fresh", 9100))), \
+               new=AsyncMock(return_value="http://fresh")), \
          patch("api.server.AcpClient", return_value=fake_client), \
-         patch("api.server._start_session_tasks"):
+         patch("api.server._start_session_tasks"), \
+         patch("daytona_sdk.Daytona", fake_daytona_cls), \
+         patch.dict(os.environ, {"DAYTONA_API_KEY": "fake-key"}):
         fake_client.initialize = AsyncMock(return_value={"sessionId": "inner-new"})
         fake_client.get_inner_session_id = lambda *a: "inner-new"
 

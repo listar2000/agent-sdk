@@ -95,16 +95,22 @@ async def test_message_lazily_provisions_sandbox(client):
     async def fake_wait_for_health(*a, **kw):
         return True
 
+    # Mock AcpClient so ensure_runtime can build a SessionState without a real supervisor.
+    fake_acp = MagicMock()
+    fake_acp.initialize = AsyncMock(return_value=None)
+    fake_acp.handshake = AsyncMock(return_value=None)
+    fake_acp.get_inner_session_id = MagicMock(return_value=None)
+
     with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
          patch("api.providers._wait_for_health", new=AsyncMock(side_effect=fake_wait_for_health)), \
-         patch("api.server._start_sse_reader", MagicMock(return_value=None)), \
+         patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
          patch("api.server._submit_prompt", MagicMock(return_value=None)), \
-         patch("api.server._do_resume", new=AsyncMock(return_value=None)), \
-         patch("api.server.start_supervisor_in_sandbox", new=AsyncMock(return_value=None)):
+         patch("api.server.start_supervisor_in_sandbox",
+               new=AsyncMock(return_value=("http://fake-supervisor:7000", 7000))), \
+         patch("api.server.AcpClient", return_value=fake_acp):
         r = await client.post(f"/sessions/{sid}/message", json={"message": "hi"})
-    # The /message call may fail at the "not connected" stage (no real ACP client)
-    # but by that point the lazy provision must have already happened. Either way,
-    # we verify: create_daytona was called with the expected volume_id + subpath.
+    # ensure_session_live now guarantees a connected client, so /message should succeed (200).
+    # We verify: create_daytona was called with the expected volume_id + subpath.
     assert len(create_calls) == 1, f"expected 1 create, got {len(create_calls)}: {create_calls}"
     assert create_calls[0].get("volume_id") == "dt-r"
     assert create_calls[0].get("subpath") == "agents/agent_r/home"
@@ -128,7 +134,25 @@ async def test_start_sandbox_provisions_eagerly(client):
         return ProviderInstance(provider="daytona", url="http://fake:7000",
                                 root="/home/daytona", sandbox_id="sb-eager-1")
 
-    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
+    # start-sandbox now calls ensure_session_live which includes ensure_runtime.
+    # Mock the full runtime startup stack so the test doesn't hit real Daytona.
+    fake_acp = MagicMock()
+    fake_acp.initialize = AsyncMock(return_value=None)
+    fake_acp.handshake = AsyncMock(return_value=None)
+    fake_acp.get_inner_session_id = MagicMock(return_value=None)
+
+    # ensure_runtime fetches the live Daytona object before starting the supervisor.
+    fake_daytona_instance = MagicMock()
+    fake_daytona_class = MagicMock()
+    fake_daytona_class.return_value.get = MagicMock(return_value=fake_daytona_instance)
+
+    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
+         patch("api.providers._wait_for_health", new=AsyncMock(return_value=True)), \
+         patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
+         patch("api.server.start_supervisor_in_sandbox",
+               new=AsyncMock(return_value=("http://fake:7000", 7000))), \
+         patch("api.server.AcpClient", return_value=fake_acp), \
+         patch("daytona_sdk.Daytona", fake_daytona_class):
         r = await client.post(f"/sessions/{sid}/start-sandbox")
     assert r.status_code == 200, f"got {r.status_code}: {r.text}"
     body = r.json()
