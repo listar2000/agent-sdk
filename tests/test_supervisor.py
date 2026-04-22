@@ -35,6 +35,8 @@ for name in [
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session", "log_event",
     "get_session_log", "get_agent_log", "session_has_log_entries",
+    "upsert_volume", "get_volume", "get_volume_by_name", "list_volumes",
+    "delete_volume", "set_session_current_sandbox",
 ]:
     setattr(_stub_db, name, _noop if "list" not in name and "log" not in name else _noop_list)
 _stub_db.init_db = lambda: None

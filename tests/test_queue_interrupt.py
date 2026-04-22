@@ -57,6 +57,13 @@ _stub_db.session_has_log_entries = _noop_false
 _stub_db.log_event = _noop
 _stub_db.get_session_log = _noop_list
 _stub_db.get_agent_log = _noop_list
+async def _noop_volume(*a, **kw): return None
+_stub_db.upsert_volume = _noop
+_stub_db.get_volume = _noop_volume
+_stub_db.get_volume_by_name = _noop_volume
+_stub_db.list_volumes = _noop_list
+_stub_db.delete_volume = _noop
+_stub_db.set_session_current_sandbox = _noop
 if "api.db" not in sys.modules:
     sys.modules["api.db"] = _stub_db
 

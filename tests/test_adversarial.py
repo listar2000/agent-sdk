@@ -78,6 +78,14 @@ _stub_db.session_has_log_entries = _noop_false
 _stub_db.log_event = _noop
 _stub_db.get_session_log = _noop_list
 _stub_db.get_agent_log = _noop_list
+# Volume + current_sandbox helpers added in the session/volume decoupling work.
+async def _noop_volume(*a, **kw): return None
+_stub_db.upsert_volume = _noop
+_stub_db.get_volume = _noop_volume
+_stub_db.get_volume_by_name = _noop_volume
+_stub_db.list_volumes = _noop_list
+_stub_db.delete_volume = _noop
+_stub_db.set_session_current_sandbox = _noop
 sys.modules["api.db"] = _stub_db
 
 # Now import server — lifespan calls init_db() / init_pool() which are no-ops
@@ -1019,24 +1027,33 @@ class TestServerEndpointAdversarial:
     @pytest.mark.asyncio
     async def test_quick_create_with_bad_provider_returns_502(self, async_client):
         """POST /sessions/quick with an unknown provider returns 502."""
-        with patch("api.server.create_instance", side_effect=ValueError("Unknown provider: 'badprovider'")):
+        from api.models import VolumeRecord
+        fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
+                                provider_ref="dt-x", status="ready")
+        with patch("api.server.create_instance", side_effect=ValueError("Unknown provider: 'badprovider'")), \
+             patch("api.server.get_volume", return_value=fake_vol):
             resp = await async_client.post("/sessions/quick", json={
                 "name": "test",
                 "provider": "badprovider",
                 "agent_type": "claude",
+                "volume_id": "vol_x",
             })
-        # The server catches the exception and returns 502
         assert resp.status_code == 502
         assert "error" in resp.json()
 
     @pytest.mark.asyncio
     async def test_quick_create_circuit_breaker_returns_503(self, async_client):
         """Circuit-breaker failures should tell clients to back off."""
-        with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")):
+        from api.models import VolumeRecord
+        fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
+                                provider_ref="dt-x", status="ready")
+        with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")), \
+             patch("api.server.get_volume", return_value=fake_vol):
             resp = await async_client.post("/sessions/quick", json={
                 "name": "test",
                 "provider": "daytona",
                 "agent_type": "claude",
+                "volume_id": "vol_x",
             })
         assert resp.status_code == 503
         assert resp.headers["Retry-After"] == "30"
