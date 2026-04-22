@@ -2015,8 +2015,14 @@ async def _do_resume(
             )
             SESSIONS[session_id] = new_state
             _start_session_tasks(new_state)
+        # Preserve the existing session's volume_id — since Task 17's NOT NULL
+        # enforcement, the INSERT half of upsert must always provide it even
+        # though we're only ever taking the ON CONFLICT UPDATE branch here.
+        _existing = await get_session(session_id)
+        _existing_volume_id = _existing.get("volume_id") if _existing else None
         await upsert_session(
-            session_id, agent_id, sandbox_id, effective_inner_session_id
+            session_id, agent_id, sandbox_id, effective_inner_session_id,
+            volume_id=_existing_volume_id,
         )
         return {
             "session_id": session_id,
