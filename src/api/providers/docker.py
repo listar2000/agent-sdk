@@ -17,6 +17,7 @@ import base64
 import logging
 import shlex
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -132,19 +133,26 @@ async def delete_volume(ref: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def install_supervisor(volume_ref: str, agent_type: str) -> None:
-    """Atomically populate ``<volume>/system/supervisor/`` with supervisor.js + deps.
+    """Populate ``<volume>/system/supervisor/`` with supervisor.js + deps.
 
-    Runs the install inside a sibling staging directory
-    (``<volume>/system/supervisor.tmp.<uuid>``) and swaps it into place with
-    ``mv`` only after a sentinel (``node_modules/.bin/<bin>``) is present.
-    On failure the staging dir is removed, leaving any previous install
-    intact — a retried install starts from a fresh staging dir so a stale
-    ``package.json`` or ``package-lock.json`` from a killed ``npm install``
-    can never corrupt the destination.
+    Live-safe: each install writes to a fresh ``system/supervisor.v<ts>/``
+    directory and flips the ``system/supervisor`` symlink to point at it.
+    Running sandboxes that already mounted ``volume-subpath=system/supervisor``
+    keep their bind-mount pointing at the OLD versioned directory — the
+    kernel resolves the symlink once at ``docker run`` time, so a subsequent
+    install can't pull the rug out from under them.  New sandboxes created
+    after the symlink flip pick up the new install transparently.
 
-    Mounts ``system/`` (not ``system/supervisor``) so both the staging dir
-    and the final target share a single mount point and ``mv`` is a
-    rename-within-volume rather than a cross-mount copy.
+    Old versioned directories are garbage-collected at install time once
+    they're at least 24 h old — that window is longer than the longest
+    practical sandbox session, so we never delete a directory a live
+    container could still be reading.
+
+    Recovery / retry semantics from the previous staging+rename scheme
+    are preserved: on failure the staging v-dir is removed and any
+    previous ``system/supervisor`` symlink is left intact.  The very
+    first install has no symlink yet — in that case we write the
+    v-dir, point the symlink at it, and that's it.
     """
     if agent_type not in _ACP_NPM_SPECS:
         raise ValueError(
@@ -154,34 +162,62 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
         raise RuntimeError(f"host supervisor.js missing at {_SUPERVISOR_JS_HOST}")
     npm_spec = _ACP_NPM_SPECS[agent_type]
     bin_name = _acp_bin_name(agent_type)
-    staging_name = f"supervisor.tmp.{uuid.uuid4().hex[:8]}"
+    # Versioned dir name: monotonic timestamp + short random suffix so two
+    # concurrent installs on the same volume don't clobber each other.
+    v_name = f"supervisor.v{int(time.time() * 1000):013d}.{uuid.uuid4().hex[:6]}"
 
-    # Sentinel path inside the staging dir; must exist before we swap.
-    sentinel = f"/work/{staging_name}/node_modules/.bin/{shlex.quote(bin_name)}"
-    staging_path = f"/work/{shlex.quote(staging_name)}"
-    final_path = "/work/supervisor"
+    sentinel = f"/work/{v_name}/node_modules/.bin/{shlex.quote(bin_name)}"
+    v_path = f"/work/{shlex.quote(v_name)}"
+    link_path = "/work/supervisor"
 
+    # Shell script:
+    #   1. Build the install into /work/<v_name>/ from scratch.
+    #   2. Verify sentinels.
+    #   3. Atomically replace /work/supervisor with a symlink pointing at
+    #      /work/<v_name>.  ``ln -sfn`` does the flip without an intermediate
+    #      unlink + create race.  If /work/supervisor is a real directory
+    #      (first-install legacy layout), remove it first — but only then,
+    #      and only if it's a dir, because turning a live symlink into a
+    #      real rm -rf would nuke whatever it points at.
+    #   4. Best-effort GC of old ``supervisor.v*`` dirs older than 24 h,
+    #      skipping the one the current symlink points at.
+    gc = (
+        "CUR=$(readlink -f /work/supervisor 2>/dev/null || echo /dev/null); "
+        "for d in /work/supervisor.v*; do "
+        "  [ -d \"$d\" ] || continue; "
+        "  [ \"$d\" = \"$CUR\" ] && continue; "
+        "  age_sec=$(( $(date +%s) - $(stat -c %Y \"$d\" 2>/dev/null || echo 0) )); "
+        "  [ \"$age_sec\" -gt 86400 ] && rm -rf \"$d\"; "
+        "done; true"
+    )
     shell = (
         "set -e && "
-        f"mkdir -p {staging_path} && "
-        f"cd {staging_path} && "
+        f"mkdir -p {v_path} && "
+        f"cd {v_path} && "
         "npm init -y >/dev/null 2>&1 && "
         f"npm install --omit=optional --silent {shlex.quote(npm_spec)} && "
-        f"cp /src/supervisor.js {staging_path}/supervisor.js && "
-        # Sentinel check + atomic swap. If the sentinel is missing, fail
-        # without touching the existing supervisor dir.
+        f"cp /src/supervisor.js {v_path}/supervisor.js && "
+        # Sentinel check — fail without touching the symlink if the install
+        # didn't produce a usable binary.
         f"test -f {sentinel} && "
-        f"test -f {staging_path}/supervisor.js && "
-        # Remove any previous install before rename (rename target must not
-        # be a non-empty dir on same-volume mv). -rf tolerates missing.
-        f"rm -rf {final_path} && "
-        f"mv {staging_path} {final_path}"
+        f"test -f {v_path}/supervisor.js && "
+        # If /work/supervisor is a real directory (legacy / first-install),
+        # swap it for a symlink. If it's already a symlink, -sfn replaces
+        # it atomically (same inode flip as rename(2) on linux).
+        f"if [ -d {link_path} ] && [ ! -L {link_path} ]; then "
+        f"  rm -rf {link_path}; "
+        "fi && "
+        f"ln -sfn {shlex.quote(v_name)} {link_path} && "
+        # Best-effort GC of stale v-dirs older than 24 h.
+        f"({gc})"
     )
-    # Whole-command cleanup: if any step fails, remove staging so the
-    # volume is never left with ``supervisor.tmp.*`` dirs.
-    shell_wrapped = f"({shell}) || (rm -rf {staging_path}; exit 1)"
+    # Whole-command cleanup: if any step fails, remove the v-dir so the
+    # volume is never left with a half-written supervisor.v* dir. The
+    # symlink (if any) is left pointing at whatever previous dir it
+    # pointed at — that dir is untouched by this run.
+    shell_wrapped = f"({shell}) || (rm -rf {v_path}; exit 1)"
 
-    log.info("docker install_supervisor: volume=%s agent=%s", volume_ref, agent_type)
+    log.info("docker install_supervisor: volume=%s agent=%s v=%s", volume_ref, agent_type, v_name)
     await _run_docker_checked(
         "run", "--rm",
         "--mount",
@@ -193,7 +229,8 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
         timeout=600,
     )
     log.info(
-        "docker install_supervisor: volume=%s agent=%s done", volume_ref, agent_type
+        "docker install_supervisor: volume=%s agent=%s done (pointed at %s)",
+        volume_ref, agent_type, v_name,
     )
 
 
