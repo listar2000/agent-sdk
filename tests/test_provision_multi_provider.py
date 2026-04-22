@@ -381,3 +381,79 @@ async def test_cross_provider_volume_rejection_via_sandboxes_endpoint(client):
             f"POST /sandboxes still accepts provider mismatch "
             f"(status={r.status_code}, body={r.text}) — source bug"
         )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 10 — volume_read error shape through the top-level dispatch.
+# The uniform api.providers.volume_read wrapper must surface a useful error
+# when the underlying provider can't find the file. Docker's shell-based
+# implementation emits __MISSING__ and raises FileNotFoundError; exercise
+# that through the public entry point to lock the contract in.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_volume_read_dispatch_through_docker_missing_file():
+    """api.providers.volume_read('docker', ref, 'nope') → clear error (not
+    a bare KeyError, not a hang). We don't need a live docker daemon: patch
+    docker.volume_read to raise FileNotFoundError and verify the wrapper
+    propagates the exception verbatim."""
+    from unittest.mock import AsyncMock, patch
+    import api.providers as providers_mod
+
+    async def fake_read(ref, path):
+        raise FileNotFoundError(f"{path} not found on volume {ref}")
+
+    with patch("api.providers.docker.volume_read",
+               new=AsyncMock(side_effect=fake_read)):
+        with pytest.raises(FileNotFoundError) as excinfo:
+            await providers_mod.volume_read("docker", "my-vol", "no/such/file")
+    # Error message names the path — operators can grep logs.
+    assert "no/such/file" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_volume_read_dispatch_through_docker_runtime_error():
+    """If the underlying docker exec fails (rc!=0, non-missing), the
+    provider raises RuntimeError with the docker stderr. The dispatch
+    wrapper must not swallow that."""
+    from unittest.mock import AsyncMock, patch
+    import api.providers as providers_mod
+
+    async def fake_read(ref, path):
+        raise RuntimeError("volume_read failed (rc=125): docker daemon error")
+
+    with patch("api.providers.docker.volume_read",
+               new=AsyncMock(side_effect=fake_read)):
+        with pytest.raises(RuntimeError) as excinfo:
+            await providers_mod.volume_read("docker", "my-vol", "some/file")
+    msg = str(excinfo.value).lower()
+    assert "volume_read" in msg or "docker" in msg, (
+        f"error should mention the failing op: {excinfo.value!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_volume_read_dispatch_through_local_missing_file(tmp_path, monkeypatch):
+    """End-to-end: api.providers.volume_read on a real local volume with a
+    missing file — no mocking the provider, test the stack."""
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    import api.providers as providers_mod
+    from api.providers import local as local_mod
+
+    name = "vol-scen10"
+    ref = await local_mod.create_volume(name)
+
+    with pytest.raises(FileNotFoundError):
+        await providers_mod.volume_read("local", ref, "shared/nope.txt")
+
+
+@pytest.mark.asyncio
+async def test_volume_read_dispatch_through_local_bad_volume_ref(tmp_path, monkeypatch):
+    """Top-level dispatch with a provider ref that isn't a real volume dir."""
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    import api.providers as providers_mod
+
+    bogus = str(tmp_path / "no-such-volume-dir")
+    with pytest.raises((FileNotFoundError, OSError)):
+        await providers_mod.volume_read("local", bogus, "file.txt")

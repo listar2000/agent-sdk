@@ -269,3 +269,86 @@ async def test_volume_read_rejects_dotdot(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="escapes volume root"):
         await local.volume_read(ref, "../../../../etc/passwd")
+
+
+# ---------------------------------------------------------------------------
+# Scenario 10 — volume_read error shapes for invalid path / volume.
+# Clear error contract: missing file inside a valid volume raises
+# FileNotFoundError (the stdlib type), missing volume root raises
+# FileNotFoundError as well (Path doesn't exist → parent_fd open fails),
+# and reading a directory path raises IsADirectoryError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_volume_read_missing_file_raises_filenotfound(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+
+    with pytest.raises(FileNotFoundError):
+        await local.volume_read(ref, "shared/does-not-exist.txt")
+
+
+@pytest.mark.asyncio
+async def test_volume_read_missing_volume_root_raises(tmp_path, monkeypatch):
+    """Reading from a volume ref that doesn't exist on disk raises a
+    filesystem error — not a silent empty string."""
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    bogus = str(tmp_path / "no-such-volume-dir")
+    # _safe_join resolves the realpath of <bogus>/<path>; since bogus doesn't
+    # exist, os.path.realpath returns it unchanged. The subsequent open fails.
+    with pytest.raises((FileNotFoundError, OSError)):
+        await local.volume_read(bogus, "any/file")
+
+
+@pytest.mark.asyncio
+async def test_volume_read_on_directory_raises(tmp_path, monkeypatch):
+    """Reading a path that resolves to a directory is a clear error, not a
+    silent empty read. The local provider opens with O_NOFOLLOW|O_RDONLY on
+    a regular file descriptor — opening a directory path that way yields
+    EISDIR."""
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+
+    # "shared" is a directory created by create_volume.
+    with pytest.raises((IsADirectoryError, OSError)):
+        await local.volume_read(ref, "shared")
+
+
+@pytest.mark.asyncio
+async def test_volume_read_empty_path_raises(tmp_path, monkeypatch):
+    """Reading with an empty path targets the volume root (a directory)."""
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+
+    # Empty path → _safe_join returns the volume root. _read raises
+    # IsADirectoryError because basename is empty OR the open returns EISDIR.
+    with pytest.raises((IsADirectoryError, OSError, ValueError)):
+        await local.volume_read(ref, "")
+
+
+@pytest.mark.asyncio
+async def test_volume_write_parent_path_through_file_fails(tmp_path, monkeypatch):
+    """Writing to a path whose parent is a regular file (not a directory)
+    must fail — not silently corrupt the parent."""
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+
+    # Create a plain file, then try to write "through" it.
+    await local.volume_write(ref, "shared/plain.txt", b"plain")
+    with pytest.raises((NotADirectoryError, OSError, FileExistsError)):
+        await local.volume_write(ref, "shared/plain.txt/child", b"should fail")
