@@ -88,3 +88,35 @@ async def test_sessions_has_volume_id_and_current_sandbox_id():
         assert cols["current_sandbox_id"] == "YES", "current_sandbox_id must be nullable"
     finally:
         await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_sandboxes_has_volume_id_and_subpath():
+    await dbmod.init_pool()
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='sandboxes' AND column_name IN ('volume_id', 'subpath')"
+            )).fetchall()
+        names = {r["column_name"] for r in rows}
+        assert names == {"volume_id", "subpath"}
+    finally:
+        await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_sandbox_record_roundtrip_with_volume():
+    from api.models import SandboxRecord, VolumeRecord
+    await dbmod.init_pool()
+    try:
+        await dbmod.upsert_volume(VolumeRecord(id="vol_x", name="x", provider="daytona", provider_ref="dt-x"))
+        sb = SandboxRecord(id="sb_x", provider="daytona", sandbox_ref="dt-sb",
+                           status="running", root="/home/daytona",
+                           volume_id="vol_x", subpath="agents/a1/home")
+        await dbmod.upsert_sandbox(sb)
+        got = await dbmod.get_sandbox("sb_x")
+        assert got.volume_id == "vol_x"
+        assert got.subpath == "agents/a1/home"
+    finally:
+        await dbmod.close_pool()

@@ -76,6 +76,8 @@ class SandboxRecord:
     sandbox_ref: str
     status: str = "stopped"
     root: str = "/tmp"
+    volume_id: str | None = None
+    subpath: str | None = None
 
     def derive_url(self) -> str:
         from .providers import PORT_BASED_PROVIDERS

@@ -118,6 +118,9 @@ _MIGRATIONS = [
     "ALTER TABLE session_log DROP CONSTRAINT IF EXISTS session_log_sandbox_id_fkey",
     """ALTER TABLE session_log ADD CONSTRAINT session_log_sandbox_id_fkey
         FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE SET NULL""",
+    # 2026-04-21: sandboxes become volume-aware.
+    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS volume_id TEXT REFERENCES volumes(id) ON DELETE RESTRICT",
+    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS subpath  TEXT",
 ]
 
 
@@ -235,13 +238,14 @@ async def delete_agent(agent_id: str) -> None:
 async def upsert_sandbox(sandbox: SandboxRecord) -> None:
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO sandboxes (id, provider, sandbox_ref, status, root)"
-            " VALUES (%s, %s, %s, %s, %s)"
+            "INSERT INTO sandboxes (id, provider, sandbox_ref, status, root, volume_id, subpath)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
             " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
-            " root=EXCLUDED.root",
+            " root=EXCLUDED.root, volume_id=EXCLUDED.volume_id,"
+            " subpath=EXCLUDED.subpath",
             (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status,
-             sandbox.root),
+             sandbox.root, sandbox.volume_id, sandbox.subpath),
         )
 
 
@@ -256,6 +260,8 @@ async def get_sandbox(sandbox_id: str) -> SandboxRecord | None:
         id=row["id"], provider=row["provider"],
         sandbox_ref=row["sandbox_ref"], status=row["status"],
         root=row.get("root", "/tmp"),
+        volume_id=row.get("volume_id"),
+        subpath=row.get("subpath"),
     )
 
 
@@ -265,7 +271,9 @@ async def list_sandboxes() -> list[SandboxRecord]:
     return [
         SandboxRecord(id=r["id"], provider=r["provider"],
                       sandbox_ref=r["sandbox_ref"], status=r["status"],
-                      root=r.get("root", "/tmp"))
+                      root=r.get("root", "/tmp"),
+                      volume_id=r.get("volume_id"),
+                      subpath=r.get("subpath"))
         for r in rows
     ]
 
