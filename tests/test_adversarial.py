@@ -34,62 +34,16 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 # ---------------------------------------------------------------------------
-# Stub out the entire DB layer BEFORE importing the server module so that
-# the Postgres connect() call never fires.
+# Import server up-front — the FastAPI lifespan (init_db/init_pool) only fires
+# on app startup, so a plain import is safe. The DB module is swapped for an
+# in-memory stub via a module-scoped autouse fixture (see
+# _stub_api_db_module) so we never hit real Postgres during tests AND we
+# don't leak the stub to sibling test files that run after us.
 # ---------------------------------------------------------------------------
 
 import types
-
-_stub_db = types.ModuleType("api.db")
-
-async def _noop(*a, **kw): return None
-async def _noop_list(*a, **kw): return []
-async def _noop_false(*a, **kw): return False
-async def _noop_agent(*a, **kw): return None
-async def _noop_sandbox(*a, **kw): return None
-async def _noop_session(*a, **kw): return None
-
-_stub_db.init_db = lambda: None
-_stub_db.init_pool = _noop
-_stub_db.close_pool = _noop
-_stub_db.upsert_agent = _noop
-_stub_db.get_agent = _noop_agent
-_stub_db.list_agents = _noop_list
-_stub_db.delete_agent = _noop
-_stub_db.upsert_sandbox = _noop
-_stub_db.get_sandbox = _noop_sandbox
-_stub_db.list_sandboxes = _noop_list
 from contextlib import asynccontextmanager as _asynccontextmanager
-@_asynccontextmanager
-async def _noop_get_db(*a, **kw):
-    yield None
-_stub_db.get_db = _noop_get_db
-_stub_db.delete_sandbox = _noop
-_stub_db.upsert_session = _noop
-_stub_db.get_session = _noop_session
-_stub_db.get_session_env = _noop_list  # returns {} via empty list coerced upstream; stub returns []
-async def _noop_dict(*a, **kw): return {}
-_stub_db.get_session_env = _noop_dict
-_stub_db.get_session_secrets = _noop_dict
-_stub_db.get_any_session_for_sandbox = _noop_session
-_stub_db.update_session_env = _noop
-_stub_db.update_session_secrets = _noop
-_stub_db.session_has_log_entries = _noop_false
-_stub_db.log_event = _noop
-_stub_db.get_session_log = _noop_list
-_stub_db.get_agent_log = _noop_list
-# Volume + current_sandbox helpers added in the session/volume decoupling work.
-async def _noop_volume(*a, **kw): return None
-_stub_db.upsert_volume = _noop
-_stub_db.get_volume = _noop_volume
-_stub_db.get_volume_by_name = _noop_volume
-_stub_db.list_volumes = _noop_list
-_stub_db.delete_volume = _noop
-_stub_db.set_session_current_sandbox = _noop
-_stub_db.add_supervisor_agent_type = _noop
-sys.modules["api.db"] = _stub_db
 
-# Now import server — lifespan calls init_db() / init_pool() which are no-ops
 import api.server as _server_module
 from api.server import app, SESSIONS, _INSTANCES
 from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
@@ -111,15 +65,71 @@ from api.providers import _get_sandbox_env_vars, PORT_BASED_PROVIDERS
 from api.server import (
     _materialize_dockerfile,
     _merge_top_level_config,
-    _derive_sandbox_ref,
     _CONFIG_KEYS,
 )
+# NOTE: _derive_sandbox_ref was removed from api.server in the volume-refactor;
+# sandbox_ref now equals the allocated port for port-based providers and the
+# provider-native sandbox id for Daytona. Tests that referenced the helper
+# have been removed below.
 from agent_sdk.client import Agent, _raise_for_status
 from agent_sdk.persist import SqliteSessionDriver, SessionRecord
 
-# If another test imported api.server first, overwrite its DB bindings here so
-# this file remains hermetic regardless of test collection/import order.
-for _name in (
+
+def _build_stub_db() -> types.ModuleType:
+    """Return a no-op stub module that stands in for api.db during tests."""
+    stub = types.ModuleType("api.db")
+
+    async def _noop(*a, **kw): return None
+    async def _noop_list(*a, **kw): return []
+    async def _noop_false(*a, **kw): return False
+    async def _noop_agent(*a, **kw): return None
+    async def _noop_sandbox(*a, **kw): return None
+    async def _noop_session(*a, **kw): return None
+    async def _noop_dict(*a, **kw): return {}
+    async def _noop_volume(*a, **kw): return None
+
+    @_asynccontextmanager
+    async def _noop_get_db(*a, **kw):
+        yield None
+
+    stub.init_db = lambda: None
+    stub.init_pool = _noop
+    stub.close_pool = _noop
+    stub.upsert_agent = _noop
+    stub.get_agent = _noop_agent
+    stub.list_agents = _noop_list
+    stub.delete_agent = _noop
+    stub.upsert_sandbox = _noop
+    stub.get_sandbox = _noop_sandbox
+    stub.list_sandboxes = _noop_list
+    stub.get_db = _noop_get_db
+    stub.delete_sandbox = _noop
+    stub.upsert_session = _noop
+    stub.get_session = _noop_session
+    stub.get_session_env = _noop_dict
+    stub.get_session_secrets = _noop_dict
+    stub.get_any_session_for_sandbox = _noop_session
+    stub.update_session_env = _noop
+    stub.update_session_secrets = _noop
+    stub.session_has_log_entries = _noop_false
+    stub.log_event = _noop
+    stub.get_session_log = _noop_list
+    stub.get_agent_log = _noop_list
+    # Volume + current_sandbox helpers added in the session/volume decoupling.
+    stub.upsert_volume = _noop
+    stub.get_volume = _noop_volume
+    stub.get_volume_by_name = _noop_volume
+    stub.list_volumes = _noop_list
+    stub.delete_volume = _noop
+    stub.set_session_current_sandbox = _noop
+    stub.add_supervisor_agent_type = _noop
+    return stub
+
+
+# Names api.server imported via `from .db import ...` — we redirect each at
+# api.server so our stub is actually consulted, then restore the originals on
+# teardown so sibling test files (real DB) keep working.
+_STUBBED_DB_NAMES = (
     "init_db", "init_pool", "close_pool",
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
@@ -127,8 +137,39 @@ for _name in (
     "get_session_env", "get_session_secrets", "get_any_session_for_sandbox",
     "update_session_env", "update_session_secrets",
     "session_has_log_entries", "log_event", "get_session_log",
-):
-    setattr(_server_module, _name, getattr(_stub_db, _name))
+    "get_db", "add_supervisor_agent_type",
+    "upsert_volume", "get_volume", "get_volume_by_name",
+    "list_volumes", "delete_volume", "set_session_current_sandbox",
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_api_db_module():
+    """Swap api.db for a stub for the duration of this test module only.
+
+    Uses patch.dict(sys.modules, ...) so sibling test files that run AFTER
+    this module see the real api.db again. Also redirects the already-bound
+    names on api.server (imported via `from .db import ...`) to the stub and
+    restores the originals on teardown.
+    """
+    stub = _build_stub_db()
+    _MISSING = object()
+    originals = {
+        name: getattr(_server_module, name, _MISSING) for name in _STUBBED_DB_NAMES
+    }
+    for name in _STUBBED_DB_NAMES:
+        if hasattr(stub, name):
+            setattr(_server_module, name, getattr(stub, name))
+    try:
+        with patch.dict(sys.modules, {"api.db": stub}):
+            yield
+    finally:
+        for name, value in originals.items():
+            if value is _MISSING:
+                if hasattr(_server_module, name):
+                    delattr(_server_module, name)
+            else:
+                setattr(_server_module, name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -303,27 +344,10 @@ class TestServerHelpers:
         assert config_data["cwd"] == "/workspace"
         assert config_data["prompt"] == "be helpful"
 
-    def test_derive_sandbox_ref_port_based(self):
-        """Port-based providers use the port number as sandbox_ref."""
-        from api.providers import ProviderInstance
-        instance = ProviderInstance(provider="local", url="http://localhost:3000", port=3000)
-        ref = _derive_sandbox_ref(instance, "local", "sbx-123")
-        assert ref == "3000"
-
-    def test_derive_sandbox_ref_daytona(self):
-        """Daytona provider uses instance.sandbox_id as sandbox_ref."""
-        from api.providers import ProviderInstance
-        daytona_id = "daytona-sandbox-xyz"
-        instance = ProviderInstance(provider="daytona", url="https://preview.daytona.io", sandbox_id=daytona_id)
-        ref = _derive_sandbox_ref(instance, "daytona", "sbx-123")
-        assert ref == daytona_id
-
-    def test_derive_sandbox_ref_daytona_fallback(self):
-        """Daytona with no sandbox_id falls back to the passed sandbox_id."""
-        from api.providers import ProviderInstance
-        instance = ProviderInstance(provider="daytona", url="https://preview.daytona.io", sandbox_id=None)
-        ref = _derive_sandbox_ref(instance, "daytona", "sbx-fallback")
-        assert ref == "sbx-fallback"
+    # NOTE: tests for the removed ``_derive_sandbox_ref`` helper used to live
+    # here. The helper was removed in the volume-refactor — sandbox_ref now
+    # equals the allocated port for port-based providers, and Daytona stores
+    # its provider-side sandbox id directly on SandboxRecord.
 
     @pytest.mark.asyncio
     async def test_health_endpoint(self, async_client):
@@ -1008,7 +1032,10 @@ class TestConcurrencyAdversarial:
             await asyncio.sleep(0.02)  # simulate latency
             return _mock_response(200, {"id": "agent-race"})
 
-        agent = Agent("race-test", api_url="http://fake")
+        # Use http://localhost so the client-side credentials guard
+        # (client.py:_is_remote_http) allows any oauth/api-key env-var creds
+        # the developer may have exported; the actual POST is mocked below.
+        agent = Agent("race-test", api_url="http://localhost")
         with patch.object(agent._client, "post", side_effect=_fake_post):
             await asyncio.gather(
                 agent._ensure_registered(),
@@ -1272,23 +1299,9 @@ class TestMergeTopLevelConfig:
             assert config_data[k] == f"val_{k}"
 
 
-class TestDeriveSandboxRef:
-    """Test the extracted _derive_sandbox_ref helper."""
-
-    def test_port_based_returns_port_string(self):
-        from api.providers import ProviderInstance
-        inst = ProviderInstance(provider="local", url="http://localhost:2469", port=2469)
-        assert _derive_sandbox_ref(inst, "local", "fallback-id") == "2469"
-
-    def test_daytona_returns_sandbox_id(self):
-        from api.providers import ProviderInstance
-        inst = ProviderInstance(provider="daytona", url="https://example.com", sandbox_id="daytona-123")
-        assert _derive_sandbox_ref(inst, "daytona", "fallback-id") == "daytona-123"
-
-    def test_daytona_falls_back_to_sandbox_id(self):
-        from api.providers import ProviderInstance
-        inst = ProviderInstance(provider="daytona", url="https://example.com")
-        assert _derive_sandbox_ref(inst, "daytona", "my-fallback") == "my-fallback"
+# NOTE: the ``TestDeriveSandboxRef`` suite was removed alongside
+# api.server._derive_sandbox_ref in the volume-refactor. sandbox_ref semantics
+# are now provider-specific and covered by the provider unit tests.
 
 
 
