@@ -48,7 +48,6 @@ from .db import (
     list_sandboxes,
     list_volumes,
     log_event,
-    session_has_log_entries,
     update_session_env,
     update_session_secrets,
     set_session_current_sandbox,
@@ -103,7 +102,6 @@ from .sse import (
     extract_tool_call_id,
     extract_tool_name,
     extract_tool_response,
-    iter_sse_blocks,
     parse_acp_payload,
     parse_sse_data,
 )
@@ -155,9 +153,7 @@ async def _cancel_task(task) -> None:
         pass
 
 
-async def _close_session_gracefully(
-    state: "SessionState", *, background: bool = False
-) -> None:
+async def _close_session_gracefully(state: "SessionState") -> None:
     """Close the HTTP connection to the ACP supervisor.
 
     We just drop the connection — the supervisor detects the disconnect
@@ -174,28 +170,11 @@ async def _close_session_gracefully(
         pass
 
 
-async def _retire_session_state_for_resume(state: SessionState) -> None:
-    """Force-retire a stale live session so a replacement can take ownership.
-
-    This path is narrower than the idle reaper shutdown: it deliberately kicks
-    live subscribers off the stale session, clears queued work, closes the old
-    ACP client, and removes the state from SESSIONS without dropping the
-    session lock that the caller is already holding.
-    """
-    _on_sse_reader_death(state)
-    await _cancel_task(state._scheduler_task)
-    await _cancel_task(state._reader_task)
-    await _close_session_gracefully(state, background=True)
-    if SESSIONS.get(state.session_id) is state:
-        SESSIONS.pop(state.session_id, None)
-
-
 async def _shutdown_session_state(
     state: SessionState,
     *,
     remove: bool,
     mark_idle_at: float | None = None,
-    background_close: bool = False,
 ) -> None:
     """Close a runtime session and optionally remove it from the active registry."""
     state.shutdown.set()
@@ -214,7 +193,7 @@ async def _shutdown_session_state(
     state.pending_prompts.clear()
     await _cancel_task(state._scheduler_task)
     await _cancel_task(state._reader_task)
-    await _close_session_gracefully(state, background=background_close)
+    await _close_session_gracefully(state)
     # Kill per-session supervisor if this session has its own.
     # Only Daytona runs multiple supervisors per sandbox (one per session);
     # docker/local always have one-supervisor-per-sandbox and teardown happens
@@ -1461,8 +1440,18 @@ async def start_sandbox_route(sandbox_id: str):
     except Exception as e:
         return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=500)
 
-    record.status = "running"
-    await upsert_sandbox(record)
+    # Re-fetch the record: _ensure_sandbox_alive may have created a replacement
+    # sandbox (for Daytona terminal-state / docker missing) and written a new
+    # sandbox_ref + listen_port to the DB. Upserting our local snapshot would
+    # clobber those updates with a stale sandbox_ref pointing at the dead
+    # container. Fresh fetch is authoritative.
+    fresh = await get_sandbox(sandbox_id)
+    if fresh is None:
+        # Shouldn't happen — _ensure_sandbox_alive just succeeded — but be
+        # defensive: fall through to returning the working URL.
+        return {"status": "running", "url": url}
+    fresh.status = "running"
+    await upsert_sandbox(fresh)
     return {"status": "running", "url": url}
 
 
@@ -1747,40 +1736,6 @@ def _process_sse_block(
         )
 
 
-async def _find_last_replay_event_id_from_stream(
-    resp: httpx.Response,
-    load_rpc_id: str,
-    timeout_s: float = 30,
-) -> str | None:
-    """Read an already-open SSE stream until the session/load RPC response appears.
-
-    The stream must have been opened BEFORE session/load was sent so the
-    replay events are captured.  Returns the last SSE event ID seen up to
-    and including the load response.
-    """
-
-    async def _scan() -> str | None:
-        last_id = None
-        async for block in iter_sse_blocks(resp):
-            for line in block.split("\n"):
-                if line.startswith("id:"):
-                    last_id = line[3:].strip()
-            payload = parse_sse_data(block)
-            if payload is not None:
-                if str(payload.get("id", "")) == load_rpc_id and "result" in payload:
-                    return last_id
-        return last_id
-
-    try:
-        return await asyncio.wait_for(_scan(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        log.warning("find last replay event timed out after %ss", timeout_s)
-        return None
-    except Exception as e:
-        log.warning("find last replay event failed: %s", e)
-        return None
-
-
 def _should_replace_daytona_sandbox(exc: Exception) -> bool:
     """True when a Daytona recovery error means the old sandbox is gone for good."""
     text = str(exc).lower()
@@ -1795,21 +1750,6 @@ def _should_replace_daytona_sandbox(exc: Exception) -> bool:
             "unknown",
         )
     )
-
-
-async def _session_has_logged_activity(session_id: str) -> bool:
-    """Whether this session has any persisted turn/activity logs yet.
-
-    Freshly created sessions can already have an inner_session_id before the
-    agent backend has durably materialized anything that `session/load` can
-    reopen. If the DB check fails, return True so recovery stays conservative
-    and never silently drops history.
-    """
-    try:
-        return await session_has_log_entries(session_id)
-    except Exception as e:
-        log.warning("session %s log-activity check failed: %s", session_id, e)
-        return True
 
 
 async def _ensure_sandbox_alive(

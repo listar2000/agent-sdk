@@ -549,16 +549,6 @@ async def get_any_session_for_sandbox(sandbox_id: str) -> dict | None:
     return dict(row)
 
 
-async def session_has_log_entries(session_id: str) -> bool:
-    """Whether the session has any persisted log entries yet."""
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT 1 FROM session_log WHERE session_id = %s LIMIT 1",
-            (session_id,),
-        )).fetchone()
-    return row is not None
-
-
 # ---------------------------------------------------------------------------
 # Session log
 # ---------------------------------------------------------------------------
