@@ -188,6 +188,9 @@ async def _ensure_subpath_dir(volume_ref: str, subpath: str) -> None:
     )
 
 
+_LABEL_KEY = "agent-sdk.sandbox-id"
+
+
 async def create_sandbox(
     *,
     volume_ref: str,
@@ -199,12 +202,17 @@ async def create_sandbox(
     pre_start_commands: list[str] | None = None,
     image: str | None = None,
     port: int | None = None,  # accepted for parity with uniform API; always allocates
+    sandbox_id: str | None = None,
     **_kw,
 ) -> ProviderInstance:
     """Create a Docker container with three volume-subpath mounts + supervisor.
 
     Returns a ``ProviderInstance`` with ``container_id`` set; supervisor is
     already started (``ensure_supervisor_url`` will be a no-op).
+
+    If ``sandbox_id`` is provided it is attached as the
+    ``agent-sdk.sandbox-id`` label so ``reconcile_on_startup`` can
+    cross-reference this container with the DB after a server crash.
     """
     if subpath is None or subpath == "":
         raise ValueError("docker create_sandbox requires a non-empty subpath")
@@ -250,6 +258,12 @@ async def create_sandbox(
         "--mount",
         f"type=volume,source={volume_ref},target={_SUPERVISOR_IN},"
         f"volume-subpath=system/supervisor",
+    ]
+    if sandbox_id:
+        # Used by reconcile_on_startup() to cross-reference live containers
+        # against DB sandbox rows after a server crash.
+        cmd += ["--label", f"{_LABEL_KEY}={sandbox_id}"]
+    cmd += [
         "--entrypoint", "sh",
         base_image,
         "-c", shell_cmd,
@@ -374,6 +388,124 @@ async def ensure_supervisor_url(
 ) -> str:
     """Docker supervisor is started at create_sandbox time — URL is stable."""
     return inst.url
+
+
+# ---------------------------------------------------------------------------
+# Startup reconciliation — cross-reference live containers w/ DB sandbox rows
+# ---------------------------------------------------------------------------
+
+async def reconcile_on_startup() -> None:
+    """Kill orphan containers and rebuild ``_INSTANCES`` from labeled survivors.
+
+    On server restart, the in-process ``_INSTANCES`` map (used by the
+    port allocator / destroy path) is empty. Without reconciliation the
+    server has no way to reattach to containers that are still running
+    and would accumulate orphaned containers over time.
+
+    For each container labeled ``agent-sdk.sandbox-id=<id>``:
+
+    * Look up the DB sandbox row (via ``api.db.get_sandbox``).
+    * If no DB row exists, or the row is marked ``stopped``/``deleted``,
+      force-remove the container — it's an orphan.
+    * Otherwise inspect the container for its published host port and
+      reconstruct a ``ProviderInstance`` in ``_INSTANCES`` keyed by the
+      sandbox_id, so later destroy/stop calls can find it.
+
+    Failures on individual containers are logged but never raised so a
+    single bad container can't prevent the server from starting.
+    """
+    # Local imports to avoid a hard cycle: docker.py is imported at module
+    # init but api.db is initialized later in the lifespan.
+    try:
+        from .. import db as dbmod
+    except Exception as e:
+        log.warning("docker reconcile: cannot import api.db: %s", e)
+        return
+
+    try:
+        out = await _run_docker_checked(
+            "ps", "-a",
+            "--filter", f"label={_LABEL_KEY}",
+            "--format", "{{.ID}} {{.State}} {{.Label \"" + _LABEL_KEY + "\"}}",
+            timeout=30,
+        )
+    except Exception as e:
+        log.warning("docker reconcile: ps failed: %s", e)
+        return
+
+    # Live import so tests that patch _INSTANCES in api.server see the same
+    # dict. The module-level singleton in api.server is the source of truth.
+    try:
+        from .. import server as srv
+        instances_map = srv._INSTANCES  # type: ignore[attr-defined]
+    except Exception:
+        instances_map = None
+
+    for line in out.decode(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        container_id, state, sandbox_id = parts[0], parts[1].lower(), parts[2]
+        try:
+            sb = await dbmod.get_sandbox(sandbox_id)
+        except Exception as e:
+            log.warning("docker reconcile: get_sandbox(%s) failed: %s", sandbox_id, e)
+            continue
+        is_orphan = (
+            sb is None
+            or getattr(sb, "status", None) in ("stopped", "deleted")
+        )
+        if is_orphan:
+            log.info(
+                "docker reconcile: removing orphan %s (sandbox_id=%s state=%s)",
+                container_id[:12], sandbox_id, state,
+            )
+            try:
+                await _run_docker("rm", "-f", container_id, timeout=30)
+            except Exception as e:
+                log.warning(
+                    "docker reconcile: rm -f %s failed: %s", container_id[:12], e
+                )
+            continue
+
+        # Live (or resumable) survivor — rebuild an instance entry so
+        # destroy_sandbox / stop_sandbox can find the container by port.
+        if instances_map is None:
+            continue
+        try:
+            port_out = await _run_docker_checked(
+                "inspect",
+                "--format",
+                "{{(index (index .NetworkSettings.Ports \""
+                f"{_SUPERVISOR_CONTAINER_PORT}/tcp"
+                "\") 0).HostPort}}",
+                container_id,
+                timeout=15,
+            )
+            port_s = port_out.decode(errors="replace").strip()
+            port = int(port_s) if port_s else None
+        except Exception as e:
+            log.warning(
+                "docker reconcile: inspect %s port failed: %s",
+                container_id[:12], e,
+            )
+            port = None
+        url = f"http://localhost:{port}" if port else ""
+        instances_map[sandbox_id] = ProviderInstance(
+            provider="docker",
+            url=url,
+            root=getattr(sb, "root", _AGENT_HOME_IN),
+            sandbox_id=container_id,
+            container_id=container_id,
+            port=port,
+        )
+        log.info(
+            "docker reconcile: reattached sandbox_id=%s container=%s port=%s state=%s",
+            sandbox_id, container_id[:12], port, state,
+        )
 
 
 # ---------------------------------------------------------------------------

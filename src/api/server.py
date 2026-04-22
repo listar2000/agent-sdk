@@ -328,6 +328,17 @@ async def lifespan(app):
     _configure_logging()
     init_db()
     await init_pool()
+
+    # Startup reconciliation: cross-reference live provider state with
+    # DB sandbox rows so orphan containers/processes are reaped and
+    # survivors are reattached to _INSTANCES. Guarded so a single
+    # provider failure doesn't prevent boot.
+    for _prov in ("docker", "daytona", "local"):
+        try:
+            await _providers_mod.reconcile_sandboxes(_prov)
+        except Exception as e:
+            log.warning("startup reconcile for %s failed: %s", _prov, e)
+
     reaper = asyncio.create_task(_idle_reaper())
     yield
     await _cancel_task(reaper)
@@ -2068,6 +2079,11 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
         # local: home is filled in by the provider from the volume path.
         root = None
 
+    # Generate the sandbox_id up-front so we can tag the underlying
+    # container/process with it. Docker uses this as a label for
+    # startup reconciliation (M5); other providers currently ignore it.
+    new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
+
     inst = await _providers_mod.provision_sandbox(
         vol.provider,
         volume_ref=vol.provider_ref,
@@ -2075,10 +2091,11 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
         agent_type=agent_type,
         spawn_env=spawn_env,
         root=root,
+        sandbox_id=new_sandbox_id,
     )
 
     sb = SandboxRecord(
-        id=f"sb_{uuid.uuid4().hex[:12]}",
+        id=new_sandbox_id,
         provider=vol.provider,
         sandbox_ref=inst.sandbox_id,
         status=STATUS_RUNNING,

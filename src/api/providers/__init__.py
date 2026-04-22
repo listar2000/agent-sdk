@@ -245,6 +245,21 @@ async def volume_write(provider: str, ref: str, path: str, content: bytes) -> No
     return await _PROVIDER_MODS[provider].volume_write(ref, path, content)
 
 
+async def reconcile_sandboxes(provider: str) -> None:
+    """Reconcile in-process sandbox state with live provider state on startup.
+
+    Only the Docker provider needs this today: its containers survive
+    server restarts and would accumulate as orphans without a scan.
+    Daytona sandboxes are managed by the Daytona control plane; local
+    sandboxes (subprocess-backed) die with the server process.
+    """
+    mod = _PROVIDER_MODS.get(provider)
+    fn = getattr(mod, "reconcile_on_startup", None)
+    if fn is None:
+        return
+    await fn()
+
+
 async def provision_sandbox(
     provider: str,
     *,
