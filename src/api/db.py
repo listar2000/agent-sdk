@@ -15,7 +15,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from psycopg_pool import AsyncConnectionPool
 
-from .models import AgentConfig, AgentRecord, LogEntry, SandboxRecord
+from .models import AgentConfig, AgentRecord, LogEntry, SandboxRecord, VolumeRecord
 
 log = logging.getLogger(__name__)
 
@@ -247,6 +247,64 @@ async def list_sandboxes() -> list[SandboxRecord]:
 async def delete_sandbox(sandbox_id: str) -> None:
     async with get_db() as conn:
         await conn.execute("DELETE FROM sandboxes WHERE id = %s", (sandbox_id,))
+
+
+# ---------------------------------------------------------------------------
+# Volume CRUD
+# ---------------------------------------------------------------------------
+
+async def upsert_volume(volume: VolumeRecord) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO volumes (id, name, provider, provider_ref, status)"
+            " VALUES (%s, %s, %s, %s, %s)"
+            " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,"
+            " provider=EXCLUDED.provider, provider_ref=EXCLUDED.provider_ref,"
+            " status=EXCLUDED.status",
+            (volume.id, volume.name, volume.provider, volume.provider_ref, volume.status),
+        )
+
+
+async def get_volume(volume_id: str) -> VolumeRecord | None:
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT * FROM volumes WHERE id = %s", (volume_id,)
+        )).fetchone()
+    if row is None:
+        return None
+    return VolumeRecord(id=row["id"], name=row["name"], provider=row["provider"],
+                        provider_ref=row["provider_ref"], status=row["status"])
+
+
+async def get_volume_by_name(name: str) -> VolumeRecord | None:
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT * FROM volumes WHERE name = %s", (name,)
+        )).fetchone()
+    if row is None:
+        return None
+    return VolumeRecord(id=row["id"], name=row["name"], provider=row["provider"],
+                        provider_ref=row["provider_ref"], status=row["status"])
+
+
+async def list_volumes(provider: str | None = None) -> list[VolumeRecord]:
+    async with get_db() as conn:
+        if provider:
+            rows = await (await conn.execute(
+                "SELECT * FROM volumes WHERE provider = %s", (provider,)
+            )).fetchall()
+        else:
+            rows = await (await conn.execute("SELECT * FROM volumes")).fetchall()
+    return [
+        VolumeRecord(id=r["id"], name=r["name"], provider=r["provider"],
+                     provider_ref=r["provider_ref"], status=r["status"])
+        for r in rows
+    ]
+
+
+async def delete_volume(volume_id: str) -> None:
+    async with get_db() as conn:
+        await conn.execute("DELETE FROM volumes WHERE id = %s", (volume_id,))
 
 
 # ---------------------------------------------------------------------------

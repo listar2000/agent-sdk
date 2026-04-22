@@ -46,3 +46,27 @@ def test_volume_record_dataclass():
     assert v.provider == "daytona"
     assert v.provider_ref == "dt-xyz"
     assert v.status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_volume_crud_roundtrip():
+    from api.models import VolumeRecord
+    await dbmod.init_pool()
+    try:
+        v = VolumeRecord(id="vol_a", name="proj-a", provider="daytona", provider_ref="dt-a")
+        await dbmod.upsert_volume(v)
+
+        got = await dbmod.get_volume("vol_a")
+        assert got is not None
+        assert got.name == "proj-a"
+
+        by_name = await dbmod.get_volume_by_name("proj-a")
+        assert by_name is not None and by_name.id == "vol_a"
+
+        listed = await dbmod.list_volumes()
+        assert any(x.id == "vol_a" for x in listed)
+
+        await dbmod.delete_volume("vol_a")
+        assert await dbmod.get_volume("vol_a") is None
+    finally:
+        await dbmod.close_pool()
