@@ -793,22 +793,13 @@ def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
 
     offenders = sorted(k for k in env if k in AUTH_KEYS)
     if offenders:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{where}: auth keys {offenders} must be sent via 'secrets', "
-                "not 'env' (env is stored plain and returned by GET)."
-            ),
-        )
+        raise HTTPException(400, f"{where}: auth keys {offenders} must be sent "
+                                 "via 'secrets', not 'env' (env is stored plain "
+                                 "and returned by GET).")
     bad_names = sorted(k for k in env if not (isinstance(k, str) and _ENV_KEY_RE.match(k)))
     if bad_names:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{where}: invalid env var name(s) {bad_names}; must match "
-                "[A-Za-z_][A-Za-z0-9_]*"
-            ),
-        )
+        raise HTTPException(400, f"{where}: invalid env var name(s) {bad_names}; "
+                                 "must match [A-Za-z_][A-Za-z0-9_]*")
 
 
 def _merge_top_level_config(data: dict, config_data: dict) -> None:
@@ -852,23 +843,18 @@ def _pop_env_and_secrets(
             if not isinstance(k, str):
                 continue
             if not _ENV_KEY_RE.match(k):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"{where}: invalid env var name {k!r}; must match "
-                        "[A-Za-z_][A-Za-z0-9_]*"
-                    ),
-                )
+                raise HTTPException(400, f"{where}: invalid env var name {k!r}; "
+                                         "must match [A-Za-z_][A-Za-z0-9_]*")
             if isinstance(v, (str, int, float)):
                 out[k] = str(v)
         return out
 
-    raw_env = data.pop("env", _ENV_MISSING)
-    raw_secrets = data.pop("secrets", _ENV_MISSING)
-    env = None if raw_env is _ENV_MISSING else _coerce(raw_env, "request body 'env'")
-    secrets = (
-        None if raw_secrets is _ENV_MISSING else _coerce(raw_secrets, "request body 'secrets'")
-    )
+    def _extract(key: str) -> dict[str, str] | None:
+        raw = data.pop(key, _ENV_MISSING)
+        return None if raw is _ENV_MISSING else _coerce(raw, f"request body {key!r}")
+
+    env = _extract("env")
+    secrets = _extract("secrets")
     _forbid_auth_keys_in_env(env, "request body 'env'")
     return env, secrets
 
