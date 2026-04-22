@@ -35,7 +35,7 @@ cd "${REPO_ROOT}"
 # Load env vars (API keys, SSL cert, etc.). Prefer the repo-local .env,
 # fall back to the user's ~/.env — this matches `set -a; source .env` that
 # users run manually before hitting the examples.
-for env_file in "${REPO_ROOT}/.env" "${HOME}/.env"; do
+for env_file in "${HOME}/.env" "${REPO_ROOT}/.env"; do
     if [ -f "${env_file}" ]; then
         set -a
         # shellcheck disable=SC1090
@@ -94,10 +94,17 @@ export PATH="${PG_BIN}:${PATH}"
 if [ ! -s "${PG_DATA_DIR}/PG_VERSION" ]; then
     echo "Initializing Postgres data dir at ${PG_DATA_DIR} ..."
     mkdir -p "${PG_DATA_DIR}"
-    "${PG_BIN}/initdb" -D "${PG_DATA_DIR}" -U postgres --auth-host=trust --auth-local=trust >/dev/null
+    "${PG_BIN}/initdb" -D "${PG_DATA_DIR}" -U postgres --auth=trust >/dev/null
 fi
 
-# Start postgres if not already listening on PG_PORT
+# Always enforce trust auth so no password prompts occur
+cat > "${PG_DATA_DIR}/pg_hba.conf" << 'EOF'
+local   all   all              trust
+host    all   all   127.0.0.1/32   trust
+host    all   all   ::1/128        trust
+EOF
+
+# Start postgres if not already listening on PG_PORT; reload config if already running
 if ! "${PG_BIN}/pg_isready" -h localhost -p "${PG_PORT}" -q 2>/dev/null; then
     echo "Starting Postgres on port ${PG_PORT} ..."
     "${PG_BIN}/pg_ctl" -D "${PG_DATA_DIR}" -l "${PG_LOG}" \
@@ -106,6 +113,8 @@ if ! "${PG_BIN}/pg_isready" -h localhost -p "${PG_PORT}" -q 2>/dev/null; then
         "${PG_BIN}/pg_isready" -h localhost -p "${PG_PORT}" -q && break
         sleep 0.5
     done
+else
+    "${PG_BIN}/pg_ctl" -D "${PG_DATA_DIR}" reload >/dev/null 2>&1 || true
 fi
 
 if ! "${PG_BIN}/pg_isready" -h localhost -p "${PG_PORT}" -q; then
