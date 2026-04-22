@@ -361,6 +361,24 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse({"error": detail}, status_code=exc.status_code)
 
 
+async def _json_body(request: Request) -> dict:
+    """Parse JSON body and require it to be an object.
+
+    Handlers that ``data = await request.json(); data.get(...)`` used to
+    blow up with a 500 ``AttributeError: 'str' object has no attribute 'get'``
+    when the client sent a JSON scalar/array instead of an object.  Route
+    all such reads through this helper so the failure is a clean 400 with
+    the canonical ``{"error": ...}`` shape.
+    """
+    try:
+        data = await request.json()
+    except Exception as e:
+        raise HTTPException(400, f"invalid JSON body: {e}")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -897,7 +915,7 @@ def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
 
 @app.post("/agents")
 async def create_agent(request: Request):
-    data = await request.json()
+    data = await _json_body(request)
     agent_id = str(uuid.uuid4())
     name = data.get("name")
     config_data = data.get("config", {})
@@ -1157,7 +1175,7 @@ async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
 
 @app.post("/sandboxes")
 async def create_sandbox(request: Request):
-    data = await request.json()
+    data = await _json_body(request)
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
     root = data.get("root", "/tmp")
@@ -1202,7 +1220,10 @@ async def create_sandbox(request: Request):
     )
     await upsert_sandbox(record)
     return {
+        # Alias ``sandbox_id`` for /sandboxes/provision parity and client
+        # convenience; ``id`` stays for the plain REST resource contract.
         "id": sandbox_id,
+        "sandbox_id": sandbox_id,
         "provider": provider,
         "sandbox_ref": sandbox_ref,
         "status": "running",
@@ -1289,7 +1310,7 @@ async def provision_sandbox_route(request: Request):
     ``ensure_runtime``). For Docker/Local the supervisor is already running.
     Returns ``{sandbox_id, status}``.
     """
-    data = await request.json()
+    data = await _json_body(request)
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
@@ -1367,8 +1388,16 @@ async def provision_sandbox_route(request: Request):
         listen_port=instance.port,
     ))
 
-    return {"sandbox_id": sandbox_id, "status": "provisioned",
-            "volume_id": vol.id, "subpath": subpath, "provider": provider}
+    return {
+        # Dual-key: ``sandbox_id`` is the historic shape, ``id`` matches the
+        # plain /sandboxes POST response so both paths are interchangeable.
+        "sandbox_id": sandbox_id,
+        "id": sandbox_id,
+        "status": "provisioned",
+        "volume_id": vol.id,
+        "subpath": subpath,
+        "provider": provider,
+    }
 
 
 @app.post("/sandboxes/{sandbox_id}/stop")
@@ -1438,7 +1467,9 @@ async def start_sandbox_route(sandbox_id: str):
     try:
         url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type="claude")
     except Exception as e:
-        return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=500)
+        # 502 matches POST /sandboxes and POST /sandboxes/provision —
+        # provider failures are upstream faults, not server bugs (500).
+        return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=502)
 
     # Re-fetch the record: _ensure_sandbox_alive may have created a replacement
     # sandbox (for Daytona terminal-state / docker missing) and written a new
@@ -2562,6 +2593,10 @@ async def session_resume(session_id: str, request: Request):
     return {
         "session_id": state.session_id,
         "agent_id": state.agent_id,
+        # Same dual-key rationale as /sessions/quick: ``sandbox_id`` for the
+        # REST/client convention, ``current_sandbox_id`` to match the DB
+        # column + /sessions/{id} GET response shape.
+        "sandbox_id": state.sandbox_id,
         "current_sandbox_id": state.sandbox_id,
         "inner_session_id": state.inner_session_id,
         "status": "resumed",
@@ -2576,15 +2611,18 @@ async def sessions_create(request: Request):
     The sandbox will be provisioned lazily on first message (Task 13).
     Returns {id, agent_id, volume_id, current_sandbox_id: null, connected: false}.
     """
-    data = await request.json()
+    data = await _json_body(request)
     # SECURITY: strip env/secrets before any merge, log, or DB write so they
     # can't leak into agents.config JSONB.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
     volume_id = data.get("volume_id")
     if not volume_id or not isinstance(volume_id, str):
+        # 400 matches POST /sandboxes ("volume_id and subpath are required")
+        # and POST /sessions/{id}/message ("message required") — all three
+        # are simple required-field checks on the raw body.
         return JSONResponse(
-            {"error": "volume_id is required"}, status_code=422
+            {"error": "volume_id is required"}, status_code=400
         )
 
     volume_record = await get_volume(volume_id)
@@ -2639,15 +2677,18 @@ async def sessions_quick_create(request: Request):
     Body requires ``volume_id``.
     Returns {agent_id, sandbox_id, session_id, connected: true}.
     """
-    data = await request.json()
+    data = await _json_body(request)
     # SECURITY: strip env/secrets before any merge, log, or DB write so they
     # can't leak into agents.config JSONB.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
     volume_id = data.get("volume_id")
     if not volume_id or not isinstance(volume_id, str):
+        # 400 matches POST /sandboxes ("volume_id and subpath are required")
+        # and POST /sessions/{id}/message ("message required") — all three
+        # are simple required-field checks on the raw body.
         return JSONResponse(
-            {"error": "volume_id is required"}, status_code=422
+            {"error": "volume_id is required"}, status_code=400
         )
 
     volume_record = await get_volume(volume_id)
@@ -2798,6 +2839,11 @@ async def sessions_quick_create(request: Request):
 
     return {
         "agent_id": agent_id,
+        # Emit both keys: ``sandbox_id`` is the canonical REST shape used by
+        # /sandboxes responses and by agent_sdk.client; ``current_sandbox_id``
+        # mirrors the DB column and the /sessions/{id} GET response.  Keeping
+        # both makes the session→sandbox link queryable under either name.
+        "sandbox_id": sandbox_id,
         "current_sandbox_id": sandbox_id,
         "session_id": session_id,
         "inner_session_id": inner_session_id,
@@ -2965,7 +3011,7 @@ async def post_session_message(session_id: str, request: Request):
     Pass ``interrupt: true`` to cancel the running prompt and wait for it
     to reach a terminal state before the new prompt starts.
     """
-    data = await request.json()
+    data = await _json_body(request)
     message = data.get("message")
     if not message:
         return JSONResponse({"error": "message required"}, status_code=400)
@@ -3142,13 +3188,13 @@ async def reset_session_sandbox(session_id: str):
 @app.post("/sessions/{session_id}/config")
 async def session_set_config(session_id: str, request: Request):
     """Set mode/model/thought_level for a session."""
+    data = await _json_body(request)
     try:
         _, _, state = await ensure_session_live(session_id)
     except HTTPException as exc:
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
     try:
-        data = await request.json()
         if "mode" in data:
             await state.client.set_mode(state.acp_session_id, data["mode"])
         if "model" in data:
@@ -3223,7 +3269,7 @@ async def session_sandbox_exec(session_id: str, request: Request):
     Auto-recovers: if the sandbox was reaped or stopped, restarts it
     before executing. Does not require an active ACP session.
     """
-    data = await request.json()
+    data = await _json_body(request)
     command = data.get("command")
     if not command:
         return JSONResponse({"error": "command required"}, status_code=400)
@@ -3306,8 +3352,8 @@ async def sandbox_files_edit(sandbox_id: str, request: Request):
     When old_string is empty, writes/creates the file with new_string as content.
     The supervisor enforces path traversal protection.
     """
+    body = await _json_body(request)
     instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
@@ -3326,8 +3372,8 @@ async def sandbox_files_edit(sandbox_id: str, request: Request):
 @app.post("/sandboxes/{sandbox_id}/files/upload")
 async def sandbox_files_upload(sandbox_id: str, request: Request):
     """Upload a file to the sandbox. Body: {"path": "...", "content": "<base64>"}"""
+    body = await _json_body(request)
     instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(f"{instance.url}/v1/files/upload", json=body)
@@ -3339,8 +3385,8 @@ async def sandbox_files_upload(sandbox_id: str, request: Request):
 @app.post("/sandboxes/{sandbox_id}/files/delete")
 async def sandbox_files_delete(sandbox_id: str, request: Request):
     """Delete a file or directory. Body: {"path": "..."}"""
+    body = await _json_body(request)
     instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{instance.url}/v1/files/delete", json=body)
@@ -3352,8 +3398,8 @@ async def sandbox_files_delete(sandbox_id: str, request: Request):
 @app.post("/sandboxes/{sandbox_id}/files/rename")
 async def sandbox_files_rename(sandbox_id: str, request: Request):
     """Rename/move a file or directory. Body: {"path": "...", "new_path": "..."}"""
+    body = await _json_body(request)
     instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{instance.url}/v1/files/rename", json=body)
