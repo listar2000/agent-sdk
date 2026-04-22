@@ -310,33 +310,57 @@ async def create_sandbox(
     else:
         shell_cmd = f"exec {supervisor_cmd}"
 
-    # IMPORTANT: not `--rm`. We want the container row to stick around so
-    # `docker inspect` can report its exited state and we can distinguish
-    # "stopped" vs "missing".
-    cmd = [
-        "run", "-d",
-        "-p", f"{port}:{_SUPERVISOR_CONTAINER_PORT}",
-        "--mount",
-        f"type=volume,source={volume_ref},target={_AGENT_HOME_IN},"
-        f"volume-subpath={subpath}",
-        "--mount",
-        f"type=volume,source={volume_ref},target={_SHARED_IN},volume-subpath=shared",
-        "--mount",
-        f"type=volume,source={volume_ref},target={_SUPERVISOR_IN},"
-        f"volume-subpath=system/supervisor",
-    ]
-    if sandbox_id:
-        # Used by reconcile_on_startup() to cross-reference live containers
-        # against DB sandbox rows after a server crash.
-        cmd += ["--label", f"{_LABEL_KEY}={sandbox_id}"]
-    cmd += [
-        "--entrypoint", "sh",
-        base_image,
-        "-c", shell_cmd,
-    ]
+    def _build_cmd(p: int) -> list[str]:
+        # IMPORTANT: not `--rm`. We want the container row to stick around so
+        # `docker inspect` can report its exited state and we can distinguish
+        # "stopped" vs "missing".
+        c = [
+            "run", "-d",
+            "-p", f"{p}:{_SUPERVISOR_CONTAINER_PORT}",
+            "--mount",
+            f"type=volume,source={volume_ref},target={_AGENT_HOME_IN},"
+            f"volume-subpath={subpath}",
+            "--mount",
+            f"type=volume,source={volume_ref},target={_SHARED_IN},volume-subpath=shared",
+            "--mount",
+            f"type=volume,source={volume_ref},target={_SUPERVISOR_IN},"
+            f"volume-subpath=system/supervisor",
+        ]
+        if sandbox_id:
+            # Used by reconcile_on_startup() to cross-reference live containers
+            # against DB sandbox rows after a server crash.
+            c += ["--label", f"{_LABEL_KEY}={sandbox_id}"]
+        c += [
+            "--entrypoint", "sh",
+            base_image,
+            "-c", shell_cmd,
+        ]
+        return c
+
+    def _is_port_collision(err_bytes: bytes) -> bool:
+        msg = err_bytes.decode(errors="replace").lower()
+        return (
+            "port is already allocated" in msg
+            or "address already in use" in msg
+            or "bind: address already in use" in msg
+        )
 
     try:
-        rc, out, err = await _run_docker(*cmd, timeout=120)
+        rc, out, err = await _run_docker(*_build_cmd(port), timeout=120)
+        # TOCTOU guard: `_find_free_port` bind-probes but the port can be
+        # taken between probe and ``docker run``.  Retry ONCE with a fresh
+        # port if the daemon reports a port collision.
+        if rc != 0 and _is_port_collision(err):
+            async with _port_lock:
+                _freed_ports.append(port)
+            new_port = await _find_free_port()
+            log.warning(
+                "docker run port %d collided; retrying on %d (err: %s)",
+                port, new_port,
+                err.decode(errors="replace").strip()[:200],
+            )
+            port = new_port
+            rc, out, err = await _run_docker(*_build_cmd(port), timeout=120)
         if rc != 0:
             raise RuntimeError(
                 f"docker run failed (rc={rc}): {err.decode(errors='replace').strip()[:800]}"
