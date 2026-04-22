@@ -2037,9 +2037,15 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
         # Autocommit mode: queries commit immediately and the connection
         # isn't parked "idle in transaction" during the slow install.
         # ``pg_advisory_lock`` is still session-scoped so the lock
-        # outlives individual statement commits.
+        # outlives individual statement commits.  We MUST restore the
+        # original autocommit setting before the connection returns to
+        # the pool — psycopg's AsyncConnectionPool has no reset callback,
+        # so a leaked `autocommit=True` silently breaks the
+        # borrow-transaction-commit contract for every later borrower.
+        _restore_autocommit = False
         try:
             await lock_conn.set_autocommit(True)
+            _restore_autocommit = True
         except Exception:
             # Some test fakes expose a shim that doesn't implement
             # set_autocommit — tolerate it, the transaction-in-progress
@@ -2102,6 +2108,16 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
                 log.warning(
                     "ensure_volume_supervisor: pg_advisory_unlock failed: %s", e,
                 )
+            # Restore the pre-borrow autocommit mode BEFORE the async
+            # context manager returns the connection to the pool.
+            if _restore_autocommit:
+                try:
+                    await lock_conn.set_autocommit(False)
+                except Exception as e:
+                    log.warning(
+                        "ensure_volume_supervisor: failed to restore "
+                        "autocommit=False on pooled conn: %s", e,
+                    )
 
 
 async def ensure_sandbox(session_row: dict) -> SandboxRecord:

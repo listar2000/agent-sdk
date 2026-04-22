@@ -550,6 +550,57 @@ async def test_ensure_volume_supervisor_retry_after_cache_fail(client):
     assert "claude" in (vol.supervisor_agent_types or [])
 
 
+@pytest.mark.asyncio
+async def test_ensure_volume_supervisor_does_not_leak_autocommit(client):
+    """Regression: ensure_volume_supervisor must restore the pooled
+    connection's ``autocommit`` state before returning it to the pool.
+
+    The advisory-lock handler flips autocommit=True for the slow install
+    window; psycopg's AsyncConnectionPool has no reset callback, so a
+    leaked ``autocommit=True`` silently breaks the borrow-transaction-
+    commit contract for every subsequent borrower (their commits become
+    no-ops). Cycle 6 review caught this.
+    """
+    from api.models import AgentConfig, AgentRecord, VolumeRecord
+
+    await dbmod.upsert_agent(AgentRecord(
+        id="a-acm", name="acm", config=AgentConfig(agent_type="claude"),
+    ))
+    await dbmod.upsert_volume(VolumeRecord(
+        id="v-acm", name="v-acm", provider="daytona", provider_ref="dt-acm",
+    ))
+
+    # Capture every connection that the pool hands out during the install.
+    borrowed_conns: list = []
+    real_get_db = dbmod.get_db
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def tracking_get_db():
+        async with real_get_db() as conn:
+            borrowed_conns.append(conn)
+            yield conn
+
+    async def fake_install(provider, volume_ref, agent_type):
+        pass
+
+    with patch("api.providers.install_supervisor",
+               new=AsyncMock(side_effect=fake_install)), \
+         patch("api.db.get_db", new=tracking_get_db), \
+         patch("api.server.get_db", new=tracking_get_db):
+        await srv.ensure_volume_supervisor("v-acm", "claude")
+
+    # At least one connection was borrowed for the lock handler. Every
+    # borrowed connection must be back in its pre-borrow autocommit state
+    # (False — our pool's default) now that the handler has returned.
+    assert borrowed_conns, "expected at least one pooled connection borrow"
+    for c in borrowed_conns:
+        # psycopg 3: .autocommit is a property that reflects current state.
+        assert c.autocommit is False, (
+            "ensure_volume_supervisor leaked autocommit=True back into the pool"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Scenario 15 — install_supervisor fault injection (no partial cache, retry).
 # The provider's install_supervisor raises mid-run (e.g., OSError("disk full"),
