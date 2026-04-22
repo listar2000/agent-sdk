@@ -35,3 +35,14 @@ async def test_volumes_table_exists():
         assert row["t"] == "volumes"
     finally:
         await dbmod.close_pool()
+
+
+def test_volume_record_dataclass():
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_1", name="proj", provider="daytona",
+                     provider_ref="dt-xyz", status="ready")
+    assert v.id == "vol_1"
+    assert v.name == "proj"
+    assert v.provider == "daytona"
+    assert v.provider_ref == "dt-xyz"
+    assert v.status == "ready"

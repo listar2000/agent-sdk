@@ -87,6 +87,15 @@ class SandboxRecord:
 
 
 @dataclass
+class VolumeRecord:
+    id: str
+    name: str
+    provider: str
+    provider_ref: str
+    status: str = "ready"
+
+
+@dataclass
 class SessionState:
     """In-memory runtime state binding an agent to a sandbox."""
     session_id: str
