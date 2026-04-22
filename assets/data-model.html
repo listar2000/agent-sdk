@@ -1118,30 +1118,32 @@
   <div class="section">
     <div class="section-header">
       <h2>REST API Endpoints</h2>
-      <p class="section-sub" style="color:#8b949e;">HTTP interface — agent management, session orchestration, and UI routes</p>
+      <p class="section-sub" style="color:#8b949e;">HTTP interface. Green dot = added in session/volume decoupling; amber dot = contract changed.</p>
     </div>
 
     <div class="endpoints-card">
       <div class="endpoints-card-header">API Reference</div>
       <div class="endpoints-body">
 
-        <!-- Agent endpoints -->
-        <div class="endpoint-group-label">Agent Endpoints</div>
-
+        <!-- Health -->
+        <div class="endpoint-group-label">Health</div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/health</span>
           <span class="endpoint-desc">server health check</span>
         </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/agents</span>
-          <span class="endpoint-desc">list all agents</span>
-        </div>
+
+        <!-- Agent endpoints -->
+        <div class="endpoint-group-label" style="padding-top:8px;">Agents</div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/agents</span>
           <span class="endpoint-desc">create agent config</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/agents</span>
+          <span class="endpoint-desc">list all agents</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
@@ -1151,62 +1153,154 @@
         <div class="endpoint-row">
           <span class="method-badge method-delete">DELETE</span>
           <span class="endpoint-path">/agents/{agent_id}</span>
-          <span class="endpoint-desc">delete agent</span>
+          <span class="endpoint-desc">delete agent (cascades sessions)</span>
         </div>
-        <!-- Sandbox endpoints -->
-        <div class="endpoint-group-label">Sandbox Endpoints</div>
 
-        <div class="endpoint-row">
+        <!-- Volume endpoints (ALL NEW) -->
+        <div class="endpoint-group-label" style="padding-top:8px;">Volumes <span class="badge badge-new" style="margin-left:6px;">New resource</span></div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes</span>
+          <span class="endpoint-desc">create volume — body {name, provider}</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes/provision</span>
+          <span class="endpoint-desc">create + wait for ready</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/volumes</span>
+          <span class="endpoint-desc">list volumes (?provider= filter)</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/volumes/{id_or_name}</span>
+          <span class="endpoint-desc">get volume</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-delete">DELETE</span>
+          <span class="endpoint-path">/volumes/{id_or_name}?force=false</span>
+          <span class="endpoint-desc">409 if sessions/sandboxes reference it; ?force=true cascades</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/tree</span>
+          <span class="endpoint-desc">browse volume contents (utility sandbox)</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/read</span>
+          <span class="endpoint-desc">read a file</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/edit</span>
+          <span class="endpoint-desc">write a file — body {path, content}</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+
+        <!-- Sandbox endpoints -->
+        <div class="endpoint-group-label" style="padding-top:8px;">Sandboxes <span class="badge badge-updated" style="margin-left:6px;">Updated</span></div>
+        <div class="endpoint-row is-updated">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sandboxes</span>
-          <span class="endpoint-desc">provision sandbox</span>
+          <span class="endpoint-desc">create — body now REQUIRES {volume_id, subpath}</span>
+        </div>
+        <div class="endpoint-row is-updated">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/provision</span>
+          <span class="endpoint-desc">create + install deps. Also requires {volume_id, subpath}</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/sandboxes</span>
           <span class="endpoint-desc">list all sandboxes</span>
         </div>
-        <div class="endpoint-row">
+        <div class="endpoint-row is-updated">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/sandboxes/{sandbox_id}</span>
-          <span class="endpoint-desc">get sandbox</span>
+          <span class="endpoint-desc">get sandbox — response now includes volume_id + subpath</span>
         </div>
-        <div class="endpoint-row">
+        <div class="endpoint-row is-updated">
           <span class="method-badge method-delete">DELETE</span>
           <span class="endpoint-path">/sandboxes/{sandbox_id}</span>
-          <span class="endpoint-desc">destroy sandbox</span>
+          <span class="endpoint-desc">destroy — <strong>session survives</strong> (current_sandbox_id→NULL)</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sandboxes/{sandbox_id}/stop</span>
           <span class="endpoint-desc">stop sandbox</span>
-          <span class="endpoint-new-badge">new</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sandboxes/{sandbox_id}/start</span>
-          <span class="endpoint-desc">start sandbox</span>
-          <span class="endpoint-new-badge">new</span>
+          <span class="endpoint-desc">start a stopped sandbox</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/files/tree</span>
+          <span class="endpoint-desc">browse sandbox filesystem</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/files/read</span>
+          <span class="endpoint-desc">read a file in the sandbox</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sandboxes/{sandbox_id}/files/edit</span>
+          <span class="endpoint-desc">write a file in the sandbox</span>
         </div>
 
         <!-- Session endpoints -->
-        <div class="endpoint-group-label">Session Endpoints</div>
-
-        <div class="endpoint-row">
+        <div class="endpoint-group-label" style="padding-top:8px;">Sessions <span class="badge badge-updated" style="margin-left:6px;">Updated</span></div>
+        <div class="endpoint-row is-updated">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions</span>
+          <span class="endpoint-desc">create — body REQUIRES {agent_id, volume_id}. <strong>No sandbox provisioned</strong> (lazy)</span>
+        </div>
+        <div class="endpoint-row is-updated">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions/quick</span>
-          <span class="endpoint-desc">create agent + sandbox + session</span>
-          <span class="endpoint-new-badge">new</span>
+          <span class="endpoint-desc">one-shot agent+sandbox+session — now REQUIRES volume_id</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions</span>
+          <span class="endpoint-desc">list all sessions</span>
+        </div>
+        <div class="endpoint-row is-updated">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{session_id}</span>
+          <span class="endpoint-desc">get session — response fields: volume_id, current_sandbox_id (nullable)</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{session_id}/status</span>
+          <span class="endpoint-desc">runtime status (idle, busy)</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{session_id}/log</span>
+          <span class="endpoint-desc">session telemetry (incl. sandbox_reattach events)</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions/{session_id}/resume</span>
-          <span class="endpoint-desc">resume by session_id only</span>
+          <span class="endpoint-desc">resume session in-memory state (recovers from DB if reaped)</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions/{session_id}/message</span>
-          <span class="endpoint-desc">send prompt</span>
+          <span class="endpoint-desc">send prompt (triggers lazy sandbox provision if needed)</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
@@ -1214,64 +1308,70 @@
           <span class="endpoint-desc">SSE stream</span>
         </div>
         <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sessions/{session_id}/log</span>
-          <span class="endpoint-desc">session telemetry</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sessions</span>
-          <span class="endpoint-desc">list all sessions</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sessions/{session_id}/status</span>
-          <span class="endpoint-desc">session status (idle time, busy)</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions/{session_id}/cancel</span>
           <span class="endpoint-desc">cancel running prompt</span>
-          <span class="endpoint-new-badge">new</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions/{session_id}/config</span>
-          <span class="endpoint-desc">set session config</span>
+          <span class="endpoint-desc">update session env/secrets</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions/{session_id}/sandbox/exec</span>
-          <span class="endpoint-desc">run command in the session sandbox</span>
+          <span class="endpoint-desc">run command in the session's current sandbox</span>
+        </div>
+
+        <!-- Session → sandbox control (NEW sub-group) -->
+        <div class="endpoint-group-label" style="padding-top:8px;">Session Sandbox Control <span class="badge badge-new" style="margin-left:6px;">New</span></div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{session_id}/start-sandbox</span>
+          <span class="endpoint-desc">eagerly provision a sandbox (pre-warm)</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{session_id}/stop-sandbox</span>
+          <span class="endpoint-desc">kill current sandbox; next run provisions lazily</span>
+          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row is-new">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{session_id}/reset-sandbox</span>
+          <span class="endpoint-desc">kill + re-provision immediately (emits sandbox_reattach)</span>
           <span class="endpoint-new-badge">new</span>
         </div>
 
         <!-- Admin / UI -->
-        <div class="endpoint-group-label">Admin &amp; UI</div>
+        <div class="endpoint-group-label" style="padding-top:8px;">Admin &amp; UI</div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/ui</span>
           <span class="endpoint-desc">chat UI</span>
-          <span class="endpoint-new-badge">new</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/ui/dashboard</span>
+          <span class="endpoint-desc">admin dashboard UI</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/ui/files</span>
+          <span class="endpoint-desc">file browser UI</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/admin/sessions</span>
           <span class="endpoint-desc">debug: list all sessions</span>
-          <span class="endpoint-new-badge">new</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/admin/sessions/{id}/reap</span>
+          <span class="endpoint-path">/admin/sessions/{session_id}/reap</span>
           <span class="endpoint-desc">force-reap a session</span>
-          <span class="endpoint-new-badge">new</span>
         </div>
 
-        <!-- Most sandbox operations (filesystem, desktop, clipboard) are exposed
-             through ACP tools inside an agent turn. The helper REST route
-             /sessions/{session_id}/sandbox/exec is available for shell commands. -->
       </div>
     </div>
   </div>
