@@ -1378,18 +1378,30 @@ async def stop_sandbox_route(sandbox_id: str):
 
     # Hold the sandbox lock to prevent concurrent auto-restart
     # from restarting the sandbox while we're stopping it.
+    #
+    # IMPORTANT: stop the provider instance BEFORE flipping status="stopped"
+    # in the DB. A crash between the flip and a successful stop_instance
+    # would leave "stopped" in the DB with a live container still running,
+    # and docker reconcile used to treat that as an orphan (cycle 4 MA3).
+    # Reconcile now preserves stopped+live pairs, but we still want the DB
+    # to reflect reality — only mark stopped after the provider confirms.
     async with _get_sandbox_lock(sandbox_id):
         instance = _INSTANCES.pop(sandbox_id, None)
+        if instance:
+            try:
+                await stop_instance(instance)
+            except Exception as e:
+                # Keep the row in its previous (running) status and
+                # re-register the instance so the caller can retry.
+                _INSTANCES[sandbox_id] = instance
+                log.warning("stop_sandbox_route: stop_instance failed for %s: %s",
+                            sandbox_id, e)
+                return JSONResponse(
+                    {"error": f"stop failed: {e}"}, status_code=502,
+                )
+
         record.status = "stopped"
         await upsert_sandbox(record)
-
-    # Stop the sandbox outside the lock (may be slow)
-    if instance:
-        try:
-            await stop_instance(instance)
-        except Exception as e:
-            log.warning("stop_sandbox_route: stop_instance failed for %s: %s",
-                        sandbox_id, e)
 
     return {"status": "stopped"}
 

@@ -471,8 +471,12 @@ async def reconcile_on_startup() -> None:
     For each container labeled ``agent-sdk.sandbox-id=<id>``:
 
     * Look up the DB sandbox row (via ``api.db.get_sandbox``).
-    * If no DB row exists, or the row is marked ``stopped``/``deleted``,
-      force-remove the container — it's an orphan.
+    * If no DB row exists, or the row is marked ``deleted``, force-remove
+      the container — it's an orphan.
+    * ``stopped`` rows are NOT orphans: a stopped row + an exited
+      container is a legitimate resumable pair waiting for
+      ``docker start``.  Force-removing that container would erase
+      state the user is about to resume.
     * Otherwise inspect the container for its published host port and
       reconstruct a ``ProviderInstance`` in ``_INSTANCES`` keyed by the
       sandbox_id, so later destroy/stop calls can find it.
@@ -520,9 +524,12 @@ async def reconcile_on_startup() -> None:
         except Exception as e:
             log.warning("docker reconcile: get_sandbox(%s) failed: %s", sandbox_id, e)
             continue
+        # "stopped" is NOT orphan — it's a resumable pair (DB row + exited
+        # container waiting for docker start).  Only ``deleted`` (or no row
+        # at all) qualifies the container as an orphan.
         is_orphan = (
             sb is None
-            or getattr(sb, "status", None) in ("stopped", "deleted")
+            or getattr(sb, "status", None) == "deleted"
         )
         if is_orphan:
             log.info(
