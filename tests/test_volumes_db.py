@@ -120,3 +120,23 @@ async def test_sandbox_record_roundtrip_with_volume():
         assert got.subpath == "agents/a1/home"
     finally:
         await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_volume_id_is_not_null_after_backfill():
+    """After all migrations run, sessions.volume_id and sandboxes.volume_id are NOT NULL."""
+    await dbmod.init_pool()
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT table_name, column_name, is_nullable "
+                "FROM information_schema.columns "
+                "WHERE (table_name='sessions' AND column_name='volume_id') "
+                "   OR (table_name='sandboxes' AND column_name IN ('volume_id', 'subpath'))"
+            )).fetchall()
+        state = {(r["table_name"], r["column_name"]): r["is_nullable"] for r in rows}
+        assert state.get(("sessions", "volume_id")) == "NO", f"sessions.volume_id should be NOT NULL: {state}"
+        assert state.get(("sandboxes", "volume_id")) == "NO", f"sandboxes.volume_id should be NOT NULL: {state}"
+        assert state.get(("sandboxes", "subpath")) == "NO", f"sandboxes.subpath should be NOT NULL: {state}"
+    finally:
+        await dbmod.close_pool()

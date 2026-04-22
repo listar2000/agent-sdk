@@ -121,6 +121,68 @@ _MIGRATIONS = [
     # 2026-04-21: sandboxes become volume-aware.
     "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS volume_id TEXT REFERENCES volumes(id) ON DELETE RESTRICT",
     "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS subpath  TEXT",
+    # 2026-04-21: backfill volume_id + subpath for pre-existing rows, then enforce NOT NULL.
+    # Create a "legacy" volume per distinct provider in the sandboxes table.
+    """DO $$
+    DECLARE p TEXT;
+    DECLARE legacy_id TEXT;
+    BEGIN
+        -- Providers from sandboxes
+        FOR p IN SELECT DISTINCT provider FROM sandboxes WHERE provider IS NOT NULL LOOP
+            legacy_id := 'vol_legacy_' || p;
+            INSERT INTO volumes (id, name, provider, provider_ref, status)
+            VALUES (legacy_id, 'legacy-' || p, p, 'legacy-backfill', 'ready')
+            ON CONFLICT (id) DO NOTHING;
+        END LOOP;
+        -- If there are no sandboxes but there are sessions with NULL volume_id,
+        -- ensure at least one legacy volume exists so the backfill has a target.
+        IF EXISTS (SELECT 1 FROM sessions WHERE volume_id IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM volumes) THEN
+            INSERT INTO volumes (id, name, provider, provider_ref, status)
+            VALUES ('vol_legacy_daytona', 'legacy-daytona', 'daytona', 'legacy-backfill', 'ready')
+            ON CONFLICT (id) DO NOTHING;
+        END IF;
+    END $$""",
+    # Backfill sessions.volume_id from the matching legacy volume (by provider of current sandbox).
+    # If the session has no current sandbox, point at the first legacy volume.
+    """UPDATE sessions s SET volume_id = (
+        SELECT id FROM volumes
+        WHERE provider = COALESCE(
+            (SELECT provider FROM sandboxes WHERE id = s.current_sandbox_id),
+            (SELECT provider FROM volumes LIMIT 1)
+        ) LIMIT 1
+    ) WHERE s.volume_id IS NULL""",
+    # Backfill sandboxes.volume_id from the matching legacy volume.
+    """UPDATE sandboxes SET volume_id = (
+        SELECT id FROM volumes WHERE provider = sandboxes.provider LIMIT 1
+    ) WHERE volume_id IS NULL""",
+    # Backfill sandboxes.subpath with a placeholder for pre-existing rows.
+    "UPDATE sandboxes SET subpath = 'legacy' WHERE subpath IS NULL",
+    # Enforce NOT NULL now that backfill is done.
+    """DO $$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='sessions' AND column_name='volume_id' AND is_nullable='YES'
+        ) THEN
+            ALTER TABLE sessions ALTER COLUMN volume_id SET NOT NULL;
+        END IF;
+    END $$""",
+    """DO $$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='sandboxes' AND column_name='volume_id' AND is_nullable='YES'
+        ) THEN
+            ALTER TABLE sandboxes ALTER COLUMN volume_id SET NOT NULL;
+        END IF;
+    END $$""",
+    """DO $$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='sandboxes' AND column_name='subpath' AND is_nullable='YES'
+        ) THEN
+            ALTER TABLE sandboxes ALTER COLUMN subpath SET NOT NULL;
+        END IF;
+    END $$""",
 ]
 
 
