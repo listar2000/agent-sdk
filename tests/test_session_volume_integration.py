@@ -643,3 +643,73 @@ async def test_install_supervisor_fault_leaves_other_agents_untouched(client):
     cached = set(vol.supervisor_agent_types or [])
     assert "claude" in cached, "claude cache must survive an unrelated failed install"
     assert "codex" not in cached, "failed codex install must not populate the cache"
+
+
+# ---------------------------------------------------------------------------
+# MT6 — install_supervisor must not corrupt a live sandbox on the same volume.
+# The docker provider's historical ``rm -rf /work/supervisor`` (MA2) would
+# delete files out from under a running container. With the staging+rename
+# atomic swap now in place the reinstall must be invisible to the live
+# sandbox's health endpoint.
+#
+# Uses the local provider (simplest to drive end-to-end without docker).
+# Skipped when npm/node are absent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_install_does_not_corrupt_live_sandbox(client, tmp_path, monkeypatch):
+    """Live sandbox on volume V; install_supervisor runs again on V.
+    Sandbox's health endpoint must keep responding throughout."""
+    import shutil as _shutil
+    import sys as _sys
+    if _shutil.which("npm") is None or _shutil.which("node") is None:
+        pytest.skip("npm + node required for live-sandbox install test")
+
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+    if _SRC not in _sys.path:
+        _sys.path.insert(0, _SRC)
+    from api.providers import local  # noqa: E402
+    import httpx as _httpx  # noqa: E402
+
+    # Stand up a volume + install supervisor for claude.
+    vol_name = "vol-mt6"
+    ref = await local.create_volume(vol_name)
+    await local.install_supervisor(ref, "claude")
+
+    inst = await local.create_sandbox(
+        volume_ref=ref, subpath="agents/live-install/home",
+        agent_type="claude",
+    )
+    try:
+        # Baseline: supervisor is healthy.
+        async with _httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{inst.url}/v1/health")
+        assert r.status_code == 200
+
+        # Trigger a fresh install_supervisor on the SAME volume. A naive
+        # ``rm -rf`` + ``os.rename`` would delete files the supervisor's
+        # children or future require() calls may need.  The staging +
+        # rename-into-place flow should be safe: the running node process
+        # already holds its supervisor.js fd.
+        await local.install_supervisor(ref, "claude")
+
+        # After reinstall, the live sandbox's health endpoint must still
+        # respond. (The process was not restarted — it's serving from its
+        # existing open fds.)
+        async with _httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{inst.url}/v1/health")
+        assert r.status_code == 200, (
+            f"live sandbox corrupted by concurrent reinstall: {r.status_code}"
+        )
+
+        # The new install should be on disk and functional for a fresh
+        # create_sandbox as well.
+        new_sup = os.path.join(ref, "system", "supervisor", "supervisor.js")
+        assert os.path.isfile(new_sup)
+    finally:
+        try:
+            await local.destroy_sandbox(inst)
+        except Exception:
+            pass
