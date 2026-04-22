@@ -735,10 +735,11 @@ async def create_daytona_volume(name: str) -> str:
 
 
 async def delete_daytona_volume(provider_ref: str) -> None:
-    """Delete a Daytona volume by provider-native id."""
+    """Delete a Daytona volume by provider-native id (UUID)."""
+    from daytona_api_client import VolumesApi
     client = _get_daytona_client()
-    vol = await asyncio.to_thread(client.volume.get, provider_ref)
-    await asyncio.to_thread(client.volume.delete, vol)
+    volumes_api = VolumesApi(client._api_client)
+    await asyncio.to_thread(volumes_api.delete_volume, provider_ref)
 
 
 async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
