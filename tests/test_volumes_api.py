@@ -30,7 +30,7 @@ async def client():
 
 @pytest.mark.asyncio
 async def test_post_volume_creates_row(client):
-    with patch("api.providers.create_daytona_volume",
+    with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-fake-ref")):
         r = await client.post("/volumes", json={"name": "proj-api-test", "provider": "daytona"})
     assert r.status_code == 200
@@ -42,7 +42,7 @@ async def test_post_volume_creates_row(client):
 
 @pytest.mark.asyncio
 async def test_get_and_list_volumes(client):
-    with patch("api.providers.create_daytona_volume",
+    with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-r1")):
         await client.post("/volumes", json={"name": "p1", "provider": "daytona"})
 
@@ -57,7 +57,7 @@ async def test_get_and_list_volumes(client):
 
 @pytest.mark.asyncio
 async def test_delete_volume(client):
-    with patch("api.providers.create_daytona_volume",
+    with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-del")), \
          patch("api.providers.delete_daytona_volume",
                new=AsyncMock(return_value=None)):
@@ -69,11 +69,51 @@ async def test_delete_volume(client):
 
 
 @pytest.mark.asyncio
+async def test_delete_volume_calls_provider_for_docker(client):
+    """Mi8: DELETE /volumes/{id} must dispatch to the provider's
+    ``delete_volume`` for docker/local too — previously only daytona got
+    provider-side cleanup and docker/local volumes leaked.
+    """
+    # Patch both create and delete on the docker module so no real daemon is
+    # touched; assert delete_volume is called with the provider ref we minted.
+    with patch("api.providers.docker.create_volume",
+               new=AsyncMock(return_value="docker-vol-mi8")), \
+         patch("api.providers.docker.delete_volume",
+               new=AsyncMock(return_value=None)) as del_mock:
+        r = await client.post("/volumes",
+                              json={"name": "mi8-docker", "provider": "docker"})
+        assert r.status_code == 200, r.text
+
+        r = await client.delete("/volumes/mi8-docker")
+        assert r.status_code == 204
+    del_mock.assert_awaited_once_with("docker-vol-mi8")
+
+
+@pytest.mark.asyncio
+async def test_delete_volume_provider_error_still_removes_row(client):
+    """Mi8: if the provider-side delete fails (docker daemon hiccup) we
+    still remove the DB row — a dangling volume is recoverable manually,
+    a phantom DB row the user can't clear is not."""
+    with patch("api.providers.docker.create_volume",
+               new=AsyncMock(return_value="docker-vol-err")), \
+         patch("api.providers.docker.delete_volume",
+               new=AsyncMock(side_effect=RuntimeError("docker daemon unreachable"))):
+        r = await client.post("/volumes",
+                              json={"name": "mi8-err", "provider": "docker"})
+        assert r.status_code == 200, r.text
+
+        r = await client.delete("/volumes/mi8-err")
+        assert r.status_code == 204
+    r = await client.get("/volumes/mi8-err")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_delete_volume_conflict_if_session_exists(client):
     """DELETE returns 409 if a session references the volume; force=true cascades."""
     from api.models import AgentConfig, AgentRecord
     await dbmod.upsert_agent(AgentRecord(id="a1", name="A1", config=AgentConfig()))
-    with patch("api.providers.create_daytona_volume",
+    with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-c")):
         await client.post("/volumes", json={"name": "conflict", "provider": "daytona"})
     v = await dbmod.get_volume_by_name("conflict")
@@ -104,7 +144,7 @@ async def test_delete_volume_conflict_if_session_exists(client):
 
 @pytest.mark.asyncio
 async def test_provision_volume_waits_for_ready(client):
-    with patch("api.providers.create_daytona_volume",
+    with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-prov")):
         r = await client.post("/volumes/provision",
                               json={"name": "prov-test", "provider": "daytona"})

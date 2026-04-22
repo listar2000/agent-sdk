@@ -189,6 +189,74 @@ async def test_stop_sandbox_clears_pointer(client):
 
 
 @pytest.mark.asyncio
+async def test_stop_sandbox_route_keeps_instance_on_db_failure(client):
+    """Mi7: if ``POST /sandboxes/{id}/stop`` succeeds in stopping the
+    container but the subsequent DB update fails, ``_INSTANCES`` must
+    stay populated so the next reconcile / retry can still locate the
+    sandbox.  Popping the map first would zombify the container (already
+    exited, but the DB row still reports 'running' and the map is empty
+    — a subsequent ensure-alive would provision a duplicate)."""
+    from api.models import AgentConfig, AgentRecord, VolumeRecord, SandboxRecord
+    from api.providers import ProviderInstance
+
+    await dbmod.upsert_agent(AgentRecord(id="agent_mi7", name="M", config=AgentConfig()))
+    await dbmod.upsert_volume(VolumeRecord(id="vol_mi7", name="v-mi7",
+                                           provider="daytona", provider_ref="dt-mi7"))
+    sb_id = "sb_mi7"
+    await dbmod.upsert_sandbox(SandboxRecord(
+        id=sb_id, provider="daytona", sandbox_ref="dt-sb-mi7",
+        status="running", root="/home/daytona",
+        volume_id="vol_mi7", subpath="agents/agent_mi7/home",
+    ))
+    inst = ProviderInstance(provider="daytona", url="http://fake:7000",
+                            root="/home/daytona", sandbox_id="dt-sb-mi7")
+    srv._INSTANCES[sb_id] = inst
+    try:
+        # stop_instance succeeds; upsert_sandbox blows up to simulate a DB hiccup.
+        with patch("api.server.stop_instance", new=AsyncMock(return_value=None)), \
+             patch("api.server.upsert_sandbox",
+                   new=AsyncMock(side_effect=RuntimeError("db down"))):
+            r = await client.post(f"/sandboxes/{sb_id}/stop")
+        assert r.status_code == 502, f"got {r.status_code}: {r.text}"
+        # _INSTANCES must still carry the entry — otherwise a subsequent
+        # ensure-alive would provision a duplicate container.
+        assert sb_id in srv._INSTANCES, (
+            "_INSTANCES must remain populated on DB failure so reconcile "
+            "can still locate the sandbox"
+        )
+    finally:
+        srv._INSTANCES.pop(sb_id, None)
+
+
+@pytest.mark.asyncio
+async def test_stop_sandbox_route_pops_instance_on_success(client):
+    """Mi7 symmetry: on the happy path — stop_instance succeeds AND the
+    DB update succeeds — ``_INSTANCES`` is cleared as before."""
+    from api.models import AgentConfig, AgentRecord, VolumeRecord, SandboxRecord
+    from api.providers import ProviderInstance
+
+    await dbmod.upsert_agent(AgentRecord(id="agent_mi7b", name="Mb", config=AgentConfig()))
+    await dbmod.upsert_volume(VolumeRecord(id="vol_mi7b", name="v-mi7b",
+                                           provider="daytona", provider_ref="dt-mi7b"))
+    sb_id = "sb_mi7b"
+    await dbmod.upsert_sandbox(SandboxRecord(
+        id=sb_id, provider="daytona", sandbox_ref="dt-sb-mi7b",
+        status="running", root="/home/daytona",
+        volume_id="vol_mi7b", subpath="agents/agent_mi7b/home",
+    ))
+    inst = ProviderInstance(provider="daytona", url="http://fake:7001",
+                            root="/home/daytona", sandbox_id="dt-sb-mi7b")
+    srv._INSTANCES[sb_id] = inst
+    try:
+        with patch("api.server.stop_instance", new=AsyncMock(return_value=None)):
+            r = await client.post(f"/sandboxes/{sb_id}/stop")
+        assert r.status_code == 200, f"got {r.status_code}: {r.text}"
+        assert sb_id not in srv._INSTANCES
+    finally:
+        srv._INSTANCES.pop(sb_id, None)
+
+
+@pytest.mark.asyncio
 async def test_reset_sandbox_swaps(client):
     from api.models import AgentConfig, AgentRecord, VolumeRecord, SandboxRecord
     from api.providers import ProviderInstance

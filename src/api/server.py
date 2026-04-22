@@ -987,19 +987,14 @@ async def create_volume(body: _VolumeCreateBody):
     if await get_volume_by_name(body.name) is not None:
         raise HTTPException(409, f"Volume '{body.name}' already exists")
 
-    # Dispatch through each provider's uniform ``create_volume`` helper.
-    # Daytona's hot-path continues to call ``create_daytona_volume`` under
-    # the dispatcher so the existing module-level provider fixtures keep
-    # patching the right symbol.
-    if body.provider == "daytona":
-        # Keep the direct-call form — the daytona.create_volume wrapper
-        # delegates to this same function, but existing tests patch
-        # ``api.providers.create_daytona_volume`` directly.
-        provider_ref = await _providers_mod.create_daytona_volume(body.name)
-    elif body.provider in _providers_mod._PROVIDER_MODS:
-        provider_ref = await _providers_mod.create_volume(body.provider, body.name)
-    else:
+    # Mi4: single dispatch path through the uniform ``create_volume`` helper.
+    # Tests that used to patch ``api.providers.create_daytona_volume`` should
+    # instead patch ``api.providers.daytona.create_daytona_volume`` (the
+    # underlying function the dispatcher calls for provider="daytona") —
+    # that's the function the dispatcher resolves via ``_PROVIDER_MODS``.
+    if body.provider not in _providers_mod._PROVIDER_MODS:
         raise HTTPException(400, f"Unknown provider: {body.provider}")
+    provider_ref = await _providers_mod.create_volume(body.provider, body.name)
 
     vol = VolumeRecord(
         id=_gen_volume_id(),
@@ -1013,10 +1008,7 @@ async def create_volume(body: _VolumeCreateBody):
     except Exception:
         # Clean up the now-orphaned provider volume on DB failure.
         try:
-            if body.provider == "daytona":
-                await _providers_mod.delete_daytona_volume(provider_ref)
-            else:
-                await _providers_mod.delete_volume(body.provider, provider_ref)
+            await _providers_mod.delete_volume(body.provider, provider_ref)
         except Exception as cleanup_err:
             log.warning(
                 "orphaned %s volume %s: rollback delete failed: %s",
@@ -1089,6 +1081,19 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
             if "forbidden" not in msg and "not found" not in msg and "404" not in msg:
                 raise
             log.warning("volume %s provider delete skipped: %s", vol.id, e)
+    else:
+        # Mi8: docker/local volumes previously leaked on DELETE because only
+        # the daytona branch cleaned up the provider side.  Call the uniform
+        # dispatcher but wrap in try/except so a provider hiccup can't block
+        # the DB row deletion — a dangling named volume is recoverable; a
+        # phantom DB row the user can't clear is not.
+        try:
+            await _providers_mod.delete_volume(vol.provider, vol.provider_ref)
+        except Exception as e:
+            log.warning(
+                "volume %s (%s) provider delete failed; DB row still removed: %s",
+                vol.id, vol.provider, e,
+            )
     await delete_volume(vol.id)
 
 
@@ -1405,15 +1410,19 @@ async def stop_sandbox_route(sandbox_id: str):
     # and docker reconcile used to treat that as an orphan (cycle 4 MA3).
     # Reconcile now preserves stopped+live pairs, but we still want the DB
     # to reflect reality — only mark stopped after the provider confirms.
+    #
+    # Mi7: ``_INSTANCES`` is only popped AFTER the DB update succeeds.  If
+    # the UPDATE fails we keep the entry so reconcile / retry can still
+    # find the container via the in-process map; otherwise the container
+    # has exited (stop_instance returned) but the DB row still says
+    # "running" and the map is empty — a subsequent _ensure_sandbox_alive
+    # would provision a second container with the same label.
     async with _get_sandbox_lock(sandbox_id):
-        instance = _INSTANCES.pop(sandbox_id, None)
+        instance = _INSTANCES.get(sandbox_id)
         if instance:
             try:
                 await stop_instance(instance)
             except Exception as e:
-                # Keep the row in its previous (running) status and
-                # re-register the instance so the caller can retry.
-                _INSTANCES[sandbox_id] = instance
                 log.warning("stop_sandbox_route: stop_instance failed for %s: %s",
                             sandbox_id, e)
                 return JSONResponse(
@@ -1421,7 +1430,25 @@ async def stop_sandbox_route(sandbox_id: str):
                 )
 
         record.status = "stopped"
-        await upsert_sandbox(record)
+        try:
+            await upsert_sandbox(record)
+        except Exception as e:
+            # Provider is stopped but DB flip failed.  Leave _INSTANCES as-is
+            # so the next reconcile or a client retry can still locate the
+            # container (already exited; upsert_sandbox is idempotent).
+            # Returning 502 prompts the client to retry.
+            log.warning(
+                "stop_sandbox_route: DB update failed for %s "
+                "(container stopped; _INSTANCES kept): %s",
+                sandbox_id, e,
+            )
+            return JSONResponse(
+                {"error": f"stop succeeded but DB update failed: {e}"},
+                status_code=502,
+            )
+
+        # DB update succeeded — drop the in-process entry now.
+        _INSTANCES.pop(sandbox_id, None)
 
     return {"status": "stopped"}
 
