@@ -412,7 +412,7 @@
   ═══════════════════════════════════════════════ -->
   <div class="page-header">
     <h1>AFE Agent SDK — Data Model</h1>
-    <p class="subtitle">Schema reference for the auto-feature-engineer agent server</p>
+    <p class="subtitle">Schema reference. <strong>Sessions bind to a durable volume; sandboxes are ephemeral compute leases that mount that volume.</strong> Sandbox death doesn't kill the session — a new one gets provisioned with the same volume+subpath, and the CLI resumes from the transcript on disk.</p>
   </div>
 
 
@@ -462,6 +462,59 @@
           </div>
         </div>
 
+        <!-- volumes table (NEW) -->
+        <div class="card">
+          <div class="card-header ch-green">
+            <div class="table-name">
+              <span class="dot dot-green"></span>
+              volumes
+            </div>
+            <div class="badges">
+              <span class="badge badge-new">New</span>
+              <span class="badge badge-green">Postgres</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-pk">PK</span></div>
+              <span class="field-name">id</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">vol_&lt;hex&gt;</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
+              <span class="field-name">name</span>
+              <span class="field-type">TEXT UNIQUE NOT NULL</span>
+              <span class="field-desc">user-chosen, e.g. "my-project"</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
+              <span class="field-name">provider</span>
+              <span class="field-type">TEXT NOT NULL</span>
+              <span class="field-desc">"daytona" | "docker" | "local"</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
+              <span class="field-name">provider_ref</span>
+              <span class="field-type">TEXT NOT NULL</span>
+              <span class="field-desc">Daytona volume UUID / Docker vol name / host path</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
+              <span class="field-name">status</span>
+              <span class="field-type">TEXT NOT NULL</span>
+              <span class="field-desc">default 'ready'</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
+              <span class="field-name">created_at</span>
+              <span class="field-type">TIMESTAMPTZ</span>
+              <span class="field-desc">default now()</span>
+            </div>
+            <div class="relation-note">Durable storage, independent of any sandbox. Lifecycle via <code style="font-family:monospace;color:#fb923c;">/volumes</code> CRUD.</div>
+          </div>
+        </div>
+
         <!-- sandboxes table -->
         <div class="card">
           <div class="card-header ch-green">
@@ -470,6 +523,7 @@
               sandboxes
             </div>
             <div class="badges">
+              <span class="badge badge-updated">Updated</span>
               <span class="badge badge-green">Postgres</span>
             </div>
           </div>
@@ -500,10 +554,29 @@
             </div>
             <div class="field">
               <div class="field-badges"></div>
+              <span class="field-name">root</span>
+              <span class="field-type">TEXT NOT NULL</span>
+              <span class="field-desc">default '/tmp'</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-fk">FK</span></div>
+              <span class="field-name">volume_id</span>
+              <span class="field-type">TEXT NOT NULL</span>
+              <span class="field-desc">→ volumes, ON DELETE RESTRICT</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"></div>
+              <span class="field-name">subpath</span>
+              <span class="field-type">TEXT NOT NULL</span>
+              <span class="field-desc">e.g. agents/&lt;agent_id&gt;/home — mounted at /home/daytona</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
               <span class="field-name">created_at</span>
               <span class="field-type">TIMESTAMPTZ</span>
               <span class="field-desc">default now()</span>
             </div>
+            <div class="relation-note">Sandbox = ephemeral compute + a volume mount. Killing a sandbox never loses the session's data.</div>
           </div>
         </div>
 
@@ -515,6 +588,7 @@
               sessions
             </div>
             <div class="badges">
+              <span class="badge badge-updated">Updated</span>
               <span class="badge badge-orange">Postgres</span>
             </div>
           </div>
@@ -529,26 +603,44 @@
               <div class="field-badges"><span class="badge-fk">FK</span></div>
               <span class="field-name">agent_id</span>
               <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">→ agents</span>
+              <span class="field-desc">→ agents, ON DELETE CASCADE</span>
             </div>
-            <div class="field">
+            <div class="field is-new">
               <div class="field-badges"><span class="badge-fk">FK</span></div>
-              <span class="field-name">sandbox_id</span>
+              <span class="field-name">volume_id</span>
               <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">→ sandboxes</span>
+              <span class="field-desc">→ volumes, ON DELETE RESTRICT</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-fk">FK</span></div>
+              <span class="field-name">current_sandbox_id</span>
+              <span class="field-type">TEXT NULL</span>
+              <span class="field-desc">→ sandboxes, ON DELETE SET NULL (was sandbox_id NOT NULL CASCADE)</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">inner_session_id</span>
               <span class="field-type">TEXT</span>
-              <span class="field-desc">ACP session handle</span>
+              <span class="field-desc">ACP session handle (used for --resume)</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">env</span>
+              <span class="field-type">JSONB NOT NULL</span>
+              <span class="field-desc">non-secret env, default {}</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">secrets</span>
+              <span class="field-type">JSONB NOT NULL</span>
+              <span class="field-desc">default {} (plaintext for now)</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">created_at</span>
               <span class="field-type">TIMESTAMPTZ</span>
             </div>
-            <div class="relation-note">Stores the agent/sandbox/session binding. Resume via <code style="font-family:monospace;color:#fb923c;">POST /sessions/{id}/resume</code>.</div>
+            <div class="relation-note">Session now binds to a <strong>volume</strong> (durable). <code style="font-family:monospace;color:#fb923c;">current_sandbox_id</code> is the ephemeral compute lease — nullable, swapped transparently when the sandbox dies.</div>
           </div>
         </div>
 
@@ -585,14 +677,14 @@
             <div class="field">
               <div class="field-badges"><span class="badge-fk">FK</span></div>
               <span class="field-name">sandbox_id</span>
-              <span class="field-type">TEXT</span>
-              <span class="field-desc">→ sandboxes</span>
+              <span class="field-type">TEXT NULL</span>
+              <span class="field-desc">→ sandboxes, ON DELETE SET NULL</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">event_type</span>
               <span class="field-type">TEXT</span>
-              <span class="field-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | turn_end | error</span>
+              <span class="field-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | turn_end | error | <strong style="color:#4ade80;">sandbox_reattach</strong></span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
