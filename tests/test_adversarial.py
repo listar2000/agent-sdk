@@ -1125,7 +1125,8 @@ class TestServerEndpointAdversarial:
         fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
                                 provider_ref="dt-x", status="ready")
         with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")), \
-             patch("api.server.get_volume", return_value=fake_vol):
+             patch("api.server.get_volume", return_value=fake_vol), \
+             patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
             resp = await async_client.post("/sessions/quick", json={
                 "name": "test",
                 "provider": "daytona",
@@ -1179,14 +1180,16 @@ class TestServerEndpointAdversarial:
 
 class TestSandboxRecordDeriveUrl:
 
-    def test_local_derives_url_from_ref(self):
-        """SandboxRecord with local provider derives URL from sandbox_ref port."""
-        rec = SandboxRecord(id="s1", provider="local", sandbox_ref="9999")
+    def test_local_derives_url_from_listen_port(self):
+        """SandboxRecord with local provider derives URL from listen_port."""
+        rec = SandboxRecord(id="s1", provider="local", sandbox_ref="pid-1234",
+                            listen_port=9999)
         assert rec.derive_url() == "http://localhost:9999"
 
-    def test_docker_derives_url_from_ref(self):
-        """SandboxRecord with docker provider derives URL from sandbox_ref port."""
-        rec = SandboxRecord(id="s1", provider="docker", sandbox_ref="8888")
+    def test_docker_derives_url_from_listen_port(self):
+        """SandboxRecord with docker provider derives URL from listen_port."""
+        rec = SandboxRecord(id="s1", provider="docker", sandbox_ref="cid-abc",
+                            listen_port=8888)
         assert rec.derive_url() == "http://localhost:8888"
 
     def test_daytona_derive_url_raises(self):
