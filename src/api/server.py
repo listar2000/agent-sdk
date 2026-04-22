@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
@@ -30,17 +31,22 @@ from .db import (
     close_pool,
     delete_agent,
     delete_sandbox,
+    delete_volume,
     get_agent,
     get_any_session_for_sandbox,
+    get_db,
     get_sandbox,
     get_session,
     get_session_env,
     get_session_log,
     get_session_secrets,
+    get_volume,
+    get_volume_by_name,
     init_db,
     init_pool,
     list_agents,
     list_sandboxes,
+    list_volumes,
     log_event,
     session_has_log_entries,
     update_session_env,
@@ -48,6 +54,7 @@ from .db import (
     upsert_agent,
     upsert_sandbox,
     upsert_session,
+    upsert_volume,
 )
 from .models import (
     _KICK_SENTINEL,
@@ -64,7 +71,9 @@ from .models import (
     PendingPrompt,
     SandboxRecord,
     SessionState,
+    VolumeRecord,
 )
+from . import providers as _providers_mod
 from .providers import (
     PORT_BASED_PROVIDERS,
     ProviderInstance,
@@ -932,6 +941,89 @@ async def delete_agent_route(agent_id: str):
         return JSONResponse({"error": "agent not found"}, status_code=404)
     await delete_agent(agent_id)
     return {"status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Volume CRUD
+# ---------------------------------------------------------------------------
+
+
+class _VolumeCreateBody(BaseModel):
+    name: str
+    provider: str
+
+
+def _gen_volume_id() -> str:
+    return f"vol_{uuid.uuid4().hex[:12]}"
+
+
+@app.post("/volumes")
+async def create_volume(body: _VolumeCreateBody):
+    if body.provider == "daytona":
+        provider_ref = await _providers_mod.create_daytona_volume(body.name)
+    elif body.provider == "docker":
+        raise HTTPException(501, "Docker volumes not implemented yet")
+    elif body.provider == "local":
+        raise HTTPException(501, "Local volumes not implemented yet")
+    else:
+        raise HTTPException(400, f"Unknown provider: {body.provider}")
+
+    vol = VolumeRecord(
+        id=_gen_volume_id(),
+        name=body.name,
+        provider=body.provider,
+        provider_ref=provider_ref,
+        status="ready",
+    )
+    await upsert_volume(vol)
+    return vol
+
+
+@app.get("/volumes")
+async def list_volumes_route(provider: str | None = None):
+    return await list_volumes(provider)
+
+
+@app.get("/volumes/{id_or_name}")
+async def get_volume_route(id_or_name: str):
+    vol = await get_volume(id_or_name)
+    if vol is None:
+        vol = await get_volume_by_name(id_or_name)
+    if vol is None:
+        raise HTTPException(404, "Volume not found")
+    return vol
+
+
+@app.delete("/volumes/{id_or_name}", status_code=204)
+async def delete_volume_route(id_or_name: str, force: bool = False):
+    vol = await get_volume(id_or_name)
+    if vol is None:
+        vol = await get_volume_by_name(id_or_name)
+    if vol is None:
+        raise HTTPException(404, "Volume not found")
+
+    # Check for referencing sessions.
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (vol.id,)
+        )).fetchone()
+        session_count = row["n"]
+
+    if session_count > 0 and not force:
+        raise HTTPException(
+            409,
+            f"Volume has {session_count} session(s). Use ?force=true to cascade.",
+        )
+
+    if force and session_count > 0:
+        async with get_db() as conn:
+            await conn.execute(
+                "DELETE FROM sessions WHERE volume_id = %s", (vol.id,)
+            )
+
+    if vol.provider == "daytona":
+        await _providers_mod.delete_daytona_volume(vol.provider_ref)
+    await delete_volume(vol.id)
 
 
 # ---------------------------------------------------------------------------
