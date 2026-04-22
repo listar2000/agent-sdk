@@ -1048,10 +1048,12 @@ class _VolumeEditBody(_BaseModel):
 
 
 def _safe_path(p: str) -> str:
-    """Normalize a path: strip leading /, reject traversal."""
+    """Normalize a path: strip leading /, reject traversal and shell metacharacters."""
     p = p.lstrip("/")
     if ".." in p.split("/"):
         raise HTTPException(400, "path traversal not allowed")
+    if any(c in p for c in "\x00\n\r"):
+        raise HTTPException(400, "invalid control characters in path")
     return p
 
 
@@ -1074,13 +1076,15 @@ async def _destroy_utility_sandbox(inst):
 
 @app.get("/volumes/{id_or_name}/files/tree")
 async def volume_files_tree(id_or_name: str, path: str = ""):
+    import shlex
     vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
     if not vol:
         raise HTTPException(404, "Volume not found")
     p = _safe_path(path)
+    abs_path = shlex.quote(f"/home/daytona/{p}")
     inst = await _with_utility_sandbox(vol)
     try:
-        cmd = f"find /home/daytona/{p} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null"
+        cmd = f"find {abs_path} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null"
         res = await _providers_mod.exec_in_instance(inst, cmd, timeout=30)
         return {"tree": res.stdout}
     finally:
@@ -1089,13 +1093,15 @@ async def volume_files_tree(id_or_name: str, path: str = ""):
 
 @app.get("/volumes/{id_or_name}/files/read")
 async def volume_files_read(id_or_name: str, path: str):
+    import shlex
     vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
     if not vol:
         raise HTTPException(404, "Volume not found")
     p = _safe_path(path)
+    abs_path = shlex.quote(f"/home/daytona/{p}")
     inst = await _with_utility_sandbox(vol)
     try:
-        res = await _providers_mod.exec_in_instance(inst, f"cat /home/daytona/{p}", timeout=30)
+        res = await _providers_mod.exec_in_instance(inst, f"cat {abs_path}", timeout=30)
         if res.exit_code != 0:
             raise HTTPException(404, f"File not found or unreadable: {res.stderr}")
         return {"content": res.stdout}
@@ -1105,17 +1111,20 @@ async def volume_files_read(id_or_name: str, path: str):
 
 @app.post("/volumes/{id_or_name}/files/edit", status_code=204)
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
+    import base64 as _base64
+    import shlex
     vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
     if not vol:
         raise HTTPException(404, "Volume not found")
     p = _safe_path(body.path)
+    abs_path = shlex.quote(f"/home/daytona/{p}")
     inst = await _with_utility_sandbox(vol)
     try:
-        import base64 as _base64
         b64 = _base64.b64encode(body.content.encode()).decode()
+        # abs_path is shlex-quoted; b64 only contains [A-Za-z0-9+/=] so single-quoting is safe.
         cmd = (
-            f"mkdir -p $(dirname /home/daytona/{p}) && "
-            f"echo '{b64}' | base64 -d > /home/daytona/{p}"
+            f"mkdir -p \"$(dirname {abs_path})\" && "
+            f"echo '{b64}' | base64 -d > {abs_path}"
         )
         res = await _providers_mod.exec_in_instance(inst, cmd, timeout=30)
         if res.exit_code != 0:
