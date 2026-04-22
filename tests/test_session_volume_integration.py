@@ -95,10 +95,11 @@ async def test_message_lazily_provisions_sandbox(client):
     async def fake_wait_for_health(*a, **kw):
         return True
 
-    with patch("api.providers.create_daytona", new=AsyncMock(side_effect=fake_create)), \
+    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
          patch("api.providers._wait_for_health", new=AsyncMock(side_effect=fake_wait_for_health)), \
          patch("api.server._start_sse_reader", MagicMock(return_value=None)), \
          patch("api.server._submit_prompt", MagicMock(return_value=None)), \
+         patch("api.server._do_resume", new=AsyncMock(return_value=None)), \
          patch("api.server.start_supervisor_in_sandbox", new=AsyncMock(return_value=None)):
         r = await client.post(f"/sessions/{sid}/message", json={"message": "hi"})
     # The /message call may fail at the "not connected" stage (no real ACP client)
@@ -127,7 +128,7 @@ async def test_start_sandbox_provisions_eagerly(client):
         return ProviderInstance(provider="daytona", url="http://fake:7000",
                                 root="/home/daytona", sandbox_id="sb-eager-1")
 
-    with patch("api.providers.create_daytona", new=AsyncMock(side_effect=fake_create)):
+    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
         r = await client.post(f"/sessions/{sid}/start-sandbox")
     assert r.status_code == 200, f"got {r.status_code}: {r.text}"
     body = r.json()
@@ -180,7 +181,7 @@ async def test_reset_sandbox_swaps(client):
                                 root="/home/daytona", sandbox_id="dt-new")
 
     with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
-         patch("api.providers.create_daytona", new=AsyncMock(side_effect=fake_create)):
+         patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
         r = await client.post(f"/sessions/{sid}/reset-sandbox")
     assert r.status_code == 200
     body = r.json()
@@ -211,7 +212,7 @@ async def test_reset_sandbox_emits_reattach_event(client):
                                 root="/home/daytona", sandbox_id="dt-new")
 
     with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
-         patch("api.providers.create_daytona", new=AsyncMock(side_effect=fake_create)):
+         patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
         r = await client.post(f"/sessions/{sid}/reset-sandbox")
     assert r.status_code == 200
 
