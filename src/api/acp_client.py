@@ -1,5 +1,6 @@
 """Thin async Python client for a JSON-RPC 2.0 ACP agent over POST+SSE."""
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -118,13 +119,12 @@ class AcpClient:
             # Retry session/new to absorb transient CLI-not-fully-ready errors
             # on freshly-provisioned sandboxes (observed as ACP -32603 Internal
             # error even after the supervisor's health endpoint reports OK).
-            import asyncio as _asyncio
-            _last_exc = None
-            for _attempt in range(3):
+            last_exc = None
+            for attempt in range(3):
                 try:
                     new_result = await self._send_rpc(session_id, "session/new",
                                                       {"cwd": cwd, "mcpServers": mcp_array})
-                    _last_exc = None
+                    last_exc = None
                     break
                 except RuntimeError as e:
                     if "Authentication required" in str(e):
@@ -133,13 +133,13 @@ class AcpClient:
                                              {"methodId": "openai-api-key"})
                         new_result = await self._send_rpc(session_id, "session/new",
                                                           {"cwd": cwd, "mcpServers": mcp_array})
-                        _last_exc = None
+                        last_exc = None
                         break
-                    _last_exc = e
-                    if _attempt < 2:
-                        await _asyncio.sleep(1.0 * (_attempt + 1))
-            if _last_exc is not None:
-                raise _last_exc
+                    last_exc = e
+                    if attempt < 2:
+                        await asyncio.sleep(1.0 * (attempt + 1))
+            if last_exc is not None:
+                raise last_exc
             inner_sid = new_result.get("sessionId")
             log.info("session/new result for %s: sessionId=%s keys=%s", session_id, inner_sid, list(new_result.keys()))
             if inner_sid:

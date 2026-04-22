@@ -997,8 +997,11 @@ async def create_volume(body: _VolumeCreateBody):
         if body.provider == "daytona":
             try:
                 await _providers_mod.delete_daytona_volume(provider_ref)
-            except Exception:
-                pass
+            except Exception as cleanup_err:
+                log.warning(
+                    "orphaned daytona volume %s: rollback delete failed: %s",
+                    provider_ref, cleanup_err,
+                )
         raise
     return vol
 
@@ -1822,6 +1825,8 @@ async def _ensure_sandbox_alive(
                 sandbox_ref=new_instance.sandbox_id or sandbox_id,
                 status=STATUS_RUNNING,
                 root=sandbox_record.root,
+                volume_id=sandbox_record.volume_id,
+                subpath=sandbox_record.subpath,
             )
         )
         return new_instance.url, replaced
@@ -1992,22 +1997,24 @@ async def _do_resume(
                     if agent_record.config.mcp_servers
                     else [],
                 }
-                _last_exc = None
-                for _attempt in range(3):
+                # Keep load_rpc_id stable across retries: the replay_stream
+                # opened above is looking for events tagged with this id, so
+                # rotating it would break _find_last_replay_event_id_from_stream.
+                last_exc = None
+                for attempt in range(3):
                     try:
                         await client._send_rpc(
                             acp_session_id, "session/load", _load_args,
                             rpc_id=load_rpc_id,
                         )
-                        _last_exc = None
+                        last_exc = None
                         break
-                    except Exception as _e:
-                        _last_exc = _e
-                        if _attempt < 2:
-                            await asyncio.sleep(1.5 * (_attempt + 1))
-                            load_rpc_id = str(uuid.uuid4())
-                if _last_exc is not None:
-                    raise _last_exc
+                    except Exception as e:
+                        last_exc = e
+                        if attempt < 2:
+                            await asyncio.sleep(1.5 * (attempt + 1))
+                if last_exc is not None:
+                    raise last_exc
                 client.set_inner_session_id(acp_session_id, inner_session_id)
                 try:
                     await client.set_mode(acp_session_id, "bypassPermissions")
@@ -2080,9 +2087,9 @@ async def _do_resume(
             )
             SESSIONS[session_id] = new_state
             _start_session_tasks(new_state)
-        # Preserve the existing session's volume_id — since Task 17's NOT NULL
-        # enforcement, the INSERT half of upsert must always provide it even
-        # though we're only ever taking the ON CONFLICT UPDATE branch here.
+        # Preserve the existing session's volume_id: the INSERT half of
+        # upsert must always provide it (NOT NULL) even though this call site
+        # is really an UPDATE via ON CONFLICT.
         _existing = await get_session(session_id)
         _existing_volume_id = _existing.get("volume_id") if _existing else None
         await upsert_session(
@@ -2094,7 +2101,6 @@ async def _do_resume(
             "agent_id": agent_id,
             "sandbox_id": sandbox_id,
             "inner_session_id": effective_inner_session_id,
-            "status": "resumed",
             "status": "resumed",
         }
 
