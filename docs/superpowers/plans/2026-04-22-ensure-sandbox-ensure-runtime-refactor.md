@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+<!-- NOTES (2026-04-22): Refactor complete on branch ensure-refactor.
+  server.py net line reduction: 3317 → 3012 = -305 lines.
+  Deleted: get_or_recover_session (~150 lines), _do_resume (~270 lines),
+  _lazy_provision_sandbox_for_session + _locked (~75 lines).
+  Kept: _ensure_sandbox_alive (~135 lines) — still used by /sandboxes/{id}/start
+  and _resolve_sandbox_instance (file-browsing paths, not session-lifecycle).
+  3/3 e2e runs pass (plus one transient cold-start flake = known pre-existing issue).
+  demo.py: ✅ agent remembered OSPREY. -->
+
 **Goal:** Replace the 4+ overlapping session-recovery helpers with 2 idempotent "ensure" primitives. Every session endpoint becomes ~5 lines of orchestration. Delete ~400 lines of branchy recovery code.
 
 **Architecture:** Two idempotent helpers.
