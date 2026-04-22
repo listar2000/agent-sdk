@@ -4,6 +4,7 @@ Run: uvicorn src.api.server:app --port 7778
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -958,6 +959,15 @@ def _gen_volume_id() -> str:
     return f"vol_{uuid.uuid4().hex[:12]}"
 
 
+async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
+    vol = await get_volume(id_or_name)
+    if vol is None:
+        vol = await get_volume_by_name(id_or_name)
+    if vol is None:
+        raise HTTPException(404, "Volume not found")
+    return vol
+
+
 @app.post("/volumes")
 async def create_volume(body: _VolumeCreateBody):
     if body.provider == "daytona":
@@ -996,40 +1006,23 @@ async def list_volumes_route(provider: str | None = None):
 
 @app.get("/volumes/{id_or_name}")
 async def get_volume_route(id_or_name: str):
-    vol = await get_volume(id_or_name)
-    if vol is None:
-        vol = await get_volume_by_name(id_or_name)
-    if vol is None:
-        raise HTTPException(404, "Volume not found")
-    return vol
+    return await _resolve_volume(id_or_name)
 
 
 @app.delete("/volumes/{id_or_name}", status_code=204)
 async def delete_volume_route(id_or_name: str, force: bool = False):
-    vol = await get_volume(id_or_name)
-    if vol is None:
-        vol = await get_volume_by_name(id_or_name)
-    if vol is None:
-        raise HTTPException(404, "Volume not found")
+    vol = await _resolve_volume(id_or_name)
 
-    # Check for referencing sessions.
     async with get_db() as conn:
-        row = await (await conn.execute(
+        cur = await conn.execute(
             "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (vol.id,)
-        )).fetchone()
-        session_count = row["n"]
-
-    if session_count > 0 and not force:
-        raise HTTPException(
-            409,
-            f"Volume has {session_count} session(s). Use ?force=true to cascade.",
         )
-
-    if force and session_count > 0:
-        async with get_db() as conn:
-            await conn.execute(
-                "DELETE FROM sessions WHERE volume_id = %s", (vol.id,)
-            )
+        row = await cur.fetchone()
+        session_count = row["n"]
+        if session_count > 0 and not force:
+            raise HTTPException(409, f"Volume has {session_count} session(s). Use ?force=true to cascade.")
+        if force and session_count > 0:
+            await conn.execute("DELETE FROM sessions WHERE volume_id = %s", (vol.id,))
 
     if vol.provider == "daytona":
         await _providers_mod.delete_daytona_volume(vol.provider_ref)
@@ -1040,10 +1033,8 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
 # Volume file operations (tree / read / edit)
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel as _BaseModel  # noqa: E402
 
-
-class _VolumeEditBody(_BaseModel):
+class _VolumeEditBody(BaseModel):
     path: str
     content: str  # plain text for v1
 
@@ -1058,80 +1049,53 @@ def _safe_path(p: str) -> str:
     return p
 
 
-async def _with_utility_sandbox(vol):
-    """Spin up a short-lived sandbox with the whole volume mounted at /home/daytona."""
+async def _run_in_volume_sandbox(vol, cmd: str, timeout: int = 30):
+    """Spin up a short-lived Daytona sandbox with the whole volume mounted,
+    run cmd inside it, tear it down. Returns the ExecResult."""
     if vol.provider != "daytona":
         raise HTTPException(501, f"File ops on {vol.provider} not implemented")
-    # subpath=None => mount the entire volume at /home/daytona
     inst = await _providers_mod.create_daytona(
         agent_type="claude",
         volume_id=vol.provider_ref,
         subpath=None,
     )
-    return inst
-
-
-async def _destroy_utility_sandbox(inst):
-    await _providers_mod.destroy_daytona(inst)
+    try:
+        return await _providers_mod.exec_in_instance(inst, cmd, timeout=timeout)
+    finally:
+        await _providers_mod.destroy_daytona(inst)
 
 
 @app.get("/volumes/{id_or_name}/files/tree")
 async def volume_files_tree(id_or_name: str, path: str = ""):
-    import shlex
-    vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
-    if not vol:
-        raise HTTPException(404, "Volume not found")
-    p = _safe_path(path)
-    abs_path = shlex.quote(f"/home/daytona/{p}")
-    inst = await _with_utility_sandbox(vol)
-    try:
-        cmd = f"find {abs_path} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null"
-        res = await _providers_mod.exec_in_instance(inst, cmd, timeout=30)
-        return {"tree": res.stdout}
-    finally:
-        await _destroy_utility_sandbox(inst)
+    vol = await _resolve_volume(id_or_name)
+    abs_path = shlex.quote(f"/home/daytona/{_safe_path(path)}")
+    res = await _run_in_volume_sandbox(vol, f"find {abs_path} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null")
+    return {"tree": res.stdout}
 
 
 @app.get("/volumes/{id_or_name}/files/read")
 async def volume_files_read(id_or_name: str, path: str):
-    import shlex
-    vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
-    if not vol:
-        raise HTTPException(404, "Volume not found")
-    p = _safe_path(path)
-    abs_path = shlex.quote(f"/home/daytona/{p}")
-    inst = await _with_utility_sandbox(vol)
-    try:
-        res = await _providers_mod.exec_in_instance(inst, f"cat {abs_path}", timeout=30)
-        if res.exit_code != 0:
-            raise HTTPException(404, f"File not found or unreadable: {res.stderr}")
-        return {"content": res.stdout}
-    finally:
-        await _destroy_utility_sandbox(inst)
+    vol = await _resolve_volume(id_or_name)
+    abs_path = shlex.quote(f"/home/daytona/{_safe_path(path)}")
+    res = await _run_in_volume_sandbox(vol, f"cat {abs_path}")
+    if res.exit_code != 0:
+        raise HTTPException(404, f"File not found or unreadable: {res.stderr}")
+    return {"content": res.stdout}
 
 
 @app.post("/volumes/{id_or_name}/files/edit", status_code=204)
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
-    import base64 as _base64
-    import shlex
-    vol = await get_volume(id_or_name) or await get_volume_by_name(id_or_name)
-    if not vol:
-        raise HTTPException(404, "Volume not found")
-    p = _safe_path(body.path)
-    abs_path = shlex.quote(f"/home/daytona/{p}")
-    inst = await _with_utility_sandbox(vol)
-    try:
-        b64 = _base64.b64encode(body.content.encode()).decode()
-        # abs_path is shlex-quoted; b64 only contains [A-Za-z0-9+/=] so single-quoting is safe.
-        cmd = (
-            f"mkdir -p \"$(dirname {abs_path})\" && "
-            f"echo '{b64}' | base64 -d > {abs_path}"
-        )
-        res = await _providers_mod.exec_in_instance(inst, cmd, timeout=30)
-        if res.exit_code != 0:
-            raise HTTPException(500, f"Edit failed: {res.stderr}")
-    finally:
-        await _destroy_utility_sandbox(inst)
+    vol = await _resolve_volume(id_or_name)
+    abs_path = shlex.quote(f"/home/daytona/{_safe_path(body.path)}")
+    b64 = base64.b64encode(body.content.encode()).decode()
+    # abs_path is shlex-quoted; b64 only contains [A-Za-z0-9+/=] so single-quoting is safe.
+    cmd = (
+        f"mkdir -p \"$(dirname {abs_path})\" && "
+        f"echo '{b64}' | base64 -d > {abs_path}"
+    )
+    res = await _run_in_volume_sandbox(vol, cmd)
+    if res.exit_code != 0:
+        raise HTTPException(500, f"Edit failed: {res.stderr}")
 
 
 # ---------------------------------------------------------------------------

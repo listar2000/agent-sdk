@@ -499,6 +499,18 @@ async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
         log.warning("kill_supervisor_in_sandbox port=%d failed: %s", port, e)
 
 
+def _build_volume_mounts(volume_id: str | None, subpath: str | None):
+    """Build the VolumeMount list for a Daytona sandbox. Returns None if no volume.
+
+    NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
+    spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
+    """
+    if not volume_id:
+        return None
+    from daytona_sdk import VolumeMount
+    return [VolumeMount(volume_id=volume_id, mount_path="/home/daytona", subpath=subpath)]
+
+
 async def provision_daytona_sandbox(
     agent_type: str = "claude",
     dockerfile: str | None = None,
@@ -515,7 +527,7 @@ async def provision_daytona_sandbox(
     try:
         from daytona_sdk import (
             Daytona, DaytonaConfig, CreateSandboxFromImageParams,
-            CreateSandboxFromSnapshotParams, VolumeMount,
+            CreateSandboxFromSnapshotParams,
         )
     except ImportError:
         raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
@@ -541,16 +553,7 @@ async def provision_daytona_sandbox(
 
     create_timeout = 300 if dockerfile else 60
 
-    # Build volumes list if volume_id + subpath are provided.
-    # NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
-    # spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
-    volumes = None
-    if volume_id:
-        volumes = [VolumeMount(
-            volume_id=volume_id,
-            mount_path="/home/daytona",
-            subpath=subpath,  # None => mount whole volume
-        )]
+    volumes = _build_volume_mounts(volume_id, subpath)
 
     if use_snapshot:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
@@ -676,7 +679,7 @@ async def create_daytona(
     try:
         from daytona_sdk import (
             Daytona, DaytonaConfig, CreateSandboxFromImageParams,
-            CreateSandboxFromSnapshotParams, VolumeMount,
+            CreateSandboxFromSnapshotParams,
         )
     except ImportError:
         raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
@@ -705,16 +708,7 @@ async def create_daytona(
 
     create_timeout = 300 if dockerfile else 60
 
-    # Build volumes list if volume_id + subpath are provided.
-    # NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
-    # spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
-    volumes = None
-    if volume_id:
-        volumes = [VolumeMount(
-            volume_id=volume_id,
-            mount_path="/home/daytona",
-            subpath=subpath,  # None => mount whole volume
-        )]
+    volumes = _build_volume_mounts(volume_id, subpath)
 
     if use_snapshot:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
