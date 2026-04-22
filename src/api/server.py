@@ -2967,6 +2967,62 @@ async def sandbox_files_edit(sandbox_id: str, request: Request):
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 
 
+@app.post("/sandboxes/{sandbox_id}/files/upload")
+async def sandbox_files_upload(sandbox_id: str, request: Request):
+    """Upload a file to the sandbox. Body: {"path": "...", "content": "<base64>"}"""
+    instance = await _resolve_sandbox_instance(sandbox_id)
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(f"{instance.url}/v1/files/upload", json=body)
+            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+@app.post("/sandboxes/{sandbox_id}/files/delete")
+async def sandbox_files_delete(sandbox_id: str, request: Request):
+    """Delete a file or directory. Body: {"path": "..."}"""
+    instance = await _resolve_sandbox_instance(sandbox_id)
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"{instance.url}/v1/files/delete", json=body)
+            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+@app.post("/sandboxes/{sandbox_id}/files/rename")
+async def sandbox_files_rename(sandbox_id: str, request: Request):
+    """Rename/move a file or directory. Body: {"path": "...", "new_path": "..."}"""
+    instance = await _resolve_sandbox_instance(sandbox_id)
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"{instance.url}/v1/files/rename", json=body)
+            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+@app.get("/sandboxes/{sandbox_id}/files/download")
+async def sandbox_files_download(sandbox_id: str, path: str):
+    """Download a file as raw bytes."""
+    instance = await _resolve_sandbox_instance(sandbox_id)
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(f"{instance.url}/v1/files/download", params={"path": path})
+            return Response(
+                content=r.content,
+                status_code=r.status_code,
+                media_type=r.headers.get("content-type", "application/octet-stream"),
+                headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Static UI
 # ---------------------------------------------------------------------------

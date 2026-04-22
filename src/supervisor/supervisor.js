@@ -521,6 +521,173 @@ async function handleExec(req, res) {
   });
 }
 
+async function handleFilesUpload(req, res) {
+  let raw = "";
+  req.setEncoding("utf8");
+  for await (const chunk of req) raw += chunk;
+
+  if (Buffer.byteLength(raw) > MAX_FILE_SIZE) {
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "payload too large" }));
+    return;
+  }
+
+  let body;
+  try { body = JSON.parse(raw); } catch (e) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid JSON: " + e.message }));
+    return;
+  }
+
+  const filePath = body.path;
+  const content = body.content;
+  if (typeof filePath !== "string" || !filePath || typeof content !== "string") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path and content (base64) required" }));
+    return;
+  }
+
+  const resolvedRoot = path.resolve(args.root);
+  const fullPath = path.resolve(resolvedRoot, filePath);
+  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path traversal denied" }));
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  fs.writeFileSync(fullPath, Buffer.from(content, "base64"));
+  const stat = fs.statSync(fullPath);
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: true, path: filePath, size: stat.size }));
+}
+
+async function handleFilesDelete(req, res) {
+  let raw = "";
+  req.setEncoding("utf8");
+  for await (const chunk of req) raw += chunk;
+
+  let body;
+  try { body = JSON.parse(raw); } catch (e) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid JSON: " + e.message }));
+    return;
+  }
+
+  const filePath = body.path;
+  if (typeof filePath !== "string" || !filePath) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path required" }));
+    return;
+  }
+
+  const resolvedRoot = path.resolve(args.root);
+  const fullPath = path.resolve(resolvedRoot, filePath);
+  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path traversal denied" }));
+    return;
+  }
+
+  if (!fs.existsSync(fullPath)) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+    return;
+  }
+
+  const stat = fs.statSync(fullPath);
+  if (stat.isDirectory()) {
+    fs.rmSync(fullPath, { recursive: true });
+  } else {
+    fs.unlinkSync(fullPath);
+  }
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: true }));
+}
+
+async function handleFilesRename(req, res) {
+  let raw = "";
+  req.setEncoding("utf8");
+  for await (const chunk of req) raw += chunk;
+
+  let body;
+  try { body = JSON.parse(raw); } catch (e) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid JSON: " + e.message }));
+    return;
+  }
+
+  const filePath = body.path;
+  const newPath = body.new_path;
+  if (typeof filePath !== "string" || !filePath || typeof newPath !== "string" || !newPath) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path and new_path required" }));
+    return;
+  }
+
+  const resolvedRoot = path.resolve(args.root);
+  const fullPath = path.resolve(resolvedRoot, filePath);
+  const newFullPath = path.resolve(resolvedRoot, newPath);
+  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path traversal denied" }));
+    return;
+  }
+  if (!newFullPath.startsWith(resolvedRoot + "/") && newFullPath !== resolvedRoot) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path traversal denied (new_path)" }));
+    return;
+  }
+
+  if (!fs.existsSync(fullPath)) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(newFullPath), { recursive: true });
+  fs.renameSync(fullPath, newFullPath);
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: true, path: newPath }));
+}
+
+function handleFilesDownload(req, res) {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const filePath = u.searchParams.get("path");
+  if (!filePath) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path query param required" }));
+    return;
+  }
+
+  const resolvedRoot = path.resolve(args.root);
+  const fullPath = path.resolve(resolvedRoot, filePath);
+  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "path traversal denied" }));
+    return;
+  }
+
+  if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "file not found" }));
+    return;
+  }
+
+  const fileName = path.basename(fullPath);
+  const ext = path.extname(fileName).toLowerCase();
+  const mimeTypes = { ".html": "text/html", ".js": "text/javascript", ".json": "application/json", ".css": "text/css", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".svg": "image/svg+xml", ".pdf": "application/pdf", ".zip": "application/zip", ".tar": "application/x-tar", ".gz": "application/gzip" };
+  const contentType = mimeTypes[ext] || "application/octet-stream";
+
+  const data = fs.readFileSync(fullPath);
+  res.writeHead(200, {
+    "content-type": contentType,
+    "content-disposition": `attachment; filename="${fileName}"`,
+    "content-length": data.length,
+  });
+  res.end(data);
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === "/v1/health" || req.url === "/health") {
     const body = JSON.stringify({
@@ -659,6 +826,40 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: e.message }));
       } catch {}
     });
+    return;
+  }
+  if (req.url && req.url.startsWith("/v1/files/upload") && req.method === "POST") {
+    handleFilesUpload(req, res).catch((e) => {
+      log("files/upload handler crashed: " + e.stack);
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      } catch {}
+    });
+    return;
+  }
+  if (req.url && req.url.startsWith("/v1/files/delete") && req.method === "POST") {
+    handleFilesDelete(req, res).catch((e) => {
+      log("files/delete handler crashed: " + e.stack);
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      } catch {}
+    });
+    return;
+  }
+  if (req.url && req.url.startsWith("/v1/files/rename") && req.method === "POST") {
+    handleFilesRename(req, res).catch((e) => {
+      log("files/rename handler crashed: " + e.stack);
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      } catch {}
+    });
+    return;
+  }
+  if (req.url && req.url.startsWith("/v1/files/download") && req.method === "GET") {
+    handleFilesDownload(req, res);
     return;
   }
   res.writeHead(404, { "content-type": "text/plain" });
