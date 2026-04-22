@@ -43,64 +43,22 @@ def _get_daytona_client():
 
 
 async def _bootstrap_supervisor_in_daytona_sandbox(
-    sandbox, agent_type: str, *, install_deps: bool,
-    pre_start_commands: list[str] | None = None,
+    sandbox, agent_type: str, *,
     root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
-    """Install (optionally) + start the supervisor inside an existing daytona
-    sandbox object. Returns a fresh ProviderInstance with a new signed URL.
+    """Start the supervisor inside an existing daytona sandbox.
 
-    install_deps=False is the recovery path: deps are already on disk from
-    the previous run, so we skip apt + npm install + supervisor.js upload
-    and just exec the supervisor binary.
+    Recovery path only: deps are already on disk from the previous run
+    (either the original /tmp install or a volume-cached deps.tar.gz), so
+    we just exec the supervisor binary against the existing node_modules.
     """
     bin_name = _acp_bin_name(agent_type)
-    npm_spec = _ACP_NPM_SPECS[agent_type]
     loop = asyncio.get_running_loop()
 
     def _exec(cmd: str, timeout: int = 120) -> str:
         r = sandbox.process.exec(cmd, timeout=timeout)
         return (r.result if hasattr(r, "result") else str(r)) or ""
-
-    if install_deps:
-        await loop.run_in_executor(None, lambda: _exec(
-            "apt-get update >/dev/null 2>&1 && "
-            "apt-get install -y --no-install-recommends libssl3 ca-certificates >/dev/null 2>&1 || true",
-            timeout=120,
-        ))
-        await loop.run_in_executor(None, lambda: _exec(
-            f"mkdir -p {_SUPERVISOR_REMOTE_DIR} && cd {_SUPERVISOR_REMOTE_DIR} && "
-            "npm init -y >/dev/null 2>&1"
-        ))
-        await loop.run_in_executor(None, lambda: _exec(
-            f"cd {_SUPERVISOR_REMOTE_DIR} && "
-            f"npm install --silent {npm_spec} 2>&1 | tail -5",
-            timeout=240,
-        ))
-
-        import base64 as _b64
-        with open(_SUPERVISOR_DIR / "supervisor.js", "rb") as f:
-            b64 = _b64.b64encode(f.read()).decode()
-
-        def _upload():
-            _exec(f"rm -f {_SUPERVISOR_REMOTE_DIR}/supervisor.js {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64")
-            chunk = 4096
-            for i in range(0, len(b64), chunk):
-                seg = b64[i:i + chunk]
-                _exec(f"printf '%s' '{seg}' >> {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64")
-            _exec(
-                f"base64 -d {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64 > "
-                f"{_SUPERVISOR_REMOTE_DIR}/supervisor.js && "
-                f"rm {_SUPERVISOR_REMOTE_DIR}/supervisor.js.b64"
-            )
-        await loop.run_in_executor(None, _upload)
-
-    # Run pre-start commands (e.g. skill installation) before supervisor
-    if pre_start_commands:
-        for cmd in pre_start_commands:
-            log.info("daytona pre-start: %s", cmd)
-            await loop.run_in_executor(None, lambda c=cmd: _exec(c, timeout=120))
 
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
     launch_args = _acp_launch_args(agent_type)
@@ -331,9 +289,9 @@ async def restart_daytona_supervisor(
     Prefers the volume-cache install path
     (``start_supervisor_in_sandbox``) so the restart and fresh-provision
     paths agree on where the ACP binary lives.  Falls back to the legacy
-    ``_bootstrap_supervisor_in_daytona_sandbox(install_deps=False)`` branch
-    only when the volume cache is absent — typically because the sandbox
-    was created before the volume-refactor landed and has no
+    ``_bootstrap_supervisor_in_daytona_sandbox`` branch only when the
+    volume cache is absent — typically because the sandbox was created
+    before the volume-refactor landed and has no
     ``/opt/supervisor`` mount.
     """
     try:
@@ -391,86 +349,8 @@ async def restart_daytona_supervisor(
         daytona_sandbox_id[:16],
     )
     return await _bootstrap_supervisor_in_daytona_sandbox(
-        sandbox, agent_type, install_deps=False, root=root, spawn_env=spawn_env,
+        sandbox, agent_type, root=root, spawn_env=spawn_env,
     )
-
-
-async def create_daytona(
-    agent_type: str = "claude",
-    dockerfile: str | None = None,
-    pre_start_commands: list[str] | None = None,
-    root: str = "/tmp",
-    spawn_env: dict[str, str] | None = None,
-    volume_id: str | None = None,
-    subpath: str | None = None,
-) -> ProviderInstance:
-    """Create a fresh Daytona sandbox, install + start a supervisor inside it."""
-    try:
-        from daytona_sdk import (
-            Daytona, DaytonaConfig, CreateSandboxFromImageParams,
-            CreateSandboxFromSnapshotParams,
-        )
-    except ImportError:
-        raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
-
-    api_key = os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DAYTONA_API_KEY not set")
-
-    env_vars = _get_sandbox_env_vars(spawn_env)
-    loop = asyncio.get_running_loop()
-    daytona = Daytona(DaytonaConfig(api_key=api_key))
-
-    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
-    use_snapshot = dockerfile is None and snapshot.lower() not in {"", "0", "false", "image"}
-
-    if dockerfile is not None:
-        if not Path(dockerfile).exists():
-            raise FileNotFoundError(f"Dockerfile not found: {dockerfile}")
-        from daytona_sdk import Image
-        image = Image.from_dockerfile(dockerfile)
-    elif not use_snapshot:
-        # node:22-slim ships node + npm preinstalled. libssl3 is added at
-        # runtime in the bootstrap helper because codex-acp's native binary
-        # dynamically links against it.
-        image = "node:22-slim"
-
-    create_timeout = 300 if dockerfile else 60
-
-    volumes = _build_volume_mounts(volume_id, subpath)
-
-    if use_snapshot:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot,
-                auto_stop_interval=0,
-                env_vars=env_vars,
-                volumes=volumes,
-            ),
-            timeout=create_timeout,
-        ))
-    else:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromImageParams(
-                image=image,
-                auto_stop_interval=0,
-                env_vars=env_vars,
-                volumes=volumes,
-            ),
-            timeout=create_timeout,
-        ))
-
-    try:
-        return await _bootstrap_supervisor_in_daytona_sandbox(
-            sandbox, agent_type, install_deps=True, pre_start_commands=pre_start_commands,
-            root=root, spawn_env=spawn_env,
-        )
-    except BaseException:
-        try:
-            await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
-        except Exception:
-            pass
-        raise
 
 
 async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
