@@ -54,9 +54,7 @@ async def test_post_session_does_not_provision_sandbox(client):
                                            provider_ref="dt-t"))
 
     # Any provider provisioning during session create should fail the test.
-    with patch("api.providers.create_daytona",
-               new=AsyncMock(side_effect=AssertionError("should NOT provision during session create"))), \
-         patch("api.providers.daytona.provision_daytona_sandbox",
+    with patch("api.providers.daytona.provision_daytona_sandbox",
                new=AsyncMock(side_effect=AssertionError("should NOT provision during session create"))):
         r = await client.post("/sessions",
                               json={"agent_id": "agent_t2", "volume_id": "vol_t"})
@@ -83,7 +81,7 @@ async def test_message_lazily_provisions_sandbox(client):
     assert r.status_code == 200
     sid = r.json()["id"]
 
-    # Track what create_daytona is called with.
+    # Track what provision_daytona_sandbox is called with.
     create_calls = []
     from api.providers import ProviderInstance
     async def fake_create(**kwargs):
@@ -112,7 +110,7 @@ async def test_message_lazily_provisions_sandbox(client):
          patch("api.server.AcpClient", return_value=fake_acp):
         r = await client.post(f"/sessions/{sid}/message", json={"message": "hi"})
     # ensure_session_live now guarantees a connected client, so /message should succeed (200).
-    # We verify: create_daytona was called with the expected volume_id + subpath.
+    # We verify: provision_daytona_sandbox was called with the expected volume_id + subpath.
     assert len(create_calls) == 1, f"expected 1 create, got {len(create_calls)}: {create_calls}"
     assert create_calls[0].get("volume_id") == "dt-r"
     assert create_calls[0].get("subpath") == "agents/agent_r/home"

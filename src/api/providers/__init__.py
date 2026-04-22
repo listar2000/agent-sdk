@@ -21,53 +21,36 @@ from .. import load_dotenv
 
 load_dotenv()
 
-# Re-export all shared symbols so existing imports still work
+# Re-export shared symbols used by server.py + tests. Internal-only helpers
+# (``_build_env_prefix``, ``_port_lock``, ``_find_free_port``, etc.) live in
+# ``._shared`` and are imported by provider modules directly — no need to
+# expose them at the package level too.
 from ._shared import (
     PORT_BASED_PROVIDERS,
     AUTH_KEYS,
     ProviderInstance,
     ExecResult,
-    _ACP_BIN_NAMES,
     _ACP_NPM_SPECS,
-    _ACP_LAUNCH_ARGS,
     _acp_bin_name,
     _acp_launch_args,
     _get_sandbox_env_vars,
-    _auth_vars_to_unset,
-    _build_env_prefix,
     _wait_for_health,
-    _recycle_port,
-    _find_free_port,
     allocate_sandbox_port,
     free_sandbox_port,
-    _build_volume_mounts,
     _MAX_OUTPUT_BYTES,
     _truncate,
-    _exec_subprocess,
-    _port_lock,
-    _freed_ports,
-    _sandbox_port_counters,
-    _sandbox_freed_ports,
-    _safe_path,
 )
 
-# Re-export Daytona-specific symbols for server.py compatibility
+# Re-export Daytona-specific symbols for server.py + tests.
 from .daytona import (
-    create_daytona,
     destroy_daytona,
     stop_daytona,
     create_daytona_volume,
     delete_daytona_volume,
-    get_daytona_sandbox_status,
     provision_daytona_sandbox,
     restart_daytona_supervisor,
-    start_supervisor_in_sandbox,
     kill_supervisor_in_sandbox,
-    start_daytona,
     _get_daytona_client,
-    _bootstrap_supervisor_in_daytona_sandbox,
-    _SUPERVISOR_REMOTE_DIR,
-    _SUPERVISOR_REMOTE_PORT,
     _daytona_sandbox_op,
 )
 
