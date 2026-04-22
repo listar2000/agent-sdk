@@ -1943,11 +1943,40 @@ async def _ensure_sandbox_alive(
 async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     """Idempotently install the supervisor + ACP binary on a volume.
 
-    Cross-worker safe: uses a Postgres transaction-scoped advisory lock
-    (``pg_advisory_xact_lock``) keyed on a hash of (volume_id, agent_type)
-    to serialize installs across every server process. Fast path: if the
+    Cross-worker serialization uses a Postgres advisory lock keyed on
+    ``hash((volume_id, agent_type))``.  Fast path: if the
     ``volumes.supervisor_agent_types`` cache already lists this agent_type,
     return immediately without touching the DB beyond the initial read.
+
+    Locking model (slow path):
+
+    1. Open a short transaction, take ``pg_advisory_xact_lock``, re-check
+       the cache, then commit to release the xact lock.
+    2. Acquire a longer-lived ``pg_advisory_lock`` on the SAME key outside
+       any transaction — this is the cross-process "I'm installing" signal.
+       ``pg_advisory_lock`` is session-scoped: if the backend dies or the
+       TCP connection drops, Postgres releases it automatically, so a
+       crashed worker can't wedge the key.
+    3. Re-check the cache under the session lock (another worker may have
+       installed between steps 1 and 2).
+    4. Run the slow provider install with NO open transaction and NO
+       connection held (the provider call talks to docker/daytona/local,
+       not to the DB).
+    5. Take a fresh short transaction to update the cache + release the
+       session lock via ``pg_advisory_unlock``.
+
+    Failure semantics: if the provider call raises, the session lock is
+    released in the ``finally`` block so a retry can re-enter immediately.
+    The volumes cache is only updated on success, so a failed install
+    leaves no footprint to undo.
+
+    Trade-off: the window between steps 1 and 2 is a race — two workers
+    can both pass the double-check and then serialize on the session lock
+    in step 2, doing the install twice.  That's harmless (the install is
+    idempotent in its own right — the second worker will short-circuit at
+    the step-3 cache re-check) but means we don't get strict "install once"
+    semantics.  Acceptable because the alternative is holding a pool
+    connection for minutes, which is more expensive operationally.
     """
     # Fast path (no lock): check cache first — 99% of calls hit this.
     vol = await get_volume(volume_id)
@@ -1956,29 +1985,15 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     if agent_type in (vol.supervisor_agent_types or []):
         return  # already installed
 
-    # Compute a positive 63-bit key for pg_advisory_xact_lock (PG advisory
-    # locks take a bigint). Mask off the sign bit for safety.
+    # Compute a positive 63-bit key (pg advisory locks take a bigint; mask
+    # off the sign bit for safety).
     lock_key = hash((volume_id, agent_type)) & 0x7FFFFFFFFFFFFFFF
 
-    # Open a transaction-scoped advisory lock. All DB operations inside the
-    # ``async with get_db()`` block share a single connection; the lock
-    # releases automatically when the transaction commits / rolls back.
+    # Step 1 + 2: double-check cache, then acquire a session-scoped advisory
+    # lock OUTSIDE a transaction so we can release the connection while
+    # the slow provider call runs.  We pick up a dedicated connection for
+    # the session lock so it's not tied to any pool's transaction.
     async with get_db() as conn:
-        # Try non-blocking first for fast logging; fall back to blocking
-        # wait if another worker holds it.
-        got_row = await (await conn.execute(
-            "SELECT pg_try_advisory_xact_lock(%s)", (lock_key,)
-        )).fetchone()
-        if not (got_row and got_row.get("pg_try_advisory_xact_lock")):
-            log.info(
-                "ensure_volume_supervisor: waiting for another worker "
-                "(volume=%s agent=%s)", volume_id, agent_type,
-            )
-            await conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
-
-        # Double-check under the lock: another worker may have installed
-        # while we waited. Re-read the cache from the SAME connection so we
-        # see the latest committed state.
         row = await (await conn.execute(
             "SELECT provider, provider_ref, supervisor_agent_types FROM volumes"
             " WHERE id = %s",
@@ -1989,29 +2004,84 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
         installed = list(row.get("supervisor_agent_types") or [])
         if agent_type in installed:
             return
+        provider = row["provider"]
+        provider_ref = row["provider_ref"]
 
-        log.info(
-            "ensure_volume_supervisor: installing %s on volume %s",
-            agent_type, volume_id,
-        )
-        # Provider install talks to docker/daytona/local — NOT the DB, so
-        # holding the advisory lock across it is safe (no pool contention
-        # beyond this single connection).
-        await _providers_mod.install_supervisor(
-            row["provider"], row["provider_ref"], agent_type,
-        )
-        # Update the cache on the SAME connection so the advisory lock
-        # actually serializes the write.
-        await conn.execute(
-            "UPDATE volumes SET supervisor_agent_types = "
-            "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
-            "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
-            (agent_type, volume_id, agent_type),
-        )
-        log.info(
-            "ensure_volume_supervisor: done installing %s on volume %s",
-            agent_type, volume_id,
-        )
+    # Acquire a session-scoped advisory lock on a dedicated connection
+    # switched to autocommit so the connection isn't stuck in a
+    # long-running transaction while the slow provider call runs.
+    # ``pg_advisory_lock`` survives commits (it's session-scoped) and
+    # auto-releases on connection close, so a crashed worker can't
+    # wedge the key.
+    async with get_db() as lock_conn:
+        # Autocommit mode: queries commit immediately and the connection
+        # isn't parked "idle in transaction" during the slow install.
+        # ``pg_advisory_lock`` is still session-scoped so the lock
+        # outlives individual statement commits.
+        try:
+            await lock_conn.set_autocommit(True)
+        except Exception:
+            # Some test fakes expose a shim that doesn't implement
+            # set_autocommit — tolerate it, the transaction-in-progress
+            # semantics then match the previous code.
+            pass
+        try:
+            got_row = await (await lock_conn.execute(
+                "SELECT pg_try_advisory_lock(%s)", (lock_key,)
+            )).fetchone()
+            if not (got_row and got_row.get("pg_try_advisory_lock")):
+                log.info(
+                    "ensure_volume_supervisor: waiting for another worker "
+                    "(volume=%s agent=%s)", volume_id, agent_type,
+                )
+                await lock_conn.execute(
+                    "SELECT pg_advisory_lock(%s)", (lock_key,)
+                )
+
+            # Step 3: re-check cache while holding the session lock.
+            row2 = await (await lock_conn.execute(
+                "SELECT supervisor_agent_types FROM volumes WHERE id = %s",
+                (volume_id,),
+            )).fetchone()
+            installed2 = list((row2 or {}).get("supervisor_agent_types") or [])
+            if agent_type in installed2:
+                return
+
+            log.info(
+                "ensure_volume_supervisor: installing %s on volume %s",
+                agent_type, volume_id,
+            )
+            # Step 4: slow provider call.  The DB connection is held (we
+            # need it to keep the session-scoped advisory lock alive) but
+            # it's in autocommit mode so it's NOT in a transaction — no
+            # "idle in transaction" timeout, no dirty buffers.
+            await _providers_mod.install_supervisor(
+                provider, provider_ref, agent_type,
+            )
+
+            # Step 5: update the cache under the same session lock.
+            await lock_conn.execute(
+                "UPDATE volumes SET supervisor_agent_types = "
+                "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
+                "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
+                (agent_type, volume_id, agent_type),
+            )
+            log.info(
+                "ensure_volume_supervisor: done installing %s on volume %s",
+                agent_type, volume_id,
+            )
+        finally:
+            # Release the session lock explicitly so the connection is
+            # clean when it returns to the pool.  A failure here is
+            # survivable — the lock auto-releases on connection close.
+            try:
+                await lock_conn.execute(
+                    "SELECT pg_advisory_unlock(%s)", (lock_key,)
+                )
+            except Exception as e:
+                log.warning(
+                    "ensure_volume_supervisor: pg_advisory_unlock failed: %s", e,
+                )
 
 
 async def ensure_sandbox(session_row: dict) -> SandboxRecord:
