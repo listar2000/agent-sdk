@@ -30,33 +30,14 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# Mirror TEST_DATABASE_URL -> DATABASE_URL so api.db (captured at its own
+# import time) picks up the test URL rather than the dev default.
+_TEST_DB = os.environ.get("TEST_DATABASE_URL")
+if _TEST_DB and not os.environ.get("DATABASE_URL"):
+    os.environ["DATABASE_URL"] = _TEST_DB
+
 import types
 from contextlib import asynccontextmanager as _asynccontextmanager
-
-import api.server as _server_module
-from api.server import (
-    app,
-    SESSIONS,
-    _INSTANCES,
-    _on_sse_reader_death,
-    _broadcast_one_block,
-    _process_sse_block,
-    _schedule_log,
-    _SSE_SENTINEL,
-    _shutdown_session_state,
-    _session_idle_since,
-    _sse_reader_disconnect_is_recoverable,
-    _mark_turn_finished,
-    _idle_reaper,
-    _start_session_tasks,
-    _submit_prompt,
-    _cancel_and_drain,
-    IDLE_TIMEOUT_S,
-)
-from api.models import (
-    SessionState, PendingPrompt, SandboxRecord,
-    _KICK_SENTINEL, EVT_TOOL_CALL, EVT_ERROR,
-)
 
 
 # Generic no-op helpers used by the db stub factory and by individual tests
@@ -93,6 +74,11 @@ def _build_stub_db() -> types.ModuleType:
     stub.log_event = _noop
     stub.get_session_log = _noop_list
     stub.get_agent_log = _noop_list
+    stub.get_any_session_for_sandbox = _noop
+    stub.get_session_env = _noop
+    stub.get_session_secrets = _noop
+    stub.update_session_env = _noop
+    stub.update_session_secrets = _noop
     stub.upsert_volume = _noop
     stub.get_volume = _noop_volume
     stub.get_volume_by_name = _noop_volume
@@ -103,47 +89,107 @@ def _build_stub_db() -> types.ModuleType:
     return stub
 
 
-# Names api.server binds via `from .db import ...`. We redirect them at
-# api.server for the duration of this test module and restore on teardown
-# so sibling test files that exercise the real DB are not polluted.
 _STUBBED_DB_NAMES = (
     "init_db", "init_pool", "close_pool",
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session",
+    "get_session_env", "get_session_secrets", "get_any_session_for_sandbox",
+    "update_session_env", "update_session_secrets",
     "session_has_log_entries", "log_event", "get_session_log",
     "get_db", "add_supervisor_agent_type",
     "upsert_volume", "get_volume", "get_volume_by_name",
     "list_volumes", "delete_volume", "set_session_current_sandbox",
 )
 
+# Install stub BEFORE importing api.server so that its ``from .db import``
+# binds to stubs. Covers the case where pytest runs just this file with no
+# preceding module having installed a stub. If test_adversarial already
+# installed its own stub, our swap is harmless (both are no-ops) but
+# necessary so our fixture can restore a known-good real-db state on exit.
+_prior_api_db = sys.modules.get("api.db")
+_stub_db_module = _build_stub_db()
+sys.modules["api.db"] = _stub_db_module
+
+import api.server as _server_module
+from api.server import (
+    app,
+    SESSIONS,
+    _INSTANCES,
+    _on_sse_reader_death,
+    _broadcast_one_block,
+    _process_sse_block,
+    _schedule_log,
+    _SSE_SENTINEL,
+    _shutdown_session_state,
+    _session_idle_since,
+    _sse_reader_disconnect_is_recoverable,
+    _mark_turn_finished,
+    _idle_reaper,
+    _start_session_tasks,
+    _submit_prompt,
+    _cancel_and_drain,
+    IDLE_TIMEOUT_S,
+)
+from api.models import (
+    SessionState, PendingPrompt, SandboxRecord,
+    _KICK_SENTINEL, EVT_TOOL_CALL, EVT_ERROR,
+)
+
+# Defensive: ensure every stubbed name on api.server really points at our
+# stub, regardless of what any earlier-imported test module did to them.
+for _name in _STUBBED_DB_NAMES:
+    if hasattr(_stub_db_module, _name):
+        setattr(_server_module, _name, getattr(_stub_db_module, _name))
+
 
 @pytest.fixture(scope="module", autouse=True)
 def _stub_api_db_module():
-    """Swap api.db for a stub for the duration of this test module only.
+    """Force stub bindings for the duration of this test module.
 
-    Also redirects the already-bound names on api.server (imported via
-    `from .db import ...`) to the stub, restoring originals on teardown.
-    This prevents stub leakage to sibling test files that run after us.
+    At setup we (re-)install our stub into ``sys.modules["api.db"]`` and
+    re-bind every ``from .db import ...`` name on api.server to our stub.
+    This defends against a sibling test module (e.g. test_adversarial) that
+    may have transformed the shared stub into the real api.db during its
+    own teardown before we started.
+
+    At teardown we mutate the stub in-place to delegate to the real api.db
+    so that any other test module holding ``dbmod = <stub>`` sees real DB
+    behaviour on the next attribute access.
     """
-    stub = _build_stub_db()
-    _MISSING = object()
-    originals = {
-        name: getattr(_server_module, name, _MISSING) for name in _STUBBED_DB_NAMES
-    }
+    # Re-install stub + rebind server names (covers adversarial's teardown).
+    sys.modules["api.db"] = _stub_db_module
+    # Fresh no-op functions — adversarial's teardown may have mutated our
+    # stub module into the real db; rebuild the stub now.
+    fresh_stub = _build_stub_db()
+    for attr in dir(fresh_stub):
+        if attr.startswith("__"):
+            continue
+        setattr(_stub_db_module, attr, getattr(fresh_stub, attr))
     for name in _STUBBED_DB_NAMES:
-        if hasattr(stub, name):
-            setattr(_server_module, name, getattr(stub, name))
+        if hasattr(_stub_db_module, name):
+            setattr(_server_module, name, getattr(_stub_db_module, name))
     try:
-        with patch.dict(sys.modules, {"api.db": stub}):
-            yield
+        yield
     finally:
-        for name, value in originals.items():
-            if value is _MISSING:
-                if hasattr(_server_module, name):
-                    delattr(_server_module, name)
-            else:
-                setattr(_server_module, name, value)
+        sys.modules.pop("api.db", None)
+        import importlib
+        try:
+            real_db = importlib.import_module("api.db")
+        except Exception:
+            real_db = None
+        if real_db is not None:
+            for attr in dir(real_db):
+                if attr.startswith("__"):
+                    continue
+                try:
+                    setattr(_stub_db_module, attr, getattr(real_db, attr))
+                except Exception:
+                    pass
+            sys.modules["api.db"] = real_db
+            for name in _STUBBED_DB_NAMES:
+                if hasattr(real_db, name):
+                    setattr(_server_module, name, getattr(real_db, name))
 
 
 # ---------------------------------------------------------------------------
