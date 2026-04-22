@@ -28,22 +28,18 @@ if _DB and not os.environ.get("DATABASE_URL"):
 _DB_TABLES = ("session_log", "sessions", "sandboxes", "volumes", "agents")
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Session-scoped event loop so session-scoped async fixtures share it."""
-    import asyncio
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture
 async def db_pool():
-    """Open the connection pool once per test session.
+    """Open the connection pool for this test and tear it down after.
 
-    Tests that need DB access depend on ``clean_db`` (which transitively
-    depends on this). Kept separate from autouse so tests that don't touch
-    the DB don't pay for pool init.
+    Function-scoped to match pytest-asyncio 1.x's default ``loop_scope``
+    — a session-scoped async fixture on a function-scoped event loop is
+    the classic cause of ``psycopg_pool.PoolTimeout`` in CI: the pool
+    holds conns bound to a loop that's already closed, so the next
+    test's ``get_db()`` waits on a dead loop forever.
+
+    Per-test pool init is ~5-10ms on a warm Postgres, negligible next to
+    the DELETE-truncate already in ``clean_db``.
     """
     if not os.environ.get("TEST_DATABASE_URL"):
         yield
@@ -59,11 +55,7 @@ async def db_pool():
 
 @pytest_asyncio.fixture
 async def clean_db(db_pool):
-    """Truncate the 5 core tables before the test runs.
-
-    Depends on the session-scoped pool, so the pool opens once and each test
-    just pays for the DELETEs.
-    """
+    """Truncate the 5 core tables before the test runs."""
     if not os.environ.get("TEST_DATABASE_URL"):
         yield
         return

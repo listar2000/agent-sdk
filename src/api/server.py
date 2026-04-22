@@ -79,7 +79,6 @@ from . import providers as _providers_mod
 from .providers import (
     PORT_BASED_PROVIDERS,
     ProviderInstance,
-    _wait_for_health,
     allocate_sandbox_port,
     create_instance,
     destroy_instance,
@@ -1843,6 +1842,7 @@ async def _ensure_sandbox_alive(
             if fresh_record is None:
                 raise RuntimeError("Sandbox was deleted")
             if instance:
+                from .providers import _wait_for_health
                 alive = (
                     (instance.process is not None and instance.process.returncode is None)
                     or (instance.container_id
@@ -2286,6 +2286,7 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
             and existing.supervisor_url
         )
         if reusable:
+            from .providers import _wait_for_health
             try:
                 if await _wait_for_health(existing.supervisor_url, max_retries=2, interval=1):
                     return existing
