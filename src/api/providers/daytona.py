@@ -328,6 +328,14 @@ async def restart_daytona_supervisor(
     after the supervisor process was killed in place). Preserves the
     sandbox filesystem, so claude-agent-acp's persisted session state is
     available for session/load.
+
+    Prefers the volume-cache install path
+    (``start_supervisor_in_sandbox``) so the restart and fresh-provision
+    paths agree on where the ACP binary lives.  Falls back to the legacy
+    ``_bootstrap_supervisor_in_daytona_sandbox(install_deps=False)`` branch
+    only when the volume cache is absent — typically because the sandbox
+    was created before the volume-refactor landed and has no
+    ``/opt/supervisor`` mount.
     """
     try:
         from daytona_sdk import Daytona, DaytonaConfig
@@ -347,6 +355,42 @@ async def restart_daytona_supervisor(
         log.info("starting stopped daytona sandbox %s", daytona_sandbox_id)
         await loop.run_in_executor(None, sandbox.start)
 
+    # Probe for the volume-cached deps tarball. If present, route through
+    # start_supervisor_in_sandbox which extracts from the cache; otherwise
+    # fall back to the legacy /tmp install path.
+    def _exec(cmd: str, timeout: int = 10) -> str:
+        r = sandbox.process.exec(cmd, timeout=timeout)
+        return (r.result if hasattr(r, "result") else str(r)) or ""
+
+    cache_check = await loop.run_in_executor(
+        None,
+        lambda: _exec(
+            f"test -f {_SUPERVISOR_VOLUME_DIR}/deps.tar.gz "
+            f"&& test -f {_SUPERVISOR_VOLUME_DIR}/supervisor.js "
+            "&& echo yes || echo no"
+        ),
+    )
+    if cache_check.strip() == "yes":
+        # Volume-cached path. Uses the fixed supervisor port so the
+        # signed URL is stable across restarts for an already-issued
+        # session (Daytona maps preview URLs by port).
+        url = await start_supervisor_in_sandbox(
+            sandbox, agent_type, _SUPERVISOR_REMOTE_PORT,
+            root=root, spawn_env=spawn_env,
+        )
+        return ProviderInstance(
+            provider="daytona",
+            url=url,
+            root=root,
+            sandbox_id=sandbox.id,
+        )
+
+    # Legacy fallback — /tmp install produced by an older fresh-provision.
+    log.info(
+        "restart_daytona_supervisor: volume cache missing for sandbox %s; "
+        "using legacy /tmp bootstrap path",
+        daytona_sandbox_id[:16],
+    )
     return await _bootstrap_supervisor_in_daytona_sandbox(
         sandbox, agent_type, install_deps=False, root=root, spawn_env=spawn_env,
     )
@@ -635,10 +679,20 @@ async def stop_sandbox(inst) -> None:
 async def ensure_supervisor_url(inst, *, agent_type: str, root: str = "/tmp",
                                 spawn_env: dict | None = None,
                                 port: int | None = None, **_kw) -> str:
-    """Daytona: start a supervisor in the sandbox referenced by inst and
-    return its URL. Implements the 2-phase 'create, then start-supervisor'
-    model (docker/local start the supervisor at create time and just return
-    inst.url)."""
+    """Daytona: start a supervisor in the sandbox referenced by ``inst`` and
+    return its URL.
+
+    Daytona follows a 2-phase "create the sandbox, then start the
+    supervisor" model — ``create_sandbox`` returns an instance with
+    ``url=""``, and the server calls this helper later to spawn the
+    supervisor process and mint a signed preview URL.
+
+    Docker and local providers collapse these two steps: their
+    ``create_sandbox`` already has ``url`` set when it returns, so the
+    corresponding ``ensure_supervisor_url`` is effectively a no-op that
+    just echoes ``inst.url``.  The dispatcher in
+    ``providers.__init__.ensure_supervisor_url`` routes transparently to
+    whichever provider the instance belongs to."""
     from daytona_sdk import Daytona, DaytonaConfig
     import os as _os
     api_key = _os.environ.get("DAYTONA_API_KEY")

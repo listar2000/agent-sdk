@@ -474,9 +474,13 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
 async def ensure_supervisor_url(
     inst: ProviderInstance,
     *, agent_type: str = "claude", root: str = "/tmp",
-    spawn_env: dict | None = None, port: int | None = None, **_kw,
+    spawn_env: dict | None = None, port: int | None = None,
 ) -> str:
-    """Docker supervisor is started at create_sandbox time — URL is stable."""
+    """Docker supervisor is started at create_sandbox time — URL is stable.
+
+    Signature matches Daytona's ``ensure_supervisor_url`` exactly so
+    mis-spelled kwargs surface as TypeError instead of being silently
+    swallowed by a ``**_kw`` catch-all."""
     return inst.url
 
 

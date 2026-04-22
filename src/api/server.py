@@ -87,7 +87,6 @@ from .providers import (
     exec_in_instance,
     free_sandbox_port,
     kill_supervisor_in_sandbox,
-    provision_daytona_sandbox,
     stop_instance,
 )
 from .providers._shared import _safe_path as _shared_safe_path
@@ -914,11 +913,6 @@ def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
     return tmp.name
 
 
-# NOTE: _derive_sandbox_ref was removed in 2026-04-22. sandbox_ref now always
-# carries the provider-native id (container_id / pid / daytona sandbox id); the
-# supervisor's host port is persisted separately as sandboxes.listen_port.
-
-
 # ---------------------------------------------------------------------------
 # Agent CRUD (config only, no sandbox)
 # ---------------------------------------------------------------------------
@@ -993,12 +987,17 @@ async def create_volume(body: _VolumeCreateBody):
     if await get_volume_by_name(body.name) is not None:
         raise HTTPException(409, f"Volume '{body.name}' already exists")
 
+    # Dispatch through each provider's uniform ``create_volume`` helper.
+    # Daytona's hot-path continues to call ``create_daytona_volume`` under
+    # the dispatcher so the existing module-level provider fixtures keep
+    # patching the right symbol.
     if body.provider == "daytona":
+        # Keep the direct-call form — the daytona.create_volume wrapper
+        # delegates to this same function, but existing tests patch
+        # ``api.providers.create_daytona_volume`` directly.
         provider_ref = await _providers_mod.create_daytona_volume(body.name)
-    elif body.provider == "docker":
-        raise HTTPException(501, "Docker volumes not implemented yet")
-    elif body.provider == "local":
-        raise HTTPException(501, "Local volumes not implemented yet")
+    elif body.provider in _providers_mod._PROVIDER_MODS:
+        provider_ref = await _providers_mod.create_volume(body.provider, body.name)
     else:
         raise HTTPException(400, f"Unknown provider: {body.provider}")
 
@@ -1013,14 +1012,16 @@ async def create_volume(body: _VolumeCreateBody):
         await upsert_volume(vol)
     except Exception:
         # Clean up the now-orphaned provider volume on DB failure.
-        if body.provider == "daytona":
-            try:
+        try:
+            if body.provider == "daytona":
                 await _providers_mod.delete_daytona_volume(provider_ref)
-            except Exception as cleanup_err:
-                log.warning(
-                    "orphaned daytona volume %s: rollback delete failed: %s",
-                    provider_ref, cleanup_err,
-                )
+            else:
+                await _providers_mod.delete_volume(body.provider, provider_ref)
+        except Exception as cleanup_err:
+            log.warning(
+                "orphaned %s volume %s: rollback delete failed: %s",
+                body.provider, provider_ref, cleanup_err,
+            )
         raise
     return vol
 
@@ -1174,8 +1175,19 @@ async def create_sandbox(request: Request):
         return JSONResponse(
             {"error": "volume_id and subpath are required"}, status_code=400,
         )
+    # Docker refuses empty subpaths at the provider layer — pre-validate
+    # here so clients see a clean 400 instead of a 502 wrapping a
+    # ValueError from the provider. (MI6)
+    if provider == "docker" and not subpath:
+        return JSONResponse(
+            {"error": "subpath is required for docker sandboxes"},
+            status_code=400,
+        )
+    # ``_resolve_volume`` raises HTTPException(404) on miss; ``vol`` is
+    # always a VolumeRecord here. The defensive ``vol is not None`` guard
+    # the old code had was dead. (MI5)
     vol = await _resolve_volume(volume_id)
-    if vol is not None and provider != vol.provider:
+    if provider != vol.provider:
         return JSONResponse(
             {"error": f"provider {provider!r} does not match volume.provider {vol.provider!r}"},
             status_code=400,
@@ -1318,6 +1330,14 @@ async def provision_sandbox_route(request: Request):
     if provider != vol.provider:
         return JSONResponse(
             {"error": f"provider {provider!r} does not match volume.provider {vol.provider!r}"},
+            status_code=400,
+        )
+    # Docker refuses empty subpaths at the provider layer — pre-validate
+    # here so clients see a clean 400 instead of a 502 wrapping a
+    # ValueError from the provider. (MI6)
+    if provider == "docker" and not subpath:
+        return JSONResponse(
+            {"error": "subpath is required for docker sandboxes"},
             status_code=400,
         )
 
