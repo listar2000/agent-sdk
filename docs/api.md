@@ -2,9 +2,12 @@
 
 Base URL: `http://localhost:7778`
 
-The API has two resource groups:
-- **Sandboxes** — infrastructure lifecycle (create, list, get, destroy, stop, start)
-- **Sessions** — agent conversation (messages, events, resume, cancel, config, status, logs)
+The API has three resource groups:
+- **Volumes** — durable storage (CRUD, file ops). Each volume holds `~/.claude`, transcripts, and workspace for the agents that mount it.
+- **Sandboxes** — ephemeral compute leases (create, list, get, destroy, stop, start). Each sandbox mounts a volume at a subpath.
+- **Sessions** — agent conversation (messages, events, resume, cancel, config, status, logs). Each session binds to a volume; its current sandbox is swapped transparently when the old one dies.
+
+> **Model change in this PR:** sessions used to be bound to a specific sandbox via `ON DELETE CASCADE`. Now they bind to a volume, and the sandbox is an ephemeral lease that can come and go — `current_sandbox_id` is nullable, and deleting a sandbox leaves the session intact. See [`assets/data-model.html`](../assets/data-model.html) and [`assets/rest-api.html`](../assets/rest-api.html) for a visual diff.
 
 ## Health
 
@@ -36,12 +39,14 @@ Serves a browser-based chat interface for interacting with agent sessions.
 ```
 POST /sessions/quick
 ```
-Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win.
+
+**Requires `volume_id`.** Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win.
 
 ```json
 {
   "name": "worker",
   "provider": "local",
+  "volume_id": "vol-uuid",
   "agent_type": "claude",
   "model": "claude-sonnet-4-6",
   "cwd": "/tmp",
@@ -56,28 +61,42 @@ Returns:
 ```json
 {
   "agent_id": "uuid",
-  "sandbox_id": "uuid",
+  "current_sandbox_id": "uuid",
   "session_id": "uuid",
   "inner_session_id": "uuid",
   "connected": true
 }
 ```
 
-### Create session on an existing sandbox
+### Create a session bound to a volume (lazy sandbox)
 
 ```
 POST /sessions
 ```
 
-Same config fields as `POST /sessions/quick`, plus a required `sandbox_id` (from a prior `/sessions/quick` or sandbox create). Provisions **no** new sandbox — starts a new agent + ACP session attached to the supervisor already running in that sandbox. Response shape matches `/sessions/quick`.
+**Requires `volume_id`.** Does **not** provision a sandbox — the compute is created lazily on the first `/message` or `/resume`. Accepts the same config fields as `/sessions/quick`, plus an optional `agent_id` to reuse an existing agent config instead of creating a new one.
 
 ```json
 {
-  "sandbox_id": "uuid-from-existing-workspace",
+  "agent_id": "uuid-optional",
+  "volume_id": "vol-uuid",
   "name": "worker-2",
   "agent_type": "claude",
   "model": "claude-sonnet-4-6",
-  "cwd": "/home/daytona"
+  "cwd": "/home/daytona",
+  "secrets": {"CLAUDE_CODE_OAUTH_TOKEN": "..."}
+}
+```
+
+Returns:
+
+```json
+{
+  "id": "session-uuid",
+  "agent_id": "uuid",
+  "volume_id": "vol-uuid",
+  "current_sandbox_id": null,
+  "connected": false
 }
 ```
 
@@ -125,6 +144,13 @@ Some wrappers may emit `notifications/session/update`; clients should treat both
 | `execute_tool_started` | `{_meta: {claudeCode: {toolName, toolUseId}}, rawInput: {...}}` |
 | `tool_call_update` | `{_meta: {claudeCode: {toolResponse\|toolResult, toolName, toolUseId}}}` |
 | `usage_updated` / `usage_update` | `{cost: {amount, currency}}` |
+
+In addition to ACP-proxied events, the server emits:
+
+| event | Payload |
+|---|---|
+| `sandbox_reattach` | `{old_sandbox_id, new_sandbox_id}` — emitted before the first real event of a run when the session transparently reprovisioned its sandbox against the same volume. |
+| `sandbox_lost` | `{sandbox_id, reason}` — emitted once on mid-run sandbox failure. The run aborts; caller decides whether to retry. |
 
 Prompt done:
 ```json
@@ -224,18 +250,30 @@ considered active, so the next queued prompt cannot start yet. See
 POST /sessions/{session_id}/resume
 ```
 
-No body. Looks up everything from the DB and restarts the sandbox if stopped. Returns:
+No body. Looks up everything from the DB and ensures a live sandbox — reprovisioning against the session's volume if the prior sandbox was killed or reaped. Returns:
 ```json
 {
   "session_id": "uuid",
   "agent_id": "uuid",
-  "sandbox_id": "uuid",
+  "current_sandbox_id": "uuid",
   "inner_session_id": "uuid",
   "status": "resumed"
 }
 ```
 
-Conversation endpoints (`/message`, `/events`, `/cancel`, `/config`, `/resume`, `/sandbox/exec`) auto-recover reaped sessions by looking up session metadata in Postgres and rebuilding runtime state. You don't need to call resume explicitly before those calls. In-memory introspection endpoints like `/sessions` and `/sessions/{id}/status` do not trigger recovery.
+Conversation endpoints (`/message`, `/events`, `/cancel`, `/config`, `/resume`, `/sandbox/exec`) auto-recover reaped or killed sandboxes by looking up the session in Postgres and ensuring a live sandbox mounted against the session's volume. You don't need to call resume explicitly before those calls. In-memory introspection endpoints like `/sessions` and `/sessions/{id}/status` do not trigger recovery.
+
+### Sandbox control
+
+Explicit lifecycle control over the session's ephemeral sandbox. None of these affect the session row or its bound volume.
+
+```
+POST /sessions/{session_id}/start-sandbox    — pre-warm a sandbox eagerly (idempotent)
+POST /sessions/{session_id}/stop-sandbox     — kill current sandbox; next /message lazy-provisions a fresh one
+POST /sessions/{session_id}/reset-sandbox    — kill current + provision a fresh replacement in one call
+```
+
+`start-sandbox` and `reset-sandbox` return `{"sandbox_id": "..."}` on success. `stop-sandbox` returns 204.
 
 ### Cancel running prompt
 
@@ -266,7 +304,7 @@ GET /sessions/{id}/log?limit=500     — event log (oldest first)
 |---|---|
 | `session_id` | Session ID |
 | `agent_id` | Agent ID |
-| `sandbox_id` | Sandbox ID |
+| `current_sandbox_id` | Currently-attached sandbox ID, or `null` if none is live |
 | `inner_session_id` | Agent-native session ID used for resume/load |
 | `agent_busy` | Whether a prompt is currently active (`active_rpc_id != null`) |
 | `active_rpc_id` | Currently running prompt ID, if any |
@@ -321,18 +359,58 @@ Returns:
 
 If the session's sandbox is stopped/reaped, the server auto-recovers it before running the command.
 
+## Volumes
+
+Durable storage, independent of any sandbox. Created once, live for months. Every sandbox must be created against a volume (with a subpath), and every session binds to a volume.
+
+```
+POST   /volumes                              — create (body: {name, provider})
+POST   /volumes/provision                    — create + wait for status="ready" (mirrors /sandboxes/provision)
+GET    /volumes                              — list (optional ?provider= filter)
+GET    /volumes/{id_or_name}                 — get (name lookup supported for convenience)
+DELETE /volumes/{id_or_name}?force=false     — delete (409 if any session still references it; force=true cascades)
+GET    /volumes/{id_or_name}/files/tree      — browse volume contents (e.g. ?path=shared/)
+GET    /volumes/{id_or_name}/files/read      — read a file (?path=…)
+POST   /volumes/{id_or_name}/files/edit      — write a file (body: {path, content})
+```
+
+File ops are backed internally by a short-lived utility sandbox that mounts the volume; callers never need to manage one to seed data.
+
+`POST /volumes` body:
+
+```json
+{"name": "my-vol", "provider": "daytona"}
+```
+
+Returns the volume record including `{id, name, provider, provider_ref, status}`.
+
 ## Sandboxes
 
-Sandbox endpoints don't require a session. They operate directly on the sandbox infrastructure.
+Sandbox endpoints don't require a session. They operate directly on the sandbox infrastructure. Every sandbox is `(volume_id, subpath)`-scoped at creation: the volume is mounted at `/home/daytona` and a read-only `shared/` subpath on the same volume is mounted at `/mnt/shared`.
 
 ```
-POST   /sandboxes                    — create (provider, dockerfile)
+POST   /sandboxes                    — create (requires {provider, volume_id, subpath, …})
+POST   /sandboxes/provision          — create + wait for ready (same required fields)
 GET    /sandboxes                    — list
-GET    /sandboxes/{id}               — get info
-DELETE /sandboxes/{id}               — destroy permanently
-POST   /sandboxes/{id}/stop          — stop (preserves filesystem on Daytona)
+GET    /sandboxes/{id}               — get info (includes volume_id, subpath)
+DELETE /sandboxes/{id}               — destroy (sessions survive with current_sandbox_id = NULL)
+POST   /sandboxes/{id}/stop          — stop (volume data preserved)
 POST   /sandboxes/{id}/start         — resume stopped sandbox
 ```
+
+`POST /sandboxes` body:
+
+```json
+{
+  "provider": "daytona",
+  "volume_id": "vol-uuid",
+  "subpath": "agents/<agent_id>/home",
+  "agent_type": "claude",
+  "root": "/home/daytona"
+}
+```
+
+For session-driven creation, the server uses `subpath = agents/<agent_id>/home` so that all sessions of the same agent share HOME on the volume.
 
 ## Agents (config only)
 

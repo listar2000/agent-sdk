@@ -48,7 +48,7 @@ The server uses Postgres. On every startup, `init_db()` runs:
 
 Migrations live in `_MIGRATIONS` in `src/api/db.py`. Each must use `IF EXISTS` / `IF NOT EXISTS` so they're safe to run repeatedly. Add new ones to the bottom of the list — they run automatically on the next deploy.
 
-Tables: `agents`, `sandboxes`, `sessions`, `session_log`.
+Tables: `agents`, `volumes`, `sandboxes`, `sessions`, `session_log`.
 
 ## Use the SDK
 
@@ -107,14 +107,16 @@ Obtaining the OAuth token (`claude setup-token` or equivalent) is the caller's r
 
 ## Session persistence
 
-Sessions survive server restarts. The server persists `{session_id, agent_id, sandbox_id, inner_session_id}` to Postgres. Resume from another process with just the session_id:
+Sessions survive server restarts **and** sandbox death. The server persists `{session_id, agent_id, volume_id, current_sandbox_id, inner_session_id}` to Postgres. The agent's HOME (`~/.claude`, transcripts, workspace) lives on the volume, not the sandbox — so when a sandbox is reaped, crashes, or is explicitly deleted, the session row survives with `current_sandbox_id = NULL` and the next `/message` lazily reprovisions a new sandbox that mounts the same volume. Claude CLI resumes from the transcript still on disk.
+
+Resume from another process with just the session_id:
 
 ```python
 agent = Agent("restored", session_id="abc123")
 response = await agent.arun("What were we discussing?")
 ```
 
-The server looks up the session in the DB, restarts the sandbox if stopped, and replays the conversation history via `session/load`.
+The server looks up the session in the DB, ensures a live sandbox (reprovisioning against the session's volume if needed), and replays the conversation history via `session/load`.
 
 ## Architecture
 
@@ -125,14 +127,17 @@ The server looks up the session in the DB, restarts the sandbox if stopped, and 
 └───────────┘      └──────────────────┘      │  bridge to ACP)     │
       │                    │                 └──────────┬──────────┘
       │              Postgres                           │ stdio
-      │              (sessions, agents, sandboxes)      ▼
-      │                                        claude-agent-acp
-   /sessions/*   — conversation                  or codex-acp
-                  (message, events, resume)
+      │              (agents, volumes, sandboxes,       ▼
+      │               sessions, session_log)    claude-agent-acp
+   /sessions/*   — conversation                    or codex-acp
+                  (message, events, resume)                │
+                                              mounts volume subpath as HOME
 ```
 
-- **Sessions** hold conversation state (agent config, message history). Auto-recover from the DB when reaped.
-- **Supervisor** is a thin node process (`src/supervisor/supervisor.js`) that spawns the agent's ACP binary and exposes it over `/v1/acp/{id}` POST+SSE. One supervisor per provider-instance.
+- **Volumes** are durable storage — created once, live for months, hold `~/.claude`, transcripts, workspace. Provider-scoped (`POST /volumes`).
+- **Sandboxes** are ephemeral compute leases. Each sandbox mounts a volume at a subpath (for sessions, `agents/<agent_id>/home`) and can be killed freely; its `volume_id` + `subpath` is recorded at creation so a replacement can mount the same data.
+- **Sessions** hold conversation state and bind to a `volume_id` (immutable) + `current_sandbox_id` (nullable, swapped as sandboxes come and go). Auto-recover from the DB when the sandbox is reaped or when the in-memory runtime is evicted.
+- **Supervisor** is a thin node process (`src/supervisor/supervisor.js`) that spawns the agent's ACP binary and exposes it over `/v1/acp/{id}` POST+SSE. One supervisor per sandbox; it installs onto the volume so reattach doesn't repay the `npm install` cost.
 - **Providers**: `local` (supervisor subprocess on host), `docker` (supervisor in ephemeral container), `daytona` (supervisor in a Daytona sandbox). Provider-pluggable, same HTTP surface across all three.
 
 ## Providers
@@ -154,15 +159,19 @@ For persistent sessions that survive long idle periods, use Daytona.
 
 ```
 src/
-  agent_sdk/         Python SDK client (Agent class)
+  agent_sdk/         Python SDK client (Agent, Client, Volume)
     client.py
     errors.py
     persist.py       SQLite session persistence
   api/               Orchestration server
     server.py          FastAPI endpoints
-    providers.py       local / docker / daytona supervisor bootstrap
+    providers/         local / docker / daytona supervisor + volume bootstrap
+      _shared.py
+      local.py
+      docker.py
+      daytona.py
     acp_client.py      JSON-RPC ACP client (POST + SSE)
-    db.py              Postgres CRUD
+    db.py              Postgres CRUD (agents, volumes, sandboxes, sessions, session_log)
     sse.py             SSE parsing
     models.py          Dataclasses
     redact.py          Secret redaction for logs
@@ -173,6 +182,7 @@ src/
 tests/               pytest
 examples/            Demo scripts
 docs/                Docs
+assets/              data-model.html, rest-api.html, architecture diagrams
 docker-compose.yml   Postgres + API server
 Dockerfile
 ```
