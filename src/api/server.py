@@ -2309,7 +2309,8 @@ async def get_session_route(session_id: str):
     return {
         "session_id": rec.get("id"),
         "agent_id": rec.get("agent_id"),
-        "sandbox_id": rec.get("sandbox_id"),
+        "volume_id": rec.get("volume_id"),
+        "current_sandbox_id": rec.get("current_sandbox_id"),
         "inner_session_id": rec.get("inner_session_id"),
         "env": env,
         "secrets": {"keys": sorted(secrets.keys())},
@@ -3088,7 +3089,11 @@ async def session_sandbox_exec(session_id: str, request: Request):
         session_row = await get_session(session_id)
         if not session_row:
             return JSONResponse({"error": "session not found"}, status_code=404)
-        sandbox_id = session_row["sandbox_id"]
+        sandbox_id = session_row.get("current_sandbox_id")
+        if not sandbox_id:
+            return JSONResponse(
+                {"error": "session has no current sandbox"}, status_code=409,
+            )
 
     instance = _INSTANCES.get(sandbox_id)
 
