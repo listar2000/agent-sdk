@@ -90,22 +90,45 @@ async def test_delete_volume_calls_provider_for_docker(client):
 
 
 @pytest.mark.asyncio
-async def test_delete_volume_provider_error_still_removes_row(client):
-    """Mi8: if the provider-side delete fails (docker daemon hiccup) we
-    still remove the DB row — a dangling volume is recoverable manually,
-    a phantom DB row the user can't clear is not."""
+async def test_delete_volume_provider_not_found_swallowed(client):
+    """Mi8 + cycle-8 Ma2: if the provider says the volume is already
+    gone ("not found"), we swallow and still remove the DB row — the
+    desired end state (volume absent) is already achieved.
+    """
+    with patch("api.providers.docker.create_volume",
+               new=AsyncMock(return_value="docker-vol-gone")), \
+         patch("api.providers.docker.delete_volume",
+               new=AsyncMock(side_effect=RuntimeError("Error: no such volume"))):
+        r = await client.post("/volumes",
+                              json={"name": "mi8-gone", "provider": "docker"})
+        assert r.status_code == 200, r.text
+
+        r = await client.delete("/volumes/mi8-gone")
+        assert r.status_code == 204
+    r = await client.get("/volumes/mi8-gone")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_volume_provider_error_surfaces_as_409(client):
+    """Cycle-8 Ma2: transient / non-not-found provider errors (daemon
+    unreachable, "volume in use", etc.) must NOT be silently swallowed.
+    The DB row stays; client retries.  An out-of-band container mounting
+    a docker volume is a real conflict the user should see.
+    """
     with patch("api.providers.docker.create_volume",
                new=AsyncMock(return_value="docker-vol-err")), \
          patch("api.providers.docker.delete_volume",
                new=AsyncMock(side_effect=RuntimeError("docker daemon unreachable"))):
         r = await client.post("/volumes",
-                              json={"name": "mi8-err", "provider": "docker"})
+                              json={"name": "mi8-surface", "provider": "docker"})
         assert r.status_code == 200, r.text
 
-        r = await client.delete("/volumes/mi8-err")
-        assert r.status_code == 204
-    r = await client.get("/volumes/mi8-err")
-    assert r.status_code == 404
+        r = await client.delete("/volumes/mi8-surface")
+        assert r.status_code == 409
+    # DB row preserved so a retry can succeed later.
+    r = await client.get("/volumes/mi8-surface")
+    assert r.status_code == 200
 
 
 @pytest.mark.asyncio

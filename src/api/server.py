@@ -39,9 +39,7 @@ from .db import (
     get_db,
     get_sandbox,
     get_session,
-    get_session_env,
     get_session_log,
-    get_session_secrets,
     get_volume,
     get_volume_by_name,
     init_db,
@@ -1084,16 +1082,26 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
     else:
         # Mi8: docker/local volumes previously leaked on DELETE because only
         # the daytona branch cleaned up the provider side.  Call the uniform
-        # dispatcher but wrap in try/except so a provider hiccup can't block
-        # the DB row deletion — a dangling named volume is recoverable; a
-        # phantom DB row the user can't clear is not.
+        # dispatcher; swallow only "not found"-class errors (volume is
+        # already gone on the provider side; the DB row is the last copy).
+        # Let "in use" errors propagate — an out-of-band container mounting
+        # the volume is a real conflict the user should see, not a silent
+        # orphan.  Matches the narrow whitelist the daytona branch uses.
         try:
             await _providers_mod.delete_volume(vol.provider, vol.provider_ref)
         except Exception as e:
-            log.warning(
-                "volume %s (%s) provider delete failed; DB row still removed: %s",
-                vol.id, vol.provider, e,
-            )
+            msg = str(e).lower()
+            if ("not found" in msg or "no such" in msg or "404" in msg
+                    or "does not exist" in msg):
+                log.warning(
+                    "volume %s (%s) already gone on provider: %s",
+                    vol.id, vol.provider, e,
+                )
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"provider-side volume delete failed: {e}",
+                )
     await delete_volume(vol.id)
 
 
@@ -2064,11 +2072,21 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
         try:
             await lock_conn.set_autocommit(True)
             _restore_autocommit = True
-        except Exception:
+        except AttributeError:
             # Some test fakes expose a shim that doesn't implement
             # set_autocommit — tolerate it, the transaction-in-progress
             # semantics then match the previous code.
             pass
+        except Exception as e:
+            # Real psycopg connection rejected the flip — log loudly so
+            # ops can investigate (advisory lock still works, but the
+            # connection will be "idle in transaction" during the slow
+            # install, which may trip idle-in-transaction timeouts).
+            log.error(
+                "ensure_volume_supervisor: set_autocommit(True) failed on "
+                "pooled conn (volume=%s agent=%s): %s; falling back to "
+                "transactional mode", volume_id, agent_type, e,
+            )
         try:
             got_row = await (await lock_conn.execute(
                 "SELECT pg_try_advisory_lock(%s)", (lock_key,)
@@ -2127,15 +2145,28 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
                     "ensure_volume_supervisor: pg_advisory_unlock failed: %s", e,
                 )
             # Restore the pre-borrow autocommit mode BEFORE the async
-            # context manager returns the connection to the pool.
+            # context manager returns the connection to the pool. If the
+            # restore itself fails, we must NOT return this connection to
+            # the pool in autocommit=True — close it instead so the pool
+            # opens a fresh one. Leaving a leaked autocommit=True in the
+            # pool silently breaks every later borrower's commit contract.
             if _restore_autocommit:
                 try:
                     await lock_conn.set_autocommit(False)
                 except Exception as e:
-                    log.warning(
+                    log.error(
                         "ensure_volume_supervisor: failed to restore "
-                        "autocommit=False on pooled conn: %s", e,
+                        "autocommit=False on pooled conn: %s; closing to "
+                        "prevent pool poisoning", e,
                     )
+                    try:
+                        await lock_conn.close()
+                    except Exception as close_err:
+                        log.warning(
+                            "ensure_volume_supervisor: lock_conn.close() "
+                            "after failed autocommit restore failed: %s",
+                            close_err,
+                        )
 
 
 async def ensure_sandbox(session_row: dict) -> SandboxRecord:

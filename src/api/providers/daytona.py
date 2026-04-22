@@ -25,7 +25,6 @@ from ._shared import (
     _wait_for_health,
     ProviderInstance,
     _build_volume_mounts,
-    allocate_sandbox_port,
 )
 
 _SUPERVISOR_DIR = Path(__file__).resolve().parent.parent.parent / "supervisor"
