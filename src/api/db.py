@@ -53,10 +53,19 @@ _PG_SCHEMA = [
         payload     JSONB NOT NULL,
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
+    """CREATE TABLE IF NOT EXISTS volumes (
+        id            TEXT PRIMARY KEY,
+        name          TEXT NOT NULL UNIQUE,
+        provider      TEXT NOT NULL,
+        provider_ref  TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'ready',
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_sandbox ON sessions(sandbox_id)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_session ON session_log(session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_agent ON session_log(agent_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_volumes_name ON volumes(name)",
 ]
 
 # ---------------------------------------------------------------------------
