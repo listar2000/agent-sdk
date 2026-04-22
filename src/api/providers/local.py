@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 from ._shared import (
@@ -106,48 +107,82 @@ async def delete_volume(ref: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def install_supervisor(ref: str, agent_type: str) -> None:
-    """``npm init -y`` + ``npm install <spec>`` + copy supervisor.js into
-    ``<ref>/system/supervisor/``."""
-    if agent_type not in _ACP_NPM_SPECS:
-        # Non-npm agents are expected on the host PATH — nothing to install
-        # on the volume. Still copy supervisor.js so start_sandbox can find it.
-        sup_dir = Path(ref) / "system" / "supervisor"
-        await asyncio.to_thread(lambda: os.makedirs(sup_dir, exist_ok=True))
-        await asyncio.to_thread(shutil.copy, _SUPERVISOR_JS_SRC, sup_dir / "supervisor.js")
-        log.info("local supervisor installed (non-npm agent_type=%s) on %s", agent_type, ref)
-        return
+    """Install supervisor.js + npm deps atomically into ``<ref>/system/supervisor/``.
 
-    npm = shutil.which("npm")
-    if not npm:
-        raise RuntimeError("npm not found; install Node.js >=18")
+    Populates a sibling staging dir (``system/supervisor.tmp.<uuid>``) first,
+    verifies the expected sentinel (``node_modules/.bin/<bin>`` for npm agents
+    or just ``supervisor.js`` otherwise), then atomically swaps it into place
+    with ``os.rename``. On any failure the staging dir is removed, leaving
+    the previous install (if any) untouched. This makes a half-finished
+    ``npm install`` — killed by a disk-full or SIGKILL — safe to retry
+    because a re-run starts from a fresh staging dir, not a partially
+    populated destination.
+    """
+    final_dir = Path(ref) / "system" / "supervisor"
+    system_dir = final_dir.parent
+    await asyncio.to_thread(lambda: os.makedirs(system_dir, exist_ok=True))
+    staging = system_dir / f"supervisor.tmp.{uuid.uuid4().hex[:8]}"
+    await asyncio.to_thread(lambda: os.makedirs(staging, exist_ok=True))
 
-    sup_dir = Path(ref) / "system" / "supervisor"
-    await asyncio.to_thread(lambda: os.makedirs(sup_dir, exist_ok=True))
+    def _promote() -> None:
+        """Atomically replace final_dir with staging. Caller ensures sentinel."""
+        if final_dir.exists():
+            # shutil.rmtree is not atomic but we've already verified staging
+            # is complete; a concurrent ensure would at worst re-install.
+            shutil.rmtree(final_dir)
+        os.rename(staging, final_dir)
 
-    spec = _ACP_NPM_SPECS[agent_type]
-    # npm init -y is a no-op if package.json already exists.
-    def _run_npm_init():
-        subprocess.run(
-            [npm, "init", "-y"],
-            cwd=str(sup_dir),
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+    try:
+        if agent_type not in _ACP_NPM_SPECS:
+            # Non-npm agents: copy supervisor.js into staging, verify, swap.
+            await asyncio.to_thread(shutil.copy, _SUPERVISOR_JS_SRC, staging / "supervisor.js")
+            if not (staging / "supervisor.js").exists():
+                raise RuntimeError(f"staging sentinel missing: {staging}/supervisor.js")
+            await asyncio.to_thread(_promote)
+            log.info("local supervisor installed (non-npm agent_type=%s) on %s", agent_type, ref)
+            return
 
-    def _run_npm_install():
-        subprocess.run(
-            [npm, "install", "--omit=optional", spec],
-            cwd=str(sup_dir),
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        npm = shutil.which("npm")
+        if not npm:
+            raise RuntimeError("npm not found; install Node.js >=18")
 
-    await asyncio.to_thread(_run_npm_init)
-    await asyncio.to_thread(_run_npm_install)
-    await asyncio.to_thread(shutil.copy, _SUPERVISOR_JS_SRC, sup_dir / "supervisor.js")
-    log.info("local supervisor installed on volume %s for agent_type=%s", ref, agent_type)
+        spec = _ACP_NPM_SPECS[agent_type]
+
+        def _run_npm_init() -> None:
+            subprocess.run(
+                [npm, "init", "-y"],
+                cwd=str(staging),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+        def _run_npm_install() -> None:
+            subprocess.run(
+                [npm, "install", "--omit=optional", spec],
+                cwd=str(staging),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+        await asyncio.to_thread(_run_npm_init)
+        await asyncio.to_thread(_run_npm_install)
+        await asyncio.to_thread(shutil.copy, _SUPERVISOR_JS_SRC, staging / "supervisor.js")
+
+        # Sentinel check: the per-agent ACP binary must exist in node_modules.
+        sentinel = staging / "node_modules" / ".bin" / _acp_bin_name(agent_type)
+        if not sentinel.exists():
+            raise RuntimeError(f"staging sentinel missing: {sentinel}")
+        if not (staging / "supervisor.js").exists():
+            raise RuntimeError(f"staging sentinel missing: {staging}/supervisor.js")
+
+        await asyncio.to_thread(_promote)
+        log.info("local supervisor installed on volume %s for agent_type=%s", ref, agent_type)
+    except BaseException:
+        # Best-effort clean up the staging dir; don't mask the original error.
+        await asyncio.to_thread(lambda: shutil.rmtree(staging, ignore_errors=True))
+        raise
 
 
 # ---------------------------------------------------------------------------

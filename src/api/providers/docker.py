@@ -17,6 +17,7 @@ import base64
 import logging
 import shlex
 import shutil
+import uuid
 from pathlib import Path
 
 from ._shared import (
@@ -130,12 +131,19 @@ async def delete_volume(ref: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def install_supervisor(volume_ref: str, agent_type: str) -> None:
-    """Populate ``<volume>/system/supervisor/`` with supervisor.js + node_modules.
+    """Atomically populate ``<volume>/system/supervisor/`` with supervisor.js + deps.
 
-    Runs a 1-shot ``node:20-slim`` container with the volume-subpath
-    ``system/supervisor`` mounted at /work and a bind-ro of the host's
-    supervisor.js at /src/supervisor.js.  Executes ``npm init -y`` +
-    ``npm install <spec>`` + ``cp /src/supervisor.js .``.
+    Runs the install inside a sibling staging directory
+    (``<volume>/system/supervisor.tmp.<uuid>``) and swaps it into place with
+    ``mv`` only after a sentinel (``node_modules/.bin/<bin>``) is present.
+    On failure the staging dir is removed, leaving any previous install
+    intact — a retried install starts from a fresh staging dir so a stale
+    ``package.json`` or ``package-lock.json`` from a killed ``npm install``
+    can never corrupt the destination.
+
+    Mounts ``system/`` (not ``system/supervisor``) so both the staging dir
+    and the final target share a single mount point and ``mv`` is a
+    rename-within-volume rather than a cross-mount copy.
     """
     if agent_type not in _ACP_NPM_SPECS:
         raise ValueError(
@@ -144,23 +152,43 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
     if not _SUPERVISOR_JS_HOST.exists():
         raise RuntimeError(f"host supervisor.js missing at {_SUPERVISOR_JS_HOST}")
     npm_spec = _ACP_NPM_SPECS[agent_type]
+    bin_name = _acp_bin_name(agent_type)
+    staging_name = f"supervisor.tmp.{uuid.uuid4().hex[:8]}"
+
+    # Sentinel path inside the staging dir; must exist before we swap.
+    sentinel = f"/work/{staging_name}/node_modules/.bin/{shlex.quote(bin_name)}"
+    staging_path = f"/work/{shlex.quote(staging_name)}"
+    final_path = "/work/supervisor"
 
     shell = (
-        "set -e && cd /work && "
-        "(test -f package.json || npm init -y >/dev/null 2>&1) && "
+        "set -e && "
+        f"mkdir -p {staging_path} && "
+        f"cd {staging_path} && "
+        "npm init -y >/dev/null 2>&1 && "
         f"npm install --omit=optional --silent {shlex.quote(npm_spec)} && "
-        "cp /src/supervisor.js /work/supervisor.js"
+        f"cp /src/supervisor.js {staging_path}/supervisor.js && "
+        # Sentinel check + atomic swap. If the sentinel is missing, fail
+        # without touching the existing supervisor dir.
+        f"test -f {sentinel} && "
+        f"test -f {staging_path}/supervisor.js && "
+        # Remove any previous install before rename (rename target must not
+        # be a non-empty dir on same-volume mv). -rf tolerates missing.
+        f"rm -rf {final_path} && "
+        f"mv {staging_path} {final_path}"
     )
+    # Whole-command cleanup: if any step fails, remove staging so the
+    # volume is never left with ``supervisor.tmp.*`` dirs.
+    shell_wrapped = f"({shell}) || (rm -rf {staging_path}; exit 1)"
 
     log.info("docker install_supervisor: volume=%s agent=%s", volume_ref, agent_type)
     await _run_docker_checked(
         "run", "--rm",
         "--mount",
-        f"type=volume,source={volume_ref},target=/work,volume-subpath=system/supervisor",
+        f"type=volume,source={volume_ref},target=/work,volume-subpath=system",
         "--mount",
         f"type=bind,source={_SUPERVISOR_JS_HOST},target=/src/supervisor.js,readonly",
         _NODE_IMAGE,
-        "sh", "-c", shell,
+        "sh", "-c", shell_wrapped,
         timeout=600,
     )
     log.info(

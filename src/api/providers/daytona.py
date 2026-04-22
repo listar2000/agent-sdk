@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import shlex
+import uuid
 from pathlib import Path
 
 from .. import load_dotenv
@@ -653,11 +654,18 @@ async def ensure_supervisor_url(inst, *, agent_type: str, root: str = "/tmp",
 
 
 async def install_supervisor(volume_ref: str, agent_type: str) -> None:
-    """Install supervisor.js + ACP binary on this volume at system/supervisor/.
+    """Atomically install supervisor.js + ACP deps on this volume.
 
-    Spins a 1-shot Daytona sandbox with the volume mounted
-    (subpath=system/supervisor at /work), runs npm install + uploads
-    supervisor.js, then tears down the sandbox.
+    Writes the artifacts (``deps.tar.gz`` + ``supervisor.js``) into a sibling
+    staging dir (``system/supervisor.tmp.<uuid>/``) first, verifies both
+    sentinels are present, then atomically renames the staging dir over
+    ``system/supervisor`` via ``mv``. If any step fails the staging dir is
+    removed, leaving any previous install untouched — a retried install
+    can never end up with a half-written ``deps.tar.gz`` racing against a
+    live reader.
+
+    Mounts ``system/`` (not ``system/supervisor``) so staging and final
+    share a single mount point and ``mv`` is a rename-within-volume.
     """
     from daytona_sdk import (
         Daytona, DaytonaConfig, CreateSandboxFromSnapshotParams,
@@ -673,7 +681,8 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
     snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
     use_snapshot = snapshot.lower() not in {"", "0", "false", "image"}
 
-    volumes = [VolumeMount(volume_id=volume_ref, mount_path="/work", subpath="system/supervisor")]
+    # Mount whole system/ so staging + final share the mount and mv can rename.
+    volumes = [VolumeMount(volume_id=volume_ref, mount_path="/work", subpath="system")]
 
     if use_snapshot:
         sb = await loop.run_in_executor(None, lambda: daytona.create(
@@ -690,6 +699,10 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
             ), timeout=120,
         ))
 
+    staging_name = f"supervisor.tmp.{uuid.uuid4().hex[:8]}"
+    staging_on_volume = f"/work/{staging_name}"
+    final_on_volume = "/work/supervisor"
+
     try:
         npm_spec = _ACP_NPM_SPECS[agent_type]
 
@@ -697,42 +710,57 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
             r = sb.process.exec(cmd, timeout=timeout)
             return (r.result if hasattr(r, "result") else str(r)) or ""
 
-        # Install to local ephemeral FS (fast SSD), create a single archive,
-        # then copy ONLY that archive to the volume.  Extracting thousands of
-        # node_modules files directly to a network volume is very slow and
-        # times out; writing one ~20 MB .tar.gz is fast.
-        # At start time, start_supervisor_in_sandbox extracts the archive
-        # to local ephemeral FS inside the session sandbox.
+        # npm install to local ephemeral FS (fast SSD), pack to a tarball,
+        # place it on the volume under the staging dir.
         local_dir = "/tmp/sup-install"
         await loop.run_in_executor(None, lambda: _exec(
-            f"mkdir -p {local_dir} && cd {local_dir} && "
-            "(test -f package.json || npm init -y >/dev/null 2>&1)"
+            f"rm -rf {local_dir} && mkdir -p {local_dir} && cd {local_dir} && "
+            "npm init -y >/dev/null 2>&1"
         ))
         await loop.run_in_executor(None, lambda: _exec(
             f"cd {local_dir} && npm install --omit=optional {npm_spec} 2>&1 | tail -5",
             240,
         ))
 
-        # Pack to a single archive on local FS, then copy to volume as one file.
-        # cp of a single ~20 MB file is fast (a few seconds); tar-extracting
-        # thousands of files is slow.
+        # Build the staging dir on the volume and drop the tarball there.
         await loop.run_in_executor(None, lambda: _exec(
+            f"mkdir -p {staging_on_volume} && "
             f"tar -C {local_dir} -czf /tmp/deps.tar.gz . && "
-            f"cp /tmp/deps.tar.gz /work/deps.tar.gz && "
+            f"cp /tmp/deps.tar.gz {staging_on_volume}/deps.tar.gz && "
             f"rm -f /tmp/deps.tar.gz && rm -rf {local_dir}",
             120,
         ))
 
-        # Upload supervisor.js using the Daytona filesystem API — avoids the
-        # shell command length / printf append reliability issues.
+        # Upload supervisor.js into the staging dir via the Daytona fs API.
         with open(_SUPERVISOR_DIR / "supervisor.js", "rb") as f:
             sup_js_bytes = f.read()
-
         await loop.run_in_executor(
-            None, lambda: sb.fs.upload_file(sup_js_bytes, "/work/supervisor.js")
+            None, lambda: sb.fs.upload_file(
+                sup_js_bytes, f"{staging_on_volume}/supervisor.js"
+            )
         )
 
+        # Sentinel checks + atomic swap. Using shell ``test`` so a single
+        # missing file aborts before we touch the existing supervisor dir.
+        await loop.run_in_executor(None, lambda: _exec(
+            f"set -e && "
+            f"test -f {staging_on_volume}/deps.tar.gz && "
+            f"test -f {staging_on_volume}/supervisor.js && "
+            f"rm -rf {final_on_volume} && "
+            f"mv {staging_on_volume} {final_on_volume}",
+            30,
+        ))
+
         log.info("supervisor installed on volume %s for %s", volume_ref, agent_type)
+    except BaseException:
+        # Best-effort staging-dir cleanup; don't mask the original error.
+        try:
+            await loop.run_in_executor(None, lambda: sb.process.exec(
+                f"rm -rf {staging_on_volume}", timeout=30,
+            ))
+        except Exception as cleanup_err:  # pragma: no cover
+            log.warning("daytona install_supervisor staging cleanup failed: %s", cleanup_err)
+        raise
     finally:
         try:
             await loop.run_in_executor(None, lambda: daytona.delete(sb))
