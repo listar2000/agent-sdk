@@ -85,3 +85,18 @@ async def test_delete_volume_conflict_if_session_exists(client):
         )
     r = await client.delete("/volumes/conflict")
     assert r.status_code == 409
+
+    # With force=true the referenced session is deleted and the volume too.
+    with patch("api.providers.delete_daytona_volume",
+               new=AsyncMock(return_value=None)):
+        r = await client.delete("/volumes/conflict?force=true")
+    assert r.status_code == 204
+    # Volume gone.
+    r = await client.get("/volumes/conflict")
+    assert r.status_code == 404
+    # Session gone.
+    async with dbmod.get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT id FROM sessions WHERE id = %s", ("sess_1",)
+        )).fetchone()
+    assert row is None
