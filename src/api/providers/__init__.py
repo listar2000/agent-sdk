@@ -243,3 +243,42 @@ async def volume_read(provider: str, ref: str, path: str) -> bytes:
 
 async def volume_write(provider: str, ref: str, path: str, content: bytes) -> None:
     return await _PROVIDER_MODS[provider].volume_write(ref, path, content)
+
+
+async def provision_sandbox(
+    provider: str,
+    *,
+    volume_ref: str,
+    subpath: str,
+    agent_type: str = "claude",
+    spawn_env: dict | None = None,
+    port: int | None = None,
+    root: str | None = None,
+    dockerfile: str | None = None,
+    pre_start_commands: list[str] | None = None,
+    **kwargs,
+) -> ProviderInstance:
+    """Uniform sandbox provisioning across providers.
+
+    Each provider exposes ``create_sandbox(volume_ref, subpath, agent_type, ...)``
+    and returns a fresh ``ProviderInstance``. For Daytona, the returned instance
+    has ``url=""`` (no supervisor yet) and the caller must invoke
+    ``ensure_supervisor_url`` before talking to the supervisor. For Docker/Local
+    the supervisor is already started at create-time and ``inst.url`` is live.
+    """
+    mod = _PROVIDER_MODS[provider]
+    kw: dict = dict(kwargs)
+    if root is not None:
+        kw["root"] = root
+    if dockerfile is not None:
+        kw["dockerfile"] = dockerfile
+    if pre_start_commands is not None:
+        kw["pre_start_commands"] = pre_start_commands
+    return await mod.create_sandbox(
+        volume_ref=volume_ref,
+        subpath=subpath,
+        agent_type=agent_type,
+        spawn_env=spawn_env,
+        port=port,
+        **kw,
+    )

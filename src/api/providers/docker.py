@@ -198,6 +198,8 @@ async def create_sandbox(
     dockerfile: str | None = None,  # accepted but ignored — Docker uses _NODE_IMAGE
     pre_start_commands: list[str] | None = None,
     image: str | None = None,
+    port: int | None = None,  # accepted for parity with uniform API; always allocates
+    **_kw,
 ) -> ProviderInstance:
     """Create a Docker container with three volume-subpath mounts + supervisor.
 
@@ -211,7 +213,8 @@ async def create_sandbox(
     bin_name = _acp_bin_name(agent_type)
     launch_args = _acp_launch_args(agent_type)
     agent_root = root or _AGENT_HOME_IN
-    port = await _find_free_port()
+    if port is None:
+        port = await _find_free_port()
     base_image = image or _NODE_IMAGE
 
     env_prefix = _build_env_prefix(spawn_env)

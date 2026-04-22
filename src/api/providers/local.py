@@ -162,6 +162,8 @@ async def create_sandbox(
     port: int | None = None,
     spawn_env: dict[str, str] | None = None,
     root: str | None = None,
+    dockerfile: str | None = None,  # accepted for parity; no effect on local
+    pre_start_commands: list[str] | None = None,  # accepted for parity
     **_: object,
 ) -> ProviderInstance:
     """Launch a supervisor subprocess rooted at ``<vol>/<subpath>``.

@@ -223,19 +223,25 @@ async def _shutdown_session_state(
     await _cancel_task(state._scheduler_task)
     await _cancel_task(state._reader_task)
     await _close_session_gracefully(state, background=background_close)
-    # Kill per-session supervisor if this session has its own
+    # Kill per-session supervisor if this session has its own.
+    # Only Daytona runs multiple supervisors per sandbox (one per session);
+    # docker/local always have one-supervisor-per-sandbox and teardown happens
+    # via destroy_sandbox, not here.
     if state.supervisor_port is not None:
         try:
-            from daytona_sdk import Daytona, DaytonaConfig
-            api_key = os.environ.get("DAYTONA_API_KEY")
-            if api_key:
+            sb = await get_sandbox(state.sandbox_id)
+            provider = sb.provider if sb else None
+            if provider == "daytona":
+                from .providers.daytona import _get_daytona_client
                 loop = asyncio.get_running_loop()
-                daytona_client = Daytona(DaytonaConfig(api_key=api_key))
+                daytona_client = _get_daytona_client()
                 sandbox = await loop.run_in_executor(
-                    None, lambda: daytona_client.get(state.sandbox_id)
+                    None, lambda: daytona_client.get(sb.sandbox_ref)
                 )
                 await kill_supervisor_in_sandbox(sandbox, state.supervisor_port)
                 free_sandbox_port(state.sandbox_id, state.supervisor_port)
+            # For docker/local: no-op — the supervisor is the container/process
+            # itself, and destroy_sandbox tears it down.
         except Exception as e:
             log.warning("failed to kill supervisor port %d for session %s: %s",
                         state.supervisor_port, state.session_id, e)
@@ -902,12 +908,9 @@ def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
     return tmp.name
 
 
-def _derive_sandbox_ref(
-    instance: ProviderInstance, provider: str, sandbox_id: str
-) -> str:
-    if provider in PORT_BASED_PROVIDERS:
-        return str(instance.port)
-    return instance.sandbox_id or sandbox_id
+# NOTE: _derive_sandbox_ref was removed in 2026-04-22. sandbox_ref now always
+# carries the provider-native id (container_id / pid / daytona sandbox id); the
+# supervisor's host port is persisted separately as sandboxes.listen_port.
 
 
 # ---------------------------------------------------------------------------
@@ -1102,59 +1105,48 @@ def _safe_path(p: str) -> str:
     return p
 
 
-async def _run_in_volume_sandbox(vol, cmd: str, timeout: int = 30):
-    """Spin up a short-lived Daytona sandbox with the whole volume mounted,
-    run cmd inside it, tear it down. Returns the ExecResult."""
-    if vol.provider != "daytona":
-        raise HTTPException(501, f"File ops on {vol.provider} not implemented")
-    inst = await _providers_mod.create_daytona(
-        agent_type="claude",
-        volume_id=vol.provider_ref,
-        subpath=None,
-    )
-    try:
-        return await _providers_mod.exec_in_instance(inst, cmd, timeout=timeout)
-    finally:
-        # Best-effort cleanup — never mask the original exception (if any)
-        # from exec_in_instance with a cleanup failure.
-        try:
-            await _providers_mod.destroy_daytona(inst)
-        except Exception as cleanup_err:
-            log.warning("utility sandbox %s cleanup failed: %s",
-                        getattr(inst, "sandbox_id", "?"), cleanup_err)
-
-
 @app.get("/volumes/{id_or_name}/files/tree")
 async def volume_files_tree(id_or_name: str, path: str = ""):
     vol = await _resolve_volume(id_or_name)
-    abs_path = shlex.quote(f"/home/daytona/{_safe_path(path)}")
-    res = await _run_in_volume_sandbox(vol, f"find {abs_path} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null")
-    return {"tree": res.stdout}
+    rel = _safe_path(path)
+    try:
+        tree = await _providers_mod.volume_tree(vol.provider, vol.provider_ref, rel)
+    except NotImplementedError as e:
+        raise HTTPException(501, f"File ops on {vol.provider} not implemented: {e}")
+    return {"tree": tree}
 
 
 @app.get("/volumes/{id_or_name}/files/read")
 async def volume_files_read(id_or_name: str, path: str):
     vol = await _resolve_volume(id_or_name)
-    abs_path = shlex.quote(f"/home/daytona/{_safe_path(path)}")
-    res = await _run_in_volume_sandbox(vol, f"cat {abs_path}")
-    if res.exit_code != 0:
-        raise HTTPException(404, f"File not found or unreadable: {res.stderr}")
-    return {"content": res.stdout}
+    rel = _safe_path(path)
+    try:
+        data = await _providers_mod.volume_read(vol.provider, vol.provider_ref, rel)
+    except FileNotFoundError as e:
+        raise HTTPException(404, f"File not found: {e}")
+    except NotImplementedError as e:
+        raise HTTPException(501, f"File ops on {vol.provider} not implemented: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Read failed: {e}")
+    # v1 response contract: text content.
+    try:
+        return {"content": data.decode()}
+    except UnicodeDecodeError:
+        return {"content_base64": base64.b64encode(data).decode()}
 
 
 @app.post("/volumes/{id_or_name}/files/edit", status_code=204)
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
     vol = await _resolve_volume(id_or_name)
-    abs_path = shlex.quote(f"/home/daytona/{_safe_path(body.path)}")
-    b64 = base64.b64encode(body.content.encode()).decode()
-    # abs_path is shlex-quoted; b64 only contains [A-Za-z0-9+/=] so single-quoting is safe.
-    cmd = (
-        f"mkdir -p \"$(dirname {abs_path})\" && "
-        f"echo '{b64}' | base64 -d > {abs_path}"
-    )
-    res = await _run_in_volume_sandbox(vol, cmd)
-    if res.exit_code != 0:
-        raise HTTPException(500, f"Edit failed: {res.stderr}")
+    rel = _safe_path(body.path)
+    try:
+        await _providers_mod.volume_write(
+            vol.provider, vol.provider_ref, rel, body.content.encode()
+        )
+    except NotImplementedError as e:
+        raise HTTPException(501, f"File ops on {vol.provider} not implemented: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Edit failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1187,12 +1179,16 @@ async def create_sandbox(request: Request):
             {"error": f"Provider '{provider}' failed: {e}"}, status_code=502
         )
 
-    sandbox_ref = _derive_sandbox_ref(instance, provider, sandbox_id)
+    # Canonical sandbox_ref is the provider's native id (container_id / pid /
+    # daytona sandbox id); the port travels separately in listen_port so
+    # docker/local lookups (by container_id) still work.
+    sandbox_ref = instance.sandbox_id or sandbox_id
 
     _INSTANCES[sandbox_id] = instance
     record = SandboxRecord(
         id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status=STATUS_RUNNING,
-        root=root, volume_id=vol.id, subpath=subpath,
+        root=instance.root or root, volume_id=vol.id, subpath=subpath,
+        listen_port=instance.port,
     )
     await upsert_sandbox(record)
     return {
@@ -1200,9 +1196,11 @@ async def create_sandbox(request: Request):
         "provider": provider,
         "sandbox_ref": sandbox_ref,
         "status": "running",
-        "root": root,
+        "root": record.root,
         "volume_id": vol.id,
         "subpath": subpath,
+        "listen_port": instance.port,
+        "url": instance.url or None,
     }
 
 
@@ -1272,9 +1270,14 @@ async def delete_sandbox_route(sandbox_id: str):
 
 @app.post("/sandboxes/provision")
 async def provision_sandbox_route(request: Request):
-    """Provision a sandbox with deps installed, but no supervisor started.
+    """Provision a sandbox on the provider selected by the request body.
 
-    Returns sandbox_id. Supervisors are started per-session via POST /sessions.
+    Body: ``{"volume_id": ..., "subpath": ..., "provider": "daytona"|"docker"|"local",
+              "agent_type": ..., "config": {...}}``
+
+    For Daytona the returned instance has no supervisor yet (started lazily by
+    ``ensure_runtime``). For Docker/Local the supervisor is already running.
+    Returns ``{sandbox_id, status}``.
     """
     data = await request.json()
     agent_type = data.get("agent_type", "claude")
@@ -1295,18 +1298,37 @@ async def provision_sandbox_route(request: Request):
             {"error": "volume_id and subpath are required"}, status_code=400,
         )
     vol = await _resolve_volume(volume_id)
+    # Default the provider from the volume (so existing Daytona-only clients
+    # don't have to pass it), but let an explicit body field override for tests.
+    provider = data.get("provider") or vol.provider
+    if provider != vol.provider:
+        return JSONResponse(
+            {"error": f"provider {provider!r} does not match volume.provider {vol.provider!r}"},
+            status_code=400,
+        )
 
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     pre_start_commands = skill_cmds + (data.get("pre_start_commands") or [])
 
+    # Install supervisor on the volume first — docker/local need this before
+    # create_sandbox; daytona tolerates it (fast-path on cache hit).
     try:
-        instance = await provision_daytona_sandbox(
+        await ensure_volume_supervisor(vol.id, agent_type)
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Failed to install supervisor on volume: {e}"},
+            status_code=502,
+        )
+
+    try:
+        instance = await _providers_mod.provision_sandbox(
+            provider,
+            volume_ref=vol.provider_ref,
+            subpath=subpath,
             agent_type=agent_type,
             dockerfile=dockerfile,
             pre_start_commands=pre_start_commands if pre_start_commands else None,
             root=root,
-            volume_id=vol.provider_ref,
-            subpath=subpath,
         )
     except Exception as e:
         if "circuit breaker" in str(e).lower():
@@ -1316,16 +1338,18 @@ async def provision_sandbox_route(request: Request):
             )
         return JSONResponse({"error": f"Failed to provision sandbox: {e}"}, status_code=502)
 
-    sandbox_id = instance.sandbox_id
+    sandbox_id = instance.sandbox_id or f"sb_{uuid.uuid4().hex[:12]}"
     _INSTANCES[sandbox_id] = instance
     await upsert_sandbox(SandboxRecord(
-        id=sandbox_id, provider="daytona",
-        sandbox_ref=sandbox_id, status=STATUS_RUNNING,
-        root=root, volume_id=vol.id, subpath=subpath,
+        id=sandbox_id, provider=provider,
+        sandbox_ref=instance.sandbox_id or sandbox_id, status=STATUS_RUNNING,
+        root=instance.root or root,
+        volume_id=vol.id, subpath=subpath,
+        listen_port=instance.port,
     ))
 
     return {"sandbox_id": sandbox_id, "status": "provisioned",
-            "volume_id": vol.id, "subpath": subpath}
+            "volume_id": vol.id, "subpath": subpath, "provider": provider}
 
 
 @app.post("/sandboxes/{sandbox_id}/stop")
@@ -1342,8 +1366,12 @@ async def stop_sandbox_route(sandbox_id: str):
         await upsert_sandbox(record)
 
     # Stop the sandbox outside the lock (may be slow)
-    if instance and record.provider == "daytona":
-        await stop_daytona(instance)
+    if instance:
+        try:
+            await stop_instance(instance)
+        except Exception as e:
+            log.warning("stop_sandbox_route: stop_instance failed for %s: %s",
+                        sandbox_id, e)
 
     return {"status": "stopped"}
 
@@ -1757,9 +1785,30 @@ async def _ensure_sandbox_alive(
             log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
             if spawn_env is None:
                 spawn_env = await _spawn_env_for_sandbox(sandbox_id)
+
+            # Resolve the volume so the replacement lands on the same mount
+            # — Docker refuses an empty subpath and Local would start outside
+            # the volume otherwise.
+            if fresh_record.volume_id:
+                vol = await get_volume(fresh_record.volume_id)
+                if vol is None:
+                    raise RuntimeError(
+                        f"Sandbox {sandbox_id} references missing volume {fresh_record.volume_id}"
+                    )
+                volume_ref = vol.provider_ref
+            else:
+                raise RuntimeError(
+                    f"Sandbox {sandbox_id} has no volume_id; cannot auto-restart"
+                )
+            subpath = fresh_record.subpath or ""
+
             try:
-                new_instance = await create_instance(
-                    provider, agent_type, dockerfile=dockerfile,
+                new_instance = await _providers_mod.provision_sandbox(
+                    provider,
+                    volume_ref=volume_ref,
+                    subpath=subpath,
+                    agent_type=agent_type,
+                    dockerfile=dockerfile,
                     root=sandbox_record.root,
                     spawn_env=spawn_env,
                 )
@@ -1767,18 +1816,16 @@ async def _ensure_sandbox_alive(
                 raise RuntimeError(f"Failed to restart sandbox: {e}")
 
             _INSTANCES[sandbox_id] = new_instance
-            new_ref = (
-                str(new_instance.port) if new_instance.port is not None else sandbox_id
-            )
             await upsert_sandbox(
                 SandboxRecord(
                     id=sandbox_id,
                     provider=provider,
-                    sandbox_ref=new_ref,
+                    sandbox_ref=new_instance.sandbox_id or sandbox_id,
                     status=STATUS_RUNNING,
                     root=sandbox_record.root,
                     volume_id=sandbox_record.volume_id,
                     subpath=sandbox_record.subpath,
+                    listen_port=new_instance.port,
                 )
             )
             return new_instance.url, False
@@ -1821,11 +1868,21 @@ async def _ensure_sandbox_alive(
                 sandbox_id,
                 e,
             )
+            # Preserve the volume_id + subpath so the replacement mounts the
+            # same storage. `create_instance` accepts both kwargs; we resolve
+            # the Daytona volume provider_ref for the mount API.
+            dt_volume_ref: str | None = None
+            if sandbox_record.volume_id:
+                _vol = await get_volume(sandbox_record.volume_id)
+                if _vol is not None:
+                    dt_volume_ref = _vol.provider_ref
             try:
                 new_instance = await create_instance(
                     "daytona", agent_type, dockerfile=dockerfile,
                     root=sandbox_record.root,
                     spawn_env=spawn_env,
+                    volume_id=dt_volume_ref,
+                    subpath=sandbox_record.subpath,
                 )
             except Exception as create_err:
                 raise RuntimeError(
@@ -1843,6 +1900,7 @@ async def _ensure_sandbox_alive(
                 root=sandbox_record.root,
                 volume_id=sandbox_record.volume_id,
                 subpath=sandbox_record.subpath,
+                listen_port=new_instance.port,
             )
         )
         return new_instance.url, replaced
@@ -1941,7 +1999,12 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
 
 
 async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxRecord:
-    """Create a fresh Daytona sandbox with session.volume + agents/<agent>/home."""
+    """Create a fresh sandbox (provider selected from the session's volume).
+
+    Dispatches through the uniform ``provision_sandbox`` wrapper so docker,
+    local, and daytona all work. Supervisor is installed on the volume first
+    (idempotent fast-path); the sandbox is then attached to it.
+    """
     vol = await get_volume(session_row["volume_id"])
     if vol is None:
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
@@ -1954,20 +2017,39 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
     # This is idempotent: fast-path if already installed (cache hit in volumes table).
     await ensure_volume_supervisor(vol.id, agent_type)
 
-    inst = await _providers_mod.provision_daytona_sandbox(
-        agent_type=agent_type,
-        volume_id=vol.provider_ref,
+    # Build the spawn env for the supervisor (agent.env + session.env + secrets).
+    spawn_env = await _build_spawn_env_from_row(session_row)
+
+    # Provider-specific default root. Daytona mounts the per-agent subpath at
+    # /home/daytona; docker mounts it at /home/agent; local's home is the host path.
+    if vol.provider == "daytona":
+        root = "/home/daytona"
+    elif vol.provider == "docker":
+        root = "/home/agent"
+    else:
+        # local: home is filled in by the provider from the volume path.
+        root = None
+
+    inst = await _providers_mod.provision_sandbox(
+        vol.provider,
+        volume_ref=vol.provider_ref,
         subpath=subpath,
+        agent_type=agent_type,
+        spawn_env=spawn_env,
+        root=root,
     )
+
     sb = SandboxRecord(
         id=f"sb_{uuid.uuid4().hex[:12]}",
-        provider="daytona",
+        provider=vol.provider,
         sandbox_ref=inst.sandbox_id,
         status=STATUS_RUNNING,
-        root="/home/daytona",
+        root=inst.root or root or "/tmp",
         volume_id=vol.id,
         subpath=subpath,
+        listen_port=inst.port,
     )
+    _INSTANCES[sb.id] = inst
     await upsert_sandbox(sb)
     await set_session_current_sandbox(session_row["id"], sb.id)
     if previous_id is not None:
@@ -2039,21 +2121,47 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
         free_sandbox_port(sandbox.id, supervisor_port)
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
 
-    inst = ProviderInstance(
-        provider=vol.provider, url="",
-        root=root, sandbox_id=sandbox.sandbox_ref,
-    )
-    try:
-        supervisor_url = await _providers_mod.ensure_supervisor_url(
-            vol.provider, inst,
-            agent_type=agent_type,
-            root=root,
-            spawn_env=effective_spawn_env,
-            port=supervisor_port,
+    # Supervisor URL resolution:
+    #  - For Docker/Local the supervisor starts at create_sandbox time; the
+    #    live ProviderInstance in _INSTANCES carries the real URL. On cold
+    #    start (_INSTANCES empty) we fall back to the DB-stored listen_port.
+    #  - For Daytona the URL comes from the SDK-signed preview API and is
+    #    minted per session inside ensure_supervisor_url().
+    if vol.provider in PORT_BASED_PROVIDERS:
+        cached = _INSTANCES.get(sandbox.id)
+        if cached and cached.url:
+            supervisor_url = cached.url
+            # No per-session supervisor port on docker/local — one sandbox
+            # == one supervisor; return the allocated counter to the pool.
+            free_sandbox_port(sandbox.id, supervisor_port)
+            supervisor_port = cached.port  # type: ignore[assignment]
+        elif sandbox.listen_port is not None:
+            supervisor_url = f"http://localhost:{sandbox.listen_port}"
+            free_sandbox_port(sandbox.id, supervisor_port)
+            supervisor_port = sandbox.listen_port
+        else:
+            free_sandbox_port(sandbox.id, supervisor_port)
+            raise HTTPException(
+                500,
+                f"Sandbox {sandbox.id} (provider={vol.provider}) has no live "
+                f"instance and no listen_port recorded; cannot resolve supervisor URL",
+            )
+    else:
+        inst = ProviderInstance(
+            provider=vol.provider, url="",
+            root=root, sandbox_id=sandbox.sandbox_ref,
         )
-    except Exception as exc:
-        free_sandbox_port(sandbox.id, supervisor_port)
-        raise HTTPException(500, f"Failed to start supervisor: {exc}") from exc
+        try:
+            supervisor_url = await _providers_mod.ensure_supervisor_url(
+                vol.provider, inst,
+                agent_type=agent_type,
+                root=root,
+                spawn_env=effective_spawn_env,
+                port=supervisor_port,
+            )
+        except Exception as exc:
+            free_sandbox_port(sandbox.id, supervisor_port)
+            raise HTTPException(500, f"Failed to start supervisor: {exc}") from exc
 
     client = AcpClient(supervisor_url)
     acp_session_id = str(uuid.uuid4())
@@ -2389,6 +2497,20 @@ async def sessions_quick_create(request: Request):
 
     sandbox_id = str(uuid.uuid4())
     subpath = f"agents/{agent_id}/home"
+
+    # Install supervisor on the volume before spawning the sandbox.
+    # Docker/Local need supervisor.js + node_modules under <vol>/system/supervisor/
+    # to exist at create time or create_sandbox raises "supervisor.js missing".
+    # Idempotent fast-path on cache hit.
+    try:
+        await ensure_volume_supervisor(volume_id, agent_type)
+    except Exception as e:
+        await delete_agent(agent_id)
+        return JSONResponse(
+            {"error": f"Failed to install supervisor on volume: {e}"},
+            status_code=502,
+        )
+
     try:
         instance = await create_instance(
             provider,
@@ -2414,7 +2536,10 @@ async def sessions_quick_create(request: Request):
             {"error": f"Provider '{provider}' failed: {e}"}, status_code=502
         )
 
-    sandbox_ref = _derive_sandbox_ref(instance, provider, sandbox_id)
+    # Store the provider-native id (container_id / pid / daytona sandbox id);
+    # the listen port is persisted separately so docker/local lookups keep
+    # working after a server restart.
+    sandbox_ref = instance.sandbox_id or sandbox_id
 
     _INSTANCES[sandbox_id] = instance
     await upsert_sandbox(
@@ -2423,9 +2548,10 @@ async def sessions_quick_create(request: Request):
             provider=provider,
             sandbox_ref=sandbox_ref,
             status=STATUS_RUNNING,
-            root=root,
+            root=instance.root or root,
             volume_id=volume_id,
             subpath=subpath,
+            listen_port=instance.port,
         )
     )
 

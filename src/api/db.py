@@ -186,6 +186,10 @@ _MIGRATIONS = [
     # 2026-04-22: cache which agent_types have their supervisor installed on each volume.
     # Avoids a 30s utility-sandbox probe on every Daytona sandbox boot.
     "ALTER TABLE volumes ADD COLUMN IF NOT EXISTS supervisor_agent_types JSONB NOT NULL DEFAULT '[]'::jsonb",
+    # 2026-04-22: split sandbox_ref vs. listen_port so docker/local can store
+    # both container_id / pid *and* the host port the supervisor is listening on.
+    # Daytona rows leave listen_port NULL (URL comes from the signed preview API).
+    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS listen_port INTEGER",
 ]
 
 
@@ -303,15 +307,27 @@ async def delete_agent(agent_id: str) -> None:
 async def upsert_sandbox(sandbox: SandboxRecord) -> None:
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO sandboxes (id, provider, sandbox_ref, status, root, volume_id, subpath)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            "INSERT INTO sandboxes"
+            " (id, provider, sandbox_ref, status, root, volume_id, subpath, listen_port)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
             " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
             " root=EXCLUDED.root, volume_id=EXCLUDED.volume_id,"
-            " subpath=EXCLUDED.subpath",
+            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port",
             (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status,
-             sandbox.root, sandbox.volume_id, sandbox.subpath),
+             sandbox.root, sandbox.volume_id, sandbox.subpath, sandbox.listen_port),
         )
+
+
+def _row_to_sandbox(row: dict) -> SandboxRecord:
+    return SandboxRecord(
+        id=row["id"], provider=row["provider"],
+        sandbox_ref=row["sandbox_ref"], status=row["status"],
+        root=row.get("root", "/tmp"),
+        volume_id=row.get("volume_id"),
+        subpath=row.get("subpath"),
+        listen_port=row.get("listen_port"),
+    )
 
 
 async def get_sandbox(sandbox_id: str) -> SandboxRecord | None:
@@ -321,26 +337,13 @@ async def get_sandbox(sandbox_id: str) -> SandboxRecord | None:
         )).fetchone()
     if row is None:
         return None
-    return SandboxRecord(
-        id=row["id"], provider=row["provider"],
-        sandbox_ref=row["sandbox_ref"], status=row["status"],
-        root=row.get("root", "/tmp"),
-        volume_id=row.get("volume_id"),
-        subpath=row.get("subpath"),
-    )
+    return _row_to_sandbox(row)
 
 
 async def list_sandboxes() -> list[SandboxRecord]:
     async with get_db() as conn:
         rows = await (await conn.execute("SELECT * FROM sandboxes")).fetchall()
-    return [
-        SandboxRecord(id=r["id"], provider=r["provider"],
-                      sandbox_ref=r["sandbox_ref"], status=r["status"],
-                      root=r.get("root", "/tmp"),
-                      volume_id=r.get("volume_id"),
-                      subpath=r.get("subpath"))
-        for r in rows
-    ]
+    return [_row_to_sandbox(r) for r in rows]
 
 
 async def delete_sandbox(sandbox_id: str) -> None:

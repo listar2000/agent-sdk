@@ -32,12 +32,14 @@ async def setup():
     await dbmod.close_pool()
 
 
-async def _mk_fixtures():
+async def _mk_fixtures(provider: str = "daytona"):
     from api.models import AgentConfig, AgentRecord, VolumeRecord
     await dbmod.upsert_agent(AgentRecord(id="a1", name="A",
                                          config=AgentConfig(agent_type="claude")))
-    await dbmod.upsert_volume(VolumeRecord(id="v1", name="v", provider="daytona",
-                                           provider_ref="dt-v"))
+    provider_ref = {"daytona": "dt-v", "docker": "agentsdk-testvol",
+                    "local": "/tmp/agentsdk-testvol"}[provider]
+    await dbmod.upsert_volume(VolumeRecord(id="v1", name="v", provider=provider,
+                                           provider_ref=provider_ref))
     async with dbmod.get_db() as conn:
         await conn.execute(
             "INSERT INTO sessions (id, agent_id, volume_id) VALUES (%s,%s,%s)",
@@ -56,7 +58,11 @@ async def test_ensure_sandbox_creates_when_none(setup):
         return ProviderInstance(provider="daytona", url="http://fake",
                                 root="/home/daytona", sandbox_id=f"dt-{len(created)}")
 
-    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)), \
+    # _provision_new now dispatches through providers.provision_sandbox →
+    # _PROVIDER_MODS[provider].create_sandbox. Patch at the daytona-module level
+    # so the dispatch resolves to the mock.
+    with patch("api.providers.daytona.provision_daytona_sandbox",
+               new=AsyncMock(side_effect=fake_provision)), \
          patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
         sess = await dbmod.get_session("s1")
         sb = await srv.ensure_sandbox(sess)
@@ -79,7 +85,7 @@ async def test_ensure_sandbox_returns_existing_when_running(setup):
 
     with patch("api.providers.daytona.get_daytona_sandbox_status",
                new=AsyncMock(return_value="running")), \
-         patch("api.providers.provision_daytona_sandbox",
+         patch("api.providers.daytona.provision_daytona_sandbox",
                new=AsyncMock(side_effect=AssertionError("should not provision"))):
         sess = await dbmod.get_session("s1")
         got = await srv.ensure_sandbox(sess)
@@ -111,7 +117,8 @@ async def test_ensure_sandbox_reprovisions_when_missing_emits_reattach(setup):
             return None
         return await original_get_sandbox(sb_id)
 
-    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)), \
+    with patch("api.providers.daytona.provision_daytona_sandbox",
+               new=AsyncMock(side_effect=fake_provision)), \
          patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
          patch("api.db.get_sandbox", new=AsyncMock(side_effect=fake_get_sandbox)), \
          patch("api.server.get_sandbox", new=AsyncMock(side_effect=fake_get_sandbox)):
@@ -146,7 +153,7 @@ async def test_ensure_sandbox_starts_stopped(setup):
                new=AsyncMock(return_value="stopped")), \
          patch("api.providers.daytona.start_daytona",
                new=AsyncMock(side_effect=fake_start)), \
-         patch("api.providers.provision_daytona_sandbox",
+         patch("api.providers.daytona.provision_daytona_sandbox",
                new=AsyncMock(side_effect=AssertionError("should not provision"))):
         sess = await dbmod.get_session("s1")
         got = await srv.ensure_sandbox(sess)
@@ -179,6 +186,86 @@ async def test_ensure_runtime_reuses_healthy_state(setup):
         got = await srv.ensure_runtime(sess, sb)
 
     assert got is state  # identity — no rebuild
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+async def test_ensure_sandbox_creates_across_providers(setup, provider):
+    """_provision_new must dispatch through the provider-agnostic wrapper."""
+    await _mk_fixtures(provider)
+    from api.providers import ProviderInstance
+    created = []
+
+    async def fake_provision(**kw):
+        created.append(kw)
+        # Local/docker put a URL + port on the instance; daytona has no URL yet.
+        url = "http://fake:9999" if provider != "daytona" else ""
+        port = 9999 if provider != "daytona" else None
+        return ProviderInstance(
+            provider=provider, url=url, root="/home/x",
+            sandbox_id=f"{provider}-sb-1",
+            container_id=f"{provider}-cid" if provider == "docker" else None,
+            port=port,
+        )
+
+    patches = [
+        patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)),
+    ]
+    if provider == "daytona":
+        patches.append(patch("api.providers.daytona.provision_daytona_sandbox",
+                             new=AsyncMock(side_effect=fake_provision)))
+    elif provider == "docker":
+        patches.append(patch("api.providers.docker.create_sandbox",
+                             new=AsyncMock(side_effect=fake_provision)))
+    else:  # local
+        patches.append(patch("api.providers.local.create_sandbox",
+                             new=AsyncMock(side_effect=fake_provision)))
+
+    with patches[0], patches[1]:
+        sess = await dbmod.get_session("s1")
+        sb = await srv.ensure_sandbox(sess)
+
+    assert sb is not None
+    assert sb.provider == provider
+    assert len(created) == 1
+    # volume_ref (daytona uses `volume_id`, others `volume_ref`)
+    assert "volume_ref" in created[0] or "volume_id" in created[0]
+    # subpath always present
+    assert created[0].get("subpath") == "agents/a1/home"
+    # Docker/Local: listen_port should be persisted.
+    if provider != "daytona":
+        assert sb.listen_port == 9999
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+async def test_ensure_sandbox_reuses_existing_running_across_providers(setup, provider):
+    """When a sandbox row exists and provider reports 'running', no reprovision."""
+    await _mk_fixtures(provider)
+    from api.models import SandboxRecord
+    sb = SandboxRecord(id="sb1", provider=provider, sandbox_ref=f"{provider}-live",
+                       status="running", root="/home/x",
+                       volume_id="v1", subpath="agents/a1/home",
+                       listen_port=9999 if provider != "daytona" else None)
+    await dbmod.upsert_sandbox(sb)
+    await dbmod.set_session_current_sandbox("s1", "sb1")
+
+    status_paths = {
+        "daytona": "api.providers.daytona.get_daytona_sandbox_status",
+        "docker":  "api.providers.docker.get_sandbox_status",
+        "local":   "api.providers.local.get_sandbox_status",
+    }
+    create_paths = {
+        "daytona": "api.providers.daytona.provision_daytona_sandbox",
+        "docker":  "api.providers.docker.create_sandbox",
+        "local":   "api.providers.local.create_sandbox",
+    }
+    with patch(status_paths[provider], new=AsyncMock(return_value="running")), \
+         patch(create_paths[provider],
+               new=AsyncMock(side_effect=AssertionError("should not provision"))):
+        sess = await dbmod.get_session("s1")
+        got = await srv.ensure_sandbox(sess)
+    assert got.id == "sb1"
 
 
 @pytest.mark.asyncio

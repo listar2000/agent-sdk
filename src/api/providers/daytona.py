@@ -740,13 +740,111 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
             pass
 
 
+async def create_sandbox(
+    *,
+    volume_ref: str,
+    subpath: str,
+    agent_type: str = "claude",
+    spawn_env: dict[str, str] | None = None,
+    port: int | None = None,
+    root: str | None = None,
+    dockerfile: str | None = None,
+    pre_start_commands: list[str] | None = None,
+    **_kw,
+) -> ProviderInstance:
+    """Uniform ``create_sandbox`` for the Daytona provider.
+
+    Delegates to ``provision_daytona_sandbox`` which creates the sandbox with
+    the three volume mounts but does NOT start a supervisor; the caller must
+    run ``ensure_supervisor_url`` before talking to the supervisor.
+
+    ``spawn_env`` / ``port`` are accepted for parity with docker/local but are
+    unused here — the supervisor is started later with its own env + port.
+    """
+    return await provision_daytona_sandbox(
+        agent_type=agent_type,
+        dockerfile=dockerfile,
+        pre_start_commands=pre_start_commands,
+        root=root or "/home/daytona",
+        volume_id=volume_ref,
+        subpath=subpath,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Volume file ops — dispatched from server.py's /volumes/{id}/files/*
+# ---------------------------------------------------------------------------
+
+async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
+    """Spin a short-lived sandbox with ``ref`` mounted at /v, run cmd, tear down."""
+    from ._shared import _exec_subprocess  # noqa: F401
+    from .. import providers as _prov  # pragma: no cover — local import for cycle
+    inst = await provision_daytona_sandbox(
+        agent_type="claude",
+        volume_id=ref,
+        subpath=None,
+    )
+    try:
+        return await _prov.exec_in_instance(inst, cmd, timeout=timeout)
+    finally:
+        try:
+            await destroy_daytona(inst)
+        except Exception as cleanup_err:  # pragma: no cover
+            log.warning("utility sandbox cleanup failed: %s", cleanup_err)
+
+
 async def volume_tree(ref: str, path: str) -> str:
-    raise NotImplementedError("Phase 3/Daytona file ops — already in server.py")
+    """Tree listing of ``<volume>/<path>``.
+
+    Spins a utility sandbox with the whole volume at /v, lists files.
+    Paths are relative to the volume root (e.g. ``"shared"``, ``""`` for all).
+    """
+    rel = (path or "").lstrip("/")
+    if ".." in rel.split("/") or any(c in rel for c in "\x00\n\r"):
+        raise ValueError("invalid path")
+    target = "/v/" + rel if rel else "/v"
+    res = await _run_in_utility_sandbox(
+        ref, f"find {shlex.quote(target)} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null"
+    )
+    return res.stdout
 
 
 async def volume_read(ref: str, path: str) -> bytes:
-    raise NotImplementedError
+    """Read ``<volume>/<path>`` bytes via a short-lived utility sandbox."""
+    rel = (path or "").lstrip("/")
+    if not rel or ".." in rel.split("/") or any(c in rel for c in "\x00\n\r"):
+        raise ValueError("invalid path")
+    target = "/v/" + rel
+    # base64 so binary survives the exec response.
+    res = await _run_in_utility_sandbox(
+        ref,
+        f"if [ ! -f {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
+        f"base64 -w0 {shlex.quote(target)} 2>/dev/null || base64 {shlex.quote(target)}",
+    )
+    if res.exit_code != 0:
+        if "__MISSING__" in (res.stdout or ""):
+            raise FileNotFoundError(f"{path} not found on volume {ref}")
+        raise RuntimeError(f"volume_read failed: {res.stderr[:400]}")
+    import base64 as _b64
+    try:
+        return _b64.b64decode((res.stdout or "").strip())
+    except Exception as exc:
+        raise RuntimeError(f"volume_read: malformed base64: {exc}") from exc
 
 
 async def volume_write(ref: str, path: str, content: bytes) -> None:
-    raise NotImplementedError
+    """Write ``content`` to ``<volume>/<path>`` via a short-lived utility sandbox."""
+    rel = (path or "").lstrip("/")
+    if not rel or ".." in rel.split("/") or any(c in rel for c in "\x00\n\r"):
+        raise ValueError("invalid path")
+    target = "/v/" + rel
+    parent = "/v/" + "/".join(rel.split("/")[:-1])
+    import base64 as _b64
+    b64 = _b64.b64encode(content).decode()
+    cmd = (
+        f"mkdir -p {shlex.quote(parent)} && "
+        f"printf %s {shlex.quote(b64)} | base64 -d > {shlex.quote(target)}"
+    )
+    res = await _run_in_utility_sandbox(ref, cmd)
+    if res.exit_code != 0:
+        raise RuntimeError(f"volume_write failed: {res.stderr[:400]}")

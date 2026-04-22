@@ -55,7 +55,7 @@ async def test_post_session_does_not_provision_sandbox(client):
     # Any provider provisioning during session create should fail the test.
     with patch("api.providers.create_daytona",
                new=AsyncMock(side_effect=AssertionError("should NOT provision during session create"))), \
-         patch("api.providers.provision_daytona_sandbox",
+         patch("api.providers.daytona.provision_daytona_sandbox",
                new=AsyncMock(side_effect=AssertionError("should NOT provision during session create"))):
         r = await client.post("/sessions",
                               json={"agent_id": "agent_t2", "volume_id": "vol_t"})
@@ -101,7 +101,7 @@ async def test_message_lazily_provisions_sandbox(client):
     fake_acp.handshake = AsyncMock(return_value=None)
     fake_acp.get_inner_session_id = MagicMock(return_value=None)
 
-    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
+    with patch("api.providers.daytona.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
          patch("api.providers._wait_for_health", new=AsyncMock(side_effect=fake_wait_for_health)), \
          patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
          patch("api.server._submit_prompt", MagicMock(return_value=None)), \
@@ -147,7 +147,7 @@ async def test_start_sandbox_provisions_eagerly(client):
     fake_daytona_class = MagicMock()
     fake_daytona_class.return_value.get = MagicMock(return_value=fake_daytona_instance)
 
-    with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
+    with patch("api.providers.daytona.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
          patch("api.providers._wait_for_health", new=AsyncMock(return_value=True)), \
          patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
          patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
@@ -208,7 +208,7 @@ async def test_reset_sandbox_swaps(client):
 
     with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
          patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
-         patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
+         patch("api.providers.daytona.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
         r = await client.post(f"/sessions/{sid}/reset-sandbox")
     assert r.status_code == 200
     body = r.json()
@@ -240,7 +240,7 @@ async def test_reset_sandbox_emits_reattach_event(client):
 
     with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
          patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)), \
-         patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
+         patch("api.providers.daytona.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)):
         r = await client.post(f"/sessions/{sid}/reset-sandbox")
     assert r.status_code == 200
 
@@ -288,7 +288,7 @@ async def test_ensure_volume_supervisor_caches_installs(client):
                                 root="/home/daytona", sandbox_id="dt-sbx")
 
     with patch("api.providers.daytona.install_supervisor", new=AsyncMock(side_effect=fake_install)), \
-         patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)):
+         patch("api.providers.daytona.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_provision)):
         # First run: should install
         sess = await dbmod.get_session("sess-cache")
         from api.server import ensure_sandbox
