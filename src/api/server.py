@@ -3142,12 +3142,9 @@ async def post_session_message(session_id: str, request: Request):
 async def session_events(session_id: str):
     """SSE stream for a session. Recovers reaped sessions automatically."""
     try:
-        state = await get_or_recover_session(session_id)
+        _, _, state = await ensure_session_live(session_id)
     except HTTPException as exc:
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
-
-    if not state.client or not state.acp_session_id:
-        return JSONResponse({"error": "session not connected"}, status_code=409)
 
     shutdown = state.shutdown
 
