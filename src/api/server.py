@@ -143,6 +143,22 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
 SESSIONS: dict[str, SessionState] = {}
 
 
+# Strong references to fire-and-forget background tasks so Python's GC can't
+# collect them mid-flight ("Task was destroyed but it is pending!" bug — the
+# event loop holds only a weak ref to tasks, so a caller that does
+# ``asyncio.create_task(coro())`` without keeping the returned Task alive
+# risks silent cancellation). Tasks self-discard from the set on completion.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """Create a background task and hold a strong reference to it."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 async def _cancel_task(task) -> None:
     """Cancel an asyncio task and await its completion so cleanup code runs."""
     if task is None or task.done():
@@ -448,7 +464,7 @@ def _maybe_auto_approve_permission(payload: dict | None, state: SessionState) ->
                 "auto-approve permission failed for session %s: %s", state.session_id, e
             )
 
-    asyncio.create_task(_grant())
+    _spawn_bg(_grant())
 
 
 def _on_sse_reader_death(state: SessionState) -> None:
