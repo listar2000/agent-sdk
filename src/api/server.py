@@ -87,8 +87,6 @@ from .providers import (
     free_sandbox_port,
     kill_supervisor_in_sandbox,
     provision_daytona_sandbox,
-    start_supervisor_in_sandbox,
-    stop_daytona,
     stop_instance,
 )
 from .redact import redact_secrets
@@ -1880,20 +1878,23 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
         return await _provision_new(fresh, previous_id=current_id)
 
     # Case C-F: row exists — probe provider state.
-    status = await _providers_mod.get_daytona_sandbox_status(sb.sandbox_ref)
+    vol = await get_volume(sb.volume_id)
+    if vol is None:
+        raise HTTPException(500, f"Sandbox's volume {sb.volume_id} missing")
+    status = await _providers_mod.get_sandbox_status(vol.provider, sb.sandbox_ref)
     if status == "running":
         return sb
     if status == "stopped":
-        await _providers_mod.start_daytona(sb.sandbox_ref)
+        await _providers_mod.start_sandbox(vol.provider, sb.sandbox_ref)
         sb.status = STATUS_RUNNING
         await upsert_sandbox(sb)
         return sb
     if status in ("missing", "error"):
         if status == "error":
             try:
-                inst = ProviderInstance(provider="daytona", url="",
+                inst = ProviderInstance(provider=vol.provider, url="",
                                         root=sb.root, sandbox_id=sb.sandbox_ref)
-                await _providers_mod.destroy_daytona(inst)
+                await _providers_mod.destroy_sandbox(vol.provider, inst)
             except Exception:
                 pass
         await delete_sandbox(sb.id)
@@ -1992,26 +1993,22 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     effective_spawn_env = dict(spawn_env)
     effective_spawn_env.setdefault("HOME", root)
 
-    # Need the live Daytona SDK sandbox object (not the SandboxRecord) to exec
-    # commands.  Fetch it by sandbox_ref, which is the provider-side identifier.
-    try:
-        from daytona_sdk import Daytona, DaytonaConfig
-        api_key = os.environ.get("DAYTONA_API_KEY")
-        if not api_key:
-            raise RuntimeError("DAYTONA_API_KEY not set")
-        loop = asyncio.get_running_loop()
-        daytona_client = Daytona(DaytonaConfig(api_key=api_key))
-        live_sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(sandbox.sandbox_ref)
-        )
-    except Exception as exc:
+    vol = await get_volume(session_row["volume_id"])
+    if vol is None:
         free_sandbox_port(sandbox.id, supervisor_port)
-        raise HTTPException(500, f"Failed to fetch Daytona sandbox: {exc}") from exc
+        raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
 
+    inst = ProviderInstance(
+        provider=vol.provider, url="",
+        root=root, sandbox_id=sandbox.sandbox_ref,
+    )
     try:
-        supervisor_url = await start_supervisor_in_sandbox(
-            live_sandbox, agent_type, supervisor_port, root=root,
+        supervisor_url = await _providers_mod.ensure_supervisor_url(
+            vol.provider, inst,
+            agent_type=agent_type,
+            root=root,
             spawn_env=effective_spawn_env,
+            port=supervisor_port,
         )
     except Exception as exc:
         free_sandbox_port(sandbox.id, supervisor_port)
@@ -2754,14 +2751,13 @@ async def stop_session_sandbox(session_id: str):
     if sbid is None:
         return  # 204, no-op — already stopped
     sb = await get_sandbox(sbid)
-    if sb and sb.provider == "daytona":
-        from .providers import ProviderInstance
+    if sb:
         inst = ProviderInstance(
-            provider="daytona", url="",
+            provider=sb.provider, url="",
             root=sb.root, sandbox_id=sb.sandbox_ref,
         )
         try:
-            await _providers_mod.destroy_daytona(inst)
+            await _providers_mod.destroy_sandbox(sb.provider, inst)
         except Exception:
             pass  # best-effort
     await set_session_current_sandbox(session_id, None)

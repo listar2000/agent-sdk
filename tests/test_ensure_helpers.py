@@ -76,7 +76,7 @@ async def test_ensure_sandbox_returns_existing_when_running(setup):
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb1")
 
-    with patch("api.providers.get_daytona_sandbox_status",
+    with patch("api.providers.daytona.get_daytona_sandbox_status",
                new=AsyncMock(return_value="running")), \
          patch("api.providers.provision_daytona_sandbox",
                new=AsyncMock(side_effect=AssertionError("should not provision"))):
@@ -140,9 +140,9 @@ async def test_ensure_sandbox_starts_stopped(setup):
     async def fake_start(ref):
         start_calls.append(ref)
 
-    with patch("api.providers.get_daytona_sandbox_status",
+    with patch("api.providers.daytona.get_daytona_sandbox_status",
                new=AsyncMock(return_value="stopped")), \
-         patch("api.providers.start_daytona",
+         patch("api.providers.daytona.start_daytona",
                new=AsyncMock(side_effect=fake_start)), \
          patch("api.providers.provision_daytona_sandbox",
                new=AsyncMock(side_effect=AssertionError("should not provision"))):
@@ -193,16 +193,10 @@ async def test_ensure_runtime_rebuilds_when_missing(setup):
 
     import os
     fake_client = AsyncMock()
-    fake_live_sandbox = AsyncMock()
-    from unittest.mock import MagicMock
-    fake_daytona_cls = MagicMock()
-    fake_daytona_cls.return_value.get = MagicMock(return_value=fake_live_sandbox)
-    with patch("api.server.start_supervisor_in_sandbox",
+    with patch("api.providers.daytona.ensure_supervisor_url",
                new=AsyncMock(return_value="http://fresh")), \
          patch("api.server.AcpClient", return_value=fake_client), \
-         patch("api.server._start_session_tasks"), \
-         patch("daytona_sdk.Daytona", fake_daytona_cls), \
-         patch.dict(os.environ, {"DAYTONA_API_KEY": "fake-key"}):
+         patch("api.server._start_session_tasks"):
         fake_client.initialize = AsyncMock(return_value={"sessionId": "inner-new"})
         fake_client.get_inner_session_id = lambda *a: "inner-new"
 

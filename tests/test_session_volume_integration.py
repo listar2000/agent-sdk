@@ -105,7 +105,7 @@ async def test_message_lazily_provisions_sandbox(client):
          patch("api.providers._wait_for_health", new=AsyncMock(side_effect=fake_wait_for_health)), \
          patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
          patch("api.server._submit_prompt", MagicMock(return_value=None)), \
-         patch("api.server.start_supervisor_in_sandbox",
+         patch("api.providers.daytona.ensure_supervisor_url",
                new=AsyncMock(return_value=("http://fake-supervisor:7000", 7000))), \
          patch("api.server.AcpClient", return_value=fake_acp):
         r = await client.post(f"/sessions/{sid}/message", json={"message": "hi"})
@@ -149,7 +149,7 @@ async def test_start_sandbox_provisions_eagerly(client):
     with patch("api.providers.provision_daytona_sandbox", new=AsyncMock(side_effect=fake_create)), \
          patch("api.providers._wait_for_health", new=AsyncMock(return_value=True)), \
          patch("api.server._start_session_tasks", MagicMock(return_value=None)), \
-         patch("api.server.start_supervisor_in_sandbox",
+         patch("api.providers.daytona.ensure_supervisor_url",
                new=AsyncMock(return_value=("http://fake:7000", 7000))), \
          patch("api.server.AcpClient", return_value=fake_acp), \
          patch("daytona_sdk.Daytona", fake_daytona_class):

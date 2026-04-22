@@ -573,13 +573,26 @@ async def stop_sandbox(inst) -> None:
     return await stop_daytona(inst)
 
 
-async def ensure_supervisor_url(inst, **kw) -> str:
-    """Daytona: uses existing start_supervisor_in_sandbox logic. Stub for now;
-    Phase 1 wires it to the actual work."""
-    # For Phase 0 compatibility, this is implemented inline in server.py's
-    # _ensure_runtime_locked. Just raise NotImplementedError — will be lifted
-    # here in Phase 1.
-    raise NotImplementedError("Phase 1 will wire this")
+async def ensure_supervisor_url(inst, *, agent_type: str, root: str = "/tmp",
+                                spawn_env: dict | None = None,
+                                port: int | None = None, **_kw) -> str:
+    """Daytona: start a supervisor in the sandbox referenced by inst and
+    return its URL. Implements the 2-phase 'create, then start-supervisor'
+    model (docker/local start the supervisor at create time and just return
+    inst.url)."""
+    from daytona_sdk import Daytona, DaytonaConfig
+    import os as _os
+    api_key = _os.environ.get("DAYTONA_API_KEY")
+    if not api_key:
+        raise RuntimeError("DAYTONA_API_KEY not set")
+    daytona_client = Daytona(DaytonaConfig(api_key=api_key))
+    loop = asyncio.get_running_loop()
+    sandbox = await loop.run_in_executor(
+        None, lambda: daytona_client.get(inst.sandbox_id)
+    )
+    return await start_supervisor_in_sandbox(
+        sandbox, agent_type, port, root=root, spawn_env=spawn_env,
+    )
 
 
 async def install_supervisor(volume_ref: str, agent_type: str) -> None:
