@@ -23,7 +23,7 @@ from api import server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def client(db_pool):
+async def client(clean_db):
     transport = ASGITransport(app=srv.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
