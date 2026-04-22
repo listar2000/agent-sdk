@@ -202,51 +202,25 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
 
 
 # ---------------------------------------------------------------------------
-# New uniform-API dispatch helpers (for Phase 1+ use by server.py)
+# Uniform-API dispatch helpers — each forwards to the per-provider function
+# of the same name via ``__getattr__`` so we don't hand-write 12 wrappers.
 # ---------------------------------------------------------------------------
 
-async def create_volume(provider: str, name: str) -> str:
-    return await _dispatch_mod(provider).create_volume(name)
+_DISPATCH_FNS = frozenset({
+    "create_volume", "delete_volume", "get_sandbox_status",
+    "start_sandbox", "destroy_sandbox", "stop_sandbox",
+    "ensure_supervisor_url", "install_supervisor",
+    "volume_tree", "volume_read", "volume_write",
+})
 
 
-async def delete_volume(provider: str, ref: str) -> None:
-    return await _dispatch_mod(provider).delete_volume(ref)
-
-
-async def get_sandbox_status(provider: str, ref: str) -> str:
-    return await _dispatch_mod(provider).get_sandbox_status(ref)
-
-
-async def start_sandbox(provider: str, ref: str) -> None:
-    return await _dispatch_mod(provider).start_sandbox(ref)
-
-
-async def destroy_sandbox(provider: str, inst) -> None:
-    return await _dispatch_mod(provider).destroy_sandbox(inst)
-
-
-async def stop_sandbox(provider: str, inst) -> None:
-    return await _dispatch_mod(provider).stop_sandbox(inst)
-
-
-async def ensure_supervisor_url(provider: str, inst, **kw) -> str:
-    return await _dispatch_mod(provider).ensure_supervisor_url(inst, **kw)
-
-
-async def install_supervisor(provider: str, volume_ref: str, agent_type: str) -> None:
-    return await _dispatch_mod(provider).install_supervisor(volume_ref, agent_type)
-
-
-async def volume_tree(provider: str, ref: str, path: str) -> str:
-    return await _dispatch_mod(provider).volume_tree(ref, path)
-
-
-async def volume_read(provider: str, ref: str, path: str) -> bytes:
-    return await _dispatch_mod(provider).volume_read(ref, path)
-
-
-async def volume_write(provider: str, ref: str, path: str, content: bytes) -> None:
-    return await _dispatch_mod(provider).volume_write(ref, path, content)
+def __getattr__(name: str):
+    if name in _DISPATCH_FNS:
+        async def _dispatch(provider: str, *args, **kwargs):
+            return await getattr(_dispatch_mod(provider), name)(*args, **kwargs)
+        _dispatch.__name__ = name
+        return _dispatch
+    raise AttributeError(name)
 
 
 async def reconcile_sandboxes(provider: str) -> None:
