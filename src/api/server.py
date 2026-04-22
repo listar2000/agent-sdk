@@ -1242,8 +1242,8 @@ async def delete_sandbox_route(sandbox_id: str):
     if record is None:
         return JSONResponse({"error": "sandbox not found"}, status_code=404)
 
-    # Hold the sandbox lock to prevent concurrent _ensure_sandbox_alive
-    # from auto-restarting the sandbox while we're deleting it.
+    # Hold the sandbox lock to prevent concurrent auto-restart
+    # from restarting the sandbox while we're deleting it.
     async with _get_sandbox_lock(sandbox_id):
         # Clean up sessions BEFORE removing the instance so that
         # concurrent requests still see the sandbox as existing.
@@ -1329,8 +1329,8 @@ async def stop_sandbox_route(sandbox_id: str):
     if record is None:
         return JSONResponse({"error": "sandbox not found"}, status_code=404)
 
-    # Hold the sandbox lock to prevent concurrent _ensure_sandbox_alive
-    # from auto-restarting the sandbox while we're stopping it.
+    # Hold the sandbox lock to prevent concurrent auto-restart
+    # from restarting the sandbox while we're stopping it.
     async with _get_sandbox_lock(sandbox_id):
         instance = _INSTANCES.pop(sandbox_id, None)
         record.status = "stopped"
@@ -2391,10 +2391,8 @@ async def _lazy_provision_sandbox_for_session_locked(
     subpath = f"agents/{agent_id}/home"
 
     # Use provision_daytona_sandbox (install deps only, no supervisor start).
-    # The supervisor is started per-session by _do_resume / get_or_recover_session
-    # with the right spawn_env (including auth secrets).  Using create_daytona here
-    # would start a supervisor without auth and occupy port 9100, conflicting with
-    # the per-session supervisor started moments later by _do_resume.
+    # The supervisor is started per-session by ensure_runtime with the right
+    # spawn_env (including auth secrets).
     inst = await _providers_mod.provision_daytona_sandbox(
         agent_type=agent_type,
         volume_id=vol.provider_ref,
@@ -2423,155 +2421,6 @@ async def _lazy_provision_sandbox_for_session_locked(
     return sandbox
 
 
-async def get_or_recover_session(
-    session_id: str, spawn_env: dict[str, str] | None = None,
-) -> SessionState:
-    """Get a live session, recovering from DB if it was reaped.
-
-    This is the single entry point for all session endpoints. Checks
-    in-memory SESSIONS first, then falls back to DB lookup + _do_resume
-    to restart the sandbox and reload conversation state.
-
-    Raises HTTPException(404) if the session doesn't exist anywhere.
-    Raises HTTPException(502) if recovery fails.
-    """
-    state = SESSIONS.get(session_id)
-    if state and not state.shutdown.is_set():
-        try:
-            sandbox_record = await get_sandbox(state.sandbox_id)
-        except Exception as e:
-            log.warning(
-                "session %s live sandbox lookup failed for %s: %s; using live state",
-                session_id,
-                state.sandbox_id,
-                e,
-            )
-            return state
-        if sandbox_record is None:
-            return state
-        if sandbox_record.provider != "daytona":
-            return state
-
-        # For per-session supervisors, health-check the session's own supervisor
-        if state.supervisor_url:
-            from .providers import _wait_for_health
-            try:
-                healthy = await _wait_for_health(state.supervisor_url, max_retries=3, interval=1)
-                if healthy:
-                    return state
-            except Exception:
-                pass
-            # Per-session supervisor is down — recovery will start a new one
-        else:
-            # Legacy shared supervisor path
-            try:
-                current_url, _ = await _ensure_sandbox_alive(
-                    state.sandbox_id,
-                    sandbox_record,
-                    agent_type=state.agent_type,
-                )
-            except Exception as e:
-                log.warning(
-                    "session %s Daytona liveness refresh failed for %s: %s; forcing recovery",
-                    session_id,
-                    state.sandbox_id,
-                    e,
-                )
-                current_url = ""
-            client_base_url = str(getattr(state.client, "base_url", "")).rstrip("/")
-            if client_base_url == current_url.rstrip("/"):
-                return state
-        log.info(
-            "session %s has stale Daytona preview URL; forcing recovery",
-            session_id,
-        )
-
-    rec = await get_session(session_id)
-    if rec is None:
-        log.warning("session %s not found in DB", session_id)
-        raise HTTPException(status_code=404, detail="session not found")
-
-    stale_sandbox_id: str | None = None
-    if rec.get("current_sandbox_id") is None:
-        # Lazy session — provision on demand and re-read the row.
-        await _lazy_provision_sandbox_for_session(session_id)
-        rec = await get_session(session_id)
-    else:
-        # Sandbox pointer is set — verify it still exists.  If it was explicitly
-        # deleted (DELETE /sandboxes/{id}), provision a fresh one and treat this
-        # as a sandbox-loss recovery (same as lazy provisioning).
-        sandbox_rec = await get_sandbox(rec["current_sandbox_id"])
-        if sandbox_rec is None:
-            stale_sandbox_id = rec["current_sandbox_id"]
-            log.warning(
-                "session %s: current_sandbox_id %s not found in DB — re-provisioning",
-                session_id,
-                stale_sandbox_id,
-            )
-            await set_session_current_sandbox(session_id, None)
-            await _lazy_provision_sandbox_for_session(
-                session_id, previous_sandbox_id=stale_sandbox_id
-            )
-            rec = await get_session(session_id)
-
-    agent_id = rec.get("agent_id")
-    inner_session_id = rec.get("inner_session_id")
-    sandbox_id = rec.get("current_sandbox_id")
-    if not agent_id or not sandbox_id:
-        log.warning("session %s record incomplete: %s", session_id, rec)
-        raise HTTPException(status_code=404, detail="session record incomplete")
-
-    log.info(
-        "recovering session %s (sandbox=%s, inner=%s)",
-        session_id,
-        sandbox_id,
-        inner_session_id,
-    )
-    # If caller didn't supply spawn_env (e.g. /message auto-recovery),
-    # rebuild from stored agent.env ∪ session.env ∪ session.secrets.
-    if spawn_env is None:
-        try:
-            spawn_env = await _build_spawn_env_for_session(session_id)
-        except Exception as e:
-            log.warning(
-                "session %s: failed to rebuild spawn_env from DB: %s", session_id, e,
-            )
-            spawn_env = None
-    result = await _do_resume(
-        sandbox_id=sandbox_id,
-        agent_id=agent_id,
-        inner_session_id=inner_session_id,
-        client_session_id=session_id,
-        force_replace_live_state=state is not None and not state.shutdown.is_set(),
-        spawn_env=spawn_env,
-    )
-
-    if isinstance(result, JSONResponse):
-        body = bytes(result.body).decode("utf-8", errors="replace")
-        log.error(
-            "session %s recovery failed: status=%d body=%s",
-            session_id,
-            result.status_code,
-            body[:500],
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"session recovery failed: {body[:200]}",
-        )
-
-    recovered = SESSIONS.get(session_id)
-    if recovered is None:
-        log.error(
-            "session %s recovery succeeded but SESSIONS lookup returned None",
-            session_id,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="session recovery failed: state missing after resume",
-        )
-
-    log.info("session %s recovered successfully", session_id)
-    return recovered
 
 
 # ---------------------------------------------------------------------------
@@ -2623,7 +2472,7 @@ async def get_session_route(session_id: str):
 async def session_status(session_id: str):
     """Get session runtime status including last activity timestamp."""
     try:
-        state = await get_or_recover_session(session_id)
+        _, _, state = await ensure_session_live(session_id)
     except HTTPException as exc:
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
     now = time.time()
@@ -2676,7 +2525,7 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 
 
 # ---------------------------------------------------------------------------
-# Session endpoints (new — keyed by session_id, use get_or_recover_session)
+# Session endpoints (keyed by session_id, use ensure_session_live)
 # ---------------------------------------------------------------------------
 
 
