@@ -5,9 +5,9 @@ Base URL: `http://localhost:7778`
 The API has three resource groups:
 - **Volumes** — durable storage (CRUD, file ops). Each volume holds `~/.claude`, transcripts, and workspace for the agents that mount it.
 - **Sandboxes** — ephemeral compute leases (create, list, get, destroy, stop, start). Each sandbox mounts a volume at a subpath.
-- **Sessions** — agent conversation (messages, events, resume, cancel, config, status, logs). Each session binds to a volume; its current sandbox is swapped transparently when the old one dies.
+- **Sessions** — agent conversation (messages, events, resume, cancel, config, status, logs). Each session binds to a volume; its current sandbox is swapped when the old one dies.
 
-> **Model change in this PR:** sessions used to be bound to a specific sandbox via `ON DELETE CASCADE`. Now they bind to a volume, and the sandbox is an ephemeral lease that can come and go — `current_sandbox_id` is nullable, and deleting a sandbox leaves the session intact. See [`assets/data-model.html`](../assets/data-model.html) and [`assets/rest-api.html`](../assets/rest-api.html) for a visual diff.
+See also: [`assets/data-model.html`](../assets/data-model.html) and [`assets/rest-api.html`](../assets/rest-api.html).
 
 ## Health
 
@@ -40,7 +40,7 @@ Serves a browser-based chat interface for interacting with agent sessions.
 POST /sessions/quick
 ```
 
-**Requires `volume_id`.** Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win.
+Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win. `volume_id` is optional — if omitted, a per-provider default volume is created (or reused) transparently.
 
 ```json
 {
@@ -61,6 +61,7 @@ Returns:
 ```json
 {
   "agent_id": "uuid",
+  "sandbox_id": "uuid",
   "current_sandbox_id": "uuid",
   "session_id": "uuid",
   "inner_session_id": "uuid",
@@ -68,13 +69,15 @@ Returns:
 }
 ```
 
+`sandbox_id` and `current_sandbox_id` are emitted with the same value for backward compatibility with pre-refactor clients.
+
 ### Create a session bound to a volume (lazy sandbox)
 
 ```
 POST /sessions
 ```
 
-**Requires `volume_id`.** Does **not** provision a sandbox — the compute is created lazily on the first `/message` or `/resume`. Accepts the same config fields as `/sessions/quick`, plus an optional `agent_id` to reuse an existing agent config instead of creating a new one.
+Does **not** provision a sandbox — the compute is created lazily on the first `/message` or `/resume`. Accepts the same config fields as `/sessions/quick`, plus an optional `agent_id` to reuse an existing agent config instead of creating a new one. `volume_id` is optional (falls back to the per-provider default volume if omitted).
 
 ```json
 {
@@ -356,8 +359,6 @@ Returns:
   "timed_out": false
 }
 ```
-
-If the session's sandbox is stopped/reaped, the server auto-recovers it before running the command.
 
 ## Volumes
 

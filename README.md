@@ -107,7 +107,7 @@ Obtaining the OAuth token (`claude setup-token` or equivalent) is the caller's r
 
 ## Session persistence
 
-Sessions survive server restarts **and** sandbox death. The server persists `{session_id, agent_id, volume_id, current_sandbox_id, inner_session_id}` to Postgres. The agent's HOME (`~/.claude`, transcripts, workspace) lives on the volume, not the sandbox — so when a sandbox is reaped, crashes, or is explicitly deleted, the session row survives with `current_sandbox_id = NULL` and the next `/message` lazily reprovisions a new sandbox that mounts the same volume. Claude CLI resumes from the transcript still on disk.
+Sessions survive server restarts **and** sandbox death. The server persists `{session_id, agent_id, volume_id, current_sandbox_id, inner_session_id}` to Postgres. The agent's HOME (`~/.claude`, transcripts, workspace) lives on the volume, not the sandbox. When a sandbox is reaped, crashes, or is explicitly deleted, the session row survives with `current_sandbox_id = NULL`; the next `/message` lazily reprovisions a new sandbox that mounts the same volume, and Claude CLI resumes from the transcript still on disk.
 
 Resume from another process with just the session_id:
 
@@ -142,13 +142,13 @@ The server looks up the session in the DB, ensures a live sandbox (reprovisionin
 
 ## Providers
 
-| Provider | How it works | Survives reap? |
+| Provider | How the sandbox runs | Sandbox survives stop? |
 |---|---|---|
 | `local` | Subprocess on the host | No — process killed |
 | `docker` | Docker container | No — container removed |
 | `daytona` | Daytona cloud workspace | Yes — workspace stopped, filesystem preserved |
 
-For persistent sessions that survive long idle periods, use Daytona.
+Session data (HOME, transcripts, workspace) lives on the volume, so the session survives sandbox death on every provider — the next `/message` reprovisions a new sandbox that mounts the same volume. The column above is sandbox-level behavior only.
 
 ## Docs
 

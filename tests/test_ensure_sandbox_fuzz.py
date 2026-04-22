@@ -53,15 +53,7 @@ from api.providers import ProviderInstance  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def setup():
-    dbmod.init_db()
-    await dbmod.init_pool()
-    async with dbmod.get_db() as conn:
-        await conn.execute("DELETE FROM session_log")
-        await conn.execute("DELETE FROM sessions")
-        await conn.execute("DELETE FROM sandboxes")
-        await conn.execute("DELETE FROM volumes")
-        await conn.execute("DELETE FROM agents")
+async def setup(clean_db):
     srv._INSTANCES.clear()
     srv.SESSIONS.clear()
     srv._sandbox_locks.clear()
@@ -69,7 +61,6 @@ async def setup():
     yield
     srv._INSTANCES.clear()
     srv.SESSIONS.clear()
-    await dbmod.close_pool()
 
 
 async def _mk_fixtures(include_sandbox: bool, include_pointer: bool,

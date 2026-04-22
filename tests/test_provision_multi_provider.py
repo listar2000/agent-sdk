@@ -30,17 +30,8 @@ from api import db as dbmod, server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def setup():
-    dbmod.init_db()
-    await dbmod.init_pool()
-    async with dbmod.get_db() as conn:
-        await conn.execute("DELETE FROM session_log")
-        await conn.execute("DELETE FROM sessions")
-        await conn.execute("DELETE FROM sandboxes")
-        await conn.execute("DELETE FROM volumes")
-        await conn.execute("DELETE FROM agents")
+async def setup(clean_db):
     yield
-    await dbmod.close_pool()
 
 
 async def _mk_session(provider: str, provider_ref: str) -> None:

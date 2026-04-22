@@ -76,66 +76,13 @@ uvicorn src.api.server:app --port 7778 --reload
 
 ## API Structure
 
-### Volume endpoints (persistent storage)
+See [`docs/api.md`](api.md) for the full endpoint reference and [`assets/rest-api.html`](../assets/rest-api.html) for a visual map. Three resource groups:
 
-```
-POST   /volumes                              — create volume
-POST   /volumes/provision                    — create + wait for ready
-GET    /volumes                              — list (?provider= filter)
-GET    /volumes/{id_or_name}                 — get info
-DELETE /volumes/{id_or_name}?force=false     — delete (409 if sessions reference it unless force=true)
-GET    /volumes/{id_or_name}/files/tree      — browse volume contents
-GET    /volumes/{id_or_name}/files/read      — read a file on the volume
-POST   /volumes/{id_or_name}/files/edit      — write a file on the volume
-```
+- **Volumes** (`/volumes/*`) — durable storage, with file ops backed by a short-lived utility sandbox.
+- **Sandboxes** (`/sandboxes/*`) — ephemeral compute. Every sandbox is `(volume_id, subpath)`-scoped at creation; the volume is mounted at `/home/daytona` with a read-only `shared/` subpath at `/mnt/shared`.
+- **Sessions** (`/sessions/*`) — conversation. Bind to a volume; `current_sandbox_id` is swapped as sandboxes come and go. Explicit sandbox control via `/sessions/{id}/{start,stop,reset}-sandbox`.
 
-File ops are backed internally by a short-lived utility sandbox — callers never
-need to manage one to seed data.
-
-### Sandbox endpoints (ephemeral compute)
-
-```
-POST   /sandboxes                    — create sandbox (requires volume_id, subpath)
-POST   /sandboxes/provision          — create + wait for ready
-GET    /sandboxes                    — list
-GET    /sandboxes/{id}               — get info
-DELETE /sandboxes/{id}               — destroy (sessions referencing it survive with current_sandbox_id = NULL)
-POST   /sandboxes/{id}/stop          — stop (preserves volume data)
-POST   /sandboxes/{id}/start         — resume stopped sandbox
-```
-
-Sandbox endpoints operate directly on the infrastructure. No session required.
-Every sandbox is `(volume_id, subpath)`-scoped at creation: the volume is
-mounted at `/home/daytona`, with an additional read-only `shared/` mount at
-`/mnt/shared`.
-
-### Session endpoints (conversation)
-
-```
-POST   /sessions                     — create session bound to a volume (no sandbox yet, lazy)
-POST   /sessions/quick               — create agent + volume binding + sandbox + session in one call
-POST   /sessions/{id}/message        — send prompt (lazily provisions a sandbox if needed)
-GET    /sessions/{id}/events         — SSE event stream (now also emits sandbox_reattach / sandbox_lost)
-POST   /sessions/{id}/cancel         — cancel running prompt
-POST   /sessions/{id}/config         — set model, mode, thinking level
-GET    /sessions/{id}/status         — session status
-GET    /sessions/{id}/log            — event log
-POST   /sessions/{id}/resume         — resume (works even after sandbox was killed)
-POST   /sessions/{id}/start-sandbox  — pre-warm a sandbox eagerly
-POST   /sessions/{id}/stop-sandbox   — kill current sandbox (next /message lazy-provisions)
-POST   /sessions/{id}/reset-sandbox  — kill current + provision a fresh one
-POST   /sessions/{id}/sandbox/exec   — run a shell command in session sandbox
-```
-
-`POST /sessions` requires `volume_id` and does **not** provision a sandbox —
-the compute is created lazily on the first `/message` or `/resume`.
-`POST /sessions/quick` also requires `volume_id`.
-
-Conversation endpoints (`/sessions/{id}/message`, `/sessions/{id}/events`,
-`/sessions/{id}/cancel`, `/sessions/{id}/config`, `/sessions/{id}/resume`,
-`/sessions/{id}/sandbox/exec`) auto-recover if the sandbox was reaped or killed
-— the server reprovisions a new sandbox bound to the session's volume, so
-conversation history on disk survives.
+`POST /sessions` and `POST /sessions/quick` accept an optional `volume_id`; if omitted, a per-provider default volume is created/reused.
 
 ## Database
 

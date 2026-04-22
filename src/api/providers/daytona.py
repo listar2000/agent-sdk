@@ -23,6 +23,7 @@ from ._shared import (
     _get_sandbox_env_vars,
     _safe_path,
     _wait_for_health,
+    build_supervisor_argv,
     ProviderInstance,
     _build_volume_mounts,
 )
@@ -61,13 +62,15 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
         return (r.result if hasattr(r, "result") else str(r)) or ""
 
     acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
-    launch_args = _acp_launch_args(agent_type)
-    acp_arg_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in launch_args)
     env_prefix = _build_env_prefix(spawn_env)
+    supervisor_argv = build_supervisor_argv(
+        supervisor_js="supervisor.js", acp_bin=acp_bin,
+        acp_launch_args=_acp_launch_args(agent_type),
+        port=_SUPERVISOR_REMOTE_PORT, root=root, quote_paths=False,
+    )
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
-        f"setsid env {env_prefix} node supervisor.js --host 0.0.0.0 --port {_SUPERVISOR_REMOTE_PORT} "
-        f"--acp {acp_bin}{acp_arg_flags} --root {root} "
+        f"setsid env {env_prefix} {supervisor_argv} "
         f"> {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1 </dev/null & echo started"
     )
     start_cmd = f"sh -c {shlex.quote(inner)}"
@@ -122,9 +125,32 @@ async def start_supervisor_in_sandbox(
     vol_supervisor = f"{_SUPERVISOR_VOLUME_DIR}/supervisor.js"
     local_work = f"/tmp/sup-work-{port}"
 
-    check_result = await loop.run_in_executor(
-        None, lambda: _exec(f"test -f {vol_tarball} && echo yes || echo no")
-    )
+    # Daytona S3-backed volumes have FUSE write-to-read visibility lag
+    # (seconds), so a session sandbox created ~immediately after
+    # install_supervisor may not yet see /opt/supervisor/deps.tar.gz.
+    # Retry a handful of times before falling back to the legacy /tmp
+    # install path.
+    check_result = "no"
+    for _attempt in range(10):
+        check_result = await loop.run_in_executor(
+            None, lambda: _exec(f"test -f {vol_tarball} && echo yes || echo no")
+        )
+        if check_result.strip() == "yes":
+            break
+        await asyncio.sleep(1)
+
+    if check_result.strip() != "yes":
+        diag = await loop.run_in_executor(
+            None, lambda: _exec(
+                f"ls -la {_SUPERVISOR_VOLUME_DIR} 2>&1 | head -10; "
+                f"echo '---'; mount | grep -i supervisor"
+            )
+        )
+        log.warning(
+            "start_supervisor_in_sandbox: volume cache not visible after retries "
+            "(sandbox %s); /opt/supervisor contents:\n%s",
+            sandbox.id[:16], diag,
+        )
 
     if check_result.strip() == "yes":
         # Volume-cached mode: extract deps tarball to local ephemeral dir.
@@ -146,14 +172,16 @@ async def start_supervisor_in_sandbox(
                  _SUPERVISOR_REMOTE_DIR, port, sandbox.id[:16])
 
     acp_bin = f"{sup_dir}/node_modules/.bin/{bin_name}"
-    launch_args = _acp_launch_args(agent_type)
-    acp_arg_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in launch_args)
     env_prefix = _build_env_prefix(spawn_env)
     log_file = f"{sup_dir}/sup-{port}.log"
+    supervisor_argv = build_supervisor_argv(
+        supervisor_js="supervisor.js", acp_bin=acp_bin,
+        acp_launch_args=_acp_launch_args(agent_type),
+        port=port, root=root, quote_paths=False,
+    )
     inner = (
         f"cd {sup_dir} && "
-        f"setsid env {env_prefix} node supervisor.js --host 0.0.0.0 --port {port} "
-        f"--acp {acp_bin}{acp_arg_flags} --root {root} "
+        f"setsid env {env_prefix} {supervisor_argv} "
         f"> {log_file} 2>&1 </dev/null & echo started"
     )
     start_cmd = f"sh -c {shlex.quote(inner)}"
@@ -419,7 +447,12 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     from daytona_api_client.models import VolumeState
 
     client = _get_daytona_client()
-    vol = await asyncio.to_thread(client.volume.create, name)
+    # Idempotent: volume.get(name, create=True) returns the existing volume
+    # if one already has this name, else creates a new one. Lets
+    # `_get_or_create_default_volume` re-enter safely across server restarts
+    # and on multi-worker deploys where the DB row was lost but the Daytona
+    # volume still exists.
+    vol = await asyncio.to_thread(client.volume.get, name, True)
     vol_id = vol.id
 
     volumes_api = VolumesApi(client._api_client)
@@ -650,21 +683,39 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
             return (r.result if hasattr(r, "result") else str(r)) or ""
 
         # npm install to local ephemeral FS (fast SSD), pack to a tarball,
-        # place it on the volume under the staging dir.
+        # place it on the volume under the staging dir.  Every shell step
+        # uses ``set -e`` so a silent npm failure can't produce an empty
+        # node_modules that then tarballs without the acp bin.
         local_dir = "/tmp/sup-install"
+        bin_name = _acp_bin_name(agent_type)
         await loop.run_in_executor(None, lambda: _exec(
-            f"rm -rf {local_dir} && mkdir -p {local_dir} && cd {local_dir} && "
-            "npm init -y >/dev/null 2>&1"
+            f"set -e && rm -rf {local_dir} && mkdir -p {local_dir} && "
+            f"cd {local_dir} && npm init -y >/dev/null 2>&1"
         ))
-        await loop.run_in_executor(None, lambda: _exec(
-            f"cd {local_dir} && npm install --omit=optional {npm_spec} 2>&1 | tail -5",
+        install_out = await loop.run_in_executor(None, lambda: _exec(
+            f"set -e && cd {local_dir} && "
+            f"npm install --omit=optional {npm_spec} 2>&1",
             240,
         ))
+        # Sentinel: the ACP bin must exist after npm install.  If it
+        # doesn't, surface the npm output so the caller knows why.
+        verify = await loop.run_in_executor(None, lambda: _exec(
+            f"test -f {local_dir}/node_modules/.bin/{bin_name} && echo ok || echo missing"
+        ))
+        if verify.strip() != "ok":
+            raise RuntimeError(
+                f"npm install produced no {bin_name} at "
+                f"{local_dir}/node_modules/.bin/ — npm output:\n"
+                f"{install_out[-2000:]}"
+            )
 
         # Build the staging dir on the volume and drop the tarball there.
         await loop.run_in_executor(None, lambda: _exec(
-            f"mkdir -p {staging_on_volume} && "
+            f"set -e && mkdir -p {staging_on_volume} && "
             f"tar -C {local_dir} -czf /tmp/deps.tar.gz . && "
+            # Sanity-check the tarball contains the acp bin before we ship
+            # it onto the slow network volume.  Cheap sanity gate.
+            f"tar -tzf /tmp/deps.tar.gz | grep -q 'node_modules/.bin/{bin_name}' && "
             f"cp /tmp/deps.tar.gz {staging_on_volume}/deps.tar.gz && "
             f"rm -f /tmp/deps.tar.gz && rm -rf {local_dir}",
             120,
@@ -681,13 +732,21 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
 
         # Sentinel checks + atomic swap. Using shell ``test`` so a single
         # missing file aborts before we touch the existing supervisor dir.
+        # mountpoint-s3 doesn't support rename of non-empty dirs, so we
+        # create final/ and copy contents in (idempotent via rm -rf first).
         await loop.run_in_executor(None, lambda: _exec(
             f"set -e && "
             f"test -f {staging_on_volume}/deps.tar.gz && "
             f"test -f {staging_on_volume}/supervisor.js && "
             f"rm -rf {final_on_volume} && "
-            f"mv {staging_on_volume} {final_on_volume}",
-            30,
+            f"mkdir -p {final_on_volume} && "
+            f"cp -f {staging_on_volume}/deps.tar.gz {final_on_volume}/deps.tar.gz && "
+            f"cp -f {staging_on_volume}/supervisor.js {final_on_volume}/supervisor.js && "
+            f"rm -rf {staging_on_volume} && "
+            f"test -f {final_on_volume}/deps.tar.gz && "
+            f"test -f {final_on_volume}/supervisor.js && "
+            f"sync",
+            120,
         ))
 
         log.info("supervisor installed on volume %s for %s", volume_ref, agent_type)

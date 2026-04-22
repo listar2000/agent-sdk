@@ -34,21 +34,8 @@ from api.models import VolumeRecord  # noqa: E402
 from api.providers import ProviderInstance  # noqa: E402
 
 
-async def _truncate():
-    async with dbmod.get_db() as conn:
-        await conn.execute("DELETE FROM session_log")
-        await conn.execute("DELETE FROM sessions")
-        await conn.execute("DELETE FROM sandboxes")
-        await conn.execute("DELETE FROM volumes")
-        await conn.execute("DELETE FROM agents")
-
-
 @pytest_asyncio.fixture
-async def client():
-    dbmod.init_db()
-    await dbmod.init_pool()
-    await _truncate()
-    # Each test starts from a clean in-memory state.
+async def client(clean_db):
     srv._INSTANCES.clear()
     srv.SESSIONS.clear()
     srv._sandbox_locks.clear()
@@ -58,10 +45,8 @@ async def client():
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
 
-    # After-test cleanup — don't leave orphans for the next test.
     srv._INSTANCES.clear()
     srv.SESSIONS.clear()
-    await dbmod.close_pool()
 
 
 # ---------------------------------------------------------------------------

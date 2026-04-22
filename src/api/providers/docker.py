@@ -33,6 +33,7 @@ from ._shared import (
     _recycle_port,
     _safe_path,
     _wait_for_health,
+    build_supervisor_argv,
 )
 
 log = logging.getLogger(__name__)
@@ -284,24 +285,18 @@ async def create_sandbox(
     await _ensure_subpath_dir(volume_ref, subpath)
 
     bin_name = _acp_bin_name(agent_type)
-    launch_args = _acp_launch_args(agent_type)
     agent_root = root or _AGENT_HOME_IN
     if port is None:
         port = await _find_free_port()
 
     env_prefix = _build_env_prefix(spawn_env)
-    acp_arg_flags = "".join(
-        f" --acp-arg {shlex.quote(a)}" for a in launch_args
-    )
     acp_path = f"{_SUPERVISOR_IN}/node_modules/.bin/{bin_name}"
-
-    supervisor_cmd = (
-        f"env {env_prefix} "
-        f"node {_SUPERVISOR_IN}/supervisor.js "
-        f"--host 0.0.0.0 --port {_SUPERVISOR_CONTAINER_PORT} "
-        f"--acp {shlex.quote(acp_path)}{acp_arg_flags} "
-        f"--root {shlex.quote(agent_root)}"
+    supervisor_argv = build_supervisor_argv(
+        supervisor_js=f"{_SUPERVISOR_IN}/supervisor.js", acp_bin=acp_path,
+        acp_launch_args=_acp_launch_args(agent_type),
+        port=_SUPERVISOR_CONTAINER_PORT, root=agent_root,
     )
+    supervisor_cmd = f"env {env_prefix} {supervisor_argv}"
     if pre_start_commands:
         setup = " && ".join(pre_start_commands)
         shell_cmd = f"{setup} && exec {supervisor_cmd}"

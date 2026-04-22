@@ -20,20 +20,10 @@ from api import db as dbmod, server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def client():
-    dbmod.init_db()
-    await dbmod.init_pool()
-    # Clean any leftovers.
-    async with dbmod.get_db() as conn:
-        await conn.execute("DELETE FROM session_log")
-        await conn.execute("DELETE FROM sessions")
-        await conn.execute("DELETE FROM sandboxes")
-        await conn.execute("DELETE FROM volumes")
-        await conn.execute("DELETE FROM agents")
+async def client(clean_db):
     transport = ASGITransport(app=srv.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
-    await dbmod.close_pool()
 
 
 @pytest.mark.asyncio

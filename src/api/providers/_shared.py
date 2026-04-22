@@ -121,6 +121,35 @@ def _acp_launch_args(agent_type: str) -> list[str]:
     return list(_ACP_LAUNCH_ARGS.get(agent_type, []))
 
 
+def build_supervisor_argv(
+    *,
+    supervisor_js: str,
+    acp_bin: str,
+    acp_launch_args: list[str],
+    port: int,
+    root: str,
+    host: str = "0.0.0.0",
+    quote_paths: bool = True,
+) -> str:
+    """Return the ``node supervisor.js ...`` argv string shared by every
+    provider. Callers wrap with their own env prefix, backgrounding, and
+    I/O redirection — Daytona prepends ``setsid env`` and appends ``&``,
+    Docker uses ``exec`` as the container PID 1.
+
+    ``quote_paths=False`` is for Daytona, whose paths are constants
+    controlled by this package (no shell-metacharacter risk) and which
+    built its command without quoting before the helper existed.
+    """
+    q = shlex.quote if quote_paths else (lambda s: s)
+    acp_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in acp_launch_args)
+    return (
+        f"node {q(supervisor_js)} "
+        f"--host {host} --port {port} "
+        f"--acp {q(acp_bin)}{acp_flags} "
+        f"--root {q(root)}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Env helpers
 # ---------------------------------------------------------------------------

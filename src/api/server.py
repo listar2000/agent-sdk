@@ -1088,6 +1088,25 @@ async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
     return vol
 
 
+async def _resolve_or_default_volume(
+    volume_id: str | None, default_provider: str,
+) -> "VolumeRecord":
+    """Resolve an explicit volume id/name or fall back to the per-provider default.
+
+    Four endpoints share this contract (``POST /sandboxes``, ``/sandboxes/provision``,
+    ``/sessions``, ``/sessions/quick``). Raises ``HTTPException(404)`` for an
+    unknown id/name and ``HTTPException(502)`` if default-volume provisioning fails.
+    """
+    if volume_id and isinstance(volume_id, str):
+        return await _resolve_volume(volume_id)
+    try:
+        return await _get_or_create_default_volume(default_provider)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"default volume provision failed: {e}")
+
+
 async def _get_or_create_default_volume(provider: str) -> "VolumeRecord":
     """Return (creating if needed) the shared default volume for ``provider``.
 
@@ -1148,11 +1167,8 @@ async def create_volume(body: _VolumeCreateBody):
     if await get_volume_by_name(body.name) is not None:
         raise HTTPException(409, f"Volume '{body.name}' already exists")
 
-    # Mi4: single dispatch path through the uniform ``create_volume`` helper.
-    # Tests that used to patch ``api.providers.create_daytona_volume`` should
-    # instead patch ``api.providers.daytona.create_daytona_volume`` (the
-    # underlying function the dispatcher calls for provider="daytona") —
-    # that's the function the dispatcher resolves via ``_PROVIDER_MODS``.
+    # Tests mocking provider creation should patch the per-provider function
+    # (e.g. ``api.providers.daytona.create_daytona_volume``), not this dispatcher.
     if body.provider not in _providers_mod._PROVIDER_MODS:
         raise HTTPException(400, f"Unknown provider: {body.provider}")
     provider_ref = await _providers_mod.create_volume(body.provider, body.name)
@@ -1219,9 +1235,8 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
                 f"sandbox(es). Use ?force=true to cascade.",
             )
         if force:
-            # Sessions first (FK RESTRICT on sandbox is already SET NULL via
-            # Task 4), then sandboxes (FK RESTRICT on volume blocks the final
-            # delete unless we clear them).
+            # Sessions first (sandbox FK is SET NULL), then sandboxes —
+            # FK RESTRICT on volume blocks the final delete otherwise.
             if session_count > 0:
                 await conn.execute(
                     "DELETE FROM sessions WHERE volume_id = %s", (vol.id,),
@@ -1243,13 +1258,9 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
                 raise
             log.warning("volume %s provider delete skipped: %s", vol.id, e)
     else:
-        # Mi8: docker/local volumes previously leaked on DELETE because only
-        # the daytona branch cleaned up the provider side.  Call the uniform
-        # dispatcher; swallow only "not found"-class errors (volume is
-        # already gone on the provider side; the DB row is the last copy).
-        # Let "in use" errors propagate — an out-of-band container mounting
-        # the volume is a real conflict the user should see, not a silent
-        # orphan.  Matches the narrow whitelist the daytona branch uses.
+        # Swallow only "not found"-class errors (volume already gone on the
+        # provider side; the DB row is the last copy). Let "in use" propagate:
+        # an out-of-band container mounting the volume is a real conflict.
         try:
             await _providers_mod.delete_volume(vol.provider, vol.provider_ref)
         except Exception as e:
@@ -1347,21 +1358,8 @@ async def create_sandbox(request: Request):
     root = data.get("root", "/tmp")
     volume_id = data.get("volume_id")
     subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
-    if not volume_id:
-        # Default-volume shortcut — keeps direct `/sandboxes` callers working
-        # without a manual POST /volumes. Server picks `default-{provider}`.
-        try:
-            vol = await _get_or_create_default_volume(provider)
-        except HTTPException:
-            raise
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"default volume provision failed: {e}"},
-                status_code=502,
-            )
-        volume_id = vol.id
-    else:
-        vol = await _resolve_volume(volume_id)
+    vol = await _resolve_or_default_volume(volume_id, provider)
+    volume_id = vol.id
     _validate_subpath(subpath)
     if provider != vol.provider:
         return JSONResponse(
@@ -1499,29 +1497,12 @@ async def provision_sandbox_route(request: Request):
     volume_id = data.get("volume_id")
     subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
     explicit_provider = data.get("provider")
-    if not volume_id:
-        default_provider = explicit_provider or "local"
-        try:
-            vol = await _get_or_create_default_volume(default_provider)
-        except HTTPException:
-            raise
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"default volume provision failed: {e}"},
-                status_code=502,
-            )
-        volume_id = vol.id
-    else:
-        vol = await _resolve_volume(volume_id)
+    vol = await _resolve_or_default_volume(volume_id, explicit_provider or "local")
+    volume_id = vol.id
     _validate_subpath(subpath)
     # Default the provider from the volume (so existing Daytona-only clients
     # don't have to pass it), but let an explicit body field override for tests.
     provider = explicit_provider or vol.provider
-    # Mi5: ``provider != vol.provider`` is only reachable when the client
-    # explicitly overrides ``provider`` in the body to something that
-    # disagrees with the volume.  Tests exercise this to verify the
-    # cross-provider rejection; normal clients omit ``provider`` and the
-    # default (``vol.provider``) makes this branch unreachable.
     if provider != vol.provider:
         return JSONResponse(
             {"error": f"provider {provider!r} does not match volume.provider {vol.provider!r}"},
@@ -1596,17 +1577,12 @@ async def stop_sandbox_route(sandbox_id: str):
     #
     # IMPORTANT: stop the provider instance BEFORE flipping status="stopped"
     # in the DB. A crash between the flip and a successful stop_instance
-    # would leave "stopped" in the DB with a live container still running,
-    # and docker reconcile used to treat that as an orphan (cycle 4 MA3).
-    # Reconcile now preserves stopped+live pairs, but we still want the DB
-    # to reflect reality — only mark stopped after the provider confirms.
-    #
-    # Mi7: ``_INSTANCES`` is only popped AFTER the DB update succeeds.  If
-    # the UPDATE fails we keep the entry so reconcile / retry can still
-    # find the container via the in-process map; otherwise the container
-    # has exited (stop_instance returned) but the DB row still says
-    # "running" and the map is empty — a subsequent _ensure_sandbox_alive
-    # would provision a second container with the same label.
+    # Only mark stopped after the provider confirms — otherwise the DB says
+    # "stopped" while a live container still runs, and reconcile treats it as
+    # an orphan. ``_INSTANCES`` must be popped *after* the DB update: if the
+    # UPDATE fails, keep the entry so retry/reconcile can still locate the
+    # container; otherwise the container is gone but the row says "running"
+    # and the next ensure call would provision a duplicate.
     async with _get_sandbox_lock(sandbox_id):
         instance = _INSTANCES.get(sandbox_id)
         if instance:
@@ -2823,21 +2799,8 @@ async def sessions_create(request: Request):
 
     volume_id = data.get("volume_id")
     default_provider = data.get("provider") or data.get("config", {}).get("provider") or "local"
-    if volume_id and isinstance(volume_id, str):
-        volume_record = await get_volume(volume_id)
-        if volume_record is None:
-            return JSONResponse({"error": "volume not found"}, status_code=404)
-    else:
-        try:
-            volume_record = await _get_or_create_default_volume(default_provider)
-        except HTTPException:
-            raise
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"default volume provision failed: {e}"},
-                status_code=502,
-            )
-        volume_id = volume_record.id
+    volume_record = await _resolve_or_default_volume(volume_id, default_provider)
+    volume_id = volume_record.id
 
     agent_id = data.get("agent_id")
     agent_type = data.get("agent_type", "claude")
@@ -2894,24 +2857,8 @@ async def sessions_quick_create(request: Request):
 
     provider = data.get("provider", "local")
     volume_id = data.get("volume_id")
-    if volume_id and isinstance(volume_id, str):
-        volume_record = await get_volume(volume_id)
-        if volume_record is None:
-            return JSONResponse({"error": "volume not found"}, status_code=404)
-    else:
-        # Default-volume shortcut: callers that don't explicitly manage
-        # volumes share a per-provider default. Keeps the SDK's zero-config
-        # path working (``Agent(name, provider="local", cwd=...)``).
-        try:
-            volume_record = await _get_or_create_default_volume(provider)
-        except HTTPException:
-            raise
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"default volume provision failed: {e}"},
-                status_code=502,
-            )
-        volume_id = volume_record.id
+    volume_record = await _resolve_or_default_volume(volume_id, provider)
+    volume_id = volume_record.id
     agent_type = data.get("agent_type", "claude")
     name = data.get("name")
     config_data = data.get("config", {})
@@ -3005,7 +2952,32 @@ async def sessions_quick_create(request: Request):
         )
     )
 
+    # For Daytona (Phase 2+), create_instance returns ProviderInstance(url="")
+    # because the supervisor is installed on the volume separately and started
+    # lazily. Fill in the supervisor URL now so AcpClient has a real endpoint.
+    # Docker/Local already started the supervisor inside create_sandbox.
     url = instance.url
+    if not url:
+        supervisor_port = allocate_sandbox_port(sandbox_id)
+        try:
+            url = await _providers_mod.ensure_supervisor_url(
+                provider, instance,
+                agent_type=agent_type,
+                root=instance.root or root,
+                spawn_env=spawn_env,
+                port=supervisor_port,
+            )
+        except Exception as e:
+            free_sandbox_port(sandbox_id, supervisor_port)
+            await delete_agent(agent_id)
+            _INSTANCES.pop(sandbox_id, None)
+            try:
+                await destroy_instance(instance)
+            except Exception:
+                pass
+            return JSONResponse(
+                {"error": f"Failed to start supervisor: {e}"}, status_code=502,
+            )
     acp_session_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
 
@@ -3529,17 +3501,23 @@ async def session_sandbox_exec(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/sandboxes/{sandbox_id}/files/tree")
-async def sandbox_files_tree(sandbox_id: str):
-    """Return the recursive directory tree of the sandbox filesystem.
+async def _proxy_to_supervisor(
+    sandbox_id: str, method: str, path: str, *,
+    params: dict | None = None, json: dict | None = None,
+    timeout: int = 30,
+) -> Response:
+    """Forward a request to the sandbox's supervisor and return its JSON response.
 
-    Browses the supervisor's configured --root (the sandbox root).
-    The root is not caller-controlled — the supervisor owns that decision.
+    Shared by every ``/sandboxes/{id}/files/*`` endpoint that returns JSON.
+    For binary responses (see ``files/download``) the header-forwarding case is
+    handled inline since it's unique.
     """
     instance = await _resolve_sandbox_instance(sandbox_id)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f"{instance.url}/v1/files/tree")
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.request(
+                method, f"{instance.url}{path}", params=params, json=json,
+            )
             return Response(
                 content=r.content,
                 status_code=r.status_code,
@@ -3547,98 +3525,65 @@ async def sandbox_files_tree(sandbox_id: str):
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+@app.get("/sandboxes/{sandbox_id}/files/tree")
+async def sandbox_files_tree(sandbox_id: str):
+    """Return the recursive directory tree of the sandbox root."""
+    return await _proxy_to_supervisor(sandbox_id, "GET", "/v1/files/tree")
 
 
 @app.get("/sandboxes/{sandbox_id}/files/read")
 async def sandbox_files_read(sandbox_id: str, path: str):
-    """Read a single file from the sandbox filesystem.
-
-    The `path` is relative to the sandbox root. The supervisor
-    enforces path traversal protection — callers cannot escape the root.
-    """
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(
-                f"{instance.url}/v1/files/read",
-                params={"path": path},
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Read a single file. Supervisor enforces path-traversal protection."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "GET", "/v1/files/read", params={"path": path},
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/edit")
 async def sandbox_files_edit(sandbox_id: str, request: Request):
-    """Edit or create a file in the sandbox filesystem.
+    """Edit or create a file.
 
-    Body: {"path": "relative/path", "old_string": "...", "new_string": "...", "replace_all": false}
-    When old_string is empty, writes/creates the file with new_string as content.
-    The supervisor enforces path traversal protection.
+    Body: ``{"path": ..., "old_string": ..., "new_string": ..., "replace_all": bool}``.
+    When ``old_string`` is empty, writes/creates the file with ``new_string`` as content.
     """
-    body = await _json_body(request)
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                f"{instance.url}/v1/files/edit",
-                json=body,
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/edit",
+        json=await _json_body(request),
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/upload")
 async def sandbox_files_upload(sandbox_id: str, request: Request):
-    """Upload a file to the sandbox. Body: {"path": "...", "content": "<base64>"}"""
-    body = await _json_body(request)
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(f"{instance.url}/v1/files/upload", json=body)
-            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/upload",
+        json=await _json_body(request), timeout=60,
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/delete")
 async def sandbox_files_delete(sandbox_id: str, request: Request):
-    """Delete a file or directory. Body: {"path": "..."}"""
-    body = await _json_body(request)
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{instance.url}/v1/files/delete", json=body)
-            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Delete a file or directory. Body: ``{"path": ...}``."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/delete",
+        json=await _json_body(request),
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/rename")
 async def sandbox_files_rename(sandbox_id: str, request: Request):
-    """Rename/move a file or directory. Body: {"path": "...", "new_path": "..."}"""
-    body = await _json_body(request)
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{instance.url}/v1/files/rename", json=body)
-            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/rename",
+        json=await _json_body(request),
+    )
 
 
 @app.get("/sandboxes/{sandbox_id}/files/download")
 async def sandbox_files_download(sandbox_id: str, path: str):
-    """Download a file as raw bytes."""
+    """Download a file as raw bytes (forwards content-type + disposition)."""
     instance = await _resolve_sandbox_instance(sandbox_id)
     try:
         async with httpx.AsyncClient(timeout=60) as client:

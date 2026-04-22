@@ -19,13 +19,10 @@ from api import db as dbmod, server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def client():
-    dbmod.init_db()
-    await dbmod.init_pool()
+async def client(db_pool):
     transport = ASGITransport(app=srv.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
-    await dbmod.close_pool()
 
 
 @pytest.mark.asyncio
