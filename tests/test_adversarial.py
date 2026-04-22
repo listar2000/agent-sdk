@@ -86,6 +86,7 @@ _stub_db.get_volume_by_name = _noop_volume
 _stub_db.list_volumes = _noop_list
 _stub_db.delete_volume = _noop
 _stub_db.set_session_current_sandbox = _noop
+_stub_db.add_supervisor_agent_type = _noop
 sys.modules["api.db"] = _stub_db
 
 # Now import server — lifespan calls init_db() / init_pool() which are no-ops
