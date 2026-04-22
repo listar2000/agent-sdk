@@ -577,13 +577,3 @@ async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
             (session_id, limit),
         )).fetchall()
     return [_row_to_log_entry(r) for r in rows]
-
-
-async def get_agent_log(agent_id: str, limit: int = 100) -> list[LogEntry]:
-    async with get_db() as conn:
-        rows = await (await conn.execute(
-            "SELECT id, session_id, agent_id, sandbox_id, event_type, payload, created_at"
-            " FROM session_log WHERE agent_id = %s ORDER BY created_at DESC LIMIT %s",
-            (agent_id, limit),
-        )).fetchall()
-    return [_row_to_log_entry(r) for r in rows]

@@ -7,10 +7,12 @@ This package splits provider-specific code into sub-modules:
   - _shared.py   — Shared types, constants, helpers
 
 providers/__init__.py:
-  - Re-exports everything from _shared for backward compatibility
-  - Re-exports Daytona-specific symbols for server.py compatibility
-  - Provides universal dispatch wrappers (create_instance, destroy_instance, etc.)
-  - Provides new uniform-API dispatch helpers for Phase 1+ use
+  - Re-exports the ``_shared`` and ``.daytona`` symbols that server.py
+    (and tests) import from ``api.providers``.
+  - Provides universal dispatch wrappers (create_instance, destroy_instance,
+    exec_in_instance).
+  - Provides uniform-API dispatch helpers (create_volume, delete_volume,
+    provision_sandbox, reconcile_sandboxes, ensure_supervisor_url, etc.).
 """
 
 import asyncio
@@ -39,6 +41,7 @@ from ._shared import (
     free_sandbox_port,
     _MAX_OUTPUT_BYTES,
     _truncate,
+    _exec_subprocess,
 )
 
 # Re-export Daytona-specific symbols for server.py + tests.
