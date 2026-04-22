@@ -3218,12 +3218,10 @@ async def session_events(session_id: str):
 async def session_cancel(session_id: str):
     """Cancel the active prompt and wait for it to finish."""
     try:
-        state = await get_or_recover_session(session_id)
+        _, _, state = await ensure_session_live(session_id)
     except HTTPException as exc:
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
-    if not state.acp_session_id:
-        return JSONResponse({"error": "no active session"}, status_code=409)
     if not state.agent_busy:
         return {"status": "ok", "detail": "not busy"}
 
@@ -3289,12 +3287,10 @@ async def reset_session_sandbox(session_id: str):
 async def session_set_config(session_id: str, request: Request):
     """Set mode/model/thought_level for a session."""
     try:
-        state = await get_or_recover_session(session_id)
+        _, _, state = await ensure_session_live(session_id)
     except HTTPException as exc:
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
-    if not state.acp_session_id:
-        return JSONResponse({"error": "no active session"}, status_code=409)
     try:
         data = await request.json()
         if "mode" in data:
