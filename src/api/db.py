@@ -345,18 +345,29 @@ async def delete_volume(volume_id: str) -> None:
 # Session CRUD
 # ---------------------------------------------------------------------------
 
-async def upsert_session(session_id: str, agent_id: str, sandbox_id: str,
+async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
                          inner_session_id: str | None,
+                         volume_id: str | None = None,
                          env: dict[str, str] | None = None,
                          secrets: dict[str, str] | None = None) -> None:
     """Upsert a session row.
 
     PATCH-like semantics: ``env=None`` (and ``secrets=None``) means don't
     touch the stored column on update. Pass ``{}`` to explicitly wipe.
+
+    ``sandbox_id`` maps to the ``current_sandbox_id`` column (may be None
+    if no sandbox is currently attached).
     """
-    cols = ["id", "agent_id", "sandbox_id", "inner_session_id"]
+    cols = ["id", "agent_id", "current_sandbox_id", "inner_session_id"]
     vals: list = [session_id, agent_id, sandbox_id, inner_session_id]
-    update_parts = ["inner_session_id=EXCLUDED.inner_session_id"]
+    update_parts = [
+        "current_sandbox_id=EXCLUDED.current_sandbox_id",
+        "inner_session_id=EXCLUDED.inner_session_id",
+    ]
+    if volume_id is not None:
+        cols.append("volume_id")
+        vals.append(volume_id)
+        update_parts.append("volume_id=EXCLUDED.volume_id")
     if env is not None:
         cols.append("env")
         vals.append(Json(env))
@@ -440,7 +451,7 @@ async def get_any_session_for_sandbox(sandbox_id: str) -> dict | None:
     """
     async with get_db() as conn:
         row = await (await conn.execute(
-            "SELECT * FROM sessions WHERE sandbox_id = %s"
+            "SELECT * FROM sessions WHERE current_sandbox_id = %s"
             " ORDER BY created_at DESC, id DESC LIMIT 1",
             (sandbox_id,),
         )).fetchone()

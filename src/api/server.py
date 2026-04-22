@@ -2323,146 +2323,66 @@ async def session_resume(session_id: str, request: Request):
 
 
 @app.post("/sessions")
-async def sessions_create_on_existing_sandbox(request: Request):
-    """Create agent + new session on an existing sandbox (no new container).
+async def sessions_create(request: Request):
+    """Create a new session bound to a volume (lazy sandbox provisioning).
 
-    Body requires ``sandbox_id``; other fields match ``POST /sessions/quick``.
-    Returns the same shape as ``/sessions/quick``.
+    Body requires ``volume_id``; no sandbox is provisioned at this point.
+    The sandbox will be provisioned lazily on first message (Task 13).
+    Returns {id, agent_id, volume_id, current_sandbox_id: null, connected: false}.
     """
     data = await request.json()
     # SECURITY: strip env/secrets before any merge, log, or DB write so they
     # can't leak into agents.config JSONB.
     body_env, body_secrets = _pop_env_and_secrets(data)
-    sandbox_id = data.get("sandbox_id")
-    if not sandbox_id or not isinstance(sandbox_id, str):
+
+    volume_id = data.get("volume_id")
+    if not volume_id or not isinstance(volume_id, str):
         return JSONResponse(
-            {"error": "sandbox_id is required"}, status_code=400
+            {"error": "volume_id is required"}, status_code=422
         )
 
-    sandbox_record = await get_sandbox(sandbox_id)
-    if sandbox_record is None:
-        return JSONResponse({"error": "sandbox not found"}, status_code=404)
+    volume_record = await get_volume(volume_id)
+    if volume_record is None:
+        return JSONResponse({"error": "volume not found"}, status_code=404)
 
+    agent_id = data.get("agent_id")
     agent_type = data.get("agent_type", "claude")
     name = data.get("name")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
     _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
     cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
-    dockerfile = _materialize_dockerfile(config_data)
 
-    agent_id = str(uuid.uuid4())
-    config = AgentConfig.from_dict(
-        {**config_data, "agent_type": agent_type, "cwd": cwd}
-    )
-    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
+    # If agent_id was provided, look it up; otherwise create a new agent.
+    if agent_id:
+        agent_record = await get_agent(agent_id)
+        if agent_record is None:
+            return JSONResponse({"error": "agent not found"}, status_code=404)
+    else:
+        agent_id = str(uuid.uuid4())
+        config = AgentConfig.from_dict(
+            {**config_data, "agent_type": agent_type, "cwd": cwd}
+        )
+        await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
 
     session_env = body_env or {}
     session_secrets = body_secrets or {}
-    spawn_env = _merge_env(config.env, session_env, session_secrets)
 
-    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    if skill_cmds and sandbox_record.provider == "local":
-        try:
-            await _install_skills_locally(config.skills)
-        except Exception as e:
-            log.error("skill install failed, continuing without skills: %s", e)
-
-    # For Daytona: start a per-session supervisor on a unique port
-    # For local/docker: use the existing shared supervisor
-    root = config_data.get("root", data.get("root", cwd))
-    supervisor_url = None
-    supervisor_port = None
-
-    if sandbox_record.provider == "daytona":
-        try:
-            # Get sandbox object to start supervisor inside it
-            from daytona_sdk import Daytona, DaytonaConfig
-            api_key = os.environ.get("DAYTONA_API_KEY")
-            if not api_key:
-                raise RuntimeError("DAYTONA_API_KEY not set")
-            loop = asyncio.get_running_loop()
-            daytona_client = Daytona(DaytonaConfig(api_key=api_key))
-            sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(sandbox_id))
-
-            # Ensure sandbox is running
-            raw_state = sandbox.state
-            state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
-            if state_str != "started":
-                await loop.run_in_executor(None, sandbox.start)
-
-            supervisor_port = allocate_sandbox_port(sandbox_id)
-            supervisor_url = await start_supervisor_in_sandbox(
-                sandbox, config.agent_type or "claude", supervisor_port, root=root,
-                spawn_env=spawn_env,
-            )
-            url = supervisor_url
-        except Exception as e:
-            await delete_agent(agent_id)
-            if supervisor_port is not None:
-                free_sandbox_port(sandbox_id, supervisor_port)
-            return JSONResponse({"error": f"Failed to start supervisor: {e}"}, status_code=502)
-    else:
-        try:
-            url, _replaced = await _ensure_sandbox_alive(
-                sandbox_id,
-                sandbox_record,
-                agent_type=config.agent_type or "claude",
-                dockerfile=dockerfile,
-                spawn_env=spawn_env,
-            )
-        except RuntimeError as e:
-            await delete_agent(agent_id)
-            return JSONResponse({"error": str(e)}, status_code=502)
-
-    acp_session_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
 
-    client = AcpClient(url)
-    try:
-        await _apply_config_and_initialize(
-            client,
-            config,
-            acp_session_id,
-            cwd,
-        )
-    except Exception as e:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        await delete_agent(agent_id)
-        if supervisor_port is not None:
-            free_sandbox_port(sandbox_id, supervisor_port)
-        return JSONResponse(
-            {"error": f"Failed to connect to ACP supervisor: {e}"}, status_code=502
-        )
-
-    inner_session_id = client.get_inner_session_id(acp_session_id)
-    state = SessionState(
-        session_id=session_id,
-        agent_id=agent_id,
-        sandbox_id=sandbox_id,
-        acp_session_id=acp_session_id,
-        inner_session_id=inner_session_id,
-        agent_type=config.agent_type or "claude",
-        client=client,
-        supervisor_url=supervisor_url,
-        supervisor_port=supervisor_port,
-    )
-    SESSIONS[session_id] = state
-    _start_session_tasks(state)
+    # Lazy mode: no sandbox provisioning here. current_sandbox_id = None.
     await upsert_session(
-        session_id, agent_id, sandbox_id, inner_session_id,
+        session_id, agent_id, sandbox_id=None, inner_session_id=None,
+        volume_id=volume_id,
         env=session_env, secrets=session_secrets,
     )
 
     return {
+        "id": session_id,
         "agent_id": agent_id,
-        "sandbox_id": sandbox_id,
-        "session_id": session_id,
-        "inner_session_id": inner_session_id,
-        "connected": True,
+        "volume_id": volume_id,
+        "current_sandbox_id": None,
+        "connected": False,
     }
 
 
@@ -2470,12 +2390,24 @@ async def sessions_create_on_existing_sandbox(request: Request):
 async def sessions_quick_create(request: Request):
     """Create agent + provision sandbox + connect in one call.
 
+    Body requires ``volume_id``.
     Returns {agent_id, sandbox_id, session_id, connected: true}.
     """
     data = await request.json()
     # SECURITY: strip env/secrets before any merge, log, or DB write so they
     # can't leak into agents.config JSONB.
     body_env, body_secrets = _pop_env_and_secrets(data)
+
+    volume_id = data.get("volume_id")
+    if not volume_id or not isinstance(volume_id, str):
+        return JSONResponse(
+            {"error": "volume_id is required"}, status_code=422
+        )
+
+    volume_record = await get_volume(volume_id)
+    if volume_record is None:
+        return JSONResponse({"error": "volume not found"}, status_code=404)
+
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
     name = data.get("name")
@@ -2543,6 +2475,8 @@ async def sessions_quick_create(request: Request):
             sandbox_ref=sandbox_ref,
             status=STATUS_RUNNING,
             root=root,
+            volume_id=volume_id,
+            subpath=f"agents/{agent_id}/home",
         )
     )
 
@@ -2590,6 +2524,7 @@ async def sessions_quick_create(request: Request):
     _start_session_tasks(state)
     await upsert_session(
         session_id, agent_id, sandbox_id, inner_session_id,
+        volume_id=volume_id,
         env=session_env, secrets=session_secrets,
     )
 
