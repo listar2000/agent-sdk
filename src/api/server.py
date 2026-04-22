@@ -2108,12 +2108,29 @@ async def _lazy_provision_sandbox_for_session(
     Uses the session's volume + agents/<agent_id>/home subpath. Persists the
     sandbox row and sets sessions.current_sandbox_id. Returns the SandboxRecord.
 
+    Serialized per-session so two concurrent callers don't both provision.
+
     If *previous_sandbox_id* is provided a ``sandbox_reattach`` event is written
     to session_log recording the old→new transition.
     """
+    async with _get_session_lock(session_id):
+        return await _lazy_provision_sandbox_for_session_locked(
+            session_id, previous_sandbox_id,
+        )
+
+
+async def _lazy_provision_sandbox_for_session_locked(
+    session_id: str,
+    previous_sandbox_id: str | None,
+) -> SandboxRecord:
     sess = await get_session(session_id)
     if sess is None:
         raise HTTPException(404, "Session not found")
+    # Someone else may have won the race and provisioned while we waited.
+    if sess.get("current_sandbox_id") and previous_sandbox_id is None:
+        existing = await get_sandbox(sess["current_sandbox_id"])
+        if existing is not None:
+            return existing
     vol_id = sess.get("volume_id")
     if vol_id is None:
         raise HTTPException(500, "Session has no volume_id")
