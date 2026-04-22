@@ -70,3 +70,21 @@ async def test_volume_crud_roundtrip():
         assert await dbmod.get_volume("vol_a") is None
     finally:
         await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_sessions_has_volume_id_and_current_sandbox_id():
+    await dbmod.init_pool()
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT column_name, is_nullable FROM information_schema.columns "
+                "WHERE table_name='sessions' AND column_name IN ('volume_id', 'current_sandbox_id', 'sandbox_id')"
+            )).fetchall()
+        cols = {r["column_name"]: r["is_nullable"] for r in rows}
+        assert "volume_id" in cols
+        assert "current_sandbox_id" in cols
+        assert "sandbox_id" not in cols, "old sandbox_id column should be renamed"
+        assert cols["current_sandbox_id"] == "YES", "current_sandbox_id must be nullable"
+    finally:
+        await dbmod.close_pool()

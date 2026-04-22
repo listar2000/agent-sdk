@@ -62,7 +62,9 @@ _PG_SCHEMA = [
         created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id)",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_sandbox ON sessions(sandbox_id)",
+    # Note: idx_sessions_sandbox was removed here; after the 2026-04-21 migration
+    # that renames sandbox_id -> current_sandbox_id, the index is managed in
+    # _MIGRATIONS as idx_sessions_current_sandbox.
     "CREATE INDEX IF NOT EXISTS idx_session_log_session ON session_log(session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_agent ON session_log(agent_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_volumes_name ON volumes(name)",
@@ -92,6 +94,30 @@ _MIGRATIONS = [
     # note in models.py. Phase 2 adds envelope encryption.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS env JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secrets JSONB NOT NULL DEFAULT '{}'::jsonb",
+    # 2026-04-21: decouple sessions from sandboxes; bind to volumes.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS volume_id TEXT REFERENCES volumes(id) ON DELETE RESTRICT",
+    # Rename sandbox_id -> current_sandbox_id (idempotent: no-op if already done).
+    """DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sessions' AND column_name='sandbox_id')
+           AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sessions' AND column_name='current_sandbox_id') THEN
+            ALTER TABLE sessions RENAME COLUMN sandbox_id TO current_sandbox_id;
+        END IF;
+    END $$""",
+    # Drop the old index (created by _PG_SCHEMA on sandbox_id) and recreate on
+    # current_sandbox_id. DROP IF EXISTS is safe if it was never created.
+    "DROP INDEX IF EXISTS idx_sessions_sandbox",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_current_sandbox ON sessions(current_sandbox_id)",
+    "ALTER TABLE sessions ALTER COLUMN current_sandbox_id DROP NOT NULL",
+    # Drop any CASCADE FK on current_sandbox_id, replace with SET NULL.
+    "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_sandbox_id_fkey",
+    "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_current_sandbox_id_fkey",
+    """ALTER TABLE sessions ADD CONSTRAINT sessions_current_sandbox_id_fkey
+        FOREIGN KEY (current_sandbox_id) REFERENCES sandboxes(id) ON DELETE SET NULL""",
+    # session_log no longer lifecycle-coupled to sandbox.
+    "ALTER TABLE session_log ALTER COLUMN sandbox_id DROP NOT NULL",
+    "ALTER TABLE session_log DROP CONSTRAINT IF EXISTS session_log_sandbox_id_fkey",
+    """ALTER TABLE session_log ADD CONSTRAINT session_log_sandbox_id_fkey
+        FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE SET NULL""",
 ]
 
 
