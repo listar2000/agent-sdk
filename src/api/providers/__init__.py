@@ -48,6 +48,7 @@ from ._shared import (
     _freed_ports,
     _sandbox_port_counters,
     _sandbox_freed_ports,
+    _safe_path,
 )
 
 # Re-export Daytona-specific symbols for server.py compatibility

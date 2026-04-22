@@ -90,6 +90,7 @@ from .providers import (
     provision_daytona_sandbox,
     stop_instance,
 )
+from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_secrets
 from .sse import (
     UT_COMMANDS_UPDATE,
@@ -1101,13 +1102,15 @@ class _VolumeEditBody(BaseModel):
 
 
 def _safe_path(p: str) -> str:
-    """Normalize a path: strip leading /, reject traversal and shell metacharacters."""
-    p = p.lstrip("/")
-    if ".." in p.split("/"):
-        raise HTTPException(400, "path traversal not allowed")
-    if any(c in p for c in "\x00\n\r"):
-        raise HTTPException(400, "invalid control characters in path")
-    return p
+    """Normalize a volume-relative path; HTTP 400 on any violation.
+
+    Thin adapter over :func:`api.providers._shared._safe_path` (which raises
+    ``ValueError``) so the HTTP layer surfaces a 400 with a readable message.
+    """
+    try:
+        return _shared_safe_path(None, p)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/volumes/{id_or_name}/files/tree")

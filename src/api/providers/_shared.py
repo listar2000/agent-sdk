@@ -7,6 +7,7 @@ everything from here, and daytona.py imports from here directly.
 
 import asyncio
 import logging
+import os
 import shlex
 import socket
 from dataclasses import dataclass
@@ -288,6 +289,40 @@ def _truncate(data: bytes, limit: int) -> tuple[str, bool]:
     if len(data) > limit:
         return data[:limit].decode(errors="replace"), True
     return data.decode(errors="replace"), False
+
+
+# ---------------------------------------------------------------------------
+# Path sanitizer (shared across server + providers)
+# ---------------------------------------------------------------------------
+
+def _safe_path(ref: str | None, rel_path: str) -> str:
+    """Normalize + validate a volume-relative path.
+
+    Strips a leading ``/`` so it never anchors to host root, rejects ``..``
+    traversal and NUL/CR/LF control chars. If ``ref`` is provided (local
+    provider), realpath-validates that the resolved target stays inside
+    ``ref`` — catches symlink escapes.
+
+    Returns the normalized relative path (no leading slash). Raises
+    ``ValueError`` on any violation; callers that need HTTP semantics should
+    translate to 400.
+    """
+    p = (rel_path or "").lstrip("/")
+    if "\x00" in p or "\n" in p or "\r" in p:
+        raise ValueError("invalid control characters in path")
+    parts = [seg for seg in p.split("/") if seg not in ("", ".")]
+    for seg in parts:
+        if seg == "..":
+            # Unified message: traversal and realpath-escape both report as
+            # "escapes volume root" so callers/tests can match one phrase.
+            raise ValueError("path escapes volume root")
+    normalized = "/".join(parts)
+    if ref is not None and normalized:
+        candidate = os.path.realpath(os.path.join(ref, normalized))
+        root_real = os.path.realpath(ref)
+        if candidate != root_real and not candidate.startswith(root_real + os.sep):
+            raise ValueError("path escapes volume root")
+    return normalized
 
 
 async def _exec_subprocess(proc, timeout: int) -> ExecResult:

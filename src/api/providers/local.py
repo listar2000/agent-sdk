@@ -27,6 +27,7 @@ from ._shared import (
     _get_sandbox_env_vars,
     _port_lock,
     _freed_ports,
+    _safe_path,
     _wait_for_health,
 )
 
@@ -60,18 +61,13 @@ _PROCESSES_LOCK = asyncio.Lock()
 def _safe_join(ref: str, path: str) -> str:
     """Return the realpath of ``<ref>/<path>``, enforcing containment.
 
-    Raises ``ValueError`` if the resolved path escapes ``ref`` via symlinks
-    or ``..`` segments. Required on Local because the server process has
-    full host FS access — unlike Daytona/Docker where the shell runs inside
-    a container scoped to the volume mount.
+    Thin wrapper over :func:`api.providers._shared._safe_path` that also
+    returns the resolved absolute path (callers here need it to open the
+    file). The shared helper already handles traversal, control-char and
+    realpath-escape checks.
     """
-    # Strip any leading slash so os.path.join doesn't reset to root.
-    cleaned = (path or "").lstrip("/")
-    candidate = os.path.realpath(os.path.join(ref, cleaned))
-    root_real = os.path.realpath(ref)
-    if candidate != root_real and not candidate.startswith(root_real + os.sep):
-        raise ValueError("path escapes volume root")
-    return candidate
+    rel = _safe_path(ref, path or "")
+    return os.path.realpath(os.path.join(ref, rel)) if rel else os.path.realpath(ref)
 
 
 # ---------------------------------------------------------------------------

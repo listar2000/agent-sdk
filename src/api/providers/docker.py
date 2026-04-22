@@ -30,6 +30,7 @@ from ._shared import (
     _port_lock,
     _freed_ports,
     _recycle_port,
+    _safe_path,
     _wait_for_health,
 )
 
@@ -543,17 +544,11 @@ async def reconcile_on_startup() -> None:
 def _safe_rel(path: str) -> str:
     """Normalize + validate a path relative to the volume root.
 
-    Strip leading slashes, reject traversal components and control chars.
-    Returns a path that can safely follow ``/v/`` inside the utility container.
+    Thin wrapper over :func:`api.providers._shared._safe_path` — no realpath
+    check here because the shell runs inside an alpine container that only
+    sees ``/v`` of the volume; traversal / control-char rejection is enough.
     """
-    p = (path or "").lstrip("/")
-    if "\x00" in p or "\n" in p or "\r" in p:
-        raise ValueError("path contains control characters")
-    parts = [seg for seg in p.split("/") if seg not in ("", ".")]
-    for seg in parts:
-        if seg == "..":
-            raise ValueError("path escapes volume root")
-    return "/".join(parts)
+    return _safe_path(None, path)
 
 
 async def _run_volume_shell(

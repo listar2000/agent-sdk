@@ -21,6 +21,7 @@ from ._shared import (
     _ACP_NPM_SPECS,
     _build_env_prefix,
     _get_sandbox_env_vars,
+    _safe_path,
     _wait_for_health,
     ProviderInstance,
     _build_volume_mounts,
@@ -827,9 +828,7 @@ async def volume_tree(ref: str, path: str) -> str:
     Spins a utility sandbox with the whole volume at /v, lists files.
     Paths are relative to the volume root (e.g. ``"shared"``, ``""`` for all).
     """
-    rel = (path or "").lstrip("/")
-    if ".." in rel.split("/") or any(c in rel for c in "\x00\n\r"):
-        raise ValueError("invalid path")
+    rel = _safe_path(None, path or "")
     target = "/v/" + rel if rel else "/v"
     res = await _run_in_utility_sandbox(
         ref, f"find {shlex.quote(target)} -maxdepth 3 -printf '%y %p\\n' 2>/dev/null"
@@ -839,9 +838,9 @@ async def volume_tree(ref: str, path: str) -> str:
 
 async def volume_read(ref: str, path: str) -> bytes:
     """Read ``<volume>/<path>`` bytes via a short-lived utility sandbox."""
-    rel = (path or "").lstrip("/")
-    if not rel or ".." in rel.split("/") or any(c in rel for c in "\x00\n\r"):
-        raise ValueError("invalid path")
+    rel = _safe_path(None, path or "")
+    if not rel:
+        raise ValueError("volume_read: path required")
     target = "/v/" + rel
     # base64 so binary survives the exec response.
     res = await _run_in_utility_sandbox(
@@ -862,9 +861,9 @@ async def volume_read(ref: str, path: str) -> bytes:
 
 async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write ``content`` to ``<volume>/<path>`` via a short-lived utility sandbox."""
-    rel = (path or "").lstrip("/")
-    if not rel or ".." in rel.split("/") or any(c in rel for c in "\x00\n\r"):
-        raise ValueError("invalid path")
+    rel = _safe_path(None, path or "")
+    if not rel:
+        raise ValueError("volume_write: path required")
     target = "/v/" + rel
     parent = "/v/" + "/".join(rel.split("/")[:-1])
     import base64 as _b64
