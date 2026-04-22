@@ -114,7 +114,8 @@ def _configure_logging() -> None:
     """Set up logging. Called once at server startup, not on import."""
     level = os.environ.get("LOG_LEVEL", "INFO")
     logging.basicConfig(
-        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
     logging.getLogger("api").setLevel(level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -192,11 +193,13 @@ async def _shutdown_session_state(
     *,
     remove: bool,
     mark_idle_at: float | None = None,
+    force: bool = False,
 ) -> None:
     """Close a runtime session and optionally remove it from the active registry."""
     state.shutdown.set()
     # Re-check: new work may have arrived between the caller's idle check and here.
-    if (
+    # Skip this guard when force=True (e.g. ensure_runtime rebuilding a dead supervisor).
+    if not force and (
         state.active_rpc_id is not None
         or state.pending_prompts
         or state._session_subscribers
@@ -368,6 +371,20 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Agent Orchestration API", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def _log_unhandled(request: Request, exc: Exception):
+    from fastapi.responses import JSONResponse
+    from fastapi.exception_handlers import http_exception_handler
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    if isinstance(exc, StarletteHTTPException):
+        if exc.status_code >= 500:
+            log.error("HTTP %s %s → %s: %s", request.method, request.url.path, exc.status_code, exc.detail)
+        return await http_exception_handler(request, exc)
+    log.error("Unhandled exception in %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse({"error": str(exc)}, status_code=500)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -661,6 +678,51 @@ def _start_sse_reader(state: SessionState) -> None:
                     await asyncio.sleep(reconnect_delay_s)
                     reconnect_delay_s = min(reconnect_delay_s * 2, 10.0)
                     continue
+
+                # Retries exhausted — try to recover the sandbox before giving up.
+                if not state.shutdown.is_set():
+                    try:
+                        sandbox_record = await get_sandbox(state.sandbox_id)
+                        if sandbox_record is not None:
+                            log.info(
+                                "[SSE-READER] retries exhausted for session %s; attempting sandbox recovery",
+                                state.session_id,
+                            )
+                            spawn_env = await _spawn_env_for_sandbox(state.sandbox_id)
+                            new_url, _ = await _ensure_sandbox_alive(
+                                state.sandbox_id, sandbox_record,
+                                agent_type=state.agent_type, spawn_env=spawn_env,
+                            )
+                            new_acp_session_id = str(uuid.uuid4())
+                            new_client = AcpClient(new_url)
+                            agent_record = await get_agent(state.agent_id)
+                            if agent_record is not None:
+                                await _apply_config_and_initialize(
+                                    new_client, agent_record.config,
+                                    new_acp_session_id, sandbox_record.root or "/tmp",
+                                )
+                            new_inner_sid = new_client.get_inner_session_id(new_acp_session_id)
+                            old_client = state.client
+                            state.client = new_client
+                            state.supervisor_url = new_url
+                            state.acp_session_id = new_acp_session_id
+                            state.inner_session_id = new_inner_sid
+                            try:
+                                await old_client.aclose()
+                            except Exception:
+                                pass
+                            log.info(
+                                "[SSE-READER] sandbox recovered for session %s; new acp_session=%s",
+                                state.session_id, new_acp_session_id,
+                            )
+                            attempt = 0
+                            reconnect_delay_s = 1.0
+                            continue
+                    except Exception as recovery_err:
+                        log.error(
+                            "[SSE-READER] sandbox recovery failed for session %s: %s",
+                            state.session_id, recovery_err, exc_info=True,
+                        )
 
                 log.warning(
                     "[SSE-READER] unrecoverable upstream disconnect for session %s (%s) "
@@ -1049,6 +1111,7 @@ async def _resolve_or_default_volume(
     except HTTPException:
         raise
     except Exception as e:
+        log.error("_resolve_or_default_volume failed (provider=%s): %s", default_provider, e, exc_info=True)
         raise HTTPException(502, f"default volume provision failed: {e}")
 
 
@@ -2292,7 +2355,7 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
                     return existing
             except Exception:
                 pass
-        await _shutdown_session_state(existing, remove=True)
+        await _shutdown_session_state(existing, remove=True, force=True)
 
     # Build fresh.
     agent_id = session_row["agent_id"]
@@ -2363,14 +2426,20 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     mcp = agent_record.config.mcp_servers if agent_record.config else None
 
     if inner_sid:
-        # Reconnect to existing conversation on disk.
-        await client.handshake(acp_session_id, agent_type)
-        await client._send_rpc(acp_session_id, "session/load", {
-            "sessionId": inner_sid, "cwd": cwd,
-            "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
-        })
-        client.set_inner_session_id(acp_session_id, inner_sid)
-    else:
+        try:
+            await client.handshake(acp_session_id, agent_type)
+            await client._send_rpc(acp_session_id, "session/load", {
+                "sessionId": inner_sid, "cwd": cwd,
+                "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
+            })
+            client.set_inner_session_id(acp_session_id, inner_sid)
+        except Exception as load_err:
+            log.warning(
+                "session/load failed for session %s (inner_sid=%s): %s; falling back to fresh session",
+                session_id, inner_sid, load_err,
+            )
+            inner_sid = None
+    if not inner_sid:
         # Fresh conversation — wrap in wait_for with generous timeout.
         await asyncio.wait_for(
             _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd),
@@ -2645,6 +2714,7 @@ async def sessions_quick_create(request: Request):
         await ensure_volume_supervisor(volume_id, agent_type)
     except Exception as e:
         await delete_agent(agent_id)
+        log.error("sessions_quick_create: ensure_volume_supervisor failed: %s", e, exc_info=True)
         raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
 
     try:
@@ -2657,6 +2727,7 @@ async def sessions_quick_create(request: Request):
         )
     except Exception as e:
         await delete_agent(agent_id)
+        log.error("sessions_quick_create: create_instance failed (provider=%s): %s", provider, e, exc_info=True)
         # 503 + Retry-After tells callers to back off on circuit-breaker trips.
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
@@ -3265,3 +3336,9 @@ async def serve_dashboard():
 async def serve_files_ui():
     """Serve the filesystem browser UI."""
     return _serve_ui_file("fs.html", "Files UI")
+
+
+@app.get("/ui/volumes")
+async def serve_volumes_ui():
+    """Serve the Volume Inspector UI."""
+    return _serve_ui_file("volumes.html", "Volumes UI")
