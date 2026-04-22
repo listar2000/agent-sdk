@@ -10,15 +10,17 @@ Today, `agent-sdk` binds a session to a sandbox: `sessions.sandbox_id → sandbo
 We want to:
 
 1. Treat sandboxes as ephemeral compute. A sandbox can die or be swapped without losing the session.
-2. Introduce a first-class `Volume` as durable storage. The session's home directory and all CLI state live on the volume.
-3. Scope volumes to a user-defined "sub-project". Multiple sessions/agents working on the same sub-project share a volume; each gets its own subpath so their HOMEs don't collide.
+2. Introduce a first-class `Volume` as durable storage. The agent's home directory and all CLI state live on the volume.
+3. Scope volumes to a user-defined "sub-project". Multiple agents working on the same sub-project share a volume; each agent gets its own HOME subpath. Multiple sessions of the same agent share that agent's HOME and use Claude Code's own per-session transcript naming for isolation.
 
 ## Goals
 
 - A session survives sandbox replacement. Its conversation continues where it left off.
 - Users explicitly create/list/delete volumes; sessions opt into one by `volume_id` at creation.
-- Concurrent sessions on the same volume run in parallel, each in an isolated HOME subpath.
-- A shared read-only area exists on each volume for cross-session data sharing.
+- Concurrent sessions *of different agents* on the same volume run in parallel, each in its own agent HOME subpath.
+- Concurrent sessions *of the same agent* on the same volume share one HOME — acceptable because Claude Code's per-session transcript naming gives per-conversation isolation, and cross-cutting files (`.claude.json`, statsig cache) rarely collide in practice.
+- A shared read-only area exists on each volume for cross-agent data sharing.
+- Sandboxes are public resources, always created with `(volume_id, subpath)`. No volumeless sandboxes, no full-volume mounts.
 - Supported on Daytona first, then Docker, then local.
 
 ## Non-goals
@@ -33,31 +35,37 @@ We want to:
 
 | | |
 |---|---|
-| **Volume** | User-scoped, persistent storage. Backed by a provider-native volume (Daytona volume, Docker named volume, host dir). Owns a namespace of per-session HOME subpaths + one shared area. |
-| **Session** | Durable logical conversation. Anchored to exactly one volume. Has a stable id used as its subpath on the volume. |
-| **Sandbox** | Ephemeral compute lease for a single session. Created lazily on first run; can be killed and replaced without touching session or volume state. |
+| **Volume** | User-scoped, persistent storage. Backed by a provider-native volume (Daytona volume, Docker named volume, host dir). Owns a namespace of per-agent HOME subpaths + one shared area. |
+| **Session** | Durable logical conversation. Anchored to one volume (via its agent's volume_id) and one agent. Stable id; its transcripts live inside its agent's HOME. |
+| **Sandbox** | Ephemeral compute. Created with a `(volume_id, subpath)` mount at creation time. Usually provisioned lazily when a session runs, with `subpath=agents/<agent_id>/home`. Can also be created standalone via the public API. Can be killed and replaced without touching session or volume state. |
 
 ### Relationships
 
 - `Session → Volume`: required, immutable, `ON DELETE RESTRICT` (cannot delete a volume with live sessions except via `force=True`).
+- `Session → Agent`: required, immutable (existing).
 - `Session → current Sandbox`: nullable, swappable, `ON DELETE SET NULL` (sandbox row can disappear without killing the session).
-- `Sandbox → Session`: every sandbox belongs to exactly one session (invariant, not a DB FK).
-- `Sandbox → Volume`: inherited from its session at creation time. Not stored separately.
+- `Sandbox → Volume`: required at sandbox creation, stored on the sandbox row (via `volume_id` + `subpath` columns). A sandbox mounts exactly one "home" subpath of one volume (plus the implicit `shared` read-only mount on the same volume).
+- `Sandbox → Session`: no hard FK. In practice a sandbox is provisioned for a session's agent; if `subpath = agents/<agent_id>/home`, the sandbox is bound to any session of that agent on that volume.
 
 ### Filesystem layout on a volume
 
 ```
 <volume>/
-├── sessions/
-│   ├── <session-id-1>/
-│   │   └── home/           ← mounted writable at /home/daytona
-│   │       ├── .claude/    ← OAuth, projects/, transcripts, todos
-│   │       ├── .claude.json
-│   │       └── workspace/  ← session cwd
-│   └── <session-id-2>/
+├── agents/
+│   ├── <agent-id-1>/
+│   │   └── home/                        ← mounted writable at /home/daytona for all sessions of agent-1
+│   │       ├── .claude.json             ← OAuth — shared across this agent's sessions
+│   │       ├── .claude/
+│   │       │   ├── projects/<cwd>/
+│   │       │   │   ├── <inner-sess-A>.jsonl   ← per-session transcript (Claude CLI
+│   │       │   │   ├── <inner-sess-B>.jsonl      names these by its own id)
+│   │       │   │   └── ...
+│   │       │   └── statsig/
+│   │       └── workspace/               ← agent's cwd
+│   └── <agent-id-2>/
 │       └── home/
 │           └── ...
-└── shared/                 ← mounted read-only at /mnt/shared in every sandbox on this volume
+└── shared/                              ← mounted read-only at /mnt/shared in every sandbox on this volume
 ```
 
 ### Per-sandbox mounts
@@ -68,11 +76,11 @@ Every sandbox on a volume mounts the volume twice:
 volumes=[
     VolumeMount(volume_id=v.provider_ref,
                 mount_path="/home/daytona",
-                subpath=f"sessions/{session.id}/home"),       # writable, private
+                subpath=f"agents/{session.agent_id}/home"),    # writable, per-agent
     VolumeMount(volume_id=v.provider_ref,
                 mount_path="/mnt/shared",
                 subpath="shared",
-                read_only=True),                               # read-only, cross-session
+                read_only=True),                               # read-only, cross-agent
 ]
 ```
 
@@ -103,6 +111,16 @@ ALTER TABLE sessions ADD CONSTRAINT sessions_current_sandbox_id_fkey
     FOREIGN KEY (current_sandbox_id) REFERENCES sandboxes(id) ON DELETE SET NULL;
 ```
 
+Sandboxes changes (volume-aware):
+
+```sql
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS volume_id TEXT REFERENCES volumes(id) ON DELETE RESTRICT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS subpath  TEXT;
+-- After backfill (see below), enforce required:
+ALTER TABLE sandboxes ALTER COLUMN volume_id SET NOT NULL;
+ALTER TABLE sandboxes ALTER COLUMN subpath   SET NOT NULL;
+```
+
 `session_log.sandbox_id`: allow NULL, drop CASCADE (keep for audit, no longer lifecycle-coupled).
 
 Backfill on first startup after migration: create a default "legacy" volume per provider actively in use (based on existing sandbox rows' providers), point all existing sessions without a `volume_id` at the matching legacy volume. Existing `current_sandbox_id` values stay valid until the sandbox dies, at which point the session rejoins the new world via the reprovision path.
@@ -119,25 +137,39 @@ This must run after backfill; it lives at the bottom of `_MIGRATIONS` below the 
 
 ### Volumes (new, explicit CRUD)
 
-SDK:
+SDK (shape parallels `client.sandboxes.*`):
 
 ```python
 client.volumes.create(name: str, provider: str) -> Volume
+client.volumes.provision(name: str, provider: str) -> Volume        # blocks until status == "ready"
 client.volumes.get(id_or_name: str) -> Volume
 client.volumes.list(provider: str | None = None) -> list[Volume]
 client.volumes.delete(id_or_name: str, force: bool = False) -> None
+
+# File ops — mirror client.sandboxes.files.*
+client.volumes.files.tree(id_or_name: str, path: str = "/") -> Tree
+client.volumes.files.read(id_or_name: str, path: str) -> bytes
+client.volumes.files.edit(id_or_name: str, path: str, content: bytes) -> None
 ```
 
-HTTP:
+HTTP (deliberately parallel to `/sandboxes`):
 
 ```
-POST   /volumes                  {name, provider}
-GET    /volumes/{id_or_name}
-GET    /volumes
-DELETE /volumes/{id_or_name}?force=false
+POST   /volumes                       # create — body: {name, provider}
+POST   /volumes/provision             # create + wait for provider "ready" — mirrors /sandboxes/provision
+GET    /volumes                       # list — all volumes (filter: ?provider=daytona)
+GET    /volumes/{id_or_name}          # inspect — id, name, provider, provider_ref, status, created_at
+DELETE /volumes/{id_or_name}?force=false    # delete — errors if sessions reference it, force=true cascades
+GET    /volumes/{id_or_name}/files/tree?path=shared/
+GET    /volumes/{id_or_name}/files/read?path=shared/datasets/foo.csv
+POST   /volumes/{id_or_name}/files/edit     # body: {path, content} — write to any subpath (useful for seeding shared/)
 ```
 
-`delete` errors if any session references the volume; `force=True` cascades to delete those sessions' subpaths and the sessions themselves.
+Volume file-ops mirror the sandbox file-ops (`/sandboxes/{id}/files/{tree,read,edit}`). They let callers browse and populate a volume directly — critical for seeding the `shared/` area without spinning up a sandbox, and useful for debugging an agent's HOME contents.
+
+Implementation note: the file-ops endpoints are backed by a tiny internal sandbox the server spins up on demand (or a pooled "volume-ops" sandbox), since the only way to access a Daytona volume's content is from inside a sandbox that has it mounted. This is an implementation detail; to callers, it's just a REST endpoint on the volume.
+
+`DELETE` returns 409 if any session references the volume; `?force=true` cascades to those sessions (see "Volume deletion" below).
 
 ### Sessions (modified)
 
@@ -152,7 +184,7 @@ async for ev in sess.run(prompt):
 
 await sess.reset_sandbox()   # kill current AND immediately provision a new one (eager)
 await sess.stop_sandbox()    # kill current; no new sandbox until next run() call (lazy)
-await sess.delete()          # tears down sandbox + removes sessions/<sid>/ on volume
+await sess.delete()          # tears down sandbox + deletes session row; HOME on volume is shared per-agent, so not removed
 ```
 
 HTTP:
@@ -161,15 +193,22 @@ HTTP:
 - `sandbox_id` on session responses is renamed to `current_sandbox_id` and can be null between runs.
 - New: `POST /sessions/{id}/start-sandbox` (pre-warm), `POST /sessions/{id}/reset-sandbox` (kill + provision new), `POST /sessions/{id}/stop-sandbox` (kill).
 
-### Sandboxes (kept public, read + delete + pre-warm-via-session)
+### Sandboxes (public, volume-aware)
 
 ```
-GET    /sandboxes                 # list — current active leases
-GET    /sandboxes/{id}            # inspect — status, session_id, provider, created_at
-DELETE /sandboxes/{id}            # kill — session survives with current_sandbox_id=NULL
+POST   /sandboxes                 # create — body requires {provider, volume_id, subpath, ...compute params}
+GET    /sandboxes                 # list
+GET    /sandboxes/{id}            # inspect — status, provider, volume_id, subpath, created_at
+DELETE /sandboxes/{id}            # kill — any session pointing at it has current_sandbox_id set to NULL
+POST   /sandboxes/{id}/stop       # existing — stop the underlying provider compute
+POST   /sandboxes/{id}/start      # existing — start a stopped sandbox
 ```
 
-No `POST /sandboxes`. Creation is always session-scoped (lazy on first run, or explicit via `POST /sessions/{id}/start-sandbox`). This preserves the invariant that every sandbox has exactly one owning session, which is what lets the volume mount path be unambiguous.
+Existing file-ops endpoints (`/sandboxes/{id}/files/tree|read|edit`) keep working unchanged; they operate on whatever the sandbox sees, which under the new rules is always `/home/daytona` = `<vol>/agents/<agent_id>/home` (or whatever subpath the caller specified).
+
+**Rule of thumb:** every sandbox is always `(volume_id, subpath)`-scoped at creation. No volumeless sandboxes, no full-volume mounts. Every sandbox also gets the implicit `/mnt/shared` read-only mount at subpath `"shared"` on the same volume.
+
+Existing `POST /sandboxes/provision` (create + wait) stays, with the same new required fields.
 
 ## Lifecycle
 
@@ -194,10 +233,10 @@ sess = await client.sessions.create(agent_id="worker", volume_id=vol.id)
 
 1. Acquire `pg_try_advisory_lock(hash(session.id))`.
 2. Probe `current_sandbox_id` (NULL -> skip).
-3. Call `provider.create_sandbox(volumes=[...home subpath..., ...shared ro...])`.
-4. Upsert `sandboxes` row. Set `sessions.current_sandbox_id`.
+3. Call `provider.create_sandbox(volume_id=session.volume_id, subpath=f"agents/{session.agent_id}/home", ...)`. The provider adds the implicit shared-ro mount internally.
+4. Upsert `sandboxes` row with `volume_id` + `subpath` columns. Set `sessions.current_sandbox_id`.
 5. Ensure `~/workspace` exists inside the sandbox, `cd ~/workspace`.
-6. Launch ACP agent (claude / codex / opencode) with `HOME=/home/daytona`. No `--resume` since first run.
+6. Launch ACP agent (claude / codex / opencode) with `HOME=/home/daytona`. No `--resume` since first run (or `--resume` from `sessions.inner_session_id` if this is a resumed session whose transcript is already on the volume).
 7. Capture CLI-reported inner session id, store in `sessions.inner_session_id`.
 8. Stream events.
 
@@ -215,7 +254,7 @@ probe provider.get_sandbox(current_sandbox_id):
 └─ error               → destroy + go to "first run" path
 ```
 
-The new sandbox gets the same `sessions/<session.id>/home` subpath, so the HOME content is identical to what the old sandbox had. CLI is re-launched with `--resume <inner_session_id>`.
+The new sandbox gets the same `agents/<session.agent_id>/home` subpath, so the HOME content (including the session's transcript file at `~/.claude/projects/<cwd>/<inner_session_id>.jsonl`) is identical to what the old sandbox had. CLI is re-launched with `--resume <inner_session_id>`.
 
 ### During-run sandbox loss
 
@@ -229,22 +268,35 @@ On any pre-run reprovision, emit `{"type": "sandbox_reattach", "old_sandbox_id":
 
 `RESTRICT` by default. `force=True` path:
 
-1. List sessions where `volume_id = X`.
-2. For each: kill current sandbox, remove `sessions/<id>/home/` from the volume (optional; volume is about to be deleted), delete session row.
+1. List sandboxes where `volume_id = X`, delete each (kills compute).
+2. List sessions where `volume_id = X`, delete each row.
 3. Delete provider volume.
-4. Delete row.
+4. Delete `volumes` row.
 
 ### Session deletion
 
-1. Kill current sandbox if any (via provider).
-2. Remove `sessions/<id>/home/` subpath from the volume (best effort).
+HOME is per-agent, not per-session, so session deletion does NOT remove the HOME subpath from the volume. Other sessions of the same agent may still use it.
+
+1. If `current_sandbox_id` is set: kill the sandbox (the sandbox is per-agent-HOME, not per-session — so we only kill it if no other sessions of the same agent are likely to reuse it; simplest behavior: always kill on session delete, next session reprovisions).
+2. Best-effort: delete the session's transcript file at `~/.claude/projects/<cwd>/<inner_session_id>.jsonl` by execing into a sandbox, OR defer cleanup (transcripts are small; leaving them is harmless).
 3. Delete session row.
+
+### Agent deletion
+
+Extended semantic: deleting an agent removes its HOME on every volume.
+
+1. Block if any session of this agent exists (standard FK), OR cascade-delete those sessions.
+2. For each volume referenced by this agent's sessions: exec a cleanup step that removes `agents/<agent_id>/` from the volume.
+3. Delete agent row.
+
+(This is a new responsibility for the existing agent-delete path; previously there was no cross-volume state to clean up.)
 
 ## Concurrency
 
 - **Per-session run lock:** Postgres advisory lock keyed on `hash(session.id)`. Prevents two concurrent `run()` calls on the same session from both provisioning a sandbox.
-- **Cross-session on same volume:** allowed. Each session has a distinct `sessions/<id>/home` subpath, so writes don't collide. Reads from `/mnt/shared/` are concurrent-safe (read-only).
-- **Shared-area writes:** out-of-band for now. If a session needs to write to `shared/`, we either add a dedicated write endpoint later or accept that users do it via direct volume access.
+- **Cross-agent on same volume:** fully isolated — each agent has a distinct `agents/<agent_id>/home` subpath.
+- **Same agent, different sessions, same volume:** share HOME. Accepted — Claude Code's per-session transcript filenames handle per-conversation isolation, and shared-file collisions (`.claude.json`, statsig cache) are rare and typically benign. No extra locking.
+- **Shared-area writes:** out-of-band for now. If an agent needs to write to `shared/`, add a dedicated write endpoint later or do it via direct volume access.
 
 ## Provider adapters
 
@@ -252,14 +304,14 @@ On any pre-run reprovision, emit `{"type": "sandbox_reattach", "old_sandbox_id":
 
 - `create_volume(name)` -> `daytona.volume.create(name).id`
 - `delete_volume(ref)` -> `daytona.volume.delete(ref)`
-- `create_sandbox(session_id, volume_ref)` -> `daytona.create(CreateSandboxFromSnapshotParams(..., volumes=[VolumeMount(volume_id=volume_ref, mount_path="/home/daytona", subpath=f"sessions/{session_id}/home"), VolumeMount(volume_id=volume_ref, mount_path="/mnt/shared", subpath="shared", read_only=True)]))`
+- `create_sandbox(volume_ref, subpath)` -> `daytona.create(CreateSandboxFromSnapshotParams(..., volumes=[VolumeMount(volume_id=volume_ref, mount_path="/home/daytona", subpath=subpath), VolumeMount(volume_id=volume_ref, mount_path="/mnt/shared", subpath="shared", read_only=True)]))`
 - `start_sandbox(ref)`, `stop_sandbox(ref)`, `delete_sandbox(ref)`, `get_sandbox(ref)` as today.
 
 ### Docker (phase 2)
 
 - `create_volume(name)` -> `docker volume create <name>`
 - `delete_volume(ref)` -> `docker volume rm <ref>`
-- `create_sandbox(...)` -> `docker run --mount type=volume,src=<ref>,dst=/home/daytona,volume-subpath=sessions/<sid>/home --mount type=volume,src=<ref>,dst=/mnt/shared,volume-subpath=shared,readonly ...`
+- `create_sandbox(volume_ref, subpath)` -> `docker run --mount type=volume,src=<ref>,dst=/home/daytona,volume-subpath=<subpath> --mount type=volume,src=<ref>,dst=/mnt/shared,volume-subpath=shared,readonly ...`
 
 Short `-v` form is not used — it doesn't support `volume-subpath`.
 
@@ -267,7 +319,7 @@ Short `-v` form is not used — it doesn't support `volume-subpath`.
 
 - `create_volume(name)` -> `mkdir -p ~/.agent-sdk/volumes/<name>`
 - `delete_volume(ref)` -> `rm -rf ~/.agent-sdk/volumes/<ref>`
-- `create_sandbox(...)` -> fork a process with `HOME=<vol>/sessions/<sid>/home` and `AGENT_SHARED_DIR=<vol>/shared` env vars. No mount namespace — soft isolation only. Acceptable for dev-only local path.
+- `create_sandbox(volume_ref, subpath)` -> fork a process with `HOME=<vol>/<subpath>` and `AGENT_SHARED_DIR=<vol>/shared` env vars. For session-driven creation, `subpath = agents/<agent_id>/home`. No mount namespace — soft isolation only. Acceptable for dev-only local path.
 
 ## Rollout
 
