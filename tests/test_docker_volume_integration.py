@@ -373,3 +373,520 @@ async def test_install_supervisor_populates_system_supervisor():
         )
     finally:
         await dprov.delete_volume(name)
+
+
+# ---------------------------------------------------------------------------
+# MT1 — Docker ``agent-sdk.sandbox-id`` label propagation
+#
+# Every code path that can spin up a Docker container must set the
+# ``agent-sdk.sandbox-id=<id>`` label so ``reconcile_on_startup`` can match
+# live containers against DB rows after a restart.  Four distinct entry
+# points reach ``docker.create_sandbox``:
+#
+#   1. ``_provision_new``                → regression guard (already sets it)
+#   2. ``POST /sandboxes``               → MA1 fix: thread sandbox_id through
+#   3. ``POST /sessions/quick``          → MA1 fix
+#   4. ``_ensure_sandbox_alive`` restart → MA1 fix
+#
+# Each test seeds the minimum DB state, hits the entrypoint end-to-end
+# against a real Docker daemon, then runs ``docker inspect`` to read the
+# label back and asserts the expected sandbox_id is there.
+# ---------------------------------------------------------------------------
+
+_LABEL_KEY = "agent-sdk.sandbox-id"
+
+
+def _inspect_label(container_id: str) -> str:
+    """Return ``<label>`` from ``docker inspect``. Empty string if missing."""
+    proc = subprocess.run(
+        [
+            "docker", "inspect",
+            "--format", f'{{{{index .Config.Labels "{_LABEL_KEY}"}}}}',
+            container_id,
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+async def _seed_volume_with_fake_supervisor() -> str:
+    """Create a Docker volume + fake-supervisor payload so sandbox create
+    doesn't need a real npm install.  Caller is responsible for deletion."""
+    name = _vol_name()
+    await dprov.create_volume(name)
+    await _seed_fake_supervisor(name)
+    return name
+
+
+@pytest.mark.asyncio
+async def test_label_propagation_provider_create_sandbox():
+    """Regression guard for MT1 path 1 — ``docker.create_sandbox`` with an
+    explicit ``sandbox_id`` must attach the label."""
+    name = await _seed_volume_with_fake_supervisor()
+    inst: ProviderInstance | None = None
+    try:
+        sb_id = f"sb_{uuid.uuid4().hex[:10]}"
+        inst = await dprov.create_sandbox(
+            volume_ref=name, subpath="agents/label-probe/home",
+            agent_type="claude", sandbox_id=sb_id,
+        )
+        assert inst.container_id
+        assert _inspect_label(inst.container_id) == sb_id, (
+            f"_provision_new path: expected label {sb_id!r}, "
+            f"got {_inspect_label(inst.container_id)!r}"
+        )
+    finally:
+        if inst is not None:
+            try:
+                await dprov.destroy_sandbox(inst)
+            except Exception:
+                pass
+        await dprov.delete_volume(name)
+
+
+@pytest.mark.asyncio
+async def test_label_propagation_post_sandboxes_endpoint():
+    """MT1 path 2 — ``POST /sandboxes`` must pass ``sandbox_id`` through to
+    the provider so the container carries the label."""
+    import pytest_asyncio  # noqa: F401 — used via fixture dependency
+    from httpx import ASGITransport, AsyncClient
+
+    _DB = os.environ.get("TEST_DATABASE_URL")
+    if _DB is None:
+        pytest.skip("TEST_DATABASE_URL not set")
+    os.environ["DATABASE_URL"] = _DB
+
+    from api import db as dbmod, server as srv  # noqa: E402
+    from api.models import VolumeRecord  # noqa: E402
+
+    dbmod.init_db()
+    await dbmod.init_pool()
+    async with dbmod.get_db() as conn:
+        await conn.execute("DELETE FROM session_log")
+        await conn.execute("DELETE FROM sessions")
+        await conn.execute("DELETE FROM sandboxes")
+        await conn.execute("DELETE FROM volumes")
+        await conn.execute("DELETE FROM agents")
+
+    vol_name = _vol_name()
+    try:
+        await dprov.create_volume(vol_name)
+        await _seed_fake_supervisor(vol_name)
+        await dbmod.upsert_volume(
+            VolumeRecord(id="v-lbl-1", name=vol_name, provider="docker",
+                         provider_ref=vol_name),
+        )
+
+        transport = ASGITransport(app=srv.app)
+        sandbox_id: str | None = None
+        container_id: str | None = None
+        try:
+            async with AsyncClient(transport=transport, base_url="http://test") as c:
+                r = await c.post("/sandboxes", json={
+                    "provider": "docker",
+                    "volume_id": "v-lbl-1",
+                    "subpath": "agents/lbl-endpoint/home",
+                    "agent_type": "claude",
+                })
+            assert r.status_code == 200, r.text
+            body = r.json()
+            sandbox_id = body["id"]
+            # server stores container_id on the instance; find it via _INSTANCES.
+            inst = srv._INSTANCES.get(sandbox_id)
+            assert inst is not None and inst.container_id, body
+            container_id = inst.container_id
+            assert _inspect_label(container_id) == sandbox_id, (
+                f"POST /sandboxes: expected label {sandbox_id!r}, "
+                f"got {_inspect_label(container_id)!r}"
+            )
+        finally:
+            if container_id:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                )
+            if sandbox_id:
+                srv._INSTANCES.pop(sandbox_id, None)
+    finally:
+        await dprov.delete_volume(vol_name)
+        await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_label_propagation_sessions_quick_endpoint():
+    """MT1 path 3 — ``POST /sessions/quick`` must thread ``sandbox_id`` into
+    ``create_instance`` so the resulting container is labeled."""
+    from httpx import ASGITransport, AsyncClient
+
+    _DB = os.environ.get("TEST_DATABASE_URL")
+    if _DB is None:
+        pytest.skip("TEST_DATABASE_URL not set")
+    os.environ["DATABASE_URL"] = _DB
+
+    from api import db as dbmod, server as srv  # noqa: E402
+    from api.models import VolumeRecord  # noqa: E402
+
+    dbmod.init_db()
+    await dbmod.init_pool()
+    async with dbmod.get_db() as conn:
+        await conn.execute("DELETE FROM session_log")
+        await conn.execute("DELETE FROM sessions")
+        await conn.execute("DELETE FROM sandboxes")
+        await conn.execute("DELETE FROM volumes")
+        await conn.execute("DELETE FROM agents")
+
+    vol_name = _vol_name()
+    try:
+        await dprov.create_volume(vol_name)
+        await _seed_fake_supervisor(vol_name)
+        await dbmod.upsert_volume(
+            VolumeRecord(id="v-lbl-q", name=vol_name, provider="docker",
+                         provider_ref=vol_name),
+        )
+
+        # /sessions/quick also initializes ACP. The fake supervisor doesn't
+        # implement /v1/session/new, so stub AcpClient + _apply_config_and_initialize
+        # so the endpoint returns 200 after the container is up.
+        from unittest.mock import AsyncMock, MagicMock, patch
+        fake_acp = MagicMock()
+        fake_acp.aclose = AsyncMock(return_value=None)
+        fake_acp.get_inner_session_id = MagicMock(return_value="inner-xyz")
+
+        async def fake_apply(client, cfg, acp_sid, cwd):
+            return None
+
+        transport = ASGITransport(app=srv.app)
+        sandbox_id: str | None = None
+        container_id: str | None = None
+        try:
+            with patch("api.server.AcpClient", return_value=fake_acp), \
+                 patch("api.server._apply_config_and_initialize",
+                       new=AsyncMock(side_effect=fake_apply)), \
+                 patch("api.server._start_session_tasks", MagicMock()):
+                async with AsyncClient(transport=transport, base_url="http://test") as c:
+                    r = await c.post("/sessions/quick", json={
+                        "provider": "docker",
+                        "volume_id": "v-lbl-q",
+                        "agent_type": "claude",
+                    })
+            assert r.status_code == 200, r.text
+            body = r.json()
+            sandbox_id = body["current_sandbox_id"]
+            inst = srv._INSTANCES.get(sandbox_id)
+            assert inst is not None and inst.container_id, body
+            container_id = inst.container_id
+            assert _inspect_label(container_id) == sandbox_id, (
+                f"POST /sessions/quick: expected label {sandbox_id!r}, "
+                f"got {_inspect_label(container_id)!r}"
+            )
+        finally:
+            if container_id:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                )
+            if sandbox_id:
+                srv._INSTANCES.pop(sandbox_id, None)
+    finally:
+        await dprov.delete_volume(vol_name)
+        await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_label_propagation_ensure_sandbox_alive_restart():
+    """MT1 path 4 — ``_ensure_sandbox_alive`` restarts a dead docker sandbox
+    via ``provision_sandbox``; the replacement container must also be
+    labeled with the sandbox_id (same one as the DB row)."""
+    from httpx import ASGITransport, AsyncClient  # noqa: F401 — kept for parity
+
+    _DB = os.environ.get("TEST_DATABASE_URL")
+    if _DB is None:
+        pytest.skip("TEST_DATABASE_URL not set")
+    os.environ["DATABASE_URL"] = _DB
+
+    from api import db as dbmod, server as srv  # noqa: E402
+    from api.models import SandboxRecord, VolumeRecord  # noqa: E402
+
+    dbmod.init_db()
+    await dbmod.init_pool()
+    async with dbmod.get_db() as conn:
+        await conn.execute("DELETE FROM session_log")
+        await conn.execute("DELETE FROM sessions")
+        await conn.execute("DELETE FROM sandboxes")
+        await conn.execute("DELETE FROM volumes")
+        await conn.execute("DELETE FROM agents")
+
+    vol_name = _vol_name()
+    first_cid: str | None = None
+    try:
+        await dprov.create_volume(vol_name)
+        await _seed_fake_supervisor(vol_name)
+        await dbmod.upsert_volume(
+            VolumeRecord(id="v-lbl-r", name=vol_name, provider="docker",
+                         provider_ref=vol_name),
+        )
+
+        sb_id = f"sb_{uuid.uuid4().hex[:10]}"
+        # Seed a DB row but DO NOT put anything in _INSTANCES — this is
+        # exactly the cold-start-plus-dead-sandbox state _ensure_sandbox_alive
+        # is designed to recover from.
+        record = SandboxRecord(
+            id=sb_id, provider="docker", sandbox_ref="nonexistent-cid",
+            status="running", root="/home/agent",
+            volume_id="v-lbl-r", subpath="agents/restart/home",
+            listen_port=None,
+        )
+        await dbmod.upsert_sandbox(record)
+        srv._INSTANCES.pop(sb_id, None)
+
+        try:
+            url, _replaced = await srv._ensure_sandbox_alive(sb_id, record)
+            inst = srv._INSTANCES.get(sb_id)
+            assert inst is not None and inst.container_id, (
+                f"_ensure_sandbox_alive did not repopulate _INSTANCES: url={url!r}"
+            )
+            first_cid = inst.container_id
+            assert _inspect_label(first_cid) == sb_id, (
+                f"_ensure_sandbox_alive path: expected label {sb_id!r}, "
+                f"got {_inspect_label(first_cid)!r}"
+            )
+        finally:
+            if first_cid:
+                subprocess.run(
+                    ["docker", "rm", "-f", first_cid],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                )
+            srv._INSTANCES.pop(sb_id, None)
+    finally:
+        await dprov.delete_volume(vol_name)
+        await dbmod.close_pool()
+
+
+# ---------------------------------------------------------------------------
+# MT2 — ``reconcile_on_startup`` coverage
+#
+# Seeds various Docker/DB states that reconcile must handle correctly:
+#   * labeled container with no DB row      → orphan, rm -f
+#   * labeled container + running DB row    → rebuild _INSTANCES entry
+#   * labeled container + stopped DB row    → preserved (per MA3 fix)
+#
+# Reconcile also needs to extract the published host port from docker
+# inspect; we read it back and assert _INSTANCES matches.
+# ---------------------------------------------------------------------------
+
+
+class TestDockerReconcile:
+    """Reconcile-on-startup scenarios. All tests skip gracefully on no docker."""
+
+    @staticmethod
+    async def _seeded_container(volume_name: str, subpath: str,
+                                sandbox_id: str) -> ProviderInstance:
+        """Create a labeled container against a prepared volume."""
+        return await dprov.create_sandbox(
+            volume_ref=volume_name, subpath=subpath, agent_type="claude",
+            sandbox_id=sandbox_id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_orphan_container_removed(self):
+        """A labeled container whose sandbox_id has no DB row is removed."""
+        _DB = os.environ.get("TEST_DATABASE_URL")
+        if _DB is None:
+            pytest.skip("TEST_DATABASE_URL not set")
+        os.environ["DATABASE_URL"] = _DB
+
+        from api import db as dbmod, server as srv  # noqa: E402
+
+        dbmod.init_db()
+        await dbmod.init_pool()
+        async with dbmod.get_db() as conn:
+            await conn.execute("DELETE FROM sandboxes")
+
+        vol_name = _vol_name()
+        cid: str | None = None
+        try:
+            await dprov.create_volume(vol_name)
+            await _seed_fake_supervisor(vol_name)
+
+            # Label it with an sb_id that has NO DB row → orphan.
+            orphan_id = f"sb_{uuid.uuid4().hex[:10]}"
+            inst = await self._seeded_container(
+                vol_name, "agents/orphan/home", orphan_id,
+            )
+            cid = inst.container_id
+            assert cid
+            assert _inspect_label(cid) == orphan_id
+
+            # Reconcile: must rm -f the orphan.
+            srv._INSTANCES.clear()
+            await dprov.reconcile_on_startup()
+
+            status = await dprov.get_sandbox_status(cid)
+            assert status == "missing", (
+                f"orphan container should be removed; got status={status!r}"
+            )
+            # _INSTANCES must not rebuild an entry for an orphan.
+            assert orphan_id not in srv._INSTANCES
+            cid = None  # already gone
+        finally:
+            if cid:
+                subprocess.run(
+                    ["docker", "rm", "-f", cid],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                )
+            await dprov.delete_volume(vol_name)
+            await dbmod.close_pool()
+
+    @pytest.mark.asyncio
+    async def test_live_sandbox_preserved_and_instance_rebuilt(self):
+        """Labeled container + matching DB row with status=running survives
+        reconcile; _INSTANCES[sandbox_id] is populated with the live
+        container_id, url, and port."""
+        _DB = os.environ.get("TEST_DATABASE_URL")
+        if _DB is None:
+            pytest.skip("TEST_DATABASE_URL not set")
+        os.environ["DATABASE_URL"] = _DB
+
+        from api import db as dbmod, server as srv  # noqa: E402
+        from api.models import SandboxRecord, VolumeRecord  # noqa: E402
+
+        dbmod.init_db()
+        await dbmod.init_pool()
+        async with dbmod.get_db() as conn:
+            await conn.execute("DELETE FROM session_log")
+            await conn.execute("DELETE FROM sessions")
+            await conn.execute("DELETE FROM sandboxes")
+            await conn.execute("DELETE FROM volumes")
+
+        vol_name = _vol_name()
+        cid: str | None = None
+        try:
+            await dprov.create_volume(vol_name)
+            await _seed_fake_supervisor(vol_name)
+            await dbmod.upsert_volume(VolumeRecord(
+                id="v-rc-live", name=vol_name, provider="docker",
+                provider_ref=vol_name,
+            ))
+
+            sb_id = f"sb_{uuid.uuid4().hex[:10]}"
+            inst = await self._seeded_container(
+                vol_name, "agents/alive/home", sb_id,
+            )
+            cid = inst.container_id
+            assert cid
+
+            await dbmod.upsert_sandbox(SandboxRecord(
+                id=sb_id, provider="docker", sandbox_ref=cid,
+                status="running", root="/home/agent",
+                volume_id="v-rc-live", subpath="agents/alive/home",
+                listen_port=inst.port,
+            ))
+
+            # Simulate a cold restart: drop the in-process instance map.
+            srv._INSTANCES.clear()
+
+            await dprov.reconcile_on_startup()
+
+            # Container is still running.
+            assert await dprov.get_sandbox_status(cid) == "running"
+
+            # _INSTANCES was rebuilt.
+            rebuilt = srv._INSTANCES.get(sb_id)
+            assert rebuilt is not None, (
+                f"reconcile did not rebuild _INSTANCES[{sb_id!r}]"
+            )
+            assert rebuilt.container_id == cid
+            assert rebuilt.port == inst.port, (
+                f"port mismatch: reconcile got {rebuilt.port}, "
+                f"expected {inst.port}"
+            )
+            assert rebuilt.url == f"http://localhost:{inst.port}"
+        finally:
+            if cid:
+                subprocess.run(
+                    ["docker", "rm", "-f", cid],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                )
+            try:
+                srv._INSTANCES.clear()
+            except Exception:
+                pass
+            await dprov.delete_volume(vol_name)
+            await dbmod.close_pool()
+
+    @pytest.mark.asyncio
+    async def test_stopped_db_with_live_container_preserved(self):
+        """MA3: a DB row in status='stopped' but with a live container must
+        NOT be force-removed by reconcile.  ``stop_sandbox_route`` flips
+        the DB row to 'stopped' BEFORE calling ``stop_instance``; if a crash
+        happens in between, reconcile must survive the partial state.
+
+        Hard assert — ``docker.reconcile_on_startup`` no longer treats
+        ``status='stopped'`` as orphan.
+        """
+        _DB = os.environ.get("TEST_DATABASE_URL")
+        if _DB is None:
+            pytest.skip("TEST_DATABASE_URL not set")
+        os.environ["DATABASE_URL"] = _DB
+
+        from api import db as dbmod, server as srv  # noqa: E402
+        from api.models import SandboxRecord, VolumeRecord  # noqa: E402
+
+        dbmod.init_db()
+        await dbmod.init_pool()
+        async with dbmod.get_db() as conn:
+            await conn.execute("DELETE FROM session_log")
+            await conn.execute("DELETE FROM sessions")
+            await conn.execute("DELETE FROM sandboxes")
+            await conn.execute("DELETE FROM volumes")
+
+        vol_name = _vol_name()
+        cid: str | None = None
+        try:
+            await dprov.create_volume(vol_name)
+            await _seed_fake_supervisor(vol_name)
+            await dbmod.upsert_volume(VolumeRecord(
+                id="v-rc-stp", name=vol_name, provider="docker",
+                provider_ref=vol_name,
+            ))
+
+            sb_id = f"sb_{uuid.uuid4().hex[:10]}"
+            inst = await TestDockerReconcile._seeded_container(
+                vol_name, "agents/stp/home", sb_id,
+            )
+            cid = inst.container_id
+            assert cid
+            # DB says "stopped" while the container is actually alive — the
+            # crash-between-UPDATE-and-stop_instance state.
+            await dbmod.upsert_sandbox(SandboxRecord(
+                id=sb_id, provider="docker", sandbox_ref=cid,
+                status="stopped", root="/home/agent",
+                volume_id="v-rc-stp", subpath="agents/stp/home",
+                listen_port=inst.port,
+            ))
+
+            srv._INSTANCES.clear()
+
+            await dprov.reconcile_on_startup()
+            status = await dprov.get_sandbox_status(cid)
+            # Container must survive — a status='stopped' row is resumable,
+            # not an orphan. Force-removing it would nuke the container the
+            # user is about to resume via start_sandbox.
+            assert status in ("running", "stopped"), (
+                f"reconcile removed a stopped-but-live container "
+                f"(status={status!r}) — MA3 regression"
+            )
+        finally:
+            if cid:
+                subprocess.run(
+                    ["docker", "rm", "-f", cid],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                )
+            try:
+                srv._INSTANCES.clear()
+            except Exception:
+                pass
+            await dprov.delete_volume(vol_name)
+            await dbmod.close_pool()
