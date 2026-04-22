@@ -34,14 +34,13 @@ for name in [
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session", "log_event",
-    "get_session_log", "get_agent_log", "session_has_log_entries",
+    "get_session_log",
     "upsert_volume", "get_volume", "get_volume_by_name", "list_volumes",
     "delete_volume", "set_session_current_sandbox",
 ]:
     setattr(_stub_db, name, _noop if "list" not in name and "log" not in name else _noop_list)
 _stub_db.init_db = lambda: None
 _stub_db.get_db = _noop_get_db
-_stub_db.session_has_log_entries = _noop_false
 sys.modules.setdefault("api.db", _stub_db)
 
 from api.providers import create_instance, destroy_instance

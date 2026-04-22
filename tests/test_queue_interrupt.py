@@ -70,10 +70,8 @@ def _build_stub_db() -> types.ModuleType:
     stub.delete_sandbox = _noop
     stub.upsert_session = _noop
     stub.get_session = _noop
-    stub.session_has_log_entries = _noop_false
     stub.log_event = _noop
     stub.get_session_log = _noop_list
-    stub.get_agent_log = _noop_list
     stub.get_any_session_for_sandbox = _noop
     stub.get_session_env = _noop
     stub.get_session_secrets = _noop
@@ -96,7 +94,7 @@ _STUBBED_DB_NAMES = (
     "upsert_session", "get_session",
     "get_session_env", "get_session_secrets", "get_any_session_for_sandbox",
     "update_session_env", "update_session_secrets",
-    "session_has_log_entries", "log_event", "get_session_log",
+    "log_event", "get_session_log",
     "get_db", "add_supervisor_agent_type",
     "upsert_volume", "get_volume", "get_volume_by_name",
     "list_volumes", "delete_volume", "set_session_current_sandbox",

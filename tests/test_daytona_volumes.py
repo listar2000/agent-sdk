@@ -36,12 +36,11 @@ async def test_daytona_sandbox_mounts_volume_subpath():
     """Create a volume, create a sandbox with subpath, write a file, kill
     the sandbox, create a new one with the same subpath, verify file is still there.
 
-    NOTE: Uses provision_daytona_sandbox (not create_daytona) because in the
-    test environment ANTHROPIC_API_KEY is not set so the supervisor health check
-    inside create_daytona always fails. provision_daytona_sandbox installs deps
-    but does NOT start or health-check the supervisor, so exec_in_instance still
-    works for simple shell commands. Both functions now accept volume_id+subpath,
-    and provision_daytona_sandbox exercises the same VolumeMount code path.
+    NOTE: Uses provision_daytona_sandbox directly (bypasses /sessions/quick)
+    because it installs deps without starting the supervisor — useful in
+    environments where ANTHROPIC_API_KEY is not set and the supervisor
+    health check would fail. exec_in_instance still works for shell commands
+    and exercises the same VolumeMount code path.
     """
     from api.providers import (
         create_daytona_volume, delete_daytona_volume,
