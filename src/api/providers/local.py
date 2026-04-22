@@ -431,20 +431,78 @@ async def volume_tree(ref: str, subpath: str = "") -> str:
 
 
 async def volume_read(ref: str, path: str) -> bytes:
-    """Read a file from the volume. Symlink-escape is rejected."""
+    """Read a file from the volume. Symlink-escape is rejected.
+
+    Hardened against TOCTOU: after ``_safe_join`` resolves the path we
+    reopen via ``openat(O_NOFOLLOW)`` relative to a directory fd of the
+    parent so a concurrent rename-over with a symlink can't escape the
+    volume between resolution and open.
+    """
     target = await asyncio.to_thread(_safe_join, ref, path)
+
     def _read() -> bytes:
-        with open(target, "rb") as f:
-            return f.read()
+        parent_dir, basename = os.path.split(target)
+        if not basename:
+            raise IsADirectoryError(target)
+        # Open the parent directory O_NOFOLLOW so a symlink swap on the
+        # parent itself fails here rather than silently redirecting.
+        parent_fd = os.open(parent_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = os.open(
+                basename,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+            try:
+                chunks: list[bytes] = []
+                while True:
+                    buf = os.read(fd, 1 << 20)  # 1 MiB chunks
+                    if not buf:
+                        break
+                    chunks.append(buf)
+                return b"".join(chunks)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent_fd)
+
     return await asyncio.to_thread(_read)
 
 
 async def volume_write(ref: str, path: str, content: bytes | str) -> None:
-    """Write to the volume. Creates parent dirs. Symlink-escape is rejected."""
+    """Write to the volume. Creates parent dirs. Symlink-escape is rejected.
+
+    Hardened against TOCTOU: opens the target via ``openat(O_NOFOLLOW)``
+    relative to a directory fd of the parent so a concurrent rename-over
+    with a symlink can't redirect the write outside the volume.
+    """
     target = await asyncio.to_thread(_safe_join, ref, path)
     data = content.encode() if isinstance(content, str) else content
+
     def _write() -> None:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "wb") as f:
-            f.write(data)
+        parent_dir, basename = os.path.split(target)
+        if not basename:
+            raise IsADirectoryError(target)
+        # os.makedirs is fine here: even if it races with a symlink
+        # plant, the subsequent O_NOFOLLOW open of the parent directory
+        # will refuse to follow a symlink that tries to retarget it.
+        os.makedirs(parent_dir, exist_ok=True)
+        parent_fd = os.open(parent_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = os.open(
+                basename,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o644,
+                dir_fd=parent_fd,
+            )
+            try:
+                to_write = memoryview(data)
+                while to_write:
+                    n = os.write(fd, to_write)
+                    to_write = to_write[n:]
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent_fd)
+
     await asyncio.to_thread(_write)
