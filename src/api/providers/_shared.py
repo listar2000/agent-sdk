@@ -8,6 +8,7 @@ everything from here, and daytona.py imports from here directly.
 import asyncio
 import logging
 import shlex
+import socket
 from dataclasses import dataclass
 
 import httpx
@@ -192,14 +193,43 @@ async def _recycle_port(instance) -> None:
         _freed_ports.append(port)
 
 
+def _port_is_bindable(port: int) -> bool:
+    """Return True if ``port`` is currently free to bind on 127.0.0.1."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
 async def _find_free_port() -> int:
+    """Allocate a host port that is currently free at the OS level.
+
+    Keeps the monotonic counter + freed-port recycling for backward compat,
+    but each candidate is verified by a bind-and-close probe before return.
+    If no candidate binds cleanly within a bounded loop, falls through to
+    ``bind(0)`` and lets the OS pick.
+    """
     global _next_local_port
     async with _port_lock:
-        if _freed_ports:
-            return _freed_ports.pop()
-        port = _next_local_port
-        _next_local_port += 1
-        return port
+        # Try up to N candidates (recycled + counter) before falling back
+        # to OS-assigned. Bounded so we can't spin forever.
+        for _ in range(64):
+            if _freed_ports:
+                candidate = _freed_ports.pop()
+            else:
+                candidate = _next_local_port
+                _next_local_port += 1
+            if _port_is_bindable(candidate):
+                return candidate
+            # Port in use at OS level — drop it, try another.
+        # Fallback: let the OS pick any free port.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
 
 
 def allocate_sandbox_port(sandbox_id: str) -> int:
