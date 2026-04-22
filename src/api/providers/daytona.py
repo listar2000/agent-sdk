@@ -115,7 +115,7 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     )
     start_cmd = f"sh -c {shlex.quote(inner)}"
     await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
-    await asyncio.sleep(3)
+    # _wait_for_health already polls with backoff; no redundant pre-sleep.
 
     signed = await loop.run_in_executor(
         None, lambda: sandbox.create_signed_preview_url(_SUPERVISOR_REMOTE_PORT, 24 * 3600)
@@ -169,7 +169,7 @@ async def start_supervisor_in_sandbox(
         None, lambda: _exec(f"test -f {vol_tarball} && echo yes || echo no")
     )
 
-    if "yes" in check_result:
+    if check_result.strip() == "yes":
         # Volume-cached mode: extract deps tarball to local ephemeral dir.
         # Reading one archive from the volume is fast; we never write
         # node_modules there.
@@ -201,7 +201,7 @@ async def start_supervisor_in_sandbox(
     )
     start_cmd = f"sh -c {shlex.quote(inner)}"
     await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
-    await asyncio.sleep(3)
+    # _wait_for_health already polls with backoff; no redundant pre-sleep.
 
     signed = await loop.run_in_executor(
         None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
