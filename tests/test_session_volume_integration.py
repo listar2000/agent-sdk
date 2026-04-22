@@ -189,3 +189,41 @@ async def test_reset_sandbox_swaps(client):
     assert await dbmod.get_sandbox("sb_old") is None
     sess = await dbmod.get_session(sid)
     assert sess["current_sandbox_id"] == body["sandbox_id"]
+
+
+@pytest.mark.asyncio
+async def test_reset_sandbox_emits_reattach_event(client):
+    from api.models import AgentConfig, AgentRecord, VolumeRecord, SandboxRecord
+    from api.providers import ProviderInstance
+    await dbmod.upsert_agent(AgentRecord(id="agent_e", name="E", config=AgentConfig()))
+    await dbmod.upsert_volume(VolumeRecord(id="vol_e", name="ve", provider="daytona",
+                                           provider_ref="dt-e"))
+    r = await client.post("/sessions", json={"agent_id": "agent_e", "volume_id": "vol_e"})
+    sid = r.json()["id"]
+    sb_old = SandboxRecord(id="sb_old", provider="daytona", sandbox_ref="dt-old",
+                           status="running", root="/home/daytona",
+                           volume_id="vol_e", subpath="agents/agent_e/home")
+    await dbmod.upsert_sandbox(sb_old)
+    await dbmod.set_session_current_sandbox(sid, "sb_old")
+
+    async def fake_create(**kw):
+        return ProviderInstance(provider="daytona", url="http://fake:7000",
+                                root="/home/daytona", sandbox_id="dt-new")
+
+    with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)), \
+         patch("api.providers.create_daytona", new=AsyncMock(side_effect=fake_create)):
+        r = await client.post(f"/sessions/{sid}/reset-sandbox")
+    assert r.status_code == 200
+
+    # Look up session_log for a sandbox_reattach event.
+    async with dbmod.get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT event_type, payload FROM session_log WHERE session_id = %s",
+            (sid,),
+        )).fetchall()
+    reattach = [r for r in rows if r["event_type"] == "sandbox_reattach"]
+    assert len(reattach) == 1, f"expected 1 reattach event, got {len(reattach)}: {rows}"
+    payload = reattach[0]["payload"]
+    assert payload.get("old_sandbox_id") == "sb_old"
+    assert payload.get("new_sandbox_id") is not None
+    assert payload["new_sandbox_id"] != "sb_old"

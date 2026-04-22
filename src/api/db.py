@@ -488,7 +488,7 @@ def _row_to_log_entry(r: dict) -> LogEntry:
                     payload=r["payload"], created_at=r["created_at"].timestamp())
 
 
-async def log_event(*, session_id: str, agent_id: str, sandbox_id: str,
+async def log_event(*, session_id: str, agent_id: str, sandbox_id: str | None,
                     event_type: str, payload: dict) -> None:
     async with get_db() as conn:
         await conn.execute(

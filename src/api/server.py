@@ -2042,11 +2042,17 @@ async def _do_resume(
         }
 
 
-async def _lazy_provision_sandbox_for_session(session_id: str) -> SandboxRecord:
+async def _lazy_provision_sandbox_for_session(
+    session_id: str,
+    previous_sandbox_id: str | None = None,
+) -> SandboxRecord:
     """Provision a new Daytona sandbox for a session that has no current one.
 
     Uses the session's volume + agents/<agent_id>/home subpath. Persists the
     sandbox row and sets sessions.current_sandbox_id. Returns the SandboxRecord.
+
+    If *previous_sandbox_id* is provided a ``sandbox_reattach`` event is written
+    to session_log recording the old→new transition.
     """
     sess = await get_session(session_id)
     if sess is None:
@@ -2082,6 +2088,14 @@ async def _lazy_provision_sandbox_for_session(session_id: str) -> SandboxRecord:
     )
     await upsert_sandbox(sandbox)
     await set_session_current_sandbox(session_id, sandbox.id)
+    if previous_sandbox_id is not None:
+        await log_event(
+            session_id=session_id,
+            agent_id=agent_id,
+            sandbox_id=sandbox.id,
+            event_type="sandbox_reattach",
+            payload={"old_sandbox_id": previous_sandbox_id, "new_sandbox_id": sandbox.id},
+        )
     return sandbox
 
 
@@ -2922,8 +2936,12 @@ async def stop_session_sandbox(session_id: str):
 @app.post("/sessions/{session_id}/reset-sandbox")
 async def reset_session_sandbox(session_id: str):
     """Kill current sandbox and provision a fresh one."""
+    sess = await get_session(session_id)
+    if sess is None:
+        raise HTTPException(404, "Session not found")
+    old_sbid = sess.get("current_sandbox_id")
     await stop_session_sandbox(session_id)
-    sandbox = await _lazy_provision_sandbox_for_session(session_id)
+    sandbox = await _lazy_provision_sandbox_for_session(session_id, previous_sandbox_id=old_sbid)
     return {"sandbox_id": sandbox.id}
 
 
