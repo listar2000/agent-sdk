@@ -1180,14 +1180,6 @@ async def create_sandbox(request: Request):
         return JSONResponse(
             {"error": "volume_id and subpath are required"}, status_code=400,
         )
-    # Docker refuses empty subpaths at the provider layer — pre-validate
-    # here so clients see a clean 400 instead of a 502 wrapping a
-    # ValueError from the provider. (MI6)
-    if provider == "docker" and not subpath:
-        return JSONResponse(
-            {"error": "subpath is required for docker sandboxes"},
-            status_code=400,
-        )
     # ``_resolve_volume`` raises HTTPException(404) on miss; ``vol`` is
     # always a VolumeRecord here. The defensive ``vol is not None`` guard
     # the old code had was dead. (MI5)
@@ -1332,17 +1324,14 @@ async def provision_sandbox_route(request: Request):
     # Default the provider from the volume (so existing Daytona-only clients
     # don't have to pass it), but let an explicit body field override for tests.
     provider = data.get("provider") or vol.provider
+    # Mi5: ``provider != vol.provider`` is only reachable when the client
+    # explicitly overrides ``provider`` in the body to something that
+    # disagrees with the volume.  Tests exercise this to verify the
+    # cross-provider rejection; normal clients omit ``provider`` and the
+    # default (``vol.provider``) makes this branch unreachable.
     if provider != vol.provider:
         return JSONResponse(
             {"error": f"provider {provider!r} does not match volume.provider {vol.provider!r}"},
-            status_code=400,
-        )
-    # Docker refuses empty subpaths at the provider layer — pre-validate
-    # here so clients see a clean 400 instead of a 502 wrapping a
-    # ValueError from the provider. (MI6)
-    if provider == "docker" and not subpath:
-        return JSONResponse(
-            {"error": "subpath is required for docker sandboxes"},
             status_code=400,
         )
 
@@ -1997,13 +1986,15 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
 
     Locking model (slow path):
 
-    1. Open a short transaction, take ``pg_advisory_xact_lock``, re-check
-       the cache, then commit to release the xact lock.
-    2. Acquire a longer-lived ``pg_advisory_lock`` on the SAME key outside
-       any transaction — this is the cross-process "I'm installing" signal.
-       ``pg_advisory_lock`` is session-scoped: if the backend dies or the
-       TCP connection drops, Postgres releases it automatically, so a
-       crashed worker can't wedge the key.
+    1. Open a short transaction, re-check the cache, then release — the
+       cheap double-check lets most racers short-circuit before touching
+       the advisory-lock machinery at all.
+    2. Acquire a session-scoped ``pg_advisory_lock`` on the SAME key on
+       a dedicated autocommit connection — this is the cross-process
+       "I'm installing" signal.  ``pg_advisory_lock`` (session-scoped,
+       NOT ``pg_advisory_xact_lock``) is released automatically if the
+       backend dies or the TCP connection drops, so a crashed worker
+       can't wedge the key.
     3. Re-check the cache under the session lock (another worker may have
        installed between steps 1 and 2).
     4. Run the slow provider install with NO open transaction and NO
