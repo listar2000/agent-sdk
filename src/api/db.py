@@ -189,6 +189,45 @@ _MIGRATIONS = [
     # both container_id / pid *and* the host port the supervisor is listening on.
     # Daytona rows leave listen_port NULL (URL comes from the signed preview API).
     "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS listen_port INTEGER",
+    # 2026-04-23: config ownership split — cwd belongs to session (JSONL hash
+    # key, per-conversation), dockerfile + shared_mounts belong to sandbox
+    # (provisioning-time identity; must survive sandbox replacement). Agent is
+    # pure identity (agent_type, model, prompt, tools, mcp_servers, skills).
+    "ALTER TABLE sessions  ADD COLUMN IF NOT EXISTS cwd TEXT",
+    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS dockerfile TEXT",
+    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS shared_mounts JSONB NOT NULL DEFAULT '[]'::jsonb",
+    # Backfill from agents.config before dropping those keys. Each session's
+    # cwd comes from its agent; each sandbox's dockerfile/shared_mounts come
+    # from the agent currently bound via sessions.current_sandbox_id.
+    """UPDATE sessions s SET cwd = COALESCE(
+        (SELECT a.config->>'cwd' FROM agents a WHERE a.id = s.agent_id),
+        '/tmp'
+    ) WHERE cwd IS NULL""",
+    """UPDATE sandboxes sb SET dockerfile = (
+        SELECT a.config->>'dockerfile' FROM agents a
+        JOIN sessions s ON s.agent_id = a.id
+        WHERE s.current_sandbox_id = sb.id
+        LIMIT 1
+    ) WHERE dockerfile IS NULL""",
+    """UPDATE sandboxes sb SET shared_mounts = COALESCE((
+        SELECT a.config->'shared_mounts' FROM agents a
+        JOIN sessions s ON s.agent_id = a.id
+        WHERE s.current_sandbox_id = sb.id
+          AND jsonb_typeof(a.config->'shared_mounts') = 'array'
+        LIMIT 1
+    ), '[]'::jsonb) WHERE shared_mounts = '[]'::jsonb""",
+    # Enforce NOT NULL on sessions.cwd now that backfill is done.
+    "ALTER TABLE sessions ALTER COLUMN cwd SET DEFAULT '/tmp'",
+    """DO $$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='sessions' AND column_name='cwd' AND is_nullable='YES'
+        ) THEN
+            ALTER TABLE sessions ALTER COLUMN cwd SET NOT NULL;
+        END IF;
+    END $$""",
+    # Drop the moved keys from agents.config so server reads stop finding them.
+    "UPDATE agents SET config = config - 'cwd' - 'dockerfile' - 'shared_mounts' - 'env' WHERE config IS NOT NULL",
 ]
 
 
@@ -307,14 +346,17 @@ async def upsert_sandbox(sandbox: SandboxRecord) -> None:
     async with get_db() as conn:
         await conn.execute(
             "INSERT INTO sandboxes"
-            " (id, provider, sandbox_ref, status, root, volume_id, subpath, listen_port)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+            " (id, provider, sandbox_ref, status, root, volume_id, subpath,"
+            "  listen_port, dockerfile, shared_mounts)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
             " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
             " root=EXCLUDED.root, volume_id=EXCLUDED.volume_id,"
-            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port",
+            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port,"
+            " dockerfile=EXCLUDED.dockerfile, shared_mounts=EXCLUDED.shared_mounts",
             (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status,
-             sandbox.root, sandbox.volume_id, sandbox.subpath, sandbox.listen_port),
+             sandbox.root, sandbox.volume_id, sandbox.subpath, sandbox.listen_port,
+             sandbox.dockerfile, Json(list(sandbox.shared_mounts or []))),
         )
 
 
@@ -326,6 +368,8 @@ def _row_to_sandbox(row: dict) -> SandboxRecord:
         volume_id=row.get("volume_id"),
         subpath=row.get("subpath"),
         listen_port=row.get("listen_port"),
+        dockerfile=row.get("dockerfile"),
+        shared_mounts=list(row.get("shared_mounts") or []),
     )
 
 
@@ -430,11 +474,13 @@ async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
                          inner_session_id: str | None,
                          volume_id: str | None = None,
                          env: dict[str, str] | None = None,
-                         secrets: dict[str, str] | None = None) -> None:
+                         secrets: dict[str, str] | None = None,
+                         cwd: str | None = None) -> None:
     """Upsert a session row.
 
-    PATCH-like semantics: ``env=None`` (and ``secrets=None``) means don't
-    touch the stored column on update. Pass ``{}`` to explicitly wipe.
+    PATCH-like semantics: ``env=None`` / ``secrets=None`` / ``cwd=None``
+    means don't touch the stored column on update. Pass ``{}`` / ``""``
+    to explicitly wipe.
 
     ``sandbox_id`` maps to the ``current_sandbox_id`` column (may be None
     if no sandbox is currently attached).
@@ -457,6 +503,10 @@ async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
         cols.append("secrets")
         vals.append(Json(secrets))
         update_parts.append("secrets=EXCLUDED.secrets")
+    if cwd is not None:
+        cols.append("cwd")
+        vals.append(cwd)
+        update_parts.append("cwd=EXCLUDED.cwd")
     placeholders = ", ".join(["%s"] * len(cols))
     col_list = ", ".join(cols)
     update_sql = ", ".join(update_parts)

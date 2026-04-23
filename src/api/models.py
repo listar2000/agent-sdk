@@ -20,28 +20,19 @@ class PendingPrompt:
 
 @dataclass
 class AgentConfig:
+    """Pure agent identity. No per-invocation or provisioning knobs — those
+    live on the session (cwd, env, secrets) or sandbox (dockerfile,
+    shared_mounts, root) rows.
+    """
     agent_type: str = "claude"
     model: str | None = None
     prompt: str | None = None
-    cwd: str | None = None
     tools: list[str] | None = None
     mcp_servers: dict | None = None
     skills: list | dict | None = None  # npx skills sources
-    dockerfile: str | None = None
-    env: dict[str, str] = field(default_factory=dict)
-    # Named shared folders this agent mounts at /mnt/<name>. Each entry refers
-    # to a subdir under <volume>/shared/ on the agent's volume. Opt-in per
-    # agent — an empty list means no shared mounts (default). Unknown names
-    # are silently ignored at mount time; the mount just doesn't appear.
-    shared_mounts: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        d = {k: v for k, v in asdict(self).items() if v is not None}
-        if not d.get("env"):
-            d.pop("env", None)
-        if not d.get("shared_mounts"):
-            d.pop("shared_mounts", None)
-        return d
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentConfig:
@@ -88,6 +79,12 @@ class SandboxRecord:
     # Host-side port the supervisor listens on. Populated for docker/local;
     # always NULL for Daytona (URL comes from the SDK-signed preview API).
     listen_port: int | None = None
+    # Provisioning-time identity — frozen for the sandbox's lifetime. A
+    # sandbox replacement (e.g. daytona unrecoverable error) reads these
+    # from the row to rebuild an equivalent instance, so editing the agent
+    # afterwards doesn't change how an existing sandbox is restarted.
+    dockerfile: str | None = None
+    shared_mounts: list[str] = field(default_factory=list)
 
     def derive_url(self) -> str:
         """Reconstruct the supervisor URL from the DB row.
