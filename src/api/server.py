@@ -610,12 +610,13 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     supervisor. Preserving `_session_subscribers` is what keeps a UI's
     persistent /events stream alive across an external sandbox kill.
     """
-    agent_record = await get_agent(state.agent_id)
+    # Parallel DB reads — agent + session row are independent lookups.
+    agent_record, session_row = await asyncio.gather(
+        get_agent(state.agent_id),
+        _require_session_row(state.session_id),
+    )
     if agent_record is None:
         raise RuntimeError(f"agent {state.agent_id} missing during rebind")
-    # Build spawn_env inline to avoid _spawn_env_for_sandbox's redundant
-    # get_agent round-trip (we already have agent_record).
-    session_row = await _require_session_row(state.session_id)
     agent_env = (agent_record.config.env or {}) if agent_record.config else {}
     spawn_env = _merge_env(
         agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
@@ -2488,12 +2489,15 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
     local, and daytona all work. Supervisor is installed on the volume first
     (idempotent fast-path); the sandbox is then attached to it.
     """
-    vol = await get_volume(session_row["volume_id"])
-    if vol is None:
-        raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
     agent_id = session_row["agent_id"]
     subpath = f"agents/{agent_id}"
-    agent = await get_agent(agent_id)
+    # Parallel DB reads — volume + agent are independent lookups.
+    vol, agent = await asyncio.gather(
+        get_volume(session_row["volume_id"]),
+        get_agent(agent_id),
+    )
+    if vol is None:
+        raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
     agent_type = (agent.config.agent_type if agent and agent.config else "claude")
     shared_mounts = (agent.config.shared_mounts if agent and agent.config else None)
 
@@ -2501,8 +2505,11 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
     # This is idempotent: fast-path if already installed (cache hit in volumes table).
     await ensure_volume_supervisor(vol.id, agent_type)
 
-    # Build the spawn env for the supervisor (agent.env + session.env + secrets).
-    spawn_env = await _build_spawn_env_from_row(session_row)
+    # Build spawn_env from the agent we already fetched (avoids another get_agent).
+    agent_env = (agent.config.env or {}) if agent and agent.config else {}
+    spawn_env = _merge_env(
+        agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
+    )
 
     # Provider-specific default root. Daytona mounts per-agent at /home/daytona;
     # docker at /home/agent; local fills it in from the volume path.
@@ -2605,20 +2612,25 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
                               "falling back to full rebuild", session_id)
                 await _shutdown_session_state(existing, remove=True, force=True)
 
-    # Build fresh.
+    # Build fresh. Parallel DB reads — agent + volume are independent.
     agent_id = session_row["agent_id"]
-    agent_record = await get_agent(agent_id)
+    agent_record, vol = await asyncio.gather(
+        get_agent(agent_id),
+        get_volume(session_row["volume_id"]),
+    )
     if agent_record is None:
         raise HTTPException(500, f"Agent {agent_id} missing")
-    agent_type = agent_record.config.agent_type or "claude"
-
-    spawn_env = await _build_spawn_env_from_row(session_row)
-    root = sandbox.root or (agent_record.config.cwd if agent_record.config else None) or "/tmp"
-    effective_spawn_env = {**spawn_env, "HOME": root}
-
-    vol = await get_volume(session_row["volume_id"])
     if vol is None:
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
+    agent_type = agent_record.config.agent_type or "claude"
+
+    # Build spawn_env from the agent we already fetched.
+    agent_env = (agent_record.config.env or {}) if agent_record.config else {}
+    spawn_env = _merge_env(
+        agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
+    )
+    root = sandbox.root or (agent_record.config.cwd if agent_record.config else None) or "/tmp"
+    effective_spawn_env = {**spawn_env, "HOME": root}
 
     # Supervisor URL resolution:
     #  - Port-based (local/docker): URL is known from _INSTANCES or the DB row.
@@ -3088,9 +3100,7 @@ def _start_session_tasks(state: SessionState) -> None:
         state._reader_alive,
     )
     _start_sse_reader(state)
-    if state._scheduler_task is None or (
-        hasattr(state._scheduler_task, "done") and state._scheduler_task.done()
-    ):
+    if state._scheduler_task is None or state._scheduler_task.done():
         state._scheduler_task = asyncio.create_task(_scheduler_loop(state))
 
 
