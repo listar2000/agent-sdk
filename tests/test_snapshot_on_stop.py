@@ -202,3 +202,65 @@ async def test_snapshot_and_stop_proceeds_when_snapshot_raises(monkeypatch):
     )
     await srv.snapshot_and_stop(sb, inst)
     assert called == ["stop"]
+
+
+# ---------------------------------------------------------------------------
+# _reap_one_tick — reap routes idle sandboxes through snapshot_and_stop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reap_one_tick_calls_snapshot_and_stop(monkeypatch):
+    """When an idle session past IDLE_TIMEOUT_S is reaped and it's the last
+    session on the sandbox, snapshot_and_stop must be called."""
+    from api import server as srv
+    from api.providers._shared import ProviderInstance
+    from api.models import SessionState
+
+    calls: list[str] = []
+
+    async def fake_snap_and_stop(sb, inst=None, *, url=None):
+        calls.append(f"snap_and_stop:{sb.id}")
+
+    # Avoid DB work — the helper path calls get_sandbox → upsert_sandbox.
+    async def fake_get_sandbox(sbid):
+        return SandboxRecord(
+            id=sbid, provider="local", sandbox_ref="fake",
+            status="running", root="/tmp", listen_port=12345,
+        )
+
+    async def fake_upsert_sandbox(_rec):
+        pass
+
+    async def fake_shutdown_state(state, remove=True, mark_idle_at=None, force=False):
+        calls.append(f"shutdown:{state.session_id}")
+        if remove:
+            srv.SESSIONS.pop(state.session_id, None)
+
+    monkeypatch.setattr(srv, "snapshot_and_stop", fake_snap_and_stop)
+    monkeypatch.setattr(srv, "get_sandbox", fake_get_sandbox)
+    monkeypatch.setattr(srv, "upsert_sandbox", fake_upsert_sandbox)
+    monkeypatch.setattr(srv, "_shutdown_session_state", fake_shutdown_state)
+
+    # Install an idle session.
+    sess = SessionState(
+        session_id="sess_idle", agent_id="agent_x", sandbox_id="sb_idle",
+        last_activity=0.0, turn_completed_at=0.0,
+    )
+    srv.SESSIONS["sess_idle"] = sess
+    srv._INSTANCES["sb_idle"] = ProviderInstance(
+        provider="local", url="http://localhost:12345",
+        root="/tmp", sandbox_id="fake",
+    )
+    try:
+        # now very far past IDLE_TIMEOUT_S ⇒ reap fires.
+        await srv._reap_one_tick(now=srv.IDLE_TIMEOUT_S * 10)
+    finally:
+        srv.SESSIONS.pop("sess_idle", None)
+        srv._INSTANCES.pop("sb_idle", None)
+
+    assert any(c.startswith("snap_and_stop:sb_idle") for c in calls), calls
+    # ordering: shutdown session first, then snapshot+stop the sandbox.
+    assert calls.index("shutdown:sess_idle") < next(
+        i for i, c in enumerate(calls) if c.startswith("snap_and_stop:")
+    )

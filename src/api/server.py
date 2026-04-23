@@ -271,59 +271,75 @@ _SSE_MAX_IDLE_RETRIES = (
 )
 
 
+async def _reap_one_tick(now: float) -> None:
+    """Single iteration of the reap loop, factored out for testability.
+
+    Closes any session that is idle past IDLE_TIMEOUT_S with no active or
+    pending prompts and no subscribers. When the last session on a sandbox
+    is reaped, the sandbox itself is snapshotted + stopped via
+    ``snapshot_and_stop`` so workspace state is durable on the volume
+    before the provider call lands.
+    """
+    busy = sum(1 for s in SESSIONS.values() if s.agent_busy)
+    readers = sum(1 for s in SESSIONS.values() if s._reader_alive)
+    subs = sum(len(s._session_subscribers) for s in SESSIONS.values())
+    log.info(
+        "idle reaper tick: sessions=%d busy=%d readers=%d subs=%d instances=%d",
+        len(SESSIONS), busy, readers, subs, len(_INSTANCES),
+    )
+
+    for state in list(SESSIONS.values()):
+        if (
+            state.active_rpc_id is not None
+            or state.pending_prompts
+            or state._session_subscribers
+        ):
+            continue
+        idle_since = _session_idle_since(state)
+        if now - idle_since < IDLE_TIMEOUT_S:
+            continue
+        log.info(
+            "idle reaper: closing session %s (idle %.0fs)",
+            state.session_id,
+            now - idle_since,
+        )
+        sandbox_id = state.sandbox_id
+        await _shutdown_session_state(state, remove=True, mark_idle_at=now)
+        # If no other sessions use this sandbox, stop the supervisor.
+        # For local/docker: kills the process (no filesystem to preserve).
+        # For daytona: stops the workspace (filesystem preserved for resume).
+        if not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+            _sandbox_locks.pop(sandbox_id, None)
+            instance = _INSTANCES.pop(sandbox_id, None)
+            if instance:
+                log.info(
+                    "idle reaper: snapshot+stop sandbox %s (provider=%s)",
+                    sandbox_id, instance.provider,
+                )
+                try:
+                    rec = await get_sandbox(sandbox_id)
+                    if rec is not None:
+                        await snapshot_and_stop(rec, instance)
+                    else:
+                        # Row already gone (concurrent delete) — just stop.
+                        await stop_instance(instance)
+                    log.info("idle reaper: sandbox %s snapshotted + stopped",
+                             sandbox_id)
+                    if rec is not None and rec.status != STATUS_STOPPED:
+                        rec.status = STATUS_STOPPED
+                        await upsert_sandbox(rec)
+                except Exception as e:
+                    log.warning(
+                        "reaper: failed to snapshot+stop sandbox %s: %s",
+                        sandbox_id, e,
+                    )
+
+
 async def _idle_reaper():
     """Background task: close idle sessions that have been inactive too long."""
     while True:
         await asyncio.sleep(REAPER_TICK_S)
-        now = time.time()
-        busy = sum(1 for s in SESSIONS.values() if s.agent_busy)
-        readers = sum(1 for s in SESSIONS.values() if s._reader_alive)
-        subs = sum(len(s._session_subscribers) for s in SESSIONS.values())
-        log.info(
-            "idle reaper tick: sessions=%d busy=%d readers=%d subs=%d instances=%d",
-            len(SESSIONS), busy, readers, subs, len(_INSTANCES),
-        )
-
-        for state in list(SESSIONS.values()):
-            if (
-                state.active_rpc_id is not None
-                or state.pending_prompts
-                or state._session_subscribers
-            ):
-                continue
-            idle_since = _session_idle_since(state)
-            if now - idle_since < IDLE_TIMEOUT_S:
-                continue
-            log.info(
-                "idle reaper: closing session %s (idle %.0fs)",
-                state.session_id,
-                now - idle_since,
-            )
-            sandbox_id = state.sandbox_id
-            await _shutdown_session_state(state, remove=True, mark_idle_at=now)
-            # If no other sessions use this sandbox, stop the supervisor.
-            # For local/docker: kills the process (no filesystem to preserve).
-            # For daytona: stops the workspace (filesystem preserved for resume).
-            if not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
-                _sandbox_locks.pop(sandbox_id, None)
-                instance = _INSTANCES.pop(sandbox_id, None)
-                if instance:
-                    log.info(
-                        "idle reaper: stopping sandbox %s (provider=%s)",
-                        sandbox_id,
-                        instance.provider,
-                    )
-                    try:
-                        await stop_instance(instance)
-                        log.info("idle reaper: sandbox %s stopped", sandbox_id)
-                        rec = await get_sandbox(sandbox_id)
-                        if rec is not None and rec.status != STATUS_STOPPED:
-                            rec.status = STATUS_STOPPED
-                            await upsert_sandbox(rec)
-                    except Exception as e:
-                        log.warning(
-                            "reaper: failed to stop sandbox %s: %s", sandbox_id, e
-                        )
+        await _reap_one_tick(time.time())
 
 
 @asynccontextmanager
