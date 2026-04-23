@@ -201,6 +201,17 @@ async def _external_delete(sandbox: dict) -> None:
         daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
         sb = await loop.run_in_executor(None, lambda: daytona.get(ref))
         await loop.run_in_executor(None, lambda: daytona.delete(sb))
+        # Wait for daytona's internal state to settle. Without this, the
+        # NEXT test's daytona.create can race the delete's cleanup and
+        # get "An unexpected error occurred" from the API. Poll until
+        # get(ref) raises (sandbox is gone), with a bounded timeout.
+        deadline = asyncio.get_event_loop().time() + 10.0
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await loop.run_in_executor(None, lambda: daytona.get(ref))
+                await asyncio.sleep(0.5)
+            except Exception:
+                break  # get raised → sandbox is gone from daytona's index
 
     elif provider == "docker":
         await loop.run_in_executor(None, lambda: subprocess.run(
