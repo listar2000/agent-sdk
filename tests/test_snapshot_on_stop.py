@@ -139,3 +139,66 @@ async def test_snapshot_supervisor_no_url_skips(caplog):
     with caplog.at_level(logging.WARNING):
         await snapshot_supervisor(sb)  # must not raise
     assert any("no URL" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# snapshot_and_stop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_snapshot_and_stop_orders_snapshot_before_stop(monkeypatch):
+    """snapshot_supervisor must be awaited BEFORE stop_instance."""
+    from api import server as srv
+    from api.providers._shared import ProviderInstance
+
+    order: list[str] = []
+
+    async def fake_snap(sb, *, url=None):
+        order.append(f"snapshot:{sb.id}")
+
+    async def fake_stop(inst):
+        order.append(f"stop:{inst.sandbox_id}")
+
+    monkeypatch.setattr(srv, "snapshot_supervisor", fake_snap)
+    monkeypatch.setattr(srv, "stop_instance", fake_stop)
+
+    sb = SandboxRecord(
+        id="sb_test", provider="local", sandbox_ref="fake",
+        status="running", root="/tmp", listen_port=12345,
+    )
+    inst = ProviderInstance(
+        provider="local", url="http://localhost:12345",
+        root="/tmp", sandbox_id="fake",
+    )
+    await srv.snapshot_and_stop(sb, inst)
+    assert order == ["snapshot:sb_test", "stop:fake"], order
+
+
+@pytest.mark.asyncio
+async def test_snapshot_and_stop_proceeds_when_snapshot_raises(monkeypatch):
+    """If snapshot_supervisor raises, stop_instance must still run."""
+    from api import server as srv
+    from api.providers._shared import ProviderInstance
+
+    called: list[str] = []
+
+    async def boom(_sb, *, url=None):
+        raise RuntimeError("S3 is down")
+
+    async def fake_stop(inst):
+        called.append("stop")
+
+    monkeypatch.setattr(srv, "snapshot_supervisor", boom)
+    monkeypatch.setattr(srv, "stop_instance", fake_stop)
+
+    sb = SandboxRecord(
+        id="sb_test", provider="local", sandbox_ref="fake",
+        status="running", root="/tmp", listen_port=12345,
+    )
+    inst = ProviderInstance(
+        provider="local", url="http://localhost:12345",
+        root="/tmp", sandbox_id="fake",
+    )
+    await srv.snapshot_and_stop(sb, inst)
+    assert called == ["stop"]

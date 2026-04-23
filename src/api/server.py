@@ -2013,6 +2013,46 @@ async def snapshot_supervisor(
             )
 
 
+async def snapshot_and_stop(
+    sandbox: SandboxRecord,
+    instance: ProviderInstance | None = None,
+    *, url: str | None = None,
+) -> None:
+    """Snapshot the workspace, then stop the sandbox at the provider.
+
+    The single server-initiated stop entry point under the snapshot-on-stop
+    model: reap, /sandboxes/:id/stop, sandbox-replacement during recovery,
+    agent-delete all route through here.
+
+    Ordering is strict — snapshot before stop, even if the snapshot step
+    itself fails. ``snapshot_supervisor`` already swallows its own errors,
+    but we wrap again defensively so a bug in the helper cannot wedge the
+    stop path. The sandbox is about to die; a lost snapshot is recoverable
+    (the user loses a turn's worth of state, at most), a wedged stop is not.
+
+    ``instance`` is used if provided; otherwise we look up _INSTANCES or
+    synthesize a minimal ProviderInstance from the sandbox row so
+    ``stop_instance`` can still target the provider.
+    """
+    try:
+        await snapshot_supervisor(sandbox, url=url)
+    except Exception as e:
+        log.warning(
+            "snapshot_and_stop: snapshot step failed for %s: %s; "
+            "proceeding to stop anyway", sandbox.id, e,
+        )
+
+    inst = instance or _INSTANCES.get(sandbox.id)
+    if inst is None:
+        vol = await get_volume(sandbox.volume_id) if sandbox.volume_id else None
+        provider = vol.provider if vol else sandbox.provider
+        inst = ProviderInstance(
+            provider=provider, url="",
+            root=sandbox.root, sandbox_id=sandbox.sandbox_ref,
+        )
+    await stop_instance(inst)
+
+
 async def _ensure_sandbox_alive(
     sandbox_id: str,
     sandbox_record: SandboxRecord,
