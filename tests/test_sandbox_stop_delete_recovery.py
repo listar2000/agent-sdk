@@ -1,6 +1,7 @@
 """E2E: sandbox stop/delete recovery and session resume.
 
-All tests require a live server on localhost:7778. Three test groups:
+All tests require a live server on localhost:7778. Four test groups
+(8 test functions total, each parametrized over local/docker/daytona):
 
   1. stop  — external sandbox stop → server restarts same sandbox → same hostname,
              files at /tmp survive (same sandbox, /tmp is not volume but same process)
@@ -8,11 +9,18 @@ All tests require a live server on localhost:7778. Three test groups:
   2. delete — external sandbox delete → server provisions new sandbox on same volume
               → different hostname, files in the VOLUME working dir survive
 
-  3. resume — session persists across ensure_session_live re-entrancy (simulates
-              server restart by clearing SESSIONS in-process)
+  3. resume — session persists across ensure_session_live re-entrancy, including
+              a midstream variant that exercises the SSE-reader's own recovery
+              path (reader observes upstream EOF, rebinds, resumes)
 
-Each parametrized over provider ("local", "docker", "daytona") and skipped when
-the provider is unavailable.
+  4. message-after-stop — POST /message races external stop. Three scenarios
+              increasing in subtlety: no-delay (scheduler race), short-delay
+              (reader has observed disconnect but still retrying), and
+              persistent-SSE (UI holds /events open across turns — the path
+              where the subscriber-kick-on-rebuild bug lived)
+
+Skipped when the provider is unavailable (no docker daemon, no DAYTONA_API_KEY
++ CLAUDE_CODE_OAUTH_TOKEN, or no server on localhost:7778).
 """
 from __future__ import annotations
 
