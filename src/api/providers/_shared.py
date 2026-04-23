@@ -287,7 +287,17 @@ async def _recycle_port(instance) -> None:
 
 
 def _port_is_bindable(port: int) -> bool:
-    """Return True if ``port`` is currently free to bind on 127.0.0.1."""
+    """Return True if ``port`` is currently free to bind on 127.0.0.1.
+
+    Rejects port 0 even though ``bind(("127.0.0.1", 0))`` technically
+    succeeds — that's OS-assigned allocation, not "this port is free," and
+    callers treat the return value as the port they'll listen on. Letting
+    0 through here meant a spurious 0 entry in ``_freed_ports`` would get
+    recycled and crash supervisor startup with "health check failed on
+    port 0".
+    """
+    if port <= 0:
+        return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:

@@ -246,8 +246,10 @@ async def create_sandbox(
         os.makedirs(home_dir / ".claude", exist_ok=True)
     await asyncio.to_thread(_mkhome)
 
-    # Allocate a port via the shared allocator.
-    if port is None:
+    # Allocate a port via the shared allocator. port=0 is treated the same
+    # as None — it's always an invalid listen port for us, and historical
+    # bugs pushed 0 into _freed_ports, so defend at the entry point too.
+    if port is None or port == 0:
         port = await _find_free_port()
 
     # Build the supervisor env. Local provider is by definition single-tenant
@@ -326,6 +328,7 @@ async def create_sandbox(
         root=str(home_dir),
         sandbox_id=str(proc.pid),
         port=port,
+        process=proc,
     )
 
 

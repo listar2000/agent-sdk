@@ -2420,14 +2420,20 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
         # dead port.
         proc_alive = True
         if cached_inst is not None and cached_inst.process is not None:
+            # Both subprocess.Popen (local provider) and
+            # asyncio.subprocess.Process expose .poll() which reaps zombies
+            # and updates returncode. os.kill(pid, 0) alone returns success
+            # on zombie PIDs until the parent reaps, which is exactly our
+            # situation after a test's external SIGKILL before the server
+            # calls wait(). .poll() closes that hole.
             proc = cached_inst.process
+            try:
+                if hasattr(proc, "poll"):
+                    proc.poll()
+            except Exception:
+                pass
             if proc.returncode is not None:
                 proc_alive = False
-            elif proc.pid is not None:
-                try:
-                    os.kill(proc.pid, 0)
-                except (ProcessLookupError, PermissionError):
-                    proc_alive = False
         if (
             cached_inst is not None
             and existing_state is not None
