@@ -586,6 +586,18 @@
               <span class="field-type">INTEGER</span>
               <span class="field-desc">Docker/Local port for URL reconstruction on cold-start</span>
             </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">dockerfile</span>
+              <span class="field-type">TEXT</span>
+              <span class="field-desc">provisioning identity — path to Dockerfile used to build this sandbox image (moved from AgentConfig 2026-04-23)</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">shared_mounts</span>
+              <span class="field-type">JSONB NOT NULL</span>
+              <span class="field-desc">list of shared-folder names; each mounts &lt;volume&gt;/shared/&lt;name&gt; at /mnt/&lt;name&gt;. Frozen at provision time — change requires /reset-sandbox. Moved from AgentConfig 2026-04-23.</span>
+            </div>
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">created_at</span>
@@ -650,6 +662,12 @@
               <span class="field-name">secrets</span>
               <span class="field-type">JSONB NOT NULL</span>
               <span class="field-desc">default {} (plaintext for now)</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">cwd</span>
+              <span class="field-type">TEXT NOT NULL</span>
+              <span class="field-desc">default '/tmp'. Per-conversation working directory — determines the JSONL hash (~/.claude/projects/&lt;hash&gt;/&lt;inner_sid&gt;.jsonl), so frozen at session-create time. Moved from AgentConfig 2026-04-23.</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -832,12 +850,6 @@
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">cwd</span>
-              <span class="field-type">str?</span>
-              <span class="field-desc">working directory</span>
-            </div>
-            <div class="field">
-              <div class="field-badges"></div>
               <span class="field-name">tools</span>
               <span class="field-type">list[str]?</span>
             </div>
@@ -853,25 +865,13 @@
               <span class="field-type">list | dict?</span>
               <span class="field-desc">npx skills sources</span>
             </div>
-            <div class="field is-new">
-              <div class="field-badges"><span class="badge-field-new">new</span></div>
-              <span class="field-name">dockerfile</span>
-              <span class="field-type">str?</span>
-              <span class="field-desc">custom sandbox image</span>
+            <div class="relation-note">Stored as JSON in agents.config column. Pure agent identity — cloneable, no per-invocation state.</div>
+            <div class="relation-note" style="margin-top:6px;">
+              <strong>Moved out of AgentConfig (2026-04-23):</strong><br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">cwd</code> → <code style="font-family:monospace;color:#fb923c;">sessions.cwd</code> (JSONL-hash key; per-conversation)<br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">dockerfile</code> + <code style="font-family:monospace;color:#fb923c;">shared_mounts</code> → <code style="font-family:monospace;color:#fb923c;">sandboxes</code> (provisioning identity; frozen per-sandbox)<br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">env</code> → dropped; use <code style="font-family:monospace;color:#fb923c;">sessions.env</code> / <code style="font-family:monospace;color:#fb923c;">sessions.secrets</code>
             </div>
-            <div class="field">
-              <div class="field-badges"></div>
-              <span class="field-name">env</span>
-              <span class="field-type">dict[str,str]</span>
-              <span class="field-desc">non-secret env baked into every session on this agent (e.g. LANG, TZ)</span>
-            </div>
-            <div class="field is-new">
-              <div class="field-badges"><span class="badge-field-new">new</span></div>
-              <span class="field-name">shared_mounts</span>
-              <span class="field-type">list[str]</span>
-              <span class="field-desc">opt-in: each entry mounts &lt;volume&gt;/shared/&lt;name&gt; at /mnt/&lt;name&gt; inside the sandbox</span>
-            </div>
-            <div class="relation-note">Stored as JSON in agents.config column.</div>
           </div>
         </div>
 

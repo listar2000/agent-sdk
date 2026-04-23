@@ -1212,6 +1212,7 @@ class TestResumeRecovery:
             "current_sandbox_id": "sbx-1",
             "volume_id": "vol-1",
             "inner_session_id": None,
+            "cwd": "/tmp",
         }
         sandbox = SandboxRecord(
             id="sbx-1",
@@ -1238,7 +1239,7 @@ class TestResumeRecovery:
         with patch("api.server.get_agent", AsyncMock(return_value=AgentRecord(
             id="agent-1",
             name="agent",
-            config=AgentConfig(agent_type="claude", cwd="/tmp"),
+            config=AgentConfig(agent_type="claude"),
         ))), patch(
             "api.server.get_volume",
             AsyncMock(return_value=volume),
@@ -1260,7 +1261,7 @@ class TestResumeRecovery:
             "api.server.free_sandbox_port",
         ), patch(
             "api.server._build_spawn_env_from_row",
-            AsyncMock(return_value={}),
+            return_value={},
         ):
             # Call the internal helper directly — server_mod.ensure_runtime is
             # patched in the autouse fixture for the other tests in this module,

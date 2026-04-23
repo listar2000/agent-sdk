@@ -383,12 +383,17 @@ class TestServerHelpers:
         assert config_data["tools"] == ["Bash"]         # merged from data
 
     def test_merge_top_level_config_adds_missing_keys(self):
-        """_merge_top_level_config adds keys that are absent from config_data."""
-        data = {"model": "gpt-4", "cwd": "/workspace", "prompt": "be helpful"}
+        """_merge_top_level_config adds keys that are absent from config_data.
+
+        After the 2026-04-23 ownership split, cwd is session-level and is
+        not in _CONFIG_KEYS — only identity fields (model, prompt, tools,
+        …) get merged into AgentConfig.
+        """
+        data = {"model": "gpt-4", "agent_type": "codex", "prompt": "be helpful"}
         config_data = {}
         _merge_top_level_config(data, config_data)
         assert config_data["model"] == "gpt-4"
-        assert config_data["cwd"] == "/workspace"
+        assert config_data["agent_type"] == "codex"
         assert config_data["prompt"] == "be helpful"
 
     # NOTE: tests for the removed ``_derive_sandbox_ref`` helper used to live
@@ -1205,11 +1210,11 @@ class TestAgentConfigEdgeCases:
 
     def test_to_dict_omits_none_values(self):
         """AgentConfig.to_dict() excludes fields that are None."""
-        config = AgentConfig(agent_type="claude", model=None, cwd="/tmp")
+        config = AgentConfig(agent_type="claude", model=None, prompt="hi")
         d = config.to_dict()
         assert "model" not in d
         assert d["agent_type"] == "claude"
-        assert d["cwd"] == "/tmp"
+        assert d["prompt"] == "hi"
 
     def test_from_dict_ignores_unknown_keys(self):
         """AgentConfig.from_dict() silently ignores unrecognised keys."""
