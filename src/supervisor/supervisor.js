@@ -119,10 +119,6 @@ acp.on("exit", (code, signal) => {
 // for a specific response register here; the stdout reader resolves them.
 const pendingResponses = new Map();
 
-// JSON-RPC ids of in-flight session/prompt requests. When we see a matching
-// response from the ACP child, the agent's turn is done — kick a snapshot.
-const pendingPromptIds = new Set();
-
 // SSE subscribers — every line of acp stdout is fanned out to these.
 const sseSubscribers = new Set();
 
@@ -272,23 +268,11 @@ async function handleAcpLine(line) {
     "id" in msg &&
     ("result" in msg || "error" in msg)
   ) {
+    // Snapshot is no longer triggered per-turn. The server now calls
+    // POST /v1/snapshot before stopping the sandbox (snapshot_and_stop in
+    // server.py). Turn-end just resolves the pending POST response — no
+    // blocking tar/cp on the critical path.
     const rid = String(msg.id);
-    const isPromptResponse = pendingPromptIds.has(rid);
-    // Turn-end: block the HTTP response until the workspace snapshot for
-    // this turn is durable on the volume. Trade ~0.5–2 s of end-of-turn
-    // latency for the invariant "once the client sees `turn done`, the
-    // sandbox can be deleted without losing the turn". The original async
-    // firing left a race window in which `daytona.delete()` could kill
-    // the container mid-PUT, losing the session JSONL and causing
-    // session/load to fail on the replacement sandbox.
-    if (isPromptResponse) {
-      pendingPromptIds.delete(rid);
-      try {
-        await runSnapshotOnce();
-      } catch (e) {
-        log(`snapshot error on turn-end: ${e.message}`);
-      }
-    }
     const resolver = pendingResponses.get(rid);
     if (resolver) {
       pendingResponses.delete(rid);
@@ -330,13 +314,6 @@ async function handlePost(req, res) {
     res.writeHead(502, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "acp stdin write failed: " + e.message }));
     return;
-  }
-
-  // Remember session/prompt request ids so the stdout reader can trigger a
-  // snapshot when the matching response lands. Covers every client variant —
-  // SDK + direct-ACP + external integrations — without parsing update events.
-  if (body && body.method === "session/prompt" && "id" in body) {
-    pendingPromptIds.add(String(body.id));
   }
 
   // Notification — fire-and-forget.
