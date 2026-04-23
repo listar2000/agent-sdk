@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+from psycopg.types.json import Json
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -617,21 +618,15 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     )
     if agent_record is None:
         raise RuntimeError(f"agent {state.agent_id} missing during rebind")
-    cfg = agent_record.config
-    agent_env = (cfg.env or {}) if cfg else {}
-    spawn_env = _merge_env(
-        agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
-    )
-    shared_mounts = (list(cfg.shared_mounts) if cfg and cfg.shared_mounts else None)
+    # Session row owns env/secrets/cwd now; sandbox row owns shared_mounts.
+    spawn_env = _build_spawn_env_from_row(session_row)
     new_url, _ = await _ensure_sandbox_alive(
         state.sandbox_id, sandbox_record,
         agent_type=state.agent_type, spawn_env=spawn_env,
-        shared_mounts=shared_mounts,
     )
-    # cwd MUST match what session/new used (agent.config.cwd). Using
-    # sandbox_record.root instead would change the JSONL hash and cause
-    # session/load to fall back to session/new, losing context.
-    cwd = (cfg.cwd or "/tmp") if cfg else "/tmp"
+    # cwd MUST match what session/new used — it determines the JSONL hash.
+    # session.cwd is populated at session-create time and frozen thereafter.
+    cwd = session_row.get("cwd") or "/tmp"
     new_client = AcpClient(new_url)
     new_acp_session_id = str(uuid.uuid4())
     new_inner_sid, started_fresh = await _attach_acp_session(
@@ -996,11 +991,12 @@ _CONFIG_KEYS = (
     "mcp_servers",
     "skills",
     "agent_type",
-    "cwd",
-    "root",
-    "dockerfile",
-    "dockerfile_content",
 )
+
+# Keys that were once inside AgentConfig but now live on session / sandbox
+# rows. `/agents` POST rejects them with 400 so callers migrate cleanly;
+# `/sessions/quick` and `/sessions` consume them and route to the right row.
+_AGENT_REJECTED_KEYS = ("cwd", "env", "dockerfile", "dockerfile_content", "shared_mounts")
 
 
 def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
@@ -1088,18 +1084,13 @@ def _pop_env_and_secrets(
     return env, secrets
 
 
-async def _build_spawn_env_from_row(rec: dict) -> dict[str, str]:
-    """Assemble spawn_env (agent.env ∪ session.env ∪ session.secrets) from a
-    session row already fetched from the DB."""
-    agent_id = rec.get("agent_id")
-    session_env = rec.get("env") or {}
-    session_secrets = rec.get("secrets") or {}
-    agent_env: dict[str, str] = {}
-    if agent_id:
-        agent_record = await get_agent(agent_id)
-        if agent_record is not None:
-            agent_env = agent_record.config.env or {}
-    return _merge_env(agent_env, session_env, session_secrets)
+def _build_spawn_env_from_row(rec: dict) -> dict[str, str]:
+    """Assemble spawn_env (session.env ∪ session.secrets) from a session row.
+
+    Agent-level env is no longer a thing after the config-ownership split —
+    session.env is the only non-secret source, session.secrets stacks on top.
+    """
+    return _merge_env(rec.get("env") or {}, rec.get("secrets") or {})
 
 
 async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
@@ -1111,45 +1102,16 @@ async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
     strip auth keys, so auto-recovery simply has nothing extra to inject.
     """
     rec = await get_any_session_for_sandbox(sandbox_id)
-    if rec is None:
-        return {}
-    return await _build_spawn_env_from_row(rec)
+    return _build_spawn_env_from_row(rec) if rec else {}
 
 
-async def _shared_mounts_for_sandbox(rec: SandboxRecord) -> list[str] | None:
-    """Return the agent's shared_mounts for this sandbox, or None if unknown.
-
-    The subpath encodes the agent id (``agents/<agent_id>``) — we parse it
-    back to look up the current agent config. If shared_mounts changed on
-    the agent since provisioning, the recovered sandbox reflects the
-    current config; that's intentional (treat shared_mounts as a
-    live-attached-at-recovery setting, not a frozen provision-time property).
-    """
-    if not rec.subpath or not rec.subpath.startswith("agents/"):
-        return None
-    agent_id = rec.subpath.split("/", 2)[1]
-    if not agent_id:
-        return None
-    try:
-        agent = await get_agent(agent_id)
-    except Exception:
-        return None
-    if agent is None or agent.config is None:
-        return None
-    return list(agent.config.shared_mounts) if agent.config.shared_mounts else None
-
-
-def _merge_env(
-    agent_env: dict[str, str] | None,
-    session_env: dict[str, str] | None,
-    secrets: dict[str, str] | None,
-) -> dict[str, str]:
-    """Build the env that lands in a supervisor subprocess.
-
-    Precedence (later wins): agent.env → session.env → secrets.
-    Returns a fresh dict; never mutates inputs.
-    """
-    return {**(agent_env or {}), **(session_env or {}), **(secrets or {})}
+def _merge_env(*sources: dict[str, str] | None) -> dict[str, str]:
+    """Merge env dicts (later sources win); None is treated as empty."""
+    out: dict[str, str] = {}
+    for s in sources:
+        if s:
+            out.update(s)
+    return out
 
 
 def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
@@ -1175,11 +1137,13 @@ def _sandbox_record(
     subpath: str,
     root_fallback: str = "/tmp",
     status: str = STATUS_RUNNING,
+    dockerfile: str | None = None,
+    shared_mounts: list[str] | None = None,
 ) -> SandboxRecord:
     """Build a SandboxRecord from a freshly-provisioned ProviderInstance.
 
-    Consolidates the seven call sites that construct an identical shape
-    from ``(sandbox_id, provider, instance, volume_id, subpath)``.
+    ``dockerfile`` + ``shared_mounts`` are the provisioning identity of the
+    sandbox — frozen at create time, read unchanged by later recoveries.
     """
     return SandboxRecord(
         id=sandbox_id,
@@ -1190,6 +1154,8 @@ def _sandbox_record(
         volume_id=volume_id,
         subpath=subpath,
         listen_port=instance.port,
+        dockerfile=dockerfile,
+        shared_mounts=shared_mounts or [],
     )
 
 
@@ -1205,9 +1171,17 @@ async def create_agent(request: Request):
     name = data.get("name")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
-    if materialized := _materialize_dockerfile(config_data):
-        config_data["dockerfile"] = materialized
+    # cwd / env / dockerfile / shared_mounts moved off AgentConfig — reject
+    # them at the boundary so stale clients get a clear 400 instead of
+    # silently-discarded fields.
+    for k in _AGENT_REJECTED_KEYS:
+        if k in data or k in config_data:
+            raise HTTPException(
+                400,
+                f"'{k}' no longer belongs to agent config. "
+                "cwd → session; env → session; dockerfile + shared_mounts → sandbox. "
+                "Set these on POST /sessions or /sessions/quick instead.",
+            )
     config = AgentConfig.from_dict(config_data)
     await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
     return {"id": agent_id, "name": name, "config": config.to_dict()}
@@ -1570,6 +1544,8 @@ async def create_sandbox(request: Request):
     record = _sandbox_record(
         sandbox_id, provider, instance,
         volume_id=vol.id, subpath=subpath, root_fallback=root,
+        dockerfile=dockerfile,
+        shared_mounts=list(shared_mounts) if shared_mounts else [],
     )
     await upsert_sandbox(record)
     # Dual-key: ``sandbox_id`` for /sandboxes/provision parity; ``id`` stays
@@ -1673,13 +1649,14 @@ async def provision_sandbox_route(request: Request):
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
-    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
-    root = config_data.get("root", data.get("root", cwd))
-    dockerfile = _materialize_dockerfile(config_data)
-    config = AgentConfig.from_dict(
-        {**config_data, "agent_type": agent_type, "cwd": cwd}
-    )
+    # Sandbox-level inputs come straight from the body now, not via AgentConfig.
+    cwd = data.get("cwd", config_data.pop("cwd", "/tmp"))
+    root = data.get("root", config_data.pop("root", cwd))
+    dockerfile = _materialize_dockerfile({**config_data, **data})
+    shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
+    config_data.pop("dockerfile", None)
+    config_data.pop("dockerfile_content", None)
+    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type})
 
     subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
     explicit_provider = data.get("provider")
@@ -1718,7 +1695,7 @@ async def provision_sandbox_route(request: Request):
             pre_start_commands=pre_start_commands if pre_start_commands else None,
             root=root,
             sandbox_id=sandbox_id,
-            shared_mounts=config.shared_mounts or None,
+            shared_mounts=shared_mounts or None,
         )
     except Exception as e:
         if "circuit breaker" in str(e).lower():
@@ -1729,6 +1706,8 @@ async def provision_sandbox_route(request: Request):
     await upsert_sandbox(_sandbox_record(
         sandbox_id, provider, instance,
         volume_id=vol.id, subpath=subpath, root_fallback=root,
+        dockerfile=dockerfile,
+        shared_mounts=list(shared_mounts) if shared_mounts else [],
     ))
 
     # Dual-key: ``sandbox_id`` is the historic shape, ``id`` matches the
@@ -2123,8 +2102,7 @@ async def _instance_is_alive(inst: ProviderInstance) -> bool:
 
 async def _replace_sandbox_inplace(
     sandbox_id: str, rec: SandboxRecord, agent_type: str,
-    dockerfile: str | None, spawn_env: dict,
-    shared_mounts: list[str] | None = None,
+    spawn_env: dict,
 ) -> tuple[ProviderInstance, bool]:
     """Provision a fresh provider instance for ``sandbox_id``, keeping the
     same DB row. For port-based providers always just provision_sandbox.
@@ -2132,13 +2110,13 @@ async def _replace_sandbox_inplace(
     inside a live sandbox); only on unrecoverable errors create a brand-new
     daytona sandbox (replaced=True).
 
-    ``shared_mounts`` is opt-in: callers that already hold the agent record
-    pass the list through to skip the internal get_agent lookup. When None
-    we do the lookup ourselves.
+    dockerfile + shared_mounts come from the sandbox row itself — the
+    sandbox owns its provisioning identity, so a replacement always gets
+    the same image + mount layout.
     """
     provider = rec.provider
-    if shared_mounts is None:
-        shared_mounts = await _shared_mounts_for_sandbox(rec)
+    dockerfile = rec.dockerfile
+    shared_mounts = list(rec.shared_mounts) if rec.shared_mounts else None
     if provider in PORT_BASED_PROVIDERS:
         if not rec.volume_id:
             raise RuntimeError(f"Sandbox {sandbox_id} has no volume_id")
@@ -2189,9 +2167,7 @@ async def _ensure_sandbox_alive(
     sandbox_id: str,
     sandbox_record: SandboxRecord,
     agent_type: str = "claude",
-    dockerfile: str | None = None,
     spawn_env: dict[str, str] | None = None,
-    shared_mounts: list[str] | None = None,
 ) -> tuple[str, bool]:
     """Ensure the supervisor for ``sandbox_id`` is reachable. Restart if needed.
 
@@ -2254,14 +2230,17 @@ async def _ensure_sandbox_alive(
             except Exception: pass
         log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
         new_instance, replaced = await _replace_sandbox_inplace(
-            sandbox_id, fresh, agent_type, dockerfile, spawn_env,
-            shared_mounts=shared_mounts,
+            sandbox_id, fresh, agent_type, spawn_env,
         )
         _INSTANCES[sandbox_id] = new_instance
+        # Preserve dockerfile + shared_mounts on the replacement row so future
+        # recoveries keep the same provisioning identity.
         await upsert_sandbox(_sandbox_record(
             sandbox_id, provider, new_instance,
             volume_id=sandbox_record.volume_id, subpath=sandbox_record.subpath,
             root_fallback=sandbox_record.root,
+            dockerfile=fresh.dockerfile,
+            shared_mounts=list(fresh.shared_mounts or []),
         ))
         return new_instance.url, replaced
 
@@ -2493,16 +2472,21 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
     raise HTTPException(500, f"Unknown sandbox status: {status}")
 
 
-async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxRecord:
+async def _provision_new(
+    session_row: dict, previous_id: str | None,
+    *,
+    dockerfile: str | None = None,
+    shared_mounts: list[str] | None = None,
+) -> SandboxRecord:
     """Create a fresh sandbox (provider selected from the session's volume).
 
-    Dispatches through the uniform ``provision_sandbox`` wrapper so docker,
-    local, and daytona all work. Supervisor is installed on the volume first
-    (idempotent fast-path); the sandbox is then attached to it.
+    ``dockerfile`` + ``shared_mounts`` define the new sandbox's provisioning
+    identity. Callers supply them from: (a) the request body (new session),
+    or (b) a prior sandbox row being replaced (reset). Sandbox row is the
+    durable source of truth once created.
     """
     agent_id = session_row["agent_id"]
     subpath = f"agents/{agent_id}"
-    # Parallel DB reads — volume + agent are independent lookups.
     vol, agent = await asyncio.gather(
         get_volume(session_row["volume_id"]),
         get_agent(agent_id),
@@ -2510,17 +2494,11 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
     if vol is None:
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
     agent_type = (agent.config.agent_type if agent and agent.config else "claude")
-    shared_mounts = (agent.config.shared_mounts if agent and agent.config else None)
 
-    # Ensure supervisor is installed on the volume before provisioning the sandbox.
-    # This is idempotent: fast-path if already installed (cache hit in volumes table).
+    # Supervisor install is idempotent (cache hit in volumes table on reruns).
     await ensure_volume_supervisor(vol.id, agent_type)
 
-    # Build spawn_env from the agent we already fetched (avoids another get_agent).
-    agent_env = (agent.config.env or {}) if agent and agent.config else {}
-    spawn_env = _merge_env(
-        agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
-    )
+    spawn_env = _build_spawn_env_from_row(session_row)
 
     # Provider-specific default root. Daytona mounts per-agent at /home/daytona;
     # docker at /home/agent; local fills it in from the volume path.
@@ -2539,32 +2517,35 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
         spawn_env=spawn_env,
         root=root,
         sandbox_id=new_sandbox_id,
-        shared_mounts=shared_mounts,
+        dockerfile=dockerfile,
+        shared_mounts=shared_mounts or None,
     )
 
     sb = _sandbox_record(
         new_sandbox_id, vol.provider, inst,
         volume_id=vol.id, subpath=subpath,
         root_fallback=root or "/tmp",
+        dockerfile=dockerfile,
+        shared_mounts=shared_mounts,
     )
     _INSTANCES[sb.id] = inst
 
     # Atomic: insert the sandbox row + link session->sandbox in one
-    # transaction. A crash between the two writes would otherwise orphan
-    # the sandbox (row exists on the provider + in sandboxes, but no
-    # session points at it). Use a single pool connection so both
-    # statements commit (or roll back) together.
+    # transaction so a crash between writes can't orphan the sandbox.
     async with get_db() as conn:
         await conn.execute(
             "INSERT INTO sandboxes"
-            " (id, provider, sandbox_ref, status, root, volume_id, subpath, listen_port)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+            " (id, provider, sandbox_ref, status, root, volume_id, subpath,"
+            "  listen_port, dockerfile, shared_mounts)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
             " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
             " root=EXCLUDED.root, volume_id=EXCLUDED.volume_id,"
-            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port",
+            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port,"
+            " dockerfile=EXCLUDED.dockerfile, shared_mounts=EXCLUDED.shared_mounts",
             (sb.id, sb.provider, sb.sandbox_ref, sb.status,
-             sb.root, sb.volume_id, sb.subpath, sb.listen_port),
+             sb.root, sb.volume_id, sb.subpath, sb.listen_port,
+             sb.dockerfile, Json(list(sb.shared_mounts or []))),
         )
         await conn.execute(
             "UPDATE sessions SET current_sandbox_id = %s WHERE id = %s",
@@ -2635,14 +2616,9 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
     agent_type = agent_record.config.agent_type or "claude"
 
-    # Build spawn_env from the agent we already fetched (HOME → sandbox root).
-    cfg = agent_record.config
-    agent_env = (cfg.env or {}) if cfg else {}
-    root = sandbox.root or (cfg.cwd if cfg else None) or "/tmp"
-    effective_spawn_env = {
-        **_merge_env(agent_env, session_row.get("env") or {}, session_row.get("secrets") or {}),
-        "HOME": root,
-    }
+    # Build spawn_env from the session row (agent no longer owns env).
+    root = sandbox.root or "/tmp"
+    effective_spawn_env = {**_build_spawn_env_from_row(session_row), "HOME": root}
 
     # Supervisor URL resolution:
     #  - Port-based (local/docker): URL is known from _INSTANCES or the DB row.
@@ -2680,17 +2656,12 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     client = AcpClient(supervisor_url)
     acp_session_id = str(uuid.uuid4())
     # cwd determines the hash under which Claude Code writes the session
-    # JSONL (~/.claude/projects/<hash>/<inner_sid>.jsonl). For session/load
-    # to find the same file on a replacement sandbox, cwd MUST match the
-    # one that was passed to session/new. The agent's stored config.cwd
-    # captures exactly that: it's what sessions_quick_create used at
-    # create-time (default_cwd_for_provider for the provider). HOME is
-    # always the sandbox's root regardless of cwd, so ``~/.claude/projects``
-    # still lands in a persistent location. Falling back to root (the
-    # sandbox HOME) breaks recovery for any agent whose original session
-    # was created with cwd != root — e.g. local provider where default cwd
-    # is /tmp.
-    cwd = (cfg.cwd or "/tmp") if cfg else "/tmp"
+    # JSONL (~/.claude/projects/<hash>/<inner_sid>.jsonl). Lives on the
+    # session row — frozen at session-create time and read unchanged by
+    # every subsequent rebind / replacement, so session/load always finds
+    # the right JSONL. HOME is the sandbox root regardless of cwd, so
+    # ``~/.claude/projects`` still lands on the persistent volume.
+    cwd = session_row.get("cwd") or "/tmp"
 
     # Single source of truth for "get me an attached ACP session" — tries
     # session/load when an inner_sid exists and only falls through to
@@ -2907,10 +2878,12 @@ async def sessions_create(request: Request):
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), default_provider)
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
-    # Default cwd lands on the volume mount (persistent), not /tmp — so
-    # the agent's ~/ and working-dir files survive sandbox restart/replace.
-    cwd = config_data.get("cwd", data.get("cwd", default_cwd_for_provider(default_provider)))
+    # Pull session cwd out of the body; agent config is pure identity now.
+    cwd = data.get("cwd", config_data.pop("cwd", default_cwd_for_provider(default_provider)))
+    config_data.pop("dockerfile", None)
+    config_data.pop("dockerfile_content", None)
+    config_data.pop("shared_mounts", None)
+    config_data.pop("root", None)
 
     agent_id = data.get("agent_id")
     if agent_id:
@@ -2920,16 +2893,20 @@ async def sessions_create(request: Request):
         await upsert_agent(AgentRecord(
             id=agent_id, name=data.get("name"),
             config=AgentConfig.from_dict(
-                {**config_data, "agent_type": data.get("agent_type", "claude"), "cwd": cwd}
+                {**config_data, "agent_type": data.get("agent_type", "claude")}
             ),
         ))
 
     session_id = str(uuid.uuid4())
     # Lazy mode: no sandbox provisioning here. current_sandbox_id = None.
+    # dockerfile + shared_mounts defer to whatever the eventual
+    # /sessions/{id}/start-sandbox or first /message supplies (currently
+    # they default to none; future: body of /sessions could set them).
     await upsert_session(
         session_id, agent_id, sandbox_id=None, inner_session_id=None,
         volume_id=volume_record.id,
         env=body_env or {}, secrets=body_secrets or {},
+        cwd=cwd,
     )
 
     return {
@@ -2958,20 +2935,25 @@ async def sessions_quick_create(request: Request):
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
-    # Default cwd lands on the volume mount (persistent), not /tmp — so
-    # the agent's ~/ and working-dir files survive sandbox restart/replace.
-    cwd = config_data.get("cwd", data.get("cwd", default_cwd_for_provider(provider)))
-    root = config_data.get("root", data.get("root", cwd))
-    dockerfile = _materialize_dockerfile(config_data)
+
+    # Pull session-level and sandbox-level fields out of the request body
+    # before building AgentConfig (which is pure identity now).
+    cwd = data.get("cwd", config_data.pop("cwd", default_cwd_for_provider(provider)))
+    root = data.get("root", config_data.pop("root", cwd))
+    dockerfile = _materialize_dockerfile({**config_data, **data})
+    shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
+    # Drop any dockerfile_content key that may have landed in config_data;
+    # _materialize_dockerfile already consumed it above.
+    config_data.pop("dockerfile_content", None)
+    config_data.pop("dockerfile", None)
 
     agent_id = str(uuid.uuid4())
-    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type, "cwd": cwd})
+    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type})
     await upsert_agent(AgentRecord(id=agent_id, name=data.get("name"), config=config))
 
     session_env = body_env or {}
     session_secrets = body_secrets or {}
-    spawn_env = _merge_env(config.env, session_env, session_secrets)
+    spawn_env = _merge_env(session_env, session_secrets)
 
     # Install skills BEFORE starting the supervisor — claude-agent-acp
     # discovers skills at process startup. For local: install on host.
@@ -3004,7 +2986,7 @@ async def sessions_quick_create(request: Request):
             root=root, spawn_env=spawn_env,
             volume_id=volume_record.provider_ref, subpath=subpath,
             sandbox_id=sandbox_id,
-            shared_mounts=config.shared_mounts or None,
+            shared_mounts=shared_mounts or None,
         )
     except Exception as e:
         await delete_agent(agent_id)
@@ -3018,6 +3000,7 @@ async def sessions_quick_create(request: Request):
     await upsert_sandbox(_sandbox_record(
         sandbox_id, provider, instance,
         volume_id=volume_id, subpath=subpath, root_fallback=root,
+        dockerfile=dockerfile, shared_mounts=shared_mounts,
     ))
 
     async def _cleanup_and_raise(msg_fmt: str, e: Exception) -> None:
@@ -3082,6 +3065,7 @@ async def sessions_quick_create(request: Request):
         session_id, agent_id, sandbox_id, inner_session_id,
         volume_id=volume_id,
         env=session_env, secrets=session_secrets,
+        cwd=cwd,
     )
 
     # Dual-key response: ``sandbox_id`` matches /sandboxes + client code;
@@ -3390,11 +3374,13 @@ async def start_session_sandbox(session_id: str):
 
 @app.post("/sessions/{session_id}/stop-sandbox", status_code=204)
 async def stop_session_sandbox(session_id: str):
-    """Kill the current sandbox. Next /message lazy-provisions a fresh one.
+    """Pause the current sandbox. Next /message resumes the SAME sandbox
+    (same dockerfile, shared_mounts, volume_subpath) — no re-provision.
 
-    Durability lives at turn-end in the supervisor; stop here is just
-    destroy. The replacement sandbox restores from the last turn-end
-    snapshot on first boot.
+    Stops compute (SIGTERM / daytona.stop()) but keeps the sandboxes row
+    so ensure_sandbox's "status=stopped → start_sandbox" branch can revive
+    it with all its provisioning identity intact. Use /reset-sandbox for
+    the tear-down-and-recreate semantic.
     """
     sess = await _require_session_row(session_id)
     sbid = sess.get("current_sandbox_id")
@@ -3403,25 +3389,64 @@ async def stop_session_sandbox(session_id: str):
     sb = await get_sandbox(sbid)
     if sb:
         try:
-            await _providers_mod.destroy_sandbox(sb.provider, _synthesize_instance(sb))
+            await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))
         except Exception:
             pass  # best-effort
-    await set_session_current_sandbox(session_id, None)
-    await delete_sandbox(sbid)
+        sb.status = STATUS_STOPPED
+        await upsert_sandbox(sb)
+    _INSTANCES.pop(sbid, None)
+    # Shut down any live SessionState so the next /message rebuilds cleanly
+    # against the resumed sandbox.
+    state = SESSIONS.get(session_id)
+    if state is not None:
+        await _shutdown_session_state(state, remove=True, force=True)
+    # current_sandbox_id STAYS pointing at the row — that's how resume
+    # finds it. For the old "wipe on stop" behavior, use /reset-sandbox.
 
 
 @app.post("/sessions/{session_id}/reset-sandbox")
-async def reset_session_sandbox(session_id: str):
-    """Kill current sandbox and provision a fresh one."""
+async def reset_session_sandbox(session_id: str, request: Request):
+    """Destroy current sandbox and provision a fresh one. Accepts optional
+    body ``{dockerfile, dockerfile_content, shared_mounts}`` to change the
+    provisioning identity; otherwise inherits from the old sandbox row."""
+    data: dict = {}
+    try:
+        data = await _json_body(request)
+    except HTTPException:
+        pass  # empty body is fine
     sess = await _require_session_row(session_id)
     old_sbid = sess.get("current_sandbox_id")
-    await stop_session_sandbox(session_id)
-    # Re-read the row after stop (current_sandbox_id is now NULL), then provision
-    # a replacement.  Call _provision_new directly (inside the session lock) so
-    # the previous_id is passed through and the sandbox_reattach event is emitted.
+    old_sb = await get_sandbox(old_sbid) if old_sbid else None
+
+    # Destroy compute + delete row (unlike stop, this is the real tear-down).
+    if old_sb:
+        try:
+            await _providers_mod.destroy_sandbox(old_sb.provider, _synthesize_instance(old_sb))
+        except Exception:
+            pass
+    _INSTANCES.pop(old_sbid, None) if old_sbid else None
+    state = SESSIONS.get(session_id)
+    if state is not None:
+        await _shutdown_session_state(state, remove=True, force=True)
+    if old_sbid:
+        await set_session_current_sandbox(session_id, None)
+        await delete_sandbox(old_sbid)
+
+    # Body overrides, else inherit from the old sandbox row.
+    new_dockerfile = _materialize_dockerfile(data) if data else None
+    if new_dockerfile is None:
+        new_dockerfile = old_sb.dockerfile if old_sb else None
+    if "shared_mounts" in data:
+        new_shared_mounts = data.get("shared_mounts") or []
+    else:
+        new_shared_mounts = list(old_sb.shared_mounts) if old_sb else []
+
     fresh_sess = await _require_session_row(session_id)
     async with _get_session_lock(session_id):
-        sandbox = await _provision_new(fresh_sess, previous_id=old_sbid)
+        sandbox = await _provision_new(
+            fresh_sess, previous_id=old_sbid,
+            dockerfile=new_dockerfile, shared_mounts=new_shared_mounts,
+        )
     return {"sandbox_id": sandbox.id}
 
 
