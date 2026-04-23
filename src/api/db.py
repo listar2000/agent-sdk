@@ -259,13 +259,6 @@ _MIGRATIONS = [
             END IF;
         END LOOP;
     END $$""",
-    # Also neutralize the backfill block above so future deploys against
-    # a fresh DB (where no default-<provider> exists yet) don't resurrect
-    # legacy stubs: if we have no legacy rows left AND at least one non-
-    # legacy volume exists, the backfill's "there are sessions with NULL
-    # volume_id" branch is no longer reachable (sessions.volume_id is
-    # NOT NULL after 2026-04-21's earlier step). This is a no-op on
-    # clean DBs — there's nothing to clean up.
 ]
 
 

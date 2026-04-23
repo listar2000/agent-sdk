@@ -223,6 +223,22 @@ class SessionState:
         for rpc_qs in list(self._rpc_subscribers.values()):
             self._send(rpc_qs, item)
 
+    def kick_all(self) -> None:
+        """Wake every subscriber and empty the subscriber tables.
+
+        Called on fatal reader death and forced shutdown — the /events
+        handler's ``q.get()`` needs to unblock so it can see the shutdown
+        flag and close the stream. Clearing the tables prevents further
+        dispatch into now-orphaned queues.
+        """
+        subs = list(self._session_subscribers)
+        self._session_subscribers.clear()
+        for rpc_qs in self._rpc_subscribers.values():
+            subs.extend(rpc_qs)
+        self._rpc_subscribers.clear()
+        for q in subs:
+            self._kick_subscriber(q)
+
 
 
 def _try_put(q: asyncio.Queue, item) -> bool:

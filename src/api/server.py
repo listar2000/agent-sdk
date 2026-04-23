@@ -243,20 +243,9 @@ async def _shutdown_session_state(
         except Exception as e:
             log.warning("failed to kill supervisor port %d for session %s: %s",
                         state.supervisor_port, state.session_id, e)
-    # Kick any subscribers before releasing the state. Without this, a UI
-    # holding a persistent /events stream stays blocked on the orphaned
-    # queue forever — the cancelled SSE reader doesn't broadcast the
-    # sentinel. Kicking wakes the /events handler's ``q.get()`` which
-    # then sees ``shutdown`` and returns, so the UI can reconnect and
-    # subscribe to the replacement state.
-    state.broadcast(_SSE_SENTINEL)
-    for q in state._session_subscribers:
-        state._kick_subscriber(q)
-    state._session_subscribers.clear()
-    for rpc_qs in state._rpc_subscribers.values():
-        for q in rpc_qs:
-            state._kick_subscriber(q)
-    state._rpc_subscribers.clear()
+    # Wake any /events handler waiting on a subscriber queue; without
+    # this the UI stream stays blocked on an orphaned queue forever.
+    state.kick_all()
     if remove and SESSIONS.get(state.session_id) is state:
         SESSIONS.pop(state.session_id, None)
         _session_locks.pop(state.session_id, None)
@@ -375,14 +364,8 @@ async def lifespan(app):
     reaper = asyncio.create_task(_idle_reaper())
     yield
     await _cancel_task(reaper)
-    # Parallel session shutdown. force=True is required on app shutdown:
-    # any session still holding a /events subscriber would otherwise
-    # early-return as a no-op, leaving its SSE reader running while the
-    # supervisor goes away below — the reader then loops through its
-    # retry ladder (up to ~25s backoff) before the task finally exits,
-    # extending uvicorn's drain phase by that much. Force-shutdown
-    # cancels the reader immediately and kicks subscribers so /events
-    # handlers return cleanly.
+    # force=True: a UI still holding /events would otherwise turn each
+    # shutdown into a no-op and the reader's retry ladder blocks drain.
     await asyncio.gather(
         *[_shutdown_session_state(s, remove=False, force=True) for s in SESSIONS.values()],
         return_exceptions=True,
@@ -564,14 +547,7 @@ def _on_sse_reader_death(state: SessionState) -> None:
         state.turn_completed_at = time.time()
     state.active_rpc_id = None
     state.pending_prompts.clear()
-    # Kick all subscribers (session + RPC-scoped)
-    kicked = list(state._session_subscribers)
-    state._session_subscribers.clear()
-    for rpc_qs in state._rpc_subscribers.values():
-        kicked.extend(rpc_qs)
-    state._rpc_subscribers.clear()
-    for q in kicked:
-        state._kick_subscriber(q)
+    state.kick_all()
 
 
 def _sse_reader_disconnect_is_recoverable(state: SessionState) -> bool:
@@ -1551,17 +1527,13 @@ async def create_sandbox(request: Request):
     dockerfile = _materialize_dockerfile(data)
     shared_mounts = data.get("shared_mounts") or None
     sandbox_id = str(uuid.uuid4())
-
-    async def _create_once():
-        return await create_instance(
+    try:
+        instance = await _provision_with_cache_retry(
+            (vol.id, agent_type), create_instance,
             provider, agent_type, dockerfile=dockerfile, root=root,
             volume_id=vol.provider_ref, subpath=subpath,
-            sandbox_id=sandbox_id,
-            shared_mounts=shared_mounts,
+            sandbox_id=sandbox_id, shared_mounts=shared_mounts,
         )
-
-    try:
-        instance = await _provision_with_cache_retry(vol.id, agent_type, _create_once)
     except Exception as e:
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
@@ -1639,27 +1611,14 @@ async def delete_sandbox_route(sandbox_id: str):
     # Hold the sandbox lock to prevent concurrent auto-restart
     # from restarting the sandbox while we're deleting it.
     async with _get_sandbox_lock(sandbox_id):
-        # Clean up sessions BEFORE removing the instance. ``force=True``
-        # is required: without it, _shutdown_session_state early-returns
-        # when the session still has an /events subscriber (UI holding
-        # a persistent SSE stream), leaving a zombie SessionState pointing
-        # at the soon-to-be-deleted sandbox. The zombie's SSE reader then
-        # keeps retrying the dead URL while the UI receives nothing.
-        # Also NULL out current_sandbox_id so the next ensure_sandbox takes
-        # the Case A ("no sandbox") path cleanly.
-        affected = any(
-            state.sandbox_id == sandbox_id for state in SESSIONS.values()
-        )
+        # force=True so a UI holding a persistent /events stream doesn't
+        # block the shutdown and leave a zombie state pointing at the
+        # deleted sandbox. session.current_sandbox_id NULL-outs itself
+        # via the sandboxes_current_sandbox_id_fkey ON DELETE SET NULL
+        # constraint below.
         for state in list(SESSIONS.values()):
             if state.sandbox_id == sandbox_id:
                 await _shutdown_session_state(state, remove=True, force=True)
-        if affected:
-            async with get_db() as conn:
-                await conn.execute(
-                    "UPDATE sessions SET current_sandbox_id = NULL "
-                    "WHERE current_sandbox_id = %s",
-                    (sandbox_id,),
-                )
 
         instance = _INSTANCES.pop(sandbox_id, None)
         _sandbox_locks.pop(sandbox_id, None)
@@ -1727,21 +1686,16 @@ async def provision_sandbox_route(request: Request):
     # against DB rows by this id.
     sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
 
-    async def _provision_once():
-        return await _providers_mod.provision_sandbox(
+    try:
+        instance = await _provision_with_cache_retry(
+            (vol.id, agent_type), _providers_mod.provision_sandbox,
             provider,
-            volume_ref=vol.provider_ref,
-            subpath=subpath,
-            agent_type=agent_type,
-            dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands if pre_start_commands else None,
-            root=root,
-            sandbox_id=sandbox_id,
+            volume_ref=vol.provider_ref, subpath=subpath,
+            agent_type=agent_type, dockerfile=dockerfile,
+            pre_start_commands=pre_start_commands or None,
+            root=root, sandbox_id=sandbox_id,
             shared_mounts=shared_mounts or None,
         )
-
-    try:
-        instance = await _provision_with_cache_retry(vol.id, agent_type, _provision_once)
     except Exception as e:
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
@@ -1894,8 +1848,6 @@ async def admin_reap_session(session_id: str):
         raise HTTPException(404, "session not in memory")
 
     sandbox_id = state.sandbox_id
-    # force=True: admin reap is explicit user action, don't let an open
-    # /events subscriber make it a no-op.
     await _shutdown_session_state(state, remove=True, force=True, mark_idle_at=time.time())
 
     stopped_provider: str | None = None
@@ -2301,41 +2253,36 @@ _STALE_CACHE_MARKERS = (
 )
 
 
-async def _provision_with_cache_retry(
-    volume_id: str, agent_type: str,
-    provision_fn,
-):
-    """Run ``provision_fn``; on stale-install-cache markers, clear the
-    cache entry for ``(volume_id, agent_type)``, reinstall via
-    ``ensure_volume_supervisor``, and retry once.
+async def _provision_with_cache_retry(cache_key, fn, /, *args, **kwargs):
+    """Call ``fn(*args, **kwargs)``; on stale-install-cache markers,
+    clear the supervisor-install cache for ``cache_key`` (a
+    ``(volume_id, agent_type)`` tuple), reinstall, and retry once.
 
-    Shared by ``_provision_new``, ``/sessions/quick``, and
-    ``/sandboxes/provision`` — every code path that runs a provider's
-    ``create_sandbox`` after ``ensure_volume_supervisor`` can hit a
-    stale cache (volumes table says "installed" but the volume was wiped
-    out-of-band — common after a container restart with an ephemeral
-    volume mount). One cache-clear + reinstall + retry is enough; a
-    second failure surfaces the real error.
+    ``volumes.supervisor_agent_types`` says installed but the on-disk
+    state can diverge (ephemeral volume wiped on container restart,
+    failed install that still marked the cache). One clean-and-retry
+    self-heals; a second failure surfaces the real error.
+
+    Positional-only for the key so ``*args``/``**kwargs`` forwarded to
+    ``fn`` can contain any names (including ``volume_id`` /
+    ``agent_type``) without colliding with our own parameters.
     """
+    vol_id, agent_type = cache_key
     try:
-        return await provision_fn()
+        return await fn(*args, **kwargs)
     except RuntimeError as e:
-        msg = str(e)
-        if not any(marker in msg for marker in _STALE_CACHE_MARKERS):
+        if not any(marker in str(e) for marker in _STALE_CACHE_MARKERS):
             raise
-        log.warning(
-            "provision failed with stale-cache marker for volume %s "
-            "(agent=%s): %s — clearing cache + reinstalling",
-            volume_id, agent_type, e,
-        )
+        log.warning("stale-cache on volume %s agent=%s: %s — reinstalling",
+                    vol_id, agent_type, e)
         async with get_db() as conn:
             await conn.execute(
                 "UPDATE volumes SET supervisor_agent_types = "
                 "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
-                (agent_type, volume_id),
+                (agent_type, vol_id),
             )
-        await ensure_volume_supervisor(volume_id, agent_type)
-        return await provision_fn()
+        await ensure_volume_supervisor(vol_id, agent_type)
+        return await fn(*args, **kwargs)
 
 
 async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
@@ -2600,20 +2547,14 @@ async def _provision_new(
     # startup reconciliation (M5); other providers currently ignore it.
     new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
 
-    async def _provision_once() -> ProviderInstance:
-        return await _providers_mod.provision_sandbox(
-            vol.provider,
-            volume_ref=vol.provider_ref,
-            subpath=subpath,
-            agent_type=agent_type,
-            spawn_env=spawn_env,
-            root=root,
-            sandbox_id=new_sandbox_id,
-            dockerfile=dockerfile,
-            shared_mounts=shared_mounts or None,
-        )
-
-    inst = await _provision_with_cache_retry(vol.id, agent_type, _provision_once)
+    inst = await _provision_with_cache_retry(
+        (vol.id, agent_type), _providers_mod.provision_sandbox,
+        vol.provider,
+        volume_ref=vol.provider_ref, subpath=subpath,
+        agent_type=agent_type, spawn_env=spawn_env,
+        root=root, sandbox_id=new_sandbox_id,
+        dockerfile=dockerfile, shared_mounts=shared_mounts or None,
+    )
 
     sb = _sandbox_record(
         new_sandbox_id, vol.provider, inst,
@@ -3088,18 +3029,15 @@ async def sessions_quick_create(request: Request):
         log.error("sessions_quick_create: ensure_volume_supervisor failed: %s", e, exc_info=True)
         raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
 
-    async def _create_once():
-        return await create_instance(
+    try:
+        instance = await _provision_with_cache_retry(
+            (volume_id, agent_type), create_instance,
             provider, agent_type, dockerfile=dockerfile,
             pre_start_commands=skill_cmds if provider != "local" else None,
             root=root, spawn_env=spawn_env,
             volume_id=volume_record.provider_ref, subpath=subpath,
-            sandbox_id=sandbox_id,
-            shared_mounts=shared_mounts or None,
+            sandbox_id=sandbox_id, shared_mounts=shared_mounts or None,
         )
-
-    try:
-        instance = await _provision_with_cache_retry(volume_id, agent_type, _create_once)
     except Exception as e:
         await delete_agent(agent_id)
         log.error("sessions_quick_create: create_instance failed (provider=%s): %s", provider, e, exc_info=True)
