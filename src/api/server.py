@@ -2088,17 +2088,8 @@ def _should_replace_daytona_sandbox(exc: Exception) -> bool:
     return any(token in text for token in _DAYTONA_UNRECOVERABLE_TOKENS)
 
 
-def _synthesize_instance(
-    sandbox: SandboxRecord, cached: ProviderInstance | None = None,
-) -> ProviderInstance:
-    """Return a ProviderInstance suitable for stop_instance / destroy_instance.
-
-    Uses the _INSTANCES cache entry if provided; otherwise synthesizes a
-    minimal instance from the sandbox row. Either is enough for the
-    provider's stop/destroy path to target the right container/process.
-    """
-    if cached is not None:
-        return cached
+def _synthesize_instance(sandbox: SandboxRecord) -> ProviderInstance:
+    """Minimal ProviderInstance suitable for stop_sandbox / destroy_sandbox."""
     return ProviderInstance(
         provider=sandbox.provider, url="",
         root=sandbox.root, sandbox_id=sandbox.sandbox_ref,
@@ -2108,28 +2099,22 @@ def _synthesize_instance(
 async def _instance_is_alive(inst: ProviderInstance) -> bool:
     """Cheap liveness check on a cached ProviderInstance.
 
-    Port-based (local/docker): trust the subprocess/container reference.
-    Daytona (container_id None, URL-only): HTTP /v1/health probe with
-    short timeout — the URL can expire or the supervisor inside a live
-    sandbox can die independently.
+    Port-based (local): trust the subprocess reference. Everything else
+    (docker container, daytona preview URL) uses an HTTP health probe — the
+    URL can expire or the supervisor inside a live sandbox can die
+    independently.
     """
     if inst.process is not None:
         try: inst.process.poll()   # reap zombies, update returncode
         except Exception: pass
         return inst.process.returncode is None
-    if inst.container_id and inst.url:
-        from .providers import _wait_for_health
-        try:
-            return await _wait_for_health(inst.url, max_retries=2, interval=0.5)
-        except Exception:
-            return False
-    if inst.url:  # daytona
-        try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                return (await c.get(f"{inst.url}/v1/health")).status_code == 200
-        except Exception:
-            return False
-    return False
+    if not inst.url:
+        return False
+    from .providers import _wait_for_health
+    try:
+        return await _wait_for_health(inst.url, max_retries=2, interval=0.5)
+    except Exception:
+        return False
 
 
 async def _replace_sandbox_inplace(

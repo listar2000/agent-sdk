@@ -698,31 +698,16 @@ async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Uniform API — each provider module exposes these names.
+# Uniform API — each provider module exposes these names. Daytona's internals
+# already have the right shape, so alias instead of writing thin wrappers.
 # ---------------------------------------------------------------------------
 
-async def create_volume(name: str) -> str:
-    return await create_daytona_volume(name)
-
-
-async def delete_volume(ref: str) -> None:
-    return await delete_daytona_volume(ref)
-
-
-async def get_sandbox_status(ref: str) -> str:
-    return await get_daytona_sandbox_status(ref)
-
-
-async def start_sandbox(ref: str) -> None:
-    return await start_daytona(ref)
-
-
-async def destroy_sandbox(inst: ProviderInstance) -> None:
-    return await destroy_daytona(inst)
-
-
-async def stop_sandbox(inst: ProviderInstance) -> None:
-    return await stop_daytona(inst)
+create_volume = create_daytona_volume
+delete_volume = delete_daytona_volume
+get_sandbox_status = get_daytona_sandbox_status
+start_sandbox = start_daytona
+destroy_sandbox = destroy_daytona
+stop_sandbox = stop_daytona
 
 
 async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
