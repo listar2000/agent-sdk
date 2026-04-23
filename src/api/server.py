@@ -745,9 +745,12 @@ def _start_sse_reader(state: SessionState) -> None:
                                 # Genuine fresh session — reflect in DB so a
                                 # later ensure_session_live sees the right
                                 # inner_sid when the next message arrives.
+                                # volume_id is NOT NULL on sessions; pull it
+                                # from the sandbox row we already fetched.
                                 await upsert_session(
                                     state.session_id, state.agent_id,
                                     state.sandbox_id, new_inner_sid,
+                                    volume_id=sandbox_record.volume_id,
                                 )
                             old_client = state.client
                             state.client = new_client
