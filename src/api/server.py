@@ -596,60 +596,95 @@ def _broadcast_one_block(
     state.dispatch(tag, (tag, block + "\n\n"))
 
 
-async def _recover_after_disconnect(state: SessionState) -> bool:
-    """Re-provision the sandbox and re-attach the ACP session after an
-    SSE-reader disconnect. Mutates ``state`` in place on success.
+async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> None:
+    """Rebind `state` to a fresh supervisor + ACP session, preserving its
+    SessionState object (and thus its subscriber list). Caller holds the
+    session lock.
 
-    Returns True iff recovery succeeded — caller should reset retry
-    counters and continue the reader loop. On False the reader gives up
-    and the session goes fatal.
+    Unifies the recovery dance used by (a) the SSE-reader loop after
+    exhausting retries, and (b) ensure_runtime when it discovers a dead
+    supervisor. Preserving `_session_subscribers` is what keeps a UI's
+    persistent /events stream alive across an external sandbox kill.
     """
+    agent_record = await get_agent(state.agent_id)
+    if agent_record is None:
+        raise RuntimeError(f"agent {state.agent_id} missing during rebind")
+    spawn_env = await _spawn_env_for_sandbox(state.sandbox_id)
+    new_url, _ = await _ensure_sandbox_alive(
+        state.sandbox_id, sandbox_record,
+        agent_type=state.agent_type, spawn_env=spawn_env,
+    )
+    # cwd MUST match what session/new used (agent.config.cwd). Using
+    # sandbox_record.root instead would change the JSONL hash and cause
+    # session/load to fall back to session/new, losing context.
+    cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
+    new_client = AcpClient(new_url)
+    new_acp_session_id = str(uuid.uuid4())
+    new_inner_sid, started_fresh = await _attach_acp_session(
+        new_client, new_acp_session_id, agent_record,
+        inner_sid=state.inner_session_id, cwd=cwd,
+    )
+    if started_fresh and new_inner_sid:
+        await upsert_session(
+            state.session_id, state.agent_id, state.sandbox_id,
+            new_inner_sid, volume_id=sandbox_record.volume_id,
+        )
+    old_client = state.client
+    state.client = new_client
+    state.supervisor_url = new_url
+    state.acp_session_id = new_acp_session_id
+    state.inner_session_id = new_inner_sid
+    state.last_event_id = None  # old cursor is meaningless on the new session
     try:
-        sandbox_record = await get_sandbox(state.sandbox_id)
-        if sandbox_record is None:
-            return False
-        log.info("[SSE-READER] retries exhausted for session %s; attempting sandbox recovery",
-                 state.session_id)
-        spawn_env = await _spawn_env_for_sandbox(state.sandbox_id)
-        new_url, _ = await _ensure_sandbox_alive(
-            state.sandbox_id, sandbox_record,
-            agent_type=state.agent_type, spawn_env=spawn_env,
-        )
-        new_acp_session_id = str(uuid.uuid4())
-        new_client = AcpClient(new_url)
-        agent_record = await get_agent(state.agent_id)
-        if agent_record is None:
-            raise RuntimeError(f"agent {state.agent_id} missing during SSE-reader recovery")
-        # cwd MUST match what session/new used (agent.config.cwd). Using
-        # sandbox_record.root instead would change the JSONL hash and
-        # cause session/load to fall back to session/new, losing context.
-        attach_cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
-        new_inner_sid, started_fresh = await _attach_acp_session(
-            new_client, new_acp_session_id, agent_record,
-            inner_sid=state.inner_session_id, cwd=attach_cwd,
-        )
-        if started_fresh and new_inner_sid:
-            # sessions.volume_id is NOT NULL — carry it from the record we have.
-            await upsert_session(
-                state.session_id, state.agent_id,
-                state.sandbox_id, new_inner_sid,
-                volume_id=sandbox_record.volume_id,
-            )
-        old_client = state.client
-        state.client = new_client
-        state.supervisor_url = new_url
-        state.acp_session_id = new_acp_session_id
-        state.inner_session_id = new_inner_sid
-        try:
-            await old_client.aclose()
-        except Exception:
-            pass
-        log.info("[SSE-READER] sandbox recovered for session %s; new acp_session=%s",
-                 state.session_id, new_acp_session_id)
+        await old_client.aclose()
+    except Exception:
+        pass
+    log.info("[REBIND] session %s → new supervisor %s (acp=%s)",
+             state.session_id, new_url, new_acp_session_id)
+
+
+async def _ensure_state_live(state: SessionState, sandbox: SandboxRecord) -> None:
+    """Ensure `state` points at a live, healthy supervisor. Caller holds
+    the session lock. Fast path: health-probe the current URL. Slow path:
+    rebind in place (which does NOT disturb subscribers)."""
+    from .providers import _wait_for_health
+    if state.supervisor_url and state._reader_alive:
+        # Port-based fast-fail: if the supervisor subprocess is already
+        # dead we KNOW a health probe will fail. Skip the ~2s probe and
+        # go straight to rebind.
+        cached = _INSTANCES.get(state.sandbox_id)
+        proc_dead = False
+        if cached is not None and cached.process is not None:
+            try:
+                cached.process.poll()
+            except Exception:
+                pass
+            proc_dead = cached.process.returncode is not None
+        if not proc_dead:
+            try:
+                if await _wait_for_health(state.supervisor_url, max_retries=2, interval=1):
+                    return
+            except Exception:
+                pass
+    await _rebind_state(state, sandbox)
+    if not state._reader_alive:
+        _start_sse_reader(state)
+
+
+async def _recover_after_disconnect(state: SessionState) -> bool:
+    """SSE-reader entry point: rebind state to a fresh supervisor. Returns
+    True on success. Acquires the session lock so a concurrent /message
+    path doesn't race this recovery."""
+    try:
+        async with _get_session_lock(state.session_id):
+            sandbox_record = await get_sandbox(state.sandbox_id)
+            if sandbox_record is None:
+                return False
+            await _ensure_state_live(state, sandbox_record)
         return True
-    except Exception as recovery_err:
-        log.error("[SSE-READER] sandbox recovery failed for session %s: %s",
-                  state.session_id, recovery_err, exc_info=True)
+    except Exception as e:
+        log.error("[SSE-READER] rebind failed for session %s: %s",
+                  state.session_id, e, exc_info=True)
         return False
 
 
@@ -2171,8 +2206,14 @@ async def _ensure_sandbox_alive(
                     _INSTANCES[sandbox_id] = revived
                     return url, False
 
-        # Full replacement path (all providers). Old instance is torn down first.
-        if instance is not None:
+        # Full replacement path. For port-based providers, tear down the
+        # old process/container so its port is free for the new one. For
+        # daytona, the replacement branch inside _replace_sandbox_inplace
+        # wants to restart the supervisor INSIDE the existing sandbox —
+        # destroying the instance here would delete that sandbox out from
+        # under it, forcing a brand-new-sandbox fallback and (more
+        # importantly) breaking the subscriber-preserving rebind path.
+        if instance is not None and provider in PORT_BASED_PROVIDERS:
             try: await destroy_instance(instance)
             except Exception: pass
         log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
@@ -2514,29 +2555,28 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     session_id = session_row["id"]
     existing = SESSIONS.get(session_id)
 
-    # Reuse if the existing state is attached to this sandbox, its
-    # supervisor is reachable, AND the upstream SSE reader is alive.
-    # The _reader_alive flag is a second independent signal: if the reader
-    # has observed a disconnect, the supervisor is definitively dead (or
-    # was moments ago) — don't trust a health check that raced with the
-    # kill, just tear down and rebuild. Otherwise a POST /message that
-    # arrives between the sandbox dying and the reader observing the
-    # disconnect ends up submitting a prompt to a dead supervisor.
+    # If an existing state is attached to this same sandbox and hasn't
+    # been shut down, rebind it in place (preserving subscribers) rather
+    # than tearing down + rebuilding. This keeps a persistent /events
+    # connection alive across an external sandbox kill: the UI's subscriber
+    # queue lives on `existing._session_subscribers`, so swapping the
+    # supervisor URL on the same SessionState object delivers the next
+    # turn's events to the UI without requiring it to reconnect and
+    # re-subscribe (the window during which the NEW state has zero
+    # subscribers is where events were previously lost).
     if existing:
-        reusable = (
-            not existing.shutdown.is_set()
-            and existing.sandbox_id == sandbox.id
-            and existing.supervisor_url
-            and existing._reader_alive
-        )
-        if reusable:
-            from .providers import _wait_for_health
+        if existing.shutdown.is_set() or existing.sandbox_id != sandbox.id:
+            await _shutdown_session_state(existing, remove=True, force=True)
+        else:
             try:
-                if await _wait_for_health(existing.supervisor_url, max_retries=2, interval=1):
-                    return existing
+                await _ensure_state_live(existing, sandbox)
+                return existing
+            except SandboxMissingError:
+                raise
             except Exception:
-                pass
-        await _shutdown_session_state(existing, remove=True, force=True)
+                log.exception("in-place rebind failed for session %s; "
+                              "falling back to full rebuild", session_id)
+                await _shutdown_session_state(existing, remove=True, force=True)
 
     # Build fresh.
     agent_id = session_row["agent_id"]

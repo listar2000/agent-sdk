@@ -557,11 +557,14 @@ async def test_message_immediately_after_stop(provider):
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        # Turn 1 — confirm the agent is live and record the token.
+        # Turn 1 — confirm the agent is live and record the token. Neutral
+        # ticket framing avoids Claude's injection guardrail (see comment
+        # above test_session_resume_after_stop).
         ticket = "TKT-42042"
         reply1 = await _ask(
             client, session_id,
-            f"Remember this ticket ID: {ticket}. Reply with exactly: OK {ticket}.",
+            f"I'm tracking work under ticket ID {ticket}. Please acknowledge by "
+            f"echoing the ticket ID back to me so I know you have it.",
         )
         assert ticket in reply1, f"turn 1 didn't echo ticket: {reply1!r}"
         print(f"[test:{provider}] turn1: {ticket}")
@@ -574,7 +577,8 @@ async def test_message_immediately_after_stop(provider):
         # Turn 2 — the server must recover this request, not silently lose it.
         reply2 = await _ask(
             client, session_id,
-            f"What was the ticket ID I mentioned earlier? Reply with only the ticket ID.",
+            "What was the ticket ID I mentioned earlier in this conversation? "
+            "Reply with only the ticket ID.",
         )
         print(f"[test:{provider}] turn2 reply: {reply2[:200]!r}")
         assert ticket in reply2, (
@@ -582,3 +586,226 @@ async def test_message_immediately_after_stop(provider):
             f"(probable race: SSE reader hadn't yet detected the dead "
             f"supervisor when ensure_session_live returned): {reply2!r}"
         )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_message_after_stop_with_delay(provider):
+    """Turn 1 → stop sandbox → wait ~4s → turn 2. User-reported repro.
+
+    Different from test_message_immediately_after_stop: by the time we
+    POST /message, the SSE reader has definitely observed the upstream
+    disconnect, the reader task has exited, and _INSTANCES holds a stale
+    entry whose supervisor URL no longer answers. The cache entry is
+    "confidently dead" rather than "racing with the kill".
+
+    User's exact words: "wait for just a few sec after the sandbox
+    stopped. And then send a new msg, and no reply received."
+
+    The server must detect the staleness on the /message path and restart
+    the sandbox before dispatching. With _execute_one_prompt calling
+    ensure_session_live unconditionally, this should recover — but any
+    short-circuit in the reusable check (e.g. trusting _INSTANCES because
+    sandbox_id matches) will drop the request.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        # Neutral ticket framing — see comment above test_session_resume_after_stop
+        # for why "Remember this secret code" trips Claude's injection guardrail.
+        ticket = "TKT-99991"
+        reply1 = await _ask(
+            client, session_id,
+            f"I'm tracking work under ticket ID {ticket}. Please acknowledge by "
+            f"echoing the ticket ID back to me so I know you have it.",
+        )
+        assert ticket in reply1, f"turn 1 didn't echo ticket: {reply1!r}"
+        print(f"[test:{provider}] turn1 ok")
+
+        sandbox = await _get_sandbox(client, session_id)
+        await _external_stop(sandbox)
+        # Give the server's SSE reader time to observe the upstream
+        # disconnect and tear down. This is the state the UI is in when
+        # the user clicks send.
+        await asyncio.sleep(4)
+        print(f"[test:{provider}] stopped + waited 4s; sending turn 2")
+
+        reply2 = await _ask(
+            client, session_id,
+            "What was the ticket ID I mentioned earlier in this conversation? "
+            "Reply with only the ticket ID.",
+        )
+        print(f"[test:{provider}] turn2 reply: {reply2[:200]!r}")
+        assert ticket in reply2, (
+            f"turn 2 lost after 4s stop-delay: server did not recover "
+            f"the dead sandbox before dispatching the prompt: {reply2!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# UI-path reproduction: persistent SSE across turn-1 / stop / turn-2
+# ---------------------------------------------------------------------------
+
+class _PersistentSse:
+    """Matches the UI: one long-lived /events connection that reconnects on
+    error, demuxing events by rpc_id into per-rpc queues. Events that arrive
+    while no reader is reading them stay queued.
+
+    The previous per-ask helper (_ask) opens a FRESH /events stream each
+    time — that path always starts with a live subscriber before the prompt
+    is dispatched, so the "new state has no subscribers" window is invisible
+    to it. The UI doesn't; holding a persistent connection is the actual
+    repro.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, session_id: str) -> None:
+        self._client = client
+        self._session_id = session_id
+        self._queues: dict[str, asyncio.Queue] = {}
+        self._alive = True
+        self._reader_task: asyncio.Task | None = None
+        self._reconnected = asyncio.Event()  # flipped whenever a new stream opens
+
+    async def __aenter__(self) -> "_PersistentSse":
+        self._reader_task = asyncio.create_task(self._reader())
+        # Wait for first connection so the subscriber is live before the
+        # caller posts anything — matches the UI opening /events at session
+        # load, then posting messages later.
+        await asyncio.wait_for(self._reconnected.wait(), timeout=30)
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        self._alive = False
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def get_queue(self, rpc_id: str) -> asyncio.Queue:
+        return self._queues.setdefault(rpc_id, asyncio.Queue())
+
+    async def _reader(self) -> None:
+        attempt = 0
+        while self._alive:
+            try:
+                async with self._client.stream(
+                    "GET",
+                    f"{SERVER}/sessions/{self._session_id}/events",
+                    timeout=None,
+                    headers={"Accept": "text/event-stream"},
+                ) as stream:
+                    if stream.status_code != 200:
+                        raise RuntimeError(f"/events HTTP {stream.status_code}")
+                    attempt = 0
+                    self._reconnected.set()
+                    buf = ""
+                    async for chunk in stream.aiter_text():
+                        if not self._alive:
+                            return
+                        buf += chunk
+                        while "\n\n" in buf:
+                            block, buf = buf.split("\n\n", 1)
+                            tag = extract_sse_tag(block)
+                            if tag is None:
+                                continue
+                            evt = parse_acp_event(block, tag)
+                            if evt is None:
+                                continue
+                            await self._queues.setdefault(
+                                tag, asyncio.Queue()
+                            ).put(evt)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                if not self._alive:
+                    return
+                attempt += 1
+                delay = min(1.0 * (2 ** (attempt - 1)), 10.0)
+                print(f"[persistent-sse] stream error ({e!r}); "
+                      f"reconnecting in {delay:.1f}s (attempt={attempt})")
+                await asyncio.sleep(delay)
+
+
+async def _ask_on_stream(
+    client: httpx.AsyncClient, session_id: str, stream: _PersistentSse,
+    message: str,
+) -> str:
+    """POST /message then drain the rpc's events off the persistent stream.
+
+    Unlike `_ask`, this does NOT open a new /events connection — it uses
+    the already-open one, matching the UI flow.
+    """
+    rpc_id = await _send_message(client, session_id, message)
+    q = stream.get_queue(rpc_id)
+    parts: list[str] = []
+    deadline = time.time() + PROMPT_TIMEOUT
+    while True:
+        try:
+            evt = await asyncio.wait_for(q.get(), timeout=max(1.0, deadline - time.time()))
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"no reply within {PROMPT_TIMEOUT}s for rpc {rpc_id}")
+        if evt["type"] == "text":
+            parts.append(evt["text"])
+        elif evt["type"] == "done":
+            return "".join(parts)
+        elif evt["type"] == "error":
+            raise RuntimeError(f"agent error: {evt['text']}")
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_persistent_sse_stop_then_message(provider):
+    """UI-shape repro: one persistent /events connection spans turn1 →
+    external stop → a few seconds wait → turn 2.
+
+    The UI keeps /events open the whole session. When the sandbox dies
+    server-side, _ensure_runtime_locked's reusable-check health probe
+    fails → it tears down the OLD state (kicking the UI subscriber) and
+    builds a FRESH state with zero subscribers. The prompt dispatches to
+    the new supervisor, events flow into the new state's subscriber list
+    — which is empty until the UI reconnects. The UI reconnects with
+    backoff (starts at 1s). Events that arrive before the reconnect land
+    are lost.
+
+    User's words: "I can reproduce this bug pretty consistently in the UI."
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(client, session_id) as sse:
+            ticket = "TKT-55501"
+            reply1 = await _ask_on_stream(
+                client, session_id, sse,
+                f"I'm tracking work under ticket ID {ticket}. Please acknowledge by "
+                f"echoing the ticket ID back to me so I know you have it.",
+            )
+            assert ticket in reply1, f"turn 1 didn't echo ticket: {reply1!r}"
+            print(f"[test:{provider}] turn1 ok (persistent SSE held open)")
+
+            sandbox = await _get_sandbox(client, session_id)
+            await _external_stop(sandbox)
+            await asyncio.sleep(4)
+            print(f"[test:{provider}] stopped + waited 4s; sending turn 2 "
+                  f"on the SAME persistent /events stream")
+
+            reply2 = await _ask_on_stream(
+                client, session_id, sse,
+                "What was the ticket ID I mentioned earlier in this conversation? "
+                "Reply with only the ticket ID.",
+            )
+            print(f"[test:{provider}] turn2 reply: {reply2[:200]!r}")
+            assert ticket in reply2, (
+                f"turn 2 lost on persistent SSE after stop+delay: the "
+                f"server's state rebuild dropped the UI's subscribers and "
+                f"events for the new prompt went nowhere: {reply2!r}"
+            )

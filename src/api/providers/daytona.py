@@ -385,12 +385,15 @@ async def restart_daytona_supervisor(
 
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
-    sandbox = await loop.run_in_executor(None, lambda: daytona.get(daytona_sandbox_id))
-
-    raw_state = sandbox.state
-    state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
-    if state_str != "started":
-        log.info("starting stopped daytona sandbox %s", daytona_sandbox_id)
+    # Wait for a stable (non-transitional) state before attempting start.
+    # Without this, an external stop that's still in progress makes
+    # `sandbox.start()` reject with "Sandbox state change in progress",
+    # which kills the fast recovery path that preserves /events
+    # subscribers. Max ~15s wait — matches Daytona's typical stop latency.
+    sandbox, state_str = await _wait_for_stable_daytona_state(daytona, daytona_sandbox_id)
+    if state_str not in ("started", "running"):
+        log.info("starting stopped daytona sandbox %s (state=%s)",
+                 daytona_sandbox_id, state_str)
         await loop.run_in_executor(None, sandbox.start)
         await _wait_for_daytona_sandbox_ready(daytona, daytona_sandbox_id)
         sandbox = await loop.run_in_executor(None, lambda: daytona.get(daytona_sandbox_id))
@@ -470,6 +473,32 @@ async def stop_daytona(instance: ProviderInstance) -> None:
     await _daytona_sandbox_op(instance, "stop")
 
 
+async def _wait_for_stable_daytona_state(
+    daytona, sandbox_ref: str, max_wait_s: float = 15.0,
+) -> tuple[object, str]:
+    """Poll until the sandbox is NOT in a transitional state. Returns
+    (sandbox_obj, state_string). Used by the restart/start paths so a
+    `sandbox.start()` call doesn't race an external stop still in
+    progress (which rejects with "state change in progress").
+
+    Terminal states: started, running, stopped, paused, error, archived.
+    Transitional: starting, stopping, pulling_image, resizing, ...
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_wait_s
+    STABLE = {"started", "running", "stopped", "paused", "error",
+              "archived", "destroyed"}
+    sandbox = None
+    state_str = ""
+    while True:
+        sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
+        raw = sandbox.state
+        state_str = (raw.value if hasattr(raw, "value") else str(raw)).lower()
+        if state_str in STABLE or loop.time() > deadline:
+            return sandbox, state_str
+        await asyncio.sleep(0.5)
+
+
 async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=None) -> None:
     """Poll until the sandbox is "started" AND an exec succeeds (IP allocated).
 
@@ -501,7 +530,17 @@ async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=Non
 
 
 async def start_daytona(sandbox_ref: str) -> None:
-    """Start a stopped Daytona sandbox and wait for it to be network-ready."""
+    """Start a stopped Daytona sandbox and wait for it to be network-ready.
+
+    Retries `sandbox.start()` while Daytona reports the sandbox is in the
+    middle of a state change ("state change in progress"). This race
+    happens when /message arrives a few seconds after an external stop:
+    the sandbox is still transitioning from started→stopped, and
+    `sandbox.start()` rejects until the transition completes. Polling
+    for a stable state first (or retrying on the error) is required;
+    otherwise the fast-recovery path fails and we fall back to a full
+    state rebuild, losing any persistent /events subscribers.
+    """
     try:
         daytona = _get_daytona_client()
     except (ImportError, RuntimeError) as e:
@@ -509,8 +548,12 @@ async def start_daytona(sandbox_ref: str) -> None:
         return
 
     loop = asyncio.get_running_loop()
+    sandbox, state_str = await _wait_for_stable_daytona_state(daytona, sandbox_ref)
+    if state_str in ("started", "running"):
+        log.info("daytona sandbox %s already started", sandbox_ref)
+        await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref, sandbox=sandbox)
+        return
     try:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
         await loop.run_in_executor(None, sandbox.start)
         log.info("daytona sandbox started: %s", sandbox_ref)
         await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref)
