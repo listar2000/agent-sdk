@@ -160,11 +160,14 @@ async def _external_stop(sandbox: dict) -> None:
         ))
 
     elif provider == "local":
-        # ref is the PID of the supervisor process
+        # Kill the supervisor PID. Read it from the ``pid`` field if the
+        # server exposes one (sandbox_ref may be a stable UUID, not the
+        # PID, once the local provider supports restart-same-ref). Fall
+        # back to treating ref itself as the PID for older server shapes.
+        pid_str = sandbox.get("pid") or ref
         try:
-            pid = int(ref)
-            os.kill(pid, 9)
-        except (ValueError, ProcessLookupError):
+            os.kill(int(pid_str), 9)
+        except (ValueError, ProcessLookupError, TypeError):
             pass
 
     print(f"\n[test] externally stopped {provider} sandbox {ref[:20]}")
@@ -187,12 +190,23 @@ async def _external_delete(sandbox: dict) -> None:
         ))
 
     elif provider == "local":
-        # Kill the process and remove the sandbox directory from the volume
+        # "delete" = kill the supervisor AND remove the sandbox-alive marker
+        # file. HOME stays intact (that's the volume data the test expects
+        # to persist across delete). The marker is the signal local's
+        # get_sandbox_status uses to distinguish delete (marker gone →
+        # "missing" → reprovision, new ref) from stop (marker intact →
+        # "stopped" → restart in place, same ref).
         try:
-            pid = int(ref)
-            os.kill(pid, 9)
-        except (ValueError, ProcessLookupError):
+            pid_str = sandbox.get("pid") or ref
+            os.kill(int(pid_str), 9)
+        except (ValueError, ProcessLookupError, TypeError):
             pass
+        marker = sandbox.get("marker_path")
+        if marker:
+            try:
+                os.remove(marker)
+            except FileNotFoundError:
+                pass
 
     print(f"\n[test] externally deleted {provider} sandbox {ref[:20]}")
 

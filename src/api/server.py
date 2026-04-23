@@ -1570,6 +1570,22 @@ async def get_sandbox_route(sandbox_id: str):
             result["url"] = record.derive_url()
         except Exception:
             pass
+    # Expose the supervisor's current PID for local provider so callers
+    # that need to send signals (e.g. test harnesses) can do so without
+    # coupling to the shape of sandbox_ref. Docker's container_id + daytona's
+    # sandbox_id fill the same role on their own providers. Also expose
+    # the alive-marker file path so an external "delete" can remove just
+    # the marker without disturbing home (preserving volume semantics).
+    if record.provider == "local":
+        inst = _INSTANCES.get(record.id)
+        if inst is not None and inst.process is not None:
+            pid = getattr(inst.process, "pid", None)
+            if pid is not None:
+                result["pid"] = pid
+        from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
+        args = _LOCAL_SPAWN_ARGS.get(record.sandbox_ref)
+        if args and args.get("marker_path"):
+            result["marker_path"] = args["marker_path"]
     return result
 
 
@@ -2155,7 +2171,62 @@ async def _ensure_sandbox_alive(
                 )
                 if alive:
                     return instance.url, False
-                # Clean up old container before creating replacement.
+
+            # Try to restart AT THE SAME sandbox_ref before falling back to
+            # full re-provisioning. For local, start_sandbox respawns the
+            # supervisor using cached spawn args — preserves sandbox_ref
+            # and home dir. For docker, start_sandbox runs ``docker start``
+            # on the existing container. Both avoid the overhead (and
+            # ref-changing semantics) of a full provision.
+            try:
+                status = await _providers_mod.get_sandbox_status(
+                    provider, fresh_record.sandbox_ref,
+                )
+            except Exception as status_err:
+                log.info("get_sandbox_status(%s) raised: %s — will reprovision",
+                         sandbox_id, status_err)
+                status = "missing"
+            if status == "stopped":
+                log.info("restarting sandbox %s at same ref %s",
+                         sandbox_id, fresh_record.sandbox_ref)
+                try:
+                    await _providers_mod.start_sandbox(
+                        provider, fresh_record.sandbox_ref,
+                    )
+                except Exception as start_err:
+                    log.warning(
+                        "start_sandbox(%s) failed: %s — falling back to reprovision",
+                        sandbox_id, start_err,
+                    )
+                else:
+                    # Rebuild a ProviderInstance from the restarted ref.
+                    # URL is port-based so we can derive it.
+                    if instance is not None:
+                        try:
+                            await destroy_instance(instance)
+                        except Exception:
+                            pass
+                    # Try to recover the instance from registry first (local
+                    # populates _PROCESSES[ref] in start_sandbox, but no
+                    # ProviderInstance is returned by start). Rebuild one.
+                    url = sandbox_record.derive_url()
+                    revived = ProviderInstance(
+                        provider=provider, url=url,
+                        root=sandbox_record.root,
+                        sandbox_id=fresh_record.sandbox_ref,
+                        port=sandbox_record.listen_port,
+                    )
+                    # For local, hydrate .process from the module registry so
+                    # subsequent liveness probes work.
+                    if provider == "local":
+                        from .providers.local import _PROCESSES as _LOCAL_PROCS
+                        revived.process = _LOCAL_PROCS.get(fresh_record.sandbox_ref)
+                    _INSTANCES[sandbox_id] = revived
+                    # DB row unchanged — same sandbox_ref, same port.
+                    return url, False
+
+            # Clean up old instance before creating a fresh replacement.
+            if instance is not None:
                 try:
                     await destroy_instance(instance)
                 except Exception:

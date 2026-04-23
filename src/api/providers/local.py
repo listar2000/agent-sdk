@@ -45,13 +45,21 @@ def _vol_root() -> Path:
     return (Path.home() / ".agent-sdk" / "volumes").resolve()
 
 
-# Module-level registry of sandbox subprocesses keyed by pid (str).
-# ``ProviderInstance`` already carries ``process``, but ``sandbox_ref`` stored
-# in the DB is a string; we key this registry by the stringified pid so
-# get_sandbox_status/destroy_sandbox can look up the live handle even after
-# an instance dict has been rehydrated from the DB.
-_PROCESSES: dict[int, subprocess.Popen] = {}
+# Registry of sandbox subprocesses keyed by sandbox_ref (a stable UUID
+# we assign at create time). Keying on a stable ref (not the PID, which
+# changes across respawn) is what lets a local sandbox survive an external
+# SIGKILL as a logical entity: the ref stays in sandboxes.sandbox_ref and
+# start_sandbox(ref) respawns a new supervisor under the same ref with a
+# new PID. Matches Daytona's model (daytona.stop preserves sandbox.id;
+# daytona.start revives at the same id).
+_PROCESSES: dict[str, subprocess.Popen] = {}
 _PROCESSES_LOCK = asyncio.Lock()
+
+# Spawn plan cached per ref so start_sandbox can recreate a supervisor
+# with the same HOME / volume / port / etc. after the process dies.
+# Cleared on destroy_sandbox (and when home_dir vanishes, signalling
+# "delete" semantics — see get_sandbox_status).
+_SPAWN_ARGS: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -318,15 +326,39 @@ async def create_sandbox(
             _freed_ports.append(port)
         raise RuntimeError(f"local supervisor failed to become healthy on port {port}")
 
-    async with _PROCESSES_LOCK:
-        _PROCESSES[proc.pid] = proc
+    # Stable ref that outlives the PID — what sandboxes.sandbox_ref stores.
+    ref = f"local-{uuid.uuid4().hex[:12]}"
 
-    log.info("local sandbox started (pid=%d, port=%d, home=%s)", proc.pid, port, home_dir)
+    # Write a sandbox-alive marker OUTSIDE the home dir so an external
+    # "delete" operation can remove it without disturbing the volume data
+    # we actually want to persist. Located alongside home at:
+    #   <volume>/system/sandboxes/<ref>.alive
+    # Server's get_sandbox_status checks existence of this file.
+    marker_dir = vol / "system" / "sandboxes"
+    marker_path = marker_dir / f"{ref}.alive"
+    await asyncio.to_thread(lambda: os.makedirs(marker_dir, exist_ok=True))
+    await asyncio.to_thread(lambda: marker_path.write_text("alive"))
+
+    async with _PROCESSES_LOCK:
+        _PROCESSES[ref] = proc
+        _SPAWN_ARGS[ref] = {
+            "node": node,
+            "supervisor_js": str(supervisor_js),
+            "acp_bin_str": acp_bin_str,
+            "extra": list(extra),
+            "effective_root": effective_root,
+            "port": port,
+            "base_env": dict(base_env),
+            "marker_path": str(marker_path),
+        }
+
+    log.info("local sandbox started (ref=%s, pid=%d, port=%d, home=%s)",
+             ref, proc.pid, port, home_dir)
     return ProviderInstance(
         provider="local",
         url=url,
         root=str(home_dir),
-        sandbox_id=str(proc.pid),
+        sandbox_id=ref,
         port=port,
         process=proc,
     )
@@ -353,77 +385,129 @@ def _kill_proc(proc: subprocess.Popen) -> None:
 
 
 def _lookup_proc(ref: str) -> subprocess.Popen | None:
-    try:
-        pid = int(ref)
-    except (TypeError, ValueError):
-        return None
-    return _PROCESSES.get(pid)
+    return _PROCESSES.get(ref)
 
 
 async def get_sandbox_status(ref: str) -> str:
-    """Return running / stopped / missing / error based on ``proc.poll()``."""
+    """Return running / stopped / missing / error.
+
+    ``missing`` → no spawn plan cached for this ref, OR the home dir we'd
+    respawn into is gone. Either way the sandbox is unrevivable and the
+    caller should provision a fresh one.
+
+    ``stopped`` → spawn plan cached, home intact, but Popen is dead (or
+    absent). start_sandbox(ref) can restart in place at the same ref.
+
+    ``running`` → Popen is alive.
+    """
+    args = _SPAWN_ARGS.get(ref)
+    if args is None:
+        return "missing"
+    # The alive marker (at system/sandboxes/<ref>.alive) is the external
+    # "this sandbox still logically exists" signal. External delete wipes
+    # just this file, leaving HOME intact so the volume-persistence tests
+    # can still read their marker files.
+    marker = args.get("marker_path")
+    if marker and not os.path.exists(marker):
+        return "missing"
+
     proc = _lookup_proc(ref)
     if proc is None:
-        return "missing"
+        return "stopped"
     rc = proc.poll()
     if rc is None:
         return "running"
-    if rc == 0:
-        return "stopped"
-    return "error"
+    # Process exited. With spawn plan + marker intact, we can revive.
+    return "stopped"
 
 
 async def start_sandbox(ref: str) -> None:
-    """Local subprocesses are not restartable — ``ensure_sandbox`` will
-    reprovision on status=missing. No-op for parity with the interface."""
-    return None
+    """Respawn a supervisor for ``ref`` using the cached spawn plan.
+
+    Called by ensure_sandbox when get_sandbox_status returned "stopped".
+    Replaces the stale Popen at the same ref + port, so sandbox_ref stays
+    stable across external kill events (mirroring Daytona's stop/start
+    contract).
+    """
+    args = _SPAWN_ARGS.get(ref)
+    if args is None:
+        raise RuntimeError(f"start_sandbox: no spawn plan for ref {ref}")
+
+    # Drop any stale Popen for this ref before respawn.
+    async with _PROCESSES_LOCK:
+        existing = _PROCESSES.pop(ref, None)
+    if existing is not None:
+        await asyncio.to_thread(_kill_proc, existing)
+
+    proc = await asyncio.to_thread(
+        subprocess.Popen,
+        [
+            args["node"], args["supervisor_js"],
+            "--host", "127.0.0.1",
+            "--port", str(args["port"]),
+            "--acp", args["acp_bin_str"],
+            *args["extra"],
+            "--root", args["effective_root"],
+        ],
+        env=args["base_env"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    url = f"http://127.0.0.1:{args['port']}"
+    healthy = await _wait_for_health(url)
+    if not healthy:
+        await asyncio.to_thread(_kill_proc, proc)
+        raise RuntimeError(
+            f"local supervisor failed to become healthy on port {args['port']} (ref={ref})"
+        )
+    async with _PROCESSES_LOCK:
+        _PROCESSES[ref] = proc
+    log.info("local sandbox respawned (ref=%s, pid=%d, port=%d)",
+             ref, proc.pid, args["port"])
 
 
 async def stop_sandbox(inst: ProviderInstance) -> None:
-    """For local, stop == destroy (nothing valuable lives in the process)."""
-    await destroy_sandbox(inst)
+    """Kill the supervisor but keep spawn args cached so start_sandbox(ref)
+    can revive it at the same ref. Mirrors Daytona stop semantics."""
+    ref = getattr(inst, "sandbox_id", None) if hasattr(inst, "sandbox_id") else None
+    proc: subprocess.Popen | None = None
+    if hasattr(inst, "process") and inst.process is not None and isinstance(inst.process, subprocess.Popen):
+        proc = inst.process
+    if proc is None and ref:
+        proc = _PROCESSES.get(ref)
+    if proc is not None:
+        await asyncio.to_thread(_kill_proc, proc)
+    if ref:
+        async with _PROCESSES_LOCK:
+            _PROCESSES.pop(ref, None)
+    # NOTE: _SPAWN_ARGS[ref] INTENTIONALLY retained so start_sandbox can revive.
 
 
 async def destroy_sandbox(inst: ProviderInstance) -> None:
-    """Terminate the supervisor subprocess and drop it from the registry."""
-    proc = None
-    pid: int | None = None
+    """Terminate the supervisor subprocess and wipe all cached state for
+    this ref — sandbox_id, Popen, and spawn args. Subsequent
+    get_sandbox_status(ref) returns 'missing'."""
+    ref = getattr(inst, "sandbox_id", None) if hasattr(inst, "sandbox_id") else None
+    proc: subprocess.Popen | None = None
+    if hasattr(inst, "process") and inst.process is not None and isinstance(inst.process, subprocess.Popen):
+        proc = inst.process
+    if proc is None and ref:
+        proc = _PROCESSES.get(ref)
 
-    # Resolve both from the instance.process and from the sandbox_id → pid map.
-    if hasattr(inst, "process") and inst.process is not None:
-        proc = inst.process  # may be an asyncio.subprocess or subprocess.Popen
-        pid = getattr(proc, "pid", None)
-    sid = getattr(inst, "sandbox_id", None) if hasattr(inst, "sandbox_id") else None
-    if sid:
-        try:
-            pid = int(sid)
-        except (TypeError, ValueError):
-            pass
-    if proc is None and pid is not None:
-        proc = _PROCESSES.get(pid)
-
-    if proc is None:
-        return
-
-    # Branch on subprocess flavor.
-    if isinstance(proc, subprocess.Popen):
+    if proc is not None:
         await asyncio.to_thread(_kill_proc, proc)
-    else:
-        # asyncio.subprocess.Process
-        try:
-            if proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-        except ProcessLookupError:
-            pass
 
-    if pid is not None:
+    if ref:
         async with _PROCESSES_LOCK:
-            _PROCESSES.pop(pid, None)
+            _PROCESSES.pop(ref, None)
+            args = _SPAWN_ARGS.pop(ref, None)
+        marker = args.get("marker_path") if args else None
+        if marker:
+            try:
+                os.remove(marker)
+            except FileNotFoundError:
+                pass
 
     port = getattr(inst, "port", None)
     if port is not None:
