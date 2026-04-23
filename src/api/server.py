@@ -1551,13 +1551,17 @@ async def create_sandbox(request: Request):
     dockerfile = _materialize_dockerfile(data)
     shared_mounts = data.get("shared_mounts") or None
     sandbox_id = str(uuid.uuid4())
-    try:
-        instance = await create_instance(
+
+    async def _create_once():
+        return await create_instance(
             provider, agent_type, dockerfile=dockerfile, root=root,
             volume_id=vol.provider_ref, subpath=subpath,
             sandbox_id=sandbox_id,
             shared_mounts=shared_mounts,
         )
+
+    try:
+        instance = await _provision_with_cache_retry(vol.id, agent_type, _create_once)
     except Exception as e:
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
@@ -1722,8 +1726,9 @@ async def provision_sandbox_route(request: Request):
     # container label — reconcile_on_startup cross-references live containers
     # against DB rows by this id.
     sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
-    try:
-        instance = await _providers_mod.provision_sandbox(
+
+    async def _provision_once():
+        return await _providers_mod.provision_sandbox(
             provider,
             volume_ref=vol.provider_ref,
             subpath=subpath,
@@ -1734,6 +1739,9 @@ async def provision_sandbox_route(request: Request):
             sandbox_id=sandbox_id,
             shared_mounts=shared_mounts or None,
         )
+
+    try:
+        instance = await _provision_with_cache_retry(vol.id, agent_type, _provision_once)
     except Exception as e:
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
@@ -2286,6 +2294,50 @@ async def _ensure_sandbox_alive(
 
 
 
+_STALE_CACHE_MARKERS = (
+    "supervisor.js missing",
+    "ACP binary missing",
+    "call install_supervisor",
+)
+
+
+async def _provision_with_cache_retry(
+    volume_id: str, agent_type: str,
+    provision_fn,
+):
+    """Run ``provision_fn``; on stale-install-cache markers, clear the
+    cache entry for ``(volume_id, agent_type)``, reinstall via
+    ``ensure_volume_supervisor``, and retry once.
+
+    Shared by ``_provision_new``, ``/sessions/quick``, and
+    ``/sandboxes/provision`` — every code path that runs a provider's
+    ``create_sandbox`` after ``ensure_volume_supervisor`` can hit a
+    stale cache (volumes table says "installed" but the volume was wiped
+    out-of-band — common after a container restart with an ephemeral
+    volume mount). One cache-clear + reinstall + retry is enough; a
+    second failure surfaces the real error.
+    """
+    try:
+        return await provision_fn()
+    except RuntimeError as e:
+        msg = str(e)
+        if not any(marker in msg for marker in _STALE_CACHE_MARKERS):
+            raise
+        log.warning(
+            "provision failed with stale-cache marker for volume %s "
+            "(agent=%s): %s — clearing cache + reinstalling",
+            volume_id, agent_type, e,
+        )
+        async with get_db() as conn:
+            await conn.execute(
+                "UPDATE volumes SET supervisor_agent_types = "
+                "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
+                (agent_type, volume_id),
+            )
+        await ensure_volume_supervisor(volume_id, agent_type)
+        return await provision_fn()
+
+
 async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     """Idempotently install the supervisor + ACP binary on a volume.
 
@@ -2326,7 +2378,7 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     semantics.  Acceptable because the alternative is holding a pool
     connection for minutes, which is more expensive operationally.
     """
-    # Fast path (no lock): check cache first — 99% of calls hit this.
+    # Fast path (no lock): check cache — 99% of calls hit this.
     vol = await get_volume(volume_id)
     if vol is None:
         raise HTTPException(500, f"Volume {volume_id} not found")
@@ -2561,34 +2613,7 @@ async def _provision_new(
             shared_mounts=shared_mounts or None,
         )
 
-    try:
-        inst = await _provision_once()
-    except RuntimeError as e:
-        # Stale-cache guard: ``ensure_volume_supervisor`` said the install was
-        # present (volumes.supervisor_agent_types cache hit) but the actual
-        # files on disk are missing — the volume got wiped out-of-band, or
-        # the install failed mid-way after marking the cache. Clear the cache
-        # entry for this agent_type, re-install, and retry once.
-        msg = str(e)
-        stale_cache = (
-            "supervisor.js missing" in msg or "ACP binary missing" in msg
-            or "call install_supervisor" in msg
-        )
-        if not stale_cache:
-            raise
-        log.warning(
-            "provision_sandbox failed with stale-cache marker for volume %s "
-            "(agent=%s): %s — clearing cache + reinstalling",
-            vol.id, agent_type, e,
-        )
-        async with get_db() as conn:
-            await conn.execute(
-                "UPDATE volumes SET supervisor_agent_types = "
-                "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
-                (agent_type, vol.id),
-            )
-        await ensure_volume_supervisor(vol.id, agent_type)
-        inst = await _provision_once()
+    inst = await _provision_with_cache_retry(vol.id, agent_type, _provision_once)
 
     sb = _sandbox_record(
         new_sandbox_id, vol.provider, inst,
@@ -3063,8 +3088,8 @@ async def sessions_quick_create(request: Request):
         log.error("sessions_quick_create: ensure_volume_supervisor failed: %s", e, exc_info=True)
         raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
 
-    try:
-        instance = await create_instance(
+    async def _create_once():
+        return await create_instance(
             provider, agent_type, dockerfile=dockerfile,
             pre_start_commands=skill_cmds if provider != "local" else None,
             root=root, spawn_env=spawn_env,
@@ -3072,6 +3097,9 @@ async def sessions_quick_create(request: Request):
             sandbox_id=sandbox_id,
             shared_mounts=shared_mounts or None,
         )
+
+    try:
+        instance = await _provision_with_cache_retry(volume_id, agent_type, _create_once)
     except Exception as e:
         await delete_agent(agent_id)
         log.error("sessions_quick_create: create_instance failed (provider=%s): %s", provider, e, exc_info=True)

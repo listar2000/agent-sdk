@@ -1,26 +1,36 @@
 """E2E: sandbox stop/delete recovery and session resume.
 
-All tests require a live server on localhost:7778. Four test groups
-(8 test functions total, each parametrized over local/docker/daytona):
+All tests require a live server on localhost:7778. Five test groups
+(10 parametrized over local/docker/daytona + 1 local-only = 11 tests
+total; see tests/README.md for per-test invariants):
 
-  1. stop  — external sandbox stop → server restarts same sandbox → same hostname,
-             files at /tmp survive (same sandbox, /tmp is not volume but same process)
+  1. stop — external sandbox stop → server restarts same sandbox →
+            same ``sandbox_ref``, files at /tmp survive.
 
-  2. delete — external sandbox delete → server provisions new sandbox on same volume
-              → different hostname, files in the VOLUME working dir survive
+  2. delete — external sandbox delete → server provisions new sandbox
+              on same volume → different ``sandbox_ref``, files in the
+              VOLUME working dir survive.
 
-  3. resume — session persists across ensure_session_live re-entrancy, including
-              a midstream variant that exercises the SSE-reader's own recovery
-              path (reader observes upstream EOF, rebinds, resumes)
+  3. resume — session persists across ensure_session_live re-entrancy,
+              including a midstream variant that exercises the
+              SSE-reader's own recovery path.
 
-  4. message-after-stop — POST /message races external stop. Three scenarios
-              increasing in subtlety: no-delay (scheduler race), short-delay
-              (reader has observed disconnect but still retrying), and
-              persistent-SSE (UI holds /events open across turns — the path
-              where the subscriber-kick-on-rebuild bug lived)
+  4. message-after-stop — POST /message races external stop. Three
+              scenarios increasing in subtlety: no-delay (scheduler
+              race), short-delay (reader observed disconnect but still
+              retrying), and persistent-SSE (UI holds /events open
+              across turns).
 
-Skipped when the provider is unavailable (no docker daemon, no DAYTONA_API_KEY
-+ CLAUDE_CODE_OAUTH_TOKEN, or no server on localhost:7778).
+  5. persistent-SSE + delete — two variants matching real UI flow:
+              server-side DELETE /sandboxes/{id} vs out-of-band delete
+              (daytona dashboard / docker rm / kill -9).
+
+  6. stale-cache — local-only: wipe system/supervisor/ on disk while
+              the DB cache claims it's installed; server must detect
+              on next provision and self-heal.
+
+Skipped when the provider is unavailable (no docker daemon, no
+DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN, or no server on localhost:7778).
 """
 from __future__ import annotations
 

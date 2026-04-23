@@ -228,6 +228,44 @@ _MIGRATIONS = [
     END $$""",
     # Drop the moved keys from agents.config so server reads stop finding them.
     "UPDATE agents SET config = config - 'cwd' - 'dockerfile' - 'shared_mounts' - 'env' WHERE config IS NOT NULL",
+    # 2026-04-23: the 2026-04-21 backfill (around line 125 above) inserts
+    # synthetic volumes with provider_ref='legacy-backfill' so pre-refactor
+    # sessions have SOMETHING to point at. That placeholder isn't a real
+    # provider-side volume, so daytona.create rejects every mount of it
+    # and the user sees 500 on /events. Redirect any session/sandbox that
+    # still points at a legacy stub to the provider's ``default-<provider>``
+    # volume (which has a real provider_ref), then delete the stub. If a
+    # default isn't present yet for that provider, leave the legacy row
+    # alone — the next caller that goes through _resolve_or_default_volume
+    # will create one and re-run of this migration on the next deploy will
+    # then repoint. Idempotent: the WHERE provider_ref='legacy-backfill'
+    # clause means re-running on already-healed rows is a no-op.
+    """DO $$
+    DECLARE legacy RECORD;
+    DECLARE default_id TEXT;
+    BEGIN
+        FOR legacy IN
+            SELECT id, provider FROM volumes WHERE provider_ref = 'legacy-backfill'
+        LOOP
+            SELECT id INTO default_id
+            FROM volumes
+            WHERE name = 'default-' || legacy.provider
+              AND provider_ref <> 'legacy-backfill'
+            LIMIT 1;
+            IF default_id IS NOT NULL THEN
+                UPDATE sessions  SET volume_id = default_id WHERE volume_id = legacy.id;
+                UPDATE sandboxes SET volume_id = default_id WHERE volume_id = legacy.id;
+                DELETE FROM volumes WHERE id = legacy.id;
+            END IF;
+        END LOOP;
+    END $$""",
+    # Also neutralize the backfill block above so future deploys against
+    # a fresh DB (where no default-<provider> exists yet) don't resurrect
+    # legacy stubs: if we have no legacy rows left AND at least one non-
+    # legacy volume exists, the backfill's "there are sessions with NULL
+    # volume_id" branch is no longer reachable (sessions.volume_id is
+    # NOT NULL after 2026-04-21's earlier step). This is a no-op on
+    # clean DBs — there's nothing to clean up.
 ]
 
 
