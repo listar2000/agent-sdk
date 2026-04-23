@@ -646,21 +646,15 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
 async def _ensure_state_live(state: SessionState, sandbox: SandboxRecord) -> None:
     """Ensure `state` points at a live, healthy supervisor. Caller holds
     the session lock. Fast path: health-probe the current URL. Slow path:
-    rebind in place (which does NOT disturb subscribers)."""
+    rebind in place (which does NOT disturb subscribers).
+
+    Port-based fast-fail: if the cached subprocess is confirmed dead, skip
+    the ~2s health probe entirely and go straight to rebind.
+    """
     from .providers import _wait_for_health
     if state.supervisor_url and state._reader_alive:
-        # Port-based fast-fail: if the supervisor subprocess is already
-        # dead we KNOW a health probe will fail. Skip the ~2s probe and
-        # go straight to rebind.
         cached = _INSTANCES.get(state.sandbox_id)
-        proc_dead = False
-        if cached is not None and cached.process is not None:
-            try:
-                cached.process.poll()
-            except Exception:
-                pass
-            proc_dead = cached.process.returncode is not None
-        if not proc_dead:
+        if cached is None or _instance_process_alive(cached):
             try:
                 if await _wait_for_health(state.supervisor_url, max_retries=2, interval=1):
                     return
@@ -773,18 +767,14 @@ def _start_sse_reader(state: SessionState) -> None:
 
                 # Fast-fail on confirmed-dead supervisors: for port-based
                 # providers we can cheaply check the subprocess in _INSTANCES
-                # and skip the full exponential-backoff ladder (up to ~35s)
-                # when we KNOW the old supervisor is gone. A ConnectError
-                # against a port whose process is dead will never recover
-                # by retrying.
+                # and skip the full exponential-backoff ladder (~35s) when
+                # the supervisor is definitely gone.
                 cached_inst = _INSTANCES.get(state.sandbox_id)
-                supervisor_dead = False
-                if cached_inst is not None and cached_inst.process is not None:
-                    try:
-                        cached_inst.process.poll()
-                    except Exception:
-                        pass
-                    supervisor_dead = cached_inst.process.returncode is not None
+                supervisor_dead = (
+                    cached_inst is not None
+                    and cached_inst.process is not None
+                    and not _instance_process_alive(cached_inst)
+                )
 
                 if (_sse_reader_disconnect_is_recoverable(state)
                         and attempt <= _SSE_MAX_IDLE_RETRIES
