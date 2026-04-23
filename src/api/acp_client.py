@@ -239,21 +239,20 @@ class AcpClient:
             except Exception:
                 continue
 
-    async def set_model(self, session_id: str, model: str) -> None:
-        """Change the agent model mid-session."""
+    async def _set_config_option(self, session_id: str, config_id: str, value: object) -> None:
         inner_sid = self.get_inner_session_id(session_id)
         if not inner_sid:
             return
         await self._send_rpc(session_id, "session/set_config_option",
-                             {"sessionId": inner_sid, "configId": "model", "value": model})
+                             {"sessionId": inner_sid, "configId": config_id, "value": value})
+
+    async def set_model(self, session_id: str, model: str) -> None:
+        """Change the agent model mid-session."""
+        await self._set_config_option(session_id, "model", model)
 
     async def set_thought_level(self, session_id: str, level: str) -> None:
         """Set thinking depth ('high', 'medium', 'low')."""
-        inner_sid = self.get_inner_session_id(session_id)
-        if not inner_sid:
-            return
-        await self._send_rpc(session_id, "session/set_config_option",
-                             {"sessionId": inner_sid, "configId": "thinking", "value": level})
+        await self._set_config_option(session_id, "thinking", level)
 
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -124,32 +124,16 @@ async def create_instance(
     """
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(_ACP_BIN_NAMES)}")
-    mod = _dispatch_mod(provider)
-    if provider == "local":
-        return await mod.create_sandbox(
-            volume_ref=volume_id, subpath=subpath or "",
-            agent_type=agent_type, root=root, spawn_env=spawn_env,
-            sandbox_id=sandbox_id,
-        )
-    if provider == "docker":
-        return await mod.create_sandbox(
-            volume_ref=volume_id, subpath=subpath or "",
-            agent_type=agent_type, dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands,
-            root=root, spawn_env=spawn_env,
-            sandbox_id=sandbox_id,
-            shared_mounts=shared_mounts,
-        )
-    if provider == "daytona":
-        return await mod.create_sandbox(
-            volume_ref=volume_id, subpath=subpath or "",
-            agent_type=agent_type, dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands,
-            root=root, spawn_env=spawn_env,
-            sandbox_id=sandbox_id,
-            shared_mounts=shared_mounts,
-        )
-    raise ValueError(f"Unknown provider: {provider!r}. Use 'local', 'docker', or 'daytona'.")
+    # All three provider modules accept the same kwargs (they ignore what
+    # they don't use — local/docker/daytona all declare ``dockerfile``,
+    # ``pre_start_commands``, ``shared_mounts`` for parity). Dispatch is a
+    # single call; _dispatch_mod raises a readable error for unknown providers.
+    return await _dispatch_mod(provider).create_sandbox(
+        volume_ref=volume_id, subpath=subpath or "",
+        agent_type=agent_type, root=root, spawn_env=spawn_env,
+        dockerfile=dockerfile, pre_start_commands=pre_start_commands,
+        sandbox_id=sandbox_id, shared_mounts=shared_mounts,
+    )
 
 
 async def destroy_instance(instance: ProviderInstance) -> None:
