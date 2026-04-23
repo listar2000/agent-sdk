@@ -250,8 +250,14 @@ def _build_env_prefix(spawn_env: dict[str, str] | None) -> str:
 # Health check
 # ---------------------------------------------------------------------------
 
-async def _wait_for_health(url: str, max_retries: int = 30, interval: float = 0.5) -> bool:
-    """Poll /v1/health until 200 or retries exhausted."""
+async def _wait_for_health(url: str, max_retries: int = 150, interval: float = 0.1) -> bool:
+    """Poll /v1/health until 200 or retries exhausted.
+
+    Tight 100ms interval (was 500ms) with proportionally more attempts — node
+    supervisors typically come up in 100-300ms, and the old 500ms cadence
+    wasted ~400ms per recovery on "just-missed" polling windows. Total
+    budget ~15s stays the same.
+    """
     async with httpx.AsyncClient(timeout=5) as client:
         for _ in range(max_retries):
             try:
