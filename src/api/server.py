@@ -2409,12 +2409,32 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
     if sb is not None and sb.status == STATUS_RUNNING:
         existing_state = SESSIONS.get(session_id)
         cached_inst = _INSTANCES.get(current_id)
+        # Port-based providers (local/docker) carry a live Popen on the
+        # cached instance — verify it's actually running before trusting
+        # the fast-path. External kill-9 leaves the DB row as "running"
+        # and _INSTANCES populated, but the PID is gone. returncode alone
+        # isn't reliable — asyncio.subprocess doesn't set it until the
+        # event loop observes SIGCHLD — so check the PID directly. Without
+        # this the golden recovery tests see "All connection attempts
+        # failed" because ensure_runtime tries session/load against a
+        # dead port.
+        proc_alive = True
+        if cached_inst is not None and cached_inst.process is not None:
+            proc = cached_inst.process
+            if proc.returncode is not None:
+                proc_alive = False
+            elif proc.pid is not None:
+                try:
+                    os.kill(proc.pid, 0)
+                except (ProcessLookupError, PermissionError):
+                    proc_alive = False
         if (
             cached_inst is not None
             and existing_state is not None
             and not existing_state.shutdown.is_set()
             and existing_state.sandbox_id == current_id
             and existing_state.supervisor_url
+            and proc_alive
         ):
             return sb
 
@@ -2634,9 +2654,14 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
 
     client = AcpClient(supervisor_url)
     acp_session_id = str(uuid.uuid4())
-    # Use agent config cwd to avoid initializing into a directory that may
-    # not exist on the sandbox filesystem.
-    cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
+    # cwd determines the hash under which Claude Code writes the session
+    # JSONL (~/.claude/projects/<hash>/<inner_sid>.jsonl). For session/load
+    # to find the same file on a replacement sandbox, cwd must match the
+    # one used by session/new. ``root`` is the sandbox HOME — stable for
+    # the lifetime of the agent's volume subpath — and therefore the right
+    # anchor. Falling back to /tmp broke every golden recovery test because
+    # the hash changed across restart.
+    cwd = root
 
     # Single source of truth for "get me an attached ACP session" — tries
     # session/load when an inner_sid exists and only falls through to
