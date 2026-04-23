@@ -641,10 +641,13 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     state.acp_session_id = new_acp_session_id
     state.inner_session_id = new_inner_sid
     state.last_event_id = None  # old cursor is meaningless on the new session
-    try:
-        await old_client.aclose()
-    except Exception:
-        pass
+    # Close the old client in the background — the next turn doesn't need
+    # to wait for the TCP teardown.
+    if old_client is not None:
+        async def _close_old():
+            try: await old_client.aclose()
+            except Exception: pass
+        _spawn_bg(_close_old())
     log.info("[REBIND] session %s → new supervisor %s (acp=%s)",
              state.session_id, new_url, new_acp_session_id)
 
