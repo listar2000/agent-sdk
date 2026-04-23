@@ -1654,9 +1654,13 @@ async def stop_sandbox_route(sandbox_id: str):
         instance = _INSTANCES.get(sandbox_id)
         if instance:
             try:
-                await stop_instance(instance)
+                # snapshot_and_stop: workspace tarball lands on the volume
+                # BEFORE the provider stops the sandbox, so the next
+                # ensure_sandbox call can restore a fresh container from
+                # the up-to-date snapshot.
+                await snapshot_and_stop(record, instance)
             except Exception as e:
-                log.warning("stop_sandbox_route: stop_instance failed for %s: %s",
+                log.warning("stop_sandbox_route: snapshot_and_stop failed for %s: %s",
                             sandbox_id, e)
                 raise HTTPException(502, f"stop failed: {e}")
 
@@ -3333,6 +3337,17 @@ async def stop_session_sandbox(session_id: str):
         return  # 204, no-op — already stopped
     sb = await get_sandbox(sbid)
     if sb:
+        # Snapshot the workspace before destroy so the next sandbox can
+        # restore conversation state + session JSONLs + installed deps.
+        # Best-effort: snapshot_supervisor swallows its own errors; a
+        # failure here must not pin the sandbox alive.
+        try:
+            await snapshot_supervisor(sb)
+        except Exception as e:
+            log.warning(
+                "stop_session_sandbox: snapshot failed for %s: %s; "
+                "proceeding to destroy", sb.id, e,
+            )
         inst = ProviderInstance(
             provider=sb.provider, url="",
             root=sb.root, sandbox_id=sb.sandbox_ref,
