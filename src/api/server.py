@@ -617,18 +617,21 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     )
     if agent_record is None:
         raise RuntimeError(f"agent {state.agent_id} missing during rebind")
-    agent_env = (agent_record.config.env or {}) if agent_record.config else {}
+    cfg = agent_record.config
+    agent_env = (cfg.env or {}) if cfg else {}
     spawn_env = _merge_env(
         agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
     )
+    shared_mounts = (list(cfg.shared_mounts) if cfg and cfg.shared_mounts else None)
     new_url, _ = await _ensure_sandbox_alive(
         state.sandbox_id, sandbox_record,
         agent_type=state.agent_type, spawn_env=spawn_env,
+        shared_mounts=shared_mounts,
     )
     # cwd MUST match what session/new used (agent.config.cwd). Using
     # sandbox_record.root instead would change the JSONL hash and cause
     # session/load to fall back to session/new, losing context.
-    cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
+    cwd = (cfg.cwd or "/tmp") if cfg else "/tmp"
     new_client = AcpClient(new_url)
     new_acp_session_id = str(uuid.uuid4())
     new_inner_sid, started_fresh = await _attach_acp_session(
@@ -2121,15 +2124,21 @@ async def _instance_is_alive(inst: ProviderInstance) -> bool:
 async def _replace_sandbox_inplace(
     sandbox_id: str, rec: SandboxRecord, agent_type: str,
     dockerfile: str | None, spawn_env: dict,
+    shared_mounts: list[str] | None = None,
 ) -> tuple[ProviderInstance, bool]:
     """Provision a fresh provider instance for ``sandbox_id``, keeping the
     same DB row. For port-based providers always just provision_sandbox.
     For daytona, try restart_daytona_supervisor first (supervisor died
     inside a live sandbox); only on unrecoverable errors create a brand-new
     daytona sandbox (replaced=True).
+
+    ``shared_mounts`` is opt-in: callers that already hold the agent record
+    pass the list through to skip the internal get_agent lookup. When None
+    we do the lookup ourselves.
     """
     provider = rec.provider
-    shared_mounts = await _shared_mounts_for_sandbox(rec)
+    if shared_mounts is None:
+        shared_mounts = await _shared_mounts_for_sandbox(rec)
     if provider in PORT_BASED_PROVIDERS:
         if not rec.volume_id:
             raise RuntimeError(f"Sandbox {sandbox_id} has no volume_id")
@@ -2182,6 +2191,7 @@ async def _ensure_sandbox_alive(
     agent_type: str = "claude",
     dockerfile: str | None = None,
     spawn_env: dict[str, str] | None = None,
+    shared_mounts: list[str] | None = None,
 ) -> tuple[str, bool]:
     """Ensure the supervisor for ``sandbox_id`` is reachable. Restart if needed.
 
@@ -2245,6 +2255,7 @@ async def _ensure_sandbox_alive(
         log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
         new_instance, replaced = await _replace_sandbox_inplace(
             sandbox_id, fresh, agent_type, dockerfile, spawn_env,
+            shared_mounts=shared_mounts,
         )
         _INSTANCES[sandbox_id] = new_instance
         await upsert_sandbox(_sandbox_record(
@@ -2624,13 +2635,14 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
     agent_type = agent_record.config.agent_type or "claude"
 
-    # Build spawn_env from the agent we already fetched.
-    agent_env = (agent_record.config.env or {}) if agent_record.config else {}
-    spawn_env = _merge_env(
-        agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
-    )
-    root = sandbox.root or (agent_record.config.cwd if agent_record.config else None) or "/tmp"
-    effective_spawn_env = {**spawn_env, "HOME": root}
+    # Build spawn_env from the agent we already fetched (HOME → sandbox root).
+    cfg = agent_record.config
+    agent_env = (cfg.env or {}) if cfg else {}
+    root = sandbox.root or (cfg.cwd if cfg else None) or "/tmp"
+    effective_spawn_env = {
+        **_merge_env(agent_env, session_row.get("env") or {}, session_row.get("secrets") or {}),
+        "HOME": root,
+    }
 
     # Supervisor URL resolution:
     #  - Port-based (local/docker): URL is known from _INSTANCES or the DB row.
@@ -2640,8 +2652,7 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
         if cached and cached.url:
             supervisor_url, supervisor_port = cached.url, cached.port
         elif sandbox.listen_port is not None:
-            supervisor_url = f"http://localhost:{sandbox.listen_port}"
-            supervisor_port = sandbox.listen_port
+            supervisor_url, supervisor_port = sandbox.derive_url(), sandbox.listen_port
         else:
             raise HTTPException(
                 500,
@@ -2679,7 +2690,7 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     # sandbox HOME) breaks recovery for any agent whose original session
     # was created with cwd != root — e.g. local provider where default cwd
     # is /tmp.
-    cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
+    cwd = (cfg.cwd or "/tmp") if cfg else "/tmp"
 
     # Single source of truth for "get me an attached ACP session" — tries
     # session/load when an inner_sid exists and only falls through to
