@@ -59,61 +59,6 @@ def _get_daytona_client():
     return Daytona(DaytonaConfig(api_key=api_key))
 
 
-async def _bootstrap_supervisor_in_daytona_sandbox(
-    sandbox, agent_type: str, *,
-    root: str = "/tmp",
-    spawn_env: dict[str, str] | None = None,
-) -> ProviderInstance:
-    """Start the supervisor inside an existing daytona sandbox.
-
-    Recovery path only: deps are already on disk from the previous run
-    (either the original /tmp install or a volume-cached deps.tar.gz), so
-    we just exec the supervisor binary against the existing node_modules.
-    """
-    bin_name = _acp_bin_name(agent_type)
-    loop = asyncio.get_running_loop()
-
-    def _exec(cmd: str, timeout: int = 120) -> str:
-        r = sandbox.process.exec(cmd, timeout=timeout)
-        return (r.result if hasattr(r, "result") else str(r)) or ""
-
-    acp_bin = f"{_SUPERVISOR_REMOTE_DIR}/node_modules/.bin/{bin_name}"
-    env_prefix = _build_env_prefix(spawn_env)
-    supervisor_argv = build_supervisor_argv(
-        supervisor_js="supervisor.js", acp_bin=acp_bin,
-        acp_launch_args=_acp_launch_args(agent_type),
-        port=_SUPERVISOR_REMOTE_PORT, root=root,
-        snapshot_path=_SNAPSHOT_PATH, quote_paths=False,
-    )
-    inner = (
-        f"cd {_SUPERVISOR_REMOTE_DIR} && "
-        f"setsid env {env_prefix} {supervisor_argv} "
-        f"> {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1 </dev/null & echo started"
-    )
-    start_cmd = f"sh -c {shlex.quote(inner)}"
-    await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
-    # _wait_for_health already polls with backoff; no redundant pre-sleep.
-
-    signed = await loop.run_in_executor(
-        None, lambda: sandbox.create_signed_preview_url(_SUPERVISOR_REMOTE_PORT, 24 * 3600)
-    )
-    url = signed.url.rstrip("/")
-
-    if not await _wait_for_health(url, max_retries=20, interval=1):
-        log_out = await loop.run_in_executor(None, lambda: _exec(f"tail -40 {_SUPERVISOR_REMOTE_DIR}/sup.log 2>&1"))
-        raise RuntimeError(
-            f"supervisor in Daytona sandbox {sandbox.id} failed health check; log:\n{log_out[:800]}"
-        )
-
-    log.info("daytona supervisor ready: %s (sandbox %s)", url[:60], sandbox.id[:16])
-    return ProviderInstance(
-        provider="daytona",
-        url=url,
-        root=root,
-        sandbox_id=sandbox.id,
-    )
-
-
 async def start_supervisor_in_sandbox(
     sandbox, agent_type: str, port: int, root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
@@ -368,13 +313,10 @@ async def restart_daytona_supervisor(
     sandbox filesystem, so claude-agent-acp's persisted session state is
     available for session/load.
 
-    Prefers the volume-cache install path
-    (``start_supervisor_in_sandbox``) so the restart and fresh-provision
-    paths agree on where the ACP binary lives.  Falls back to the legacy
-    ``_bootstrap_supervisor_in_daytona_sandbox`` branch only when the
-    volume cache is absent — typically because the sandbox was created
-    before the volume-refactor landed and has no
-    ``/opt/supervisor`` mount.
+    Routes through ``start_supervisor_in_sandbox`` which reads from the
+    per-volume deps.tar.gz cache installed by ``install_supervisor``. Any
+    post-volume-refactor sandbox has that cache; sandboxes old enough to
+    lack it are no longer supported (pre-2026-04).
     """
     try:
         from daytona_sdk import Daytona, DaytonaConfig
@@ -399,46 +341,19 @@ async def restart_daytona_supervisor(
         await _wait_for_daytona_sandbox_ready(daytona, daytona_sandbox_id)
         sandbox = await loop.run_in_executor(None, lambda: daytona.get(daytona_sandbox_id))
 
-    # Probe for the volume-cached deps tarball. If present, route through
-    # start_supervisor_in_sandbox which extracts from the cache; otherwise
-    # fall back to the legacy /tmp install path.
-    def _exec(cmd: str, timeout: int = 10) -> str:
-        r = sandbox.process.exec(cmd, timeout=timeout)
-        return (r.result if hasattr(r, "result") else str(r)) or ""
-
-    cache_check = await loop.run_in_executor(
-        None,
-        lambda: _exec(
-            f"test -f {_SUPERVISOR_VOLUME_DIR}/deps.tar.gz "
-            f"&& test -f {_SUPERVISOR_VOLUME_DIR}/supervisor.js "
-            "&& echo yes || echo no"
-        ),
+    # Volume-cached path. Uses the fixed supervisor port so the signed URL
+    # is stable across restarts for an already-issued session (Daytona maps
+    # preview URLs by port). HOME is set to root by supervisor.js when it
+    # spawns ACP — no need to force it here.
+    url = await start_supervisor_in_sandbox(
+        sandbox, agent_type, _SUPERVISOR_REMOTE_PORT,
+        root=_DAYTONA_AGENT_HOME, spawn_env=spawn_env,
     )
-    if cache_check.strip() == "yes":
-        # Volume-cached path. Uses the fixed supervisor port so the
-        # signed URL is stable across restarts for an already-issued
-        # session (Daytona maps preview URLs by port). HOME is set to
-        # root by supervisor.js when it spawns ACP — no need to force it
-        # here.
-        url = await start_supervisor_in_sandbox(
-            sandbox, agent_type, _SUPERVISOR_REMOTE_PORT,
-            root=_DAYTONA_AGENT_HOME, spawn_env=spawn_env,
-        )
-        return ProviderInstance(
-            provider="daytona",
-            url=url,
-            root=root,
-            sandbox_id=sandbox.id,
-        )
-
-    # Legacy fallback — /tmp install produced by an older fresh-provision.
-    log.info(
-        "restart_daytona_supervisor: volume cache missing for sandbox %s; "
-        "using legacy /tmp bootstrap path",
-        daytona_sandbox_id[:16],
-    )
-    return await _bootstrap_supervisor_in_daytona_sandbox(
-        sandbox, agent_type, root=root, spawn_env=spawn_env,
+    return ProviderInstance(
+        provider="daytona",
+        url=url,
+        root=root,
+        sandbox_id=sandbox.id,
     )
 
 

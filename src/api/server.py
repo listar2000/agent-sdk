@@ -3378,13 +3378,12 @@ async def session_cancel(session_id: str):
     _, _, state = await ensure_session_live(session_id)
     if not state.agent_busy:
         return {"status": "ok", "detail": "not busy"}
-
+    # Raise 504 on timeout; _cancel_and_drain only logs.
     await state.client.cancel_prompt(state.acp_session_id)
     try:
         await asyncio.wait_for(state._prompt_done.wait(), timeout=_CANCEL_DRAIN_TIMEOUT)
     except asyncio.TimeoutError:
-        log.warning("session_cancel: timed out waiting for rpc %s", state.active_rpc_id)
-        raise HTTPException(504, "cancel timed out")
+        raise HTTPException(504, f"cancel timed out (rpc {state.active_rpc_id})")
     return {"status": "ok"}
 
 
