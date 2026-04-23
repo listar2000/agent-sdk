@@ -605,16 +605,14 @@ async def _recover_after_disconnect(state: SessionState) -> bool:
     and the session goes fatal.
     """
     try:
-        sandbox_record = await get_sandbox(state.sandbox_id)
-        if sandbox_record is None:
-            return False
         log.info("[SSE-READER] retries exhausted for session %s; attempting sandbox recovery",
                  state.session_id)
-        spawn_env = await _spawn_env_for_sandbox(state.sandbox_id)
-        new_url, _ = await _ensure_sandbox_alive(
-            state.sandbox_id, sandbox_record,
-            agent_type=state.agent_type, spawn_env=spawn_env,
-        )
+        try:
+            sandbox_record, new_url = await ensure_live(
+                state.sandbox_id, agent_type=state.agent_type,
+            )
+        except RuntimeError:
+            return False  # sandbox row deleted out-of-band
         new_acp_session_id = str(uuid.uuid4())
         new_client = AcpClient(new_url)
         agent_record = await get_agent(state.agent_id)
@@ -1714,24 +1712,12 @@ async def stop_sandbox_route(sandbox_id: str):
 
 @app.post("/sandboxes/{sandbox_id}/start")
 async def start_sandbox_route(sandbox_id: str):
-    record = await _require_sandbox(sandbox_id)
+    await _require_sandbox(sandbox_id)
     try:
-        url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type="claude")
+        fresh, url = await ensure_live(sandbox_id)
     except Exception as e:
-        # 502 matches POST /sandboxes and POST /sandboxes/provision —
-        # provider failures are upstream faults, not server bugs (500).
+        # 502 matches POST /sandboxes — provider failures are upstream faults.
         raise HTTPException(502, f"failed to start sandbox: {e}")
-
-    # Re-fetch the record: _ensure_sandbox_alive may have created a replacement
-    # sandbox (for Daytona terminal-state / docker missing) and written a new
-    # sandbox_ref + listen_port to the DB. Upserting our local snapshot would
-    # clobber those updates with a stale sandbox_ref pointing at the dead
-    # container. Fresh fetch is authoritative.
-    fresh = await get_sandbox(sandbox_id)
-    if fresh is None:
-        # Shouldn't happen — _ensure_sandbox_alive just succeeded — but be
-        # defensive: fall through to returning the working URL.
-        return {"status": "running", "url": url}
     fresh.status = "running"
     await upsert_sandbox(fresh)
     return {"status": "running", "url": url}
@@ -2061,14 +2047,12 @@ async def _instance_is_alive(inst: ProviderInstance) -> bool:
 
 
 async def _replace_sandbox_inplace(
-    sandbox_id: str, rec: SandboxRecord, agent_type: str,
-    dockerfile: str | None, spawn_env: dict,
-) -> tuple[ProviderInstance, bool]:
+    sandbox_id: str, rec: SandboxRecord, agent_type: str, spawn_env: dict,
+) -> ProviderInstance:
     """Provision a fresh provider instance for ``sandbox_id``, keeping the
-    same DB row. For port-based providers always just provision_sandbox.
-    For daytona, try restart_daytona_supervisor first (supervisor died
-    inside a live sandbox); only on unrecoverable errors create a brand-new
-    daytona sandbox (replaced=True).
+    same DB row. Port-based: always provision_sandbox. Daytona: try
+    restart_daytona_supervisor (supervisor died inside a live sandbox)
+    first; only on unrecoverable errors create a brand-new daytona sandbox.
     """
     provider = rec.provider
     if provider in PORT_BASED_PROVIDERS:
@@ -2078,21 +2062,20 @@ async def _replace_sandbox_inplace(
         if vol is None:
             raise RuntimeError(f"Sandbox {sandbox_id} references missing volume {rec.volume_id}")
         try:
-            inst = await _providers_mod.provision_sandbox(
+            return await _providers_mod.provision_sandbox(
                 provider, volume_ref=vol.provider_ref, subpath=rec.subpath or "",
-                agent_type=agent_type, dockerfile=dockerfile,
-                root=rec.root, spawn_env=spawn_env, sandbox_id=sandbox_id,
+                agent_type=agent_type, root=rec.root,
+                spawn_env=spawn_env, sandbox_id=sandbox_id,
             )
         except Exception as e:
             raise RuntimeError(f"Failed to restart sandbox: {e}")
-        return inst, False
 
     # Daytona: try supervisor-only restart first; full replace on unrecoverable.
     from .providers import restart_daytona_supervisor
     try:
         return await restart_daytona_supervisor(
             rec.sandbox_ref, agent_type, root=rec.root, spawn_env=spawn_env,
-        ), False
+        )
     except Exception as e:
         if not _should_replace_daytona_sandbox(e):
             raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
@@ -2104,47 +2087,40 @@ async def _replace_sandbox_inplace(
         if v is not None:
             dt_volume_ref = v.provider_ref
     try:
-        inst = await create_instance(
-            "daytona", agent_type, dockerfile=dockerfile,
-            root=rec.root, spawn_env=spawn_env,
-            volume_id=dt_volume_ref, subpath=rec.subpath,
-            sandbox_id=sandbox_id,
+        return await create_instance(
+            "daytona", agent_type, root=rec.root, spawn_env=spawn_env,
+            volume_id=dt_volume_ref, subpath=rec.subpath, sandbox_id=sandbox_id,
         )
     except Exception as e:
         raise RuntimeError(f"Failed to create replacement daytona sandbox: {e}")
-    return inst, True
 
 
-async def _ensure_sandbox_alive(
-    sandbox_id: str,
-    sandbox_record: SandboxRecord,
-    agent_type: str = "claude",
-    dockerfile: str | None = None,
-    spawn_env: dict[str, str] | None = None,
-) -> tuple[str, bool]:
-    """Ensure the supervisor for ``sandbox_id`` is reachable. Restart if needed.
+async def ensure_live(sandbox_id: str, *, agent_type: str = "claude") -> tuple[SandboxRecord, str]:
+    """Return (record, supervisor_url) with the supervisor confirmed alive.
 
-    Returns ``(url, replaced)`` where replaced=True means a fresh Daytona
-    sandbox had to be created (new daytona sandbox_ref). Port-based providers
-    always keep the same sandbox_ref since their restart is in-place.
+    Idempotent. Three transitions:
+      running → return (rec, cached url)
+      stopped (port-based) → start_sandbox in place, same sandbox_ref
+      missing/error (or start failed) → replace in place (same DB id,
+        possibly new provider ref for daytona)
+
+    sandbox_id (the DB primary key) is always stable across transitions;
+    only the underlying sandbox_ref may change.
     """
-    provider = sandbox_record.provider
     async with _get_sandbox_lock(sandbox_id):
         fresh = await get_sandbox(sandbox_id)
         if fresh is None:
-            raise RuntimeError("Sandbox was deleted")
+            raise RuntimeError(f"Sandbox {sandbox_id} was deleted")
+        provider = fresh.provider
 
+        # Cached-instance fast path.
         instance = _INSTANCES.get(sandbox_id)
         if instance is not None and await _instance_is_alive(instance):
-            return instance.url, False
+            return fresh, instance.url
 
-        if spawn_env is None:
-            spawn_env = await _spawn_env_for_sandbox(sandbox_id)
+        spawn_env = await _spawn_env_for_sandbox(sandbox_id)
 
-        # Port-based: try in-place start on the existing sandbox_ref before
-        # falling through to provision_sandbox. For local this respawns
-        # the supervisor using cached spawn args; for docker it runs
-        # ``docker start`` — both keep the ref stable.
+        # Port-based in-place restart on the existing sandbox_ref.
         if provider in PORT_BASED_PROVIDERS:
             try:
                 status = await _providers_mod.get_sandbox_status(provider, fresh.sandbox_ref)
@@ -2160,32 +2136,31 @@ async def _ensure_sandbox_alive(
                     if instance is not None:
                         try: await destroy_instance(instance)
                         except Exception: pass
-                    url = sandbox_record.derive_url()
+                    url = fresh.derive_url()
                     revived = ProviderInstance(
-                        provider=provider, url=url, root=sandbox_record.root,
-                        sandbox_id=fresh.sandbox_ref, port=sandbox_record.listen_port,
+                        provider=provider, url=url, root=fresh.root,
+                        sandbox_id=fresh.sandbox_ref, port=fresh.listen_port,
                     )
                     if provider == "local":
                         from .providers.local import _PROCESSES as _LOCAL_PROCS
                         revived.process = _LOCAL_PROCS.get(fresh.sandbox_ref)
                     _INSTANCES[sandbox_id] = revived
-                    return url, False
+                    return fresh, url
 
-        # Full replacement path (all providers). Old instance is torn down first.
+        # Replace in place (new underlying instance, same DB id).
         if instance is not None:
             try: await destroy_instance(instance)
             except Exception: pass
         log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
-        new_instance, replaced = await _replace_sandbox_inplace(
-            sandbox_id, fresh, agent_type, dockerfile, spawn_env,
-        )
+        new_instance = await _replace_sandbox_inplace(sandbox_id, fresh, agent_type, spawn_env)
         _INSTANCES[sandbox_id] = new_instance
-        await upsert_sandbox(_sandbox_record(
+        new_rec = _sandbox_record(
             sandbox_id, provider, new_instance,
-            volume_id=sandbox_record.volume_id, subpath=sandbox_record.subpath,
-            root_fallback=sandbox_record.root,
-        ))
-        return new_instance.url, replaced
+            volume_id=fresh.volume_id, subpath=fresh.subpath,
+            root_fallback=fresh.root,
+        )
+        await upsert_sandbox(new_rec)
+        return new_rec, new_instance.url
 
 
 
@@ -2379,9 +2354,8 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
         await set_session_current_sandbox(session_id, None)
         return await _provision_new(fresh, previous_id=current_id)
 
-    # Hot-path fast-path: trust a live cached instance + attached SessionState.
-    # No provider round-trip. ensure_runtime will re-verify with a health
-    # probe if this turns out stale; kill -9 is caught by process.poll().
+    # Hot-path fast-path: skip the sandbox-layer network probe when we
+    # have strong cached evidence the runtime is attached + live.
     cached = _INSTANCES.get(current_id)
     state = SESSIONS.get(session_id)
     if (sb.status == STATUS_RUNNING
@@ -2391,28 +2365,17 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
             and _instance_process_alive(cached)):
         return sb
 
-    # Cold path: probe provider status and act.
-    vol = await get_volume(sb.volume_id)
-    if vol is None:
-        raise HTTPException(500, f"Sandbox's volume {sb.volume_id} missing")
-    status = await _providers_mod.get_sandbox_status(vol.provider, sb.sandbox_ref)
-    if status == "running":
-        return sb
-    if status == "stopped":
-        await _providers_mod.start_sandbox(vol.provider, sb.sandbox_ref)
-        sb.status = STATUS_RUNNING
-        await upsert_sandbox(sb)
-        return sb
-    if status in ("missing", "error"):
-        if status == "error":
-            try:
-                await _providers_mod.destroy_sandbox(vol.provider, _synthesize_instance(sb))
-            except Exception:
-                pass
-        await delete_sandbox(sb.id)
+    # Cold path: delegate to the sandbox-layer primitive.
+    try:
+        rec, _ = await ensure_live(current_id)
+        return rec
+    except RuntimeError:
+        # Row deleted between our get_sandbox and ensure_live.
         await set_session_current_sandbox(session_id, None)
+        fresh = await get_session(session_id)
+        if fresh is None:
+            raise HTTPException(404, "Session not found")
         return await _provision_new(fresh, previous_id=current_id)
-    raise HTTPException(500, f"Unknown sandbox status: {status}")
 
 
 async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxRecord:
@@ -3356,9 +3319,9 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
     if instance and instance.provider in PORT_BASED_PROVIDERS:
         return instance
 
-    sandbox_record = await _require_sandbox(sandbox_id)
+    await _require_sandbox(sandbox_id)
     try:
-        await _ensure_sandbox_alive(sandbox_id, sandbox_record)
+        await ensure_live(sandbox_id)
     except Exception as e:
         raise HTTPException(502, f"failed to start sandbox: {e}")
     instance = _INSTANCES.get(sandbox_id)
