@@ -665,8 +665,11 @@ async def _ensure_state_live(state: SessionState, sandbox: SandboxRecord) -> Non
     if state.supervisor_url and state._reader_alive:
         cached = _INSTANCES.get(state.sandbox_id)
         if cached is None or _instance_process_alive(cached):
+            # One quick probe, no backoff. If it fails we go to rebind
+            # (which has its own retry ladder), so extra retries here
+            # just delay the inevitable by ~1s per attempt.
             try:
-                if await _wait_for_health(state.supervisor_url, max_retries=2, interval=1):
+                if await _wait_for_health(state.supervisor_url, max_retries=1, interval=0):
                     return
             except Exception:
                 pass
@@ -3128,8 +3131,8 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
     own ensure call happens before the prompt is enqueued, so a sandbox
     that died between enqueue and scheduler pickup would otherwise get
     the prompt sent to a dead supervisor. The ensure call here is cheap
-    on the hot path (reusable state → one health probe) and guarantees
-    the client + acp_session_id we use are live.
+    on the hot path (_reader_connected skips the health probe) and
+    guarantees the client + acp_session_id we use are live.
     """
     session_id = state.session_id
     await log_event(
@@ -3140,6 +3143,23 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
         _, _, state = await ensure_session_live(session_id)
         await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
         return
+    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as first_err:
+        # The supervisor died between `_reader_connected` observing it up
+        # and our prompt submit. Clear the flag so the next
+        # ensure_session_live is forced through the rebind path, then
+        # retry once. Handles the kill-then-immediately-send race for UI
+        # flows that don't add any delay.
+        log.warning("prompt for session %s failed with %s; forcing rebind + retry",
+                    session_id, type(first_err).__name__)
+        state._reader_connected = False
+        try:
+            _, _, state = await ensure_session_live(session_id)
+            await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
+            return
+        except Exception as e:
+            err = e
+            tb = traceback.format_exc()
+            log.exception("retry after rebind also failed for session %s", session_id)
     except Exception as e:
         err = e
         tb = traceback.format_exc()
