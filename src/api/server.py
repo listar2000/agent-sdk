@@ -277,8 +277,8 @@ async def _reap_one_tick(now: float) -> None:
     Closes any session that is idle past IDLE_TIMEOUT_S with no active or
     pending prompts and no subscribers. When the last session on a sandbox
     is reaped, the sandbox itself is snapshotted + stopped via
-    ``snapshot_and_stop`` so workspace state is durable on the volume
-    before the provider call lands.
+    provider stop. Durability lives at turn-end in the supervisor;
+    stop here is just SIGTERM.
     """
     busy = sum(1 for s in SESSIONS.values() if s.agent_busy)
     readers = sum(1 for s in SESSIONS.values() if s._reader_alive)
@@ -312,27 +312,17 @@ async def _reap_one_tick(now: float) -> None:
             _sandbox_locks.pop(sandbox_id, None)
             instance = _INSTANCES.pop(sandbox_id, None)
             if instance:
-                log.info(
-                    "idle reaper: snapshot+stop sandbox %s (provider=%s)",
-                    sandbox_id, instance.provider,
-                )
+                log.info("idle reaper: stopping sandbox %s (provider=%s)",
+                         sandbox_id, instance.provider)
                 try:
+                    await stop_instance(instance)
                     rec = await get_sandbox(sandbox_id)
-                    if rec is not None:
-                        await snapshot_and_stop(rec, instance)
-                    else:
-                        # Row already gone (concurrent delete) — just stop.
-                        await stop_instance(instance)
-                    log.info("idle reaper: sandbox %s snapshotted + stopped",
-                             sandbox_id)
                     if rec is not None and rec.status != STATUS_STOPPED:
                         rec.status = STATUS_STOPPED
                         await upsert_sandbox(rec)
                 except Exception as e:
-                    log.warning(
-                        "reaper: failed to snapshot+stop sandbox %s: %s",
-                        sandbox_id, e,
-                    )
+                    log.warning("reaper: failed to stop sandbox %s: %s",
+                                sandbox_id, e)
 
 
 async def _idle_reaper():
@@ -373,20 +363,13 @@ async def lifespan(app):
     )
     SESSIONS.clear()
 
-    # Parallel instance teardown. Use snapshot_and_stop (not raw stop_instance)
-    # so every sandbox's workspace is durable on the volume before the
-    # process exits — server shutdown is otherwise indistinguishable from a
-    # crash from the client's perspective, and we don't want to lose the
-    # last-turn state just because the API was restarted. Falls back to
-    # stop_instance if the sandbox row isn't readable (e.g. DB already torn
-    # down in a weird shutdown ordering).
+    # Parallel instance teardown. Durability is already on the volume
+    # from per-turn snapshots; stop is just SIGTERM here. Falls through
+    # to stop_instance regardless of DB row state — the provider owns
+    # liveness truth.
     async def _safe_stop(sid, inst):
         try:
-            rec = await get_sandbox(sid)
-            if rec is not None:
-                await snapshot_and_stop(rec, inst)
-            else:
-                await stop_instance(inst)
+            await stop_instance(inst)
         except Exception as e:
             log.warning("shutdown cleanup failed for %s: %s", sid, e)
 
@@ -1715,13 +1698,11 @@ async def stop_sandbox_route(sandbox_id: str):
         instance = _INSTANCES.get(sandbox_id)
         if instance:
             try:
-                # snapshot_and_stop: workspace tarball lands on the volume
-                # BEFORE the provider stops the sandbox, so the next
-                # ensure_sandbox call can restore a fresh container from
-                # the up-to-date snapshot.
-                await snapshot_and_stop(record, instance)
+                # Durability lives at turn-end in the supervisor; stop is
+                # just SIGTERM. Client sees this return as "stop complete."
+                await stop_instance(instance)
             except Exception as e:
-                log.warning("stop_sandbox_route: snapshot_and_stop failed for %s: %s",
+                log.warning("stop_sandbox_route: stop failed for %s: %s",
                             sandbox_id, e)
                 raise HTTPException(502, f"stop failed: {e}")
 
@@ -1836,16 +1817,10 @@ async def admin_reap_session(session_id: str):
         if instance is not None:
             stopped_provider = instance.provider
             try:
-                rec = await get_sandbox(sandbox_id)
-                if rec is not None:
-                    await snapshot_and_stop(rec, instance)
-                else:
-                    await stop_instance(instance)
+                await stop_instance(instance)
             except Exception as e:
-                log.warning(
-                    "admin reap: snapshot_and_stop failed for %s: %s",
-                    sandbox_id, e,
-                )
+                log.warning("admin reap: stop failed for %s: %s",
+                            sandbox_id, e)
 
     return {
         "session_id": session_id,
@@ -2056,87 +2031,21 @@ def _should_replace_daytona_sandbox(exc: Exception) -> bool:
     return any(token in text for token in _DAYTONA_UNRECOVERABLE_TOKENS)
 
 
-async def snapshot_supervisor(
-    sandbox: SandboxRecord, *, url: str | None = None,
-) -> None:
-    """Call POST /v1/snapshot on the sandbox's supervisor.
+def _synthesize_instance(
+    sandbox: SandboxRecord, cached: ProviderInstance | None = None,
+) -> ProviderInstance:
+    """Return a ProviderInstance suitable for stop_instance / destroy_instance.
 
-    Best-effort: non-200 responses and transport errors are logged, not
-    raised. Callers (typically ``snapshot_and_stop``) proceed with
-    teardown regardless — a transient volume error must not pin the
-    sandbox alive, and the sandbox is about to die anyway.
-
-    ``url`` lets the caller inject a pre-resolved supervisor URL (e.g.
-    from ``SessionState.supervisor_url``). Without it we try the
-    ``_INSTANCES`` cache, then port-based derivation. That covers
-    docker/local today; Daytona callers pass ``url=`` explicitly for now
-    until a URL-resolution step lands with the daytona call-sites.
+    Uses the _INSTANCES cache entry if provided; otherwise synthesizes a
+    minimal instance from the sandbox row. Either is enough for the
+    provider's stop/destroy path to target the right container/process.
     """
-    if url is None:
-        inst = _INSTANCES.get(sandbox.id)
-        if inst and inst.url:
-            url = inst.url
-        elif sandbox.listen_port is not None:
-            url = f"http://localhost:{sandbox.listen_port}"
-        else:
-            log.warning(
-                "snapshot_supervisor: no URL for sandbox %s (provider=%s); skipping",
-                sandbox.id, sandbox.provider,
-            )
-            return
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            r = await client.post(f"{url}/v1/snapshot")
-            if r.status_code != 200:
-                log.warning(
-                    "snapshot_supervisor: %s returned %d: %s",
-                    sandbox.id, r.status_code, r.text[:200],
-                )
-        except Exception as e:
-            log.warning(
-                "snapshot_supervisor: POST failed for %s: %s", sandbox.id, e,
-            )
-
-
-async def snapshot_and_stop(
-    sandbox: SandboxRecord,
-    instance: ProviderInstance | None = None,
-    *, url: str | None = None,
-) -> None:
-    """Snapshot the workspace, then stop the sandbox at the provider.
-
-    The single server-initiated stop entry point under the snapshot-on-stop
-    model: reap, /sandboxes/:id/stop, sandbox-replacement during recovery,
-    agent-delete all route through here.
-
-    Ordering is strict — snapshot before stop, even if the snapshot step
-    itself fails. ``snapshot_supervisor`` already swallows its own errors,
-    but we wrap again defensively so a bug in the helper cannot wedge the
-    stop path. The sandbox is about to die; a lost snapshot is recoverable
-    (the user loses a turn's worth of state, at most), a wedged stop is not.
-
-    ``instance`` is used if provided; otherwise we look up _INSTANCES or
-    synthesize a minimal ProviderInstance from the sandbox row so
-    ``stop_instance`` can still target the provider.
-    """
-    try:
-        await snapshot_supervisor(sandbox, url=url)
-    except Exception as e:
-        log.warning(
-            "snapshot_and_stop: snapshot step failed for %s: %s; "
-            "proceeding to stop anyway", sandbox.id, e,
-        )
-
-    inst = instance or _INSTANCES.get(sandbox.id)
-    if inst is None:
-        vol = await get_volume(sandbox.volume_id) if sandbox.volume_id else None
-        provider = vol.provider if vol else sandbox.provider
-        inst = ProviderInstance(
-            provider=provider, url="",
-            root=sandbox.root, sandbox_id=sandbox.sandbox_ref,
-        )
-    await stop_instance(inst)
+    if cached is not None:
+        return cached
+    return ProviderInstance(
+        provider=sandbox.provider, url="",
+        root=sandbox.root, sandbox_id=sandbox.sandbox_ref,
+    )
 
 
 async def _ensure_sandbox_alive(
@@ -3486,30 +3395,20 @@ async def start_session_sandbox(session_id: str):
 
 @app.post("/sessions/{session_id}/stop-sandbox", status_code=204)
 async def stop_session_sandbox(session_id: str):
-    """Kill the current sandbox. Next /message lazy-provisions a fresh one."""
+    """Kill the current sandbox. Next /message lazy-provisions a fresh one.
+
+    Durability lives at turn-end in the supervisor; stop here is just
+    destroy. The replacement sandbox restores from the last turn-end
+    snapshot on first boot.
+    """
     sess = await _require_session_row(session_id)
     sbid = sess.get("current_sandbox_id")
     if sbid is None:
         return  # 204, no-op — already stopped
     sb = await get_sandbox(sbid)
     if sb:
-        # Snapshot the workspace before destroy so the next sandbox can
-        # restore conversation state + session JSONLs + installed deps.
-        # Best-effort: snapshot_supervisor swallows its own errors; a
-        # failure here must not pin the sandbox alive.
         try:
-            await snapshot_supervisor(sb)
-        except Exception as e:
-            log.warning(
-                "stop_session_sandbox: snapshot failed for %s: %s; "
-                "proceeding to destroy", sb.id, e,
-            )
-        inst = ProviderInstance(
-            provider=sb.provider, url="",
-            root=sb.root, sandbox_id=sb.sandbox_ref,
-        )
-        try:
-            await _providers_mod.destroy_sandbox(sb.provider, inst)
+            await _providers_mod.destroy_sandbox(sb.provider, _synthesize_instance(sb))
         except Exception:
             pass  # best-effort
     await set_session_current_sandbox(session_id, None)
