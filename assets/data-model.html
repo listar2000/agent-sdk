@@ -518,6 +518,10 @@
               <span class="field-desc">default now()</span>
             </div>
             <div class="relation-note">Durable storage, independent of any sandbox. Lifecycle via <code style="font-family:monospace;color:#fb923c;">/volumes</code> CRUD.</div>
+            <div class="relation-note" style="margin-top:6px;">On-volume layout:<br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">system/supervisor/</code> — shared supervisor.js + node_modules (installed once per agent_type, read-only to sandboxes)<br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">agents/&lt;agent_id&gt;/</code> — per-agent slice: <code style="font-family:monospace;color:#fb923c;">snapshot.tar</code> (HOME contents, refreshed each turn-end) + <code style="font-family:monospace;color:#fb923c;">logs/</code><br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">shared/&lt;name&gt;/</code> — opt-in shared folder, mounted at <code style="font-family:monospace;color:#fb923c;">/mnt/&lt;name&gt;</code> for agents that list it in <code style="font-family:monospace;color:#fb923c;">config.shared_mounts</code></div>
           </div>
         </div>
 
@@ -574,7 +578,7 @@
               <div class="field-badges"></div>
               <span class="field-name">subpath</span>
               <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">e.g. agents/&lt;agent_id&gt;/home — mounted at /home/daytona</span>
+              <span class="field-desc">per-agent volume slice: agents/&lt;agent_id&gt; (holds snapshot.tar + logs). Docker/local bind-mount it at the sandbox root; Daytona mounts it at /vol and restores from snapshot.tar on boot.</span>
             </div>
             <div class="field is-new">
               <div class="field-badges"></div>
@@ -854,6 +858,18 @@
               <span class="field-name">dockerfile</span>
               <span class="field-type">str?</span>
               <span class="field-desc">custom sandbox image</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">env</span>
+              <span class="field-type">dict[str,str]</span>
+              <span class="field-desc">non-secret env baked into every session on this agent (e.g. LANG, TZ)</span>
+            </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">shared_mounts</span>
+              <span class="field-type">list[str]</span>
+              <span class="field-desc">opt-in: each entry mounts &lt;volume&gt;/shared/&lt;name&gt; at /mnt/&lt;name&gt; inside the sandbox</span>
             </div>
             <div class="relation-note">Stored as JSON in agents.config column.</div>
           </div>
