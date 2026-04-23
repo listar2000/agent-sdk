@@ -505,16 +505,21 @@ async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=Non
     sandbox.start() returns as soon as Daytona accepts the request, before the
     container network is configured.  Subsequent exec calls fail with
     "failed to resolve container IP" until the network stack is up.
+
+    Check FIRST, then sleep — the old "sleep 2s up-front" burned ~2s on
+    every restart even when the sandbox was already ready. 0.5s cadence
+    also surfaces readiness ~4x faster than the old 2s polls.
     """
     loop = asyncio.get_running_loop()
-    for _attempt in range(30):
-        await asyncio.sleep(2)
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
-        raw_state = sandbox.state
-        state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
-        if state_str != "started":
-            continue
+    for attempt in range(30):  # 30 * 0.5s = 15s max
+        if attempt > 0:
+            await asyncio.sleep(0.5)
         try:
+            sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
+            raw_state = sandbox.state
+            state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
+            if state_str != "started":
+                continue
             r = await loop.run_in_executor(
                 None, lambda: sandbox.process.exec("echo ready", timeout=5)
             )
