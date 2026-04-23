@@ -375,9 +375,16 @@ async def lifespan(app):
     reaper = asyncio.create_task(_idle_reaper())
     yield
     await _cancel_task(reaper)
-    # Parallel session shutdown
+    # Parallel session shutdown. force=True is required on app shutdown:
+    # any session still holding a /events subscriber would otherwise
+    # early-return as a no-op, leaving its SSE reader running while the
+    # supervisor goes away below — the reader then loops through its
+    # retry ladder (up to ~25s backoff) before the task finally exits,
+    # extending uvicorn's drain phase by that much. Force-shutdown
+    # cancels the reader immediately and kicks subscribers so /events
+    # handlers return cleanly.
     await asyncio.gather(
-        *[_shutdown_session_state(s, remove=False) for s in SESSIONS.values()],
+        *[_shutdown_session_state(s, remove=False, force=True) for s in SESSIONS.values()],
         return_exceptions=True,
     )
     SESSIONS.clear()
