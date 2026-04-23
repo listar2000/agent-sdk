@@ -1970,6 +1970,49 @@ def _should_replace_daytona_sandbox(exc: Exception) -> bool:
     return any(token in text for token in _DAYTONA_UNRECOVERABLE_TOKENS)
 
 
+async def snapshot_supervisor(
+    sandbox: SandboxRecord, *, url: str | None = None,
+) -> None:
+    """Call POST /v1/snapshot on the sandbox's supervisor.
+
+    Best-effort: non-200 responses and transport errors are logged, not
+    raised. Callers (typically ``snapshot_and_stop``) proceed with
+    teardown regardless — a transient volume error must not pin the
+    sandbox alive, and the sandbox is about to die anyway.
+
+    ``url`` lets the caller inject a pre-resolved supervisor URL (e.g.
+    from ``SessionState.supervisor_url``). Without it we try the
+    ``_INSTANCES`` cache, then port-based derivation. That covers
+    docker/local today; Daytona callers pass ``url=`` explicitly for now
+    until a URL-resolution step lands with the daytona call-sites.
+    """
+    if url is None:
+        inst = _INSTANCES.get(sandbox.id)
+        if inst and inst.url:
+            url = inst.url
+        elif sandbox.listen_port is not None:
+            url = f"http://localhost:{sandbox.listen_port}"
+        else:
+            log.warning(
+                "snapshot_supervisor: no URL for sandbox %s (provider=%s); skipping",
+                sandbox.id, sandbox.provider,
+            )
+            return
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.post(f"{url}/v1/snapshot")
+            if r.status_code != 200:
+                log.warning(
+                    "snapshot_supervisor: %s returned %d: %s",
+                    sandbox.id, r.status_code, r.text[:200],
+                )
+        except Exception as e:
+            log.warning(
+                "snapshot_supervisor: POST failed for %s: %s", sandbox.id, e,
+            )
+
+
 async def _ensure_sandbox_alive(
     sandbox_id: str,
     sandbox_record: SandboxRecord,
