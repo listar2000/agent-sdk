@@ -1,5 +1,6 @@
 """Thin async Python client for a JSON-RPC 2.0 ACP agent over POST+SSE."""
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -115,17 +116,39 @@ class AcpClient:
         result = await self.handshake(session_id, agent)
         try:
             mcp_array = _mcp_dict_to_acp_array(mcp_servers) if mcp_servers else []
-            try:
-                new_result = await self._send_rpc(session_id, "session/new",
-                                                  {"cwd": cwd, "mcpServers": mcp_array})
-            except RuntimeError as e:
-                if "Authentication required" not in str(e):
-                    raise
-                log.info("%s requires authenticate; retrying with env-var auth", agent)
-                await self._send_rpc(session_id, "authenticate",
-                                     {"methodId": "openai-api-key"})
-                new_result = await self._send_rpc(session_id, "session/new",
-                                                  {"cwd": cwd, "mcpServers": mcp_array})
+            # Retry session/new to absorb transient CLI-not-fully-ready errors
+            # on freshly-provisioned sandboxes (observed as ACP -32603 Internal
+            # error even after the supervisor's health endpoint reports OK).
+            # Observed failure mode: all 3 attempts with 1s/2s backoff completed
+            # within 3s of supervisor-up, but the Claude CLI's internal init
+            # can take 10s+ on cold boots. Extend to 5 attempts with longer
+            # gaps — up to ~25s total before we give up.
+            backoffs = [1.0, 3.0, 5.0, 8.0]  # 4 waits between 5 attempts
+            last_exc = None
+            for attempt in range(5):
+                try:
+                    new_result = await self._send_rpc(session_id, "session/new",
+                                                      {"cwd": cwd, "mcpServers": mcp_array})
+                    last_exc = None
+                    break
+                except RuntimeError as e:
+                    if "Authentication required" in str(e):
+                        log.info("%s requires authenticate; retrying with env-var auth", agent)
+                        await self._send_rpc(session_id, "authenticate",
+                                             {"methodId": "openai-api-key"})
+                        new_result = await self._send_rpc(session_id, "session/new",
+                                                          {"cwd": cwd, "mcpServers": mcp_array})
+                        last_exc = None
+                        break
+                    last_exc = e
+                    if attempt < len(backoffs):
+                        log.info(
+                            "session/new attempt %d failed (%s); retrying in %.1fs",
+                            attempt + 1, e, backoffs[attempt],
+                        )
+                        await asyncio.sleep(backoffs[attempt])
+            if last_exc is not None:
+                raise last_exc
             inner_sid = new_result.get("sessionId")
             log.info("session/new result for %s: sessionId=%s keys=%s", session_id, inner_sid, list(new_result.keys()))
             if inner_sid:

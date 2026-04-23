@@ -311,12 +311,17 @@ class Agent:
             config["mcp_servers"] = self.mcp_servers
         if self.skills is not None:
             config["skills"] = self.skills
-        # Credentials ride at top level so the server can pop them before any
-        # merge into config/AgentConfig/DB. Never include inside the config dict.
+        # Credentials ride through the standard ``secrets`` channel — the
+        # server pops env/secrets uniformly via ``_pop_env_and_secrets`` and
+        # merges them into the sandbox's ``spawn_env``. No special-case
+        # oauth_token / api_key handling anywhere.
+        secrets: dict[str, str] = {}
         if self._oauth_token:
-            config["oauth_token"] = self._oauth_token
+            secrets["CLAUDE_CODE_OAUTH_TOKEN"] = self._oauth_token
         if self._api_key:
-            config["api_key"] = self._api_key
+            secrets["ANTHROPIC_API_KEY"] = self._api_key
+        if secrets:
+            config["secrets"] = secrets
         return config
 
     def __repr__(self) -> str:
@@ -364,7 +369,7 @@ class Agent:
             else:
                 # Plain agent registration (no sandbox)
                 resp = await self._client.post("/agents", json=self._registration_payload())
-                resp.raise_for_status()
+                _raise_for_status(resp)
                 data = resp.json()
                 self.id = data.get("id", self.name)
                 if self.session_id is None:
@@ -546,7 +551,7 @@ class Agent:
         """Set session config dynamically. Accepts: mode, model, thought_level."""
         await self._ensure_registered()
         resp = await self._client.post(f"/sessions/{self.session_id}/config", json=kwargs)
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     async def cancel(self) -> None:
         """Cancel the currently running prompt (best-effort)."""
@@ -554,7 +559,7 @@ class Agent:
         resp = await self._client.post(
             f"/sessions/{self.session_id}/cancel",
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def reset_session(self) -> None:
         """Clear session state so the agent re-registers on next call."""
@@ -583,3 +588,88 @@ class Agent:
 
     async def __aexit__(self, *args):
         await self.aclose()
+
+
+# ── Volumes API ──
+
+from dataclasses import dataclass as _dataclass, fields
+
+
+@_dataclass
+class Volume:
+    id: str
+    name: str
+    provider: str
+    provider_ref: str
+    status: str
+
+    @classmethod
+    def _from_server(cls, payload: dict) -> "Volume":
+        """Build a ``Volume`` from a server response, tolerating extra keys.
+
+        The server's ``VolumeRecord`` has grown fields (``supervisor_agent_types``
+        as of the volume-aware supervisor rollout) that this lean SDK dataclass
+        does not model. Previously ``Volume(**payload)`` raised ``TypeError``
+        the moment the server started emitting those keys. Filtering to our
+        known slots keeps the SDK forward-compatible — new server fields are
+        silently ignored, no client release required.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in payload.items() if k in known})
+
+
+class _VolumesAPI:
+    """Client-side wrapper for /volumes REST endpoints."""
+
+    def __init__(self, client: "Client"):
+        self._c = client
+
+    async def create(self, name: str, provider: str) -> Volume:
+        r = await self._c._http.post(f"{self._c.base_url}/volumes",
+                                     json={"name": name, "provider": provider})
+        _raise_for_status(r)
+        return Volume._from_server(r.json())
+
+    async def provision(self, name: str, provider: str) -> Volume:
+        r = await self._c._http.post(f"{self._c.base_url}/volumes/provision",
+                                     json={"name": name, "provider": provider})
+        _raise_for_status(r)
+        return Volume._from_server(r.json())
+
+    async def get(self, id_or_name: str) -> Volume:
+        r = await self._c._http.get(f"{self._c.base_url}/volumes/{id_or_name}")
+        _raise_for_status(r)
+        return Volume._from_server(r.json())
+
+    async def list(self, provider: str | None = None) -> list[Volume]:
+        params = {"provider": provider} if provider else None
+        r = await self._c._http.get(f"{self._c.base_url}/volumes", params=params)
+        _raise_for_status(r)
+        return [Volume._from_server(v) for v in r.json()]
+
+    async def delete(self, id_or_name: str, force: bool = False) -> None:
+        params = {"force": "true"} if force else None
+        r = await self._c._http.delete(f"{self._c.base_url}/volumes/{id_or_name}",
+                                       params=params)
+        _raise_for_status(r)
+
+
+class Client:
+    """Top-level SDK client. For now only exposes .volumes — other resources
+    are still accessed via the Agent class."""
+
+    def __init__(self, base_url: str = "http://localhost:7778"):
+        self.base_url = base_url.rstrip("/")
+        # Lazy import to match the rest of the SDK's style.
+        import httpx
+        self._http = httpx.AsyncClient(timeout=30.0)
+        self.volumes = _VolumesAPI(self)
+
+    async def close(self) -> None:
+        await self._http.aclose()
+
+    async def __aenter__(self) -> "Client":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()

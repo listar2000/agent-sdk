@@ -28,9 +28,13 @@ class AgentConfig:
     mcp_servers: dict | None = None
     skills: list | dict | None = None  # npx skills sources
     dockerfile: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        d = {k: v for k, v in asdict(self).items() if v is not None}
+        if not d.get("env"):
+            d.pop("env", None)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentConfig:
@@ -72,14 +76,34 @@ class SandboxRecord:
     sandbox_ref: str
     status: str = "stopped"
     root: str = "/tmp"
+    volume_id: str | None = None
+    subpath: str | None = None
+    # Host-side port the supervisor listens on. Populated for docker/local;
+    # always NULL for Daytona (URL comes from the SDK-signed preview API).
+    listen_port: int | None = None
 
     def derive_url(self) -> str:
-        from .providers import PORT_BASED_PROVIDERS
-        if self.provider in PORT_BASED_PROVIDERS:
-            return f"http://localhost:{self.sandbox_ref}"
+        """Reconstruct the supervisor URL from the DB row.
+
+        Used on cold-start when the in-memory ``_INSTANCES`` cache is empty.
+        Requires ``listen_port`` to be set (docker/local). Daytona has no
+        port-based URL; callers must consult the provider's SDK instead.
+        """
+        if self.listen_port is not None:
+            return f"http://localhost:{self.listen_port}"
         raise NotImplementedError(
             f"URL derivation for provider '{self.provider}' requires external resolver"
         )
+
+
+@dataclass
+class VolumeRecord:
+    id: str
+    name: str
+    provider: str
+    provider_ref: str
+    status: str = "ready"
+    supervisor_agent_types: list[str] = field(default_factory=list)
 
 
 @dataclass

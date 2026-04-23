@@ -54,9 +54,16 @@ docker compose down        # stop, keep data
 docker compose down -v     # stop, delete database
 ```
 
-## Without Docker (server only)
+## Helper scripts
 
-If you want to run the server directly (e.g., for debugging):
+`scripts/launch_server_docker.sh` and `scripts/launch_server_local.sh` bootstrap everything (venv, Postgres, uvicorn):
+
+- `launch_server_docker.sh` — Postgres via `docker compose`, server on `:7778`.
+- `launch_server_local.sh` — project-local conda-installed Postgres (no Docker needed), server on `:7778`.
+
+Both load env vars from `.env` (repo-local) or `~/.env` before starting.
+
+## Without Docker or the helper scripts
 
 ```bash
 # Start Postgres separately
@@ -76,37 +83,13 @@ uvicorn src.api.server:app --port 7778 --reload
 
 ## API Structure
 
-### Sandbox endpoints (infrastructure)
+See [`docs/api.md`](api.md) for the full endpoint reference and [`assets/rest-api.html`](../assets/rest-api.html) for a visual map. Three resource groups:
 
-```
-POST   /sandboxes                    — create sandbox
-GET    /sandboxes                    — list
-GET    /sandboxes/{id}               — get info
-DELETE /sandboxes/{id}               — destroy
-POST   /sandboxes/{id}/stop          — stop (preserves filesystem on Daytona)
-POST   /sandboxes/{id}/start         — resume stopped sandbox
-```
+- **Volumes** (`/volumes/*`) — durable storage, with file ops backed by a short-lived utility sandbox.
+- **Sandboxes** (`/sandboxes/*`) — ephemeral compute. Every sandbox is `(volume_id, subpath)`-scoped at creation; the volume is mounted at `/home/daytona` with a read-only `shared/` subpath at `/mnt/shared`.
+- **Sessions** (`/sessions/*`) — conversation. Bind to a volume; `current_sandbox_id` is swapped as sandboxes come and go. Explicit sandbox control via `/sessions/{id}/{start,stop,reset}-sandbox`.
 
-Sandbox endpoints operate directly on the infrastructure. No session required.
-
-### Session endpoints (conversation)
-
-```
-POST   /sessions/quick               — create agent + sandbox + session
-POST   /sessions/{id}/message        — send prompt
-GET    /sessions/{id}/events         — SSE event stream
-POST   /sessions/{id}/cancel         — cancel running prompt
-POST   /sessions/{id}/config         — set model, mode, thinking level
-GET    /sessions/{id}/status         — session status
-GET    /sessions/{id}/log            — event log
-POST   /sessions/{id}/sandbox/exec   — run a shell command in session sandbox
-```
-
-Conversation endpoints (`/sessions/{id}/message`, `/sessions/{id}/events`,
-`/sessions/{id}/cancel`, `/sessions/{id}/config`, `/sessions/{id}/resume`,
-`/sessions/{id}/sandbox/exec`) auto-recover if a session was reaped by the idle
-timeout — the server looks up the session in the DB, restarts the sandbox if
-stopped, and reloads the conversation.
+`POST /sessions` and `POST /sessions/quick` accept an optional `volume_id`; if omitted, a per-provider default volume is created/reused.
 
 ## Database
 
@@ -116,8 +99,9 @@ The server uses Postgres. Tables are created automatically on startup via
 
 Tables:
 - `agents` — agent configurations (id, name, config JSONB)
-- `sandboxes` — sandbox records (id, provider, sandbox_ref, status)
-- `sessions` — session records (id, agent_id, sandbox_id, inner_session_id)
+- `volumes` — persistent storage records (id, name, provider, provider_ref, status)
+- `sandboxes` — ephemeral compute records (id, provider, sandbox_ref, status, volume_id, subpath)
+- `sessions` — session records (id, agent_id, volume_id, current_sandbox_id, inner_session_id, env, secrets)
 - `session_log` — event log (session_id, event_type, payload JSONB)
 
 ## Environment Variables

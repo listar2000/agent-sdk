@@ -30,36 +30,86 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# Mirror TEST_DATABASE_URL -> DATABASE_URL so api.db (captured at its own
+# import time) picks up the test URL rather than the dev default.
+_TEST_DB = os.environ.get("TEST_DATABASE_URL")
+if _TEST_DB and not os.environ.get("DATABASE_URL"):
+    os.environ["DATABASE_URL"] = _TEST_DB
+
 import types
-_stub_db = types.ModuleType("api.db")
+from contextlib import asynccontextmanager as _asynccontextmanager
+
+
+# Generic no-op helpers used by the db stub factory and by individual tests
+# that need to disable incidental server calls (e.g. log_event).
 async def _noop(*a, **kw): return None
 async def _noop_list(*a, **kw): return []
 async def _noop_false(*a, **kw): return False
-from contextlib import asynccontextmanager as _asynccontextmanager
+async def _noop_volume(*a, **kw): return None
+
+
 @_asynccontextmanager
 async def _noop_get_db(*a, **kw):
     yield None
-_stub_db.init_db = lambda: None
-_stub_db.init_pool = _noop
-_stub_db.close_pool = _noop
-_stub_db.upsert_agent = _noop
-_stub_db.get_agent = _noop
-_stub_db.list_agents = _noop_list
-_stub_db.delete_agent = _noop
-_stub_db.upsert_sandbox = _noop
-_stub_db.get_sandbox = _noop
-_stub_db.list_sandboxes = _noop_list
-_stub_db.get_db = _noop_get_db
-_stub_db.delete_sandbox = _noop
-_stub_db.upsert_session = _noop
-_stub_db.get_session = _noop
-_stub_db.session_has_log_entries = _noop_false
-_stub_db.log_event = _noop
-_stub_db.get_session_log = _noop_list
-_stub_db.get_agent_log = _noop_list
-if "api.db" not in sys.modules:
-    sys.modules["api.db"] = _stub_db
 
+
+def _build_stub_db() -> types.ModuleType:
+    """Return a no-op stub module that stands in for api.db during tests."""
+    stub = types.ModuleType("api.db")
+    stub.init_db = lambda: None
+    stub.init_pool = _noop
+    stub.close_pool = _noop
+    stub.upsert_agent = _noop
+    stub.get_agent = _noop
+    stub.list_agents = _noop_list
+    stub.delete_agent = _noop
+    stub.upsert_sandbox = _noop
+    stub.get_sandbox = _noop
+    stub.list_sandboxes = _noop_list
+    stub.get_db = _noop_get_db
+    stub.delete_sandbox = _noop
+    stub.upsert_session = _noop
+    stub.get_session = _noop
+    stub.log_event = _noop
+    stub.get_session_log = _noop_list
+    stub.get_any_session_for_sandbox = _noop
+    stub.get_session_env = _noop
+    stub.get_session_secrets = _noop
+    stub.update_session_env = _noop
+    stub.update_session_secrets = _noop
+    stub.upsert_volume = _noop
+    stub.get_volume = _noop_volume
+    stub.get_volume_by_name = _noop_volume
+    stub.list_volumes = _noop_list
+    stub.delete_volume = _noop
+    stub.set_session_current_sandbox = _noop
+    stub.add_supervisor_agent_type = _noop
+    return stub
+
+
+_STUBBED_DB_NAMES = (
+    "init_db", "init_pool", "close_pool",
+    "upsert_agent", "get_agent", "list_agents", "delete_agent",
+    "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
+    "upsert_session", "get_session",
+    "get_session_env", "get_session_secrets", "get_any_session_for_sandbox",
+    "update_session_env", "update_session_secrets",
+    "log_event", "get_session_log",
+    "get_db", "add_supervisor_agent_type",
+    "upsert_volume", "get_volume", "get_volume_by_name",
+    "list_volumes", "delete_volume", "set_session_current_sandbox",
+)
+
+# Install stub BEFORE importing api.server so that its ``from .db import``
+# binds to stubs. Covers the case where pytest runs just this file with no
+# preceding module having installed a stub. If test_adversarial already
+# installed its own stub, our swap is harmless (both are no-ops) but
+# necessary so our fixture can restore a known-good real-db state on exit.
+_prior_api_db = sys.modules.get("api.db")
+_stub_db_module = _build_stub_db()
+sys.modules["api.db"] = _stub_db_module
+
+import api.server as _server_module
 from api.server import (
     app,
     SESSIONS,
@@ -80,19 +130,120 @@ from api.server import (
     IDLE_TIMEOUT_S,
 )
 from api.models import (
-    SessionState, PendingPrompt,
+    SessionState, PendingPrompt, SandboxRecord,
     _KICK_SENTINEL, EVT_TOOL_CALL, EVT_ERROR,
 )
+
+# Defensive: ensure every stubbed name on api.server really points at our
+# stub, regardless of what any earlier-imported test module did to them.
+for _name in _STUBBED_DB_NAMES:
+    if hasattr(_stub_db_module, _name):
+        setattr(_server_module, _name, getattr(_stub_db_module, _name))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_api_db_module():
+    """Force stub bindings for the duration of this test module.
+
+    At setup we (re-)install our stub into ``sys.modules["api.db"]`` and
+    re-bind every ``from .db import ...`` name on api.server to our stub.
+    This defends against a sibling test module (e.g. test_adversarial) that
+    may have transformed the shared stub into the real api.db during its
+    own teardown before we started.
+
+    At teardown we mutate the stub in-place to delegate to the real api.db
+    so that any other test module holding ``dbmod = <stub>`` sees real DB
+    behaviour on the next attribute access.
+    """
+    # Re-install stub + rebind server names (covers adversarial's teardown).
+    sys.modules["api.db"] = _stub_db_module
+    # Fresh no-op functions — adversarial's teardown may have mutated our
+    # stub module into the real db; rebuild the stub now.
+    fresh_stub = _build_stub_db()
+    for attr in dir(fresh_stub):
+        if attr.startswith("__"):
+            continue
+        setattr(_stub_db_module, attr, getattr(fresh_stub, attr))
+    for name in _STUBBED_DB_NAMES:
+        if hasattr(_stub_db_module, name):
+            setattr(_server_module, name, getattr(_stub_db_module, name))
+    try:
+        yield
+    finally:
+        sys.modules.pop("api.db", None)
+        import importlib
+        try:
+            real_db = importlib.import_module("api.db")
+        except Exception:
+            real_db = None
+        if real_db is not None:
+            for attr in dir(real_db):
+                if attr.startswith("__"):
+                    continue
+                try:
+                    setattr(_stub_db_module, attr, getattr(real_db, attr))
+                except Exception:
+                    pass
+            sys.modules["api.db"] = real_db
+            for name in _STUBBED_DB_NAMES:
+                if hasattr(real_db, name):
+                    setattr(_server_module, name, getattr(real_db, name))
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def clear_server_state():
+    """Reset server state around each test and short-circuit ensure_session_live.
+
+    Many tests in this module populate SESSIONS directly via _make_state to
+    exercise the scheduler / subscriber / reader plumbing without a real DB.
+    Under the new API the POST /sessions/{id}/message endpoint goes through
+    ensure_session_live -> require_session -> get_session, so we need to
+    synthesize a row from the in-memory SESSIONS entry and make
+    ensure_sandbox / ensure_runtime return the existing state.
+    """
+    async def _fake_get_session(session_id: str):
+        state = SESSIONS.get(session_id)
+        if state is None:
+            return None
+        return {
+            "id": state.session_id,
+            "agent_id": state.agent_id,
+            "current_sandbox_id": state.sandbox_id,
+            "volume_id": "vol-test",
+            "inner_session_id": state.inner_session_id,
+        }
+
+    async def _fake_ensure_sandbox(session_row):
+        return SandboxRecord(
+            id=session_row["current_sandbox_id"] or "sbx-test",
+            provider="local",
+            sandbox_ref="2469",
+            status="running",
+            volume_id="vol-test",
+            subpath="agents/a/home",
+            listen_port=2469,
+        )
+
+    async def _fake_ensure_runtime(session_row, sandbox):
+        return SESSIONS[session_row["id"]]
+
     with patch(
         "api.server._live_session_looks_healthy",
         AsyncMock(return_value=True),
         create=True,
+    ), patch(
+        "api.server.get_session",
+        side_effect=_fake_get_session,
+    ), patch(
+        "api.server.ensure_sandbox",
+        side_effect=_fake_ensure_sandbox,
+    ), patch(
+        "api.server.ensure_runtime",
+        side_effect=_fake_ensure_runtime,
     ):
         SESSIONS.clear()
         _INSTANCES.clear()
@@ -1001,12 +1152,22 @@ class TestInterrupt:
 
 
 class TestResumeRecovery:
+    """Resumption flow for a reaped session.
+
+    History: this used to patch ``api.server._do_resume``. That helper was
+    removed in the volume-refactor and replaced with the
+    ``ensure_sandbox`` / ``ensure_runtime`` pair (composed by
+    ``ensure_session_live``). The test now drives ``ensure_runtime``
+    directly with a stub sandbox and verifies that a fresh SessionState is
+    returned / stored without issuing ACP ``session/load`` for an empty
+    session.
+    """
 
     @pytest.mark.asyncio
     async def test_empty_reaped_session_starts_fresh_inner_session(self):
-        """A reaped session with no logged turns should not attempt session/load."""
+        """Reaped session -> ensure_runtime rebuilds SESSIONS entry via AcpClient."""
         from api import server as server_mod
-        from api.models import AgentConfig, AgentRecord, SandboxRecord
+        from api.models import AgentConfig, AgentRecord, SandboxRecord, VolumeRecord
 
         created_clients = []
 
@@ -1043,21 +1204,44 @@ class TestResumeRecovery:
         async def fake_apply(client, config, acp_session_id, cwd):
             client.set_inner_session_id(acp_session_id, "fresh-inner")
 
+        # Simulate an empty reaped session: DB row has no inner_session_id,
+        # so ensure_runtime takes the fresh-init branch (not session/load).
+        session_row = {
+            "id": "sess-1",
+            "agent_id": "agent-1",
+            "current_sandbox_id": "sbx-1",
+            "volume_id": "vol-1",
+            "inner_session_id": None,
+        }
+        sandbox = SandboxRecord(
+            id="sbx-1",
+            provider="local",
+            sandbox_ref="2469",
+            status="running",
+            volume_id="vol-1",
+            subpath="agents/a/home",
+            listen_port=2469,
+        )
+        volume = VolumeRecord(
+            id="vol-1",
+            name="vol",
+            provider="local",
+            provider_ref="vol-1",
+            status="ready",
+        )
+
+        # Start from a clean SESSIONS/INSTANCES so ensure_runtime walks the
+        # fresh-build branch (no healthy existing state to reuse).
+        server_mod.SESSIONS.pop("sess-1", None)
+        server_mod._INSTANCES.pop("sbx-1", None)
+
         with patch("api.server.get_agent", AsyncMock(return_value=AgentRecord(
             id="agent-1",
             name="agent",
             config=AgentConfig(agent_type="claude", cwd="/tmp"),
         ))), patch(
-            "api.server.get_sandbox",
-            AsyncMock(return_value=SandboxRecord(
-                id="sbx-1", provider="local", sandbox_ref="2469", status="running",
-            )),
-        ), patch(
-            "api.server._ensure_sandbox_alive",
-            AsyncMock(return_value=("http://sandbox", False)),
-        ), patch(
-            "api.server._session_has_logged_activity",
-            AsyncMock(return_value=False),
+            "api.server.get_volume",
+            AsyncMock(return_value=volume),
         ), patch(
             "api.server._apply_config_and_initialize",
             side_effect=fake_apply,
@@ -1069,15 +1253,26 @@ class TestResumeRecovery:
         ), patch(
             "api.server.AcpClient",
             FakeAcpClient,
+        ), patch(
+            "api.server.allocate_sandbox_port",
+            return_value=2469,
+        ), patch(
+            "api.server.free_sandbox_port",
+        ), patch(
+            "api.server._build_spawn_env_from_row",
+            AsyncMock(return_value={}),
         ):
-            result = await server_mod._do_resume(
-                sandbox_id="sbx-1",
-                agent_id="agent-1",
-                inner_session_id="old-inner",
-                client_session_id="sess-1",
-            )
+            # Call the internal helper directly — server_mod.ensure_runtime is
+            # patched in the autouse fixture for the other tests in this module,
+            # and ``_ensure_runtime_locked`` contains the real build-fresh logic.
+            state = await server_mod._ensure_runtime_locked(session_row, sandbox)
 
-        assert result["status"] == "resumed"
-        assert result["inner_session_id"] == "fresh-inner"
-        assert server_mod.SESSIONS["sess-1"].inner_session_id == "fresh-inner"
-        assert not any(method == "session/load" for method, *_ in created_clients[0].sent_methods)
+        assert state is not None
+        assert state.sandbox_id == "sbx-1"
+        assert state.inner_session_id == "fresh-inner"
+        assert server_mod.SESSIONS["sess-1"] is state
+        # Empty reaped session must not issue session/load on the ACP client.
+        assert created_clients, "ensure_runtime should have constructed an AcpClient"
+        assert not any(
+            method == "session/load" for method, *_ in created_clients[0].sent_methods
+        )

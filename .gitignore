@@ -8,3 +8,10 @@ build/
 .env
 node_modules/
 .claude/
+
+# Local Postgres for launch_server_local.sh
+.postgres-env/
+.postgres-data/
+
+# Worktrees for subagent-driven development
+.worktrees/

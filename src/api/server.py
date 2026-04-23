@@ -4,9 +4,11 @@ Run: uvicorn src.api.server:app --port 7778
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import shlex
 import tempfile
 import time
@@ -18,6 +20,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
@@ -27,22 +30,32 @@ from fastapi.responses import (
 
 from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .db import (
+    add_supervisor_agent_type,
     close_pool,
     delete_agent,
     delete_sandbox,
+    delete_volume,
     get_agent,
+    get_any_session_for_sandbox,
+    get_db,
     get_sandbox,
     get_session,
     get_session_log,
+    get_volume,
+    get_volume_by_name,
     init_db,
     init_pool,
     list_agents,
     list_sandboxes,
+    list_volumes,
     log_event,
-    session_has_log_entries,
+    update_session_env,
+    update_session_secrets,
+    set_session_current_sandbox,
     upsert_agent,
     upsert_sandbox,
     upsert_session,
+    upsert_volume,
 )
 from .models import (
     _KICK_SENTINEL,
@@ -54,26 +67,29 @@ from .models import (
     EVT_USAGE,
     EVT_USER_MESSAGE,
     STATUS_RUNNING,
+    STATUS_STOPPED,
     AgentConfig,
     AgentRecord,
     PendingPrompt,
     SandboxRecord,
     SessionState,
+    VolumeRecord,
 )
+from . import providers as _providers_mod
 from .providers import (
     PORT_BASED_PROVIDERS,
     ProviderInstance,
+    SandboxMissingError,
     allocate_sandbox_port,
     create_instance,
+    default_cwd_for_provider,
     destroy_instance,
     exec_in_instance,
     free_sandbox_port,
     kill_supervisor_in_sandbox,
-    provision_daytona_sandbox,
-    start_supervisor_in_sandbox,
-    stop_daytona,
     stop_instance,
 )
+from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_secrets
 from .sse import (
     UT_COMMANDS_UPDATE,
@@ -89,7 +105,6 @@ from .sse import (
     extract_tool_call_id,
     extract_tool_name,
     extract_tool_response,
-    iter_sse_blocks,
     parse_acp_payload,
     parse_sse_data,
 )
@@ -101,7 +116,8 @@ def _configure_logging() -> None:
     """Set up logging. Called once at server startup, not on import."""
     level = os.environ.get("LOG_LEVEL", "INFO")
     logging.basicConfig(
-        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
     logging.getLogger("api").setLevel(level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -130,6 +146,22 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
 SESSIONS: dict[str, SessionState] = {}
 
 
+# Strong references to fire-and-forget background tasks so Python's GC can't
+# collect them mid-flight ("Task was destroyed but it is pending!" bug — the
+# event loop holds only a weak ref to tasks, so a caller that does
+# ``asyncio.create_task(coro())`` without keeping the returned Task alive
+# risks silent cancellation). Tasks self-discard from the set on completion.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """Create a background task and hold a strong reference to it."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 async def _cancel_task(task) -> None:
     """Cancel an asyncio task and await its completion so cleanup code runs."""
     if task is None or task.done():
@@ -141,9 +173,7 @@ async def _cancel_task(task) -> None:
         pass
 
 
-async def _close_session_gracefully(
-    state: "SessionState", *, background: bool = False
-) -> None:
+async def _close_session_gracefully(state: "SessionState") -> None:
     """Close the HTTP connection to the ACP supervisor.
 
     We just drop the connection — the supervisor detects the disconnect
@@ -160,33 +190,18 @@ async def _close_session_gracefully(
         pass
 
 
-async def _retire_session_state_for_resume(state: SessionState) -> None:
-    """Force-retire a stale live session so a replacement can take ownership.
-
-    This path is narrower than the idle reaper shutdown: it deliberately kicks
-    live subscribers off the stale session, clears queued work, closes the old
-    ACP client, and removes the state from SESSIONS without dropping the
-    session lock that the caller is already holding.
-    """
-    _on_sse_reader_death(state)
-    await _cancel_task(state._scheduler_task)
-    await _cancel_task(state._reader_task)
-    await _close_session_gracefully(state, background=True)
-    if SESSIONS.get(state.session_id) is state:
-        SESSIONS.pop(state.session_id, None)
-
-
 async def _shutdown_session_state(
     state: SessionState,
     *,
     remove: bool,
     mark_idle_at: float | None = None,
-    background_close: bool = False,
+    force: bool = False,
 ) -> None:
     """Close a runtime session and optionally remove it from the active registry."""
     state.shutdown.set()
     # Re-check: new work may have arrived between the caller's idle check and here.
-    if (
+    # Skip this guard when force=True (e.g. ensure_runtime rebuilding a dead supervisor).
+    if not force and (
         state.active_rpc_id is not None
         or state.pending_prompts
         or state._session_subscribers
@@ -200,17 +215,27 @@ async def _shutdown_session_state(
     state.pending_prompts.clear()
     await _cancel_task(state._scheduler_task)
     await _cancel_task(state._reader_task)
-    await _close_session_gracefully(state, background=background_close)
-    # Kill per-session supervisor if this session has its own
+    # Flush any pending DB log writes so turn_end / tool_result events that
+    # were scheduled during the last prompt aren't silently dropped when the
+    # session is reaped.  Bounded wait so a hung writer can't block shutdown.
+    pending = state._log_chain
+    if pending is not None and not pending.done():
+        try:
+            await asyncio.wait_for(pending, timeout=5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+    await _close_session_gracefully(state)
+    # Kill per-session supervisor if this session has its own. Only Daytona
+    # runs per-session supervisors here; docker/local have one-supervisor-per-
+    # sandbox handled by destroy_sandbox.
     if state.supervisor_port is not None:
         try:
-            from daytona_sdk import Daytona, DaytonaConfig
-            api_key = os.environ.get("DAYTONA_API_KEY")
-            if api_key:
+            sb = await get_sandbox(state.sandbox_id)
+            if sb and sb.provider == "daytona":
+                from .providers.daytona import _get_daytona_client
                 loop = asyncio.get_running_loop()
-                daytona_client = Daytona(DaytonaConfig(api_key=api_key))
                 sandbox = await loop.run_in_executor(
-                    None, lambda: daytona_client.get(state.sandbox_id)
+                    None, lambda: _get_daytona_client().get(sb.sandbox_ref)
                 )
                 await kill_supervisor_in_sandbox(sandbox, state.supervisor_port)
                 free_sandbox_port(state.sandbox_id, state.supervisor_port)
@@ -246,55 +271,75 @@ _SSE_MAX_IDLE_RETRIES = (
 )
 
 
+async def _reap_one_tick(now: float) -> None:
+    """Single iteration of the reap loop, factored out for testability.
+
+    Closes any session that is idle past IDLE_TIMEOUT_S with no active or
+    pending prompts and no subscribers. When the last session on a sandbox
+    is reaped, the sandbox itself is snapshotted + stopped via
+    ``snapshot_and_stop`` so workspace state is durable on the volume
+    before the provider call lands.
+    """
+    busy = sum(1 for s in SESSIONS.values() if s.agent_busy)
+    readers = sum(1 for s in SESSIONS.values() if s._reader_alive)
+    subs = sum(len(s._session_subscribers) for s in SESSIONS.values())
+    log.info(
+        "idle reaper tick: sessions=%d busy=%d readers=%d subs=%d instances=%d",
+        len(SESSIONS), busy, readers, subs, len(_INSTANCES),
+    )
+
+    for state in list(SESSIONS.values()):
+        if (
+            state.active_rpc_id is not None
+            or state.pending_prompts
+            or state._session_subscribers
+        ):
+            continue
+        idle_since = _session_idle_since(state)
+        if now - idle_since < IDLE_TIMEOUT_S:
+            continue
+        log.info(
+            "idle reaper: closing session %s (idle %.0fs)",
+            state.session_id,
+            now - idle_since,
+        )
+        sandbox_id = state.sandbox_id
+        await _shutdown_session_state(state, remove=True, mark_idle_at=now)
+        # If no other sessions use this sandbox, stop the supervisor.
+        # For local/docker: kills the process (no filesystem to preserve).
+        # For daytona: stops the workspace (filesystem preserved for resume).
+        if not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+            _sandbox_locks.pop(sandbox_id, None)
+            instance = _INSTANCES.pop(sandbox_id, None)
+            if instance:
+                log.info(
+                    "idle reaper: snapshot+stop sandbox %s (provider=%s)",
+                    sandbox_id, instance.provider,
+                )
+                try:
+                    rec = await get_sandbox(sandbox_id)
+                    if rec is not None:
+                        await snapshot_and_stop(rec, instance)
+                    else:
+                        # Row already gone (concurrent delete) — just stop.
+                        await stop_instance(instance)
+                    log.info("idle reaper: sandbox %s snapshotted + stopped",
+                             sandbox_id)
+                    if rec is not None and rec.status != STATUS_STOPPED:
+                        rec.status = STATUS_STOPPED
+                        await upsert_sandbox(rec)
+                except Exception as e:
+                    log.warning(
+                        "reaper: failed to snapshot+stop sandbox %s: %s",
+                        sandbox_id, e,
+                    )
+
+
 async def _idle_reaper():
     """Background task: close idle sessions that have been inactive too long."""
     while True:
         await asyncio.sleep(REAPER_TICK_S)
-        now = time.time()
-        busy = sum(1 for s in SESSIONS.values() if s.agent_busy)
-        readers = sum(1 for s in SESSIONS.values() if s._reader_alive)
-        subs = sum(len(s._session_subscribers) for s in SESSIONS.values())
-        log.info(
-            "idle reaper tick: sessions=%d busy=%d readers=%d subs=%d instances=%d",
-            len(SESSIONS), busy, readers, subs, len(_INSTANCES),
-        )
-
-        for state in list(SESSIONS.values()):
-            if (
-                state.active_rpc_id is not None
-                or state.pending_prompts
-                or state._session_subscribers
-            ):
-                continue
-            idle_since = _session_idle_since(state)
-            if now - idle_since < IDLE_TIMEOUT_S:
-                continue
-            log.info(
-                "idle reaper: closing session %s (idle %.0fs)",
-                state.session_id,
-                now - idle_since,
-            )
-            sandbox_id = state.sandbox_id
-            await _shutdown_session_state(state, remove=True, mark_idle_at=now)
-            # If no other sessions use this sandbox, stop the supervisor.
-            # For local/docker: kills the process (no filesystem to preserve).
-            # For daytona: stops the workspace (filesystem preserved for resume).
-            if not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
-                _sandbox_locks.pop(sandbox_id, None)
-                instance = _INSTANCES.pop(sandbox_id, None)
-                if instance:
-                    log.info(
-                        "idle reaper: stopping sandbox %s (provider=%s)",
-                        sandbox_id,
-                        instance.provider,
-                    )
-                    try:
-                        await stop_instance(instance)
-                        log.info("idle reaper: sandbox %s stopped", sandbox_id)
-                    except Exception as e:
-                        log.warning(
-                            "reaper: failed to stop sandbox %s: %s", sandbox_id, e
-                        )
+        await _reap_one_tick(time.time())
 
 
 @asynccontextmanager
@@ -302,6 +347,22 @@ async def lifespan(app):
     _configure_logging()
     init_db()
     await init_pool()
+
+    # Startup reconciliation: cross-reference live provider state with
+    # DB sandbox rows so orphan containers/processes are reaped and
+    # survivors are reattached to _INSTANCES. Run per-provider reconciles
+    # in parallel so a slow provider doesn't serialize boot: in practice
+    # only Docker does real work (~seconds of ``docker ps``+``docker
+    # inspect``); daytona/local are no-ops, but future providers that
+    # talk to remote APIs should not queue behind docker.
+    async def _safe_reconcile(prov: str) -> None:
+        try:
+            await _providers_mod.reconcile_sandboxes(prov)
+        except Exception as e:
+            log.warning("startup reconcile for %s failed: %s", prov, e)
+
+    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local")])
+
     reaper = asyncio.create_task(_idle_reaper())
     yield
     await _cancel_task(reaper)
@@ -312,22 +373,45 @@ async def lifespan(app):
     )
     SESSIONS.clear()
 
-    # Parallel instance teardown. Use stop_instance (not destroy) so Daytona
-    # sandboxes are stopped — not permanently deleted — across server restarts.
-    # Without this, every container restart wipes all sandbox state, breaking
-    # session recovery for all active users.
-    async def _safe_stop(inst):
+    # Parallel instance teardown. Use snapshot_and_stop (not raw stop_instance)
+    # so every sandbox's workspace is durable on the volume before the
+    # process exits — server shutdown is otherwise indistinguishable from a
+    # crash from the client's perspective, and we don't want to lose the
+    # last-turn state just because the API was restarted. Falls back to
+    # stop_instance if the sandbox row isn't readable (e.g. DB already torn
+    # down in a weird shutdown ordering).
+    async def _safe_stop(sid, inst):
         try:
-            await stop_instance(inst)
+            rec = await get_sandbox(sid)
+            if rec is not None:
+                await snapshot_and_stop(rec, inst)
+            else:
+                await stop_instance(inst)
         except Exception as e:
-            log.warning("shutdown cleanup failed: %s", e)
+            log.warning("shutdown cleanup failed for %s: %s", sid, e)
 
-    await asyncio.gather(*[_safe_stop(i) for i in _INSTANCES.values()])
+    await asyncio.gather(
+        *[_safe_stop(sid, inst) for sid, inst in list(_INSTANCES.items())]
+    )
     _INSTANCES.clear()
     await close_pool()
 
 
 app = FastAPI(title="Agent Orchestration API", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def _log_unhandled(request: Request, exc: Exception):
+    from fastapi.responses import JSONResponse
+    from fastapi.exception_handlers import http_exception_handler
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    if isinstance(exc, StarletteHTTPException):
+        if exc.status_code >= 500:
+            log.error("HTTP %s %s → %s: %s", request.method, request.url.path, exc.status_code, exc.detail)
+        return await http_exception_handler(request, exc)
+    log.error("Unhandled exception in %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse({"error": str(exc)}, status_code=500)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -340,11 +424,55 @@ app.add_middleware(
 
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException):
-    """Return dict details as-is so dependencies can control the response shape."""
+    """Uniform error shape: ``{"error": ...}`` for string details, pass-through for dict."""
     detail = exc.detail
     if isinstance(detail, dict):
         return JSONResponse(detail, status_code=exc.status_code)
-    return JSONResponse({"error": detail}, status_code=exc.status_code)
+    return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+async def _json_body(request: Request) -> dict:
+    """Parse JSON body and require it to be an object.
+
+    Handlers that ``data = await request.json(); data.get(...)`` used to
+    blow up with a 500 ``AttributeError: 'str' object has no attribute 'get'``
+    when the client sent a JSON scalar/array instead of an object.  Route
+    all such reads through this helper so the failure is a clean 400 with
+    the canonical ``{"error": ...}`` shape.
+    """
+    try:
+        data = await request.json()
+    except Exception as e:
+        raise HTTPException(400, f"invalid JSON body: {e}")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Lookup preamble helpers — raise HTTPException(404) on missing records so the
+# caller never has to write ``if rec is None: return JSONResponse(...)``.
+# ---------------------------------------------------------------------------
+
+async def _require_agent(agent_id: str) -> AgentRecord:
+    rec = await get_agent(agent_id)
+    if rec is None:
+        raise HTTPException(404, "agent not found")
+    return rec
+
+
+async def _require_sandbox(sandbox_id: str) -> SandboxRecord:
+    rec = await get_sandbox(sandbox_id)
+    if rec is None:
+        raise HTTPException(404, "sandbox not found")
+    return rec
+
+
+async def _require_session_row(session_id: str) -> dict:
+    rec = await get_session(session_id)
+    if rec is None:
+        raise HTTPException(404, f"Session {session_id} not found")
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -377,45 +505,30 @@ def _maybe_auto_approve_permission(payload: dict | None, state: SessionState) ->
     rpc_id = payload.get("id")
     if rpc_id is None:
         return
-    params = payload.get("params", {})
-    options = params.get("options", [])
-    # Pick "allow_always" > "allow" > first option
-    option_id = None
-    for opt in options:
-        if opt.get("kind") == "allow_always":
-            option_id = opt["optionId"]
-            break
-    if not option_id:
-        for opt in options:
-            if opt.get("kind") == "allow_once":
-                option_id = opt["optionId"]
-                break
-    if not option_id and options:
-        option_id = options[0].get("optionId")
+    options = payload.get("params", {}).get("options", [])
+    # Pick "allow_always" > "allow_once" > first option.
+    by_kind = {opt.get("kind"): opt.get("optionId") for opt in options}
+    option_id = (
+        by_kind.get("allow_always")
+        or by_kind.get("allow_once")
+        or (options[0].get("optionId") if options else None)
+    )
     if not option_id:
         return
 
     async def _grant():
         try:
-            # Send JSON-RPC response (not request) back to the ACP endpoint
-            url = f"/v1/acp/{state.acp_session_id}"
-            resp_payload = {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {"optionId": option_id},
-            }
-            resp = await state.client._client.post(url, json=resp_payload)
-            log.info(
-                "auto-approved permission for session %s (status=%d)",
-                state.session_id,
-                resp.status_code,
+            resp = await state.client._client.post(
+                f"/v1/acp/{state.acp_session_id}",
+                json={"jsonrpc": "2.0", "id": rpc_id, "result": {"optionId": option_id}},
             )
+            log.info("auto-approved permission for session %s (status=%d)",
+                     state.session_id, resp.status_code)
         except Exception as e:
-            log.warning(
-                "auto-approve permission failed for session %s: %s", state.session_id, e
-            )
+            log.warning("auto-approve permission failed for session %s: %s",
+                        state.session_id, e)
 
-    asyncio.create_task(_grant())
+    _spawn_bg(_grant())
 
 
 def _on_sse_reader_death(state: SessionState) -> None:
@@ -508,18 +621,14 @@ def _start_sse_reader(state: SessionState) -> None:
     Works with the supervisor which exposes the POST+SSE JSON-RPC surface.
     """
     if state._reader_alive:
-        log.info(
-            "[SSE-READER] start requested but reader already alive for session %s",
-            state.session_id,
-        )
+        log.info("[SSE-READER] start requested but reader already alive for session %s",
+                 state.session_id)
         return
     state._reader_alive = True
     log.info(
         "[SSE-READER] starting upstream reader for session %s (acp_session=%s, base_url=%s, last_event_id=%s)",
-        state.session_id,
-        state.acp_session_id,
-        getattr(state.client, "base_url", "?"),
-        state.last_event_id or "-",
+        state.session_id, state.acp_session_id,
+        getattr(state.client, "base_url", "?"), state.last_event_id or "-",
     )
 
     async def _reader():
@@ -537,65 +646,46 @@ def _start_sse_reader(state: SessionState) -> None:
                     headers = {"Accept": "text/event-stream"}
                     if state.last_event_id:
                         headers["Last-Event-ID"] = state.last_event_id
-                    log.info(
-                        "[SSE-READER] connecting upstream stream for session %s (attempt=%d, last_event_id=%s)",
-                        state.session_id,
-                        attempt,
-                        state.last_event_id or "-",
-                    )
+                    log.info("[SSE-READER] connecting upstream stream for session %s "
+                             "(attempt=%d, last_event_id=%s)",
+                             state.session_id, attempt, state.last_event_id or "-")
                     sse_http = httpx.AsyncClient(
-                        base_url=state.client.base_url,
-                        timeout=None,
-                        proxy=None,
+                        base_url=state.client.base_url, timeout=None, proxy=None,
                     )
                     async with sse_http.stream(
-                        "GET",
-                        f"/v1/acp/{state.acp_session_id}",
-                        headers=headers,
+                        "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
                     ) as resp:
                         resp.raise_for_status()
                         reconnect_delay_s = 1.0
                         attempt = 0
-                        log.info(
-                            "[SSE-READER] upstream stream connected for session %s (attempt=%d, status=%d)",
-                            state.session_id,
-                            attempt,
-                            resp.status_code,
-                        )
+                        log.info("[SSE-READER] upstream stream connected for session %s "
+                                 "(attempt=%d, status=%d)",
+                                 state.session_id, attempt, resp.status_code)
                         async for chunk in resp.aiter_text():
                             if state.shutdown.is_set():
-                                log.info(
-                                    "[SSE-READER] session %s shutting down; exiting reader loop",
-                                    state.session_id,
-                                )
+                                log.info("[SSE-READER] session %s shutting down; "
+                                         "exiting reader loop", state.session_id)
                                 return
                             reader_buffer += chunk
                             while "\n\n" in reader_buffer:
                                 block, reader_buffer = reader_buffer.split("\n\n", 1)
-                                payload = parse_sse_data(block)
                                 _broadcast_one_block(
-                                    state, block, payload, text_parts, thinking_parts
+                                    state, block, parse_sse_data(block),
+                                    text_parts, thinking_parts,
                                 )
                 except asyncio.CancelledError:
-                    log.info(
-                        "[SSE-READER] reader task cancelled for session %s",
-                        state.session_id,
-                    )
+                    log.info("[SSE-READER] reader task cancelled for session %s",
+                             state.session_id)
                     raise
                 except Exception as e:
                     disconnect_reason = f"{type(e).__name__}: {e}"
-                    log.warning(
-                        "[SSE-READER] upstream reader error for session %s on attempt %d: %s",
-                        state.session_id,
-                        attempt,
-                        disconnect_reason,
-                    )
+                    log.warning("[SSE-READER] upstream reader error for session %s "
+                                "on attempt %d: %s",
+                                state.session_id, attempt, disconnect_reason)
                 else:
-                    log.warning(
-                        "[SSE-READER] upstream stream ended for session %s on attempt %d without an exception",
-                        state.session_id,
-                        attempt,
-                    )
+                    log.warning("[SSE-READER] upstream stream ended for session %s "
+                                "on attempt %d without an exception",
+                                state.session_id, attempt)
                 finally:
                     if sse_http is not None:
                         try:
@@ -606,35 +696,125 @@ def _start_sse_reader(state: SessionState) -> None:
                 if state.shutdown.is_set():
                     return
 
-                if (
-                    _sse_reader_disconnect_is_recoverable(state)
-                    and attempt <= _SSE_MAX_IDLE_RETRIES
-                ):
-                    log.warning(
-                        "[SSE-READER] recoverable upstream disconnect for session %s (%s); reconnecting in %.1fs (attempt %d/%d)",
-                        state.session_id,
-                        disconnect_reason,
-                        reconnect_delay_s,
-                        attempt,
-                        _SSE_MAX_IDLE_RETRIES,
-                    )
+                # Fast-fail on confirmed-dead supervisors: for port-based
+                # providers we can cheaply check the subprocess in _INSTANCES
+                # and skip the full exponential-backoff ladder (up to ~35s)
+                # when we KNOW the old supervisor is gone. A ConnectError
+                # against a port whose process is dead will never recover
+                # by retrying.
+                cached_inst = _INSTANCES.get(state.sandbox_id)
+                supervisor_dead = False
+                if cached_inst is not None and cached_inst.process is not None:
+                    try:
+                        cached_inst.process.poll()
+                    except Exception:
+                        pass
+                    supervisor_dead = cached_inst.process.returncode is not None
+
+                if (_sse_reader_disconnect_is_recoverable(state)
+                        and attempt <= _SSE_MAX_IDLE_RETRIES
+                        and not supervisor_dead):
+                    log.warning("[SSE-READER] recoverable upstream disconnect for "
+                                "session %s (%s); reconnecting in %.1fs (attempt %d/%d)",
+                                state.session_id, disconnect_reason,
+                                reconnect_delay_s, attempt, _SSE_MAX_IDLE_RETRIES)
                     await asyncio.sleep(reconnect_delay_s)
                     reconnect_delay_s = min(reconnect_delay_s * 2, 10.0)
                     continue
 
+                if supervisor_dead:
+                    log.info(
+                        "[SSE-READER] supervisor process dead for session %s — "
+                        "skipping retry ladder, going straight to sandbox recovery",
+                        state.session_id,
+                    )
+
+                # Retries exhausted — try to recover the sandbox before giving up.
+                if not state.shutdown.is_set():
+                    try:
+                        sandbox_record = await get_sandbox(state.sandbox_id)
+                        if sandbox_record is not None:
+                            log.info(
+                                "[SSE-READER] retries exhausted for session %s; attempting sandbox recovery",
+                                state.session_id,
+                            )
+                            spawn_env = await _spawn_env_for_sandbox(state.sandbox_id)
+                            new_url, _ = await _ensure_sandbox_alive(
+                                state.sandbox_id, sandbox_record,
+                                agent_type=state.agent_type, spawn_env=spawn_env,
+                            )
+                            new_acp_session_id = str(uuid.uuid4())
+                            new_client = AcpClient(new_url)
+                            agent_record = await get_agent(state.agent_id)
+                            if agent_record is None:
+                                raise RuntimeError(
+                                    f"agent {state.agent_id} missing during SSE-reader recovery"
+                                )
+                            # Route through the shared helper — try session/load
+                            # against the existing inner_sid first, only fall
+                            # through to session/new when we genuinely have
+                            # nothing to resume or when load fails loudly.
+                            # Previously this path ALWAYS called
+                            # _apply_config_and_initialize (session/new),
+                            # silently overwriting state.inner_session_id and
+                            # wiping conversation context on every external
+                            # sandbox stop mid-conversation.
+                            # cwd MUST match what session/new used, i.e.
+                            # agent.config.cwd (same rule as the main
+                            # _ensure_runtime_locked path). sandbox_record.root
+                            # is the sandbox HOME, which is usually NOT the
+                            # cwd the session was created under — using it
+                            # breaks session/load's JSONL hash lookup.
+                            attach_cwd = (
+                                (agent_record.config.cwd or "/tmp")
+                                if agent_record.config else "/tmp"
+                            )
+                            new_inner_sid, started_fresh = await _attach_acp_session(
+                                new_client, new_acp_session_id, agent_record,
+                                inner_sid=state.inner_session_id,
+                                cwd=attach_cwd,
+                            )
+                            if started_fresh and new_inner_sid:
+                                # Genuine fresh session — reflect in DB so a
+                                # later ensure_session_live sees the right
+                                # inner_sid when the next message arrives.
+                                # volume_id is NOT NULL on sessions; pull it
+                                # from the sandbox row we already fetched.
+                                await upsert_session(
+                                    state.session_id, state.agent_id,
+                                    state.sandbox_id, new_inner_sid,
+                                    volume_id=sandbox_record.volume_id,
+                                )
+                            old_client = state.client
+                            state.client = new_client
+                            state.supervisor_url = new_url
+                            state.acp_session_id = new_acp_session_id
+                            state.inner_session_id = new_inner_sid
+                            try:
+                                await old_client.aclose()
+                            except Exception:
+                                pass
+                            log.info(
+                                "[SSE-READER] sandbox recovered for session %s; new acp_session=%s",
+                                state.session_id, new_acp_session_id,
+                            )
+                            attempt = 0
+                            reconnect_delay_s = 1.0
+                            continue
+                    except Exception as recovery_err:
+                        log.error(
+                            "[SSE-READER] sandbox recovery failed for session %s: %s",
+                            state.session_id, recovery_err, exc_info=True,
+                        )
+
                 log.warning(
                     "[SSE-READER] unrecoverable upstream disconnect for session %s (%s) "
                     "(shutdown=%s, agent_busy=%s, pending=%d, in_SESSIONS=%s)",
-                    state.session_id,
-                    disconnect_reason,
-                    state.shutdown.is_set(),
-                    state.agent_busy,
-                    len(state.pending_prompts),
+                    state.session_id, disconnect_reason, state.shutdown.is_set(),
+                    state.agent_busy, len(state.pending_prompts),
                     state.session_id in SESSIONS,
                 )
-                _flush_buffered_text(
-                    state, text_parts, thinking_parts, state.active_rpc_id
-                )
+                _flush_buffered_text(state, text_parts, thinking_parts, state.active_rpc_id)
                 _on_sse_reader_death(state)
                 state.broadcast(_SSE_SENTINEL)
                 return
@@ -642,9 +822,7 @@ def _start_sse_reader(state: SessionState) -> None:
             pass
         finally:
             state._reader_alive = False
-            log.info(
-                "[SSE-READER] reader task stopped for session %s", state.session_id
-            )
+            log.info("[SSE-READER] reader task stopped for session %s", state.session_id)
 
     state._reader_task = asyncio.create_task(_reader())
 
@@ -660,13 +838,80 @@ async def _apply_config_and_initialize(
     acp_session_id: str,
     cwd: str,
 ) -> None:
-    """Initialize the ACP session with MCP server config."""
+    """Initialize the ACP session with MCP server config (session/new path)."""
     await client.initialize(
         acp_session_id,
         config.agent_type or "claude",
         cwd=cwd,
         mcp_servers=config.mcp_servers,
     )
+
+
+async def _attach_acp_session(
+    client: AcpClient,
+    acp_session_id: str,
+    agent_record: AgentRecord,
+    *,
+    inner_sid: str | None,
+    cwd: str,
+) -> tuple[str | None, bool]:
+    """Attach to an ACP session — resume if possible, otherwise start fresh.
+
+    Single source of truth for "how do we obtain an ``inner_session_id`` on
+    this ACP connection". Every call site that needs an attached ACP session
+    (POST /message recovery, SSE-reader upstream-disconnect recovery, and
+    initial ``sessions_quick_create``) routes through here, so the invariant
+    *"always try ``session/load`` when we have an ``inner_session_id``, only
+    create a new one when genuinely fresh or when load actually fails"*
+    lives in one place and can't be accidentally skipped.
+
+    Behavior:
+      - If ``inner_sid`` is truthy → handshake + ``session/load``. On
+        success, the agent's prior conversation is preserved and this
+        returns ``(inner_sid, False)``.
+      - If ``inner_sid`` is ``None`` OR ``session/load`` raises → fall back
+        to ``session/new`` via ``_apply_config_and_initialize`` and return
+        ``(new_inner_sid, True)``.
+      - The fallback-after-failure case logs a loud WARNING: it means the
+        agent's conversation context was lost unexpectedly (e.g., the
+        session JSONL isn't where Claude Code expects it) and callers
+        should treat this as a bug signal rather than steady state.
+
+    Idempotent in the useful sense: calling with the same ``inner_sid`` on
+    a fresh ``AcpClient`` should always reattach to the same conversation.
+    """
+    agent_type = (
+        (agent_record.config.agent_type or "claude")
+        if agent_record.config else "claude"
+    )
+    mcp = agent_record.config.mcp_servers if agent_record.config else None
+
+    if inner_sid:
+        try:
+            await client.handshake(acp_session_id, agent_type)
+            await client._send_rpc(acp_session_id, "session/load", {
+                "sessionId": inner_sid,
+                "cwd": cwd,
+                "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
+            })
+            client.set_inner_session_id(acp_session_id, inner_sid)
+            try:
+                await client.set_mode(acp_session_id, "bypassPermissions")
+            except Exception:
+                pass
+            return inner_sid, False
+        except Exception as load_err:
+            log.warning(
+                "session/load failed (inner_sid=%s, cwd=%s): %r — "
+                "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
+                inner_sid, cwd, load_err,
+            )
+
+    # Genuinely fresh (no inner_sid) or load failed — start a new session.
+    await _apply_config_and_initialize(
+        client, agent_record.config, acp_session_id, cwd,
+    )
+    return client.get_inner_session_id(acp_session_id), True
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +985,34 @@ _CONFIG_KEYS = (
 )
 
 
+def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
+    """Raise 400 if a client tries to smuggle credential keys through ``env``.
+
+    ``env`` is stored plaintext and returned plain by GET endpoints; credentials
+    must go in ``secrets`` instead. Applies to both top-level ``env`` and
+    nested ``config.env``.
+
+    Also enforces POSIX env var names — blocks shell-injection via the
+    provider-layer ``_build_env_prefix`` which interpolates keys into
+    ``sh -c`` commands (the value is shlex-quoted but the key is not, so a
+    key like ``FOO;cmd;X`` would break out of ``env``'s arglist).
+    """
+    if not env:
+        return
+    from .providers import AUTH_KEYS
+    from .providers._shared import _ENV_KEY_RE
+
+    offenders = sorted(k for k in env if k in AUTH_KEYS)
+    if offenders:
+        raise HTTPException(400, f"{where}: auth keys {offenders} must be sent "
+                                 "via 'secrets', not 'env' (env is stored plain "
+                                 "and returned by GET).")
+    bad_names = sorted(k for k in env if not (isinstance(k, str) and _ENV_KEY_RE.match(k)))
+    if bad_names:
+        raise HTTPException(400, f"{where}: invalid env var name(s) {bad_names}; "
+                                 "must match [A-Za-z_][A-Za-z0-9_]*")
+
+
 def _merge_top_level_config(data: dict, config_data: dict) -> None:
     """Merge SDK top-level keys into config_data if not already present."""
     for key in _CONFIG_KEYS:
@@ -747,22 +1020,95 @@ def _merge_top_level_config(data: dict, config_data: dict) -> None:
             config_data[key] = data[key]
 
 
-def _pop_user_creds(data: dict) -> dict[str, str] | None:
-    """Extract per-request Claude credentials from the request body.
+# Sentinel distinguishing "env key not present" from "env: {}" in the request body.
+_ENV_MISSING = object()
 
-    SECURITY: pops the keys in-place so they cannot flow into ``config_data``,
-    ``AgentConfig``, or any logger that later prints ``data``. Returns a dict
-    suitable for passing to ``create_instance(..., user_creds=...)``, or
-    ``None`` if the client did not supply credentials.
+
+def _pop_env_and_secrets(
+    data: dict,
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Extract ``env`` (identity, stored) and ``secrets`` (auth material,
+    stored-but-redacted-on-read) from a request body.
+
+    PATCH-like semantics on both fields:
+        - key missing → ``None``  (caller should keep stored value unchanged)
+        - ``{}``       → ``{}``    (caller should wipe stored value)
+        - ``{…}``      → the dict (caller should replace stored value)
+
+    Any string/int/float value is coerced to str. SECURITY: both fields
+    are popped in-place so they can't flow into ``config_data``,
+    ``AgentConfig``, or request logs.  Keys are validated against the
+    POSIX env var grammar — providers (daytona, docker) interpolate them
+    into ``sh -c`` commands, and a key like ``FOO;rm -rf /;BAR`` would
+    escape ``env``'s arglist and execute arbitrary commands inside the
+    sandbox.  The provider-layer ``_build_env_prefix`` re-validates as
+    defence-in-depth.
     """
-    oauth_token = data.pop("oauth_token", None)
-    api_key = data.pop("api_key", None)
-    creds: dict[str, str] = {}
-    if isinstance(oauth_token, str) and oauth_token:
-        creds["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
-    if isinstance(api_key, str) and api_key:
-        creds["ANTHROPIC_API_KEY"] = api_key
-    return creds or None
+    from .providers._shared import _ENV_KEY_RE
+
+    def _coerce(d: object, where: str) -> dict[str, str]:
+        if not isinstance(d, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in d.items():
+            if not isinstance(k, str):
+                continue
+            if not _ENV_KEY_RE.match(k):
+                raise HTTPException(400, f"{where}: invalid env var name {k!r}; "
+                                         "must match [A-Za-z_][A-Za-z0-9_]*")
+            if isinstance(v, (str, int, float)):
+                out[k] = str(v)
+        return out
+
+    def _extract(key: str) -> dict[str, str] | None:
+        raw = data.pop(key, _ENV_MISSING)
+        return None if raw is _ENV_MISSING else _coerce(raw, f"request body {key!r}")
+
+    env = _extract("env")
+    secrets = _extract("secrets")
+    _forbid_auth_keys_in_env(env, "request body 'env'")
+    return env, secrets
+
+
+async def _build_spawn_env_from_row(rec: dict) -> dict[str, str]:
+    """Assemble spawn_env (agent.env ∪ session.env ∪ session.secrets) from a
+    session row already fetched from the DB."""
+    agent_id = rec.get("agent_id")
+    session_env = rec.get("env") or {}
+    session_secrets = rec.get("secrets") or {}
+    agent_env: dict[str, str] = {}
+    if agent_id:
+        agent_record = await get_agent(agent_id)
+        if agent_record is not None:
+            agent_env = agent_record.config.env or {}
+    return _merge_env(agent_env, session_env, session_secrets)
+
+
+async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
+    """Best-effort spawn_env for a sandbox-level operation (start/exec/etc).
+
+    All sessions on a given sandbox share the same supervisor process, so any
+    session on the sandbox has the right env/secrets. If no session exists yet
+    (e.g. provisioned but unused), returns ``{}`` — strict-mode will still
+    strip auth keys, so auto-recovery simply has nothing extra to inject.
+    """
+    rec = await get_any_session_for_sandbox(sandbox_id)
+    if rec is None:
+        return {}
+    return await _build_spawn_env_from_row(rec)
+
+
+def _merge_env(
+    agent_env: dict[str, str] | None,
+    session_env: dict[str, str] | None,
+    secrets: dict[str, str] | None,
+) -> dict[str, str]:
+    """Build the env that lands in a supervisor subprocess.
+
+    Precedence (later wins): agent.env → session.env → secrets.
+    Returns a fresh dict; never mutates inputs.
+    """
+    return {**(agent_env or {}), **(session_env or {}), **(secrets or {})}
 
 
 def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
@@ -779,12 +1125,31 @@ def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
     return tmp.name
 
 
-def _derive_sandbox_ref(
-    instance: ProviderInstance, provider: str, sandbox_id: str
-) -> str:
-    if provider in PORT_BASED_PROVIDERS:
-        return str(instance.port)
-    return instance.sandbox_id or sandbox_id
+def _sandbox_record(
+    sandbox_id: str,
+    provider: str,
+    instance: ProviderInstance,
+    *,
+    volume_id: str,
+    subpath: str,
+    root_fallback: str = "/tmp",
+    status: str = STATUS_RUNNING,
+) -> SandboxRecord:
+    """Build a SandboxRecord from a freshly-provisioned ProviderInstance.
+
+    Consolidates the seven call sites that construct an identical shape
+    from ``(sandbox_id, provider, instance, volume_id, subpath)``.
+    """
+    return SandboxRecord(
+        id=sandbox_id,
+        provider=provider,
+        sandbox_ref=instance.sandbox_id or sandbox_id,
+        status=status,
+        root=instance.root or root_fallback,
+        volume_id=volume_id,
+        subpath=subpath,
+        listen_port=instance.port,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -794,17 +1159,16 @@ def _derive_sandbox_ref(
 
 @app.post("/agents")
 async def create_agent(request: Request):
-    data = await request.json()
+    data = await _json_body(request)
     agent_id = str(uuid.uuid4())
     name = data.get("name")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    materialized = _materialize_dockerfile(config_data)
-    if materialized:
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
+    if materialized := _materialize_dockerfile(config_data):
         config_data["dockerfile"] = materialized
     config = AgentConfig.from_dict(config_data)
-    record = AgentRecord(id=agent_id, name=name, config=config)
-    await upsert_agent(record)
+    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
     return {"id": agent_id, "name": name, "config": config.to_dict()}
 
 
@@ -816,19 +1180,317 @@ async def list_agents_route():
 
 @app.get("/agents/{agent_id}")
 async def get_agent_route(agent_id: str):
-    record = await get_agent(agent_id)
-    if record is None:
-        return JSONResponse({"error": "agent not found"}, status_code=404)
+    record = await _require_agent(agent_id)
     return {"id": record.id, "name": record.name, "config": record.config.to_dict()}
 
 
 @app.delete("/agents/{agent_id}")
 async def delete_agent_route(agent_id: str):
-    record = await get_agent(agent_id)
-    if record is None:
-        return JSONResponse({"error": "agent not found"}, status_code=404)
+    await _require_agent(agent_id)
     await delete_agent(agent_id)
     return {"status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Volume CRUD
+# ---------------------------------------------------------------------------
+
+
+_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Subpath: POSIX-ish relative path, no traversal, no shell/comma/newline.
+# Docker ``--mount`` parses the value as comma-separated k=v; a subpath of
+# ``foo,readonly`` would inject an unintended mount flag. Local provider
+# further runs ``_safe_path`` on it. We pre-filter at the HTTP layer so all
+# three providers see a path that can't smuggle metacharacters.
+_SUBPATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,255}$")
+
+
+class _VolumeCreateBody(BaseModel):
+    name: str
+    provider: str
+
+
+def _validate_volume_name(name: str) -> None:
+    """Reject volume names that could escape server-generated contexts.
+
+    ``name`` appears in docker ``volume create`` argv (no shell injection) and
+    in the local provider as a filesystem path component where ``../`` or ``/``
+    would escape ``AGENT_SDK_LOCAL_VOL_ROOT``. A tight allowlist keeps every
+    provider happy.
+    """
+    if not isinstance(name, str) or not _VOLUME_NAME_RE.match(name):
+        raise HTTPException(400, "volume name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def _validate_subpath(subpath: str) -> None:
+    """Reject subpaths that could inject into docker mount flags or escape."""
+    if not isinstance(subpath, str) or not _SUBPATH_RE.match(subpath):
+        raise HTTPException(
+            400,
+            "subpath must match [A-Za-z0-9][A-Za-z0-9._/-]{0,255} "
+            "(no traversal, commas, or whitespace)",
+        )
+    # Defence-in-depth: reject ``..`` segment even though the regex already
+    # blocks that as a whole-segment match.
+    if any(seg == ".." for seg in subpath.split("/")):
+        raise HTTPException(400, "subpath must not contain '..'")
+
+
+async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
+    vol = await get_volume(id_or_name)
+    if vol is None:
+        vol = await get_volume_by_name(id_or_name)
+    if vol is None:
+        raise HTTPException(404, "Volume not found")
+    return vol
+
+
+async def _resolve_or_default_volume(
+    volume_id: str | None, default_provider: str,
+) -> "VolumeRecord":
+    """Resolve an explicit volume id/name or fall back to the per-provider default.
+
+    Four endpoints share this contract (``POST /sandboxes``, ``/sandboxes/provision``,
+    ``/sessions``, ``/sessions/quick``). Raises ``HTTPException(404)`` for an
+    unknown id/name and ``HTTPException(502)`` if default-volume provisioning fails.
+    """
+    if volume_id and isinstance(volume_id, str):
+        return await _resolve_volume(volume_id)
+    try:
+        return await _get_or_create_default_volume(default_provider)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("_resolve_or_default_volume failed (provider=%s): %s", default_provider, e, exc_info=True)
+        raise HTTPException(502, f"default volume provision failed: {e}")
+
+
+async def _get_or_create_default_volume(provider: str) -> "VolumeRecord":
+    """Return (creating if needed) the shared default volume for ``provider``.
+
+    Naming: ``default-{provider}`` (e.g., ``default-local``, ``default-daytona``,
+    ``default-docker``). This lets callers use the SDK without explicitly
+    creating a volume per session — they get a shared, persistent workspace
+    scoped to the provider.
+
+    Idempotent: on concurrent first-time creation, the UNIQUE(name) constraint
+    serializes one winner; the loser retries and reads the existing row.
+    """
+    if provider not in _providers_mod._PROVIDER_MODS:
+        raise HTTPException(400, f"Unknown provider: {provider}")
+
+    name = f"default-{provider}"
+    vol = await get_volume_by_name(name)
+    if vol is not None:
+        return vol
+
+    # Race window: another request may be creating the same default right now.
+    # Do the provider-side create first (cheap idempotent op — daytona/docker
+    # volume-create against an existing name either succeeds or 409s; local
+    # os.makedirs(..., exist_ok=True) is trivially idempotent).
+    try:
+        provider_ref = await _providers_mod.create_volume(provider, name)
+    except Exception:
+        # Someone else may have just created it; re-read.
+        vol = await get_volume_by_name(name)
+        if vol is not None:
+            return vol
+        raise
+
+    vol = VolumeRecord(
+        id=f"vol_{uuid.uuid4().hex[:12]}",
+        name=name,
+        provider=provider,
+        provider_ref=provider_ref,
+        status="ready",
+    )
+    try:
+        await upsert_volume(vol)
+    except Exception:
+        # Another worker won the UNIQUE(name) race; re-read their row.
+        existing = await get_volume_by_name(name)
+        if existing is not None:
+            # Best-effort cleanup of our now-duplicate provider-side volume.
+            # (Daytona volumes can be queried by id; ours has no Daytona-side
+            # dup since provider-create succeeded before we hit upsert.)
+            return existing
+        raise
+    return vol
+
+
+@app.post("/volumes")
+async def create_volume(body: _VolumeCreateBody):
+    _validate_volume_name(body.name)
+    # Reject duplicates up front so we never orphan a provider-side volume.
+    if await get_volume_by_name(body.name) is not None:
+        raise HTTPException(409, f"Volume '{body.name}' already exists")
+
+    # Tests mocking provider creation should patch the per-provider function
+    # (e.g. ``api.providers.daytona.create_daytona_volume``), not this dispatcher.
+    if body.provider not in _providers_mod._PROVIDER_MODS:
+        raise HTTPException(400, f"Unknown provider: {body.provider}")
+    provider_ref = await _providers_mod.create_volume(body.provider, body.name)
+
+    vol = VolumeRecord(
+        id=f"vol_{uuid.uuid4().hex[:12]}",
+        name=body.name,
+        provider=body.provider,
+        provider_ref=provider_ref,
+        status="ready",
+    )
+    try:
+        await upsert_volume(vol)
+    except Exception:
+        # Clean up the now-orphaned provider volume on DB failure.
+        try:
+            await _providers_mod.delete_volume(body.provider, provider_ref)
+        except Exception as cleanup_err:
+            log.warning(
+                "orphaned %s volume %s: rollback delete failed: %s",
+                body.provider, provider_ref, cleanup_err,
+            )
+        raise
+    return vol
+
+
+@app.post("/volumes/provision")
+async def provision_volume(body: _VolumeCreateBody):
+    """Create + wait for ready. For Daytona, create_daytona_volume already
+    polls until the backend volume is in 'ready' state, so this is equivalent
+    to POST /volumes today. Kept as a separate endpoint for API parity with
+    /sandboxes/provision."""
+    return await create_volume(body)
+
+
+@app.get("/volumes")
+async def list_volumes_route(provider: str | None = None):
+    return await list_volumes(provider)
+
+
+@app.get("/volumes/{id_or_name}")
+async def get_volume_route(id_or_name: str):
+    return await _resolve_volume(id_or_name)
+
+
+@app.delete("/volumes/{id_or_name}", status_code=204)
+async def delete_volume_route(id_or_name: str, force: bool = False):
+    vol = await _resolve_volume(id_or_name)
+
+    async with get_db() as conn:
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (vol.id,)
+        )
+        session_count = (await cur.fetchone())["n"]
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM sandboxes WHERE volume_id = %s", (vol.id,)
+        )
+        sandbox_count = (await cur.fetchone())["n"]
+
+        if (session_count > 0 or sandbox_count > 0) and not force:
+            raise HTTPException(
+                409,
+                f"Volume has {session_count} session(s) and {sandbox_count} "
+                f"sandbox(es). Use ?force=true to cascade.",
+            )
+        if force:
+            # Sessions first (sandbox FK is SET NULL), then sandboxes —
+            # FK RESTRICT on volume blocks the final delete otherwise.
+            if session_count > 0:
+                await conn.execute(
+                    "DELETE FROM sessions WHERE volume_id = %s", (vol.id,),
+                )
+            if sandbox_count > 0:
+                await conn.execute(
+                    "DELETE FROM sandboxes WHERE volume_id = %s", (vol.id,),
+                )
+
+    try:
+        if vol.provider == "daytona":
+            await _providers_mod.delete_daytona_volume(vol.provider_ref)
+        else:
+            await _providers_mod.delete_volume(vol.provider, vol.provider_ref)
+    except Exception as e:
+        # Swallow "gone already"-class errors (volume missing on provider side
+        # — the DB row is the last copy). For Daytona also swallow 403s: the
+        # user's intent is to remove this row; provider cleanup policy shouldn't
+        # block that. Let other failures (in-use, etc.) propagate as 409.
+        msg = str(e).lower()
+        forbidden_ok = vol.provider == "daytona" and "forbidden" in msg
+        gone_already = any(t in msg for t in ("not found", "no such", "404", "does not exist"))
+        if forbidden_ok or gone_already:
+            log.warning("volume %s (%s) provider delete skipped: %s", vol.id, vol.provider, e)
+        else:
+            raise HTTPException(409, f"provider-side volume delete failed: {e}")
+    await delete_volume(vol.id)
+
+
+# ---------------------------------------------------------------------------
+# Volume file operations (tree / read / edit)
+# ---------------------------------------------------------------------------
+
+
+class _VolumeEditBody(BaseModel):
+    path: str
+    content: str  # plain text for v1
+
+
+def _safe_path(p: str) -> str:
+    """Normalize a volume-relative path; HTTP 400 on any violation.
+
+    Thin adapter over :func:`api.providers._shared._safe_path` (which raises
+    ``ValueError``) so the HTTP layer surfaces a 400 with a readable message.
+    """
+    try:
+        return _shared_safe_path(None, p)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+def _volume_fs_err(op: str, vol_provider: str, exc: Exception) -> HTTPException:
+    """Common file-op error translator for the /volumes/.../files/* endpoints."""
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(404, f"File not found: {exc}")
+    if isinstance(exc, NotImplementedError):
+        return HTTPException(501, f"File ops on {vol_provider} not implemented: {exc}")
+    return HTTPException(500, f"{op} failed: {exc}")
+
+
+@app.get("/volumes/{id_or_name}/files/tree")
+async def volume_files_tree(id_or_name: str, path: str = ""):
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(path)
+    try:
+        tree = await _providers_mod.volume_tree(vol.provider, vol.provider_ref, rel)
+    except Exception as e:
+        raise _volume_fs_err("Tree", vol.provider, e)
+    return {"tree": tree}
+
+
+@app.get("/volumes/{id_or_name}/files/read")
+async def volume_files_read(id_or_name: str, path: str):
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(path)
+    try:
+        data = await _providers_mod.volume_read(vol.provider, vol.provider_ref, rel)
+    except Exception as e:
+        raise _volume_fs_err("Read", vol.provider, e)
+    # v1 response contract: text content.
+    try:
+        return {"content": data.decode()}
+    except UnicodeDecodeError:
+        return {"content_base64": base64.b64encode(data).decode()}
+
+
+@app.post("/volumes/{id_or_name}/files/edit", status_code=204)
+async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(body.path)
+    try:
+        await _providers_mod.volume_write(
+            vol.provider, vol.provider_ref, rel, body.content.encode()
+        )
+    except Exception as e:
+        raise _volume_fs_err("Edit", vol.provider, e)
 
 
 # ---------------------------------------------------------------------------
@@ -838,33 +1500,43 @@ async def delete_agent_route(agent_id: str):
 
 @app.post("/sandboxes")
 async def create_sandbox(request: Request):
-    data = await request.json()
+    data = await _json_body(request)
     provider = data.get("provider", "local")
     agent_type = data.get("agent_type", "claude")
     root = data.get("root", "/tmp")
+    subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
+    vol = await _resolve_or_default_volume(data.get("volume_id"), provider)
+    _validate_subpath(subpath)
+    if provider != vol.provider:
+        raise HTTPException(
+            400,
+            f"provider {provider!r} does not match volume.provider {vol.provider!r}",
+        )
     dockerfile = _materialize_dockerfile(data)
     sandbox_id = str(uuid.uuid4())
     try:
-        instance = await create_instance(provider, agent_type, dockerfile=dockerfile, root=root)
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"Provider '{provider}' failed: {e}"}, status_code=502
+        instance = await create_instance(
+            provider, agent_type, dockerfile=dockerfile, root=root,
+            volume_id=vol.provider_ref, subpath=subpath,
+            sandbox_id=sandbox_id,
         )
-
-    sandbox_ref = _derive_sandbox_ref(instance, provider, sandbox_id)
+    except Exception as e:
+        raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
     _INSTANCES[sandbox_id] = instance
-    record = SandboxRecord(
-        id=sandbox_id, provider=provider, sandbox_ref=sandbox_ref, status=STATUS_RUNNING,
-        root=root,
+    record = _sandbox_record(
+        sandbox_id, provider, instance,
+        volume_id=vol.id, subpath=subpath, root_fallback=root,
     )
     await upsert_sandbox(record)
+    # Dual-key: ``sandbox_id`` for /sandboxes/provision parity; ``id`` stays
+    # for the plain REST resource contract.
     return {
-        "id": sandbox_id,
-        "provider": provider,
-        "sandbox_ref": sandbox_ref,
-        "status": "running",
-        "root": root,
+        "id": sandbox_id, "sandbox_id": sandbox_id,
+        "provider": provider, "sandbox_ref": record.sandbox_ref,
+        "status": "running", "root": record.root,
+        "volume_id": vol.id, "subpath": subpath,
+        "listen_port": instance.port, "url": instance.url or None,
     }
 
 
@@ -885,9 +1557,7 @@ async def list_sandboxes_route():
 
 @app.get("/sandboxes/{sandbox_id}")
 async def get_sandbox_route(sandbox_id: str):
-    record = await get_sandbox(sandbox_id)
-    if record is None:
-        return JSONResponse({"error": "sandbox not found"}, status_code=404)
+    record = await _require_sandbox(sandbox_id)
     result = {
         "id": record.id,
         "provider": record.provider,
@@ -900,17 +1570,30 @@ async def get_sandbox_route(sandbox_id: str):
             result["url"] = record.derive_url()
         except Exception:
             pass
+    # Expose the supervisor's current PID for local provider so callers
+    # that need to send signals (e.g. test harnesses) can do so without
+    # coupling to the shape of sandbox_ref. Docker's container_id + daytona's
+    # sandbox_id fill the same role on their own providers. Also expose
+    # the alive-marker file path so an external "delete" can remove just
+    # the marker without disturbing home (preserving volume semantics).
+    if record.provider == "local":
+        inst = _INSTANCES.get(record.id)
+        if inst is not None and inst.process is not None:
+            pid = getattr(inst.process, "pid", None)
+            if pid is not None:
+                result["pid"] = pid
+        from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
+        args = _LOCAL_SPAWN_ARGS.get(record.sandbox_ref)
+        if args and args.get("marker_path"):
+            result["marker_path"] = args["marker_path"]
     return result
 
 
 @app.delete("/sandboxes/{sandbox_id}")
 async def delete_sandbox_route(sandbox_id: str):
-    record = await get_sandbox(sandbox_id)
-    if record is None:
-        return JSONResponse({"error": "sandbox not found"}, status_code=404)
-
-    # Hold the sandbox lock to prevent concurrent _ensure_sandbox_alive
-    # from auto-restarting the sandbox while we're deleting it.
+    await _require_sandbox(sandbox_id)
+    # Hold the sandbox lock to prevent concurrent auto-restart
+    # from restarting the sandbox while we're deleting it.
     async with _get_sandbox_lock(sandbox_id):
         # Clean up sessions BEFORE removing the instance so that
         # concurrent requests still see the sandbox as existing.
@@ -934,14 +1617,20 @@ async def delete_sandbox_route(sandbox_id: str):
 
 @app.post("/sandboxes/provision")
 async def provision_sandbox_route(request: Request):
-    """Provision a sandbox with deps installed, but no supervisor started.
+    """Provision a sandbox on the provider selected by the request body.
 
-    Returns sandbox_id. Supervisors are started per-session via POST /sessions.
+    Body: ``{"volume_id": ..., "subpath": ..., "provider": "daytona"|"docker"|"local",
+              "agent_type": ..., "config": {...}}``
+
+    For Daytona the returned instance has no supervisor yet (started lazily by
+    ``ensure_runtime``). For Docker/Local the supervisor is already running.
+    Returns ``{sandbox_id, status}``.
     """
-    data = await request.json()
+    data = await _json_body(request)
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
     cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
     root = config_data.get("root", data.get("root", cwd))
     dockerfile = _materialize_dockerfile(config_data)
@@ -949,69 +1638,136 @@ async def provision_sandbox_route(request: Request):
         {**config_data, "agent_type": agent_type, "cwd": cwd}
     )
 
+    subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
+    explicit_provider = data.get("provider")
+    vol = await _resolve_or_default_volume(data.get("volume_id"), explicit_provider or "local")
+    _validate_subpath(subpath)
+    # Default the provider from the volume (so existing Daytona-only clients
+    # don't have to pass it), but let an explicit body field override for tests.
+    provider = explicit_provider or vol.provider
+    if provider != vol.provider:
+        raise HTTPException(
+            400,
+            f"provider {provider!r} does not match volume.provider {vol.provider!r}",
+        )
+
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     pre_start_commands = skill_cmds + (data.get("pre_start_commands") or [])
 
+    # Install supervisor on the volume first — docker/local need this before
+    # create_sandbox; daytona tolerates it (fast-path on cache hit).
     try:
-        instance = await provision_daytona_sandbox(
+        await ensure_volume_supervisor(vol.id, agent_type)
+    except Exception as e:
+        raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
+
+    # Pre-allocate the DB sandbox_id so we can thread it to the provider as a
+    # container label — reconcile_on_startup cross-references live containers
+    # against DB rows by this id.
+    sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
+    try:
+        instance = await _providers_mod.provision_sandbox(
+            provider,
+            volume_ref=vol.provider_ref,
+            subpath=subpath,
             agent_type=agent_type,
             dockerfile=dockerfile,
             pre_start_commands=pre_start_commands if pre_start_commands else None,
             root=root,
+            sandbox_id=sandbox_id,
         )
     except Exception as e:
         if "circuit breaker" in str(e).lower():
-            return JSONResponse(
-                {"error": str(e)}, status_code=503,
-                headers={"Retry-After": "30"},
-            )
-        return JSONResponse({"error": f"Failed to provision sandbox: {e}"}, status_code=502)
+            raise HTTPException(503, str(e), headers={"Retry-After": "30"})
+        raise HTTPException(502, f"Failed to provision sandbox: {e}")
 
-    sandbox_id = instance.sandbox_id
     _INSTANCES[sandbox_id] = instance
-    await upsert_sandbox(SandboxRecord(
-        id=sandbox_id, provider="daytona",
-        sandbox_ref=sandbox_id, status=STATUS_RUNNING,
-        root=root,
+    await upsert_sandbox(_sandbox_record(
+        sandbox_id, provider, instance,
+        volume_id=vol.id, subpath=subpath, root_fallback=root,
     ))
 
-    return {"sandbox_id": sandbox_id, "status": "provisioned"}
+    # Dual-key: ``sandbox_id`` is the historic shape, ``id`` matches the
+    # plain /sandboxes POST response so both paths are interchangeable.
+    return {
+        "sandbox_id": sandbox_id, "id": sandbox_id,
+        "status": "provisioned",
+        "volume_id": vol.id, "subpath": subpath, "provider": provider,
+    }
 
 
 @app.post("/sandboxes/{sandbox_id}/stop")
 async def stop_sandbox_route(sandbox_id: str):
-    record = await get_sandbox(sandbox_id)
-    if record is None:
-        return JSONResponse({"error": "sandbox not found"}, status_code=404)
+    record = await _require_sandbox(sandbox_id)
 
-    # Hold the sandbox lock to prevent concurrent _ensure_sandbox_alive
-    # from auto-restarting the sandbox while we're stopping it.
+    # Hold the sandbox lock to prevent concurrent auto-restart
+    # from restarting the sandbox while we're stopping it.
+    #
+    # IMPORTANT: stop the provider instance BEFORE flipping status="stopped"
+    # in the DB. A crash between the flip and a successful stop_instance
+    # Only mark stopped after the provider confirms — otherwise the DB says
+    # "stopped" while a live container still runs, and reconcile treats it as
+    # an orphan. ``_INSTANCES`` must be popped *after* the DB update: if the
+    # UPDATE fails, keep the entry so retry/reconcile can still locate the
+    # container; otherwise the container is gone but the row says "running"
+    # and the next ensure call would provision a duplicate.
     async with _get_sandbox_lock(sandbox_id):
-        instance = _INSTANCES.pop(sandbox_id, None)
-        record.status = "stopped"
-        await upsert_sandbox(record)
+        instance = _INSTANCES.get(sandbox_id)
+        if instance:
+            try:
+                # snapshot_and_stop: workspace tarball lands on the volume
+                # BEFORE the provider stops the sandbox, so the next
+                # ensure_sandbox call can restore a fresh container from
+                # the up-to-date snapshot.
+                await snapshot_and_stop(record, instance)
+            except Exception as e:
+                log.warning("stop_sandbox_route: snapshot_and_stop failed for %s: %s",
+                            sandbox_id, e)
+                raise HTTPException(502, f"stop failed: {e}")
 
-    # Stop the sandbox outside the lock (may be slow)
-    if instance and record.provider == "daytona":
-        await stop_daytona(instance)
+        record.status = "stopped"
+        try:
+            await upsert_sandbox(record)
+        except Exception as e:
+            # Provider is stopped but DB flip failed.  Leave _INSTANCES as-is
+            # so the next reconcile or a client retry can still locate the
+            # container (already exited; upsert_sandbox is idempotent).
+            # Returning 502 prompts the client to retry.
+            log.warning(
+                "stop_sandbox_route: DB update failed for %s "
+                "(container stopped; _INSTANCES kept): %s",
+                sandbox_id, e,
+            )
+            raise HTTPException(502, f"stop succeeded but DB update failed: {e}")
+
+        # DB update succeeded — drop the in-process entry now.
+        _INSTANCES.pop(sandbox_id, None)
 
     return {"status": "stopped"}
 
 
 @app.post("/sandboxes/{sandbox_id}/start")
 async def start_sandbox_route(sandbox_id: str):
-    record = await get_sandbox(sandbox_id)
-    if record is None:
-        return JSONResponse({"error": "sandbox not found"}, status_code=404)
-
+    record = await _require_sandbox(sandbox_id)
     try:
-        agent_type = "claude"
-        url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type=agent_type)
+        url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type="claude")
     except Exception as e:
-        return JSONResponse({"error": f"failed to start sandbox: {e}"}, status_code=500)
+        # 502 matches POST /sandboxes and POST /sandboxes/provision —
+        # provider failures are upstream faults, not server bugs (500).
+        raise HTTPException(502, f"failed to start sandbox: {e}")
 
-    record.status = "running"
-    await upsert_sandbox(record)
+    # Re-fetch the record: _ensure_sandbox_alive may have created a replacement
+    # sandbox (for Daytona terminal-state / docker missing) and written a new
+    # sandbox_ref + listen_port to the DB. Upserting our local snapshot would
+    # clobber those updates with a stale sandbox_ref pointing at the dead
+    # container. Fresh fetch is authoritative.
+    fresh = await get_sandbox(sandbox_id)
+    if fresh is None:
+        # Shouldn't happen — _ensure_sandbox_alive just succeeded — but be
+        # defensive: fall through to returning the working URL.
+        return {"status": "running", "url": url}
+    fresh.status = "running"
+    await upsert_sandbox(fresh)
     return {"status": "running", "url": url}
 
 
@@ -1028,7 +1784,7 @@ async def admin_list_sessions():
             {
                 "session_id": s.session_id,
                 "agent_id": s.agent_id,
-                "sandbox_id": s.sandbox_id,
+                "current_sandbox_id": s.sandbox_id,
                 "inner_session_id": s.inner_session_id,
                 "agent_busy": s.agent_busy,
                 "active_rpc_id": s.active_rpc_id,
@@ -1069,7 +1825,7 @@ async def admin_reap_session(session_id: str):
     """
     state = SESSIONS.get(session_id)
     if state is None:
-        return JSONResponse({"error": "session not in memory"}, status_code=404)
+        raise HTTPException(404, "session not in memory")
 
     sandbox_id = state.sandbox_id
     await _shutdown_session_state(state, remove=True, mark_idle_at=time.time())
@@ -1080,10 +1836,15 @@ async def admin_reap_session(session_id: str):
         if instance is not None:
             stopped_provider = instance.provider
             try:
-                await stop_instance(instance)
+                rec = await get_sandbox(sandbox_id)
+                if rec is not None:
+                    await snapshot_and_stop(rec, instance)
+                else:
+                    await stop_instance(instance)
             except Exception as e:
                 log.warning(
-                    "admin reap: stop_instance failed for %s: %s", sandbox_id, e
+                    "admin reap: snapshot_and_stop failed for %s: %s",
+                    sandbox_id, e,
                 )
 
     return {
@@ -1215,38 +1976,33 @@ def _process_sse_block(
                 thinking_parts.append(text)
 
         elif log_events and ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
-            # Flush any accumulated text/thinking before the tool call so the
-            # text-tool interleave within the turn is preserved.
+            # Flush text/thinking before the tool call so the interleave
+            # within the turn is preserved.
             _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
             tool_payload: dict = {
                 "tool": extract_tool_name(update),
                 "tool_call_id": extract_tool_call_id(update),
                 "prompt_id": prompt_id,
             }
-            title = update.get("title")
-            if title:
+            if title := update.get("title"):
                 tool_payload["title"] = title
-            raw_input = update.get("rawInput")
-            if raw_input:
+            if raw_input := update.get("rawInput"):
                 tool_payload["args"] = raw_input
             _schedule_log(state, EVT_TOOL_CALL, tool_payload)
 
         elif log_events and ut == UT_TOOL_CALL_UPDATE:
-            # tool_call_update can carry either a tool result (most common
-            # — toolResponse / output / etc.) or a refined args set after
-            # the initial tool_call.  Persist whichever is present, but
-            # never re-emit a duplicate EVT_TOOL_CALL row.
-            tool_call_id = extract_tool_call_id(update)
+            # tool_call_update usually carries a tool result; sometimes a
+            # refined arg set. Persist result rows but never re-emit a
+            # duplicate EVT_TOOL_CALL.
             tool_response = extract_tool_response(update)
             if tool_response is not None:
                 result_payload: dict = {
                     "tool": extract_tool_name(update),
-                    "tool_call_id": tool_call_id,
+                    "tool_call_id": extract_tool_call_id(update),
                     "result": tool_response,
                     "prompt_id": prompt_id,
                 }
-                title = update.get("title")
-                if title:
+                if title := update.get("title"):
                     result_payload["title"] = title
                 _schedule_log(state, EVT_TOOL_RESULT, result_payload)
 
@@ -1262,21 +2018,17 @@ def _process_sse_block(
         return
 
     if kind == "done_result":
-        if log_events:
-            _mark_turn_finished(state)
-            _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
-            result = data or {}
-            done_payload: dict = {
-                "stop_reason": result.get("stopReason"),
-                "prompt_id": prompt_id,
-            }
-            usage = result.get("usage")
-            if usage:
-                done_payload["usage"] = usage
-            _schedule_log(state, "turn_end", done_payload)
-        else:
+        if not log_events:
             text_parts.clear()
             thinking_parts.clear()
+            return
+        _mark_turn_finished(state)
+        _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
+        result = data or {}
+        done_payload: dict = {"stop_reason": result.get("stopReason"), "prompt_id": prompt_id}
+        if usage := result.get("usage"):
+            done_payload["usage"] = usage
+        _schedule_log(state, "turn_end", done_payload)
         return
 
     if kind == "error" and log_events:
@@ -1285,80 +2037,106 @@ def _process_sse_block(
         _flush_buffered_text(state, text_parts, thinking_parts, prompt_id)
         err = data or {}
         err_data = err.get("data") if isinstance(err.get("data"), dict) else {}
-        _schedule_log(
-            state,
-            EVT_ERROR,
-            {
-                "message": err.get("message", str(err))[:500],
-                "kind": err_data.get("kind") if err_data else None,
-                "prompt_id": prompt_id,
-            },
-        )
+        _schedule_log(state, EVT_ERROR, {
+            "message": err.get("message", str(err))[:500],
+            "kind": err_data.get("kind") if err_data else None,
+            "prompt_id": prompt_id,
+        })
 
 
-async def _find_last_replay_event_id_from_stream(
-    resp: httpx.Response,
-    load_rpc_id: str,
-    timeout_s: float = 30,
-) -> str | None:
-    """Read an already-open SSE stream until the session/load RPC response appears.
-
-    The stream must have been opened BEFORE session/load was sent so the
-    replay events are captured.  Returns the last SSE event ID seen up to
-    and including the load response.
-    """
-
-    async def _scan() -> str | None:
-        last_id = None
-        async for block in iter_sse_blocks(resp):
-            for line in block.split("\n"):
-                if line.startswith("id:"):
-                    last_id = line[3:].strip()
-            payload = parse_sse_data(block)
-            if payload is not None:
-                if str(payload.get("id", "")) == load_rpc_id and "result" in payload:
-                    return last_id
-        return last_id
-
-    try:
-        return await asyncio.wait_for(_scan(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        log.warning("find last replay event timed out after %ss", timeout_s)
-        return None
-    except Exception as e:
-        log.warning("find last replay event failed: %s", e)
-        return None
+_DAYTONA_UNRECOVERABLE_TOKENS = (
+    "not found", "destroyed", "destroying",
+    "terminal state", "unrecoverable", "unknown",
+)
 
 
 def _should_replace_daytona_sandbox(exc: Exception) -> bool:
     """True when a Daytona recovery error means the old sandbox is gone for good."""
     text = str(exc).lower()
-    return any(
-        token in text
-        for token in (
-            "not found",
-            "destroyed",
-            "destroying",
-            "terminal state",
-            "unrecoverable",
-            "unknown",
-        )
-    )
+    return any(token in text for token in _DAYTONA_UNRECOVERABLE_TOKENS)
 
 
-async def _session_has_logged_activity(session_id: str) -> bool:
-    """Whether this session has any persisted turn/activity logs yet.
+async def snapshot_supervisor(
+    sandbox: SandboxRecord, *, url: str | None = None,
+) -> None:
+    """Call POST /v1/snapshot on the sandbox's supervisor.
 
-    Freshly created sessions can already have an inner_session_id before the
-    agent backend has durably materialized anything that `session/load` can
-    reopen. If the DB check fails, return True so recovery stays conservative
-    and never silently drops history.
+    Best-effort: non-200 responses and transport errors are logged, not
+    raised. Callers (typically ``snapshot_and_stop``) proceed with
+    teardown regardless — a transient volume error must not pin the
+    sandbox alive, and the sandbox is about to die anyway.
+
+    ``url`` lets the caller inject a pre-resolved supervisor URL (e.g.
+    from ``SessionState.supervisor_url``). Without it we try the
+    ``_INSTANCES`` cache, then port-based derivation. That covers
+    docker/local today; Daytona callers pass ``url=`` explicitly for now
+    until a URL-resolution step lands with the daytona call-sites.
+    """
+    if url is None:
+        inst = _INSTANCES.get(sandbox.id)
+        if inst and inst.url:
+            url = inst.url
+        elif sandbox.listen_port is not None:
+            url = f"http://localhost:{sandbox.listen_port}"
+        else:
+            log.warning(
+                "snapshot_supervisor: no URL for sandbox %s (provider=%s); skipping",
+                sandbox.id, sandbox.provider,
+            )
+            return
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.post(f"{url}/v1/snapshot")
+            if r.status_code != 200:
+                log.warning(
+                    "snapshot_supervisor: %s returned %d: %s",
+                    sandbox.id, r.status_code, r.text[:200],
+                )
+        except Exception as e:
+            log.warning(
+                "snapshot_supervisor: POST failed for %s: %s", sandbox.id, e,
+            )
+
+
+async def snapshot_and_stop(
+    sandbox: SandboxRecord,
+    instance: ProviderInstance | None = None,
+    *, url: str | None = None,
+) -> None:
+    """Snapshot the workspace, then stop the sandbox at the provider.
+
+    The single server-initiated stop entry point under the snapshot-on-stop
+    model: reap, /sandboxes/:id/stop, sandbox-replacement during recovery,
+    agent-delete all route through here.
+
+    Ordering is strict — snapshot before stop, even if the snapshot step
+    itself fails. ``snapshot_supervisor`` already swallows its own errors,
+    but we wrap again defensively so a bug in the helper cannot wedge the
+    stop path. The sandbox is about to die; a lost snapshot is recoverable
+    (the user loses a turn's worth of state, at most), a wedged stop is not.
+
+    ``instance`` is used if provided; otherwise we look up _INSTANCES or
+    synthesize a minimal ProviderInstance from the sandbox row so
+    ``stop_instance`` can still target the provider.
     """
     try:
-        return await session_has_log_entries(session_id)
+        await snapshot_supervisor(sandbox, url=url)
     except Exception as e:
-        log.warning("session %s log-activity check failed: %s", session_id, e)
-        return True
+        log.warning(
+            "snapshot_and_stop: snapshot step failed for %s: %s; "
+            "proceeding to stop anyway", sandbox.id, e,
+        )
+
+    inst = instance or _INSTANCES.get(sandbox.id)
+    if inst is None:
+        vol = await get_volume(sandbox.volume_id) if sandbox.volume_id else None
+        provider = vol.provider if vol else sandbox.provider
+        inst = ProviderInstance(
+            provider=provider, url="",
+            root=sandbox.root, sandbox_id=sandbox.sandbox_ref,
+        )
+    await stop_instance(inst)
 
 
 async def _ensure_sandbox_alive(
@@ -1366,13 +2144,13 @@ async def _ensure_sandbox_alive(
     sandbox_record: SandboxRecord,
     agent_type: str = "claude",
     dockerfile: str | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> tuple[str, bool]:
     """Ensure the supervisor is reachable. Restart if needed.
 
     Returns ``(url, replaced)`` where ``replaced=True`` means a fresh Daytona
     sandbox had to be created because the old one was unrecoverable.
     """
-    instance = _INSTANCES.get(sandbox_id)
     provider = sandbox_record.provider
 
     # For local/docker: check if subprocess is alive
@@ -1385,47 +2163,109 @@ async def _ensure_sandbox_alive(
             if fresh_record is None:
                 raise RuntimeError("Sandbox was deleted")
             if instance:
-                if instance.process is not None:
-                    if instance.process.returncode is None:
-                        return instance.url, False  # local: still running
-                elif instance.container_id:
-                    # Docker: health-check URL
-                    from .providers import _wait_for_health
+                from .providers import _wait_for_health
+                alive = (
+                    (instance.process is not None and instance.process.returncode is None)
+                    or (instance.container_id
+                        and await _wait_for_health(instance.url, max_retries=2, interval=0.5))
+                )
+                if alive:
+                    return instance.url, False
 
-                    if await _wait_for_health(
-                        instance.url, max_retries=2, interval=0.5
-                    ):
-                        return instance.url, False
+            # Try to restart AT THE SAME sandbox_ref before falling back to
+            # full re-provisioning. For local, start_sandbox respawns the
+            # supervisor using cached spawn args — preserves sandbox_ref
+            # and home dir. For docker, start_sandbox runs ``docker start``
+            # on the existing container. Both avoid the overhead (and
+            # ref-changing semantics) of a full provision.
+            try:
+                status = await _providers_mod.get_sandbox_status(
+                    provider, fresh_record.sandbox_ref,
+                )
+            except Exception as status_err:
+                log.info("get_sandbox_status(%s) raised: %s — will reprovision",
+                         sandbox_id, status_err)
+                status = "missing"
+            if status == "stopped":
+                log.info("restarting sandbox %s at same ref %s",
+                         sandbox_id, fresh_record.sandbox_ref)
+                try:
+                    await _providers_mod.start_sandbox(
+                        provider, fresh_record.sandbox_ref,
+                    )
+                except Exception as start_err:
+                    log.warning(
+                        "start_sandbox(%s) failed: %s — falling back to reprovision",
+                        sandbox_id, start_err,
+                    )
+                else:
+                    # Rebuild a ProviderInstance from the restarted ref.
+                    # URL is port-based so we can derive it.
+                    if instance is not None:
+                        try:
+                            await destroy_instance(instance)
+                        except Exception:
+                            pass
+                    # Try to recover the instance from registry first (local
+                    # populates _PROCESSES[ref] in start_sandbox, but no
+                    # ProviderInstance is returned by start). Rebuild one.
+                    url = sandbox_record.derive_url()
+                    revived = ProviderInstance(
+                        provider=provider, url=url,
+                        root=sandbox_record.root,
+                        sandbox_id=fresh_record.sandbox_ref,
+                        port=sandbox_record.listen_port,
+                    )
+                    # For local, hydrate .process from the module registry so
+                    # subsequent liveness probes work.
+                    if provider == "local":
+                        from .providers.local import _PROCESSES as _LOCAL_PROCS
+                        revived.process = _LOCAL_PROCS.get(fresh_record.sandbox_ref)
+                    _INSTANCES[sandbox_id] = revived
+                    # DB row unchanged — same sandbox_ref, same port.
+                    return url, False
 
-            # Clean up old container before creating replacement
-            if instance:
+            # Clean up old instance before creating a fresh replacement.
+            if instance is not None:
                 try:
                     await destroy_instance(instance)
                 except Exception:
-                    pass  # best-effort cleanup
+                    pass
 
             log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
+            if spawn_env is None:
+                spawn_env = await _spawn_env_for_sandbox(sandbox_id)
+
+            # Resolve the volume so the replacement lands on the same mount
+            # (Docker refuses empty subpath, Local would start outside the volume).
+            if not fresh_record.volume_id:
+                raise RuntimeError(
+                    f"Sandbox {sandbox_id} has no volume_id; cannot auto-restart"
+                )
+            vol = await get_volume(fresh_record.volume_id)
+            if vol is None:
+                raise RuntimeError(
+                    f"Sandbox {sandbox_id} references missing volume {fresh_record.volume_id}"
+                )
+
             try:
-                new_instance = await create_instance(
-                    provider, agent_type, dockerfile=dockerfile,
-                    root=sandbox_record.root,
+                new_instance = await _providers_mod.provision_sandbox(
+                    provider,
+                    volume_ref=vol.provider_ref, subpath=fresh_record.subpath or "",
+                    agent_type=agent_type, dockerfile=dockerfile,
+                    root=sandbox_record.root, spawn_env=spawn_env,
+                    sandbox_id=sandbox_id,
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to restart sandbox: {e}")
 
             _INSTANCES[sandbox_id] = new_instance
-            new_ref = (
-                str(new_instance.port) if new_instance.port is not None else sandbox_id
-            )
-            await upsert_sandbox(
-                SandboxRecord(
-                    id=sandbox_id,
-                    provider=provider,
-                    sandbox_ref=new_ref,
-                    status=STATUS_RUNNING,
-                    root=sandbox_record.root,
-                )
-            )
+            await upsert_sandbox(_sandbox_record(
+                sandbox_id, provider, new_instance,
+                volume_id=sandbox_record.volume_id,
+                subpath=sandbox_record.subpath,
+                root_fallback=sandbox_record.root,
+            ))
             return new_instance.url, False
 
     # For daytona: health-check the URL; if down, restart the supervisor
@@ -1442,31 +2282,37 @@ async def _ensure_sandbox_alive(
                 pass
 
         daytona_sandbox_id = sandbox_record.sandbox_ref
-        log.info(
-            "recovering daytona sandbox %s (daytona_id=%s)",
-            sandbox_id,
-            daytona_sandbox_id,
-        )
+        log.info("recovering daytona sandbox %s (daytona_id=%s)",
+                 sandbox_id, daytona_sandbox_id)
+        if spawn_env is None:
+            spawn_env = await _spawn_env_for_sandbox(sandbox_id)
         replaced = False
         try:
             from .providers import restart_daytona_supervisor
-
             new_instance = await restart_daytona_supervisor(
                 daytona_sandbox_id, agent_type, root=sandbox_record.root,
+                spawn_env=spawn_env,
             )
         except Exception as e:
             if not _should_replace_daytona_sandbox(e):
                 raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
             log.warning(
                 "daytona sandbox %s unrecoverable for sandbox %s: %s; creating replacement",
-                daytona_sandbox_id,
-                sandbox_id,
-                e,
+                daytona_sandbox_id, sandbox_id, e,
             )
+            # Preserve volume_id + subpath so the replacement mounts the same
+            # storage. Resolve the Daytona volume provider_ref for the mount API.
+            dt_volume_ref = None
+            if sandbox_record.volume_id:
+                _vol = await get_volume(sandbox_record.volume_id)
+                if _vol is not None:
+                    dt_volume_ref = _vol.provider_ref
             try:
                 new_instance = await create_instance(
                     "daytona", agent_type, dockerfile=dockerfile,
-                    root=sandbox_record.root,
+                    root=sandbox_record.root, spawn_env=spawn_env,
+                    volume_id=dt_volume_ref, subpath=sandbox_record.subpath,
+                    sandbox_id=sandbox_id,
                 )
             except Exception as create_err:
                 raise RuntimeError(
@@ -1475,382 +2321,553 @@ async def _ensure_sandbox_alive(
             replaced = True
 
         _INSTANCES[sandbox_id] = new_instance
-        await upsert_sandbox(
-            SandboxRecord(
-                id=sandbox_id,
-                provider="daytona",
-                sandbox_ref=new_instance.sandbox_id or sandbox_id,
-                status=STATUS_RUNNING,
-                root=sandbox_record.root,
-            )
-        )
+        await upsert_sandbox(_sandbox_record(
+            sandbox_id, "daytona", new_instance,
+            volume_id=sandbox_record.volume_id,
+            subpath=sandbox_record.subpath,
+            root_fallback=sandbox_record.root,
+        ))
         return new_instance.url, replaced
 
 
-async def _do_resume(
-    *,
-    sandbox_id: str,
-    agent_id: str,
-    inner_session_id: str,
-    client_session_id: str | None = None,
-    force_replace_live_state: bool = False,
-    user_creds: dict[str, str] | None = None,
-):
-    """Core resume logic shared by both resume endpoints.
 
-    A per-session lock ensures that concurrent resumes for the same session
-    are serialized: the second caller waits until the first finishes, then
-    returns the already-active session instead of creating a duplicate ACP
-    process.
+
+async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
+    """Idempotently install the supervisor + ACP binary on a volume.
+
+    Cross-worker serialization uses a Postgres advisory lock keyed on
+    ``hash((volume_id, agent_type))``.  Fast path: if the
+    ``volumes.supervisor_agent_types`` cache already lists this agent_type,
+    return immediately without touching the DB beyond the initial read.
+
+    Locking model (slow path):
+
+    1. Open a short transaction, re-check the cache, then release — the
+       cheap double-check lets most racers short-circuit before touching
+       the advisory-lock machinery at all.
+    2. Acquire a session-scoped ``pg_advisory_lock`` on the SAME key on
+       a dedicated autocommit connection — this is the cross-process
+       "I'm installing" signal.  ``pg_advisory_lock`` (session-scoped,
+       NOT ``pg_advisory_xact_lock``) is released automatically if the
+       backend dies or the TCP connection drops, so a crashed worker
+       can't wedge the key.
+    3. Re-check the cache under the session lock (another worker may have
+       installed between steps 1 and 2).
+    4. Run the slow provider install with NO open transaction and NO
+       connection held (the provider call talks to docker/daytona/local,
+       not to the DB).
+    5. Take a fresh short transaction to update the cache + release the
+       session lock via ``pg_advisory_unlock``.
+
+    Failure semantics: if the provider call raises, the session lock is
+    released in the ``finally`` block so a retry can re-enter immediately.
+    The volumes cache is only updated on success, so a failed install
+    leaves no footprint to undo.
+
+    Trade-off: the window between steps 1 and 2 is a race — two workers
+    can both pass the double-check and then serialize on the session lock
+    in step 2, doing the install twice.  That's harmless (the install is
+    idempotent in its own right — the second worker will short-circuit at
+    the step-3 cache re-check) but means we don't get strict "install once"
+    semantics.  Acceptable because the alternative is holding a pool
+    connection for minutes, which is more expensive operationally.
     """
-    session_id = client_session_id or str(uuid.uuid4())
+    # Fast path (no lock): check cache first — 99% of calls hit this.
+    vol = await get_volume(volume_id)
+    if vol is None:
+        raise HTTPException(500, f"Volume {volume_id} not found")
+    if agent_type in (vol.supervisor_agent_types or []):
+        return  # already installed
 
-    async with _get_session_lock(session_id):
-        # If a previous resume already created a live session, return it.
-        existing = SESSIONS.get(session_id)
-        if existing and not existing.shutdown.is_set():
-            if force_replace_live_state:
-                await _retire_session_state_for_resume(existing)
-            else:
-                return {
-                    "session_id": session_id,
-                    "agent_id": existing.agent_id,
-                    "sandbox_id": existing.sandbox_id,
-                    "inner_session_id": existing.inner_session_id,
-                    "status": "already_active",
-                }
+    # Compute a positive 63-bit key (pg advisory locks take a bigint; mask
+    # off the sign bit for safety).
+    lock_key = hash((volume_id, agent_type)) & 0x7FFFFFFFFFFFFFFF
 
-        agent_record = await get_agent(agent_id)
-        if agent_record is None:
-            log.error("_do_resume: agent %s not found in DB", agent_id)
-            return JSONResponse({"error": "agent not found"}, status_code=404)
+    # Step 1 + 2: double-check cache, then acquire a session-scoped advisory
+    # lock OUTSIDE a transaction so we can release the connection while
+    # the slow provider call runs.  We pick up a dedicated connection for
+    # the session lock so it's not tied to any pool's transaction.
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT provider, provider_ref, supervisor_agent_types FROM volumes"
+            " WHERE id = %s",
+            (volume_id,),
+        )).fetchone()
+        if row is None:
+            raise HTTPException(500, f"Volume {volume_id} not found")
+        installed = list(row.get("supervisor_agent_types") or [])
+        if agent_type in installed:
+            return
+        provider = row["provider"]
+        provider_ref = row["provider_ref"]
 
-        sandbox_record = await get_sandbox(sandbox_id)
-        if sandbox_record is None:
-            log.error("_do_resume: sandbox %s not found in DB", sandbox_id)
-            return JSONResponse({"error": "sandbox not found"}, status_code=404)
-
-        # Auto-restart sandbox if the process died (idle reaper or crash).
-        # sandbox_replaced=True means a fresh sandbox was created — the old
-        # inner_session_id is now meaningless (no session file on disk).
-        sandbox_replaced = False
-        supervisor_url = None
-        supervisor_port = None
-
-        if sandbox_record.provider == "daytona":
-            # Per-session supervisor: start a new one on a new port
-            try:
-                from daytona_sdk import Daytona, DaytonaConfig
-                api_key = os.environ.get("DAYTONA_API_KEY")
-                if not api_key:
-                    raise RuntimeError("DAYTONA_API_KEY not set")
-                loop = asyncio.get_running_loop()
-                daytona_client = Daytona(DaytonaConfig(api_key=api_key))
-                sandbox = await loop.run_in_executor(
-                    None, lambda: daytona_client.get(sandbox_id)
-                )
-                raw_state = sandbox.state
-                state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
-                if state_str != "started":
-                    await loop.run_in_executor(None, sandbox.start)
-                    sandbox_replaced = True
-
-                root = sandbox_record.root or agent_record.config.cwd or "/tmp"
-                supervisor_port = allocate_sandbox_port(sandbox_id)
-                supervisor_url = await start_supervisor_in_sandbox(
-                    sandbox, agent_record.config.agent_type or "claude",
-                    supervisor_port, root=root, user_creds=user_creds,
-                )
-                url = supervisor_url
-            except RuntimeError as e:
-                log.error("_do_resume: failed to start per-session supervisor: %s", e)
-                if supervisor_port is not None:
-                    free_sandbox_port(sandbox_id, supervisor_port)
-                return JSONResponse({"error": str(e)}, status_code=502)
-        else:
-            try:
-                url, sandbox_replaced = await _ensure_sandbox_alive(
-                    sandbox_id,
-                    sandbox_record,
-                    agent_type=agent_record.config.agent_type,
-                    dockerfile=agent_record.config.dockerfile,
-                )
-            except RuntimeError as e:
-                log.error(
-                    "_do_resume: _ensure_sandbox_alive failed for sandbox %s: %s",
-                    sandbox_id,
-                    e,
-                )
-                return JSONResponse({"error": str(e)}, status_code=502)
-
-        cwd = agent_record.config.cwd or "/tmp"
-        session_has_history = await _session_has_logged_activity(session_id)
-
-        acp_session_id = str(uuid.uuid4())
-
-        client = AcpClient(url)
-        load_rpc_id = str(uuid.uuid4())
-        effective_inner_session_id = inner_session_id
-        last_event_id = None
-        replay_sse: httpx.AsyncClient | None = None
-        replay_stream: httpx.Response | None = None
+    # Acquire a session-scoped advisory lock on a dedicated connection
+    # switched to autocommit so it isn't stuck in a long-running transaction
+    # while the slow provider call runs. ``pg_advisory_lock`` survives commits
+    # and auto-releases on connection close, so a crashed worker can't wedge
+    # the key. We MUST restore autocommit=False before returning the connection
+    # to the pool — psycopg's pool has no reset callback.
+    async with get_db() as lock_conn:
+        _restore_autocommit = False
         try:
-            if sandbox_replaced or not session_has_history:
-                if not sandbox_replaced:
-                    log.info(
-                        "session %s has no logged activity; creating a fresh inner session",
-                        session_id,
-                    )
-                await asyncio.wait_for(
-                    _apply_config_and_initialize(
-                        client, agent_record.config, acp_session_id, cwd
-                    ),
-                    timeout=120,
-                )
-                effective_inner_session_id = client.get_inner_session_id(acp_session_id)
-                if not effective_inner_session_id:
-                    raise RuntimeError(
-                        "session/new returned no sessionId on replacement sandbox"
-                    )
-            else:
-                await asyncio.wait_for(
-                    client.handshake(
-                        acp_session_id, agent_record.config.agent_type or "claude"
-                    ),
-                    timeout=30,
-                )
-                replay_sse = httpx.AsyncClient(
-                    base_url=client.base_url,
-                    timeout=httpx.Timeout(30, read=60, pool=30),
-                )
-                replay_stream = await replay_sse.send(
-                    replay_sse.build_request(
-                        "GET",
-                        f"/v1/acp/{acp_session_id}",
-                        headers={"Accept": "text/event-stream"},
-                    ),
-                    stream=True,
-                )
-                await client._send_rpc(
-                    acp_session_id,
-                    "session/load",
-                    {
-                        "sessionId": inner_session_id,
-                        "cwd": cwd,
-                        "mcpServers": _mcp_dict_to_acp_array(
-                            agent_record.config.mcp_servers
-                        )
-                        if agent_record.config.mcp_servers
-                        else [],
-                    },
-                    rpc_id=load_rpc_id,
-                )
-                client.set_inner_session_id(acp_session_id, inner_session_id)
+            await lock_conn.set_autocommit(True)
+            _restore_autocommit = True
+        except AttributeError:
+            pass  # test fakes without set_autocommit
+        except Exception as e:
+            log.error("ensure_volume_supervisor: set_autocommit(True) failed "
+                      "(volume=%s agent=%s): %s; falling back to transactional mode",
+                      volume_id, agent_type, e)
+        try:
+            got_row = await (await lock_conn.execute(
+                "SELECT pg_try_advisory_lock(%s)", (lock_key,)
+            )).fetchone()
+            if not (got_row and got_row.get("pg_try_advisory_lock")):
+                log.info("ensure_volume_supervisor: waiting for another worker "
+                         "(volume=%s agent=%s)", volume_id, agent_type)
+                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+
+            # Step 3: re-check cache while holding the session lock.
+            row2 = await (await lock_conn.execute(
+                "SELECT supervisor_agent_types FROM volumes WHERE id = %s",
+                (volume_id,),
+            )).fetchone()
+            installed2 = list((row2 or {}).get("supervisor_agent_types") or [])
+            if agent_type in installed2:
+                return
+
+            log.info("ensure_volume_supervisor: installing %s on volume %s",
+                     agent_type, volume_id)
+            # Step 4: slow provider call with the connection in autocommit (not
+            # in a transaction) so idle-in-transaction timers don't fire.
+            await _providers_mod.install_supervisor(provider, provider_ref, agent_type)
+            # Step 5: update the cache under the same session lock.
+            await lock_conn.execute(
+                "UPDATE volumes SET supervisor_agent_types = "
+                "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
+                "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
+                (agent_type, volume_id, agent_type),
+            )
+            log.info("ensure_volume_supervisor: done installing %s on volume %s",
+                     agent_type, volume_id)
+        finally:
+            # Release the advisory lock explicitly — a failure here is survivable
+            # (the lock auto-releases on connection close).
+            try:
+                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+            except Exception as e:
+                log.warning("ensure_volume_supervisor: pg_advisory_unlock failed: %s", e)
+            # Restore autocommit=False before the conn returns to the pool; if
+            # restore fails, close the conn to prevent pool poisoning.
+            if _restore_autocommit:
                 try:
-                    await client.set_mode(acp_session_id, "bypassPermissions")
+                    await lock_conn.set_autocommit(False)
                 except Exception as e:
-                    log.warning(
-                        "_do_resume: failed to set bypassPermissions after session/load: %s",
-                        e,
-                    )
-        except Exception as e:
-            log.error(
-                "_do_resume: failed for sandbox %s inner %s: %s: %s",
-                sandbox_id,
-                inner_session_id,
-                type(e).__name__,
-                e,
-            )
-            if replay_stream is not None:
-                try:
-                    await replay_stream.aclose()
-                except Exception:
-                    pass
-            if replay_sse is not None:
-                try:
-                    await replay_sse.aclose()
-                except Exception:
-                    pass
-            try:
-                await client.close_session(acp_session_id)
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-            return JSONResponse(
-                {"error": f"Failed to resume session: {e}"}, status_code=502
-            )
-        if replay_stream is not None:
-            last_event_id = await _find_last_replay_event_id_from_stream(
-                replay_stream, load_rpc_id
-            )
-            try:
-                await replay_stream.aclose()
-            except Exception:
-                pass
-            try:
-                await replay_sse.aclose()
-            except Exception:
-                pass
-
-        # Shut down old session before replacing (atomic swap under sandbox lock
-        # to prevent the idle reaper from popping the new session via stale refs)
-        async with _get_sandbox_lock(sandbox_id):
-            old_state = SESSIONS.get(session_id)
-            if old_state:
-                await _shutdown_session_state(
-                    old_state, remove=False, background_close=True
-                )
-            new_state = SessionState(
-                session_id=session_id,
-                agent_id=agent_id,
-                sandbox_id=sandbox_id,
-                acp_session_id=acp_session_id,
-                inner_session_id=effective_inner_session_id,
-                agent_type=agent_record.config.agent_type or "claude",
-                client=client,
-                last_event_id=last_event_id,
-                supervisor_url=supervisor_url,
-                supervisor_port=supervisor_port,
-            )
-            SESSIONS[session_id] = new_state
-            _start_session_tasks(new_state)
-        await upsert_session(
-            session_id, agent_id, sandbox_id, effective_inner_session_id
-        )
-        return {
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "sandbox_id": sandbox_id,
-            "inner_session_id": effective_inner_session_id,
-            "status": "resumed",
-            "status": "resumed",
-        }
+                    log.error("ensure_volume_supervisor: failed to restore "
+                              "autocommit=False: %s; closing conn to prevent "
+                              "pool poisoning", e)
+                    try:
+                        await lock_conn.close()
+                    except Exception as close_err:
+                        log.warning("ensure_volume_supervisor: lock_conn.close() "
+                                    "failed: %s", close_err)
 
 
-async def get_or_recover_session(
-    session_id: str, user_creds: dict[str, str] | None = None,
-) -> SessionState:
-    """Get a live session, recovering from DB if it was reaped.
+async def ensure_sandbox(session_row: dict) -> SandboxRecord:
+    """Guarantees: returns a sandbox that is currently live on the provider.
 
-    This is the single entry point for all session endpoints. Checks
-    in-memory SESSIONS first, then falls back to DB lookup + _do_resume
-    to restart the sandbox and reload conversation state.
+    Idempotent: safe to call multiple times in a row. Creates/restarts/replaces
+    as needed. Emits a ``sandbox_reattach`` event when the returned sandbox is
+    a replacement for a previously-recorded one.
 
-    Raises HTTPException(404) if the session doesn't exist anywhere.
-    Raises HTTPException(502) if recovery fails.
+    Holds the per-session lock for the entire check-and-act sequence so
+    concurrent callers don't double-provision.
     """
-    state = SESSIONS.get(session_id)
-    if state and not state.shutdown.is_set():
-        try:
-            sandbox_record = await get_sandbox(state.sandbox_id)
-        except Exception as e:
-            log.warning(
-                "session %s live sandbox lookup failed for %s: %s; using live state",
-                session_id,
-                state.sandbox_id,
-                e,
-            )
-            return state
-        if sandbox_record is None:
-            return state
-        if sandbox_record.provider != "daytona":
-            return state
+    session_id = session_row["id"]
+    async with _get_session_lock(session_id):
+        return await _ensure_sandbox_locked(session_row)
 
-        # For per-session supervisors, health-check the session's own supervisor
-        if state.supervisor_url:
+
+async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
+    session_id = session_row["id"]
+    # Re-read after acquiring lock in case a concurrent caller updated it.
+    fresh = await get_session(session_id)
+    if fresh is None:
+        raise HTTPException(404, "Session not found")
+    current_id = fresh.get("current_sandbox_id")
+
+    # Case A: no sandbox yet — create one.
+    if current_id is None:
+        return await _provision_new(fresh, previous_id=None)
+
+    sb = await get_sandbox(current_id)
+
+    # Warm fast-path: if we have a live in-process ProviderInstance AND a
+    # runtime SessionState attached to this sandbox, we can trust those as
+    # evidence that the sandbox is running — no need to round-trip to the
+    # provider (docker inspect / daytona API / etc.) for status, nor to
+    # fetch the volume row again. The subsequent ``ensure_runtime`` call
+    # does a short supervisor health probe which catches any real failure;
+    # if the provider-level sandbox has silently died, that probe will
+    # rebuild from scratch.
+    if sb is not None and sb.status == STATUS_RUNNING:
+        existing_state = SESSIONS.get(session_id)
+        cached_inst = _INSTANCES.get(current_id)
+        # Port-based providers (local/docker) carry a live Popen on the
+        # cached instance — verify it's actually running before trusting
+        # the fast-path. External kill-9 leaves the DB row as "running"
+        # and _INSTANCES populated, but the PID is gone. returncode alone
+        # isn't reliable — asyncio.subprocess doesn't set it until the
+        # event loop observes SIGCHLD — so check the PID directly. Without
+        # this the golden recovery tests see "All connection attempts
+        # failed" because ensure_runtime tries session/load against a
+        # dead port.
+        proc_alive = True
+        if cached_inst is not None and cached_inst.process is not None:
+            # Both subprocess.Popen (local provider) and
+            # asyncio.subprocess.Process expose .poll() which reaps zombies
+            # and updates returncode. os.kill(pid, 0) alone returns success
+            # on zombie PIDs until the parent reaps, which is exactly our
+            # situation after a test's external SIGKILL before the server
+            # calls wait(). .poll() closes that hole.
+            proc = cached_inst.process
+            try:
+                if hasattr(proc, "poll"):
+                    proc.poll()
+            except Exception:
+                pass
+            if proc.returncode is not None:
+                proc_alive = False
+        if (
+            cached_inst is not None
+            and existing_state is not None
+            and not existing_state.shutdown.is_set()
+            and existing_state.sandbox_id == current_id
+            and existing_state.supervisor_url
+            and proc_alive
+        ):
+            return sb
+
+    # Case B: row was deleted — replace and emit reattach.
+    if sb is None:
+        await set_session_current_sandbox(session_id, None)
+        return await _provision_new(fresh, previous_id=current_id)
+
+    # Case C-F: row exists — probe provider state.
+    vol = await get_volume(sb.volume_id)
+    if vol is None:
+        raise HTTPException(500, f"Sandbox's volume {sb.volume_id} missing")
+    status = await _providers_mod.get_sandbox_status(vol.provider, sb.sandbox_ref)
+    if status == "running":
+        return sb
+    if status == "stopped":
+        await _providers_mod.start_sandbox(vol.provider, sb.sandbox_ref)
+        sb.status = STATUS_RUNNING
+        await upsert_sandbox(sb)
+        return sb
+    if status in ("missing", "error"):
+        if status == "error":
+            try:
+                inst = ProviderInstance(provider=vol.provider, url="",
+                                        root=sb.root, sandbox_id=sb.sandbox_ref)
+                await _providers_mod.destroy_sandbox(vol.provider, inst)
+            except Exception:
+                pass
+        await delete_sandbox(sb.id)
+        await set_session_current_sandbox(session_id, None)
+        return await _provision_new(fresh, previous_id=current_id)
+    raise HTTPException(500, f"Unknown sandbox status: {status}")
+
+
+async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxRecord:
+    """Create a fresh sandbox (provider selected from the session's volume).
+
+    Dispatches through the uniform ``provision_sandbox`` wrapper so docker,
+    local, and daytona all work. Supervisor is installed on the volume first
+    (idempotent fast-path); the sandbox is then attached to it.
+    """
+    vol = await get_volume(session_row["volume_id"])
+    if vol is None:
+        raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
+    agent_id = session_row["agent_id"]
+    subpath = f"agents/{agent_id}/home"
+    agent = await get_agent(agent_id)
+    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+
+    # Ensure supervisor is installed on the volume before provisioning the sandbox.
+    # This is idempotent: fast-path if already installed (cache hit in volumes table).
+    await ensure_volume_supervisor(vol.id, agent_type)
+
+    # Build the spawn env for the supervisor (agent.env + session.env + secrets).
+    spawn_env = await _build_spawn_env_from_row(session_row)
+
+    # Provider-specific default root. Daytona mounts per-agent at /home/daytona;
+    # docker at /home/agent; local fills it in from the volume path.
+    root = {"daytona": "/home/daytona", "docker": "/home/agent"}.get(vol.provider)
+
+    # Generate the sandbox_id up-front so we can tag the underlying
+    # container/process with it. Docker uses this as a label for
+    # startup reconciliation (M5); other providers currently ignore it.
+    new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
+
+    inst = await _providers_mod.provision_sandbox(
+        vol.provider,
+        volume_ref=vol.provider_ref,
+        subpath=subpath,
+        agent_type=agent_type,
+        spawn_env=spawn_env,
+        root=root,
+        sandbox_id=new_sandbox_id,
+    )
+
+    sb = _sandbox_record(
+        new_sandbox_id, vol.provider, inst,
+        volume_id=vol.id, subpath=subpath,
+        root_fallback=root or "/tmp",
+    )
+    _INSTANCES[sb.id] = inst
+
+    # Atomic: insert the sandbox row + link session->sandbox in one
+    # transaction. A crash between the two writes would otherwise orphan
+    # the sandbox (row exists on the provider + in sandboxes, but no
+    # session points at it). Use a single pool connection so both
+    # statements commit (or roll back) together.
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO sandboxes"
+            " (id, provider, sandbox_ref, status, root, volume_id, subpath, listen_port)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
+            " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
+            " root=EXCLUDED.root, volume_id=EXCLUDED.volume_id,"
+            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port",
+            (sb.id, sb.provider, sb.sandbox_ref, sb.status,
+             sb.root, sb.volume_id, sb.subpath, sb.listen_port),
+        )
+        await conn.execute(
+            "UPDATE sessions SET current_sandbox_id = %s WHERE id = %s",
+            (sb.id, session_row["id"]),
+        )
+
+    if previous_id is not None:
+        await log_event(
+            session_id=session_row["id"],
+            agent_id=agent_id,
+            sandbox_id=sb.id,
+            event_type="sandbox_reattach",
+            payload={"old_sandbox_id": previous_id, "new_sandbox_id": sb.id},
+        )
+    return sb
+
+
+async def ensure_runtime(session_row: dict, sandbox: SandboxRecord) -> SessionState:
+    """Guarantees: returns a SessionState with a connected, initialized client.
+
+    If the existing SESSIONS entry is healthy and attached to this sandbox,
+    reuse it. Otherwise tear down any stale state and build fresh.
+
+    Holds the per-session lock for the entire check-and-act sequence so
+    concurrent callers don't double-provision.
+    """
+    session_id = session_row["id"]
+    async with _get_session_lock(session_id):
+        return await _ensure_runtime_locked(session_row, sandbox)
+
+
+async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> SessionState:
+    session_id = session_row["id"]
+    existing = SESSIONS.get(session_id)
+
+    # Reuse if the existing state is attached to this sandbox and its
+    # supervisor is reachable. Otherwise (stale sandbox, dead supervisor, or
+    # no URL) tear down before rebuilding.
+    if existing:
+        reusable = (
+            not existing.shutdown.is_set()
+            and existing.sandbox_id == sandbox.id
+            and existing.supervisor_url
+        )
+        if reusable:
             from .providers import _wait_for_health
             try:
-                healthy = await _wait_for_health(state.supervisor_url, max_retries=3, interval=1)
-                if healthy:
-                    return state
+                if await _wait_for_health(existing.supervisor_url, max_retries=2, interval=1):
+                    return existing
             except Exception:
                 pass
-            # Per-session supervisor is down — recovery will start a new one
+        await _shutdown_session_state(existing, remove=True, force=True)
+
+    # Build fresh.
+    agent_id = session_row["agent_id"]
+    agent_record = await get_agent(agent_id)
+    if agent_record is None:
+        raise HTTPException(500, f"Agent {agent_id} missing")
+    agent_type = agent_record.config.agent_type or "claude"
+
+    spawn_env = await _build_spawn_env_from_row(session_row)
+    root = sandbox.root or (agent_record.config.cwd if agent_record.config else None) or "/tmp"
+    supervisor_port = allocate_sandbox_port(sandbox.id)
+    effective_spawn_env = dict(spawn_env)
+    effective_spawn_env.setdefault("HOME", root)
+
+    vol = await get_volume(session_row["volume_id"])
+    if vol is None:
+        free_sandbox_port(sandbox.id, supervisor_port)
+        raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
+
+    # Supervisor URL resolution:
+    #  - For Docker/Local the supervisor starts at create_sandbox time; the
+    #    live ProviderInstance in _INSTANCES carries the real URL. On cold
+    #    start (_INSTANCES empty) we fall back to the DB-stored listen_port.
+    #  - For Daytona the URL comes from the SDK-signed preview API and is
+    #    minted per session inside ensure_supervisor_url().
+    if vol.provider in PORT_BASED_PROVIDERS:
+        cached = _INSTANCES.get(sandbox.id)
+        if cached and cached.url:
+            supervisor_url = cached.url
+            # No per-session supervisor port on docker/local — one sandbox
+            # == one supervisor; return the allocated counter to the pool.
+            free_sandbox_port(sandbox.id, supervisor_port)
+            supervisor_port = cached.port  # type: ignore[assignment]
+        elif sandbox.listen_port is not None:
+            supervisor_url = f"http://localhost:{sandbox.listen_port}"
+            free_sandbox_port(sandbox.id, supervisor_port)
+            supervisor_port = sandbox.listen_port
         else:
-            # Legacy shared supervisor path
-            try:
-                current_url, _ = await _ensure_sandbox_alive(
-                    state.sandbox_id,
-                    sandbox_record,
-                    agent_type=state.agent_type,
-                )
-            except Exception as e:
-                log.warning(
-                    "session %s Daytona liveness refresh failed for %s: %s; forcing recovery",
-                    session_id,
-                    state.sandbox_id,
-                    e,
-                )
-                current_url = ""
-            client_base_url = str(getattr(state.client, "base_url", "")).rstrip("/")
-            if client_base_url == current_url.rstrip("/"):
-                return state
-        log.info(
-            "session %s has stale Daytona preview URL; forcing recovery",
-            session_id,
+            free_sandbox_port(sandbox.id, supervisor_port)
+            raise HTTPException(
+                500,
+                f"Sandbox {sandbox.id} (provider={vol.provider}) has no live "
+                f"instance and no listen_port recorded; cannot resolve supervisor URL",
+            )
+    else:
+        inst = ProviderInstance(
+            provider=vol.provider, url="",
+            root=root, sandbox_id=sandbox.sandbox_ref,
         )
+        try:
+            supervisor_url = await _providers_mod.ensure_supervisor_url(
+                vol.provider, inst,
+                agent_type=agent_type,
+                root=root,
+                spawn_env=effective_spawn_env,
+                port=supervisor_port,
+            )
+        except SandboxMissingError:
+            # Provider says the sandbox is gone (deleted out-of-band). Let the
+            # caller (ensure_session_live) re-provision a replacement rather
+            # than surfacing a 500.
+            free_sandbox_port(sandbox.id, supervisor_port)
+            raise
+        except Exception as exc:
+            free_sandbox_port(sandbox.id, supervisor_port)
+            raise HTTPException(500, f"Failed to start supervisor: {exc}") from exc
 
-    rec = await get_session(session_id)
-    if rec is None:
-        log.warning("session %s not found in DB", session_id)
-        raise HTTPException(status_code=404, detail="session not found")
+    client = AcpClient(supervisor_url)
+    acp_session_id = str(uuid.uuid4())
+    # cwd determines the hash under which Claude Code writes the session
+    # JSONL (~/.claude/projects/<hash>/<inner_sid>.jsonl). For session/load
+    # to find the same file on a replacement sandbox, cwd MUST match the
+    # one that was passed to session/new. The agent's stored config.cwd
+    # captures exactly that: it's what sessions_quick_create used at
+    # create-time (default_cwd_for_provider for the provider). HOME is
+    # always the sandbox's root regardless of cwd, so ``~/.claude/projects``
+    # still lands in a persistent location. Falling back to root (the
+    # sandbox HOME) breaks recovery for any agent whose original session
+    # was created with cwd != root — e.g. local provider where default cwd
+    # is /tmp.
+    cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
 
-    agent_id = rec.get("agent_id")
-    inner_session_id = rec.get("inner_session_id")
-    sandbox_id = rec.get("sandbox_id")
-    if not agent_id or not inner_session_id or not sandbox_id:
-        log.warning("session %s record incomplete: %s", session_id, rec)
-        raise HTTPException(status_code=404, detail="session record incomplete")
-
-    log.info(
-        "recovering session %s (sandbox=%s, inner=%s)",
-        session_id,
-        sandbox_id,
-        inner_session_id,
+    # Single source of truth for "get me an attached ACP session" — tries
+    # session/load when an inner_sid exists and only falls through to
+    # session/new when there's nothing to resume or when the load raised.
+    inner_sid, started_fresh = await asyncio.wait_for(
+        _attach_acp_session(
+            client, acp_session_id, agent_record,
+            inner_sid=session_row.get("inner_session_id"),
+            cwd=cwd,
+        ),
+        timeout=120,
     )
-    result = await _do_resume(
-        sandbox_id=sandbox_id,
-        agent_id=agent_id,
-        inner_session_id=inner_session_id,
-        client_session_id=session_id,
-        force_replace_live_state=state is not None and not state.shutdown.is_set(),
-        user_creds=user_creds,
+    if started_fresh and inner_sid:
+        await upsert_session(
+            session_id, agent_id, sandbox.id, inner_sid,
+            volume_id=session_row.get("volume_id"),
+        )
+
+    state = SessionState(
+        session_id=session_id, agent_id=agent_id, sandbox_id=sandbox.id,
+        acp_session_id=acp_session_id, inner_session_id=inner_sid,
+        agent_type=agent_type, client=client,
+        supervisor_url=supervisor_url, supervisor_port=supervisor_port,
     )
-
-    if isinstance(result, JSONResponse):
-        body = bytes(result.body).decode("utf-8", errors="replace")
-        log.error(
-            "session %s recovery failed: status=%d body=%s",
-            session_id,
-            result.status_code,
-            body[:500],
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"session recovery failed: {body[:200]}",
-        )
-
-    recovered = SESSIONS.get(session_id)
-    if recovered is None:
-        log.error(
-            "session %s recovery succeeded but SESSIONS lookup returned None",
-            session_id,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="session recovery failed: state missing after resume",
-        )
-
-    log.info("session %s recovered successfully", session_id)
-    return recovered
+    SESSIONS[session_id] = state
+    _start_session_tasks(state)
+    return state
 
 
-# ---------------------------------------------------------------------------
-# (sandbox proxy endpoints removed — use ACP tools inside a turn instead)
-# ---------------------------------------------------------------------------
+async def _tail_daytona_supervisor_log(
+    sandbox_ref: str, port: int | None, lines: int = 120
+) -> str:
+    """Best-effort: read the tail of the Daytona supervisor log via process.exec."""
+    if port is None:
+        return "(no supervisor port)"
+    from .providers.daytona import _get_daytona_client
+    loop = asyncio.get_running_loop()
+    client = _get_daytona_client()
+    sb = await loop.run_in_executor(None, lambda: client.get(sandbox_ref))
+    cmd = f"tail -n {lines} /tmp/sup-work-{port}/sup-{port}.log 2>&1 || echo '(no log)'"
+    r = await loop.run_in_executor(None, lambda: sb.process.exec(cmd, timeout=10))
+    return (r.result if hasattr(r, "result") else str(r)) or "(empty)"
+
+
+async def _recover_missing_sandbox(
+    session_id: str, stale: SandboxRecord
+) -> tuple[dict, SandboxRecord]:
+    """Clear stale sandbox state after the provider reports it's gone.
+
+    Called exactly once when ``ensure_runtime`` raises ``SandboxMissingError``
+    (i.e. Daytona says "sandbox not found" during supervisor spawn). Evicts
+    the in-memory caches, deletes the stale DB row, unlinks it from the
+    session, then re-reads and re-runs ``ensure_sandbox`` — which now takes
+    Case A in ``_ensure_sandbox_locked`` (``current_sandbox_id is None``) and
+    provisions a replacement on the same volume. Not a retry loop: one
+    recoverable failure, one recovery, one forward path.
+    """
+    log.warning(
+        "sandbox %s (ref=%s) missing on provider; provisioning replacement on same volume",
+        stale.id, stale.sandbox_ref,
+    )
+    SESSIONS.pop(session_id, None)
+    _INSTANCES.pop(stale.id, None)
+    try:
+        await delete_sandbox(stale.id)
+    except Exception as del_err:
+        log.warning("delete_sandbox(%s) failed: %s", stale.id, del_err)
+    await set_session_current_sandbox(session_id, None)
+    session = await _require_session_row(session_id)
+    sandbox = await ensure_sandbox(session)
+    return session, sandbox
+
+
+async def ensure_session_live(session_id: str) -> tuple[dict, SandboxRecord, SessionState]:
+    """One-shot: session → sandbox → runtime. Most endpoints use this.
+
+    Handles the one recoverable lifecycle event that callers shouldn't have to
+    know about: ``SandboxMissingError`` from ``ensure_runtime`` means the
+    provider lost the sandbox out-of-band (e.g. external ``daytona.delete()``).
+    We provision a replacement on the same volume and try the runtime build
+    once more — a second failure is fatal, since it means provisioning itself
+    is broken, not just the stale handle.
+    """
+    session = await _require_session_row(session_id)
+    sandbox = await ensure_sandbox(session)
+    try:
+        runtime = await ensure_runtime(session, sandbox)
+    except SandboxMissingError:
+        session, sandbox = await _recover_missing_sandbox(session_id, sandbox)
+        runtime = await ensure_runtime(session, sandbox)
+    return session, sandbox, runtime
+
 
 
 @app.get("/sessions")
@@ -1861,7 +2878,7 @@ async def list_sessions_route():
         {
             "session_id": s.session_id,
             "agent_id": s.agent_id,
-            "sandbox_id": s.sandbox_id,
+            "current_sandbox_id": s.sandbox_id,
             "idle_seconds": round(now - (s.turn_completed_at or s.last_activity), 1),
             "shutdown_requested": s.shutdown.is_set(),
         }
@@ -1869,18 +2886,37 @@ async def list_sessions_route():
     ]
 
 
+@app.get("/sessions/{session_id}")
+async def get_session_route(session_id: str):
+    """Return stored session metadata. Redacts secret values — only keys.
+
+    ``env`` is returned in full (non-sensitive). ``secrets`` is returned as
+    ``{"keys": [...]}`` (names only) so callers can confirm what's stored
+    without leaking values. Values are never serialized to clients.
+    """
+    rec = await _require_session_row(session_id)
+    env = rec.get("env") or {}
+    secrets = rec.get("secrets") or {}
+    return {
+        "session_id": rec.get("id"),
+        "agent_id": rec.get("agent_id"),
+        "volume_id": rec.get("volume_id"),
+        "current_sandbox_id": rec.get("current_sandbox_id"),
+        "inner_session_id": rec.get("inner_session_id"),
+        "env": env,
+        "secrets": {"keys": sorted(secrets.keys())},
+    }
+
+
 @app.get("/sessions/{session_id}/status")
 async def session_status(session_id: str):
     """Get session runtime status including last activity timestamp."""
-    try:
-        state = await get_or_recover_session(session_id)
-    except HTTPException as exc:
-        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+    _, _, state = await ensure_session_live(session_id)
     now = time.time()
     return {
         "session_id": state.session_id,
         "agent_id": state.agent_id,
-        "sandbox_id": state.sandbox_id,
+        "current_sandbox_id": state.sandbox_id,
         "inner_session_id": state.inner_session_id,
         "agent_busy": state.agent_busy,
         "active_rpc_id": state.active_rpc_id,
@@ -1926,7 +2962,7 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 
 
 # ---------------------------------------------------------------------------
-# Session endpoints (new — keyed by session_id, use get_or_recover_session)
+# Session endpoints (keyed by session_id, use ensure_session_live)
 # ---------------------------------------------------------------------------
 
 
@@ -1934,161 +2970,96 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 async def session_resume(session_id: str, request: Request):
     """Resume a session by ID. Auto-recovers sandbox if stopped.
 
-    The body may optionally carry ``oauth_token`` / ``api_key`` so the
-    respawned supervisor runs with the caller's Claude credentials.
+    Body may optionally carry ``env`` and ``secrets``:
+      - ``env``:     PATCH semantics (missing=keep stored, {}=wipe, {...}=replace).
+      - ``secrets``: same semantics — stored server-side (plaintext JSONB, see
+        SECRETS_PLAINTEXT note). Used for this respawn and future auto-recoveries.
     """
-    user_creds: dict[str, str] | None = None
+    body_env: dict[str, str] | None = None
+    body_secrets: dict[str, str] | None = None
     try:
         if request.headers.get("content-length", "0") != "0":
             body = await request.json()
             if isinstance(body, dict):
-                user_creds = _pop_user_creds(body)
+                body_env, body_secrets = _pop_env_and_secrets(body)
     except Exception:
-        user_creds = None
-    try:
-        state = await get_or_recover_session(session_id, user_creds=user_creds)
-    except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+        body_env = body_secrets = None
+
+    # Persist updated env/secrets if the caller sent those fields. Failures
+    # are logged but non-fatal — a read-only DB shouldn't block the resume.
+    for label, updater, value in (
+        ("env", update_session_env, body_env),
+        ("secrets", update_session_secrets, body_secrets),
+    ):
+        if value is None:
+            continue
+        try:
+            await updater(session_id, value)
+        except Exception as e:
+            log.warning("resume: update_session_%s failed for %s: %s", label, session_id, e)
+
+    # ensure_session_live reads spawn_env from the DB row (via _build_spawn_env_from_row),
+    # so the updated env/secrets persisted above are automatically picked up.
+    _, sandbox, state = await ensure_session_live(session_id)
     return {
         "session_id": state.session_id,
         "agent_id": state.agent_id,
+        # Same dual-key rationale as /sessions/quick: ``sandbox_id`` for the
+        # REST/client convention, ``current_sandbox_id`` to match the DB
+        # column + /sessions/{id} GET response shape.
         "sandbox_id": state.sandbox_id,
+        "current_sandbox_id": state.sandbox_id,
         "inner_session_id": state.inner_session_id,
         "status": "resumed",
     }
 
 
 @app.post("/sessions")
-async def sessions_create_on_existing_sandbox(request: Request):
-    """Create agent + new session on an existing sandbox (no new container).
+async def sessions_create(request: Request):
+    """Create a new session bound to a volume (lazy sandbox provisioning).
 
-    Body requires ``sandbox_id``; other fields match ``POST /sessions/quick``.
-    Returns the same shape as ``/sessions/quick``.
+    Body requires ``volume_id``; no sandbox is provisioned at this point.
+    Returns ``{id, agent_id, volume_id, current_sandbox_id: null, connected: false}``.
     """
-    data = await request.json()
-    # SECURITY: strip credentials before any merge, log, or DB write.
-    user_creds = _pop_user_creds(data)
-    sandbox_id = data.get("sandbox_id")
-    if not sandbox_id or not isinstance(sandbox_id, str):
-        return JSONResponse(
-            {"error": "sandbox_id is required"}, status_code=400
-        )
+    data = await _json_body(request)
+    # SECURITY: strip env/secrets first so they can't leak into agents.config.
+    body_env, body_secrets = _pop_env_and_secrets(data)
 
-    sandbox_record = await get_sandbox(sandbox_id)
-    if sandbox_record is None:
-        return JSONResponse({"error": "sandbox not found"}, status_code=404)
-
-    agent_type = data.get("agent_type", "claude")
-    name = data.get("name")
+    default_provider = data.get("provider") or data.get("config", {}).get("provider") or "local"
+    volume_record = await _resolve_or_default_volume(data.get("volume_id"), default_provider)
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
-    dockerfile = _materialize_dockerfile(config_data)
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
+    # Default cwd lands on the volume mount (persistent), not /tmp — so
+    # the agent's ~/ and working-dir files survive sandbox restart/replace.
+    cwd = config_data.get("cwd", data.get("cwd", default_cwd_for_provider(default_provider)))
 
-    agent_id = str(uuid.uuid4())
-    config = AgentConfig.from_dict(
-        {**config_data, "agent_type": agent_type, "cwd": cwd}
-    )
-    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
-
-    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    if skill_cmds and sandbox_record.provider == "local":
-        try:
-            await _install_skills_locally(config.skills)
-        except Exception as e:
-            log.error("skill install failed, continuing without skills: %s", e)
-
-    # For Daytona: start a per-session supervisor on a unique port
-    # For local/docker: use the existing shared supervisor
-    root = config_data.get("root", data.get("root", cwd))
-    supervisor_url = None
-    supervisor_port = None
-
-    if sandbox_record.provider == "daytona":
-        try:
-            # Get sandbox object to start supervisor inside it
-            from daytona_sdk import Daytona, DaytonaConfig
-            api_key = os.environ.get("DAYTONA_API_KEY")
-            if not api_key:
-                raise RuntimeError("DAYTONA_API_KEY not set")
-            loop = asyncio.get_running_loop()
-            daytona_client = Daytona(DaytonaConfig(api_key=api_key))
-            sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(sandbox_id))
-
-            # Ensure sandbox is running
-            raw_state = sandbox.state
-            state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
-            if state_str != "started":
-                await loop.run_in_executor(None, sandbox.start)
-
-            supervisor_port = allocate_sandbox_port(sandbox_id)
-            supervisor_url = await start_supervisor_in_sandbox(
-                sandbox, config.agent_type or "claude", supervisor_port, root=root,
-                user_creds=user_creds,
-            )
-            url = supervisor_url
-        except Exception as e:
-            await delete_agent(agent_id)
-            if supervisor_port is not None:
-                free_sandbox_port(sandbox_id, supervisor_port)
-            return JSONResponse({"error": f"Failed to start supervisor: {e}"}, status_code=502)
+    agent_id = data.get("agent_id")
+    if agent_id:
+        await _require_agent(agent_id)
     else:
-        try:
-            url, _replaced = await _ensure_sandbox_alive(
-                sandbox_id,
-                sandbox_record,
-                agent_type=config.agent_type or "claude",
-                dockerfile=dockerfile,
-            )
-        except RuntimeError as e:
-            await delete_agent(agent_id)
-            return JSONResponse({"error": str(e)}, status_code=502)
+        agent_id = str(uuid.uuid4())
+        await upsert_agent(AgentRecord(
+            id=agent_id, name=data.get("name"),
+            config=AgentConfig.from_dict(
+                {**config_data, "agent_type": data.get("agent_type", "claude"), "cwd": cwd}
+            ),
+        ))
 
-    acp_session_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
-
-    client = AcpClient(url)
-    try:
-        await _apply_config_and_initialize(
-            client,
-            config,
-            acp_session_id,
-            cwd,
-        )
-    except Exception as e:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        await delete_agent(agent_id)
-        if supervisor_port is not None:
-            free_sandbox_port(sandbox_id, supervisor_port)
-        return JSONResponse(
-            {"error": f"Failed to connect to ACP supervisor: {e}"}, status_code=502
-        )
-
-    inner_session_id = client.get_inner_session_id(acp_session_id)
-    state = SessionState(
-        session_id=session_id,
-        agent_id=agent_id,
-        sandbox_id=sandbox_id,
-        acp_session_id=acp_session_id,
-        inner_session_id=inner_session_id,
-        agent_type=config.agent_type or "claude",
-        client=client,
-        supervisor_url=supervisor_url,
-        supervisor_port=supervisor_port,
+    # Lazy mode: no sandbox provisioning here. current_sandbox_id = None.
+    await upsert_session(
+        session_id, agent_id, sandbox_id=None, inner_session_id=None,
+        volume_id=volume_record.id,
+        env=body_env or {}, secrets=body_secrets or {},
     )
-    SESSIONS[session_id] = state
-    _start_session_tasks(state)
-    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
 
     return {
+        "id": session_id,
         "agent_id": agent_id,
-        "sandbox_id": sandbox_id,
-        "session_id": session_id,
-        "inner_session_id": inner_session_id,
-        "connected": True,
+        "volume_id": volume_record.id,
+        "current_sandbox_id": None,
+        "connected": False,
     }
 
 
@@ -2096,124 +3067,150 @@ async def sessions_create_on_existing_sandbox(request: Request):
 async def sessions_quick_create(request: Request):
     """Create agent + provision sandbox + connect in one call.
 
+    Body requires ``volume_id``.
     Returns {agent_id, sandbox_id, session_id, connected: true}.
     """
-    data = await request.json()
-    # SECURITY: strip credentials from the request body before any merge,
-    # log, or DB write so they can't leak into agents.config JSONB.
-    user_creds = _pop_user_creds(data)
+    data = await _json_body(request)
+    # SECURITY: strip env/secrets first so they can't leak into agents.config.
+    body_env, body_secrets = _pop_env_and_secrets(data)
+
     provider = data.get("provider", "local")
+    volume_record = await _resolve_or_default_volume(data.get("volume_id"), provider)
+    volume_id = volume_record.id
     agent_type = data.get("agent_type", "claude")
-    name = data.get("name")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    cwd = config_data.get("cwd", data.get("cwd", "/tmp"))
+    _forbid_auth_keys_in_env(config_data.get("env"), "config.env")
+    # Default cwd lands on the volume mount (persistent), not /tmp — so
+    # the agent's ~/ and working-dir files survive sandbox restart/replace.
+    cwd = config_data.get("cwd", data.get("cwd", default_cwd_for_provider(provider)))
     root = config_data.get("root", data.get("root", cwd))
     dockerfile = _materialize_dockerfile(config_data)
 
     agent_id = str(uuid.uuid4())
-    config = AgentConfig.from_dict(
-        {**config_data, "agent_type": agent_type, "cwd": cwd}
-    )
-    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
+    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type, "cwd": cwd})
+    await upsert_agent(AgentRecord(id=agent_id, name=data.get("name"), config=config))
+
+    session_env = body_env or {}
+    session_secrets = body_secrets or {}
+    spawn_env = _merge_env(config.env, session_env, session_secrets)
 
     # Install skills BEFORE starting the supervisor — claude-agent-acp
-    # discovers skills at process startup, not at session creation time.
-    # For local: install on host before spawning the supervisor.
-    # For docker/daytona: pass install commands to run inside the sandbox
-    # before the supervisor process starts.
+    # discovers skills at process startup. For local: install on host.
+    # For docker/daytona: run install commands inside the sandbox before start.
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     if skill_cmds and provider == "local":
         try:
             await _install_skills_locally(config.skills)
         except Exception as e:
             log.error("skill install failed, continuing without skills: %s", e)
-            skill_cmds = []  # don't pass to create_instance
+            skill_cmds = []
 
     sandbox_id = str(uuid.uuid4())
+    subpath = f"agents/{agent_id}/home"
+
+    # Install supervisor on the volume before spawning the sandbox.
+    # Docker/Local need supervisor.js + node_modules under the volume at create
+    # time. Idempotent fast-path on cache hit.
+    try:
+        await ensure_volume_supervisor(volume_id, agent_type)
+    except Exception as e:
+        await delete_agent(agent_id)
+        log.error("sessions_quick_create: ensure_volume_supervisor failed: %s", e, exc_info=True)
+        raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
+
     try:
         instance = await create_instance(
-            provider,
-            agent_type,
-            dockerfile=dockerfile,
+            provider, agent_type, dockerfile=dockerfile,
             pre_start_commands=skill_cmds if provider != "local" else None,
-            root=root,
-            user_creds=user_creds,
+            root=root, spawn_env=spawn_env,
+            volume_id=volume_record.provider_ref, subpath=subpath,
+            sandbox_id=sandbox_id,
         )
     except Exception as e:
         await delete_agent(agent_id)
-        # Return 503 with Retry-After for circuit-breaker trips so callers
-        # know to back off instead of retrying immediately.
+        log.error("sessions_quick_create: create_instance failed (provider=%s): %s", provider, e, exc_info=True)
+        # 503 + Retry-After tells callers to back off on circuit-breaker trips.
         if "circuit breaker" in str(e).lower():
-            return JSONResponse(
-                {"error": str(e)},
-                status_code=503,
-                headers={"Retry-After": "30"},
-            )
-        return JSONResponse(
-            {"error": f"Provider '{provider}' failed: {e}"}, status_code=502
-        )
-
-    sandbox_ref = _derive_sandbox_ref(instance, provider, sandbox_id)
+            raise HTTPException(503, str(e), headers={"Retry-After": "30"})
+        raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
     _INSTANCES[sandbox_id] = instance
-    await upsert_sandbox(
-        SandboxRecord(
-            id=sandbox_id,
-            provider=provider,
-            sandbox_ref=sandbox_ref,
-            status=STATUS_RUNNING,
-            root=root,
-        )
-    )
+    await upsert_sandbox(_sandbox_record(
+        sandbox_id, provider, instance,
+        volume_id=volume_id, subpath=subpath, root_fallback=root,
+    ))
 
-    url = instance.url
-    acp_session_id = str(uuid.uuid4())
-    session_id = str(uuid.uuid4())
-
-    client = AcpClient(url)
-    try:
-        await _apply_config_and_initialize(
-            client,
-            config,
-            acp_session_id,
-            cwd,
-        )
-    except Exception as e:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+    async def _cleanup_and_raise(msg_fmt: str, e: Exception) -> None:
+        """Shared teardown for post-upsert failures in /sessions/quick."""
         await delete_agent(agent_id)
         await delete_sandbox(sandbox_id)
         _INSTANCES.pop(sandbox_id, None)
         try:
             await destroy_instance(instance)
         except Exception as de:
-            log.warning(
-                "sessions_quick_create cleanup: destroy_instance failed: %s", de
-            )
-        return JSONResponse(
-            {"error": f"Failed to connect to ACP supervisor: {e}"}, status_code=502
-        )
+            log.warning("sessions_quick_create cleanup: destroy_instance failed: %s", de)
+        raise HTTPException(502, msg_fmt.format(e=e))
 
-    inner_session_id = client.get_inner_session_id(acp_session_id)
+    # For Daytona, create_instance returns url="" (supervisor started lazily);
+    # fill it in now so AcpClient has a real endpoint. Docker/Local already
+    # started the supervisor inside create_sandbox.
+    url = instance.url
+    if not url:
+        supervisor_port = allocate_sandbox_port(sandbox_id)
+        try:
+            url = await _providers_mod.ensure_supervisor_url(
+                provider, instance,
+                agent_type=agent_type, root=instance.root or root,
+                spawn_env=spawn_env, port=supervisor_port,
+            )
+        except Exception as e:
+            free_sandbox_port(sandbox_id, supervisor_port)
+            await _cleanup_and_raise("Failed to start supervisor: {e}", e)
+    else:
+        supervisor_port = instance.port
+
+    acp_session_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    client = AcpClient(url)
+    # Brand-new session → inner_sid=None, so _attach_acp_session goes
+    # straight to session/new. Routing through the shared helper keeps
+    # sessions_quick_create / _ensure_runtime_locked / SSE-reader recovery
+    # all using a single attach path, so the invariant "session/load first
+    # when we have an inner_sid" can't accidentally get skipped here later.
+    synthetic_agent = AgentRecord(id=agent_id, name=data.get("name"), config=config)
+    try:
+        inner_session_id, _ = await _attach_acp_session(
+            client, acp_session_id, synthetic_agent,
+            inner_sid=None, cwd=cwd,
+        )
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        await _cleanup_and_raise("Failed to connect to ACP supervisor: {e}", e)
     state = SessionState(
-        session_id=session_id,
-        agent_id=agent_id,
-        sandbox_id=sandbox_id,
-        acp_session_id=acp_session_id,
-        inner_session_id=inner_session_id,
+        session_id=session_id, agent_id=agent_id, sandbox_id=sandbox_id,
+        acp_session_id=acp_session_id, inner_session_id=inner_session_id,
         agent_type=config.agent_type or "claude",
         client=client,
+        supervisor_url=url, supervisor_port=supervisor_port,
     )
     SESSIONS[session_id] = state
     _start_session_tasks(state)
-    await upsert_session(session_id, agent_id, sandbox_id, inner_session_id)
+    await upsert_session(
+        session_id, agent_id, sandbox_id, inner_session_id,
+        volume_id=volume_id,
+        env=session_env, secrets=session_secrets,
+    )
 
+    # Dual-key response: ``sandbox_id`` matches /sandboxes + client code;
+    # ``current_sandbox_id`` matches the DB column + /sessions/{id} GET.
     return {
         "agent_id": agent_id,
         "sandbox_id": sandbox_id,
+        "current_sandbox_id": sandbox_id,
         "session_id": session_id,
         "inner_session_id": inner_session_id,
         "connected": True,
@@ -2263,95 +3260,73 @@ async def _scheduler_loop(state: SessionState) -> None:
         log.exception("scheduler loop died for session %s", state.session_id)
 
 
+def _classify_prompt_error(e: Exception, body: str) -> str:
+    """Categorize a prompt failure for the error payload's ``kind`` field."""
+    if isinstance(e, httpx.HTTPStatusError):
+        if e.response.status_code == 500:
+            if "agent process exited" in body or "start a new session" in body:
+                return "sandbox_process_died"
+            return "sandbox_internal_error"
+        return "http_error"
+    if isinstance(e, httpx.ConnectError):
+        return "sandbox_unreachable"
+    if isinstance(e, httpx.ReadTimeout):
+        return "timeout"
+    return "unknown"
+
+
 async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) -> None:
     """Execute a single prompt HTTP round-trip. Called only from the scheduler loop."""
     session_id = state.session_id
     await log_event(
-        session_id=session_id,
-        agent_id=state.agent_id,
-        sandbox_id=state.sandbox_id,
-        event_type=EVT_USER_MESSAGE,
-        payload={"text": message, "prompt_id": rpc_id},
+        session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
+        event_type=EVT_USER_MESSAGE, payload={"text": message, "prompt_id": rpc_id},
     )
     try:
         await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
+        return
     except Exception as e:
+        err = e
         tb = traceback.format_exc()
         log.exception("prompt failed for session %s", session_id)
 
-        body = ""
-        http_status: int | None = None
-        if isinstance(e, httpx.HTTPStatusError):
-            http_status = e.response.status_code
-            try:
-                body = e.response.text[:1000]
-            except Exception:
-                pass
+    body = ""
+    http_status: int | None = None
+    if isinstance(err, httpx.HTTPStatusError):
+        http_status = err.response.status_code
+        try:
+            body = err.response.text[:1000]
+        except Exception:
+            pass
+    kind = _classify_prompt_error(err, body)
+    summary = f"{type(err).__name__}: {err}" + (f" | {body}" if body else "")
 
-        if (
-            isinstance(e, httpx.HTTPStatusError)
-            and http_status == 500
-            and ("agent process exited" in body or "start a new session" in body)
-        ):
-            kind = "sandbox_process_died"
-        elif isinstance(e, httpx.HTTPStatusError) and http_status == 500:
-            kind = "sandbox_internal_error"
-        elif isinstance(e, httpx.HTTPStatusError):
-            kind = "http_error"
-        elif isinstance(e, httpx.ConnectError):
-            kind = "sandbox_unreachable"
-        elif isinstance(e, httpx.ReadTimeout):
-            kind = "timeout"
-        else:
-            kind = "unknown"
+    state.errors.append({
+        "ts": time.time(), "rpc_id": rpc_id, "kind": kind,
+        "error": summary, "traceback": tb,
+    })
+    _mark_turn_finished(state)
 
-        summary = f"{type(e).__name__}: {e}"
-        if body:
-            summary += f" | {body}"
-
-        state.errors.append(
-            {
-                "ts": time.time(),
-                "rpc_id": rpc_id,
-                "kind": kind,
-                "error": summary,
-                "traceback": tb,
-            }
-        )
-        _mark_turn_finished(state)
-
-        error_payload = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "error": {
-                    "code": -32000,
-                    "message": summary[:500],
-                    "data": {
-                        "kind": kind,
-                        "exception_type": type(e).__name__,
-                        "http_status": http_status,
-                        "upstream_body": body,
-                        "rpc_id": rpc_id,
-                    },
-                },
-            }
-        )
-        if not state.shutdown.is_set():
-            state.dispatch(rpc_id, (rpc_id, f"data: {error_payload}\n\n"))
-
-        await log_event(
-            session_id=session_id,
-            agent_id=state.agent_id,
-            sandbox_id=state.sandbox_id,
-            event_type=EVT_ERROR,
-            payload={
-                "message": summary[:1000],
-                "kind": kind,
-                "traceback": tb[:5000],
+    error_payload = json.dumps({
+        "jsonrpc": "2.0", "id": rpc_id,
+        "error": {
+            "code": -32000, "message": summary[:500],
+            "data": {
+                "kind": kind, "exception_type": type(err).__name__,
+                "http_status": http_status, "upstream_body": body,
                 "rpc_id": rpc_id,
             },
-        )
+        },
+    })
+    if not state.shutdown.is_set():
+        state.dispatch(rpc_id, (rpc_id, f"data: {error_payload}\n\n"))
+
+    await log_event(
+        session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
+        event_type=EVT_ERROR,
+        payload={"message": summary[:1000], "kind": kind,
+                 "traceback": tb[:5000], "rpc_id": rpc_id},
+    )
 
 
 def _submit_prompt(state: SessionState, rpc_id: str, message: str) -> None:
@@ -2380,20 +3355,14 @@ async def post_session_message(session_id: str, request: Request):
     Pass ``interrupt: true`` to cancel the running prompt and wait for it
     to reach a terminal state before the new prompt starts.
     """
-    data = await request.json()
+    data = await _json_body(request)
     message = data.get("message")
     if not message:
-        return JSONResponse({"error": "message required"}, status_code=400)
+        raise HTTPException(400, "message required")
 
     interrupt = data.get("interrupt", False)
 
-    try:
-        state = await get_or_recover_session(session_id)
-    except HTTPException as exc:
-        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
-
-    if not state.client or not state.acp_session_id:
-        return JSONResponse({"error": "session not connected"}, status_code=409)
+    _, _, state = await ensure_session_live(session_id)
 
     if interrupt and state.agent_busy:
         await _cancel_and_drain(state)
@@ -2412,20 +3381,13 @@ async def post_session_message(session_id: str, request: Request):
     state.last_activity = time.time()
     rpc_id = str(uuid.uuid4())
     _submit_prompt(state, rpc_id, message)
-    return JSONResponse({"rpc_id": rpc_id, "status": "ok"})
+    return {"rpc_id": rpc_id, "status": "ok"}
 
 
 @app.get("/sessions/{session_id}/events")
 async def session_events(session_id: str):
     """SSE stream for a session. Recovers reaped sessions automatically."""
-    try:
-        state = await get_or_recover_session(session_id)
-    except HTTPException as exc:
-        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
-
-    if not state.client or not state.acp_session_id:
-        return JSONResponse({"error": "session not connected"}, status_code=409)
-
+    _, _, state = await ensure_session_live(session_id)
     shutdown = state.shutdown
 
     async def _proxy_stream():
@@ -2442,20 +3404,25 @@ async def session_events(session_id: str):
         my_q = state.subscribe_session()
 
         async def _heartbeat_loop():
+            # Per-connection heartbeat: put None directly on THIS subscriber's
+            # queue instead of ``state.broadcast(None)`` (which was O(N^2) across
+            # subscribers). Skip if the consumer is backlogged — real events in
+            # the queue are already keeping the connection warm.
             try:
                 hb_count = 0
                 while True:
                     await asyncio.sleep(heartbeat_interval)
-                    state.broadcast(None)  # heartbeat to all subscribers
+                    try:
+                        my_q.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
                     hb_count += 1
                     if hb_count % 4 == 0:  # log every ~2 min
-                        log.debug(
-                            "[HEARTBEAT] session %s: sent %d heartbeats, "
-                            "busy=%s, subs=%d, reader=%s",
-                            state.session_id[:8], hb_count,
-                            state.agent_busy, len(state._session_subscribers),
-                            state._reader_alive,
-                        )
+                        log.debug("[HEARTBEAT] session %s: sent %d heartbeats, "
+                                  "busy=%s, subs=%d, reader=%s",
+                                  state.session_id[:8], hb_count,
+                                  state.agent_busy, len(state._session_subscribers),
+                                  state._reader_alive)
             except asyncio.CancelledError:
                 pass
 
@@ -2497,13 +3464,7 @@ async def session_events(session_id: str):
 @app.post("/sessions/{session_id}/cancel")
 async def session_cancel(session_id: str):
     """Cancel the active prompt and wait for it to finish."""
-    try:
-        state = await get_or_recover_session(session_id)
-    except HTTPException as exc:
-        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
-
-    if not state.acp_session_id:
-        return JSONResponse({"error": "no active session"}, status_code=409)
+    _, _, state = await ensure_session_live(session_id)
     if not state.agent_busy:
         return {"status": "ok", "detail": "not busy"}
 
@@ -2512,22 +3473,70 @@ async def session_cancel(session_id: str):
         await asyncio.wait_for(state._prompt_done.wait(), timeout=_CANCEL_DRAIN_TIMEOUT)
     except asyncio.TimeoutError:
         log.warning("session_cancel: timed out waiting for rpc %s", state.active_rpc_id)
-        return JSONResponse({"error": "cancel timed out"}, status_code=504)
+        raise HTTPException(504, "cancel timed out")
     return {"status": "ok"}
+
+
+@app.post("/sessions/{session_id}/start-sandbox")
+async def start_session_sandbox(session_id: str):
+    """Eagerly provision a sandbox for a session (pre-warm). Idempotent."""
+    _, sandbox, _ = await ensure_session_live(session_id)
+    return {"sandbox_id": sandbox.id}
+
+
+@app.post("/sessions/{session_id}/stop-sandbox", status_code=204)
+async def stop_session_sandbox(session_id: str):
+    """Kill the current sandbox. Next /message lazy-provisions a fresh one."""
+    sess = await _require_session_row(session_id)
+    sbid = sess.get("current_sandbox_id")
+    if sbid is None:
+        return  # 204, no-op — already stopped
+    sb = await get_sandbox(sbid)
+    if sb:
+        # Snapshot the workspace before destroy so the next sandbox can
+        # restore conversation state + session JSONLs + installed deps.
+        # Best-effort: snapshot_supervisor swallows its own errors; a
+        # failure here must not pin the sandbox alive.
+        try:
+            await snapshot_supervisor(sb)
+        except Exception as e:
+            log.warning(
+                "stop_session_sandbox: snapshot failed for %s: %s; "
+                "proceeding to destroy", sb.id, e,
+            )
+        inst = ProviderInstance(
+            provider=sb.provider, url="",
+            root=sb.root, sandbox_id=sb.sandbox_ref,
+        )
+        try:
+            await _providers_mod.destroy_sandbox(sb.provider, inst)
+        except Exception:
+            pass  # best-effort
+    await set_session_current_sandbox(session_id, None)
+    await delete_sandbox(sbid)
+
+
+@app.post("/sessions/{session_id}/reset-sandbox")
+async def reset_session_sandbox(session_id: str):
+    """Kill current sandbox and provision a fresh one."""
+    sess = await _require_session_row(session_id)
+    old_sbid = sess.get("current_sandbox_id")
+    await stop_session_sandbox(session_id)
+    # Re-read the row after stop (current_sandbox_id is now NULL), then provision
+    # a replacement.  Call _provision_new directly (inside the session lock) so
+    # the previous_id is passed through and the sandbox_reattach event is emitted.
+    fresh_sess = await _require_session_row(session_id)
+    async with _get_session_lock(session_id):
+        sandbox = await _provision_new(fresh_sess, previous_id=old_sbid)
+    return {"sandbox_id": sandbox.id}
 
 
 @app.post("/sessions/{session_id}/config")
 async def session_set_config(session_id: str, request: Request):
     """Set mode/model/thought_level for a session."""
+    data = await _json_body(request)
+    _, _, state = await ensure_session_live(session_id)
     try:
-        state = await get_or_recover_session(session_id)
-    except HTTPException as exc:
-        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
-
-    if not state.acp_session_id:
-        return JSONResponse({"error": "no active session"}, status_code=409)
-    try:
-        data = await request.json()
         if "mode" in data:
             await state.client.set_mode(state.acp_session_id, data["mode"])
         if "model" in data:
@@ -2538,7 +3547,7 @@ async def session_set_config(session_id: str, request: Request):
             )
         return {"status": "ok"}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
+        raise HTTPException(502, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2553,37 +3562,21 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
     because all agent types share the same supervisor.js — only the ACP binary
     differs, and file browsing doesn't need ACP at all.
     """
+    # Fast path: cached port-based instance is live as-is. Daytona preview
+    # URLs can expire while the in-memory instance stays cached, so those
+    # fall through to the liveness check below.
     instance = _INSTANCES.get(sandbox_id)
-    sandbox_record = None
-    if instance:
-        if instance.provider in PORT_BASED_PROVIDERS:
-            return instance
-        # Daytona preview URLs can expire while the in-memory instance stays
-        # cached. Refresh through the normal liveness path before tree/read.
-        sandbox_record = await get_sandbox(sandbox_id)
-        if not sandbox_record:
-            raise HTTPException(status_code=404, detail="sandbox not found")
-        try:
-            await _ensure_sandbox_alive(sandbox_id, sandbox_record)
-            instance = _INSTANCES.get(sandbox_id)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"failed to start sandbox: {e}")
-        if not instance:
-            raise HTTPException(status_code=409, detail="sandbox not running")
+    if instance and instance.provider in PORT_BASED_PROVIDERS:
         return instance
 
-    if sandbox_record is None:
-        sandbox_record = await get_sandbox(sandbox_id)
-    if not sandbox_record:
-        raise HTTPException(status_code=404, detail="sandbox not found")
+    sandbox_record = await _require_sandbox(sandbox_id)
     try:
         await _ensure_sandbox_alive(sandbox_id, sandbox_record)
-        instance = _INSTANCES.get(sandbox_id)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"failed to start sandbox: {e}")
-
+        raise HTTPException(502, f"failed to start sandbox: {e}")
+    instance = _INSTANCES.get(sandbox_id)
     if not instance:
-        raise HTTPException(status_code=409, detail="sandbox not running")
+        raise HTTPException(409, "sandbox not running")
     return instance
 
 
@@ -2602,50 +3595,28 @@ async def session_sandbox_exec(session_id: str, request: Request):
     Auto-recovers: if the sandbox was reaped or stopped, restarts it
     before executing. Does not require an active ACP session.
     """
-    data = await request.json()
+    data = await _json_body(request)
     command = data.get("command")
     if not command:
-        return JSONResponse({"error": "command required"}, status_code=400)
+        raise HTTPException(400, "command required")
     timeout = min(data.get("timeout", 30), 300)
 
-    # Resolve sandbox_id from in-memory session or DB
-    state = SESSIONS.get(session_id)
-    if state:
-        sandbox_id = state.sandbox_id
-    else:
-        session_row = await get_session(session_id)
-        if not session_row:
-            return JSONResponse({"error": "session not found"}, status_code=404)
-        sandbox_id = session_row["sandbox_id"]
+    _, sandbox, _ = await ensure_session_live(session_id)
 
-    instance = _INSTANCES.get(sandbox_id)
-
-    # Auto-start if sandbox is not running
-    if not instance:
-        sandbox_record = await get_sandbox(sandbox_id)
-        if not sandbox_record:
-            return JSONResponse({"error": "sandbox not found"}, status_code=404)
-        agent_type = "claude"
-        if state:
-            agent_type = state.agent_type
-        try:
-            await _ensure_sandbox_alive(
-                sandbox_id, sandbox_record, agent_type=agent_type
-            )
-            instance = _INSTANCES.get(sandbox_id)
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"failed to start sandbox: {e}"}, status_code=502
-            )
-
-    if not instance:
-        return JSONResponse({"error": "sandbox not running"}, status_code=409)
+    # Build a ProviderInstance from the SandboxRecord for exec.
+    # exec_in_instance only needs provider + sandbox_id (=sandbox_ref) for Daytona.
+    instance = ProviderInstance(
+        provider=sandbox.provider,
+        url="",
+        root=sandbox.root,
+        sandbox_id=sandbox.sandbox_ref,
+    )
 
     try:
         result = await exec_in_instance(instance, command, timeout=timeout)
         return result.to_dict()
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
+        raise HTTPException(502, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2653,17 +3624,23 @@ async def session_sandbox_exec(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/sandboxes/{sandbox_id}/files/tree")
-async def sandbox_files_tree(sandbox_id: str):
-    """Return the recursive directory tree of the sandbox filesystem.
+async def _proxy_to_supervisor(
+    sandbox_id: str, method: str, path: str, *,
+    params: dict | None = None, json: dict | None = None,
+    timeout: int = 30,
+) -> Response:
+    """Forward a request to the sandbox's supervisor and return its JSON response.
 
-    Browses the supervisor's configured --root (the sandbox root).
-    The root is not caller-controlled — the supervisor owns that decision.
+    Shared by every ``/sandboxes/{id}/files/*`` endpoint that returns JSON.
+    For binary responses (see ``files/download``) the header-forwarding case is
+    handled inline since it's unique.
     """
     instance = await _resolve_sandbox_instance(sandbox_id)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f"{instance.url}/v1/files/tree")
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.request(
+                method, f"{instance.url}{path}", params=params, json=json,
+            )
             return Response(
                 content=r.content,
                 status_code=r.status_code,
@@ -2671,98 +3648,65 @@ async def sandbox_files_tree(sandbox_id: str):
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+@app.get("/sandboxes/{sandbox_id}/files/tree")
+async def sandbox_files_tree(sandbox_id: str):
+    """Return the recursive directory tree of the sandbox root."""
+    return await _proxy_to_supervisor(sandbox_id, "GET", "/v1/files/tree")
 
 
 @app.get("/sandboxes/{sandbox_id}/files/read")
 async def sandbox_files_read(sandbox_id: str, path: str):
-    """Read a single file from the sandbox filesystem.
-
-    The `path` is relative to the sandbox root. The supervisor
-    enforces path traversal protection — callers cannot escape the root.
-    """
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(
-                f"{instance.url}/v1/files/read",
-                params={"path": path},
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Read a single file. Supervisor enforces path-traversal protection."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "GET", "/v1/files/read", params={"path": path},
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/edit")
 async def sandbox_files_edit(sandbox_id: str, request: Request):
-    """Edit or create a file in the sandbox filesystem.
+    """Edit or create a file.
 
-    Body: {"path": "relative/path", "old_string": "...", "new_string": "...", "replace_all": false}
-    When old_string is empty, writes/creates the file with new_string as content.
-    The supervisor enforces path traversal protection.
+    Body: ``{"path": ..., "old_string": ..., "new_string": ..., "replace_all": bool}``.
+    When ``old_string`` is empty, writes/creates the file with ``new_string`` as content.
     """
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                f"{instance.url}/v1/files/edit",
-                json=body,
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/edit",
+        json=await _json_body(request),
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/upload")
 async def sandbox_files_upload(sandbox_id: str, request: Request):
-    """Upload a file to the sandbox. Body: {"path": "...", "content": "<base64>"}"""
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(f"{instance.url}/v1/files/upload", json=body)
-            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/upload",
+        json=await _json_body(request), timeout=60,
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/delete")
 async def sandbox_files_delete(sandbox_id: str, request: Request):
-    """Delete a file or directory. Body: {"path": "..."}"""
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{instance.url}/v1/files/delete", json=body)
-            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Delete a file or directory. Body: ``{"path": ...}``."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/delete",
+        json=await _json_body(request),
+    )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/rename")
 async def sandbox_files_rename(sandbox_id: str, request: Request):
-    """Rename/move a file or directory. Body: {"path": "...", "new_path": "..."}"""
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    body = await request.json()
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{instance.url}/v1/files/rename", json=body)
-            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
+    return await _proxy_to_supervisor(
+        sandbox_id, "POST", "/v1/files/rename",
+        json=await _json_body(request),
+    )
 
 
 @app.get("/sandboxes/{sandbox_id}/files/download")
 async def sandbox_files_download(sandbox_id: str, path: str):
-    """Download a file as raw bytes."""
+    """Download a file as raw bytes (forwards content-type + disposition)."""
     instance = await _resolve_sandbox_instance(sandbox_id)
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -2782,41 +3726,39 @@ async def sandbox_files_download(sandbox_id: str, path: str):
 # ---------------------------------------------------------------------------
 
 _UI_DIR = Path(__file__).parents[2] / "ui"
-_UI_HTML: str | None = None
-_FS_HTML: str | None = None
+_UI_CACHE: dict[str, str] = {}
+
+
+def _serve_ui_file(filename: str, label: str) -> Response:
+    cached = _UI_CACHE.get(filename)
+    if cached is None:
+        try:
+            cached = (_UI_DIR / filename).read_text()
+        except FileNotFoundError:
+            return PlainTextResponse(f"{label} not found", status_code=404)
+        _UI_CACHE[filename] = cached
+    return Response(content=cached, media_type="text/html")
 
 
 @app.get("/ui")
 async def serve_ui():
     """Serve the chat UI."""
-    global _UI_HTML
-    if _UI_HTML is None:
-        try:
-            _UI_HTML = (_UI_DIR / "index.html").read_text()
-        except FileNotFoundError:
-            return PlainTextResponse("UI not found", status_code=404)
-    return Response(content=_UI_HTML, media_type="text/html")
+    return _serve_ui_file("index.html", "UI")
 
 
 @app.get("/ui/dashboard")
 async def serve_dashboard():
     """Serve the validation dashboard."""
-    try:
-        return Response(
-            content=(Path(__file__).parents[2] / "ui" / "dashboard.html").read_text(),
-            media_type="text/html",
-        )
-    except FileNotFoundError:
-        return PlainTextResponse("Dashboard not found", status_code=404)
+    return _serve_ui_file("dashboard.html", "Dashboard")
 
 
 @app.get("/ui/files")
 async def serve_files_ui():
     """Serve the filesystem browser UI."""
-    global _FS_HTML
-    if _FS_HTML is None:
-        try:
-            _FS_HTML = (_UI_DIR / "fs.html").read_text()
-        except FileNotFoundError:
-            return PlainTextResponse("Files UI not found", status_code=404)
-    return Response(content=_FS_HTML, media_type="text/html")
+    return _serve_ui_file("fs.html", "Files UI")
+
+
+@app.get("/ui/volumes")
+async def serve_volumes_ui():
+    """Serve the Volume Inspector UI."""
+    return _serve_ui_file("volumes.html", "Volumes UI")

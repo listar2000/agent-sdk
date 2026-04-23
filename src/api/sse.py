@@ -9,10 +9,8 @@ import httpx
 # ACP session update type constants
 UT_MESSAGE_DELTA = "agent_message_delta"
 UT_MESSAGE_CHUNK = "agent_message_chunk"
-UT_MESSAGE_CREATED = "agent_message_created"
 UT_THOUGHT_CHUNK = "agent_thought_chunk"
 UT_TOOL_STARTED = "execute_tool_started"
-UT_TOOL_COMPLETED = "execute_tool_completed"
 UT_TOOL_CALL = "tool_call"
 UT_TOOL_CALL_UPDATE = "tool_call_update"
 UT_USAGE_UPDATED = "usage_updated"

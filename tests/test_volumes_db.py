@@ -1,0 +1,142 @@
+"""Unit tests for volumes DAO and schema."""
+from __future__ import annotations
+
+import os, sys
+import pytest
+
+_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+# Use a per-test Postgres DB URL if set; otherwise skip.
+_DB = os.environ.get("TEST_DATABASE_URL")
+pytestmark = pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+
+if _DB:
+    os.environ["DATABASE_URL"] = _DB
+
+from api import db as dbmod  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _init_schema():
+    dbmod.init_db()
+    yield
+
+
+@pytest.mark.asyncio
+async def test_volumes_table_exists():
+    await dbmod.init_pool()
+    try:
+        async with dbmod.get_db() as conn:
+            row = await (await conn.execute(
+                "SELECT to_regclass('public.volumes') AS t"
+            )).fetchone()
+        assert row["t"] == "volumes"
+    finally:
+        await dbmod.close_pool()
+
+
+def test_volume_record_dataclass():
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_1", name="proj", provider="daytona",
+                     provider_ref="dt-xyz", status="ready")
+    assert v.id == "vol_1"
+    assert v.name == "proj"
+    assert v.provider == "daytona"
+    assert v.provider_ref == "dt-xyz"
+    assert v.status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_volume_crud_roundtrip():
+    from api.models import VolumeRecord
+    await dbmod.init_pool()
+    try:
+        v = VolumeRecord(id="vol_a", name="proj-a", provider="daytona", provider_ref="dt-a")
+        await dbmod.upsert_volume(v)
+
+        got = await dbmod.get_volume("vol_a")
+        assert got is not None
+        assert got.name == "proj-a"
+
+        by_name = await dbmod.get_volume_by_name("proj-a")
+        assert by_name is not None and by_name.id == "vol_a"
+
+        listed = await dbmod.list_volumes()
+        assert any(x.id == "vol_a" for x in listed)
+
+        await dbmod.delete_volume("vol_a")
+        assert await dbmod.get_volume("vol_a") is None
+    finally:
+        await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_sessions_has_volume_id_and_current_sandbox_id():
+    await dbmod.init_pool()
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT column_name, is_nullable FROM information_schema.columns "
+                "WHERE table_name='sessions' AND column_name IN ('volume_id', 'current_sandbox_id', 'sandbox_id')"
+            )).fetchall()
+        cols = {r["column_name"]: r["is_nullable"] for r in rows}
+        assert "volume_id" in cols
+        assert "current_sandbox_id" in cols
+        assert "sandbox_id" not in cols, "old sandbox_id column should be renamed"
+        assert cols["current_sandbox_id"] == "YES", "current_sandbox_id must be nullable"
+    finally:
+        await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_sandboxes_has_volume_id_and_subpath():
+    await dbmod.init_pool()
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='sandboxes' AND column_name IN ('volume_id', 'subpath')"
+            )).fetchall()
+        names = {r["column_name"] for r in rows}
+        assert names == {"volume_id", "subpath"}
+    finally:
+        await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_sandbox_record_roundtrip_with_volume():
+    from api.models import SandboxRecord, VolumeRecord
+    await dbmod.init_pool()
+    try:
+        await dbmod.upsert_volume(VolumeRecord(id="vol_x", name="x", provider="daytona", provider_ref="dt-x"))
+        sb = SandboxRecord(id="sb_x", provider="daytona", sandbox_ref="dt-sb",
+                           status="running", root="/home/daytona",
+                           volume_id="vol_x", subpath="agents/a1/home")
+        await dbmod.upsert_sandbox(sb)
+        got = await dbmod.get_sandbox("sb_x")
+        assert got.volume_id == "vol_x"
+        assert got.subpath == "agents/a1/home"
+    finally:
+        await dbmod.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_volume_id_is_not_null_after_backfill():
+    """After all migrations run, sessions.volume_id and sandboxes.volume_id are NOT NULL."""
+    await dbmod.init_pool()
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT table_name, column_name, is_nullable "
+                "FROM information_schema.columns "
+                "WHERE (table_name='sessions' AND column_name='volume_id') "
+                "   OR (table_name='sandboxes' AND column_name IN ('volume_id', 'subpath'))"
+            )).fetchall()
+        state = {(r["table_name"], r["column_name"]): r["is_nullable"] for r in rows}
+        assert state.get(("sessions", "volume_id")) == "NO", f"sessions.volume_id should be NOT NULL: {state}"
+        assert state.get(("sandboxes", "volume_id")) == "NO", f"sandboxes.volume_id should be NOT NULL: {state}"
+        assert state.get(("sandboxes", "subpath")) == "NO", f"sandboxes.subpath should be NOT NULL: {state}"
+    finally:
+        await dbmod.close_pool()

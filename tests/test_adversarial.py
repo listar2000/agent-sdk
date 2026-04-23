@@ -34,46 +34,91 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 # ---------------------------------------------------------------------------
-# Stub out the entire DB layer BEFORE importing the server module so that
-# the Postgres connect() call never fires.
+# If the harness exports TEST_DATABASE_URL (our Postgres test DB), mirror it
+# into DATABASE_URL before any api.* module is imported. api.db captures
+# DATABASE_URL at import time — if that happens to be the dev default, every
+# sibling test file that imports api.db after us (test_ensure_helpers,
+# test_volumes_db, etc.) will freeze on the wrong URL. Copying here makes
+# api.db pick up the test URL even when test_adversarial is the first file
+# pytest collects (alphabetical order).
+# ---------------------------------------------------------------------------
+_TEST_DB = os.environ.get("TEST_DATABASE_URL")
+if _TEST_DB and not os.environ.get("DATABASE_URL"):
+    os.environ["DATABASE_URL"] = _TEST_DB
+
+# ---------------------------------------------------------------------------
+# Install an in-memory api.db stub BEFORE importing api.server so that
+# ``from .db import ...`` inside api.server binds to stubbed functions
+# (no real DB roundtrips during these tests). The autouse
+# ``_stub_api_db_module`` fixture below tears the stub down on module
+# exit — popping api.db and api.server from sys.modules so later test files
+# get a freshly imported api.db (picking up their DATABASE_URL if any) and
+# a freshly imported api.server (re-binding to the real db functions).
 # ---------------------------------------------------------------------------
 
 import types
-
-_stub_db = types.ModuleType("api.db")
-
-async def _noop(*a, **kw): return None
-async def _noop_list(*a, **kw): return []
-async def _noop_false(*a, **kw): return False
-async def _noop_agent(*a, **kw): return None
-async def _noop_sandbox(*a, **kw): return None
-async def _noop_session(*a, **kw): return None
-
-_stub_db.init_db = lambda: None
-_stub_db.init_pool = _noop
-_stub_db.close_pool = _noop
-_stub_db.upsert_agent = _noop
-_stub_db.get_agent = _noop_agent
-_stub_db.list_agents = _noop_list
-_stub_db.delete_agent = _noop
-_stub_db.upsert_sandbox = _noop
-_stub_db.get_sandbox = _noop_sandbox
-_stub_db.list_sandboxes = _noop_list
 from contextlib import asynccontextmanager as _asynccontextmanager
-@_asynccontextmanager
-async def _noop_get_db(*a, **kw):
-    yield None
-_stub_db.get_db = _noop_get_db
-_stub_db.delete_sandbox = _noop
-_stub_db.upsert_session = _noop
-_stub_db.get_session = _noop_session
-_stub_db.session_has_log_entries = _noop_false
-_stub_db.log_event = _noop
-_stub_db.get_session_log = _noop_list
-_stub_db.get_agent_log = _noop_list
-sys.modules["api.db"] = _stub_db
 
-# Now import server — lifespan calls init_db() / init_pool() which are no-ops
+
+def _build_stub_db() -> types.ModuleType:
+    """Return a no-op stub module that stands in for api.db during tests."""
+    stub = types.ModuleType("api.db")
+
+    async def _noop(*a, **kw): return None
+    async def _noop_list(*a, **kw): return []
+    async def _noop_false(*a, **kw): return False
+    async def _noop_agent(*a, **kw): return None
+    async def _noop_sandbox(*a, **kw): return None
+    async def _noop_session(*a, **kw): return None
+    async def _noop_dict(*a, **kw): return {}
+    async def _noop_volume(*a, **kw): return None
+
+    @_asynccontextmanager
+    async def _noop_get_db(*a, **kw):
+        yield None
+
+    stub.init_db = lambda: None
+    stub.init_pool = _noop
+    stub.close_pool = _noop
+    stub.upsert_agent = _noop
+    stub.get_agent = _noop_agent
+    stub.list_agents = _noop_list
+    stub.delete_agent = _noop
+    stub.upsert_sandbox = _noop
+    stub.get_sandbox = _noop_sandbox
+    stub.list_sandboxes = _noop_list
+    stub.get_db = _noop_get_db
+    stub.delete_sandbox = _noop
+    stub.upsert_session = _noop
+    stub.get_session = _noop_session
+    stub.get_session_env = _noop_dict
+    stub.get_session_secrets = _noop_dict
+    stub.get_any_session_for_sandbox = _noop_session
+    stub.update_session_env = _noop
+    stub.update_session_secrets = _noop
+    stub.log_event = _noop
+    stub.get_session_log = _noop_list
+    # Volume + current_sandbox helpers added in the session/volume decoupling.
+    stub.upsert_volume = _noop
+    stub.get_volume = _noop_volume
+    stub.get_volume_by_name = _noop_volume
+    stub.list_volumes = _noop_list
+    stub.delete_volume = _noop
+    stub.set_session_current_sandbox = _noop
+    stub.add_supervisor_agent_type = _noop
+    return stub
+
+
+# Snapshot of any prior api.db / api.server entries in sys.modules. Usually
+# None at collection time; tracked so we can cleanly remove them on teardown.
+_prior_api_db = sys.modules.get("api.db")
+_prior_api_server = sys.modules.get("api.server")
+
+# Install stub into sys.modules BEFORE importing api.server so that
+# ``from .db import ...`` resolves to stubbed (no-connect) functions.
+_stub_db_module = _build_stub_db()
+sys.modules["api.db"] = _stub_db_module
+
 import api.server as _server_module
 from api.server import app, SESSIONS, _INSTANCES
 from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
@@ -95,22 +140,83 @@ from api.providers import _get_sandbox_env_vars, PORT_BASED_PROVIDERS
 from api.server import (
     _materialize_dockerfile,
     _merge_top_level_config,
-    _derive_sandbox_ref,
     _CONFIG_KEYS,
 )
+# NOTE: _derive_sandbox_ref was removed from api.server in the volume-refactor;
+# sandbox_ref now equals the allocated port for port-based providers and the
+# provider-native sandbox id for Daytona. Tests that referenced the helper
+# have been removed below.
 from agent_sdk.client import Agent, _raise_for_status
 from agent_sdk.persist import SqliteSessionDriver, SessionRecord
 
-# If another test imported api.server first, overwrite its DB bindings here so
-# this file remains hermetic regardless of test collection/import order.
-for _name in (
+
+# Names api.server imported via `from .db import ...` — ensure every one
+# points at the stub (defensive: covers any that may have been reassigned
+# before our sys.modules swap took effect).
+_STUBBED_DB_NAMES = (
     "init_db", "init_pool", "close_pool",
     "upsert_agent", "get_agent", "list_agents", "delete_agent",
     "upsert_sandbox", "get_sandbox", "list_sandboxes", "delete_sandbox",
     "upsert_session", "get_session",
-    "session_has_log_entries", "log_event", "get_session_log",
-):
-    setattr(_server_module, _name, getattr(_stub_db, _name))
+    "get_session_env", "get_session_secrets", "get_any_session_for_sandbox",
+    "update_session_env", "update_session_secrets",
+    "log_event", "get_session_log",
+    "get_db", "add_supervisor_agent_type",
+    "upsert_volume", "get_volume", "get_volume_by_name",
+    "list_volumes", "delete_volume", "set_session_current_sandbox",
+)
+
+for _name in _STUBBED_DB_NAMES:
+    if hasattr(_stub_db_module, _name):
+        setattr(_server_module, _name, getattr(_stub_db_module, _name))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_api_db_module():
+    """Keep the stub in place for this test module; restore on exit.
+
+    The stub was installed at module-import above so api.server's
+    ``from .db import ...`` resolved to no-op stubs (otherwise api.db would
+    load with DATABASE_URL frozen to the dev default). On teardown we need
+    to transparently hand the real api.db back to sibling test files that
+    have already captured a reference at their own module-import time
+    (``from api import db as dbmod``).
+
+    Strategy: load the real api.db module, then mutate our stub module
+    in-place so every attribute points at the real function. Callers
+    holding ``dbmod = <stub>`` will see real DB behaviour the moment they
+    access any attribute. Also re-bind the names on api.server (shared via
+    sys.modules) to the real functions.
+    """
+    yield
+    # Step 1: pop stub from sys.modules so importlib.import_module re-reads
+    # the real module file.
+    sys.modules.pop("api.db", None)
+    import importlib
+    try:
+        real_db = importlib.import_module("api.db")
+    except Exception:
+        real_db = None
+
+    # Step 2: mutate our stub to delegate to the real module. This lets
+    # sibling test files that already captured ``dbmod = <stub>`` at their
+    # own import time see real DB behaviour now.
+    if real_db is not None:
+        # Copy every public attribute from real_db onto our stub object.
+        for attr in dir(real_db):
+            if attr.startswith("__"):
+                continue
+            try:
+                setattr(_stub_db_module, attr, getattr(real_db, attr))
+            except Exception:
+                pass
+        # Re-register real_db in sys.modules — it IS the real module now.
+        sys.modules["api.db"] = real_db
+        # Step 3: rebind api.server's db-sourced names to the real
+        # functions so shared-module callers see the real DB.
+        for name in _STUBBED_DB_NAMES:
+            if hasattr(real_db, name):
+                setattr(_server_module, name, getattr(real_db, name))
 
 
 # ---------------------------------------------------------------------------
@@ -285,27 +391,10 @@ class TestServerHelpers:
         assert config_data["cwd"] == "/workspace"
         assert config_data["prompt"] == "be helpful"
 
-    def test_derive_sandbox_ref_port_based(self):
-        """Port-based providers use the port number as sandbox_ref."""
-        from api.providers import ProviderInstance
-        instance = ProviderInstance(provider="local", url="http://localhost:3000", port=3000)
-        ref = _derive_sandbox_ref(instance, "local", "sbx-123")
-        assert ref == "3000"
-
-    def test_derive_sandbox_ref_daytona(self):
-        """Daytona provider uses instance.sandbox_id as sandbox_ref."""
-        from api.providers import ProviderInstance
-        daytona_id = "daytona-sandbox-xyz"
-        instance = ProviderInstance(provider="daytona", url="https://preview.daytona.io", sandbox_id=daytona_id)
-        ref = _derive_sandbox_ref(instance, "daytona", "sbx-123")
-        assert ref == daytona_id
-
-    def test_derive_sandbox_ref_daytona_fallback(self):
-        """Daytona with no sandbox_id falls back to the passed sandbox_id."""
-        from api.providers import ProviderInstance
-        instance = ProviderInstance(provider="daytona", url="https://preview.daytona.io", sandbox_id=None)
-        ref = _derive_sandbox_ref(instance, "daytona", "sbx-fallback")
-        assert ref == "sbx-fallback"
+    # NOTE: tests for the removed ``_derive_sandbox_ref`` helper used to live
+    # here. The helper was removed in the volume-refactor — sandbox_ref now
+    # equals the allocated port for port-based providers, and Daytona stores
+    # its provider-side sandbox id directly on SandboxRecord.
 
     @pytest.mark.asyncio
     async def test_health_endpoint(self, async_client):
@@ -456,7 +545,7 @@ class TestProviderConstants:
 class TestGetSandboxEnvVars:
     def test_always_has_is_sandbox(self):
         from api.providers import _get_sandbox_env_vars
-        env = _get_sandbox_env_vars()
+        env = _get_sandbox_env_vars({})
         assert env["IS_SANDBOX"] == "1"
 
 class TestModelConstants:
@@ -651,28 +740,28 @@ class TestProviderHelpers:
 
     def test_get_sandbox_env_vars_includes_is_sandbox(self):
         """_get_sandbox_env_vars always includes IS_SANDBOX=1."""
-        result = _get_sandbox_env_vars()
+        result = _get_sandbox_env_vars({})
         assert result.get("IS_SANDBOX") == "1"
 
-    def test_get_sandbox_env_vars_picks_up_anthropic_key(self, monkeypatch):
-        """_get_sandbox_env_vars includes ANTHROPIC_API_KEY when set."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
-        result = _get_sandbox_env_vars()
+    def test_get_sandbox_env_vars_passes_through_spawn_env(self):
+        """_get_sandbox_env_vars passes caller-provided keys through."""
+        result = _get_sandbox_env_vars({"ANTHROPIC_API_KEY": "sk-test-key"})
         assert result.get("ANTHROPIC_API_KEY") == "sk-test-key"
+        assert result.get("IS_SANDBOX") == "1"
 
-    def test_get_sandbox_env_vars_omits_missing_keys(self, monkeypatch):
-        """_get_sandbox_env_vars omits keys that aren't set in env."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        result = _get_sandbox_env_vars()
+    def test_get_sandbox_env_vars_ignores_ambient_keys(self, monkeypatch):
+        """Strict mode: ambient os.environ auth keys never leak into sandbox."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-should-be-ignored")
+        monkeypatch.setenv("OPENAI_API_KEY", "ambient-should-be-ignored")
+        result = _get_sandbox_env_vars({})
         assert "ANTHROPIC_API_KEY" not in result
         assert "OPENAI_API_KEY" not in result
 
-    def test_get_sandbox_env_vars_picks_up_openai_key(self, monkeypatch):
-        """_get_sandbox_env_vars includes OPENAI_API_KEY when set."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-key")
-        result = _get_sandbox_env_vars()
-        assert result.get("OPENAI_API_KEY") == "sk-openai-key"
+    def test_get_sandbox_env_vars_caller_wins_over_ambient(self, monkeypatch):
+        """Caller-supplied spawn_env values take precedence over ambient env."""
+        monkeypatch.setenv("OPENAI_API_KEY", "ambient-wrong")
+        result = _get_sandbox_env_vars({"OPENAI_API_KEY": "sk-caller"})
+        assert result.get("OPENAI_API_KEY") == "sk-caller"
 
     def test_port_based_providers_set(self):
         """PORT_BASED_PROVIDERS is a frozenset containing 'local' and 'docker'."""
@@ -990,7 +1079,10 @@ class TestConcurrencyAdversarial:
             await asyncio.sleep(0.02)  # simulate latency
             return _mock_response(200, {"id": "agent-race"})
 
-        agent = Agent("race-test", api_url="http://fake")
+        # Use http://localhost so the client-side credentials guard
+        # (client.py:_is_remote_http) allows any oauth/api-key env-var creds
+        # the developer may have exported; the actual POST is mocked below.
+        agent = Agent("race-test", api_url="http://localhost")
         with patch.object(agent._client, "post", side_effect=_fake_post):
             await asyncio.gather(
                 agent._ensure_registered(),
@@ -1010,24 +1102,34 @@ class TestServerEndpointAdversarial:
     @pytest.mark.asyncio
     async def test_quick_create_with_bad_provider_returns_502(self, async_client):
         """POST /sessions/quick with an unknown provider returns 502."""
-        with patch("api.server.create_instance", side_effect=ValueError("Unknown provider: 'badprovider'")):
+        from api.models import VolumeRecord
+        fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
+                                provider_ref="dt-x", status="ready")
+        with patch("api.server.create_instance", side_effect=ValueError("Unknown provider: 'badprovider'")), \
+             patch("api.server.get_volume", return_value=fake_vol):
             resp = await async_client.post("/sessions/quick", json={
                 "name": "test",
                 "provider": "badprovider",
                 "agent_type": "claude",
+                "volume_id": "vol_x",
             })
-        # The server catches the exception and returns 502
         assert resp.status_code == 502
         assert "error" in resp.json()
 
     @pytest.mark.asyncio
     async def test_quick_create_circuit_breaker_returns_503(self, async_client):
         """Circuit-breaker failures should tell clients to back off."""
-        with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")):
+        from api.models import VolumeRecord
+        fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
+                                provider_ref="dt-x", status="ready")
+        with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")), \
+             patch("api.server.get_volume", return_value=fake_vol), \
+             patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
             resp = await async_client.post("/sessions/quick", json={
                 "name": "test",
                 "provider": "daytona",
                 "agent_type": "claude",
+                "volume_id": "vol_x",
             })
         assert resp.status_code == 503
         assert resp.headers["Retry-After"] == "30"
@@ -1076,14 +1178,16 @@ class TestServerEndpointAdversarial:
 
 class TestSandboxRecordDeriveUrl:
 
-    def test_local_derives_url_from_ref(self):
-        """SandboxRecord with local provider derives URL from sandbox_ref port."""
-        rec = SandboxRecord(id="s1", provider="local", sandbox_ref="9999")
+    def test_local_derives_url_from_listen_port(self):
+        """SandboxRecord with local provider derives URL from listen_port."""
+        rec = SandboxRecord(id="s1", provider="local", sandbox_ref="pid-1234",
+                            listen_port=9999)
         assert rec.derive_url() == "http://localhost:9999"
 
-    def test_docker_derives_url_from_ref(self):
-        """SandboxRecord with docker provider derives URL from sandbox_ref port."""
-        rec = SandboxRecord(id="s1", provider="docker", sandbox_ref="8888")
+    def test_docker_derives_url_from_listen_port(self):
+        """SandboxRecord with docker provider derives URL from listen_port."""
+        rec = SandboxRecord(id="s1", provider="docker", sandbox_ref="cid-abc",
+                            listen_port=8888)
         assert rec.derive_url() == "http://localhost:8888"
 
     def test_daytona_derive_url_raises(self):
@@ -1245,23 +1349,9 @@ class TestMergeTopLevelConfig:
             assert config_data[k] == f"val_{k}"
 
 
-class TestDeriveSandboxRef:
-    """Test the extracted _derive_sandbox_ref helper."""
-
-    def test_port_based_returns_port_string(self):
-        from api.providers import ProviderInstance
-        inst = ProviderInstance(provider="local", url="http://localhost:2469", port=2469)
-        assert _derive_sandbox_ref(inst, "local", "fallback-id") == "2469"
-
-    def test_daytona_returns_sandbox_id(self):
-        from api.providers import ProviderInstance
-        inst = ProviderInstance(provider="daytona", url="https://example.com", sandbox_id="daytona-123")
-        assert _derive_sandbox_ref(inst, "daytona", "fallback-id") == "daytona-123"
-
-    def test_daytona_falls_back_to_sandbox_id(self):
-        from api.providers import ProviderInstance
-        inst = ProviderInstance(provider="daytona", url="https://example.com")
-        assert _derive_sandbox_ref(inst, "daytona", "my-fallback") == "my-fallback"
+# NOTE: the ``TestDeriveSandboxRef`` suite was removed alongside
+# api.server._derive_sandbox_ref in the volume-refactor. sandbox_ref semantics
+# are now provider-specific and covered by the provider unit tests.
 
 
 
@@ -1950,7 +2040,11 @@ class TestHealthEndpoint:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
             r = await c.get("/health")
             assert r.status_code == 200
-            assert r.json() == {"status": "ok"}
+            body = r.json()
+            assert body["status"] == "ok"
+            # Health payload carries runtime counters — verify shape, not counts.
+            for k in ("sessions", "busy_sessions", "readers_alive", "instances"):
+                assert k in body and isinstance(body[k], int)
 
 
 
@@ -2557,3 +2651,158 @@ class TestSessionRecordDataclass:
         r = SessionRecord(id="s1", agent_id="a1", sandbox_id="sb1")
         assert r.id == "s1"
         assert r.inner_session_id is None
+
+
+# ===========================================================================
+# Scenario 1 — Sandbox death mid-message.
+#
+# The session has an active prompt in flight. The sandbox dies (container
+# removed / subprocess killed) between the request and the response. The
+# httpx client inside ACP raises ``httpx.ConnectError`` (or
+# ``httpx.RemoteProtocolError``) while streaming. _execute_one_prompt must:
+#
+#   1. Catch the exception, classify it (``sandbox_unreachable``), and
+#      record it on state.errors — NOT let it propagate into the scheduler.
+#   2. Dispatch a clean JSON-RPC error SSE block to the rpc subscriber
+#      so clients see a typed failure instead of a hang.
+#   3. Mark the turn finished so the scheduler can move on to the next
+#      queued prompt.
+# ===========================================================================
+
+
+class TestMidMessageDeath:
+    """Sandbox dies after the prompt is submitted but before it completes."""
+
+    def _new_state(self, session_id: str = "sess-mid-death") -> SessionState:
+        from unittest.mock import AsyncMock, MagicMock
+        client = MagicMock()
+        client.prompt = AsyncMock()
+        client.cancel_prompt = AsyncMock()
+        client.aclose = AsyncMock()
+        state = SessionState(
+            session_id=session_id,
+            agent_id="agent-die",
+            sandbox_id="sbx-die",
+            acp_session_id="acp-die",
+            inner_session_id="inner-die",
+            client=client,
+        )
+        return state
+
+    @pytest.mark.asyncio
+    async def test_connect_error_surfaces_typed_rpc_error(self):
+        """ConnectError raised by client.prompt is classified and dispatched."""
+        from api.server import _execute_one_prompt
+
+        state = self._new_state("sess-death-connect")
+
+        # Mocked client raises ConnectError mid-stream.
+        state.client.prompt = AsyncMock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+
+        # Capture dispatched SSE blocks.
+        dispatched: list[tuple] = []
+        state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
+
+        rpc_id = str(uuid.uuid4())
+
+        # log_event is stubbed already by the module-level db stub; safe to call.
+        await _execute_one_prompt(state, rpc_id, "hello")
+
+        # Error was recorded on the session.
+        assert len(state.errors) == 1, f"expected 1 error, got {state.errors}"
+        err = state.errors[0]
+        assert err["kind"] == "sandbox_unreachable"
+        assert "ConnectError" in err["error"]
+        assert err["rpc_id"] == rpc_id
+
+        # A JSON-RPC error block was dispatched to the rpc-tagged subscriber.
+        # dispatch(tag, (rpc_id, "data: ...\n\n"))
+        assert len(dispatched) == 1
+        tag, inner = dispatched[0]
+        assert tag == rpc_id
+        inner_rpc, block = inner
+        assert inner_rpc == rpc_id
+        assert block.startswith("data: ")
+        payload = json.loads(block[len("data: "):].strip())
+        assert payload["id"] == rpc_id
+        err_obj = payload["error"]
+        assert err_obj["code"] == -32000
+        assert err_obj["data"]["kind"] == "sandbox_unreachable"
+        assert err_obj["data"]["exception_type"] == "ConnectError"
+
+        # Turn was marked finished so the reaper / scheduler can progress.
+        assert state.turn_completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_after_first_chunk(self):
+        """Supervisor dies after first SSE chunk — RemoteProtocolError surfaces
+        as 'unknown' kind (default), still typed and not a hang."""
+        from api.server import _execute_one_prompt
+
+        state = self._new_state("sess-death-proto")
+
+        # Simulate: the client kicks off the prompt, starts reading SSE, then
+        # the upstream connection is severed mid-stream.
+        class _ProtoErr(Exception):
+            pass
+
+        state.client.prompt = AsyncMock(
+            side_effect=httpx.RemoteProtocolError("Server disconnected")
+        )
+
+        dispatched: list[tuple] = []
+        state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
+
+        rpc_id = str(uuid.uuid4())
+        await _execute_one_prompt(state, rpc_id, "mid-stream death")
+
+        # Still only one error recorded; kind maps to 'unknown' (neither HTTP
+        # status nor ConnectError/ReadTimeout match) but the exception_type
+        # preserves 'RemoteProtocolError' so clients can distinguish.
+        assert len(state.errors) == 1
+        assert state.errors[0]["kind"] in ("unknown", "sandbox_unreachable")
+        assert "RemoteProtocolError" in state.errors[0]["error"]
+
+        # A JSON-RPC error SSE was dispatched — no hang, typed envelope.
+        assert len(dispatched) == 1
+        tag, inner = dispatched[0]
+        assert tag == rpc_id
+        _inner_rpc, block = inner
+        payload = json.loads(block[len("data: "):].strip())
+        assert payload["id"] == rpc_id
+        assert payload["error"]["data"]["exception_type"] == "RemoteProtocolError"
+
+    @pytest.mark.asyncio
+    async def test_http_502_from_dead_supervisor_classified(self):
+        """Supervisor returns 502/504 mid-request (docker proxying a dead
+        process) — classified as http_error with the upstream body retained."""
+        from api.server import _execute_one_prompt
+
+        state = self._new_state("sess-death-502")
+
+        fake_resp = MagicMock()
+        fake_resp.status_code = 502
+        fake_resp.text = "Bad Gateway"
+        state.client.prompt = AsyncMock(
+            side_effect=httpx.HTTPStatusError("502", request=MagicMock(), response=fake_resp)
+        )
+
+        dispatched: list[tuple] = []
+        state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
+
+        rpc_id = str(uuid.uuid4())
+        await _execute_one_prompt(state, rpc_id, "ping")
+
+        assert len(state.errors) == 1
+        err = state.errors[0]
+        # 502 is not 500 nor any of the special cases — should be 'http_error'.
+        assert err["kind"] == "http_error"
+
+        assert len(dispatched) == 1
+        _, inner = dispatched[0]
+        _inner_rpc, block = inner
+        payload = json.loads(block[len("data: "):].strip())
+        assert payload["error"]["data"]["http_status"] == 502
+        assert "Bad Gateway" in payload["error"]["data"]["upstream_body"]

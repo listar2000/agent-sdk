@@ -22,22 +22,16 @@ fi
 
 cd "${REPO_ROOT}"
 
-# Load env vars (API keys, SSL cert, etc.)
-if [ -f "${HOME}/.env" ]; then
-    set -a
-    source "${HOME}/.env"
-    set +a
-fi
-
-# Vertex env vars (CLAUDE_CODE_USE_VERTEX, ANTHROPIC_VERTEX_BASE_URL, etc.)
-# are set by the managed claude binary in your shell. This script inherits
-# them automatically when run from such a shell. If they're missing and no
-# ANTHROPIC_API_KEY is set, warn the user.
-if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${CLAUDE_CODE_USE_VERTEX:-}" ]; then
-    echo "WARNING: No ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or CLAUDE_CODE_USE_VERTEX found."
-    echo "  Run this script from a terminal managed by the claude binary,"
-    echo "  or set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in ~/.env."
-fi
+# Load env vars (API keys, SSL cert, etc.). Prefer the repo-local .env,
+# fall back to the user's ~/.env.
+for env_file in "${REPO_ROOT}/.env" "${HOME}/.env"; do
+    if [ -f "${env_file}" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${env_file}"
+        set +a
+    fi
+done
 
 needs_install=0
 recreate_venv=0
