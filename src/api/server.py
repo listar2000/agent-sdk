@@ -696,8 +696,24 @@ def _start_sse_reader(state: SessionState) -> None:
                 if state.shutdown.is_set():
                     return
 
+                # Fast-fail on confirmed-dead supervisors: for port-based
+                # providers we can cheaply check the subprocess in _INSTANCES
+                # and skip the full exponential-backoff ladder (up to ~35s)
+                # when we KNOW the old supervisor is gone. A ConnectError
+                # against a port whose process is dead will never recover
+                # by retrying.
+                cached_inst = _INSTANCES.get(state.sandbox_id)
+                supervisor_dead = False
+                if cached_inst is not None and cached_inst.process is not None:
+                    try:
+                        cached_inst.process.poll()
+                    except Exception:
+                        pass
+                    supervisor_dead = cached_inst.process.returncode is not None
+
                 if (_sse_reader_disconnect_is_recoverable(state)
-                        and attempt <= _SSE_MAX_IDLE_RETRIES):
+                        and attempt <= _SSE_MAX_IDLE_RETRIES
+                        and not supervisor_dead):
                     log.warning("[SSE-READER] recoverable upstream disconnect for "
                                 "session %s (%s); reconnecting in %.1fs (attempt %d/%d)",
                                 state.session_id, disconnect_reason,
@@ -705,6 +721,13 @@ def _start_sse_reader(state: SessionState) -> None:
                     await asyncio.sleep(reconnect_delay_s)
                     reconnect_delay_s = min(reconnect_delay_s * 2, 10.0)
                     continue
+
+                if supervisor_dead:
+                    log.info(
+                        "[SSE-READER] supervisor process dead for session %s — "
+                        "skipping retry ladder, going straight to sandbox recovery",
+                        state.session_id,
+                    )
 
                 # Retries exhausted — try to recover the sandbox before giving up.
                 if not state.shutdown.is_set():
@@ -736,10 +759,20 @@ def _start_sse_reader(state: SessionState) -> None:
                             # silently overwriting state.inner_session_id and
                             # wiping conversation context on every external
                             # sandbox stop mid-conversation.
+                            # cwd MUST match what session/new used, i.e.
+                            # agent.config.cwd (same rule as the main
+                            # _ensure_runtime_locked path). sandbox_record.root
+                            # is the sandbox HOME, which is usually NOT the
+                            # cwd the session was created under — using it
+                            # breaks session/load's JSONL hash lookup.
+                            attach_cwd = (
+                                (agent_record.config.cwd or "/tmp")
+                                if agent_record.config else "/tmp"
+                            )
                             new_inner_sid, started_fresh = await _attach_acp_session(
                                 new_client, new_acp_session_id, agent_record,
                                 inner_sid=state.inner_session_id,
-                                cwd=sandbox_record.root or "/tmp",
+                                cwd=attach_cwd,
                             )
                             if started_fresh and new_inner_sid:
                                 # Genuine fresh session — reflect in DB so a
