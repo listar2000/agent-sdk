@@ -215,6 +215,23 @@ function runSnapshotSync() {
   }
 }
 
+// HTTP handler for POST /v1/snapshot. Wraps runSnapshotOnce so the server
+// can trigger a synchronous snapshot before it stops/destroys the sandbox.
+// Idempotent; safe to call repeatedly. Returns 200 after the tarball has
+// landed on the volume (or immediately if --snapshot-path was not configured,
+// in which case runSnapshotOnce is a no-op).
+async function handleSnapshot(req, res) {
+  try {
+    await runSnapshotOnce();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  } catch (e) {
+    log(`snapshot endpoint error: ${e.message}`);
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: String(e.message || e) }));
+  }
+}
+
 // Cache the last available_commands_update so late SSE subscribers receive it.
 let lastCommandsEvent = null;
 
@@ -880,6 +897,16 @@ const server = http.createServer((req, res) => {
       handleSse(req, res);
       return;
     }
+  }
+  if (req.url === "/v1/snapshot" && req.method === "POST") {
+    handleSnapshot(req, res).catch((e) => {
+      log("snapshot handler crashed: " + e.stack);
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      } catch {}
+    });
+    return;
   }
   if (req.url && req.url.startsWith("/v1/files/tree") && req.method === "GET") {
     const u = new URL(req.url, `http://${req.headers.host}`);
