@@ -2548,17 +2548,47 @@ async def _provision_new(
     # startup reconciliation (M5); other providers currently ignore it.
     new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
 
-    inst = await _providers_mod.provision_sandbox(
-        vol.provider,
-        volume_ref=vol.provider_ref,
-        subpath=subpath,
-        agent_type=agent_type,
-        spawn_env=spawn_env,
-        root=root,
-        sandbox_id=new_sandbox_id,
-        dockerfile=dockerfile,
-        shared_mounts=shared_mounts or None,
-    )
+    async def _provision_once() -> ProviderInstance:
+        return await _providers_mod.provision_sandbox(
+            vol.provider,
+            volume_ref=vol.provider_ref,
+            subpath=subpath,
+            agent_type=agent_type,
+            spawn_env=spawn_env,
+            root=root,
+            sandbox_id=new_sandbox_id,
+            dockerfile=dockerfile,
+            shared_mounts=shared_mounts or None,
+        )
+
+    try:
+        inst = await _provision_once()
+    except RuntimeError as e:
+        # Stale-cache guard: ``ensure_volume_supervisor`` said the install was
+        # present (volumes.supervisor_agent_types cache hit) but the actual
+        # files on disk are missing — the volume got wiped out-of-band, or
+        # the install failed mid-way after marking the cache. Clear the cache
+        # entry for this agent_type, re-install, and retry once.
+        msg = str(e)
+        stale_cache = (
+            "supervisor.js missing" in msg or "ACP binary missing" in msg
+            or "call install_supervisor" in msg
+        )
+        if not stale_cache:
+            raise
+        log.warning(
+            "provision_sandbox failed with stale-cache marker for volume %s "
+            "(agent=%s): %s — clearing cache + reinstalling",
+            vol.id, agent_type, e,
+        )
+        async with get_db() as conn:
+            await conn.execute(
+                "UPDATE volumes SET supervisor_agent_types = "
+                "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
+                (agent_type, vol.id),
+            )
+        await ensure_volume_supervisor(vol.id, agent_type)
+        inst = await _provision_once()
 
     sb = _sandbox_record(
         new_sandbox_id, vol.provider, inst,
