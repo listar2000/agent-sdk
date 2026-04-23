@@ -373,17 +373,26 @@ async def lifespan(app):
     )
     SESSIONS.clear()
 
-    # Parallel instance teardown. Use stop_instance (not destroy) so Daytona
-    # sandboxes are stopped — not permanently deleted — across server restarts.
-    # Without this, every container restart wipes all sandbox state, breaking
-    # session recovery for all active users.
-    async def _safe_stop(inst):
+    # Parallel instance teardown. Use snapshot_and_stop (not raw stop_instance)
+    # so every sandbox's workspace is durable on the volume before the
+    # process exits — server shutdown is otherwise indistinguishable from a
+    # crash from the client's perspective, and we don't want to lose the
+    # last-turn state just because the API was restarted. Falls back to
+    # stop_instance if the sandbox row isn't readable (e.g. DB already torn
+    # down in a weird shutdown ordering).
+    async def _safe_stop(sid, inst):
         try:
-            await stop_instance(inst)
+            rec = await get_sandbox(sid)
+            if rec is not None:
+                await snapshot_and_stop(rec, inst)
+            else:
+                await stop_instance(inst)
         except Exception as e:
-            log.warning("shutdown cleanup failed: %s", e)
+            log.warning("shutdown cleanup failed for %s: %s", sid, e)
 
-    await asyncio.gather(*[_safe_stop(i) for i in _INSTANCES.values()])
+    await asyncio.gather(
+        *[_safe_stop(sid, inst) for sid, inst in list(_INSTANCES.items())]
+    )
     _INSTANCES.clear()
     await close_pool()
 
@@ -1775,10 +1784,15 @@ async def admin_reap_session(session_id: str):
         if instance is not None:
             stopped_provider = instance.provider
             try:
-                await stop_instance(instance)
+                rec = await get_sandbox(sandbox_id)
+                if rec is not None:
+                    await snapshot_and_stop(rec, instance)
+                else:
+                    await stop_instance(instance)
             except Exception as e:
                 log.warning(
-                    "admin reap: stop_instance failed for %s: %s", sandbox_id, e
+                    "admin reap: snapshot_and_stop failed for %s: %s",
+                    sandbox_id, e,
                 )
 
     return {
