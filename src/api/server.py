@@ -2681,21 +2681,6 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     return state
 
 
-async def _tail_daytona_supervisor_log(
-    sandbox_ref: str, port: int | None, lines: int = 120
-) -> str:
-    """Best-effort: read the tail of the Daytona supervisor log via process.exec."""
-    if port is None:
-        return "(no supervisor port)"
-    from .providers.daytona import _get_daytona_client
-    loop = asyncio.get_running_loop()
-    client = _get_daytona_client()
-    sb = await loop.run_in_executor(None, lambda: client.get(sandbox_ref))
-    cmd = f"tail -n {lines} /tmp/sup-work-{port}/sup-{port}.log 2>&1 || echo '(no log)'"
-    r = await loop.run_in_executor(None, lambda: sb.process.exec(cmd, timeout=10))
-    return (r.result if hasattr(r, "result") else str(r)) or "(empty)"
-
-
 async def ensure_session_live(session_id: str) -> tuple[dict, SandboxRecord, SessionState]:
     """One-shot: session → sandbox → runtime. Most endpoints use this.
 
