@@ -529,3 +529,56 @@ async def test_session_survives_midstream_sandbox_stop(provider):
             f"agent lost conversation context across SSE recovery — cannot "
             f"recall its own prior reply: {reply2!r}"
         )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_message_immediately_after_stop(provider):
+    """Turn 1 → stop sandbox → turn 2 with NO sleep. Reproduces the race
+    the user flagged: the POST /message arrives before the server's SSE
+    reader has observed the upstream disconnect, so ensure_session_live's
+    liveness check may still trust a supervisor that's about to die (or
+    just died). The prompt is submitted; the response is 'missed' because
+    the supervisor never acks / the SSE stream never delivers the events.
+
+    The server must detect this and recover: either pre-submit (health
+    check catches the dead URL) or reactively (submit fails fast, SSE
+    reader recovers, resubmit). In either case, turn 2 must eventually
+    return a valid reply.
+
+    This is a SEPARATE test from test_session_resume_after_stop because
+    that one has an explicit ``await asyncio.sleep(3)`` between stop and
+    turn 2, which masks the race. The whole point here is no sleep.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        # Turn 1 — confirm the agent is live and record the token.
+        ticket = "TKT-42042"
+        reply1 = await _ask(
+            client, session_id,
+            f"Remember this ticket ID: {ticket}. Reply with exactly: OK {ticket}.",
+        )
+        assert ticket in reply1, f"turn 1 didn't echo ticket: {reply1!r}"
+        print(f"[test:{provider}] turn1: {ticket}")
+
+        # External stop — NO sleep. This is the race we're after.
+        sandbox = await _get_sandbox(client, session_id)
+        await _external_stop(sandbox)
+        print(f"[test:{provider}] sandbox stopped; immediately sending turn 2")
+
+        # Turn 2 — the server must recover this request, not silently lose it.
+        reply2 = await _ask(
+            client, session_id,
+            f"What was the ticket ID I mentioned earlier? Reply with only the ticket ID.",
+        )
+        print(f"[test:{provider}] turn2 reply: {reply2[:200]!r}")
+        assert ticket in reply2, (
+            f"turn 2 lost: server accepted the prompt but no reply came back "
+            f"(probable race: SSE reader hadn't yet detected the dead "
+            f"supervisor when ensure_session_live returned): {reply2!r}"
+        )

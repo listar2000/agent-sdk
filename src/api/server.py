@@ -2514,14 +2514,20 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     session_id = session_row["id"]
     existing = SESSIONS.get(session_id)
 
-    # Reuse if the existing state is attached to this sandbox and its
-    # supervisor is reachable. Otherwise (stale sandbox, dead supervisor, or
-    # no URL) tear down before rebuilding.
+    # Reuse if the existing state is attached to this sandbox, its
+    # supervisor is reachable, AND the upstream SSE reader is alive.
+    # The _reader_alive flag is a second independent signal: if the reader
+    # has observed a disconnect, the supervisor is definitively dead (or
+    # was moments ago) — don't trust a health check that raced with the
+    # kill, just tear down and rebuild. Otherwise a POST /message that
+    # arrives between the sandbox dying and the reader observing the
+    # disconnect ends up submitting a prompt to a dead supervisor.
     if existing:
         reusable = (
             not existing.shutdown.is_set()
             and existing.sandbox_id == sandbox.id
             and existing.supervisor_url
+            and existing._reader_alive
         )
         if reusable:
             from .providers import _wait_for_health
@@ -3073,13 +3079,23 @@ def _classify_prompt_error(e: Exception, body: str) -> str:
 
 
 async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) -> None:
-    """Execute a single prompt HTTP round-trip. Called only from the scheduler loop."""
+    """Execute a single prompt HTTP round-trip. Called only from the scheduler loop.
+
+    Unconditionally re-runs ``ensure_session_live`` right before the
+    submit. Closes the kill-then-send race: the POST /message handler's
+    own ensure call happens before the prompt is enqueued, so a sandbox
+    that died between enqueue and scheduler pickup would otherwise get
+    the prompt sent to a dead supervisor. The ensure call here is cheap
+    on the hot path (reusable state → one health probe) and guarantees
+    the client + acp_session_id we use are live.
+    """
     session_id = state.session_id
     await log_event(
         session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
         event_type=EVT_USER_MESSAGE, payload={"text": message, "prompt_id": rpc_id},
     )
     try:
+        _, _, state = await ensure_session_live(session_id)
         await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
         return
     except Exception as e:
