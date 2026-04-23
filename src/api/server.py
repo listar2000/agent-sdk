@@ -698,12 +698,32 @@ def _start_sse_reader(state: SessionState) -> None:
                             new_acp_session_id = str(uuid.uuid4())
                             new_client = AcpClient(new_url)
                             agent_record = await get_agent(state.agent_id)
-                            if agent_record is not None:
-                                await _apply_config_and_initialize(
-                                    new_client, agent_record.config,
-                                    new_acp_session_id, sandbox_record.root or "/tmp",
+                            if agent_record is None:
+                                raise RuntimeError(
+                                    f"agent {state.agent_id} missing during SSE-reader recovery"
                                 )
-                            new_inner_sid = new_client.get_inner_session_id(new_acp_session_id)
+                            # Route through the shared helper — try session/load
+                            # against the existing inner_sid first, only fall
+                            # through to session/new when we genuinely have
+                            # nothing to resume or when load fails loudly.
+                            # Previously this path ALWAYS called
+                            # _apply_config_and_initialize (session/new),
+                            # silently overwriting state.inner_session_id and
+                            # wiping conversation context on every external
+                            # sandbox stop mid-conversation.
+                            new_inner_sid, started_fresh = await _attach_acp_session(
+                                new_client, new_acp_session_id, agent_record,
+                                inner_sid=state.inner_session_id,
+                                cwd=sandbox_record.root or "/tmp",
+                            )
+                            if started_fresh and new_inner_sid:
+                                # Genuine fresh session — reflect in DB so a
+                                # later ensure_session_live sees the right
+                                # inner_sid when the next message arrives.
+                                await upsert_session(
+                                    state.session_id, state.agent_id,
+                                    state.sandbox_id, new_inner_sid,
+                                )
                             old_client = state.client
                             state.client = new_client
                             state.supervisor_url = new_url
@@ -757,13 +777,80 @@ async def _apply_config_and_initialize(
     acp_session_id: str,
     cwd: str,
 ) -> None:
-    """Initialize the ACP session with MCP server config."""
+    """Initialize the ACP session with MCP server config (session/new path)."""
     await client.initialize(
         acp_session_id,
         config.agent_type or "claude",
         cwd=cwd,
         mcp_servers=config.mcp_servers,
     )
+
+
+async def _attach_acp_session(
+    client: AcpClient,
+    acp_session_id: str,
+    agent_record: AgentRecord,
+    *,
+    inner_sid: str | None,
+    cwd: str,
+) -> tuple[str | None, bool]:
+    """Attach to an ACP session — resume if possible, otherwise start fresh.
+
+    Single source of truth for "how do we obtain an ``inner_session_id`` on
+    this ACP connection". Every call site that needs an attached ACP session
+    (POST /message recovery, SSE-reader upstream-disconnect recovery, and
+    initial ``sessions_quick_create``) routes through here, so the invariant
+    *"always try ``session/load`` when we have an ``inner_session_id``, only
+    create a new one when genuinely fresh or when load actually fails"*
+    lives in one place and can't be accidentally skipped.
+
+    Behavior:
+      - If ``inner_sid`` is truthy → handshake + ``session/load``. On
+        success, the agent's prior conversation is preserved and this
+        returns ``(inner_sid, False)``.
+      - If ``inner_sid`` is ``None`` OR ``session/load`` raises → fall back
+        to ``session/new`` via ``_apply_config_and_initialize`` and return
+        ``(new_inner_sid, True)``.
+      - The fallback-after-failure case logs a loud WARNING: it means the
+        agent's conversation context was lost unexpectedly (e.g., the
+        session JSONL isn't where Claude Code expects it) and callers
+        should treat this as a bug signal rather than steady state.
+
+    Idempotent in the useful sense: calling with the same ``inner_sid`` on
+    a fresh ``AcpClient`` should always reattach to the same conversation.
+    """
+    agent_type = (
+        (agent_record.config.agent_type or "claude")
+        if agent_record.config else "claude"
+    )
+    mcp = agent_record.config.mcp_servers if agent_record.config else None
+
+    if inner_sid:
+        try:
+            await client.handshake(acp_session_id, agent_type)
+            await client._send_rpc(acp_session_id, "session/load", {
+                "sessionId": inner_sid,
+                "cwd": cwd,
+                "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
+            })
+            client.set_inner_session_id(acp_session_id, inner_sid)
+            try:
+                await client.set_mode(acp_session_id, "bypassPermissions")
+            except Exception:
+                pass
+            return inner_sid, False
+        except Exception as load_err:
+            log.warning(
+                "session/load failed (inner_sid=%s, cwd=%s): %r — "
+                "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
+                inner_sid, cwd, load_err,
+            )
+
+    # Genuinely fresh (no inner_sid) or load failed — start a new session.
+    await _apply_config_and_initialize(
+        client, agent_record.config, acp_session_id, cwd,
+    )
+    return client.get_inner_session_id(acp_session_id), True
 
 
 # ---------------------------------------------------------------------------
@@ -2427,58 +2514,26 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
 
     client = AcpClient(supervisor_url)
     acp_session_id = str(uuid.uuid4())
-    inner_sid = session_row.get("inner_session_id")
     # Use agent config cwd to avoid initializing into a directory that may
     # not exist on the sandbox filesystem.
     cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
-    mcp = agent_record.config.mcp_servers if agent_record.config else None
 
-    if inner_sid:
-        try:
-            await client.handshake(acp_session_id, agent_type)
-            await client._send_rpc(acp_session_id, "session/load", {
-                "sessionId": inner_sid, "cwd": cwd,
-                "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
-            })
-            client.set_inner_session_id(acp_session_id, inner_sid)
-            # Match the mode that session/new sets on a fresh session —
-            # otherwise a reloaded session inherits the default
-            # "ask-before-every-tool" mode and the agent starts refusing
-            # shell commands after any sandbox restart.
-            try:
-                await client.set_mode(acp_session_id, "bypassPermissions")
-            except Exception:
-                pass
-        except Exception as load_err:
-            log.warning(
-                "session/load failed for session %s (inner_sid=%s, cwd=%s): %r",
-                session_id, inner_sid, cwd, load_err, exc_info=True,
-            )
-            # Dump supervisor log tail (Daytona only) so the next run-through
-            # has a real stack trace instead of the JSON-RPC "Internal error".
-            if vol.provider == "daytona":
-                try:
-                    tail = await _tail_daytona_supervisor_log(
-                        sandbox.sandbox_ref, supervisor_port, lines=120
-                    )
-                    log.warning("session/load sup.log tail (sandbox=%s):\n%s",
-                                sandbox.sandbox_ref[:16], tail)
-                except Exception as tail_err:
-                    log.warning("could not fetch sup.log: %s", tail_err)
-            log.warning("falling back to fresh session for %s", session_id)
-            inner_sid = None
-    if not inner_sid:
-        # Fresh conversation — wrap in wait_for with generous timeout.
-        await asyncio.wait_for(
-            _apply_config_and_initialize(client, agent_record.config, acp_session_id, cwd),
-            timeout=120,
+    # Single source of truth for "get me an attached ACP session" — tries
+    # session/load when an inner_sid exists and only falls through to
+    # session/new when there's nothing to resume or when the load raised.
+    inner_sid, started_fresh = await asyncio.wait_for(
+        _attach_acp_session(
+            client, acp_session_id, agent_record,
+            inner_sid=session_row.get("inner_session_id"),
+            cwd=cwd,
+        ),
+        timeout=120,
+    )
+    if started_fresh and inner_sid:
+        await upsert_session(
+            session_id, agent_id, sandbox.id, inner_sid,
+            volume_id=session_row.get("volume_id"),
         )
-        inner_sid = client.get_inner_session_id(acp_session_id)
-        if inner_sid:
-            await upsert_session(
-                session_id, agent_id, sandbox.id, inner_sid,
-                volume_id=session_row.get("volume_id"),
-            )
 
     state = SessionState(
         session_id=session_id, agent_id=agent_id, sandbox_id=sandbox.id,
@@ -2859,16 +2914,23 @@ async def sessions_quick_create(request: Request):
     acp_session_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
     client = AcpClient(url)
+    # Brand-new session → inner_sid=None, so _attach_acp_session goes
+    # straight to session/new. Routing through the shared helper keeps
+    # sessions_quick_create / _ensure_runtime_locked / SSE-reader recovery
+    # all using a single attach path, so the invariant "session/load first
+    # when we have an inner_sid" can't accidentally get skipped here later.
+    synthetic_agent = AgentRecord(id=agent_id, name=data.get("name"), config=config)
     try:
-        await _apply_config_and_initialize(client, config, acp_session_id, cwd)
+        inner_session_id, _ = await _attach_acp_session(
+            client, acp_session_id, synthetic_agent,
+            inner_sid=None, cwd=cwd,
+        )
     except Exception as e:
         try:
             await client.aclose()
         except Exception:
             pass
         await _cleanup_and_raise("Failed to connect to ACP supervisor: {e}", e)
-
-    inner_session_id = client.get_inner_session_id(acp_session_id)
     state = SessionState(
         session_id=session_id, agent_id=agent_id, sandbox_id=sandbox_id,
         acp_session_id=acp_session_id, inner_session_id=inner_session_id,

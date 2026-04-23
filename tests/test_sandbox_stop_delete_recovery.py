@@ -404,3 +404,114 @@ async def test_session_resume_after_delete(provider):
             f"session context lost after sandbox delete — volume-backed conversation "
             f"state not restored: {reply2}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test: midstream sandbox stop (UI-flow reproduction)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_session_survives_midstream_sandbox_stop(provider):
+    """SSE upstream death triggers sandbox recovery — MUST resume, not reset.
+
+    Reproduces the exact failure mode from the UI flow: user chats, then
+    the sandbox is stopped out-of-band (Daytona dashboard button, docker
+    stop, kill -9 on local supervisor). The user doesn't POST a message
+    right away — the server's own SSE reader detects the upstream death
+    through failed reconnects and enters its background recovery path.
+
+    Distinct from ``test_session_resume_after_stop`` which immediately sends
+    a new POST /message and thereby exercises the ``_ensure_runtime_locked``
+    path. The bug this test catches lives in the SSE-reader's own recovery
+    block, which used to ALWAYS create a fresh session via ``session/new``
+    regardless of whether the existing conversation was resumable — so the
+    agent would silently start over with no memory of prior turns, and the
+    DB's ``inner_session_id`` would be overwritten before the user's next
+    message ever arrived.
+
+    Regression guards:
+
+      A. ``inner_session_id`` on the session row MUST NOT change across the
+         recovery. If it changes, the server silently created a new
+         conversation when it could have resumed — the exact bug.
+
+      B. The agent recalls a product the USER never typed (only the agent
+         replied with it in turn 1). Rules out the "agent echoes what's in
+         the user-turn JSONL line" false-positive recall pattern.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        inner_sid_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
+
+        # Turn 1: agent computes a value that was NOT in the prompt.
+        # 317 * 419 = 132823. The user's message contains 317 and 419 but
+        # not the product, so a later recall of 132823 proves the agent's
+        # own reply was persisted and restored, not just echoed from the
+        # user-turn line of the JSONL.
+        reply1 = await _ask(
+            client, session_id,
+            "Please compute 317 * 419 (use `echo $((317*419))` in a shell if "
+            "it helps). Reply on a single line as `PRODUCT=<value>` so I can "
+            "parse it.",
+        )
+        print(f"[test:{provider}] turn1 reply: {reply1[:200]!r}")
+        product = _extract_kv(reply1, "PRODUCT")
+        assert product == "132823", (
+            f"agent didn't compute the product correctly, cannot proceed: {reply1!r}"
+        )
+
+        # External stop — the exact UI scenario the user reproduced manually.
+        sandbox = await _get_sandbox(client, session_id)
+        print(f"[test:{provider}] stopping sandbox {sandbox.get('sandbox_ref', '?')[:20]} externally")
+        await _external_stop(sandbox)
+
+        # Wait for the SSE reader's retries to exhaust and the recovery
+        # path to complete. Reader backoff is 1,2,4,8,10s over 5 retries
+        # (~25–35s), plus ~10s to start the sandbox + attach the ACP
+        # session. Budget 60s so we comfortably clear that window.
+        print(f"[test:{provider}] waiting 60s for SSE-reader recovery to fire")
+        await asyncio.sleep(60)
+
+        # INVARIANT A — deterministic: inner_session_id in the live SessionState
+        # must survive recovery. We read from /admin/sessions (in-memory), not
+        # GET /sessions/{id} (DB) — the buggy SSE-reader recovery path mutates
+        # state.inner_session_id in memory but doesn't upsert_session, so the
+        # DB stays stale and the DB-backed check would silently pass.
+        admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
+        in_mem = next(
+            (s for s in admin.get("sessions", []) if s["session_id"] == session_id),
+            None,
+        )
+        assert in_mem is not None, f"session {session_id[:8]} missing from in-memory SESSIONS"
+        inner_sid_after = in_mem.get("inner_session_id")
+        print(f"[test:{provider}] in-memory inner_sid after recovery: {inner_sid_after}")
+        assert inner_sid_after == inner_sid_before, (
+            f"inner_session_id changed across SSE-reader recovery — server "
+            f"silently created a new conversation instead of resuming the "
+            f"existing one: {inner_sid_before!r} → {inner_sid_after!r}"
+        )
+
+        # INVARIANT B — behavioral recall. The number 132823 is the agent's
+        # own computation from turn 1. Recalling it requires the assistant
+        # turn to have landed on disk AND session/load to have actually
+        # resumed it after recovery.
+        reply2 = await _ask(
+            client, session_id,
+            "What was the product you computed earlier in this conversation? "
+            "Reply with just the number.",
+        )
+        print(f"[test:{provider}] turn2 reply (after recovery): {reply2[:200]!r}")
+        # Strip thousands separators and whitespace so "132,823" / "132 823" /
+        # "132823" all count as a match. What we care about is that the
+        # digits appear somewhere in the reply; the agent choosing to format
+        # with commas is LLM flavor, not a recovery-path failure.
+        normalized = _re.sub(r"[,\s_]", "", reply2)
+        assert "132823" in normalized, (
+            f"agent lost conversation context across SSE recovery — cannot "
+            f"recall its own prior reply: {reply2!r}"
+        )
