@@ -838,3 +838,102 @@ async def test_persistent_sse_stop_then_message(provider):
                 f"server's state rebuild dropped the UI's subscribers and "
                 f"events for the new prompt went nowhere: {reply2!r}"
             )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_persistent_sse_external_delete_then_message(provider):
+    """UI repro for an OUT-OF-BAND sandbox delete (Daytona dashboard, ``docker rm``,
+    ``kill -9``) with a persistent /events stream held open.
+
+    Different from test_persistent_sse_delete_sandbox_then_message, this
+    one does NOT go through the server's DELETE endpoint — the server
+    only learns the sandbox is gone when its SSE reader observes
+    upstream disconnect. The reader-initiated recovery (``_rebind_state``
+    or fresh provision) must keep the UI's subscriber list intact so
+    the next /message's events reach the persistent stream.
+
+    Invariant: turn 2 returns a non-empty reply on the SAME persistent
+    /events stream the UI opened before the external delete.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(client, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            # Out-of-band delete — server finds out via SSE disconnect.
+            sandbox = await _get_sandbox(client, session_id)
+            await _external_delete(sandbox)
+            await asyncio.sleep(4)
+
+            reply2 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply2.strip(), (
+                f"turn 2 lost on persistent SSE after external delete+delay: "
+                f"the SSE reader's recovery path dropped the UI's subscribers. "
+                f"Reply was: {reply2!r}"
+            )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_persistent_sse_delete_sandbox_then_message(provider):
+    """UI repro for the `DELETE /sandboxes/{id}` + persistent /events flow.
+
+    User-reported: open UI (which holds /events), send msg, wait for reply,
+    delete the sandbox via the API, wait a few seconds, send another msg
+    — agent never replies.
+
+    Invariant (deterministic, no LLM-prose dependency):
+      A. Turn 2 returns a non-empty reply on the PERSISTENT stream.
+
+    The bug this catches is in ``delete_sandbox_route``: without
+    ``force=True`` on _shutdown_session_state, the presence of the UI's
+    /events subscriber makes the shutdown a no-op, leaving a zombie
+    SessionState whose SSE reader is still retrying the dead URL. Fresh
+    /message builds new state; events for the new prompt land on the
+    fresh state's (empty) subscriber list. The UI's reconnect to /events
+    lands on yet another state. Events lost; UI sees no reply.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        inner_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
+
+        async with _PersistentSse(client, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            # DELETE the sandbox via the server API (the exact UI path).
+            sess_row = (await client.get(f"{SERVER}/sessions/{session_id}", timeout=10)).json()
+            sbid = sess_row.get("current_sandbox_id") or sess_row.get("sandbox_id")
+            assert sbid, f"no current sandbox on session: {sess_row}"
+            r = await client.delete(f"{SERVER}/sandboxes/{sbid}", timeout=30)
+            assert r.status_code in (200, 204), f"delete sandbox failed: {r.text}"
+
+            # Wait — the UI's SSE stream may observe stream-end here; the
+            # _PersistentSse helper reconnects automatically.
+            await asyncio.sleep(4)
+
+            reply2 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply2.strip(), (
+                f"turn 2 lost on persistent SSE after delete+delay: the "
+                f"server's zombie-state path dropped events for the new "
+                f"sandbox. Reply was: {reply2!r}"
+            )

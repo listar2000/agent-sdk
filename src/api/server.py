@@ -243,6 +243,20 @@ async def _shutdown_session_state(
         except Exception as e:
             log.warning("failed to kill supervisor port %d for session %s: %s",
                         state.supervisor_port, state.session_id, e)
+    # Kick any subscribers before releasing the state. Without this, a UI
+    # holding a persistent /events stream stays blocked on the orphaned
+    # queue forever — the cancelled SSE reader doesn't broadcast the
+    # sentinel. Kicking wakes the /events handler's ``q.get()`` which
+    # then sees ``shutdown`` and returns, so the UI can reconnect and
+    # subscribe to the replacement state.
+    state.broadcast(_SSE_SENTINEL)
+    for q in state._session_subscribers:
+        state._kick_subscriber(q)
+    state._session_subscribers.clear()
+    for rpc_qs in state._rpc_subscribers.values():
+        for q in rpc_qs:
+            state._kick_subscriber(q)
+    state._rpc_subscribers.clear()
     if remove and SESSIONS.get(state.session_id) is state:
         SESSIONS.pop(state.session_id, None)
         _session_locks.pop(state.session_id, None)
@@ -1614,11 +1628,27 @@ async def delete_sandbox_route(sandbox_id: str):
     # Hold the sandbox lock to prevent concurrent auto-restart
     # from restarting the sandbox while we're deleting it.
     async with _get_sandbox_lock(sandbox_id):
-        # Clean up sessions BEFORE removing the instance so that
-        # concurrent requests still see the sandbox as existing.
-        for sid, state in list(SESSIONS.items()):
+        # Clean up sessions BEFORE removing the instance. ``force=True``
+        # is required: without it, _shutdown_session_state early-returns
+        # when the session still has an /events subscriber (UI holding
+        # a persistent SSE stream), leaving a zombie SessionState pointing
+        # at the soon-to-be-deleted sandbox. The zombie's SSE reader then
+        # keeps retrying the dead URL while the UI receives nothing.
+        # Also NULL out current_sandbox_id so the next ensure_sandbox takes
+        # the Case A ("no sandbox") path cleanly.
+        affected = any(
+            state.sandbox_id == sandbox_id for state in SESSIONS.values()
+        )
+        for state in list(SESSIONS.values()):
             if state.sandbox_id == sandbox_id:
-                await _shutdown_session_state(state, remove=True)
+                await _shutdown_session_state(state, remove=True, force=True)
+        if affected:
+            async with get_db() as conn:
+                await conn.execute(
+                    "UPDATE sessions SET current_sandbox_id = NULL "
+                    "WHERE current_sandbox_id = %s",
+                    (sandbox_id,),
+                )
 
         instance = _INSTANCES.pop(sandbox_id, None)
         _sandbox_locks.pop(sandbox_id, None)
@@ -1849,7 +1879,9 @@ async def admin_reap_session(session_id: str):
         raise HTTPException(404, "session not in memory")
 
     sandbox_id = state.sandbox_id
-    await _shutdown_session_state(state, remove=True, mark_idle_at=time.time())
+    # force=True: admin reap is explicit user action, don't let an open
+    # /events subscriber make it a no-op.
+    await _shutdown_session_state(state, remove=True, force=True, mark_idle_at=time.time())
 
     stopped_provider: str | None = None
     if sandbox_id and not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
