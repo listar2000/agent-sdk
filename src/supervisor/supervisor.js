@@ -84,13 +84,50 @@ try {
   log(`mkdir root failed: ${e.message}`);
 }
 
-if (args.snapshotPath && fs.existsSync(args.snapshotPath)) {
-  log(`restoring workspace from ${args.snapshotPath}`);
-  const r = spawnSync("tar", ["-xf", args.snapshotPath, "-C", args.root], {
-    stdio: ["ignore", "inherit", "inherit"],
-  });
-  if (r.status !== 0) {
-    log(`restore exited rc=${r.status}; continuing without restore`);
+// S3-backed FUSE (Daytona) has write→read visibility lag — often 5-15s
+// under load. When a sandbox is replaced immediately after an external
+// daytona.delete, the new sandbox can start before the previous one's
+// snapshot.tar is visible on the new mount. A single existsSync() check
+// would miss it and skip the restore, silently losing turn-1 conversation
+// state. Poll for up to 15s — cheap when the file truly doesn't exist
+// (fresh sandbox: each poll is one FUSE stat), recovers the post-delete
+// case within typical S3 propagation windows. Also do an explicit `ls` on
+// the parent dir before stating to invalidate any stale FUSE dentry cache.
+function _snapshotVisible(path, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const parent = path.replace(/\/[^\/]+$/, "") || "/";
+  let first = true;
+  while (Date.now() < deadline) {
+    // Force FUSE to refresh the parent's dir listing — mountpoint-s3 caches
+    // readdir results and existsSync alone may return false for a file that
+    // just appeared on the backing S3 bucket.
+    try { spawnSync("ls", [parent], { stdio: "ignore" }); } catch {}
+    try {
+      if (fs.existsSync(path)) {
+        if (!first) {
+          log(`snapshot became visible after poll (${Date.now() - (deadline - timeoutMs)}ms)`);
+        }
+        return true;
+      }
+    } catch {}
+    first = false;
+    spawnSync("sleep", ["0.25"]);
+  }
+  return false;
+}
+
+if (args.snapshotPath) {
+  const visible = _snapshotVisible(args.snapshotPath, 15000);
+  if (visible) {
+    log(`restoring workspace from ${args.snapshotPath}`);
+    const r = spawnSync("tar", ["-xf", args.snapshotPath, "-C", args.root], {
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    if (r.status !== 0) {
+      log(`restore exited rc=${r.status}; continuing without restore`);
+    }
+  } else {
+    log(`snapshot ${args.snapshotPath} not visible after 15s — assuming fresh sandbox`);
   }
 }
 
