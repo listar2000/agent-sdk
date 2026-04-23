@@ -266,9 +266,13 @@ def _session_idle_since(state: SessionState) -> float:
 
 IDLE_TIMEOUT_S = int(os.environ.get("SANDBOX_IDLE_TIMEOUT", "300"))  # 5 min default
 REAPER_TICK_S = int(os.environ.get("SANDBOX_REAPER_TICK", "60"))
-_SSE_MAX_IDLE_RETRIES = (
-    5  # max consecutive reconnect attempts when idle before giving up
-)
+_SSE_MAX_IDLE_RETRIES = int(os.environ.get("SSE_MAX_IDLE_RETRIES", "2"))
+# Upper bound on consecutive reconnect attempts before triggering sandbox
+# recovery. Was 5 (~25s of backoff) — cut to 2 (~3s) because the unified
+# recovery path (_recover_after_disconnect → _ensure_state_live) is cheap
+# when the URL actually IS healthy (one 2-retry health probe, then return)
+# and the 5-retry ladder was dominated by time wasted hammering a dead
+# daytona preview URL.
 
 
 async def _reap_one_tick(now: float) -> None:
