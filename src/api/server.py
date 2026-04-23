@@ -2662,12 +2662,16 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
     acp_session_id = str(uuid.uuid4())
     # cwd determines the hash under which Claude Code writes the session
     # JSONL (~/.claude/projects/<hash>/<inner_sid>.jsonl). For session/load
-    # to find the same file on a replacement sandbox, cwd must match the
-    # one used by session/new. ``root`` is the sandbox HOME — stable for
-    # the lifetime of the agent's volume subpath — and therefore the right
-    # anchor. Falling back to /tmp broke every golden recovery test because
-    # the hash changed across restart.
-    cwd = root
+    # to find the same file on a replacement sandbox, cwd MUST match the
+    # one that was passed to session/new. The agent's stored config.cwd
+    # captures exactly that: it's what sessions_quick_create used at
+    # create-time (default_cwd_for_provider for the provider). HOME is
+    # always the sandbox's root regardless of cwd, so ``~/.claude/projects``
+    # still lands in a persistent location. Falling back to root (the
+    # sandbox HOME) breaks recovery for any agent whose original session
+    # was created with cwd != root — e.g. local provider where default cwd
+    # is /tmp.
+    cwd = (agent_record.config.cwd or "/tmp") if agent_record.config else "/tmp"
 
     # Single source of truth for "get me an attached ACP session" — tries
     # session/load when an inner_sid exists and only falls through to
