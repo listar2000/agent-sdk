@@ -123,6 +123,12 @@ class SessionState:
     # Persistent SSE reader — connects once at session creation, fans out to subscribers
     _reader_task: object | None = field(default=None, repr=False)  # asyncio.Task
     _reader_alive: bool = field(default=False, repr=False)
+    # True only while the upstream SSE stream is actively connected (between
+    # a successful raise_for_status and the stream's exit). Unlike
+    # _reader_alive (task running, possibly in retry backoff), this is the
+    # "supervisor is definitely responsive" signal the hot-path fast-check
+    # uses to skip a redundant health probe on every POST /message.
+    _reader_connected: bool = field(default=False, repr=False)
     _log_chain: object | None = field(default=None, repr=False)
     errors: deque = field(default_factory=lambda: deque(maxlen=100), repr=False)
 

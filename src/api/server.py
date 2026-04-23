@@ -649,12 +649,18 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
 
 async def _ensure_state_live(state: SessionState, sandbox: SandboxRecord) -> None:
     """Ensure `state` points at a live, healthy supervisor. Caller holds
-    the session lock. Fast path: health-probe the current URL. Slow path:
-    rebind in place (which does NOT disturb subscribers).
+    the session lock.
 
-    Port-based fast-fail: if the cached subprocess is confirmed dead, skip
-    the ~2s health probe entirely and go straight to rebind.
+    Fast paths, in order:
+      (1) reader is actively streaming an upstream connection → trust it,
+          no probe needed (saves ~100ms on the hot /message path).
+      (2) port-based fast-fail: cached subprocess confirmed dead → skip
+          probe, go straight to rebind.
+      (3) health-probe the current URL; return if it answers.
+    Slow path: rebind in place (preserves subscribers).
     """
+    if state.supervisor_url and state._reader_connected:
+        return
     from .providers import _wait_for_health
     if state.supervisor_url and state._reader_alive:
         cached = _INSTANCES.get(state.sandbox_id)
@@ -731,6 +737,7 @@ def _start_sse_reader(state: SessionState) -> None:
                         resp.raise_for_status()
                         reconnect_delay_s = 1.0
                         attempt = 0
+                        state._reader_connected = True
                         log.info("[SSE-READER] upstream stream connected for session %s "
                                  "(attempt=%d, status=%d)",
                                  state.session_id, attempt, resp.status_code)
@@ -760,6 +767,7 @@ def _start_sse_reader(state: SessionState) -> None:
                                 "on attempt %d without an exception",
                                 state.session_id, attempt)
                 finally:
+                    state._reader_connected = False
                     if sse_http is not None:
                         try:
                             await sse_http.aclose()
