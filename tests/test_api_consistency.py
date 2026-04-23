@@ -269,3 +269,58 @@ async def test_post_sessions_quick_missing_volume_id_uses_default(client):
     # Success path (200) — or a clean 5xx if the mocked flow hits an
     # unpatched branch. The point: NOT 400 "volume_id is required".
     assert r.status_code != 400, f"should not reject missing volume_id: {r.text}"
+
+
+# ---------------------------------------------------------------------------
+# Session-recovery edge cases migrated from the deleted test_session_recovery.py.
+# The rest of that file was mock-tautology ("did the mock get called?") that
+# golden-suite recovery tests already exercise end-to-end. These two are
+# narrow regressions the golden suite doesn't cover.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_message_on_truly_gone_session_returns_404(client):
+    """If the session is absent from both SESSIONS and the DB, /message → 404."""
+    with patch("api.server.get_session", AsyncMock(return_value=None)):
+        r = await client.post("/sessions/gone-forever/message", json={"message": "hi"})
+    assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_sandbox_instance_refreshes_stale_daytona_instance():
+    """``_resolve_sandbox_instance`` must re-run ``_ensure_sandbox_alive`` when
+    the cached ProviderInstance's URL is stale. The Daytona preview URL has a
+    24h TTL, so a stale cache entry silently breaks reads until we refresh."""
+    from api.models import SandboxRecord
+    from api.providers import ProviderInstance
+    from api.server import _resolve_sandbox_instance, _INSTANCES
+
+    sandbox_id = "sandbox-stale-instance"
+    stale = ProviderInstance(
+        provider="daytona",
+        url="https://old-daytona-url.example.com",
+        sandbox_id="daytona-old",
+    )
+    fresh = ProviderInstance(
+        provider="daytona",
+        url="https://new-daytona-url.example.com",
+        sandbox_id="daytona-new",
+    )
+    _INSTANCES[sandbox_id] = stale
+    try:
+        async def fake_ensure(*args, **kwargs):
+            _INSTANCES[sandbox_id] = fresh
+            return fresh.url, False
+
+        with patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
+            id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
+        ))), patch(
+            "api.server._ensure_sandbox_alive", AsyncMock(side_effect=fake_ensure)
+        ) as mock_ensure:
+            resolved = await _resolve_sandbox_instance(sandbox_id)
+
+        assert resolved is fresh
+        mock_ensure.assert_awaited_once()
+    finally:
+        _INSTANCES.pop(sandbox_id, None)
