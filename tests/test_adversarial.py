@@ -339,7 +339,6 @@ class TestAgentTypes:
 # ===========================================================================
 
 
-
 # ===========================================================================
 # 3. Server Helpers
 # ===========================================================================
@@ -1067,7 +1066,6 @@ class TestRaiseForStatus:
 # ===========================================================================
 
 
-
 # ===========================================================================
 # 11. Adversarial: Concurrent and race-condition scenarios
 # ===========================================================================
@@ -1246,7 +1244,6 @@ def _mock_response(status_code: int, body: dict) -> MagicMock:
 # ── Iteration 2: Tests for new features ──
 
 
-
 class TestRedactionIntegration:
     """Test that redaction is integrated into server log paths."""
 
@@ -1357,72 +1354,6 @@ class TestMergeTopLevelConfig:
 # NOTE: the ``TestDeriveSandboxRef`` suite was removed alongside
 # api.server._derive_sandbox_ref in the volume-refactor. sandbox_ref semantics
 # are now provider-specific and covered by the provider unit tests.
-
-
-
-
-# ── Iteration 3: Pipeline enhancements, auto-install, install endpoint ──
-
-
-
-
-# ── Iteration 4: Callbacks, broadcast, exports ──
-
-
-
-
-
-class TestSDKExports:
-    """Test that all expected names are exported from agent_sdk."""
-
-    def test_agent_exported(self):
-        from agent_sdk import Agent
-        assert Agent is not None
-
-
-    def test_session_record_exported(self):
-        from agent_sdk import SessionRecord
-        assert SessionRecord is not None
-
-    def test_sqlite_session_driver_exported(self):
-        from agent_sdk import SqliteSessionDriver
-        assert SqliteSessionDriver is not None
-
-    def test_all_list_complete(self):
-        import agent_sdk
-        for name in agent_sdk.__all__:
-            assert hasattr(agent_sdk, name), f"{name} in __all__ but not accessible"
-
-
-# ── Iteration 5: Structured errors, sandbox lifecycle ──
-
-
-
-
-
-class TestErrorsAllExported:
-    """Verify __all__ is comprehensive."""
-
-    def test_all_exports_are_valid(self):
-        import agent_sdk
-        for name in agent_sdk.__all__:
-            obj = getattr(agent_sdk, name, None)
-            assert obj is not None, f"{name} in __all__ but not accessible"
-
-    def test_error_count(self):
-        """We should have exactly 8 error classes exported."""
-        from agent_sdk import errors
-        error_classes = [
-            name for name in dir(errors)
-            if isinstance(getattr(errors, name), type)
-            and issubclass(getattr(errors, name), Exception)
-            and name != 'Exception'
-        ]
-        assert len(error_classes) == 8
-
-
-# ── Iteration 6: Config files, conversation export, retry backoff ──
-
 class TestAgentFromFile:
     """Test Agent.from_file config loading."""
 
@@ -1492,67 +1423,6 @@ class TestAgentFromFile:
         assert agent.agent_type == "claude"
         assert agent.prompt == "You are a test bot"
         assert agent.tools == ["Read", "Edit"]
-
-
-
-
-
-
-
-class TestRedactCaching:
-    """Test that redact caches home directory."""
-
-    def test_home_cached_at_module_level(self):
-        from api.redact import _HOME
-        import os
-        assert _HOME == os.path.expanduser("~")
-
-    def test_redact_uses_cached_home(self):
-        """Verify the function uses _HOME not os.path.expanduser."""
-        import inspect
-        from api.redact import redact_secrets
-        source = inspect.getsource(redact_secrets)
-        assert "_HOME" in source
-        # Should NOT call expanduser inside the function
-        assert "expanduser" not in source
-
-
-class TestErrorClassesClean:
-    """Test error classes have clean definitions."""
-
-    def test_no_pass_in_errors(self):
-        """Error classes with docstrings should not have pass."""
-        import inspect
-        from agent_sdk import errors
-        source = inspect.getsource(errors)
-        # Count 'pass' occurrences - should be 0 since all classes have docstrings
-        lines = [l.strip() for l in source.split("\n")]
-        pass_lines = [l for l in lines if l == "pass"]
-        assert len(pass_lines) == 0
-
-
-class TestServerImportsClean:
-    """Test server module-level imports are clean."""
-
-    def test_redact_imported_at_module_level(self):
-        """Verify redact_secrets is imported at module level, not inline."""
-        import inspect
-        from api.server import _bg_log
-        source = inspect.getsource(_bg_log)
-        # Should NOT have 'from .redact import' inside the function
-        assert "from .redact" not in source
-
-    def test_response_imported_at_module_level(self):
-        """Verify Response is in top-level imports."""
-        from api.server import Response
-        from fastapi.responses import Response as FastAPIResponse
-        assert Response is FastAPIResponse
-
-
-# ── Iteration 8: Token tracking, agent cloning ──
-
-
-
 class TestAgentClone:
     """Test Agent.clone()."""
 
@@ -1599,125 +1469,6 @@ class TestAgentClone:
         agent.usage.call_count = 5
         cloned = agent.clone()
         assert cloned.usage.call_count == 0  # fresh stats
-
-
-# ── Iteration 9: Structured output, AgentPool ──
-
-
-
-class TestRedactHomeGuard:
-    """Test that redact handles root home directory safely."""
-
-    def test_redact_home_guard_exists(self):
-        from api.redact import _REDACT_HOME, _HOME
-        # If home is not "/" (normal case), should redact
-        if _HOME != "/":
-            assert _REDACT_HOME is True
-        else:
-            assert _REDACT_HOME is False
-
-    def test_slash_not_replaced(self):
-        from api.redact import redact_secrets
-        # A path with just slashes should not be destroyed
-        text = "/usr/local/bin/python"
-        result = redact_secrets(text)
-        assert "/usr/local/bin/python" in result
-
-
-
-
-# ── Iteration 12: from_env, info property ──
-
-
-
-
-
-# ── Iteration 13: Agent.map() ──
-
-
-# ── Iteration 14: Type-safe constants ──
-
-class TestAgentTypeConstants:
-    """Test agent type and provider constants."""
-
-    def test_all_agent_types_defined(self):
-        from agent_sdk import CLAUDE, CODEX
-        assert CLAUDE == "claude"
-        assert CODEX == "codex"
-
-    def test_agent_types_frozenset(self):
-        from agent_sdk import AGENT_TYPES
-        assert isinstance(AGENT_TYPES, frozenset)
-        assert len(AGENT_TYPES) == 8
-        for at in ("claude", "codex", "opencode", "gemini", "cline", "deepagents", "openhands", "goose"):
-            assert at in AGENT_TYPES
-        assert "invalid" not in AGENT_TYPES
-
-    def test_provider_constants_defined(self):
-        from agent_sdk import LOCAL, DOCKER, DAYTONA
-        assert LOCAL == "local"
-        assert DOCKER == "docker"
-        assert DAYTONA == "daytona"
-
-    def test_providers_frozenset(self):
-        from agent_sdk import PROVIDERS
-        assert isinstance(PROVIDERS, frozenset)
-        assert len(PROVIDERS) == 3
-
-    def test_constants_usable_in_agent_constructor(self):
-        from agent_sdk import Agent, CODEX, DOCKER
-        agent = Agent("test", agent_type=CODEX, provider=DOCKER)
-        assert agent.agent_type == "codex"
-        assert agent.provider == "docker"
-
-    def test_all_exports_still_valid(self):
-        import agent_sdk
-        for name in agent_sdk.__all__:
-            assert hasattr(agent_sdk, name), f"{name} in __all__ but missing"
-
-
-# ── Iteration 15: Prompt layering, event constants ──
-
-
-
-class TestEventTypeConstants:
-    """Test event type constants are defined and used."""
-
-    def test_constants_defined(self):
-        from api.models import (
-            EVT_USER_MESSAGE, EVT_ASSISTANT_MESSAGE,
-            EVT_TOOL_CALL, EVT_TOOL_RESULT, EVT_USAGE, EVT_ERROR,
-        )
-        assert EVT_USER_MESSAGE == "user_message"
-        assert EVT_ASSISTANT_MESSAGE == "assistant_message"
-        assert EVT_TOOL_CALL == "tool_call"
-        assert EVT_TOOL_RESULT == "tool_result"
-        assert EVT_USAGE == "usage"
-        assert EVT_ERROR == "error"
-
-    def test_constants_used_in_server(self):
-        """Verify server.py uses constants not raw strings."""
-        import inspect
-        from api.server import _process_sse_block
-        source = inspect.getsource(_process_sse_block)
-        assert "EVT_TOOL_CALL" in source
-        assert "EVT_USAGE" in source
-
-    def test_constants_used_in_flush(self):
-        import inspect
-        from api.server import _flush_buffered_text
-        source = inspect.getsource(_flush_buffered_text)
-        assert "EVT_ASSISTANT_MESSAGE" in source
-
-
-# ── Iteration 16: Validation, describe ──
-
-
-
-
-
-# ── Iteration 17: Bug fixes - Daytona state, lock cleanup, client consolidation ──
-
 class TestDaytonaStateFix:
     """Test that Daytona state comparison handles enums properly."""
 
@@ -1786,76 +1537,6 @@ class TestParallelShutdown:
         source = inspect.getsource(lifespan)
         assert "_safe_stop" in source
         assert "stop_instance" in source
-
-
-
-
-# ── Iteration 19: compare() for A/B testing ──
-
-# ── Iteration 21: Middleware system ──
-
-
-
-# ── Iteration 22: Code quality fixes ──
-
-
-
-# ── Iteration 23: fallback(), sandbox status constants ──
-
-class TestSandboxStatusConstants:
-    """Test sandbox status constants."""
-
-    def test_constants_defined(self):
-        from api.models import STATUS_RUNNING, STATUS_STOPPED, STATUS_ERROR, STATUS_CREATING
-        assert STATUS_RUNNING == "running"
-        assert STATUS_STOPPED == "stopped"
-        assert STATUS_ERROR == "error"
-        assert STATUS_CREATING == "creating"
-
-
-# ── Iteration 24: Version, logging config ──
-
-class TestSDKVersion:
-    """Test SDK version and logging."""
-
-    def test_version_defined(self):
-        import agent_sdk
-        assert hasattr(agent_sdk, '__version__')
-        assert isinstance(agent_sdk.__version__, str)
-        assert len(agent_sdk.__version__) > 0
-
-    def test_version_is_semver(self):
-        import agent_sdk
-        parts = agent_sdk.__version__.split(".")
-        assert len(parts) >= 2  # at least major.minor
-
-    def test_version_in_all(self):
-        import agent_sdk
-        assert "__version__" in agent_sdk.__all__
-
-
-# ── Iteration 25: reset_usage, Pipeline.reset ──
-
-
-
-# ── Iteration 26: Removed ──
-
-
-
-# ── Iteration 27: Config persistence ──
-
-
-
-# ── Iteration 28: Agent registry, process log tailing ──
-
-
-
-
-
-# ── Iteration 29: Agent identity, error context ──
-
-
-
 class TestErrorContext:
     """Test that errors include agent name."""
 
@@ -1871,9 +1552,7 @@ class TestErrorContext:
 # ── Iteration 31: astream_text, sync run ──
 
 
-
 # ── Iteration 32: Skill deployment ──
-
 
 
 # ── Iteration 34: Adversarial edge cases for later features ──
@@ -1896,10 +1575,7 @@ class TestUsageStatsEdgeCases:
         assert stats.total_tokens == 2 * 10**9
 
 
-
-
 # ── Iteration 35: Labels, convenience properties ──
-
 
 
 # ── Iteration 38: Server endpoint integration tests ──
@@ -2052,13 +1728,10 @@ class TestHealthEndpoint:
                 assert k in body and isinstance(body[k], int)
 
 
-
 # ── Iteration 40: SDK surface area validation ──
 
 
-
 # ── Iteration 42: Filesystem tree view ──
-
 
 
 # ── Iteration 45: SandboxError consolidation, parallel setup ──
@@ -2087,7 +1760,6 @@ class TestSandboxErrorConsolidation:
 # ── Iteration 46: Batch file reading ──
 
 
-
 # ── Iteration 47: Batch file writing ──
 
 
@@ -2097,12 +1769,7 @@ class TestSandboxErrorConsolidation:
 # ── Iteration 49: File download ──
 
 
-
 # ── Iteration 51: File diff, edge cases ──
-
-
-
-
 
 
 # ── Iteration 52: File search ──
@@ -2112,17 +1779,7 @@ class TestSandboxErrorConsolidation:
 # ── Iteration 54: file_exists, pip_install ──
 
 
-
 # ── Iteration 55: Push to 500 tests ──
-
-
-
-
-
-
-
-
-
 
 
 # ── Iteration 57: copy_file, reset_session fix ──
@@ -2150,72 +1807,6 @@ class TestResetSessionFix:
         assert agent.sandbox_id is None
         assert agent._registered is False
         assert agent._system_prompt_sent is False
-
-# ── Iteration 58: Sandbox env var management ──
-
-
-# ── Iteration 59: Sandbox introspection ──
-
-# ── Iteration 61: File metrics ──
-
-# ── Iteration 62: append_file, final method count ──
-
-
-
-# ── Iteration 63: run_python ──
-
-
-
-# ── Iteration 64: shell_json ──
-
-
-
-# ── Iteration 65: Final adversarial edge cases ──
-
-
-
-
-
-# ── Iteration 70: Final coverage push ──
-
-
-
-# ── Iteration 71: chmod, final tests ──
-
-
-
-
-# ── Iteration 72: chown, symlink ──
-
-
-# ── Iteration 73: Comprehensive method coverage ──
-
-
-
-
-
-class TestClonePreservesAll:
-    """Test clone preserves all config fields."""
-
-    def test_clone_preserves_agent_type(self):
-        from agent_sdk.client import Agent
-        agent = Agent("test", agent_type="codex")
-        cloned = agent.clone()
-        assert cloned.agent_type == "codex"
-
-    def test_clone_preserves_tools(self):
-        from agent_sdk.client import Agent
-        agent = Agent("test", tools=["Read", "Edit", "Write"])
-        cloned = agent.clone()
-        assert cloned.tools == ["Read", "Edit", "Write"]
-
-    def test_clone_preserves_cwd(self):
-        from agent_sdk.client import Agent
-        agent = Agent("test", cwd="/workspace")
-        cloned = agent.clone()
-        assert cloned.cwd == "/workspace"
-
-
 class TestValidationEdgeCases:
     """Test validation edge cases."""
 
@@ -2238,361 +1829,6 @@ class TestValidationEdgeCases:
                 Agent("test", provider=p)
                 prov_warnings = [x for x in w if "provider" in str(x.message)]
                 assert len(prov_warnings) == 0, f"Warning for valid provider {p}"
-
-
-# ── Iteration 74: head/tail ──
-
-# ── Iteration 75: touch, final checks ──
-
-
-
-# ── Iteration 76: glob_files ──
-
-# ── Iteration 77: Comprehensive file ops validation ──
-
-
-
-
-
-
-
-
-
-# ── Iteration 78: which, env_list ──
-
-# ── Iteration 79: 100th feature - hostname ──
-
-
-
-# ── Iteration 81: Push to 600 tests ──
-
-
-
-
-
-# ── Iteration 82: 600 tests milestone ──
-
-
-# ── Iteration 83: extract_archive ──
-
-# ── Iteration 84: uptime ──
-
-# ── Iteration 85: process_info, send_input ──
-
-
-# ── Iteration 86: Server proxy endpoints for process management ──
-
-
-# ── Iteration 87: Final comprehensive validation ──
-
-
-# ── Iteration 88: kill_process, delete_process ──
-
-
-# ── Iteration 89: clipboard operations ──
-
-
-# ── Iteration 90: Window management (90th milestone) ──
-
-# ── Iteration 92: Complete desktop ops validation ──
-
-
-
-
-
-
-
-
-
-# ── Iteration 93: Precision mouse/keyboard input ──
-
-# ── Iteration 94: Precision input server proxies ──
-
-
-# ── Iteration 95: Window/desktop server proxies ──
-
-
-
-# ── Iteration 96: Final edge cases ──
-
-
-
-
-
-# ── Iteration 97: Push to 675 tests ──
-
-
-
-
-class TestAgentMethodExistence:
-    def test_arun_exists(self):
-        from agent_sdk.client import Agent
-        assert hasattr(Agent, 'arun')
-
-    def test_aclose_exists(self):
-        from agent_sdk.client import Agent
-        assert hasattr(Agent, 'aclose')
-
-    def test_run_exists(self):
-        from agent_sdk.client import Agent
-        assert hasattr(Agent, 'run')
-
-    def test_clone_exists_or_not(self):
-        from agent_sdk.client import Agent
-        # just verify it's inspectable
-        import inspect
-        members = [n for n, _ in inspect.getmembers(Agent)]
-        assert 'arun' in members
-
-
-
-
-# ── Iteration 101: mouse_move, desktop_status ──
-
-
-# ── Iteration 102: Server proxies for mouse_move, desktop_status ──
-
-
-
-# ── Iteration 103: More adversarial edge cases ──
-
-
-
-class TestFromFileEdgeCases:
-    def test_from_file_yaml_extension(self):
-        """from_file detects .yaml extension."""
-        import inspect
-        from agent_sdk.client import Agent
-        source = inspect.getsource(Agent.from_file)
-        assert ".yaml" in source
-        assert ".yml" in source
-
-
-# ── Iteration 104: Push to 740 ──
-
-
-# ── Iteration 105: Additional tests to reach 740 ──
-
-
-
-
-
-
-
-class TestAgentStringOps:
-    def test_repr_contains_name(self):
-        from agent_sdk.client import Agent
-        assert "worker" in repr(Agent("worker"))
-
-    def test_str_contains_name(self):
-        from agent_sdk.client import Agent
-        assert "worker" in str(Agent("worker"))
-
-class TestErrorMessages:
-    def test_stream_error_message(self):
-        from agent_sdk.errors import StreamError
-        e = StreamError("[agent1] Connection lost")
-        assert "agent1" in str(e)
-
-    def test_prompt_error_message(self):
-        from agent_sdk.errors import PromptError
-        e = PromptError("[worker] Failed")
-        assert "worker" in str(e)
-
-    def test_timeout_error_message(self):
-        from agent_sdk.errors import AgentTimeoutError
-        e = AgentTimeoutError("30s timeout")
-        assert "30s" in str(e)
-
-class TestConstantsImmutable:
-    def test_agent_types_frozenset(self):
-        from agent_sdk import AGENT_TYPES
-        with pytest.raises(AttributeError):
-            AGENT_TYPES.add("new_type")
-
-    def test_providers_frozenset(self):
-        from agent_sdk import PROVIDERS
-        with pytest.raises(AttributeError):
-            PROVIDERS.add("new_provider")
-
-
-# ── Iteration 108: Additional coverage to reach 800 ──
-
-
-
-class TestAgentClone:
-    def test_clone_default_name(self):
-        from agent_sdk.client import Agent
-        a = Agent("parent")
-        c = a.clone()
-        assert c.name == "parent-clone"
-
-    def test_clone_custom_name(self):
-        from agent_sdk.client import Agent
-        a = Agent("parent")
-        c = a.clone(name="child")
-        assert c.name == "child"
-
-    def test_clone_inherits_model(self):
-        from agent_sdk.client import Agent
-        a = Agent("parent", model="sonnet")
-        c = a.clone()
-        assert c.model == "sonnet"
-
-    def test_clone_override_model(self):
-        from agent_sdk.client import Agent
-        a = Agent("parent", model="sonnet")
-        c = a.clone(model="haiku")
-        assert c.model == "haiku"
-
-    def test_clone_independent_usage(self):
-        from agent_sdk.client import Agent
-        a = Agent("parent")
-        a.usage.call_count = 9
-        c = a.clone()
-        assert c.usage.call_count == 0
-
-
-
-
-class TestErrorHierarchy:
-    def test_connection_error_is_sdk_error(self):
-        from agent_sdk.errors import AgentConnectionError, AgentSDKError
-        assert issubclass(AgentConnectionError, AgentSDKError)
-
-    def test_not_registered_is_sdk_error(self):
-        from agent_sdk.errors import AgentNotRegisteredError, AgentSDKError
-        assert issubclass(AgentNotRegisteredError, AgentSDKError)
-
-    def test_sandbox_error_is_sdk_error(self):
-        from agent_sdk.errors import SandboxError, AgentSDKError
-        assert issubclass(SandboxError, AgentSDKError)
-
-    def test_busy_error_is_sdk_error(self):
-        from agent_sdk.errors import AgentBusyError, AgentSDKError
-        assert issubclass(AgentBusyError, AgentSDKError)
-
-    def test_all_errors_catchable_as_base(self):
-        from agent_sdk.errors import (
-            AgentSDKError, AgentConnectionError, AgentNotRegisteredError,
-            SandboxError, AgentBusyError, AgentTimeoutError,
-            PromptError, StreamError,
-        )
-        for cls in (AgentConnectionError, AgentNotRegisteredError,
-                    SandboxError, AgentBusyError, AgentTimeoutError,
-                    PromptError, StreamError):
-            with pytest.raises(AgentSDKError):
-                raise cls("test")
-
-
-
-# ── Iteration 109: Push to 825 ──
-
-class TestServerEndpointCount:
-    """Verify all server proxy endpoints exist."""
-
-    @pytest.fixture(autouse=True)
-    def _clear(self):
-        SESSIONS.clear()
-        _INSTANCES.clear()
-        yield
-        SESSIONS.clear()
-        _INSTANCES.clear()
-
-    @pytest.mark.asyncio
-    async def test_health_endpoint(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/health")
-            assert r.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_agents_list_endpoint(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/agents")
-            assert r.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_sandboxes_list_endpoint(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sandboxes")
-            assert r.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_sessions_list_endpoint(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sessions")
-            assert r.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_agent_create_endpoint(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/agents", json={"name": "test109"})
-            assert r.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_session_status_404(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sessions/nonexistent/status")
-            assert r.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_session_resume_404(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.post("/sessions/nonexistent/resume")
-            assert r.status_code == 404
-
-
-# ── Iteration 111: More edge cases ──
-
-class TestRedactPatterns:
-    def test_redact_aws_key(self):
-        from api.redact import redact_secrets
-        assert "[REDACTED]" in redact_secrets("AKIAIOSFODNN7EXAMPLE")
-
-    def test_redact_github_token(self):
-        from api.redact import redact_secrets
-        assert "[REDACTED]" in redact_secrets("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij")
-
-    def test_redact_jwt(self):
-        from api.redact import redact_secrets
-        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
-        assert "[REDACTED]" in redact_secrets(jwt)
-
-    def test_redact_preserves_code(self):
-        from api.redact import redact_secrets
-        code = "def hello():\n    return 42\n"
-        assert redact_secrets(code) == code
-
-class TestSSEParsing:
-    def test_parse_sse_data_returns_none_for_comment(self):
-        from api.sse import parse_sse_data
-        assert parse_sse_data(": heartbeat") is None
-
-    def test_parse_sse_data_returns_none_for_empty(self):
-        from api.sse import parse_sse_data
-        assert parse_sse_data("") is None
-
-class TestSqlitePersistence:
-    def test_sqlite_driver_creates_table(self):
-        from agent_sdk.persist import SqliteSessionDriver
-        driver = SqliteSessionDriver(":memory:")
-        assert driver is not None
-
-    def test_sqlite_get_nonexistent(self):
-        from agent_sdk.persist import SqliteSessionDriver
-        driver = SqliteSessionDriver(":memory:")
-        assert driver.get_session("nonexistent") is None
-
-# ── Iteration 112: Push to 850 ──
-
-
-
-
-
-
-# ── Iteration 114: More edge cases ──
-
-
 class TestAgentRegistrationPayload:
     def test_payload_includes_name(self):
         from agent_sdk.client import Agent
@@ -2694,6 +1930,17 @@ class TestMidMessageDeath:
         )
         return state
 
+    def _patch_ensure_live(self, state):
+        """Return a context manager that stubs ensure_session_live to echo
+        this state. The real _execute_one_prompt re-resolves the session via
+        ensure_session_live at each turn (for kill-then-send retry); without
+        the stub the test would 404 because there's no DB."""
+        from unittest.mock import AsyncMock, patch
+        return patch(
+            "api.server.ensure_session_live",
+            AsyncMock(return_value=({}, None, state)),
+        )
+
     @pytest.mark.asyncio
     async def test_connect_error_surfaces_typed_rpc_error(self):
         """ConnectError raised by client.prompt is classified and dispatched."""
@@ -2713,7 +1960,8 @@ class TestMidMessageDeath:
         rpc_id = str(uuid.uuid4())
 
         # log_event is stubbed already by the module-level db stub; safe to call.
-        await _execute_one_prompt(state, rpc_id, "hello")
+        with self._patch_ensure_live(state):
+            await _execute_one_prompt(state, rpc_id, "hello")
 
         # Error was recorded on the session.
         assert len(state.errors) == 1, f"expected 1 error, got {state.errors}"
@@ -2761,7 +2009,8 @@ class TestMidMessageDeath:
         state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
 
         rpc_id = str(uuid.uuid4())
-        await _execute_one_prompt(state, rpc_id, "mid-stream death")
+        with self._patch_ensure_live(state):
+            await _execute_one_prompt(state, rpc_id, "mid-stream death")
 
         # Still only one error recorded; kind maps to 'unknown' (neither HTTP
         # status nor ConnectError/ReadTimeout match) but the exception_type
@@ -2798,7 +2047,8 @@ class TestMidMessageDeath:
         state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
 
         rpc_id = str(uuid.uuid4())
-        await _execute_one_prompt(state, rpc_id, "ping")
+        with self._patch_ensure_live(state):
+            await _execute_one_prompt(state, rpc_id, "ping")
 
         assert len(state.errors) == 1
         err = state.errors[0]
