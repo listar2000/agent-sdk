@@ -73,12 +73,13 @@ _ACP_LAUNCH_ARGS: dict[str, list[str]] = {
 _SUPERVISOR_REMOTE_PORT = 9100
 
 
-# Per-provider "where the agent's persistent HOME lives". For sandboxed
-# providers the volume is mounted at this path, so setting HOME and cwd here
-# keeps Claude Code's session JSONLs, ~/.claude/, and anything the agent
-# writes via ~/file.txt on the durable volume. /tmp is explicitly NOT the
-# default — it's ephemeral in containers and the agent's file writes would
-# disappear on sandbox restart/replace.
+# Per-provider "where the agent's persistent HOME lives". For docker this
+# is a volume mount (POSIX-real, append-safe). For daytona this is a local
+# ext4 directory inside the sandbox; the supervisor restores it from the
+# volume snapshot at startup and writes back after each turn, so the hot
+# filesystem never touches mountpoint-s3. /tmp is explicitly NOT the default
+# for local — the host filesystem is persistent anyway and tests expect
+# the volume path.
 _PROVIDER_VOLUME_HOME: dict[str, str] = {
     "daytona": "/home/daytona",
     "docker": "/home/agent",
@@ -164,6 +165,7 @@ def build_supervisor_argv(
     port: int,
     root: str,
     host: str = "0.0.0.0",
+    snapshot_path: str | None = None,
     quote_paths: bool = True,
 ) -> str:
     """Return the ``node supervisor.js ...`` argv string shared by every
@@ -171,17 +173,23 @@ def build_supervisor_argv(
     I/O redirection — Daytona prepends ``setsid env`` and appends ``&``,
     Docker uses ``exec`` as the container PID 1.
 
+    ``snapshot_path`` is Daytona-only: it's the path inside the sandbox
+    where the workspace tarball is restored from on boot and written to
+    after each turn-end. Docker and local providers leave this unset —
+    their volumes are POSIX-real and don't need the snapshot round-trip.
+
     ``quote_paths=False`` is for Daytona, whose paths are constants
     controlled by this package (no shell-metacharacter risk) and which
     built its command without quoting before the helper existed.
     """
     q = shlex.quote if quote_paths else (lambda s: s)
     acp_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in acp_launch_args)
+    snapshot_flag = f" --snapshot-path {q(snapshot_path)}" if snapshot_path else ""
     return (
         f"node {q(supervisor_js)} "
         f"--host {host} --port {port} "
         f"--acp {q(acp_bin)}{acp_flags} "
-        f"--root {q(root)}"
+        f"--root {q(root)}{snapshot_flag}"
     )
 
 
@@ -340,9 +348,17 @@ def _build_volume_mounts(volume_id: str | None, subpath: str | None):
     """Build the VolumeMount list for a Daytona sandbox. Returns None if no volume.
 
     Per-session sandboxes (subpath is a non-empty string) get three mounts:
-      - /home/daytona  → volume subpath (agent's home directory)
-      - /mnt/shared    → volume shared/ (cross-session shared data)
+      - /vol            → volume subpath (S3-backed; snapshot tarball lives here)
+      - /mnt/shared     → volume shared/ (cross-session shared data)
       - /opt/supervisor → volume system/supervisor/ (pre-installed supervisor)
+
+    The agent's HOME is ``/home/daytona`` — a local ext4 directory created
+    by the supervisor at boot — NOT the volume mount. The supervisor
+    restores that directory from ``/vol/snapshot.tar`` on startup and
+    writes a fresh snapshot after every turn-end. mountpoint-s3 can't
+    handle append-only writes (session JSONLs) or POSIX rename, so the
+    volume only ever sees single-file full-overwrite PUTs of the
+    snapshot tarball.
 
     Utility sandboxes (subpath is None or empty string) get a single whole-volume
     mount at /v. This avoids the supervisor mount failing before system/supervisor/
@@ -359,7 +375,7 @@ def _build_volume_mounts(volume_id: str | None, subpath: str | None):
         return [VolumeMount(volume_id=volume_id, mount_path="/v")]
     # Regular per-session sandbox: three named mounts.
     return [
-        VolumeMount(volume_id=volume_id, mount_path="/home/daytona", subpath=subpath),
+        VolumeMount(volume_id=volume_id, mount_path="/vol", subpath=subpath),
         VolumeMount(volume_id=volume_id, mount_path="/mnt/shared", subpath="shared"),
         VolumeMount(volume_id=volume_id, mount_path="/opt/supervisor", subpath="system/supervisor"),
     ]

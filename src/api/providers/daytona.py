@@ -34,14 +34,20 @@ _SUPERVISOR_REMOTE_DIR = "/tmp/agent-sdk-sup"  # legacy path (pre-volume era)
 _SUPERVISOR_VOLUME_DIR = "/opt/supervisor"      # volume-mounted path (Phase 2+)
 _SUPERVISOR_REMOTE_PORT = 9100
 
-# Per-session Daytona sandboxes always mount the agent's volume subpath at
-# /home/daytona (see _build_volume_mounts). Any supervisor / ACP child that
-# wants Claude Code's session JSONL files to persist MUST run with
-# HOME=/home/daytona — otherwise the CLI writes to the VM-default /root/.claude
-# which is ephemeral, and session/load fails after stop/delete with
-# "No conversation found with session ID …". Keep this constant canonical so
-# ensure_supervisor_url / restart_daytona_supervisor agree.
-_DAYTONA_VOLUME_HOME = "/home/daytona"
+# The agent's HOME inside a Daytona sandbox — a LOCAL ext4 directory the
+# supervisor creates on boot. It is populated either from the snapshot
+# tarball at _SNAPSHOT_PATH (see below) or left empty for a brand-new agent.
+# Critically this is NOT a volume mount: mountpoint-s3 can't handle
+# append-only writes (session JSONLs) or POSIX rename semantics, so we
+# keep the hot filesystem local and only round-trip a single tarball to
+# the volume.
+_DAYTONA_AGENT_HOME = "/home/daytona"
+
+# Per-session volume subpath mount point. Daytona-only. supervisor.js
+# writes the rolling workspace snapshot to `{_DAYTONA_VOLUME_MOUNT}/snapshot.tar`
+# after every turn and restores from it on boot.
+_DAYTONA_VOLUME_MOUNT = "/vol"
+_SNAPSHOT_PATH = f"{_DAYTONA_VOLUME_MOUNT}/snapshot.tar"
 
 
 def _get_daytona_client():
@@ -76,7 +82,8 @@ async def _bootstrap_supervisor_in_daytona_sandbox(
     supervisor_argv = build_supervisor_argv(
         supervisor_js="supervisor.js", acp_bin=acp_bin,
         acp_launch_args=_acp_launch_args(agent_type),
-        port=_SUPERVISOR_REMOTE_PORT, root=root, quote_paths=False,
+        port=_SUPERVISOR_REMOTE_PORT, root=root,
+        snapshot_path=_SNAPSHOT_PATH, quote_paths=False,
     )
     inner = (
         f"cd {_SUPERVISOR_REMOTE_DIR} && "
@@ -217,7 +224,8 @@ async def start_supervisor_in_sandbox(
     supervisor_argv = build_supervisor_argv(
         supervisor_js="supervisor.js", acp_bin=acp_bin,
         acp_launch_args=_acp_launch_args(agent_type),
-        port=port, root=root, quote_paths=False,
+        port=port, root=root,
+        snapshot_path=_SNAPSHOT_PATH, quote_paths=False,
     )
     # Ensure the agent's HOME (``root``) exists inside the sandbox before
     # the supervisor spawns the ACP child with ``cwd=root``. If the volume
@@ -405,14 +413,12 @@ async def restart_daytona_supervisor(
     if cache_check.strip() == "yes":
         # Volume-cached path. Uses the fixed supervisor port so the
         # signed URL is stable across restarts for an already-issued
-        # session (Daytona maps preview URLs by port).
-        # Force HOME=/home/daytona for session persistence (see
-        # ensure_supervisor_url for the rationale).
-        effective_env = dict(spawn_env or {})
-        effective_env["HOME"] = _DAYTONA_VOLUME_HOME
+        # session (Daytona maps preview URLs by port). HOME is set to
+        # root by supervisor.js when it spawns ACP — no need to force it
+        # here.
         url = await start_supervisor_in_sandbox(
             sandbox, agent_type, _SUPERVISOR_REMOTE_PORT,
-            root=_DAYTONA_VOLUME_HOME, spawn_env=effective_env,
+            root=_DAYTONA_AGENT_HOME, spawn_env=spawn_env,
         )
         return ProviderInstance(
             provider="daytona",
@@ -722,16 +728,13 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
         await loop.run_in_executor(None, sandbox.start)
         await _wait_for_daytona_sandbox_ready(daytona_client, inst.sandbox_id)
         sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(inst.sandbox_id))
-    # Volume is mounted at /home/daytona (see _build_volume_mounts). Force
-    # HOME to that path — without it, the ACP child inherits HOME=/root from
-    # the Daytona VM default and Claude Code writes session files to the
-    # ephemeral /root/.claude, so session/load after stop/delete fails with
-    # "No conversation found with session ID". This invariant lives here
-    # (the single supervisor-spawn choke point) so every code path benefits.
-    effective_env = dict(spawn_env or {})
-    effective_env["HOME"] = _DAYTONA_VOLUME_HOME
+    # The agent's HOME is /home/daytona — a local ext4 dir the supervisor
+    # creates and populates from the volume snapshot on boot. supervisor.js
+    # sets HOME=root when spawning the ACP child so Claude Code's session
+    # JSONLs land in the restored workspace. No env-level HOME override
+    # needed here anymore.
     return await start_supervisor_in_sandbox(
-        sandbox, agent_type, port, root=_DAYTONA_VOLUME_HOME, spawn_env=effective_env,
+        sandbox, agent_type, port, root=_DAYTONA_AGENT_HOME, spawn_env=spawn_env,
     )
 
 
@@ -898,11 +901,11 @@ async def create_sandbox(
     docker/local but are unused here — the supervisor is started later with
     its own env + port, and Daytona has no container-label concept.
     """
-    # For per-session sandboxes (subpath set), the volume is ALWAYS mounted
-    # at /home/daytona (see _build_volume_mounts). The ``root`` param is
-    # ignored in that case — using anything else breaks HOME-on-volume and
-    # causes Claude Code session files to land in ephemeral /root/.claude.
-    effective_root = "/home/daytona" if subpath else (root or "/home/daytona")
+    # Per-session sandboxes always root at /home/daytona — the supervisor
+    # will mkdir it, restore from the volume snapshot, and use it as HOME.
+    # The volume itself is mounted at /vol (see _build_volume_mounts) and
+    # the agent never sees it directly.
+    effective_root = _DAYTONA_AGENT_HOME if subpath else (root or _DAYTONA_AGENT_HOME)
     return await provision_daytona_sandbox(
         agent_type=agent_type,
         dockerfile=dockerfile,

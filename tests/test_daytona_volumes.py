@@ -59,9 +59,11 @@ async def test_daytona_sandbox_mounts_volume_subpath():
             subpath=subpath,
         )
         try:
-            # write a file into HOME (which is the mounted subpath)
-            await exec_in_instance(inst1, "echo hello > /home/daytona/marker.txt")
-            res = await exec_in_instance(inst1, "cat /home/daytona/marker.txt")
+            # Volume is mounted at /vol (not /home/daytona — that's a local
+            # ext4 dir in the new snapshot model). Write directly to /vol to
+            # verify the mount itself, independent of supervisor snapshots.
+            await exec_in_instance(inst1, "echo hello > /vol/marker.txt")
+            res = await exec_in_instance(inst1, "cat /vol/marker.txt")
             assert "hello" in res.stdout, f"first read: {res}"
         finally:
             await destroy_daytona(inst1)
@@ -73,7 +75,7 @@ async def test_daytona_sandbox_mounts_volume_subpath():
             subpath=subpath,
         )
         try:
-            res2 = await exec_in_instance(inst2, "cat /home/daytona/marker.txt")
+            res2 = await exec_in_instance(inst2, "cat /vol/marker.txt")
             assert "hello" in res2.stdout, f"persistence: {res2}"
         finally:
             await destroy_daytona(inst2)

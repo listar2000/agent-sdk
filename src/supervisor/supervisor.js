@@ -20,10 +20,21 @@
  * ignored — the inner ACP session id goes in JSON-RPC params as usual.
  */
 const http = require("node:http");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const SSE_HEARTBEAT_MS = 25000;
+
+// Paths under args.root that are rebuildable or purely ephemeral. Excluded
+// from snapshots so we don't round-trip hundreds of MB of node_modules
+// through S3 on every turn.
+const SNAPSHOT_EXCLUDES = [
+  "--exclude=./node_modules",
+  "--exclude=./.cache",
+  "--exclude=./.npm",
+  "--exclude=./.claude/shell-snapshots",
+  "--exclude=./.claude/statsig",
+];
 
 function parseArgs(argv) {
   const out = {
@@ -31,6 +42,7 @@ function parseArgs(argv) {
     acp: null,
     host: "0.0.0.0",
     root: "/tmp",
+    snapshotPath: null,
     acpArgs: [],
   };
   for (let i = 2; i < argv.length; i++) {
@@ -39,6 +51,7 @@ function parseArgs(argv) {
     else if (a === "--host") out.host = argv[++i];
     else if (a === "--acp") out.acp = argv[++i];
     else if (a === "--root" || a === "--cwd") out.root = argv[++i];
+    else if (a === "--snapshot-path") out.snapshotPath = argv[++i];
     else if (a === "--acp-arg") out.acpArgs.push(argv[++i]);
   }
   if (!out.acp) {
@@ -55,9 +68,40 @@ function log(...args) {
 
 const args = parseArgs(process.argv);
 
+// Ensure args.root exists and, if a snapshot is configured, restore the
+// previous workspace before starting ACP.
+//
+// Daytona-only path. Idempotent for both fresh sandboxes (empty root →
+// snapshot populates it) and stop/restart (local /home/daytona already
+// has the same state, tar extract overlays it harmlessly). Using "always
+// restore when snapshot exists" is simpler than trying to detect
+// fresh-vs-restarted: Daytona VM images pre-populate /home/daytona with
+// dotfiles (.bashrc, etc.), so a readdir-empty check false-negatives on
+// a freshly provisioned sandbox and we'd fail to restore the workspace.
+try {
+  fs.mkdirSync(args.root, { recursive: true });
+} catch (e) {
+  log(`mkdir root failed: ${e.message}`);
+}
+
+if (args.snapshotPath && fs.existsSync(args.snapshotPath)) {
+  log(`restoring workspace from ${args.snapshotPath}`);
+  const r = spawnSync("tar", ["-xf", args.snapshotPath, "-C", args.root], {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  if (r.status !== 0) {
+    log(`restore exited rc=${r.status}; continuing without restore`);
+  }
+}
+
+// The ACP child's HOME must match args.root so Claude Code's
+// ~/.claude/projects/... JSONLs land inside the workspace we just restored
+// (and therefore get captured by the next snapshot). Provider-agnostic —
+// local/docker already align HOME with root, Daytona previously needed a
+// force-override that this replaces.
 const acp = spawn(args.acp, args.acpArgs, {
   stdio: ["pipe", "pipe", "pipe"],
-  env: process.env,
+  env: { ...process.env, HOME: args.root },
   cwd: args.root,
 });
 log("spawned acp pid=" + acp.pid);
@@ -75,8 +119,101 @@ acp.on("exit", (code, signal) => {
 // for a specific response register here; the stdout reader resolves them.
 const pendingResponses = new Map();
 
+// JSON-RPC ids of in-flight session/prompt requests. When we see a matching
+// response from the ACP child, the agent's turn is done — kick a snapshot.
+const pendingPromptIds = new Set();
+
 // SSE subscribers — every line of acp stdout is fanned out to these.
 const sseSubscribers = new Set();
+
+// ── Workspace snapshot machinery ──
+//
+// We persist args.root to args.snapshotPath on every session/prompt
+// turn-end so a freshly provisioned sandbox (e.g., Daytona sandbox
+// deleted and replaced) can restore from the last completed turn.
+//
+// Synchronous w.r.t. the HTTP response: the supervisor delays writing
+// the session/prompt response back to the HTTP caller until the
+// snapshot has been committed to the volume. Once the client sees
+// "turn done" over the wire, the sandbox can be deleted without
+// losing the turn — the snapshot is already durable on S3. This is
+// the critical correctness boundary; previously the snapshot ran
+// async and could lose races against ``daytona.delete()``.
+//
+// Local staging dir for the tarball. tar's write goes to a local ext4
+// filesystem (fast), then a single ``cp`` writes the finished tarball to
+// the volume (one S3 PUT). Writing tar directly to the volume path would
+// be two sequential S3 PUTs in the worst case — slower AND in the critical
+// window between turn-end and a potential ``daytona.delete`` — so we keep
+// the staging off-volume.
+const LOCAL_SNAPSHOT_STAGING = "/tmp/agent-sdk-snapshot.tar";
+
+function runSnapshotOnce() {
+  return new Promise((resolve) => {
+    if (!args.snapshotPath) {
+      resolve();
+      return;
+    }
+    const stage = LOCAL_SNAPSHOT_STAGING;
+    const tarArgs = ["-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
+    const tar = spawn("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
+    let tarErr = "";
+    tar.stderr.on("data", (c) => { tarErr += c.toString("utf8"); });
+    tar.on("error", (e) => {
+      log(`snapshot tar spawn error: ${e.message}`);
+      try { fs.unlinkSync(stage); } catch {}
+      resolve();
+    });
+    tar.on("close", (tarCode) => {
+      if (tarCode !== 0) {
+        log(`snapshot tar rc=${tarCode}: ${tarErr.slice(0, 400)}`);
+        try { fs.unlinkSync(stage); } catch {}
+        resolve();
+        return;
+      }
+      const cp = spawn("cp", [stage, args.snapshotPath], { stdio: ["ignore", "ignore", "pipe"] });
+      let cpErr = "";
+      cp.stderr.on("data", (c) => { cpErr += c.toString("utf8"); });
+      cp.on("error", (e) => {
+        log(`snapshot cp spawn error: ${e.message}`);
+        try { fs.unlinkSync(stage); } catch {}
+        resolve();
+      });
+      cp.on("close", (cpCode) => {
+        try { fs.unlinkSync(stage); } catch {}
+        if (cpCode !== 0) {
+          log(`snapshot cp rc=${cpCode}: ${cpErr.slice(0, 400)}`);
+        }
+        resolve();
+      });
+    });
+  });
+}
+
+// Synchronous snapshot for graceful shutdown (SIGTERM/SIGINT). Caller waits
+// for it so the last turn reliably lands on the volume before the process
+// exits.
+function runSnapshotSync() {
+  if (!args.snapshotPath) return;
+  const stage = LOCAL_SNAPSHOT_STAGING;
+  try {
+    const tarArgs = ["-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
+    const tr = spawnSync("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
+    if (tr.status !== 0) {
+      log(`shutdown snapshot tar rc=${tr.status}: ${String(tr.stderr || "").slice(0, 400)}`);
+      try { fs.unlinkSync(stage); } catch {}
+      return;
+    }
+    const cr = spawnSync("cp", [stage, args.snapshotPath], { stdio: ["ignore", "ignore", "pipe"] });
+    if (cr.status !== 0) {
+      log(`shutdown snapshot cp rc=${cr.status}: ${String(cr.stderr || "").slice(0, 400)}`);
+    }
+  } catch (e) {
+    log(`shutdown snapshot failed: ${e.message}`);
+  } finally {
+    try { fs.unlinkSync(stage); } catch {}
+  }
+}
 
 // Cache the last available_commands_update so late SSE subscribers receive it.
 let lastCommandsEvent = null;
@@ -100,6 +237,49 @@ function broadcastSse(line) {
   }
 }
 
+async function handleAcpLine(line) {
+  // Always fan out to SSE subscribers — the Python server's reader
+  // consumes this stream for event broadcast + terminal attribution.
+  broadcastSse(line);
+
+  // If this is a JSON-RPC response, unblock the waiting POST.
+  let msg = null;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (
+    msg &&
+    typeof msg === "object" &&
+    "id" in msg &&
+    ("result" in msg || "error" in msg)
+  ) {
+    const rid = String(msg.id);
+    const isPromptResponse = pendingPromptIds.has(rid);
+    // Turn-end: block the HTTP response until the workspace snapshot for
+    // this turn is durable on the volume. Trade ~0.5–2 s of end-of-turn
+    // latency for the invariant "once the client sees `turn done`, the
+    // sandbox can be deleted without losing the turn". The original async
+    // firing left a race window in which `daytona.delete()` could kill
+    // the container mid-PUT, losing the session JSONL and causing
+    // session/load to fail on the replacement sandbox.
+    if (isPromptResponse) {
+      pendingPromptIds.delete(rid);
+      try {
+        await runSnapshotOnce();
+      } catch (e) {
+        log(`snapshot error on turn-end: ${e.message}`);
+      }
+    }
+    const resolver = pendingResponses.get(rid);
+    if (resolver) {
+      pendingResponses.delete(rid);
+      resolver(msg);
+    }
+  }
+}
+
 let stdoutBuf = "";
 acp.stdout.on("data", (chunk) => {
   stdoutBuf += chunk.toString("utf8");
@@ -108,31 +288,7 @@ acp.stdout.on("data", (chunk) => {
     const line = stdoutBuf.slice(0, idx);
     stdoutBuf = stdoutBuf.slice(idx + 1);
     if (!line) continue;
-
-    // Always fan out to SSE subscribers — the Python server's reader
-    // consumes this stream for event broadcast + terminal attribution.
-    broadcastSse(line);
-
-    // If this is a JSON-RPC response, unblock the waiting POST.
-    let msg = null;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (
-      msg &&
-      typeof msg === "object" &&
-      "id" in msg &&
-      ("result" in msg || "error" in msg)
-    ) {
-      const rid = String(msg.id);
-      const resolver = pendingResponses.get(rid);
-      if (resolver) {
-        pendingResponses.delete(rid);
-        resolver(msg);
-      }
-    }
+    handleAcpLine(line).catch((e) => log(`acp-line handler error: ${e.message}`));
   }
 });
 
@@ -157,6 +313,13 @@ async function handlePost(req, res) {
     res.writeHead(502, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "acp stdin write failed: " + e.message }));
     return;
+  }
+
+  // Remember session/prompt request ids so the stdout reader can trigger a
+  // snapshot when the matching response lands. Covers every client variant —
+  // SDK + direct-ACP + external integrations — without parsing update events.
+  if (body && body.method === "session/prompt" && "id" in body) {
+    pendingPromptIds.add(String(body.id));
   }
 
   // Notification — fire-and-forget.
@@ -870,11 +1033,18 @@ server.listen(args.port, args.host, () => {
   log(`listening on ${args.host}:${args.port}`);
 });
 
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   log("shutting down");
   try {
     acp.stdin.end();
   } catch {}
+  // Final sync snapshot so the most recent turn lands on the volume even
+  // when a turn completed but the async path hasn't drained. No-op when
+  // --snapshot-path wasn't provided.
+  runSnapshotSync();
   try {
     server.close();
   } catch {}
