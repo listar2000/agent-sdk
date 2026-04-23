@@ -613,7 +613,13 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     agent_record = await get_agent(state.agent_id)
     if agent_record is None:
         raise RuntimeError(f"agent {state.agent_id} missing during rebind")
-    spawn_env = await _spawn_env_for_sandbox(state.sandbox_id)
+    # Build spawn_env inline to avoid _spawn_env_for_sandbox's redundant
+    # get_agent round-trip (we already have agent_record).
+    session_row = await _require_session_row(state.session_id)
+    agent_env = (agent_record.config.env or {}) if agent_record.config else {}
+    spawn_env = _merge_env(
+        agent_env, session_row.get("env") or {}, session_row.get("secrets") or {},
+    )
     new_url, _ = await _ensure_sandbox_alive(
         state.sandbox_id, sandbox_record,
         agent_type=state.agent_type, spawn_env=spawn_env,
