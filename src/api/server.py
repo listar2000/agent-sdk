@@ -1112,6 +1112,29 @@ async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
     return await _build_spawn_env_from_row(rec)
 
 
+async def _shared_mounts_for_sandbox(rec: SandboxRecord) -> list[str] | None:
+    """Return the agent's shared_mounts for this sandbox, or None if unknown.
+
+    The subpath encodes the agent id (``agents/<agent_id>``) — we parse it
+    back to look up the current agent config. If shared_mounts changed on
+    the agent since provisioning, the recovered sandbox reflects the
+    current config; that's intentional (treat shared_mounts as a
+    live-attached-at-recovery setting, not a frozen provision-time property).
+    """
+    if not rec.subpath or not rec.subpath.startswith("agents/"):
+        return None
+    agent_id = rec.subpath.split("/", 2)[1]
+    if not agent_id:
+        return None
+    try:
+        agent = await get_agent(agent_id)
+    except Exception:
+        return None
+    if agent is None or agent.config is None:
+        return None
+    return list(agent.config.shared_mounts) if agent.config.shared_mounts else None
+
+
 def _merge_env(
     agent_env: dict[str, str] | None,
     session_env: dict[str, str] | None,
@@ -1527,12 +1550,14 @@ async def create_sandbox(request: Request):
             f"provider {provider!r} does not match volume.provider {vol.provider!r}",
         )
     dockerfile = _materialize_dockerfile(data)
+    shared_mounts = data.get("shared_mounts") or None
     sandbox_id = str(uuid.uuid4())
     try:
         instance = await create_instance(
             provider, agent_type, dockerfile=dockerfile, root=root,
             volume_id=vol.provider_ref, subpath=subpath,
             sandbox_id=sandbox_id,
+            shared_mounts=shared_mounts,
         )
     except Exception as e:
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
@@ -1689,6 +1714,7 @@ async def provision_sandbox_route(request: Request):
             pre_start_commands=pre_start_commands if pre_start_commands else None,
             root=root,
             sandbox_id=sandbox_id,
+            shared_mounts=config.shared_mounts or None,
         )
     except Exception as e:
         if "circuit breaker" in str(e).lower():
@@ -2117,6 +2143,7 @@ async def _replace_sandbox_inplace(
     daytona sandbox (replaced=True).
     """
     provider = rec.provider
+    shared_mounts = await _shared_mounts_for_sandbox(rec)
     if provider in PORT_BASED_PROVIDERS:
         if not rec.volume_id:
             raise RuntimeError(f"Sandbox {sandbox_id} has no volume_id")
@@ -2128,6 +2155,7 @@ async def _replace_sandbox_inplace(
                 provider, volume_ref=vol.provider_ref, subpath=rec.subpath or "",
                 agent_type=agent_type, dockerfile=dockerfile,
                 root=rec.root, spawn_env=spawn_env, sandbox_id=sandbox_id,
+                shared_mounts=shared_mounts,
             )
         except Exception as e:
             raise RuntimeError(f"Failed to restart sandbox: {e}")
@@ -2155,6 +2183,7 @@ async def _replace_sandbox_inplace(
             root=rec.root, spawn_env=spawn_env,
             volume_id=dt_volume_ref, subpath=rec.subpath,
             sandbox_id=sandbox_id,
+            shared_mounts=shared_mounts,
         )
     except Exception as e:
         raise RuntimeError(f"Failed to create replacement daytona sandbox: {e}")
@@ -2478,9 +2507,10 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
     if vol is None:
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
     agent_id = session_row["agent_id"]
-    subpath = f"agents/{agent_id}/home"
+    subpath = f"agents/{agent_id}"
     agent = await get_agent(agent_id)
     agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+    shared_mounts = (agent.config.shared_mounts if agent and agent.config else None)
 
     # Ensure supervisor is installed on the volume before provisioning the sandbox.
     # This is idempotent: fast-path if already installed (cache hit in volumes table).
@@ -2506,6 +2536,7 @@ async def _provision_new(session_row: dict, previous_id: str | None) -> SandboxR
         spawn_env=spawn_env,
         root=root,
         sandbox_id=new_sandbox_id,
+        shared_mounts=shared_mounts,
     )
 
     sb = _sandbox_record(
@@ -2946,7 +2977,7 @@ async def sessions_quick_create(request: Request):
             skill_cmds = []
 
     sandbox_id = str(uuid.uuid4())
-    subpath = f"agents/{agent_id}/home"
+    subpath = f"agents/{agent_id}"
 
     # Install supervisor on the volume before spawning the sandbox.
     # Docker/Local need supervisor.js + node_modules under the volume at create
@@ -2965,6 +2996,7 @@ async def sessions_quick_create(request: Request):
             root=root, spawn_env=spawn_env,
             volume_id=volume_record.provider_ref, subpath=subpath,
             sandbox_id=sandbox_id,
+            shared_mounts=config.shared_mounts or None,
         )
     except Exception as e:
         await delete_agent(agent_id)

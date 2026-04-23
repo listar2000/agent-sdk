@@ -360,13 +360,17 @@ def free_sandbox_port(sandbox_id: str, port: int) -> None:
 # Volume mounts
 # ---------------------------------------------------------------------------
 
-def _build_volume_mounts(volume_id: str | None, subpath: str | None):
+def _build_volume_mounts(
+    volume_id: str | None,
+    subpath: str | None,
+    shared_mounts: list[str] | None = None,
+):
     """Build the VolumeMount list for a Daytona sandbox. Returns None if no volume.
 
-    Per-session sandboxes (subpath is a non-empty string) get three mounts:
-      - /vol            → volume subpath (S3-backed; snapshot tarball lives here)
-      - /mnt/shared     → volume shared/ (cross-session shared data)
-      - /opt/supervisor → volume system/supervisor/ (pre-installed supervisor)
+    Per-session sandbox layout (subpath is a non-empty string like ``agents/<id>``):
+      - /vol              → volume subpath (S3-backed; snapshot tarball lives here)
+      - /opt/supervisor   → volume system/supervisor/ (pre-installed supervisor)
+      - /mnt/<name>       → volume shared/<name>/ (one per entry in shared_mounts)
 
     The agent's HOME is ``/home/daytona`` — a local ext4 directory created
     by the supervisor at boot — NOT the volume mount. The supervisor
@@ -376,12 +380,19 @@ def _build_volume_mounts(volume_id: str | None, subpath: str | None):
     volume only ever sees single-file full-overwrite PUTs of the
     snapshot tarball.
 
-    Utility sandboxes (subpath is None or empty string) get a single whole-volume
-    mount at /v. This avoids the supervisor mount failing before system/supervisor/
-    has been created.
+    Shared mounts are OPT-IN per agent. An agent with ``shared_mounts=[]``
+    (the default) sees no /mnt/<name> directories. An agent with
+    ``shared_mounts=["projects", "datasets"]`` gets /mnt/projects and
+    /mnt/datasets mounted read-write from <volume>/shared/projects and
+    <volume>/shared/datasets respectively.
 
-    NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so the
-    spec's /mnt/shared read-only mount is deferred until the SDK adds that field.
+    Utility sandboxes (subpath is None or empty string) get a single
+    whole-volume mount at /v. This avoids the supervisor mount failing
+    before system/supervisor/ has been created.
+
+    NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so
+    every shared mount is read-write today. Scope per-mount permissions
+    when the SDK exposes that field.
     """
     if not volume_id:
         return None
@@ -389,12 +400,23 @@ def _build_volume_mounts(volume_id: str | None, subpath: str | None):
     if not subpath:
         # Utility sandbox: whole-volume mount so we can inspect/create any dir.
         return [VolumeMount(volume_id=volume_id, mount_path="/v")]
-    # Regular per-session sandbox: three named mounts.
-    return [
+    mounts = [
         VolumeMount(volume_id=volume_id, mount_path="/vol", subpath=subpath),
-        VolumeMount(volume_id=volume_id, mount_path="/mnt/shared", subpath="shared"),
         VolumeMount(volume_id=volume_id, mount_path="/opt/supervisor", subpath="system/supervisor"),
     ]
+    for name in (shared_mounts or []):
+        # Defense-in-depth: the agent-config API accepts arbitrary strings,
+        # so strip separators to prevent an agent from mounting
+        # "../agents/<other-id>" at /mnt/anything.
+        clean = name.strip("/").replace("..", "").replace("/", "-")
+        if not clean:
+            continue
+        mounts.append(VolumeMount(
+            volume_id=volume_id,
+            mount_path=f"/mnt/{clean}",
+            subpath=f"shared/{clean}",
+        ))
+    return mounts
 
 
 # ---------------------------------------------------------------------------

@@ -5,10 +5,13 @@ using ``docker`` subprocess calls.  Volumes are Docker named volumes; the
 standard layout ({shared/, system/supervisor/, agents/<id>/home/}) is created
 by mounting the volume into a short-lived ``alpine`` utility container.
 
-Sandboxes are long-lived ``node:20-slim`` containers (NOT ``--rm``) that mount
-three volume-subpaths: /home/agent, /mnt/shared, /opt/supervisor.  The
-supervisor.js + ACP binary come from the volume's ``system/supervisor/`` dir,
-which is populated lazily by ``install_supervisor``.
+Sandboxes are long-lived ``node:20-slim`` containers (NOT ``--rm``) that mount:
+  - /home/agent      ← volume subpath ``agents/<id>`` (per-agent HOME)
+  - /opt/supervisor  ← volume subpath ``system/supervisor`` (supervisor deps)
+  - /mnt/<name>      ← volume subpath ``shared/<name>`` (one per entry in the
+                       agent's ``shared_mounts``; zero by default)
+The supervisor.js + ACP binary come from the volume's ``system/supervisor/``
+dir, which is populated lazily by ``install_supervisor``.
 """
 from __future__ import annotations
 
@@ -53,7 +56,6 @@ _NODE_IMAGE = "node:20-slim"
 
 # Canonical in-container paths for sandbox mounts.
 _AGENT_HOME_IN = "/home/agent"
-_SHARED_IN = "/mnt/shared"
 _SUPERVISOR_IN = "/opt/supervisor"
 
 
@@ -270,6 +272,7 @@ async def create_sandbox(
     pre_start_commands: list[str] | None = None,
     port: int | None = None,  # accepted for parity with uniform API; always allocates
     sandbox_id: str | None = None,
+    shared_mounts: list[str] | None = None,
     **_kw,
 ) -> ProviderInstance:
     """Create a Docker container with three volume-subpath mounts + supervisor.
@@ -315,11 +318,21 @@ async def create_sandbox(
             f"type=volume,source={volume_ref},target={_AGENT_HOME_IN},"
             f"volume-subpath={subpath}",
             "--mount",
-            f"type=volume,source={volume_ref},target={_SHARED_IN},volume-subpath=shared",
-            "--mount",
             f"type=volume,source={volume_ref},target={_SUPERVISOR_IN},"
             f"volume-subpath=system/supervisor",
         ]
+        # Opt-in named shared mounts (one /mnt/<name> per entry). Same
+        # name-sanitization as the daytona path — strip path separators so
+        # an agent config can't smuggle ../ into the volume-subpath.
+        for name in (shared_mounts or []):
+            clean = name.strip("/").replace("..", "").replace("/", "-")
+            if not clean:
+                continue
+            c += [
+                "--mount",
+                f"type=volume,source={volume_ref},target=/mnt/{clean},"
+                f"volume-subpath=shared/{clean}",
+            ]
         if sandbox_id:
             # Used by reconcile_on_startup() to cross-reference live containers
             # against DB sandbox rows after a server crash.

@@ -29,11 +29,18 @@ class AgentConfig:
     skills: list | dict | None = None  # npx skills sources
     dockerfile: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    # Named shared folders this agent mounts at /mnt/<name>. Each entry refers
+    # to a subdir under <volume>/shared/ on the agent's volume. Opt-in per
+    # agent — an empty list means no shared mounts (default). Unknown names
+    # are silently ignored at mount time; the mount just doesn't appear.
+    shared_mounts: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = {k: v for k, v in asdict(self).items() if v is not None}
         if not d.get("env"):
             d.pop("env", None)
+        if not d.get("shared_mounts"):
+            d.pop("shared_mounts", None)
         return d
 
     @classmethod

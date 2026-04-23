@@ -102,6 +102,7 @@ async def create_instance(
     volume_id: str | None = None,
     subpath: str | None = None,
     sandbox_id: str | None = None,
+    shared_mounts: list[str] | None = None,
 ) -> ProviderInstance:
     """Create an ACP supervisor instance using the specified provider.
 
@@ -137,6 +138,7 @@ async def create_instance(
             pre_start_commands=pre_start_commands,
             root=root, spawn_env=spawn_env,
             sandbox_id=sandbox_id,
+            shared_mounts=shared_mounts,
         )
     if provider == "daytona":
         return await mod.create_sandbox(
@@ -145,6 +147,7 @@ async def create_instance(
             pre_start_commands=pre_start_commands,
             root=root, spawn_env=spawn_env,
             sandbox_id=sandbox_id,
+            shared_mounts=shared_mounts,
         )
     raise ValueError(f"Unknown provider: {provider!r}. Use 'local', 'docker', or 'daytona'.")
 
@@ -251,6 +254,7 @@ async def provision_sandbox(
     root: str | None = None,
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
+    shared_mounts: list[str] | None = None,
     **kwargs,
 ) -> ProviderInstance:
     """Uniform sandbox provisioning across providers.
@@ -275,5 +279,6 @@ async def provision_sandbox(
         agent_type=agent_type,
         spawn_env=spawn_env,
         port=port,
+        shared_mounts=shared_mounts,
         **kw,
     )

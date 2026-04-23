@@ -275,6 +275,7 @@ async def provision_daytona_sandbox(
     root: str = "/tmp",
     volume_id: str | None = None,
     subpath: str | None = None,
+    shared_mounts: list[str] | None = None,
 ) -> ProviderInstance:
     """Create a Daytona sandbox with 3 volume mounts, but do NOT install deps
     or start a supervisor (those are handled by ensure_volume_supervisor and
@@ -314,7 +315,7 @@ async def provision_daytona_sandbox(
 
     create_timeout = 300 if dockerfile else 60
 
-    volumes = _build_volume_mounts(volume_id, subpath)
+    volumes = _build_volume_mounts(volume_id, subpath, shared_mounts)
 
     if use_snapshot:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
@@ -938,12 +939,14 @@ async def create_sandbox(
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     sandbox_id: str | None = None,  # accepted for parity; daytona has no labels
+    shared_mounts: list[str] | None = None,
 ) -> ProviderInstance:
     """Uniform ``create_sandbox`` for the Daytona provider.
 
     Delegates to ``provision_daytona_sandbox`` which creates the sandbox with
-    the three volume mounts but does NOT start a supervisor; the caller must
-    run ``ensure_supervisor_url`` before talking to the supervisor.
+    the volume mounts (per-agent subpath + supervisor cache + any opt-in
+    shared mounts) but does NOT start a supervisor; the caller must run
+    ``ensure_supervisor_url`` before talking to the supervisor.
 
     ``spawn_env`` / ``port`` / ``sandbox_id`` are accepted for parity with
     docker/local but are unused here — the supervisor is started later with
@@ -961,6 +964,7 @@ async def create_sandbox(
         root=effective_root,
         volume_id=volume_ref,
         subpath=subpath,
+        shared_mounts=shared_mounts,
     )
 
 
