@@ -956,23 +956,112 @@ async def create_sandbox(
 # ---------------------------------------------------------------------------
 # Volume file ops — dispatched from server.py's /volumes/{id}/files/*
 # ---------------------------------------------------------------------------
+# Every GET /volumes/{id}/files/tree / files/read / files/edit needs a
+# sandbox with the volume mounted at /v. Provisioning fresh on each call
+# meant ~10s+ per request on daytona and a new sandbox every UI poll. We
+# keep one utility sandbox per volume with a short TTL; reuse bypasses
+# the whole provision/destroy round-trip on back-to-back calls.
+# ---------------------------------------------------------------------------
+
+_UTILITY_TTL_S = 300.0  # 5 minutes idle before the reaper tears it down
+_UTILITY_REAPER_TICK_S = 30.0
+_utility_cache: dict[str, tuple["ProviderInstance", float]] = {}  # ref -> (inst, last_used)
+_utility_cache_lock = asyncio.Lock()
+_utility_reaper_started = False
+
+
+async def _get_or_create_utility(ref: str) -> "ProviderInstance":
+    """Return a ready utility sandbox for ``ref`` — cached per volume.
+
+    First call per volume: provisions + caches. Subsequent calls within
+    ``_UTILITY_TTL_S`` of the last use: returns the cached instance. The
+    reaper tears down idle entries; a torn-down entry is transparently
+    re-provisioned on the next call.
+    """
+    import time as _time
+    async with _utility_cache_lock:
+        cached = _utility_cache.get(ref)
+        if cached is not None:
+            inst, _last = cached
+            _utility_cache[ref] = (inst, _time.monotonic())
+            _ensure_utility_reaper()
+            return inst
+        # Provision outside the lock? No — provisioning is 5-15s and we
+        # want the lock held so a burst of concurrent file-ops on the
+        # same volume doesn't create N sandboxes. Readers wait; winner
+        # populates cache; other readers then hit the fast path above.
+        log.info("daytona utility sandbox: provisioning for volume %s", ref[:16])
+        inst = await provision_daytona_sandbox(
+            agent_type="claude", volume_id=ref, subpath=None,
+        )
+        _utility_cache[ref] = (inst, _time.monotonic())
+        _ensure_utility_reaper()
+        return inst
+
+
+async def _drop_utility(ref: str) -> None:
+    """Remove a cached utility sandbox and destroy it. No-op if absent."""
+    async with _utility_cache_lock:
+        entry = _utility_cache.pop(ref, None)
+    if entry is None:
+        return
+    inst, _ = entry
+    try:
+        await destroy_daytona(inst)
+    except Exception as e:  # pragma: no cover
+        log.warning("utility sandbox destroy failed for %s: %s", ref[:16], e)
+
+
+def _ensure_utility_reaper() -> None:
+    """Lazily start the background reaper on first cache entry."""
+    global _utility_reaper_started
+    if _utility_reaper_started:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # not in an event loop (e.g. unit tests) — caller manages cleanup
+    loop.create_task(_utility_reaper_loop())
+    _utility_reaper_started = True
+
+
+async def _utility_reaper_loop() -> None:
+    """Destroy utility sandboxes that have been idle for > _UTILITY_TTL_S."""
+    import time as _time
+    while True:
+        await asyncio.sleep(_UTILITY_REAPER_TICK_S)
+        now = _time.monotonic()
+        stale: list[tuple[str, "ProviderInstance"]] = []
+        async with _utility_cache_lock:
+            for ref, (inst, last) in list(_utility_cache.items()):
+                if now - last > _UTILITY_TTL_S:
+                    stale.append((ref, inst))
+                    _utility_cache.pop(ref, None)
+        for ref, inst in stale:
+            log.info("daytona utility sandbox: reaping idle volume %s", ref[:16])
+            try:
+                await destroy_daytona(inst)
+            except Exception as e:  # pragma: no cover
+                log.warning("utility reaper: destroy failed for %s: %s", ref[:16], e)
+
 
 async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
-    """Spin a short-lived sandbox with ``ref`` mounted at /v, run cmd, tear down."""
-    from ._shared import _exec_subprocess  # noqa: F401
-    from .. import providers as _prov  # pragma: no cover — local import for cycle
-    inst = await provision_daytona_sandbox(
-        agent_type="claude",
-        volume_id=ref,
-        subpath=None,
-    )
+    """Run ``cmd`` in the utility sandbox for ``ref``. Cached + TTL-reaped.
+
+    Transient errors (sandbox died on the provider side between the cache
+    entry's freshness check and the exec call) trigger one retry after
+    dropping the cache entry, so callers don't see a single stale-cache
+    hit bubble up as a 500.
+    """
+    from .. import providers as _prov  # local import for cycle
+    inst = await _get_or_create_utility(ref)
     try:
         return await _prov.exec_in_instance(inst, cmd, timeout=timeout)
-    finally:
-        try:
-            await destroy_daytona(inst)
-        except Exception as cleanup_err:  # pragma: no cover
-            log.warning("utility sandbox cleanup failed: %s", cleanup_err)
+    except Exception as e:
+        log.warning("utility exec failed on cached sandbox for %s (%s); retrying with fresh sandbox", ref[:16], e)
+        await _drop_utility(ref)
+        inst = await _get_or_create_utility(ref)
+        return await _prov.exec_in_instance(inst, cmd, timeout=timeout)
 
 
 async def volume_tree(ref: str, path: str) -> str:

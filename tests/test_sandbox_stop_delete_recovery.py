@@ -352,25 +352,34 @@ async def test_delete_sandbox_volume_persistence(provider):
 # Neutral ticket-ID framing avoids Claude's "secret code = social engineering"
 # guardrail. The agent will freely echo/recall TKT-<digits> tokens.
 
+async def _inner_sid_in_memory(client: httpx.AsyncClient, session_id: str) -> str | None:
+    admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
+    row = next((s for s in admin.get("sessions", []) if s["session_id"] == session_id), None)
+    return row.get("inner_session_id") if row else None
+
+
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
 @pytest.mark.asyncio
 async def test_session_resume_after_stop(provider):
-    """Full session resume: stop sandbox between turns, reconnect, context preserved."""
+    """Full session resume: stop sandbox between turns, reconnect, session is
+    LOADED (not recreated).
+
+    Deterministic invariants (no LLM-prose dependency):
+      A. Turn 2 returns a non-empty reply.
+      B. ``inner_session_id`` on the in-memory SessionState is unchanged
+         across stop+resume — proves the server did ``session/load``, not
+         ``session/new``.
+    """
     _require_provider(provider)
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
         session_id = sess["session_id"]
-        print(f"\n[test:{provider}] session={session_id[:8]}")
+        inner_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
-        ticket = "TKT-78901"
-        reply1 = await _ask(
-            client, session_id,
-            f"I'm tracking work under ticket ID {ticket}. Please acknowledge by echoing "
-            f"the ticket ID back to me so I know you have it."
-        )
-        print(f"[test:{provider}] turn1: {reply1[:200]}")
-        assert ticket in reply1, f"agent didn't echo the ticket ID: {reply1}"
+        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
         # Stop sandbox externally
         sandbox = await _get_sandbox(client, session_id)
@@ -379,52 +388,51 @@ async def test_session_resume_after_stop(provider):
 
         # Turn 2: open a FRESH httpx connection (simulates UI reconnect)
         async with httpx.AsyncClient() as client2:
-            reply2 = await _ask(
-                client2, session_id,
-                "What was the ticket ID I mentioned earlier in this conversation? "
-                "Reply with only the ticket ID."
-            )
-        print(f"[test:{provider}] turn2 (after stop+reconnect): {reply2[:200]}")
-        assert ticket in reply2, (
-            f"agent lost conversation context after stop/resume: {reply2}"
+            reply2 = await _ask(client2, session_id, "Reply with a single short word.")
+            inner_after = await _inner_sid_in_memory(client2, session_id)
+
+        assert reply2.strip(), f"turn 2 empty after stop+resume: {reply2!r}"
+        assert inner_after == inner_before, (
+            f"session/load did not run — conversation restarted from scratch: "
+            f"{inner_before!r} → {inner_after!r}"
         )
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
 @pytest.mark.asyncio
 async def test_session_resume_after_delete(provider):
-    """Delete sandbox between turns → new sandbox → session context preserved via volume."""
+    """Delete sandbox between turns → NEW sandbox provisioned → session/load
+    restores conversation via the persistent volume.
+
+    Deterministic invariants:
+      A. Turn 2 returns a non-empty reply.
+      B. ``inner_session_id`` unchanged — session/load succeeded against
+         the volume-persisted JSONL on the replacement sandbox.
+    """
     _require_provider(provider)
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
         session_id = sess["session_id"]
-        print(f"\n[test:{provider}] session={session_id[:8]}")
+        inner_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
-        ticket = "TKT-99501"
-        reply1 = await _ask(
-            client, session_id,
-            f"I'm tracking work under ticket ID {ticket}. Please acknowledge by echoing "
-            f"the ticket ID back to me so I know you have it."
-        )
-        print(f"[test:{provider}] turn1: {reply1[:200]}")
-        assert ticket in reply1, f"agent didn't echo the ticket ID: {reply1}"
+        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
-        # Delete sandbox externally
         sandbox = await _get_sandbox(client, session_id)
         await _external_delete(sandbox)
         await asyncio.sleep(3)
 
         async with httpx.AsyncClient() as client2:
-            reply2 = await _ask(
-                client2, session_id,
-                "What was the ticket ID I mentioned earlier in this conversation? "
-                "Reply with only the ticket ID."
-            )
-        print(f"[test:{provider}] turn2 (after delete+reconnect): {reply2[:200]}")
-        assert ticket in reply2, (
-            f"session context lost after sandbox delete — volume-backed conversation "
-            f"state not restored: {reply2}"
+            reply2 = await _ask(client2, session_id, "Reply with a single short word.")
+            inner_after = await _inner_sid_in_memory(client2, session_id)
+
+        assert reply2.strip(), f"turn 2 empty after delete+resume: {reply2!r}"
+        assert inner_after == inner_before, (
+            f"session context lost after sandbox delete — session/load did "
+            f"not restore the volume-backed JSONL: "
+            f"{inner_before!r} → {inner_after!r}"
         )
 
 
@@ -549,10 +557,17 @@ async def test_message_immediately_after_stop(provider):
     just died). The prompt is submitted; the response is 'missed' because
     the supervisor never acks / the SSE stream never delivers the events.
 
-    The server must detect this and recover: either pre-submit (health
-    check catches the dead URL) or reactively (submit fails fast, SSE
-    reader recovers, resubmit). In either case, turn 2 must eventually
-    return a valid reply.
+    The invariants we assert are deterministic (LLM-prose-independent):
+
+      A. Turn 2 returns a non-empty reply within the timeout — the server
+         didn't silently swallow the prompt.
+      B. ``inner_session_id`` is unchanged across the recovery — the
+         server did ``session/load`` on the replacement sandbox instead
+         of ``session/new``, preserving conversation context.
+
+    Invariant B catches the exact bug the test docstring calls out
+    (supervisor "never acks / SSE never delivers") without depending on
+    the agent's cooperation to echo a ticket.
 
     This is a SEPARATE test from test_session_resume_after_stop because
     that one has an explicit ``await asyncio.sleep(3)`` between stop and
@@ -563,36 +578,42 @@ async def test_message_immediately_after_stop(provider):
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
         session_id = sess["session_id"]
-        print(f"\n[test:{provider}] session={session_id[:8]}")
+        inner_sid_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
 
-        # Turn 1 — confirm the agent is live and record the token. Neutral
-        # ticket framing avoids Claude's injection guardrail (see comment
-        # above test_session_resume_after_stop).
-        ticket = "TKT-42042"
-        reply1 = await _ask(
-            client, session_id,
-            f"I'm tracking work under ticket ID {ticket}. Please acknowledge by "
-            f"echoing the ticket ID back to me so I know you have it.",
-        )
-        assert ticket in reply1, f"turn 1 didn't echo ticket: {reply1!r}"
-        print(f"[test:{provider}] turn1: {ticket}")
+        # Turn 1 — confirm the agent is live.
+        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        assert reply1.strip(), f"turn 1 empty reply: {reply1!r}"
+        print(f"[test:{provider}] turn1 ok")
 
         # External stop — NO sleep. This is the race we're after.
         sandbox = await _get_sandbox(client, session_id)
         await _external_stop(sandbox)
         print(f"[test:{provider}] sandbox stopped; immediately sending turn 2")
 
-        # Turn 2 — the server must recover this request, not silently lose it.
-        reply2 = await _ask(
-            client, session_id,
-            "What was the ticket ID I mentioned earlier in this conversation? "
-            "Reply with only the ticket ID.",
-        )
-        print(f"[test:{provider}] turn2 reply: {reply2[:200]!r}")
-        assert ticket in reply2, (
+        # Turn 2 — the server must recover and deliver a reply.
+        reply2 = await _ask(client, session_id, "Reply with a single short word.")
+        print(f"[test:{provider}] turn2 reply len: {len(reply2)}")
+        assert reply2.strip(), (
             f"turn 2 lost: server accepted the prompt but no reply came back "
             f"(probable race: SSE reader hadn't yet detected the dead "
             f"supervisor when ensure_session_live returned): {reply2!r}"
+        )
+
+        # Invariant B — inner_session_id must survive recovery; if it
+        # changed, the server did session/new (new conversation) instead
+        # of session/load. Read from /admin/sessions (in-memory) — the
+        # buggy path updates state.inner_session_id without upsert_session.
+        admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
+        in_mem = next(
+            (s for s in admin.get("sessions", []) if s["session_id"] == session_id),
+            None,
+        )
+        assert in_mem is not None, f"session missing from /admin/sessions"
+        assert in_mem.get("inner_session_id") == inner_sid_before, (
+            f"inner_session_id changed across recovery — server silently "
+            f"started a new conversation: {inner_sid_before!r} → "
+            f"{in_mem.get('inner_session_id')!r}"
         )
 
 
@@ -610,28 +631,20 @@ async def test_message_after_stop_with_delay(provider):
     User's exact words: "wait for just a few sec after the sandbox
     stopped. And then send a new msg, and no reply received."
 
-    The server must detect the staleness on the /message path and restart
-    the sandbox before dispatching. With _execute_one_prompt calling
-    ensure_session_live unconditionally, this should recover — but any
-    short-circuit in the reusable check (e.g. trusting _INSTANCES because
-    sandbox_id matches) will drop the request.
+    Invariants (deterministic — no LLM-prose dependency):
+      A. Turn 2 returns a non-empty reply.
+      B. ``inner_session_id`` is unchanged across recovery.
     """
     _require_provider(provider)
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
         session_id = sess["session_id"]
-        print(f"\n[test:{provider}] session={session_id[:8]}")
+        inner_sid_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
 
-        # Neutral ticket framing — see comment above test_session_resume_after_stop
-        # for why "Remember this secret code" trips Claude's injection guardrail.
-        ticket = "TKT-99991"
-        reply1 = await _ask(
-            client, session_id,
-            f"I'm tracking work under ticket ID {ticket}. Please acknowledge by "
-            f"echoing the ticket ID back to me so I know you have it.",
-        )
-        assert ticket in reply1, f"turn 1 didn't echo ticket: {reply1!r}"
+        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        assert reply1.strip(), f"turn 1 empty: {reply1!r}"
         print(f"[test:{provider}] turn1 ok")
 
         sandbox = await _get_sandbox(client, session_id)
@@ -642,15 +655,23 @@ async def test_message_after_stop_with_delay(provider):
         await asyncio.sleep(4)
         print(f"[test:{provider}] stopped + waited 4s; sending turn 2")
 
-        reply2 = await _ask(
-            client, session_id,
-            "What was the ticket ID I mentioned earlier in this conversation? "
-            "Reply with only the ticket ID.",
-        )
-        print(f"[test:{provider}] turn2 reply: {reply2[:200]!r}")
-        assert ticket in reply2, (
+        reply2 = await _ask(client, session_id, "Reply with a single short word.")
+        print(f"[test:{provider}] turn2 reply len: {len(reply2)}")
+        assert reply2.strip(), (
             f"turn 2 lost after 4s stop-delay: server did not recover "
             f"the dead sandbox before dispatching the prompt: {reply2!r}"
+        )
+
+        admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
+        in_mem = next(
+            (s for s in admin.get("sessions", []) if s["session_id"] == session_id),
+            None,
+        )
+        assert in_mem is not None, f"session missing from /admin/sessions"
+        assert in_mem.get("inner_session_id") == inner_sid_before, (
+            f"inner_session_id changed across recovery — server silently "
+            f"started a new conversation: {inner_sid_before!r} → "
+            f"{in_mem.get('inner_session_id')!r}"
         )
 
 
