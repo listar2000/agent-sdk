@@ -2878,8 +2878,6 @@ async def sessions_create(request: Request):
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), default_provider)
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
-    # Pull session cwd out of the body; agent config is pure identity now.
-    cwd = data.get("cwd", config_data.pop("cwd", default_cwd_for_provider(default_provider)))
     config_data.pop("dockerfile", None)
     config_data.pop("dockerfile_content", None)
     config_data.pop("shared_mounts", None)
@@ -2896,6 +2894,18 @@ async def sessions_create(request: Request):
                 {**config_data, "agent_type": data.get("agent_type", "claude")}
             ),
         ))
+
+    # Pull session cwd out of the body; agent config is pure identity now.
+    # The default matches the per-provider home_dir that the FIRST sandbox
+    # provision will spawn with, so session/new and every later session/load
+    # use the same path (the JSONL hash key). For local, this is the
+    # per-agent volume subpath; for docker/daytona, a fixed mount point.
+    default_cwd = (
+        str(Path(volume_record.provider_ref) / f"agents/{agent_id}")
+        if default_provider == "local"
+        else default_cwd_for_provider(default_provider)
+    )
+    cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
     session_id = str(uuid.uuid4())
     # Lazy mode: no sandbox provisioning here. current_sandbox_id = None.
@@ -2938,8 +2948,13 @@ async def sessions_quick_create(request: Request):
 
     # Pull session-level and sandbox-level fields out of the request body
     # before building AgentConfig (which is pure identity now).
-    cwd = data.get("cwd", config_data.pop("cwd", default_cwd_for_provider(provider)))
-    root = data.get("root", config_data.pop("root", cwd))
+    # ``root`` and ``cwd`` default to ``None`` — each provider fills in a
+    # sensible default (local: the per-agent volume subpath; docker:
+    # /home/agent; daytona: /home/daytona). Hardcoding a /tmp default here
+    # caused initial sandboxes to write outside the volume while replacements
+    # landed on the volume, breaking volume-persistence tests.
+    cwd = data.get("cwd", config_data.pop("cwd", None))
+    root = data.get("root", config_data.pop("root", None))
     dockerfile = _materialize_dockerfile({**config_data, **data})
     shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
     # Drop any dockerfile_content key that may have landed in config_data;
@@ -2997,9 +3012,17 @@ async def sessions_quick_create(request: Request):
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
     _INSTANCES[sandbox_id] = instance
+    # Now that the provider has computed its effective root, use that as the
+    # authoritative path for both the sandbox row and the session's cwd so
+    # session/new runs with the same path the supervisor's HOME points at.
+    # This is what makes volume-persistence tests work on local (HOME lands
+    # on the volume subpath rather than /tmp).
+    effective_root = instance.root or root or "/tmp"
+    if cwd is None:
+        cwd = effective_root
     await upsert_sandbox(_sandbox_record(
         sandbox_id, provider, instance,
-        volume_id=volume_id, subpath=subpath, root_fallback=root,
+        volume_id=volume_id, subpath=subpath, root_fallback=effective_root,
         dockerfile=dockerfile, shared_mounts=shared_mounts,
     ))
 
