@@ -296,6 +296,19 @@ async def test_cancel_session():
     assert rec.last.url.path == "/sessions/s1/cancel"
 
 
+@pytest.mark.asyncio
+async def test_session_sandbox_exec_posts_command_and_timeout():
+    sid = "s1"
+    rec = _Recorder({"stdout": "", "stderr": "", "exit_code": 0, "stdout_truncated": False, "timed_out": False})
+    async with _make_client(rec) as sc:
+        await sc.session_sandbox_exec(sid, "echo hello", timeout=60)
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == f"/sessions/{sid}/sandbox/exec"
+    body = json.loads(rec.last.content)
+    assert body["command"] == "echo hello"
+    assert body["timeout"] == 60
+
+
 # ---------------------------------------------------------------------------
 # Ghost endpoints must raise, not silently no-op
 # ---------------------------------------------------------------------------
