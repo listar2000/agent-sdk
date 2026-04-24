@@ -305,64 +305,120 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider):
 # Tests: delete recovery + volume persistence
 # ---------------------------------------------------------------------------
 
+async def _write_marker_and_read(client, session_id, marker):
+    """Turn-1: have the agent write marker and echo content back so
+    stdout is non-empty (pure tool-use turns return no SSE text)."""
+    return await _ask(
+        client, session_id,
+        f"Please run this shell pipeline and tell me the output:\n"
+        f"  echo 'volume-test' > ~/{marker} && cat ~/{marker}",
+    )
+
+
+async def _read_marker(client, session_id, marker):
+    return await _ask(
+        client, session_id,
+        f"Please run this shell command and tell me the output:\n"
+        f"  cat ~/{marker} || echo NOT_FOUND",
+    )
+
+
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
 @pytest.mark.asyncio
-async def test_delete_sandbox_volume_persistence(provider):
-    """Delete sandbox externally → new sandbox provisioned on same volume → files survive."""
+async def test_server_delete_persists_workspace(provider):
+    """Server-mediated DELETE triggers a cold snapshot (filesystem_cache)
+    before teardown, so arbitrary HOME files survive onto the replacement
+    sandbox. Conversation continuity is also preserved (agent_memory).
+    """
     _require_provider(provider)
-
-    marker = "recovery-test-marker.txt"
+    marker = "server-delete-marker.txt"
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        # Baseline: create a marker file on the persistent home directory,
-        # then read it back — combining the write+read in one turn forces
-        # textual output (pure tool-use turns return empty SSE text).
-        reply1 = await _ask(
-            client, session_id,
-            f"Please run this shell pipeline and tell me the output:\n"
-            f"  echo 'volume-test' > ~/{marker} && cat ~/{marker}",
-        )
-        print(f"[test:{provider}] setup reply: {reply1[:300]!r}")
+        reply1 = await _write_marker_and_read(client, session_id, marker)
         assert "volume-test" in reply1, f"marker setup failed: {reply1}"
 
-        # Capture sandbox_ref before delete
         sandbox = await _get_sandbox(client, session_id)
         sandbox_ref_before = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
-        print(f"[test:{provider}] sandbox_ref before delete: {sandbox_ref_before[:20]}")
-
-        # External delete
-        await _external_delete(sandbox)
+        sandbox_id = sandbox["id"]
+        r = await client.delete(f"{SERVER}/sandboxes/{sandbox_id}", timeout=60)
+        assert r.status_code in (200, 204), f"DELETE /sandboxes failed: {r.text}"
         await asyncio.sleep(3)
 
-        # Followup — server must provision a NEW sandbox on same volume.
-        # Ask the agent to read the marker and tell me what's in it.
-        reply2 = await _ask(
-            client, session_id,
-            f"Please run this shell command and tell me the output:\n"
-            f"  cat ~/{marker} || echo NOT_FOUND",
-        )
-        print(f"[test:{provider}] after delete reply: {reply2[:400]!r}")
-
+        reply2 = await _read_marker(client, session_id, marker)
+        print(f"[test:{provider}] after server-delete reply: {reply2[:400]!r}")
         assert "NOT_FOUND" not in reply2, (
-            f"marker file lost after sandbox delete — volume not persisted!\n{reply2}"
+            f"marker file lost after server DELETE — cold snapshot didn't run before "
+            f"teardown: {reply2}"
         )
-        assert "volume-test" in reply2, (
-            f"marker file content not found after delete:\n{reply2}"
-        )
+        assert "volume-test" in reply2, f"marker content missing after server DELETE: {reply2}"
 
         sandbox_after = await _get_sandbox(client, session_id)
         sandbox_ref_after = sandbox_after.get("sandbox_ref") or sandbox_after.get("provider_ref", "")
-        print(f"[test:{provider}] sandbox_ref after replacement: {sandbox_ref_after[:20]}")
-
-        # After a delete the server must provision a DIFFERENT sandbox (new sandbox_ref)
         if sandbox_ref_before:
             assert sandbox_ref_after != sandbox_ref_before, (
-                f"sandbox_ref unchanged after delete — old sandbox was restarted instead "
-                f"of a new one being provisioned: {sandbox_ref_before!r}"
+                f"sandbox_ref unchanged after delete: {sandbox_ref_before!r}"
+            )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_external_delete_preserves_agent_memory_not_workspace(provider):
+    """Out-of-band delete (daytona dashboard / docker rm / kill -9) bypasses
+    the server, so no cold snapshot runs. Two invariants we still require:
+
+      A. agent_memory (per-turn) preserved: conversation continues on the
+         replacement sandbox — the last turn's JSONL is on the volume.
+
+      B. filesystem_cache NOT guaranteed: arbitrary HOME files written
+         since the last lifecycle event may be lost.
+
+    For local/docker, HOME IS the volume (no tar round-trip), so the
+    marker survives regardless — these providers don't exhibit (B).
+    For daytona with the two-tier snapshot design, the marker is expected
+    to be LOST; the test asserts that explicitly.
+    """
+    _require_provider(provider)
+    marker = "external-delete-marker.txt"
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        inner_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner={inner_before}")
+
+        reply1 = await _write_marker_and_read(client, session_id, marker)
+        assert "volume-test" in reply1, f"marker setup failed: {reply1}"
+
+        sandbox = await _get_sandbox(client, session_id)
+        await _external_delete(sandbox)
+        await asyncio.sleep(3)
+
+        # Invariant A: agent memory preserved → session/load succeeds →
+        # inner_sid unchanged across the delete.
+        inner_after = await _inner_sid_in_memory(client, session_id)
+        assert inner_after == inner_before, (
+            f"agent_memory not preserved across external delete — session/load "
+            f"didn't restore: {inner_before!r} → {inner_after!r}"
+        )
+
+        reply2 = await _read_marker(client, session_id, marker)
+        print(f"[test:{provider}] after external-delete reply: {reply2[:400]!r}")
+
+        if provider == "daytona":
+            # Daytona: filesystem_cache only snapshotted on lifecycle events;
+            # external delete bypasses that → marker is expected to be lost.
+            assert "volume-test" not in reply2, (
+                f"daytona: marker unexpectedly survived external delete — "
+                f"did a cold snapshot run? {reply2}"
+            )
+        else:
+            # local/docker: HOME is directly on volume, marker always survives.
+            assert "volume-test" in reply2, (
+                f"{provider}: marker lost despite HOME being on volume: {reply2}"
             )
 
 
