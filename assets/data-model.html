@@ -954,7 +954,7 @@
               <span class="method-name">__aenter__ / __aexit__</span>
               <span class="method-desc">async context manager</span>
             </div>
-            <div class="relation-note">Auto-provisions via <code style="font-family:monospace;color:#22d3ee;">POST /sessions/quick</code>. Optional session persistence via SqliteSessionDriver.</div>
+            <div class="relation-note">Auto-provisions via <code style="font-family:monospace;color:#22d3ee;">POST /sessions</code> (eager by default). Optional session persistence via SqliteSessionDriver.</div>
           </div>
         </div>
 
@@ -1189,13 +1189,7 @@
         <div class="endpoint-row is-new">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/volumes</span>
-          <span class="endpoint-desc">create volume — body {name, provider}</span>
-          <span class="endpoint-new-badge">new</span>
-        </div>
-        <div class="endpoint-row is-new">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/volumes/provision</span>
-          <span class="endpoint-desc">create + wait for ready</span>
+          <span class="endpoint-desc">create + wait for ready — body {name, provider}</span>
           <span class="endpoint-new-badge">new</span>
         </div>
         <div class="endpoint-row is-new">
@@ -1240,12 +1234,7 @@
         <div class="endpoint-row is-updated">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sandboxes</span>
-          <span class="endpoint-desc">create — body now REQUIRES {volume_id, subpath}</span>
-        </div>
-        <div class="endpoint-row is-updated">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/provision</span>
-          <span class="endpoint-desc">create + install deps. Also requires {volume_id, subpath}</span>
+          <span class="endpoint-desc">create + install deps + start supervisor. Body REQUIRES {volume_id, subpath}</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
@@ -1293,12 +1282,7 @@
         <div class="endpoint-row is-updated">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions</span>
-          <span class="endpoint-desc">create — body REQUIRES {agent_id, volume_id}. <strong>No sandbox provisioned</strong> (lazy)</span>
-        </div>
-        <div class="endpoint-row is-updated">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/quick</span>
-          <span class="endpoint-desc">one-shot agent+sandbox+session — now REQUIRES volume_id</span>
+          <span class="endpoint-desc">create — eager by default (agent+sandbox+ACP connect). Pass <code>"provision": false</code> for lazy session row only. Body REQUIRES volume_id.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>

@@ -313,13 +313,7 @@
         <div class="endpoint-row is-new">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/volumes</span>
-          <span class="endpoint-desc">Create — body <code>{name, provider}</code>. Returns the volume row.</span>
-          <span class="endpoint-tag tag-new">New</span>
-        </div>
-        <div class="endpoint-row is-new">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/volumes/provision</span>
-          <span class="endpoint-desc">Create + wait until <code>status = "ready"</code>. Mirrors /sandboxes/provision.</span>
+          <span class="endpoint-desc">Create + wait until <code>status = "ready"</code>. Body <code>{name, provider}</code>.</span>
           <span class="endpoint-tag tag-new">New</span>
         </div>
         <div class="endpoint-row is-new">
@@ -389,13 +383,7 @@
         <div class="endpoint-row is-updated">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sandboxes</span>
-          <span class="endpoint-desc">Create — body now requires <code>{provider, volume_id, subpath, …compute params}</code>.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
-        </div>
-        <div class="endpoint-row is-updated">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/provision</span>
-          <span class="endpoint-desc">Create + wait. Same new required fields.</span>
+          <span class="endpoint-desc">Create + wait — body <code>{provider, volume_id, subpath, config, pre_start_commands, shared_mounts, …}</code>.</span>
           <span class="endpoint-tag tag-updated">Updated</span>
         </div>
         <div class="endpoint-row">
@@ -492,13 +480,7 @@
         <div class="endpoint-row is-updated">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions</span>
-          <span class="endpoint-desc">Create — body now requires <code>{agent_id, volume_id}</code>. No <code>sandbox_id</code>. No compute provisioned yet.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
-        </div>
-        <div class="endpoint-row is-updated">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/quick</span>
-          <span class="endpoint-desc">One-shot — now requires <code>volume_id</code> too.</span>
+          <span class="endpoint-desc">Create — eager by default (provisions sandbox + connects ACP); pass <code>"provision": false</code> in body for lazy (session row only). Old <code>/sessions/quick</code> collapsed into this.</span>
           <span class="endpoint-tag tag-updated">Updated</span>
         </div>
         <div class="endpoint-row">
