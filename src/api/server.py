@@ -324,8 +324,7 @@ async def _reap_one_tick(now: float) -> None:
                          sandbox_id, instance.provider)
                 # Snapshot BEFORE stop so next boot's session/load finds
                 # the JSONLs on the volume (per-turn snapshot was dropped).
-                if instance.url:
-                    await _request_supervisor_snapshot(instance.url)
+                await _request_supervisor_snapshot(instance)
                 try:
                     await stop_instance(instance)
                     rec = await get_sandbox(sandbox_id)
@@ -1621,8 +1620,7 @@ async def delete_sandbox_route(sandbox_id: str):
         # latest workspace state (per-turn snapshot was dropped in
         # 2026-04-23; this is the durability boundary).
         instance = _INSTANCES.get(sandbox_id)
-        if instance and instance.url:
-            await _request_supervisor_snapshot(instance.url)
+        await _request_supervisor_snapshot(instance)
 
         # force=True so a UI holding a persistent /events stream doesn't
         # block the shutdown and leave a zombie state pointing at the
@@ -1750,8 +1748,7 @@ async def stop_sandbox_route(sandbox_id: str):
         if instance:
             # Snapshot before stop so the next boot's session/load finds
             # the JSONLs on the volume (per-turn snapshot was dropped).
-            if instance.url:
-                await _request_supervisor_snapshot(instance.url)
+            await _request_supervisor_snapshot(instance)
             try:
                 await stop_instance(instance)
             except Exception as e:
@@ -2108,14 +2105,21 @@ def _synthesize_instance(sandbox: SandboxRecord) -> ProviderInstance:
     )
 
 
-async def _request_supervisor_snapshot(url: str, timeout: float = 60.0) -> bool:
+async def _request_supervisor_snapshot(
+    target: "ProviderInstance | str | None", timeout: float = 60.0,
+) -> bool:
     """Fire POST /v1/snapshot on the supervisor. Returns True on 200.
+
+    Accepts either a ``ProviderInstance`` (common) or a raw URL string.
+    ``None`` / missing URL short-circuits so the 4 pre-stop call sites can
+    drop their own ``if instance and instance.url`` guards.
 
     Called before stopping or reaping a sandbox so the next boot's
     session/load finds the JSONLs on the volume. Per-turn snapshots were
     dropped in 2026-04-23; the durability invariant now lives here.
     Best-effort — a failure logs but doesn't block the stop.
     """
+    url = target if isinstance(target, str) else (target.url if target else "")
     if not url:
         return False
     try:
@@ -3498,8 +3502,7 @@ async def stop_session_sandbox(session_id: str):
     # Snapshot BEFORE stopping compute so the volume has the latest
     # workspace for session/load on resume.
     inst = _INSTANCES.get(sbid)
-    if inst and inst.url:
-        await _request_supervisor_snapshot(inst.url)
+    await _request_supervisor_snapshot(inst)
     if sb:
         try:
             await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))

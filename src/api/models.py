@@ -150,6 +150,16 @@ class SessionState:
     # ── Subscribers ──
     _session_subscribers: list = field(default_factory=list, repr=False)  # list[asyncio.Queue]
     _rpc_subscribers: dict = field(default_factory=dict, repr=False)  # dict[str, list[asyncio.Queue]]
+    # Buffer for items dispatched while nobody is listening. When /events
+    # reconnects after a stream-closed gap (UI's EventSource retry loop),
+    # the POST /message that landed in the gap has already dispatched its
+    # reply events; without this buffer they'd be silently dropped and the
+    # UI would sit at "Queued for agent" forever. Bounded: an agent turn
+    # is ~50-200 blocks so 2000 gives 10-20x headroom without growing
+    # unbounded if no client ever returns.
+    _pending_broadcasts: deque = field(
+        default_factory=lambda: deque(maxlen=2000), repr=False,
+    )
 
     @property
     def agent_busy(self) -> bool:
@@ -158,8 +168,17 @@ class SessionState:
     # ── Session-scoped subscribers (receive all events) ──
 
     def subscribe_session(self) -> "asyncio.Queue":
-        """Register a session-scoped subscriber queue."""
+        """Register a session-scoped subscriber queue.
+
+        Also drains any items buffered during a no-subscribers gap onto
+        the new queue, in order. Without this, the UI's /events reconnect
+        after a stream-closed race loses every reply event that arrived
+        while the EventSource was retrying.
+        """
         q: asyncio.Queue = asyncio.Queue(maxsize=10000)
+        while self._pending_broadcasts:
+            if not _try_put(q, self._pending_broadcasts.popleft()):
+                break  # queue full — stop draining, rest is dropped
         self._session_subscribers.append(q)
         return q
 
@@ -210,12 +229,22 @@ class SessionState:
             self._kick_subscriber(q)
 
     def dispatch(self, tag: str | None, item) -> None:
-        """Route to matching RPC subscribers + all session subscribers."""
-        if tag is not None:
-            rpc_qs = self._rpc_subscribers.get(tag)
-            if rpc_qs:
-                self._send(rpc_qs, item)
-        self._send(self._session_subscribers, item)
+        """Route to matching RPC subscribers + all session subscribers.
+
+        When BOTH target lists are empty (UI's /events has disconnected
+        and no per-rpc caller is waiting), buffer the item onto
+        ``_pending_broadcasts`` so the next ``subscribe_session`` call
+        can replay. This closes the UI reconnect-gap race where reply
+        events flow while the EventSource retry timer is still running.
+        """
+        rpc_qs = self._rpc_subscribers.get(tag) if tag is not None else None
+        rpc_delivered = bool(rpc_qs)
+        if rpc_delivered:
+            self._send(rpc_qs, item)
+        if self._session_subscribers:
+            self._send(self._session_subscribers, item)
+        elif not rpc_delivered:
+            self._pending_broadcasts.append(item)
 
     def broadcast(self, item) -> None:
         """Push to ALL subscribers (session + all RPC). For sentinels/heartbeats."""
