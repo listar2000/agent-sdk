@@ -310,22 +310,12 @@ async function handleAcpLine(line) {
     ("result" in msg || "error" in msg)
   ) {
     const rid = String(msg.id);
-    const isPromptResponse = pendingPromptIds.has(rid);
-    // Turn-end: block the HTTP response until the workspace snapshot for
-    // this turn is durable on the volume. Trade ~0.5–2 s of end-of-turn
-    // latency for the invariant "once the client sees `turn done`, the
-    // sandbox can be deleted without losing the turn". The original async
-    // firing left a race window in which `daytona.delete()` could kill
-    // the container mid-PUT, losing the session JSONL and causing
-    // session/load to fail on the replacement sandbox.
-    if (isPromptResponse) {
-      pendingPromptIds.delete(rid);
-      try {
-        await runSnapshotOnce();
-      } catch (e) {
-        log(`snapshot error on turn-end: ${e.message}`);
-      }
-    }
+    // Per-turn snapshot was removed 2026-04-23: the tarball grew linearly
+    // with workspace size and dominated end-of-turn latency. Snapshots now
+    // only run on graceful shutdown or an explicit POST /v1/snapshot (the
+    // server hits that before /stop-sandbox and before idle reap so
+    // session/load on the replacement sandbox still finds the JSONLs).
+    pendingPromptIds.delete(rid);
     const resolver = pendingResponses.get(rid);
     if (resolver) {
       pendingResponses.delete(rid);

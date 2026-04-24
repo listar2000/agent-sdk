@@ -322,6 +322,10 @@ async def _reap_one_tick(now: float) -> None:
             if instance:
                 log.info("idle reaper: stopping sandbox %s (provider=%s)",
                          sandbox_id, instance.provider)
+                # Snapshot BEFORE stop so next boot's session/load finds
+                # the JSONLs on the volume (per-turn snapshot was dropped).
+                if instance.url:
+                    await _request_supervisor_snapshot(instance.url)
                 try:
                     await stop_instance(instance)
                     rec = await get_sandbox(sandbox_id)
@@ -1611,14 +1615,19 @@ async def get_sandbox_route(sandbox_id: str):
 @app.delete("/sandboxes/{sandbox_id}")
 async def delete_sandbox_route(sandbox_id: str):
     await _require_sandbox(sandbox_id)
-    # Hold the sandbox lock to prevent concurrent auto-restart
-    # from restarting the sandbox while we're deleting it.
     async with _get_sandbox_lock(sandbox_id):
+        # Snapshot before tearing down the compute so the next sandbox
+        # provisioned on this volume's subpath can session/load with the
+        # latest workspace state (per-turn snapshot was dropped in
+        # 2026-04-23; this is the durability boundary).
+        instance = _INSTANCES.get(sandbox_id)
+        if instance and instance.url:
+            await _request_supervisor_snapshot(instance.url)
+
         # force=True so a UI holding a persistent /events stream doesn't
         # block the shutdown and leave a zombie state pointing at the
         # deleted sandbox. session.current_sandbox_id NULL-outs itself
-        # via the sandboxes_current_sandbox_id_fkey ON DELETE SET NULL
-        # constraint below.
+        # via ON DELETE SET NULL on sandboxes_current_sandbox_id_fkey.
         for state in list(SESSIONS.values()):
             if state.sandbox_id == sandbox_id:
                 await _shutdown_session_state(state, remove=True, force=True)
@@ -1739,9 +1748,11 @@ async def stop_sandbox_route(sandbox_id: str):
     async with _get_sandbox_lock(sandbox_id):
         instance = _INSTANCES.get(sandbox_id)
         if instance:
+            # Snapshot before stop so the next boot's session/load finds
+            # the JSONLs on the volume (per-turn snapshot was dropped).
+            if instance.url:
+                await _request_supervisor_snapshot(instance.url)
             try:
-                # Durability lives at turn-end in the supervisor; stop is
-                # just SIGTERM. Client sees this return as "stop complete."
                 await stop_instance(instance)
             except Exception as e:
                 log.warning("stop_sandbox_route: stop failed for %s: %s",
@@ -1767,6 +1778,22 @@ async def stop_sandbox_route(sandbox_id: str):
         _INSTANCES.pop(sandbox_id, None)
 
     return {"status": "stopped"}
+
+
+@app.post("/sandboxes/{sandbox_id}/snapshot")
+async def snapshot_sandbox_route(sandbox_id: str):
+    """Write the sandbox's workspace to the volume. Use before risky ops
+    or when the user wants an explicit "save point". /sandboxes/{id}/stop,
+    /sessions/{id}/stop-sandbox, and the idle reaper already do this
+    implicitly — call this endpoint only for mid-session saves.
+    """
+    await _require_sandbox(sandbox_id)
+    instance = _INSTANCES.get(sandbox_id)
+    if instance is None or not instance.url:
+        raise HTTPException(409, "sandbox not running")
+    if not await _request_supervisor_snapshot(instance.url):
+        raise HTTPException(502, "supervisor snapshot failed")
+    return {"status": "ok"}
 
 
 @app.post("/sandboxes/{sandbox_id}/start")
@@ -2079,6 +2106,27 @@ def _synthesize_instance(sandbox: SandboxRecord) -> ProviderInstance:
         provider=sandbox.provider, url="",
         root=sandbox.root, sandbox_id=sandbox.sandbox_ref,
     )
+
+
+async def _request_supervisor_snapshot(url: str, timeout: float = 60.0) -> bool:
+    """Fire POST /v1/snapshot on the supervisor. Returns True on 200.
+
+    Called before stopping or reaping a sandbox so the next boot's
+    session/load finds the JSONLs on the volume. Per-turn snapshots were
+    dropped in 2026-04-23; the durability invariant now lives here.
+    Best-effort — a failure logs but doesn't block the stop.
+    """
+    if not url:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(f"{url}/v1/snapshot")
+            if r.status_code == 200:
+                return True
+            log.warning("supervisor snapshot returned %d: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.warning("supervisor snapshot failed (%s): %s", url, e)
+    return False
 
 
 async def _instance_is_alive(inst: ProviderInstance) -> bool:
@@ -3447,6 +3495,11 @@ async def stop_session_sandbox(session_id: str):
     if sbid is None:
         return  # 204, no-op — already stopped
     sb = await get_sandbox(sbid)
+    # Snapshot BEFORE stopping compute so the volume has the latest
+    # workspace for session/load on resume.
+    inst = _INSTANCES.get(sbid)
+    if inst and inst.url:
+        await _request_supervisor_snapshot(inst.url)
     if sb:
         try:
             await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))
