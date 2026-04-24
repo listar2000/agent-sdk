@@ -430,6 +430,78 @@ class ServerClient:
             json={"command": command, "timeout": timeout},
         )
 
+    # Session filesystem (sandbox identity hidden — session_id addresses
+    # the current sandbox; re-provisions transparently on /resume)
+
+    async def session_file_tree(self, session_id: str) -> dict[str, Any]:
+        """``GET /sessions/{id}/files/tree``."""
+        return await self._json("GET", f"/sessions/{session_id}/files/tree")
+
+    async def session_file_read(
+        self, session_id: str, path: str
+    ) -> dict[str, Any]:
+        """``GET /sessions/{id}/files/read?path=...``."""
+        return await self._json(
+            "GET", f"/sessions/{session_id}/files/read", params={"path": path},
+        )
+
+    async def session_file_edit(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/files/edit``."""
+        body: dict[str, Any] = {
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+        }
+        if replace_all:
+            body["replace_all"] = True
+        return await self._json(
+            "POST", f"/sessions/{session_id}/files/edit", json=body,
+        )
+
+    async def session_file_upload(
+        self, session_id: str, path: str, content_b64: str
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/files/upload`` — body: ``{path, content (b64)}``."""
+        return await self._json(
+            "POST", f"/sessions/{session_id}/files/upload",
+            json={"path": path, "content": content_b64},
+        )
+
+    async def session_file_delete(
+        self, session_id: str, path: str
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/files/delete``."""
+        return await self._json(
+            "POST", f"/sessions/{session_id}/files/delete", json={"path": path},
+        )
+
+    async def session_file_rename(
+        self, session_id: str, path: str, new_path: str
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/files/rename``."""
+        return await self._json(
+            "POST", f"/sessions/{session_id}/files/rename",
+            json={"path": path, "new_path": new_path},
+        )
+
+    async def session_file_download(
+        self, session_id: str, path: str
+    ) -> bytes:
+        """``GET /sessions/{id}/files/download?path=...`` — raw bytes."""
+        resp = await self._http.get(
+            f"/sessions/{session_id}/files/download", params={"path": path},
+        )
+        _raise_for_status(resp)
+        return resp.content
+
     # ------------------------------------------------------------------
     # Sessions — sandbox lifecycle (from the session's perspective)
     # ------------------------------------------------------------------

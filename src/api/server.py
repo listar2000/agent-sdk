@@ -3670,18 +3670,24 @@ async def session_sandbox_exec(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_to_supervisor(
-    sandbox_id: str, method: str, path: str, *,
+async def _resolve_session_instance(session_id: str) -> ProviderInstance:
+    """Resolve a session_id to its current sandbox's ProviderInstance.
+
+    Hides sandbox identity from callers — the whole point of the
+    ``/sessions/{id}/files/*`` endpoints. Does NOT start the ACP runtime
+    (file browsing doesn't need it); only ensures the sandbox itself is live.
+    """
+    session = await _require_session_row(session_id)
+    sandbox = await ensure_sandbox(session)
+    return await _resolve_sandbox_instance(sandbox.id)
+
+
+async def _proxy_instance(
+    instance: ProviderInstance, method: str, path: str, *,
     params: dict | None = None, json: dict | None = None,
     timeout: int = 30,
 ) -> Response:
-    """Forward a request to the sandbox's supervisor and return its JSON response.
-
-    Shared by every ``/sandboxes/{id}/files/*`` endpoint that returns JSON.
-    For binary responses (see ``files/download``) the header-forwarding case is
-    handled inline since it's unique.
-    """
-    instance = await _resolve_sandbox_instance(sandbox_id)
+    """Forward a request to a sandbox's supervisor via its ProviderInstance."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.request(
@@ -3694,6 +3700,31 @@ async def _proxy_to_supervisor(
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+async def _proxy_to_supervisor(
+    sandbox_id: str, method: str, path: str, *,
+    params: dict | None = None, json: dict | None = None,
+    timeout: int = 30,
+) -> Response:
+    """Forward a request to the sandbox's supervisor and return its JSON response.
+
+    Shared by every ``/sandboxes/{id}/files/*`` endpoint that returns JSON.
+    For binary responses (see ``files/download``) the header-forwarding case is
+    handled inline since it's unique.
+    """
+    instance = await _resolve_sandbox_instance(sandbox_id)
+    return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
+
+
+async def _proxy_from_session(
+    session_id: str, method: str, path: str, *,
+    params: dict | None = None, json: dict | None = None,
+    timeout: int = 30,
+) -> Response:
+    """Session-scoped twin of ``_proxy_to_supervisor``."""
+    instance = await _resolve_session_instance(session_id)
+    return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
 
 
 @app.get("/sandboxes/{sandbox_id}/files/tree")
@@ -3754,6 +3785,10 @@ async def sandbox_files_rename(sandbox_id: str, request: Request):
 async def sandbox_files_download(sandbox_id: str, path: str):
     """Download a file as raw bytes (forwards content-type + disposition)."""
     instance = await _resolve_sandbox_instance(sandbox_id)
+    return await _download_from_instance(instance, path)
+
+
+async def _download_from_instance(instance: ProviderInstance, path: str) -> Response:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.get(f"{instance.url}/v1/files/download", params={"path": path})
@@ -3765,6 +3800,68 @@ async def sandbox_files_download(sandbox_id: str, path: str):
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped filesystem browsing (sandbox identity hidden from callers)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/sessions/{session_id}/files/tree")
+async def session_files_tree(session_id: str):
+    """Return the recursive directory tree of the session's sandbox."""
+    return await _proxy_from_session(session_id, "GET", "/v1/files/tree")
+
+
+@app.get("/sessions/{session_id}/files/read")
+async def session_files_read(session_id: str, path: str):
+    """Read a single file from the session's sandbox."""
+    return await _proxy_from_session(
+        session_id, "GET", "/v1/files/read", params={"path": path},
+    )
+
+
+@app.post("/sessions/{session_id}/files/edit")
+async def session_files_edit(session_id: str, request: Request):
+    """Edit or create a file. Body: same shape as ``/sandboxes/{id}/files/edit``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/edit",
+        json=await _json_body(request),
+    )
+
+
+@app.post("/sessions/{session_id}/files/upload")
+async def session_files_upload(session_id: str, request: Request):
+    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/upload",
+        json=await _json_body(request), timeout=60,
+    )
+
+
+@app.post("/sessions/{session_id}/files/delete")
+async def session_files_delete(session_id: str, request: Request):
+    """Delete a file or directory. Body: ``{"path": ...}``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/delete",
+        json=await _json_body(request),
+    )
+
+
+@app.post("/sessions/{session_id}/files/rename")
+async def session_files_rename(session_id: str, request: Request):
+    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/rename",
+        json=await _json_body(request),
+    )
+
+
+@app.get("/sessions/{session_id}/files/download")
+async def session_files_download(session_id: str, path: str):
+    """Download a file as raw bytes from the session's sandbox."""
+    instance = await _resolve_session_instance(session_id)
+    return await _download_from_instance(instance, path)
 
 
 # ---------------------------------------------------------------------------

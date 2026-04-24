@@ -261,6 +261,88 @@ async def test_sandbox_file_download_returns_raw_bytes():
 
 
 # ---------------------------------------------------------------------------
+# Session filesystem (session_id addresses the current sandbox)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_file_tree_gets_sessions_files_tree():
+    rec = _Recorder([{"name": "a.py", "path": "a.py", "type": "file"}])
+    async with _make_client(rec) as sc:
+        out = await sc.session_file_tree("s1")
+    assert out == [{"name": "a.py", "path": "a.py", "type": "file"}]
+    assert rec.last.method == "GET"
+    assert rec.last.url.path == "/sessions/s1/files/tree"
+
+
+@pytest.mark.asyncio
+async def test_session_file_read_passes_path_param():
+    rec = _Recorder({"content": "hi", "path": "a.py"})
+    async with _make_client(rec) as sc:
+        await sc.session_file_read("s1", "a.py")
+    assert rec.last.method == "GET"
+    assert rec.last.url.path == "/sessions/s1/files/read"
+    assert dict(rec.last.url.params) == {"path": "a.py"}
+
+
+@pytest.mark.asyncio
+async def test_session_file_edit_replace_all_flag_only_when_true():
+    rec = _Recorder({"ok": True})
+    async with _make_client(rec) as sc:
+        await sc.session_file_edit("s1", "a.py", old_string="x", new_string="y")
+    body = json.loads(rec.last.content)
+    assert body == {"path": "a.py", "old_string": "x", "new_string": "y"}
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/sessions/s1/files/edit"
+
+    rec = _Recorder({"ok": True})
+    async with _make_client(rec) as sc:
+        await sc.session_file_edit("s1", "a.py", old_string="x", new_string="y", replace_all=True)
+    assert json.loads(rec.last.content)["replace_all"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_file_upload_carries_base64_body():
+    rec = _Recorder({"ok": True})
+    async with _make_client(rec) as sc:
+        await sc.session_file_upload("s1", "CLAUDE.md", "aGVsbG8=")
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/sessions/s1/files/upload"
+    assert json.loads(rec.last.content) == {"path": "CLAUDE.md", "content": "aGVsbG8="}
+
+
+@pytest.mark.asyncio
+async def test_session_file_delete_posts_path_body():
+    rec = _Recorder({"ok": True})
+    async with _make_client(rec) as sc:
+        await sc.session_file_delete("s1", "junk.txt")
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/sessions/s1/files/delete"
+    assert json.loads(rec.last.content) == {"path": "junk.txt"}
+
+
+@pytest.mark.asyncio
+async def test_session_file_rename_posts_path_and_new_path():
+    rec = _Recorder({"ok": True})
+    async with _make_client(rec) as sc:
+        await sc.session_file_rename("s1", "old.py", "new.py")
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/sessions/s1/files/rename"
+    assert json.loads(rec.last.content) == {"path": "old.py", "new_path": "new.py"}
+
+
+@pytest.mark.asyncio
+async def test_session_file_download_returns_raw_bytes():
+    raw = b"\x89PNG\r\n\x1a\n" + b"\x00" * 10
+    rec = _Recorder(raw, content_type="application/octet-stream")
+    async with _make_client(rec) as sc:
+        out = await sc.session_file_download("s1", "img.png")
+    assert out == raw
+    assert rec.last.url.path == "/sessions/s1/files/download"
+    assert dict(rec.last.url.params) == {"path": "img.png"}
+
+
+# ---------------------------------------------------------------------------
 # Sessions lifecycle
 # ---------------------------------------------------------------------------
 
