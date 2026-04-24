@@ -5,10 +5,9 @@ is mocked to return objects with controlled exit_code / result / stderr fields.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import sys
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -31,9 +30,25 @@ def _make_exec_result(exit_code, stdout="", stderr=""):
 def _make_sandbox(exec_result):
     """Return a mock sandbox whose process.exec always returns exec_result."""
     sb = MagicMock()
-    sb.id = "test-sandbox-id"
+    sb.id = "fake-sandbox-abc123"
     sb.process.exec.return_value = exec_result
     return sb
+
+
+def _fake_daytona_class(sandbox):
+    """Return a fake Daytona class that always creates the given sandbox."""
+
+    class _FakeDaytona:
+        def __init__(self, *a, **kw):
+            pass
+
+        def create(self, params, timeout=None):
+            return sandbox
+
+        def delete(self, sb):
+            pass
+
+    return _FakeDaytona
 
 
 # ---------------------------------------------------------------------------
@@ -43,41 +58,32 @@ def _make_sandbox(exec_result):
 class TestRunSandboxExec:
     def test_captures_stdout(self):
         from api.providers.daytona import _run_sandbox_exec
-        r = _make_exec_result(exit_code=0, stdout="hello\n", stderr="")
-        sb = _make_sandbox(r)
-        result = _run_sandbox_exec(sb, "echo hello")
-        assert result.stdout == "hello\n"
+        sb = _make_sandbox(_make_exec_result(exit_code=0, stdout="hello\n"))
+        assert _run_sandbox_exec(sb, "echo hello").stdout == "hello\n"
 
     def test_captures_stderr(self):
         from api.providers.daytona import _run_sandbox_exec
-        r = _make_exec_result(exit_code=1, stdout="", stderr="error message")
-        sb = _make_sandbox(r)
-        result = _run_sandbox_exec(sb, "badcmd")
-        assert result.stderr == "error message"
+        sb = _make_sandbox(_make_exec_result(exit_code=1, stderr="error message"))
+        assert _run_sandbox_exec(sb, "badcmd").stderr == "error message"
 
     def test_captures_exit_code(self):
         from api.providers.daytona import _run_sandbox_exec
-        r = _make_exec_result(exit_code=127, stdout="", stderr="command not found")
-        sb = _make_sandbox(r)
-        result = _run_sandbox_exec(sb, "missingcmd")
-        assert result.exit_code == 127
+        sb = _make_sandbox(_make_exec_result(exit_code=127, stderr="command not found"))
+        assert _run_sandbox_exec(sb, "missingcmd").exit_code == 127
 
     def test_ok_true_for_zero(self):
         from api.providers.daytona import _run_sandbox_exec
-        sb = _make_sandbox(_make_exec_result(exit_code=0))
-        assert _run_sandbox_exec(sb, "true").ok is True
+        assert _run_sandbox_exec(_make_sandbox(_make_exec_result(0)), "true").ok is True
 
     def test_ok_false_for_nonzero(self):
         from api.providers.daytona import _run_sandbox_exec
-        sb = _make_sandbox(_make_exec_result(exit_code=1))
-        assert _run_sandbox_exec(sb, "false").ok is False
+        assert _run_sandbox_exec(_make_sandbox(_make_exec_result(1)), "false").ok is False
 
     def test_ok_true_for_none_exit_code(self):
-        """exit_code=None means the SDK didn't report it; treat as OK (can't distinguish)."""
+        """exit_code=None means the SDK didn't report it; treat as OK."""
         from api.providers.daytona import _run_sandbox_exec
-        r = SimpleNamespace(result="some output")  # no exit_code or stderr attribute
         sb = MagicMock()
-        sb.process.exec.return_value = r
+        sb.process.exec.return_value = SimpleNamespace(result="output")  # no exit_code
         result = _run_sandbox_exec(sb, "cmd")
         assert result.exit_code is None
         assert result.ok is True
@@ -85,9 +91,8 @@ class TestRunSandboxExec:
     def test_defensive_missing_result_field(self):
         """When SDK object has no 'result' attr, stdout should be empty string."""
         from api.providers.daytona import _run_sandbox_exec
-        r = SimpleNamespace(exit_code=0)  # no result or stderr
         sb = MagicMock()
-        sb.process.exec.return_value = r
+        sb.process.exec.return_value = SimpleNamespace(exit_code=0)  # no result or stderr
         result = _run_sandbox_exec(sb, "cmd")
         assert result.stdout == ""
         assert result.stderr == ""
@@ -97,38 +102,16 @@ class TestRunSandboxExec:
 # Tests for pre_start_commands behavior in provision_daytona_sandbox
 # ---------------------------------------------------------------------------
 
-def _make_fake_sandbox(exec_result):
-    """Create a mock sandbox matching what provision_daytona_sandbox works with."""
-    sb = MagicMock()
-    sb.id = "fake-sandbox-abc123"
-    sb.process.exec.return_value = exec_result
-    return sb
-
-
-def _patched_provision(pre_start_commands, exec_result):
-    """
-    Call provision_daytona_sandbox's pre_start loop in isolation by patching
-    daytona.create to return a fake sandbox, and patching out the
-    Daytona/DaytonaConfig imports.
-    """
-    from api.providers.daytona import provision_daytona_sandbox
-
-    fake_sandbox = _make_fake_sandbox(exec_result)
-
-    fake_daytona_instance = MagicMock()
-    fake_daytona_instance.create.return_value = fake_sandbox
-
-    FakeDaytona = MagicMock(return_value=fake_daytona_instance)
-    FakeDaytonaConfig = MagicMock()
-    FakeCreateSandboxFromSnapshotParams = MagicMock()
-    FakeCreateSandboxFromImageParams = MagicMock()
-
-    with patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key", "DAYTONA_SNAPSHOT": "0"}), \
-         patch("api.providers.daytona.provision_daytona_sandbox.__globals__", {}):
-        pass  # just confirming we can import
-
-    return fake_sandbox, fake_daytona_instance, FakeDaytona, FakeDaytonaConfig, \
-        FakeCreateSandboxFromSnapshotParams, FakeCreateSandboxFromImageParams
+def _provision_ctx(sandbox):
+    """Context manager stack for provision_daytona_sandbox unit tests."""
+    import daytona_sdk as _dsdk
+    return (
+        patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key", "DAYTONA_SNAPSHOT": "0"}),
+        patch.object(_dsdk, "Daytona", _fake_daytona_class(sandbox)),
+        patch.object(_dsdk, "DaytonaConfig", MagicMock()),
+        patch("api.providers.daytona._build_volume_mounts", return_value=[]),
+        patch("api.providers.daytona._get_sandbox_env_vars", return_value={}),
+    )
 
 
 @pytest.mark.asyncio
@@ -136,81 +119,35 @@ async def test_pre_start_exit_zero_no_raise(caplog):
     """exit_code=0 → no raise, and INFO log is emitted."""
     from api.providers.daytona import provision_daytona_sandbox
 
-    exec_result = _make_exec_result(exit_code=0, stdout="all good\n", stderr="")
-    fake_sandbox = _make_fake_sandbox(exec_result)
-
-    fake_daytona = MagicMock()
-    fake_daytona.create.return_value = fake_sandbox
+    sb = _make_sandbox(_make_exec_result(exit_code=0, stdout="all good\n"))
+    env_ctx, daytona_ctx, cfg_ctx, mounts_ctx, env_vars_ctx = _provision_ctx(sb)
 
     with caplog.at_level(logging.INFO, logger="api.providers.daytona"), \
-         patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key", "DAYTONA_SNAPSHOT": "0"}), \
-         patch("api.providers.daytona._get_daytona_client", return_value=fake_daytona), \
-         patch("api.providers.daytona._build_volume_mounts", return_value=[]), \
-         patch("api.providers.daytona._get_sandbox_env_vars", return_value={}):
-
-        from daytona_sdk import Daytona as _RealDaytona, DaytonaConfig, \
-            CreateSandboxFromImageParams, CreateSandboxFromSnapshotParams
-        with patch("api.providers.daytona.Daytona" if False else "daytona_sdk.Daytona",
-                   _RealDaytona):
-            pass
-
-        # Patch the Daytona constructor inside the function's local import
-        import daytona_sdk as _dsdk
-        orig_daytona_cls = _dsdk.Daytona
-
-        class _FakeDaytonaClass:
-            def __init__(self, *a, **kw):
-                pass
-            def create(self, params, timeout=None):
-                return fake_sandbox
-            def delete(self, sb):
-                pass
-
-        with patch.object(_dsdk, "Daytona", _FakeDaytonaClass), \
-             patch.object(_dsdk, "DaytonaConfig", MagicMock()):
-            inst = await provision_daytona_sandbox(
-                agent_type="claude",
-                pre_start_commands=["echo hello"],
-            )
+         env_ctx, daytona_ctx, cfg_ctx, mounts_ctx, env_vars_ctx:
+        inst = await provision_daytona_sandbox(
+            agent_type="claude",
+            pre_start_commands=["echo hello"],
+        )
 
     assert inst is not None
     assert inst.sandbox_id == "fake-sandbox-abc123"
-    # INFO log for success
-    info_records = [r for r in caplog.records if r.levelno == logging.INFO
-                    and "pre-start" in r.message]
-    assert any("pre-start" in r.message for r in info_records), \
-        f"Expected pre-start INFO log, got: {[r.message for r in caplog.records]}"
+    assert any("pre-start" in r.message for r in caplog.records if r.levelno == logging.INFO), (
+        f"Expected pre-start INFO log; records: {[r.message for r in caplog.records]}"
+    )
 
 
 @pytest.mark.asyncio
 async def test_pre_start_exit_127_raises(caplog):
-    """exit_code=127 → raises RuntimeError with command + stderr in message."""
+    """exit_code=127 → raises RuntimeError with command and stderr in the message."""
     from api.providers.daytona import provision_daytona_sandbox
 
-    exec_result = _make_exec_result(
-        exit_code=127,
-        stdout="",
-        stderr="bash: curl: command not found",
-    )
-    fake_sandbox = _make_fake_sandbox(exec_result)
-
-    import daytona_sdk as _dsdk
-
-    class _FakeDaytonaClass:
-        def __init__(self, *a, **kw):
-            pass
-        def create(self, params, timeout=None):
-            return fake_sandbox
-        def delete(self, sb):
-            pass
+    sb = _make_sandbox(_make_exec_result(
+        exit_code=127, stderr="bash: curl: command not found",
+    ))
+    env_ctx, daytona_ctx, cfg_ctx, mounts_ctx, env_vars_ctx = _provision_ctx(sb)
 
     with caplog.at_level(logging.ERROR, logger="api.providers.daytona"), \
-         patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key", "DAYTONA_SNAPSHOT": "0"}), \
-         patch.object(_dsdk, "Daytona", _FakeDaytonaClass), \
-         patch.object(_dsdk, "DaytonaConfig", MagicMock()), \
-         patch("api.providers.daytona._build_volume_mounts", return_value=[]), \
-         patch("api.providers.daytona._get_sandbox_env_vars", return_value={}):
-
+         env_ctx, daytona_ctx, cfg_ctx, mounts_ctx, env_vars_ctx:
         with pytest.raises(RuntimeError) as exc_info:
             await provision_daytona_sandbox(
                 agent_type="claude",
@@ -221,10 +158,9 @@ async def test_pre_start_exit_127_raises(caplog):
     assert "exit=127" in msg, f"Expected exit=127 in message: {msg!r}"
     assert "curl https://example.com" in msg, f"Expected command in message: {msg!r}"
     assert "command not found" in msg, f"Expected stderr snippet in message: {msg!r}"
-
-    # ERROR log should be present
-    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert error_records, f"Expected ERROR log, got: {[r.message for r in caplog.records]}"
+    assert any(r.levelno == logging.ERROR for r in caplog.records), (
+        f"Expected ERROR log; records: {[r.message for r in caplog.records]}"
+    )
 
 
 @pytest.mark.asyncio
@@ -232,38 +168,24 @@ async def test_pre_start_exit_none_no_raise_warns(caplog):
     """exit_code=None (SDK didn't report it) → no raise, but WARNING logged."""
     from api.providers.daytona import provision_daytona_sandbox
 
-    # Simulate SDK returning an object with no exit_code attribute
-    exec_result = SimpleNamespace(result="output", stderr="")  # no exit_code
-    fake_sandbox = MagicMock()
-    fake_sandbox.id = "fake-sandbox-abc123"
-    fake_sandbox.process.exec.return_value = exec_result
+    sb = MagicMock()
+    sb.id = "fake-sandbox-abc123"
+    # SDK object with no exit_code attribute
+    sb.process.exec.return_value = SimpleNamespace(result="output", stderr="")
 
-    import daytona_sdk as _dsdk
-
-    class _FakeDaytonaClass:
-        def __init__(self, *a, **kw):
-            pass
-        def create(self, params, timeout=None):
-            return fake_sandbox
-        def delete(self, sb):
-            pass
+    env_ctx, daytona_ctx, cfg_ctx, mounts_ctx, env_vars_ctx = _provision_ctx(sb)
 
     with caplog.at_level(logging.WARNING, logger="api.providers.daytona"), \
-         patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key", "DAYTONA_SNAPSHOT": "0"}), \
-         patch.object(_dsdk, "Daytona", _FakeDaytonaClass), \
-         patch.object(_dsdk, "DaytonaConfig", MagicMock()), \
-         patch("api.providers.daytona._build_volume_mounts", return_value=[]), \
-         patch("api.providers.daytona._get_sandbox_env_vars", return_value={}):
-
+         env_ctx, daytona_ctx, cfg_ctx, mounts_ctx, env_vars_ctx:
         inst = await provision_daytona_sandbox(
             agent_type="claude",
             pre_start_commands=["some-cmd"],
         )
 
     assert inst is not None
-    # WARNING should be present
-    warn_records = [r for r in caplog.records if r.levelno == logging.WARNING
-                    and "exit_code" in r.message]
-    assert warn_records, (
-        f"Expected WARNING about missing exit_code, got: {[r.message for r in caplog.records]}"
+    assert any(
+        r.levelno == logging.WARNING and "exit_code" in r.message
+        for r in caplog.records
+    ), (
+        f"Expected WARNING about missing exit_code; records: {[r.message for r in caplog.records]}"
     )
