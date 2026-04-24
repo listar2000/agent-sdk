@@ -1148,6 +1148,115 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
 
 
 
+@pytest.mark.parametrize("provider", ["daytona", "local"])
+@pytest.mark.asyncio
+async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
+    """End-to-end wiring for the UI reconnect-gap bug.
+
+    The companion unit test ``test_dispatch_with_no_subscribers_buffers_
+    for_next_subscribe`` pins the ``SessionState.dispatch`` →
+    ``subscribe_session`` mechanism directly. This integration test
+    pins the full wiring — a regression in ``_broadcast_one_block``,
+    the scheduler's dispatch routing, or the /events subscribe path
+    would silently pass the unit test while breaking the UI.
+
+    Exact UI sequence reproduced here (the user's prod trace):
+        check again the host            <- prior turns work
+          Same hostname: 5f349b61-...
+        Stream error: stream closed. Reconnecting...
+        what abotu now?                 <- msg1 during gap (no reply)
+          Queued for agent
+        Reconnected to session 96f90144.
+        now?                            <- msg2 after reconnect (no reply)
+          Queued for agent
+        hi                              <- msg3 after reconnect (no reply)
+
+    Flow in-order:
+      1. Open persistent /events (UI's EventSource on page load).
+      2. Turn 1 via POST /message over the persistent stream — succeeds.
+      3. Kill supervisor process inside the sandbox (the prod 502 /
+         daytona-proxy-dead / supervisor-OOM trigger).
+      4. Exit the ``_PersistentSse`` context — cleanly tears down the
+         reader with no auto-reconnect. This is the "EventSource retry
+         timer still running, no subscriber on the server" state.
+      5. POST msg2 and msg3 during the gap.
+      6. Open a fresh /events (EventSource finally reconnects).
+      7. Assert both follow-ups get replies — on unfixed baseline both
+         time out with ``TimeoutError`` because their events were
+         dispatched to empty subscriber lists and dropped.
+
+    Docker excluded: ``docker exec pkill supervisor.js`` takes down
+    PID 1 and the container exits, which is a different failure mode
+    already covered by ``test_persistent_sse_external_delete_then_message``.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(client, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            sandbox = await _get_sandbox(client, session_id)
+            await _kill_supervisor_in_sandbox(sandbox)
+            # Let the server's upstream SSE reader observe the death and
+            # kick the UI subscriber (the persistent stream will see a
+            # stream close here).
+            await asyncio.sleep(3)
+
+        # __aexit__ above killed the reader so no auto-reconnect fires.
+        # We're now in the UI's "stream closed, EventSource retry timer
+        # running" state. The follow-up POSTs land in this gap.
+        rpc2 = await _send_message(
+            client, session_id, "Reply with a single short word.",
+        )
+        rpc3 = await _send_message(
+            client, session_id, "Reply with a single short word.",
+        )
+
+        # Give the server scheduler enough time to dispatch both turns'
+        # events into what are currently empty subscriber lists.
+        await asyncio.sleep(8)
+
+        # UI's EventSource finally reconnects — open ONE persistent /events
+        # (matching the UI's single EventSource) and look for both replies.
+        # With the fix, the pending-broadcast buffer replays every missed
+        # event onto this subscriber; _collect_reply_on_stream drains until
+        # both rpc ids have landed their stopReason.
+        collected: dict[str, str] = {}
+        async with _PersistentSse(client, session_id) as sse2:
+            deadline = time.time() + 60
+            wanted = {rpc2, rpc3}
+            while wanted and time.time() < deadline:
+                for rpc in list(wanted):
+                    q = sse2.get_queue(rpc)
+                    try:
+                        evt = await asyncio.wait_for(
+                            q.get(), timeout=max(1.0, deadline - time.time()),
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    if evt["type"] == "done":
+                        collected[rpc] = "<done>"
+                        wanted.discard(rpc)
+                    elif evt["type"] == "error":
+                        collected[rpc] = f"<error: {evt.get('text')!r}>"
+                        wanted.discard(rpc)
+
+        timed_out = [rpc for rpc in (rpc2, rpc3) if rpc not in collected]
+        assert not timed_out, (
+            f"{len(timed_out)}/2 follow-up messages never reached the "
+            f"reconnected /events stream. Events dispatched during the UI's "
+            f"EventSource retry gap were dropped because no subscriber was "
+            f"listening and the server has no replay for them. "
+            f"Missing rpc_ids = {timed_out}; collected = {list(collected)}"
+        )
+
 
 @pytest.mark.asyncio
 async def test_session_survives_supervisor_dir_wiped_from_volume():
