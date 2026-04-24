@@ -75,6 +75,21 @@ def _has_daytona() -> bool:
     return bool(DAYTONA_API_KEY and OAUTH_TOKEN)
 
 
+def _has_modal() -> bool:
+    """Modal is available if the ``modal`` SDK imports and a profile is set.
+
+    ``modal setup`` writes ~/.modal.toml with workspace credentials; we rely
+    on that rather than an env var, matching how the provider itself looks
+    up the SDK handle.
+    """
+    try:
+        import modal  # noqa: F401
+    except ImportError:
+        return False
+    modal_toml = os.path.expanduser("~/.modal.toml")
+    return bool(OAUTH_TOKEN) and os.path.exists(modal_toml)
+
+
 def _has_server() -> bool:
     try:
         return httpx.get(f"{SERVER}/health", timeout=3).status_code == 200
@@ -90,6 +105,8 @@ def _require_provider(provider: str) -> None:
         pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
     if provider == "docker" and not _has_docker():
         pytest.skip("docker not available")
+    if provider == "modal" and not _has_modal():
+        pytest.skip("modal SDK + ~/.modal.toml + CLAUDE_CODE_OAUTH_TOKEN required")
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +117,7 @@ async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
     body: dict = {"provider": provider, "agent_type": "claude"}
     if OAUTH_TOKEN:
         body["secrets"] = {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN}
-    resp = await client.post(f"{SERVER}/sessions/quick", json=body, timeout=180)
+    resp = await client.post(f"{SERVER}/sessions", json=body, timeout=180)
     assert resp.status_code == 200, f"quick session failed ({provider}): {resp.text}"
     return resp.json()
 
@@ -188,7 +205,55 @@ async def _external_stop(sandbox: dict) -> None:
         except (ValueError, ProcessLookupError, TypeError):
             pass
 
+    elif provider == "modal":
+        # Modal has no stop==pause: terminate is destructive. The server
+        # recovers via the SandboxMissingError path, same as external delete.
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        await loop.run_in_executor(None, sb.terminate)
+
     print(f"\n[test] externally stopped {provider} sandbox {ref[:20]}")
+
+
+async def _kill_supervisor_in_sandbox(sandbox: dict) -> None:
+    """Kill ONLY the supervisor.js process inside the sandbox — the sandbox
+    itself stays alive. Mimics prod's '502 Bad Gateway' scenario where the
+    daytona proxy forwards to port 9100 but no process listens there
+    (supervisor OOM'd, crashed, or was killed by the runtime). The server's
+    DB still thinks the sandbox is fine; only the supervisor is gone.
+    """
+    provider = sandbox["provider"]
+    ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+    loop = asyncio.get_event_loop()
+
+    if provider == "daytona":
+        from daytona_sdk import Daytona, DaytonaConfig
+        daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
+        sb = await loop.run_in_executor(None, lambda: daytona.get(ref))
+        await loop.run_in_executor(
+            None,
+            lambda: sb.process.exec(
+                "pkill -9 -f supervisor.js || pkill -9 -f 'node.*supervisor'",
+                timeout=10,
+            ),
+        )
+
+    elif provider == "local":
+        pid_str = sandbox.get("pid") or ref
+        try:
+            os.kill(int(pid_str), 9)
+        except (ValueError, ProcessLookupError, TypeError):
+            pass
+
+    elif provider == "docker":
+        # docker exec into the container and kill the supervisor PID 1.
+        # Without pid 1 the container exits; use pkill within the container.
+        await loop.run_in_executor(None, lambda: subprocess.run(
+            ["docker", "exec", ref, "pkill", "-9", "-f", "supervisor.js"],
+            capture_output=True, timeout=10,
+        ))
+
+    print(f"[test] killed supervisor inside {provider} sandbox {ref[:20]}")
 
 
 async def _external_delete(sandbox: dict) -> None:
@@ -201,6 +266,17 @@ async def _external_delete(sandbox: dict) -> None:
         daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
         sb = await loop.run_in_executor(None, lambda: daytona.get(ref))
         await loop.run_in_executor(None, lambda: daytona.delete(sb))
+        # Wait for daytona's internal state to settle. Without this, the
+        # NEXT test's daytona.create can race the delete's cleanup and
+        # get "An unexpected error occurred" from the API. Poll until
+        # get(ref) raises (sandbox is gone), with a bounded timeout.
+        deadline = asyncio.get_event_loop().time() + 10.0
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await loop.run_in_executor(None, lambda: daytona.get(ref))
+                await asyncio.sleep(0.5)
+            except Exception:
+                break  # get raised → sandbox is gone from daytona's index
 
     elif provider == "docker":
         await loop.run_in_executor(None, lambda: subprocess.run(
@@ -226,6 +302,11 @@ async def _external_delete(sandbox: dict) -> None:
             except FileNotFoundError:
                 pass
 
+    elif provider == "modal":
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        await loop.run_in_executor(None, sb.terminate)
+
     print(f"\n[test] externally deleted {provider} sandbox {ref[:20]}")
 
 
@@ -239,6 +320,10 @@ def _extract_kv(text: str, key: str) -> str | None:
     return m.group(1).strip("`\"'") if m else None
 
 
+# Modal is omitted here: its "stop" terminates the sandbox (no pause state),
+# so recovery always yields a fresh Modal object_id — the stable-ref invariant
+# simply doesn't apply. Session continuity is covered by
+# ``test_session_resume_after_stop[modal]`` instead.
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
 @pytest.mark.asyncio
 async def test_stop_sandbox_same_sandbox_after_restart(provider):
@@ -294,65 +379,101 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider):
 # Tests: delete recovery + volume persistence
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
-@pytest.mark.asyncio
-async def test_delete_sandbox_volume_persistence(provider):
-    """Delete sandbox externally → new sandbox provisioned on same volume → files survive."""
-    _require_provider(provider)
+async def _write_marker_and_read(client, session_id, marker):
+    """Turn-1: have the agent write marker and echo content back so
+    stdout is non-empty (pure tool-use turns return no SSE text)."""
+    return await _ask(
+        client, session_id,
+        f"Please run this shell pipeline and tell me the output:\n"
+        f"  echo 'volume-test' > ~/{marker} && cat ~/{marker}",
+    )
 
-    marker = "recovery-test-marker.txt"
+
+async def _read_marker(client, session_id, marker):
+    return await _ask(
+        client, session_id,
+        f"Please run this shell command and tell me the output:\n"
+        f"  cat ~/{marker} || echo NOT_FOUND",
+    )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.asyncio
+async def test_server_delete_persists_workspace(provider):
+    """Server-mediated DELETE triggers a cold snapshot (filesystem_cache)
+    before teardown, so arbitrary HOME files survive onto the replacement
+    sandbox. Conversation continuity is also preserved (agent_memory).
+    """
+    _require_provider(provider)
+    marker = "server-delete-marker.txt"
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        # Baseline: create a marker file on the persistent home directory,
-        # then read it back — combining the write+read in one turn forces
-        # textual output (pure tool-use turns return empty SSE text).
-        reply1 = await _ask(
-            client, session_id,
-            f"Please run this shell pipeline and tell me the output:\n"
-            f"  echo 'volume-test' > ~/{marker} && cat ~/{marker}",
-        )
-        print(f"[test:{provider}] setup reply: {reply1[:300]!r}")
+        reply1 = await _write_marker_and_read(client, session_id, marker)
         assert "volume-test" in reply1, f"marker setup failed: {reply1}"
 
-        # Capture sandbox_ref before delete
         sandbox = await _get_sandbox(client, session_id)
         sandbox_ref_before = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
-        print(f"[test:{provider}] sandbox_ref before delete: {sandbox_ref_before[:20]}")
-
-        # External delete
-        await _external_delete(sandbox)
+        sandbox_id = sandbox["id"]
+        r = await client.delete(f"{SERVER}/sandboxes/{sandbox_id}", timeout=60)
+        assert r.status_code in (200, 204), f"DELETE /sandboxes failed: {r.text}"
         await asyncio.sleep(3)
 
-        # Followup — server must provision a NEW sandbox on same volume.
-        # Ask the agent to read the marker and tell me what's in it.
-        reply2 = await _ask(
-            client, session_id,
-            f"Please run this shell command and tell me the output:\n"
-            f"  cat ~/{marker} || echo NOT_FOUND",
-        )
-        print(f"[test:{provider}] after delete reply: {reply2[:400]!r}")
-
+        reply2 = await _read_marker(client, session_id, marker)
+        print(f"[test:{provider}] after server-delete reply: {reply2[:400]!r}")
         assert "NOT_FOUND" not in reply2, (
-            f"marker file lost after sandbox delete — volume not persisted!\n{reply2}"
+            f"marker file lost after server DELETE — cold snapshot didn't run before "
+            f"teardown: {reply2}"
         )
-        assert "volume-test" in reply2, (
-            f"marker file content not found after delete:\n{reply2}"
-        )
+        assert "volume-test" in reply2, f"marker content missing after server DELETE: {reply2}"
 
         sandbox_after = await _get_sandbox(client, session_id)
         sandbox_ref_after = sandbox_after.get("sandbox_ref") or sandbox_after.get("provider_ref", "")
-        print(f"[test:{provider}] sandbox_ref after replacement: {sandbox_ref_after[:20]}")
-
-        # After a delete the server must provision a DIFFERENT sandbox (new sandbox_ref)
         if sandbox_ref_before:
             assert sandbox_ref_after != sandbox_ref_before, (
-                f"sandbox_ref unchanged after delete — old sandbox was restarted instead "
-                f"of a new one being provisioned: {sandbox_ref_before!r}"
+                f"sandbox_ref unchanged after delete: {sandbox_ref_before!r}"
             )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.asyncio
+async def test_external_delete_preserves_agent_memory(provider):
+    """Out-of-band delete (daytona dashboard / docker rm) bypasses the
+    server, so no server-driven cold snapshot runs. The invariant we
+    require is agent_memory preservation — conversation continues on
+    the replacement sandbox because the supervisor tarred per-turn
+    session state (or HOME lives on the volume for local/docker).
+
+    We deliberately do NOT assert anything about arbitrary workspace
+    files: daytona's SIGTERM handler happens to flush a full snapshot
+    on graceful external delete, but that's implementation detail —
+    the agent_memory invariant is the contract.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        inner_before = sess["inner_session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]} inner={inner_before}")
+
+        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+        sandbox = await _get_sandbox(client, session_id)
+        await _external_delete(sandbox)
+        await asyncio.sleep(3)
+
+        # agent_memory preserved → session/load succeeds → inner_sid
+        # unchanged across the delete.
+        inner_after = await _inner_sid_in_memory(client, session_id)
+        assert inner_after == inner_before, (
+            f"agent_memory not preserved across external delete — session/load "
+            f"didn't restore: {inner_before!r} → {inner_after!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +489,7 @@ async def _inner_sid_in_memory(client: httpx.AsyncClient, session_id: str) -> st
     return row.get("inner_session_id") if row else None
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_session_resume_after_stop(provider):
     """Full session resume: stop sandbox between turns, reconnect, session is
@@ -408,7 +529,7 @@ async def test_session_resume_after_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_session_resume_after_delete(provider):
     """Delete sandbox between turns → NEW sandbox provisioned → session/load
@@ -450,7 +571,7 @@ async def test_session_resume_after_delete(provider):
 # Test: midstream sandbox stop (UI-flow reproduction)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_session_survives_midstream_sandbox_stop(provider):
     """SSE upstream death triggers sandbox recovery — MUST resume, not reset.
@@ -557,7 +678,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_message_immediately_after_stop(provider):
     """Turn 1 → stop sandbox → turn 2 with NO sleep. Reproduces the race
@@ -627,7 +748,7 @@ async def test_message_immediately_after_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_message_after_stop_with_delay(provider):
     """Turn 1 → stop sandbox → wait ~4s → turn 2. User-reported repro.
@@ -797,7 +918,7 @@ async def _ask_on_stream(
             raise RuntimeError(f"agent error: {evt['text']}")
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_stop_then_message(provider):
     """UI-shape repro: one persistent /events connection spans turn1 →
@@ -850,11 +971,20 @@ async def test_persistent_sse_stop_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
+@pytest.mark.timeout(240)
 async def test_persistent_sse_external_delete_then_message(provider):
     """UI repro for an OUT-OF-BAND sandbox delete (Daytona dashboard, ``docker rm``,
     ``kill -9``) with a persistent /events stream held open.
+
+    Individual timeout bumped to 240 s. The daytona path does a full
+    provision-replacement-sandbox + start-supervisor dance on turn 2
+    (see ``_replace_sandbox_inplace`` + ``ensure_supervisor_url``), and
+    with daytona-side latency variance the critical path (turn 1 LLM +
+    external-delete poll + SSE retry ladder + fresh provisioning +
+    session/load + turn 2 LLM) can hit ~100 s on a slow day. 120 s was
+    tight; 240 s matches the suite-wide ``--timeout``.
 
     Different from test_persistent_sse_delete_sandbox_then_message, this
     one does NOT go through the server's DELETE endpoint — the server
@@ -894,7 +1024,7 @@ async def test_persistent_sse_external_delete_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_delete_sandbox_then_message(provider):
     """UI repro for the `DELETE /sandboxes/{id}` + persistent /events flow.
@@ -947,6 +1077,227 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
                 f"server's zombie-state path dropped events for the new "
                 f"sandbox. Reply was: {reply2!r}"
             )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "local"])
+@pytest.mark.asyncio
+async def test_persistent_sse_supervisor_killed_then_message(provider):
+    """Prod UI repro: supervisor process dies, sandbox stays alive.
+
+    Exact trace the user reported against prod daytona:
+      - multiple turns work
+      - one POST /v1/acp returns 502 Bad Gateway (proxy forwards to port
+        9100, nothing listens — supervisor crashed/OOM'd/restarted)
+      - stream errors, UI reconnects
+      - subsequent /message calls stick at 'Queued for agent' with no
+        reply ever arriving
+
+    Differs from the external-delete tests: the sandbox itself is NOT
+    removed. The server's cached ``_INSTANCES[sandbox_id]`` still points
+    at the old URL, and the DB row is untouched. Recovery must detect
+    the dead supervisor, rebind to a freshly-started one (daytona
+    supervisor lazy-start), and deliver turn 2's events to the
+    subscribers held on the persistent /events stream.
+
+    Docker intentionally excluded — ``docker exec ... pkill supervisor.js``
+    kills the container's PID 1 and the container exits, which is
+    covered by test_persistent_sse_external_delete_then_message.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(client, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            sandbox = await _get_sandbox(client, session_id)
+            await _kill_supervisor_in_sandbox(sandbox)
+            # Give the server's SSE reader time to observe the upstream
+            # disconnect and flip into recovery. No sandbox-delete event
+            # will ever arrive from the provider; the server only knows
+            # the supervisor died via this disconnect.
+            await asyncio.sleep(6)
+
+            reply2 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply2.strip(), (
+                f"turn 2 lost on persistent SSE after supervisor kill: the "
+                f"server didn't recover from 'supervisor dead, sandbox alive' "
+                f"and events for the new prompt never reached subscribers. "
+                f"Reply was: {reply2!r}"
+            )
+
+
+@pytest.mark.parametrize("provider", ["daytona", "local"])
+@pytest.mark.asyncio
+async def test_persistent_sse_supervisor_killed_immediate_message(provider):
+    """Prod UI race: kill supervisor, then POST /message BEFORE the server
+    has observed the upstream disconnect.
+
+    Different from test_persistent_sse_supervisor_killed_then_message —
+    that test sleeps 6s so the SSE reader has time to flip _reader_connected
+    to False and enter rebind. Here we fire the message in the ~100ms
+    window where the server still thinks the cached supervisor URL is alive.
+
+    On daytona, the dead supervisor → proxy returns ``502 Bad Gateway``
+    from ``httpx.raise_for_status`` on the POST to ``/v1/acp/...``. The
+    previous retry path only caught ConnectError/RemoteProtocolError/ReadError,
+    so the 502 fell through to the generic ``except`` which just logged
+    and dispatched an error event — no rebind, no retry. UI sees
+    'Queued for agent' forever if it's not listening for the error
+    event on the rpc it just submitted (typical EventSource reconnect
+    loses rpc_id subscription).
+
+    Invariant: turn 2 returns a non-empty reply. Either the retry path
+    rebinds and succeeds, or the error event reaches the persistent SSE.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(client, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            sandbox = await _get_sandbox(client, session_id)
+            await _kill_supervisor_in_sandbox(sandbox)
+            # NO sleep — fire the message while the server still thinks
+            # the cached supervisor URL is alive. This is the exact race
+            # the UI's "Stream error. Reconnecting... <message>" trace
+            # reproduces: the user hit Send before the server's SSE
+            # reader observed the upstream disconnect.
+
+            reply2 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply2.strip(), (
+                f"turn 2 lost on persistent SSE after supervisor kill (no delay): "
+                f"the 502/connection error on POST /v1/acp was not retried. "
+                f"Reply was: {reply2!r}"
+            )
+
+
+
+@pytest.mark.parametrize("provider", ["daytona", "local"])
+@pytest.mark.asyncio
+async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
+    """End-to-end wiring for the UI reconnect-gap bug.
+
+    The companion unit test ``test_dispatch_with_no_subscribers_buffers_
+    for_next_subscribe`` pins the ``SessionState.dispatch`` →
+    ``subscribe_session`` mechanism directly. This integration test
+    pins the full wiring — a regression in ``_broadcast_one_block``,
+    the scheduler's dispatch routing, or the /events subscribe path
+    would silently pass the unit test while breaking the UI.
+
+    Exact UI sequence reproduced here (the user's prod trace):
+        check again the host            <- prior turns work
+          Same hostname: 5f349b61-...
+        Stream error: stream closed. Reconnecting...
+        what abotu now?                 <- msg1 during gap (no reply)
+          Queued for agent
+        Reconnected to session 96f90144.
+        now?                            <- msg2 after reconnect (no reply)
+          Queued for agent
+        hi                              <- msg3 after reconnect (no reply)
+
+    Flow in-order:
+      1. Open persistent /events (UI's EventSource on page load).
+      2. Turn 1 via POST /message over the persistent stream — succeeds.
+      3. Kill supervisor process inside the sandbox (the prod 502 /
+         daytona-proxy-dead / supervisor-OOM trigger).
+      4. Exit the ``_PersistentSse`` context — cleanly tears down the
+         reader with no auto-reconnect. This is the "EventSource retry
+         timer still running, no subscriber on the server" state.
+      5. POST msg2 and msg3 during the gap.
+      6. Open a fresh /events (EventSource finally reconnects).
+      7. Assert both follow-ups get replies — on unfixed baseline both
+         time out with ``TimeoutError`` because their events were
+         dispatched to empty subscriber lists and dropped.
+
+    Docker excluded: ``docker exec pkill supervisor.js`` takes down
+    PID 1 and the container exits, which is a different failure mode
+    already covered by ``test_persistent_sse_external_delete_then_message``.
+    """
+    _require_provider(provider)
+
+    async with httpx.AsyncClient() as client:
+        sess = await _quick_session(client, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(client, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                client, session_id, sse, "Reply with a single short word.",
+            )
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            sandbox = await _get_sandbox(client, session_id)
+            await _kill_supervisor_in_sandbox(sandbox)
+            # Let the server's upstream SSE reader observe the death and
+            # kick the UI subscriber (the persistent stream will see a
+            # stream close here).
+            await asyncio.sleep(3)
+
+        # __aexit__ above killed the reader so no auto-reconnect fires.
+        # We're now in the UI's "stream closed, EventSource retry timer
+        # running" state. The follow-up POSTs land in this gap.
+        rpc2 = await _send_message(
+            client, session_id, "Reply with a single short word.",
+        )
+        rpc3 = await _send_message(
+            client, session_id, "Reply with a single short word.",
+        )
+
+        # Give the server scheduler enough time to dispatch both turns'
+        # events into what are currently empty subscriber lists.
+        await asyncio.sleep(8)
+
+        # UI's EventSource finally reconnects — open ONE persistent /events
+        # (matching the UI's single EventSource) and look for both replies.
+        # With the fix, the pending-broadcast buffer replays every missed
+        # event onto this subscriber; _collect_reply_on_stream drains until
+        # both rpc ids have landed their stopReason.
+        collected: dict[str, str] = {}
+        async with _PersistentSse(client, session_id) as sse2:
+            deadline = time.time() + 60
+            wanted = {rpc2, rpc3}
+            while wanted and time.time() < deadline:
+                for rpc in list(wanted):
+                    q = sse2.get_queue(rpc)
+                    try:
+                        evt = await asyncio.wait_for(
+                            q.get(), timeout=max(1.0, deadline - time.time()),
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    if evt["type"] == "done":
+                        collected[rpc] = "<done>"
+                        wanted.discard(rpc)
+                    elif evt["type"] == "error":
+                        collected[rpc] = f"<error: {evt.get('text')!r}>"
+                        wanted.discard(rpc)
+
+        timed_out = [rpc for rpc in (rpc2, rpc3) if rpc not in collected]
+        assert not timed_out, (
+            f"{len(timed_out)}/2 follow-up messages never reached the "
+            f"reconnected /events stream. Events dispatched during the UI's "
+            f"EventSource retry gap were dropped because no subscriber was "
+            f"listening and the server has no replay for them. "
+            f"Missing rpc_ids = {timed_out}; collected = {list(collected)}"
+        )
 
 
 @pytest.mark.asyncio

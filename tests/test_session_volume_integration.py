@@ -37,7 +37,8 @@ async def test_post_session_without_volume_id_uses_default(client):
     with patch("api.providers.local.create_volume",
                new=AsyncMock(return_value="/tmp/default-local")):
         r = await client.post("/sessions",
-                              json={"agent_id": "agent_t", "provider": "local"})
+                              json={"agent_id": "agent_t", "provider": "local",
+                                    "provision": False})
     assert r.status_code == 200, f"got {r.status_code}: {r.text}"
     body = r.json()
     assert body.get("volume_id")
@@ -54,11 +55,12 @@ async def test_post_session_does_not_provision_sandbox(client):
     await dbmod.upsert_volume(VolumeRecord(id="vol_t", name="vt", provider="daytona",
                                            provider_ref="dt-t"))
 
-    # Any provider provisioning during session create should fail the test.
+    # Any provider provisioning during lazy session create should fail the test.
     with patch("api.providers.daytona.provision_daytona_sandbox",
                new=AsyncMock(side_effect=AssertionError("should NOT provision during session create"))):
         r = await client.post("/sessions",
-                              json={"agent_id": "agent_t2", "volume_id": "vol_t"})
+                              json={"agent_id": "agent_t2", "volume_id": "vol_t",
+                                    "provision": False})
     assert r.status_code == 200, f"got {r.status_code}: {r.text}"
     body = r.json()
     # Response should include the volume_id and either null current_sandbox_id or no sandbox_id at all.
@@ -78,7 +80,7 @@ async def test_message_lazily_provisions_sandbox(client):
     await dbmod.upsert_agent(AgentRecord(id="agent_r", name="R", config=AgentConfig()))
     await dbmod.upsert_volume(VolumeRecord(id="vol_r", name="vr", provider="daytona",
                                            provider_ref="dt-r"))
-    r = await client.post("/sessions", json={"agent_id": "agent_r", "volume_id": "vol_r"})
+    r = await client.post("/sessions", json={"agent_id": "agent_r", "volume_id": "vol_r", "provision": False})
     assert r.status_code == 200
     sid = r.json()["id"]
 
@@ -128,7 +130,7 @@ async def test_start_sandbox_provisions_eagerly(client):
     await dbmod.upsert_agent(AgentRecord(id="agent_s", name="S", config=AgentConfig()))
     await dbmod.upsert_volume(VolumeRecord(id="vol_s", name="vs", provider="daytona",
                                            provider_ref="dt-s"))
-    r = await client.post("/sessions", json={"agent_id": "agent_s", "volume_id": "vol_s"})
+    r = await client.post("/sessions", json={"agent_id": "agent_s", "volume_id": "vol_s", "provision": False})
     sid = r.json()["id"]
 
     async def fake_create(**kw):
@@ -170,7 +172,7 @@ async def test_stop_sandbox_clears_pointer(client):
     await dbmod.upsert_agent(AgentRecord(id="agent_k", name="K", config=AgentConfig()))
     await dbmod.upsert_volume(VolumeRecord(id="vol_k", name="vk", provider="daytona",
                                            provider_ref="dt-k"))
-    r = await client.post("/sessions", json={"agent_id": "agent_k", "volume_id": "vol_k"})
+    r = await client.post("/sessions", json={"agent_id": "agent_k", "volume_id": "vol_k", "provision": False})
     sid = r.json()["id"]
     sb = SandboxRecord(id="sb_k", provider="daytona", sandbox_ref="dt-sb-k",
                        status="running", root="/home/daytona",
@@ -262,7 +264,7 @@ async def test_reset_sandbox_swaps(client):
     await dbmod.upsert_agent(AgentRecord(id="agent_x", name="X", config=AgentConfig()))
     await dbmod.upsert_volume(VolumeRecord(id="vol_x", name="vx", provider="daytona",
                                            provider_ref="dt-x"))
-    r = await client.post("/sessions", json={"agent_id": "agent_x", "volume_id": "vol_x"})
+    r = await client.post("/sessions", json={"agent_id": "agent_x", "volume_id": "vol_x", "provision": False})
     sid = r.json()["id"]
     sb_old = SandboxRecord(id="sb_old", provider="daytona", sandbox_ref="dt-old",
                            status="running", root="/home/daytona",
@@ -294,7 +296,7 @@ async def test_reset_sandbox_emits_reattach_event(client):
     await dbmod.upsert_agent(AgentRecord(id="agent_e", name="E", config=AgentConfig()))
     await dbmod.upsert_volume(VolumeRecord(id="vol_e", name="ve", provider="daytona",
                                            provider_ref="dt-e"))
-    r = await client.post("/sessions", json={"agent_id": "agent_e", "volume_id": "vol_e"})
+    r = await client.post("/sessions", json={"agent_id": "agent_e", "volume_id": "vol_e", "provision": False})
     sid = r.json()["id"]
     sb_old = SandboxRecord(id="sb_old", provider="daytona", sandbox_ref="dt-old",
                            status="running", root="/home/daytona",

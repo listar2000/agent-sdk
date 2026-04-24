@@ -34,11 +34,13 @@ Serves a browser-based chat interface for interacting with agent sessions.
 
 ## Sessions
 
-### Create agent + sandbox + session in one call
+### Create a session — eager (default) or lazy
 
 ```
-POST /sessions/quick
+POST /sessions
 ```
+
+Single endpoint for session creation. Defaults to **eager**: provisions a sandbox, connects ACP, starts the scheduler + SSE reader. Pass `"provision": false` in the body for the **lazy** flow — session row only, sandbox materialises on the first `/message`, `/start-sandbox`, or `/resume`.
 
 Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win. `volume_id` is optional — if omitted, a per-provider default volume is created (or reused) transparently.
 
@@ -57,7 +59,7 @@ Config fields may be passed either at the top level (`agent_type`, `model`, `pro
 }
 ```
 
-Returns:
+Returns (eager):
 ```json
 {
   "agent_id": "uuid",
@@ -69,15 +71,20 @@ Returns:
 }
 ```
 
-`sandbox_id` and `current_sandbox_id` are emitted with the same value for backward compatibility with pre-refactor clients.
-
-### Create a session bound to a volume (lazy sandbox)
-
+Returns (lazy, `"provision": false`):
+```json
+{
+  "id": "uuid",
+  "agent_id": "uuid",
+  "volume_id": "vol-uuid",
+  "current_sandbox_id": null,
+  "connected": false
+}
 ```
-POST /sessions
-```
 
-Does **not** provision a sandbox — the compute is created lazily on the first `/message` or `/resume`. Accepts the same config fields as `/sessions/quick`, plus an optional `agent_id` to reuse an existing agent config instead of creating a new one. `volume_id` is optional (falls back to the per-provider default volume if omitted).
+`sandbox_id` and `current_sandbox_id` are emitted with the same value on the eager response for backward compatibility with pre-refactor clients. The old `POST /sessions/quick` endpoint was collapsed into this one; clients that hit `/sessions/quick` now get a 405.
+
+Lazy mode accepts an additional `agent_id` field to reuse an existing agent config instead of creating a new one.
 
 ```json
 {
@@ -364,8 +371,7 @@ Returns:
 Durable storage, independent of any sandbox. Created once, live for months. Every sandbox must be created against a volume (with a subpath), and every session binds to a volume.
 
 ```
-POST   /volumes                              — create (body: {name, provider})
-POST   /volumes/provision                    — create + wait for status="ready" (mirrors /sandboxes/provision)
+POST   /volumes                              — create + wait for status="ready"
 GET    /volumes                              — list (optional ?provider= filter)
 GET    /volumes/{id_or_name}                 — get (name lookup supported for convenience)
 DELETE /volumes/{id_or_name}?force=false     — delete (409 if any session still references it; force=true cascades)
@@ -389,8 +395,7 @@ Returns the volume record including `{id, name, provider, provider_ref, status}`
 Sandbox endpoints don't require a session. They operate directly on the sandbox infrastructure. Every sandbox is `(volume_id, subpath)`-scoped at creation: the volume is mounted at `/home/daytona` and a read-only `shared/` subpath on the same volume is mounted at `/mnt/shared`.
 
 ```
-POST   /sandboxes                           — create (provider + optional volume_id/subpath)
-POST   /sandboxes/provision                 — create + wait for ready
+POST   /sandboxes                           — create + wait for ready (provider + optional volume_id/subpath, config, pre_start_commands, shared_mounts)
 GET    /sandboxes                           — list
 GET    /sandboxes/{id}                      — get info (includes volume_id, subpath)
 DELETE /sandboxes/{id}                      — destroy (sessions survive with current_sandbox_id = NULL)

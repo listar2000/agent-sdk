@@ -36,6 +36,41 @@ const SNAPSHOT_EXCLUDES = [
   "--exclude=./.claude/statsig",
 ];
 
+// Two-tier snapshot layout.
+//
+//  - filesystem_cache.tar: full HOME tarball. Heavy (workspace files,
+//    user scratch, etc.). Written only on lifecycle events
+//    (/stop-sandbox, /delete, idle reap, graceful SIGTERM, explicit
+//    POST /v1/snapshot). Old name: "snapshot.tar".
+//
+//  - agent_memory.tar: small tarball of the per-agent session-state
+//    dirs listed below. Written after every turn (before the HTTP
+//    response returns, so the invariant "once client sees turn done,
+//    the JSONL is durable" still holds). These dirs are where
+//    agents store session continuity (Claude Code: ~/.claude/projects/
+//    contains the JSONLs session/load reads, ~/.claude/todos/ etc.).
+//    Missing dirs are tar-skipped via --ignore-failed-read, so we can
+//    list all supported agent types' dirs unconditionally — no branch
+//    on the active agent_type.
+//
+//  - On restore, extract filesystem_cache.tar first (base) then
+//    agent_memory.tar (overlay), so the latest session state wins.
+const AGENT_MEMORY_DIRS = [
+  ".claude",
+  ".codex",
+  ".opencode",
+  ".gemini",
+  ".cline",
+  ".deepagents",
+  ".openhands",
+  ".config/goose",
+];
+
+function _agentMemoryPath(snapshotPath) {
+  if (!snapshotPath) return null;
+  return path.join(path.dirname(snapshotPath), "agent_memory.tar");
+}
+
 function parseArgs(argv) {
   const out = {
     port: 9100,
@@ -117,17 +152,35 @@ function _snapshotVisible(path, timeoutMs) {
 }
 
 if (args.snapshotPath) {
-  const visible = _snapshotVisible(args.snapshotPath, 15000);
-  if (visible) {
-    log(`restoring workspace from ${args.snapshotPath}`);
+  // Layer 1: cold restore (full HOME). Best-effort — fresh sandboxes
+  // don't have this and it's fine.
+  const coldVisible = _snapshotVisible(args.snapshotPath, 15000);
+  if (coldVisible) {
+    log(`restoring filesystem_cache from ${args.snapshotPath}`);
     const r = spawnSync("tar", ["-xf", args.snapshotPath, "-C", args.root], {
       stdio: ["ignore", "inherit", "inherit"],
     });
     if (r.status !== 0) {
-      log(`restore exited rc=${r.status}; continuing without restore`);
+      log(`filesystem_cache restore exited rc=${r.status}; continuing`);
     }
   } else {
-    log(`snapshot ${args.snapshotPath} not visible after 15s — assuming fresh sandbox`);
+    log(`filesystem_cache ${args.snapshotPath} not visible after 15s — assuming fresh sandbox`);
+  }
+
+  // Layer 2: agent-memory overlay (per-turn snapshot of session dirs).
+  // This is the tier that carries conversation JSONLs, so even if
+  // filesystem_cache is stale (no cold snapshot since last turn), the
+  // latest turn's memory still wins. No visibility poll — if it's
+  // missing, we just have no post-cold state to overlay.
+  const memPath = _agentMemoryPath(args.snapshotPath);
+  if (memPath && fs.existsSync(memPath)) {
+    log(`restoring agent_memory from ${memPath}`);
+    const r = spawnSync("tar", ["-xf", memPath, "-C", args.root], {
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    if (r.status !== 0) {
+      log(`agent_memory restore exited rc=${r.status}; continuing`);
+    }
   }
 }
 
@@ -184,6 +237,56 @@ const sseSubscribers = new Set();
 // window between turn-end and a potential ``daytona.delete`` — so we keep
 // the staging off-volume.
 const LOCAL_SNAPSHOT_STAGING = "/tmp/agent-sdk-snapshot.tar";
+const LOCAL_MEMORY_STAGING = "/tmp/agent-sdk-agent-memory.tar";
+
+// Per-turn snapshot: tar only AGENT_MEMORY_DIRS. Uses
+// --ignore-failed-read so dirs not present for the active agent_type
+// are silently skipped (the same tar command works for any agent).
+// Result is written to <dir(snapshotPath)>/agent_memory.tar.
+function runAgentMemorySnapshotOnce() {
+  return new Promise((resolve) => {
+    const memPath = _agentMemoryPath(args.snapshotPath);
+    if (!memPath) { resolve(); return; }
+    const stage = LOCAL_MEMORY_STAGING;
+    const tarArgs = [
+      "-cf", stage,
+      "--ignore-failed-read",
+      "-C", args.root,
+      ...AGENT_MEMORY_DIRS,
+    ];
+    const tar = spawn("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
+    let tarErr = "";
+    tar.stderr.on("data", (c) => { tarErr += c.toString("utf8"); });
+    tar.on("error", (e) => {
+      log(`agent_memory tar spawn error: ${e.message}`);
+      try { fs.unlinkSync(stage); } catch {}
+      resolve();
+    });
+    tar.on("close", (tarCode) => {
+      // tar with --ignore-failed-read returns 0 even if dirs are missing;
+      // a non-zero rc means something real failed. Don't abort — log and
+      // try cp anyway; if stage isn't present cp will fail and we move on.
+      if (tarCode !== 0) {
+        log(`agent_memory tar rc=${tarCode}: ${tarErr.slice(0, 400)}`);
+      }
+      const cp = spawn("cp", [stage, memPath], { stdio: ["ignore", "ignore", "pipe"] });
+      let cpErr = "";
+      cp.stderr.on("data", (c) => { cpErr += c.toString("utf8"); });
+      cp.on("error", (e) => {
+        log(`agent_memory cp spawn error: ${e.message}`);
+        try { fs.unlinkSync(stage); } catch {}
+        resolve();
+      });
+      cp.on("close", (cpCode) => {
+        try { fs.unlinkSync(stage); } catch {}
+        if (cpCode !== 0) {
+          log(`agent_memory cp rc=${cpCode}: ${cpErr.slice(0, 400)}`);
+        }
+        resolve();
+      });
+    });
+  });
+}
 
 function runSnapshotOnce() {
   return new Promise((resolve) => {
@@ -311,19 +414,18 @@ async function handleAcpLine(line) {
   ) {
     const rid = String(msg.id);
     const isPromptResponse = pendingPromptIds.has(rid);
-    // Turn-end: block the HTTP response until the workspace snapshot for
-    // this turn is durable on the volume. Trade ~0.5–2 s of end-of-turn
-    // latency for the invariant "once the client sees `turn done`, the
-    // sandbox can be deleted without losing the turn". The original async
-    // firing left a race window in which `daytona.delete()` could kill
-    // the container mid-PUT, losing the session JSONL and causing
-    // session/load to fail on the replacement sandbox.
+    // Per-turn agent-memory snapshot: blocks the HTTP reply until the
+    // memory tarball is durable on the volume. Small payload (just the
+    // session-state dirs), so turn-end latency is ~50-200ms vs the
+    // multi-second full-HOME snapshot this replaced. Preserves the
+    // invariant "once the client sees 'turn done', session/load on a
+    // replacement sandbox finds the JSONL."
     if (isPromptResponse) {
       pendingPromptIds.delete(rid);
       try {
-        await runSnapshotOnce();
+        await runAgentMemorySnapshotOnce();
       } catch (e) {
-        log(`snapshot error on turn-end: ${e.message}`);
+        log(`agent_memory error on turn-end: ${e.message}`);
       }
     }
     const resolver = pendingResponses.get(rid);

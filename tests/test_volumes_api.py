@@ -163,10 +163,13 @@ async def test_delete_volume_conflict_if_session_exists(client):
 
 
 @pytest.mark.asyncio
-async def test_provision_volume_waits_for_ready(client):
+async def test_create_volume_waits_for_ready(client):
+    """``POST /volumes`` returns only after the provider-side volume is in a
+    ready state. Was split across /volumes and /volumes/provision; the latter
+    was collapsed into this endpoint since it only delegated here."""
     with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-prov")):
-        r = await client.post("/volumes/provision",
+        r = await client.post("/volumes",
                               json={"name": "prov-test", "provider": "daytona"})
     assert r.status_code == 200
     assert r.json()["status"] == "ready"

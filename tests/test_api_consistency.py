@@ -10,7 +10,7 @@ file locks in the invariants audited in the REST consistency pass:
   resource, 409 conflict, 502 upstream, not 500).
 * Input validation: POST handlers that used to blow up with 500
   (AttributeError on data.get) now return 400 on non-object JSON.
-* Response-shape parity: /sandboxes POST + /sandboxes/provision expose
+* Response-shape parity: /sandboxes POST + /sandboxes expose
   both ``id`` and ``sandbox_id``; /sessions/quick + /sessions/{id}/resume
   expose both ``sandbox_id`` and ``current_sandbox_id``.
 
@@ -59,9 +59,7 @@ _NON_OBJECT_BODIES = ["not a dict", 123, [1, 2, 3], True]
 @pytest.mark.parametrize("path", [
     "/agents",
     "/sandboxes",
-    "/sandboxes/provision",
     "/sessions",
-    "/sessions/quick",
     "/sessions/any-id/message",
     "/sessions/any-id/config",
     "/sessions/any-id/sandbox/exec",
@@ -103,7 +101,7 @@ async def test_sandbox_file_forwarders_reject_non_object_body(client, path):
 #
 # 500 is reserved for "server bug" — a provider that can't restart a
 # sandbox is upstream-fault territory, matching /sandboxes and
-# /sandboxes/provision which already use 502 for the same class.
+# /sandboxes which already use 502 for the same class.
 # ---------------------------------------------------------------------------
 
 
@@ -136,43 +134,13 @@ async def test_start_sandbox_provider_failure_returns_502(client):
 # ---------------------------------------------------------------------------
 # Response-shape parity:
 #
-#   POST /sandboxes           -> {"id", "sandbox_id", ...}
-#   POST /sandboxes/provision -> {"id", "sandbox_id", ...}
+#   POST /sandboxes -> {"id", "sandbox_id", "sandbox_ref", ...}
 #   POST /sessions/quick      -> {"sandbox_id", "current_sandbox_id", ...}
 #   POST /sessions/{id}/resume-> {"sandbox_id", "current_sandbox_id", ...}
 #
-# The two creation paths must be interchangeable; the session paths need
-# both keys because the DB column is ``current_sandbox_id`` but clients
-# (agent_sdk.client) read ``sandbox_id``.
+# The session paths need both keys because the DB column is
+# ``current_sandbox_id`` but clients (agent_sdk.client) read ``sandbox_id``.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_post_sandboxes_exposes_both_id_and_sandbox_id(client):
-    from api.models import VolumeRecord
-
-    v = VolumeRecord(id="vol_shape_a", name="shape-a",
-                     provider="daytona", provider_ref="dt-a")
-    await dbmod.upsert_volume(v)
-
-    class _FakeInstance:
-        sandbox_id = "dt-sbx"
-        port = None
-        root = "/home/daytona"
-        url = None
-
-    with patch("api.server.create_instance",
-               new=AsyncMock(return_value=_FakeInstance())):
-        r = await client.post("/sandboxes", json={
-            "provider": "daytona", "volume_id": v.id, "subpath": "p",
-        })
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert "id" in body and "sandbox_id" in body
-    assert body["id"] == body["sandbox_id"], (
-        f"/sandboxes must emit a single sandbox identifier under both "
-        f"keys: {body}"
-    )
 
 
 @pytest.mark.asyncio
@@ -193,7 +161,7 @@ async def test_post_sandboxes_provision_exposes_both_id_and_sandbox_id(client):
                new=AsyncMock(return_value=None)), \
          patch("api.providers.provision_sandbox",
                new=AsyncMock(return_value=_FakeInstance())):
-        r = await client.post("/sandboxes/provision", json={
+        r = await client.post("/sandboxes", json={
             "provider": "daytona", "volume_id": v.id, "subpath": "p",
         })
     assert r.status_code == 200, r.text
@@ -233,20 +201,21 @@ async def test_duplicate_volume_name_returns_409(client):
 
 
 @pytest.mark.asyncio
-async def test_post_sessions_missing_volume_id_uses_default(client):
-    """Missing volume_id → server uses default-{provider}. Backward-compat
-    for zero-config SDK callers."""
+async def test_post_sessions_lazy_missing_volume_id_uses_default(client):
+    """Missing volume_id on lazy session → server uses default-{provider}.
+    Backward-compat for zero-config SDK callers."""
     from unittest.mock import patch, AsyncMock
     with patch("api.providers.local.create_volume",
                new=AsyncMock(return_value="/tmp/default-local-sess")):
-        r = await client.post("/sessions", json={"provider": "local"})
+        r = await client.post("/sessions",
+                              json={"provider": "local", "provision": False})
     assert r.status_code == 200, r.text
     assert r.json().get("volume_id")
 
 
 @pytest.mark.asyncio
-async def test_post_sessions_quick_missing_volume_id_uses_default(client):
-    """Missing volume_id on /sessions/quick → default-{provider}."""
+async def test_post_sessions_eager_missing_volume_id_uses_default(client):
+    """Missing volume_id on eager POST /sessions → default-{provider}."""
     from unittest.mock import patch, AsyncMock
     from api.providers._shared import ProviderInstance
 
@@ -264,7 +233,7 @@ async def test_post_sessions_quick_missing_volume_id_uses_default(client):
                new=AsyncMock(side_effect=fake_create_instance)), \
          patch("api.server.AcpClient"), \
          patch("api.server._start_session_tasks"):
-        r = await client.post("/sessions/quick",
+        r = await client.post("/sessions",
                               json={"name": "t", "provider": "local"})
     # Success path (200) — or a clean 5xx if the mocked flow hits an
     # unpatched branch. The point: NOT 400 "volume_id is required".

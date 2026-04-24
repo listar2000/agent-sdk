@@ -54,7 +54,9 @@ async def test_volumes_namespace_create_list_get_delete():
 
 
 @pytest.mark.asyncio
-async def test_volumes_provision_endpoint_called():
+async def test_volumes_provision_aliases_create():
+    """``volumes.provision`` is a historical alias that forwards to ``create``
+    now that the server-side /volumes/provision delegation was removed."""
     from agent_sdk.client import Client, Volume
     c = Client(base_url="http://fake")
     created = {"id": "vol_p", "name": "q", "provider": "daytona",
@@ -64,7 +66,7 @@ async def test_volumes_provision_endpoint_called():
         v = await c.volumes.provision(name="q", provider="daytona")
     assert isinstance(v, Volume) and v.status == "ready"
     call_args = post_mock.call_args
-    assert "/volumes/provision" in call_args.args[0]
+    assert call_args.args[0].endswith("/volumes")
     await c.close()
 
 

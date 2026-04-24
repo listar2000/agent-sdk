@@ -89,7 +89,7 @@ See [`docs/api.md`](api.md) for the full endpoint reference and [`assets/rest-ap
 - **Sandboxes** (`/sandboxes/*`) — ephemeral compute. Every sandbox is `(volume_id, subpath)`-scoped at creation; the volume is mounted at `/home/daytona` with a read-only `shared/` subpath at `/mnt/shared`.
 - **Sessions** (`/sessions/*`) — conversation. Bind to a volume; `current_sandbox_id` is swapped as sandboxes come and go. Explicit sandbox control via `/sessions/{id}/{start,stop,reset}-sandbox`.
 
-`POST /sessions` and `POST /sessions/quick` accept an optional `volume_id`; if omitted, a per-provider default volume is created/reused.
+`POST /sessions` accepts an optional `volume_id`; if omitted, a per-provider default volume is created/reused. Eager by default; pass `"provision": false` for the lazy session-shell flow.
 
 ## Database
 

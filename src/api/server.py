@@ -243,20 +243,9 @@ async def _shutdown_session_state(
         except Exception as e:
             log.warning("failed to kill supervisor port %d for session %s: %s",
                         state.supervisor_port, state.session_id, e)
-    # Kick any subscribers before releasing the state. Without this, a UI
-    # holding a persistent /events stream stays blocked on the orphaned
-    # queue forever — the cancelled SSE reader doesn't broadcast the
-    # sentinel. Kicking wakes the /events handler's ``q.get()`` which
-    # then sees ``shutdown`` and returns, so the UI can reconnect and
-    # subscribe to the replacement state.
-    state.broadcast(_SSE_SENTINEL)
-    for q in state._session_subscribers:
-        state._kick_subscriber(q)
-    state._session_subscribers.clear()
-    for rpc_qs in state._rpc_subscribers.values():
-        for q in rpc_qs:
-            state._kick_subscriber(q)
-    state._rpc_subscribers.clear()
+    # Wake any /events handler waiting on a subscriber queue; without
+    # this the UI stream stays blocked on an orphaned queue forever.
+    state.kick_all()
     if remove and SESSIONS.get(state.session_id) is state:
         SESSIONS.pop(state.session_id, None)
         _session_locks.pop(state.session_id, None)
@@ -333,6 +322,9 @@ async def _reap_one_tick(now: float) -> None:
             if instance:
                 log.info("idle reaper: stopping sandbox %s (provider=%s)",
                          sandbox_id, instance.provider)
+                # Snapshot BEFORE stop so next boot's session/load finds
+                # the JSONLs on the volume (per-turn snapshot was dropped).
+                await _request_supervisor_snapshot(instance)
                 try:
                     await stop_instance(instance)
                     rec = await get_sandbox(sandbox_id)
@@ -375,14 +367,8 @@ async def lifespan(app):
     reaper = asyncio.create_task(_idle_reaper())
     yield
     await _cancel_task(reaper)
-    # Parallel session shutdown. force=True is required on app shutdown:
-    # any session still holding a /events subscriber would otherwise
-    # early-return as a no-op, leaving its SSE reader running while the
-    # supervisor goes away below — the reader then loops through its
-    # retry ladder (up to ~25s backoff) before the task finally exits,
-    # extending uvicorn's drain phase by that much. Force-shutdown
-    # cancels the reader immediately and kicks subscribers so /events
-    # handlers return cleanly.
+    # force=True: a UI still holding /events would otherwise turn each
+    # shutdown into a no-op and the reader's retry ladder blocks drain.
     await asyncio.gather(
         *[_shutdown_session_state(s, remove=False, force=True) for s in SESSIONS.values()],
         return_exceptions=True,
@@ -564,14 +550,7 @@ def _on_sse_reader_death(state: SessionState) -> None:
         state.turn_completed_at = time.time()
     state.active_rpc_id = None
     state.pending_prompts.clear()
-    # Kick all subscribers (session + RPC-scoped)
-    kicked = list(state._session_subscribers)
-    state._session_subscribers.clear()
-    for rpc_qs in state._rpc_subscribers.values():
-        kicked.extend(rpc_qs)
-    state._rpc_subscribers.clear()
-    for q in kicked:
-        state._kick_subscriber(q)
+    state.kick_all()
 
 
 def _sse_reader_disconnect_is_recoverable(state: SessionState) -> bool:
@@ -665,10 +644,13 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     state.acp_session_id = new_acp_session_id
     state.inner_session_id = new_inner_sid
     state.last_event_id = None  # old cursor is meaningless on the new session
-    try:
-        await old_client.aclose()
-    except Exception:
-        pass
+    # Close the old client in the background — the next turn doesn't need
+    # to wait for the TCP teardown.
+    if old_client is not None:
+        async def _close_old():
+            try: await old_client.aclose()
+            except Exception: pass
+        _spawn_bg(_close_old())
     log.info("[REBIND] session %s → new supervisor %s (acp=%s)",
              state.session_id, new_url, new_acp_session_id)
 
@@ -1016,7 +998,7 @@ _CONFIG_KEYS = (
 
 # Keys that were once inside AgentConfig but now live on session / sandbox
 # rows. `/agents` POST rejects them with 400 so callers migrate cleanly;
-# `/sessions/quick` and `/sessions` consume them and route to the right row.
+# `/sessions` and `/sessions` consume them and route to the right row.
 _AGENT_REJECTED_KEYS = ("cwd", "env", "dockerfile", "dockerfile_content", "shared_mounts")
 
 
@@ -1201,7 +1183,7 @@ async def create_agent(request: Request):
                 400,
                 f"'{k}' no longer belongs to agent config. "
                 "cwd → session; env → session; dockerfile + shared_mounts → sandbox. "
-                "Set these on POST /sessions or /sessions/quick instead.",
+                "Set these on POST /sessions or /sessions instead.",
             )
     config = AgentConfig.from_dict(config_data)
     await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
@@ -1286,9 +1268,9 @@ async def _resolve_or_default_volume(
 ) -> "VolumeRecord":
     """Resolve an explicit volume id/name or fall back to the per-provider default.
 
-    Four endpoints share this contract (``POST /sandboxes``, ``/sandboxes/provision``,
-    ``/sessions``, ``/sessions/quick``). Raises ``HTTPException(404)`` for an
-    unknown id/name and ``HTTPException(502)`` if default-volume provisioning fails.
+    Three endpoints share this contract (``POST /sandboxes``, ``/sessions``,
+    ``/sessions``). Raises ``HTTPException(404)`` for an unknown
+    id/name and ``HTTPException(502)`` if default-volume provisioning fails.
     """
     if volume_id and isinstance(volume_id, str):
         return await _resolve_volume(volume_id)
@@ -1387,15 +1369,6 @@ async def create_volume(body: _VolumeCreateBody):
             )
         raise
     return vol
-
-
-@app.post("/volumes/provision")
-async def provision_volume(body: _VolumeCreateBody):
-    """Create + wait for ready. For Daytona, create_daytona_volume already
-    polls until the backend volume is in 'ready' state, so this is equivalent
-    to POST /volumes today. Kept as a separate endpoint for API parity with
-    /sandboxes/provision."""
-    return await create_volume(body)
 
 
 @app.get("/volumes")
@@ -1534,56 +1507,6 @@ async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/sandboxes")
-async def create_sandbox(request: Request):
-    data = await _json_body(request)
-    provider = data.get("provider", "local")
-    agent_type = data.get("agent_type", "claude")
-    root = data.get("root", "/tmp")
-    subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
-    vol = await _resolve_or_default_volume(data.get("volume_id"), provider)
-    _validate_subpath(subpath)
-    if provider != vol.provider:
-        raise HTTPException(
-            400,
-            f"provider {provider!r} does not match volume.provider {vol.provider!r}",
-        )
-    dockerfile = _materialize_dockerfile(data)
-    shared_mounts = data.get("shared_mounts") or None
-    sandbox_id = str(uuid.uuid4())
-
-    async def _create_once():
-        return await create_instance(
-            provider, agent_type, dockerfile=dockerfile, root=root,
-            volume_id=vol.provider_ref, subpath=subpath,
-            sandbox_id=sandbox_id,
-            shared_mounts=shared_mounts,
-        )
-
-    try:
-        instance = await _provision_with_cache_retry(vol.id, agent_type, _create_once)
-    except Exception as e:
-        raise HTTPException(502, f"Provider '{provider}' failed: {e}")
-
-    _INSTANCES[sandbox_id] = instance
-    record = _sandbox_record(
-        sandbox_id, provider, instance,
-        volume_id=vol.id, subpath=subpath, root_fallback=root,
-        dockerfile=dockerfile,
-        shared_mounts=list(shared_mounts) if shared_mounts else [],
-    )
-    await upsert_sandbox(record)
-    # Dual-key: ``sandbox_id`` for /sandboxes/provision parity; ``id`` stays
-    # for the plain REST resource contract.
-    return {
-        "id": sandbox_id, "sandbox_id": sandbox_id,
-        "provider": provider, "sandbox_ref": record.sandbox_ref,
-        "status": "running", "root": record.root,
-        "volume_id": vol.id, "subpath": subpath,
-        "listen_port": instance.port, "url": instance.url or None,
-    }
-
-
 @app.get("/sandboxes")
 async def list_sandboxes_route():
     sandboxes = await list_sandboxes()
@@ -1636,30 +1559,21 @@ async def get_sandbox_route(sandbox_id: str):
 @app.delete("/sandboxes/{sandbox_id}")
 async def delete_sandbox_route(sandbox_id: str):
     await _require_sandbox(sandbox_id)
-    # Hold the sandbox lock to prevent concurrent auto-restart
-    # from restarting the sandbox while we're deleting it.
     async with _get_sandbox_lock(sandbox_id):
-        # Clean up sessions BEFORE removing the instance. ``force=True``
-        # is required: without it, _shutdown_session_state early-returns
-        # when the session still has an /events subscriber (UI holding
-        # a persistent SSE stream), leaving a zombie SessionState pointing
-        # at the soon-to-be-deleted sandbox. The zombie's SSE reader then
-        # keeps retrying the dead URL while the UI receives nothing.
-        # Also NULL out current_sandbox_id so the next ensure_sandbox takes
-        # the Case A ("no sandbox") path cleanly.
-        affected = any(
-            state.sandbox_id == sandbox_id for state in SESSIONS.values()
-        )
+        # Snapshot before tearing down the compute so the next sandbox
+        # provisioned on this volume's subpath can session/load with the
+        # latest workspace state (per-turn snapshot was dropped in
+        # 2026-04-23; this is the durability boundary).
+        instance = _INSTANCES.get(sandbox_id)
+        await _request_supervisor_snapshot(instance)
+
+        # force=True so a UI holding a persistent /events stream doesn't
+        # block the shutdown and leave a zombie state pointing at the
+        # deleted sandbox. session.current_sandbox_id NULL-outs itself
+        # via ON DELETE SET NULL on sandboxes_current_sandbox_id_fkey.
         for state in list(SESSIONS.values()):
             if state.sandbox_id == sandbox_id:
                 await _shutdown_session_state(state, remove=True, force=True)
-        if affected:
-            async with get_db() as conn:
-                await conn.execute(
-                    "UPDATE sessions SET current_sandbox_id = NULL "
-                    "WHERE current_sandbox_id = %s",
-                    (sandbox_id,),
-                )
 
         instance = _INSTANCES.pop(sandbox_id, None)
         _sandbox_locks.pop(sandbox_id, None)
@@ -1675,16 +1589,17 @@ async def delete_sandbox_route(sandbox_id: str):
     return {"status": "deleted"}
 
 
-@app.post("/sandboxes/provision")
-async def provision_sandbox_route(request: Request):
-    """Provision a sandbox on the provider selected by the request body.
+@app.post("/sandboxes")
+async def create_sandbox(request: Request):
+    """Create a sandbox on the provider selected by the request body.
 
     Body: ``{"volume_id": ..., "subpath": ..., "provider": "daytona"|"docker"|"local",
               "agent_type": ..., "config": {...}}``
 
     For Daytona the returned instance has no supervisor yet (started lazily by
     ``ensure_runtime``). For Docker/Local the supervisor is already running.
-    Returns ``{sandbox_id, status}``.
+    Returns ``{id, sandbox_id, sandbox_ref, status, provider, root, volume_id,
+    subpath, listen_port, url}``.
     """
     data = await _json_body(request)
     agent_type = data.get("agent_type", "claude")
@@ -1727,40 +1642,40 @@ async def provision_sandbox_route(request: Request):
     # against DB rows by this id.
     sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
 
-    async def _provision_once():
-        return await _providers_mod.provision_sandbox(
+    try:
+        instance = await _provision_with_cache_retry(
+            (vol.id, agent_type), _providers_mod.provision_sandbox,
             provider,
-            volume_ref=vol.provider_ref,
-            subpath=subpath,
-            agent_type=agent_type,
-            dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands if pre_start_commands else None,
-            root=root,
-            sandbox_id=sandbox_id,
+            volume_ref=vol.provider_ref, subpath=subpath,
+            agent_type=agent_type, dockerfile=dockerfile,
+            pre_start_commands=pre_start_commands or None,
+            root=root, sandbox_id=sandbox_id,
             shared_mounts=shared_mounts or None,
         )
-
-    try:
-        instance = await _provision_with_cache_retry(vol.id, agent_type, _provision_once)
     except Exception as e:
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Failed to provision sandbox: {e}")
 
     _INSTANCES[sandbox_id] = instance
-    await upsert_sandbox(_sandbox_record(
+    record = _sandbox_record(
         sandbox_id, provider, instance,
         volume_id=vol.id, subpath=subpath, root_fallback=root,
         dockerfile=dockerfile,
         shared_mounts=list(shared_mounts) if shared_mounts else [],
-    ))
+    )
+    await upsert_sandbox(record)
 
-    # Dual-key: ``sandbox_id`` is the historic shape, ``id`` matches the
-    # plain /sandboxes POST response so both paths are interchangeable.
+    # Dual-key ``sandbox_id``/``id`` for back-compat with callers that learned
+    # either key shape. ``sandbox_ref``/``root``/``listen_port``/``url`` match
+    # the old POST /sandboxes response fields so migrating to this endpoint is
+    # a straight rename — no field lookups to rewrite.
     return {
-        "sandbox_id": sandbox_id, "id": sandbox_id,
-        "status": "provisioned",
-        "volume_id": vol.id, "subpath": subpath, "provider": provider,
+        "id": sandbox_id, "sandbox_id": sandbox_id,
+        "provider": provider, "sandbox_ref": record.sandbox_ref,
+        "status": "running",
+        "root": record.root, "volume_id": vol.id, "subpath": subpath,
+        "listen_port": instance.port, "url": instance.url or None,
     }
 
 
@@ -1782,9 +1697,10 @@ async def stop_sandbox_route(sandbox_id: str):
     async with _get_sandbox_lock(sandbox_id):
         instance = _INSTANCES.get(sandbox_id)
         if instance:
+            # Snapshot before stop so the next boot's session/load finds
+            # the JSONLs on the volume (per-turn snapshot was dropped).
+            await _request_supervisor_snapshot(instance)
             try:
-                # Durability lives at turn-end in the supervisor; stop is
-                # just SIGTERM. Client sees this return as "stop complete."
                 await stop_instance(instance)
             except Exception as e:
                 log.warning("stop_sandbox_route: stop failed for %s: %s",
@@ -1812,14 +1728,30 @@ async def stop_sandbox_route(sandbox_id: str):
     return {"status": "stopped"}
 
 
+@app.post("/sandboxes/{sandbox_id}/snapshot")
+async def snapshot_sandbox_route(sandbox_id: str):
+    """Write the sandbox's workspace to the volume. Use before risky ops
+    or when the user wants an explicit "save point". /sandboxes/{id}/stop,
+    /sessions/{id}/stop-sandbox, and the idle reaper already do this
+    implicitly — call this endpoint only for mid-session saves.
+    """
+    await _require_sandbox(sandbox_id)
+    instance = _INSTANCES.get(sandbox_id)
+    if instance is None or not instance.url:
+        raise HTTPException(409, "sandbox not running")
+    if not await _request_supervisor_snapshot(instance.url):
+        raise HTTPException(502, "supervisor snapshot failed")
+    return {"status": "ok"}
+
+
 @app.post("/sandboxes/{sandbox_id}/start")
 async def start_sandbox_route(sandbox_id: str):
     record = await _require_sandbox(sandbox_id)
     try:
         url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type="claude")
     except Exception as e:
-        # 502 matches POST /sandboxes and POST /sandboxes/provision —
-        # provider failures are upstream faults, not server bugs (500).
+        # 502 matches POST /sandboxes — provider failures are upstream
+        # faults, not server bugs (500).
         raise HTTPException(502, f"failed to start sandbox: {e}")
 
     # Re-fetch the record: _ensure_sandbox_alive may have created a replacement
@@ -1894,8 +1826,6 @@ async def admin_reap_session(session_id: str):
         raise HTTPException(404, "session not in memory")
 
     sandbox_id = state.sandbox_id
-    # force=True: admin reap is explicit user action, don't let an open
-    # /events subscriber make it a no-op.
     await _shutdown_session_state(state, remove=True, force=True, mark_idle_at=time.time())
 
     stopped_provider: str | None = None
@@ -2126,6 +2056,34 @@ def _synthesize_instance(sandbox: SandboxRecord) -> ProviderInstance:
     )
 
 
+async def _request_supervisor_snapshot(
+    target: "ProviderInstance | str | None", timeout: float = 60.0,
+) -> bool:
+    """Fire POST /v1/snapshot on the supervisor. Returns True on 200.
+
+    Accepts either a ``ProviderInstance`` (common) or a raw URL string.
+    ``None`` / missing URL short-circuits so the 4 pre-stop call sites can
+    drop their own ``if instance and instance.url`` guards.
+
+    Called before stopping or reaping a sandbox so the next boot's
+    session/load finds the JSONLs on the volume. Per-turn snapshots were
+    dropped in 2026-04-23; the durability invariant now lives here.
+    Best-effort — a failure logs but doesn't block the stop.
+    """
+    url = target if isinstance(target, str) else (target.url if target else "")
+    if not url:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(f"{url}/v1/snapshot")
+            if r.status_code == 200:
+                return True
+            log.warning("supervisor snapshot returned %d: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.warning("supervisor snapshot failed (%s): %s", url, e)
+    return False
+
+
 async def _instance_is_alive(inst: ProviderInstance) -> bool:
     """Cheap liveness check on a cached ProviderInstance.
 
@@ -2207,6 +2165,27 @@ async def _replace_sandbox_inplace(
         )
     except Exception as e:
         raise RuntimeError(f"Failed to create replacement daytona sandbox: {e}")
+    # Daytona ``create_sandbox`` does NOT start the supervisor (by design —
+    # the agent HOME mount + volume cache extraction happen later). Without
+    # this step the returned instance has url="" and the rebind path builds
+    # an AcpClient with an empty base URL, which blows up on the very next
+    # httpx call ("Request URL is missing an 'http://' or 'https://'
+    # protocol"). See test_persistent_sse_external_delete_then_message.
+    if not inst.url:
+        # Daytona supervisor uses a fixed in-sandbox port (9100) — the
+        # Daytona signed preview maps host URLs to container ports, so
+        # every supervisor we spawn inside any daytona sandbox listens on
+        # this same port. Matches restart_daytona_supervisor's constant.
+        try:
+            inst_url = await _providers_mod.ensure_supervisor_url(
+                "daytona", inst, agent_type=agent_type,
+                root=rec.root, spawn_env=spawn_env, port=9100,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to start supervisor on replacement daytona sandbox: {e}"
+            )
+        inst.url = inst_url
     return inst, True
 
 
@@ -2301,41 +2280,36 @@ _STALE_CACHE_MARKERS = (
 )
 
 
-async def _provision_with_cache_retry(
-    volume_id: str, agent_type: str,
-    provision_fn,
-):
-    """Run ``provision_fn``; on stale-install-cache markers, clear the
-    cache entry for ``(volume_id, agent_type)``, reinstall via
-    ``ensure_volume_supervisor``, and retry once.
+async def _provision_with_cache_retry(cache_key, fn, /, *args, **kwargs):
+    """Call ``fn(*args, **kwargs)``; on stale-install-cache markers,
+    clear the supervisor-install cache for ``cache_key`` (a
+    ``(volume_id, agent_type)`` tuple), reinstall, and retry once.
 
-    Shared by ``_provision_new``, ``/sessions/quick``, and
-    ``/sandboxes/provision`` — every code path that runs a provider's
-    ``create_sandbox`` after ``ensure_volume_supervisor`` can hit a
-    stale cache (volumes table says "installed" but the volume was wiped
-    out-of-band — common after a container restart with an ephemeral
-    volume mount). One cache-clear + reinstall + retry is enough; a
-    second failure surfaces the real error.
+    ``volumes.supervisor_agent_types`` says installed but the on-disk
+    state can diverge (ephemeral volume wiped on container restart,
+    failed install that still marked the cache). One clean-and-retry
+    self-heals; a second failure surfaces the real error.
+
+    Positional-only for the key so ``*args``/``**kwargs`` forwarded to
+    ``fn`` can contain any names (including ``volume_id`` /
+    ``agent_type``) without colliding with our own parameters.
     """
+    vol_id, agent_type = cache_key
     try:
-        return await provision_fn()
+        return await fn(*args, **kwargs)
     except RuntimeError as e:
-        msg = str(e)
-        if not any(marker in msg for marker in _STALE_CACHE_MARKERS):
+        if not any(marker in str(e) for marker in _STALE_CACHE_MARKERS):
             raise
-        log.warning(
-            "provision failed with stale-cache marker for volume %s "
-            "(agent=%s): %s — clearing cache + reinstalling",
-            volume_id, agent_type, e,
-        )
+        log.warning("stale-cache on volume %s agent=%s: %s — reinstalling",
+                    vol_id, agent_type, e)
         async with get_db() as conn:
             await conn.execute(
                 "UPDATE volumes SET supervisor_agent_types = "
                 "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
-                (agent_type, volume_id),
+                (agent_type, vol_id),
             )
-        await ensure_volume_supervisor(volume_id, agent_type)
-        return await provision_fn()
+        await ensure_volume_supervisor(vol_id, agent_type)
+        return await fn(*args, **kwargs)
 
 
 async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
@@ -2600,20 +2574,14 @@ async def _provision_new(
     # startup reconciliation (M5); other providers currently ignore it.
     new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
 
-    async def _provision_once() -> ProviderInstance:
-        return await _providers_mod.provision_sandbox(
-            vol.provider,
-            volume_ref=vol.provider_ref,
-            subpath=subpath,
-            agent_type=agent_type,
-            spawn_env=spawn_env,
-            root=root,
-            sandbox_id=new_sandbox_id,
-            dockerfile=dockerfile,
-            shared_mounts=shared_mounts or None,
-        )
-
-    inst = await _provision_with_cache_retry(vol.id, agent_type, _provision_once)
+    inst = await _provision_with_cache_retry(
+        (vol.id, agent_type), _providers_mod.provision_sandbox,
+        vol.provider,
+        volume_ref=vol.provider_ref, subpath=subpath,
+        agent_type=agent_type, spawn_env=spawn_env,
+        root=root, sandbox_id=new_sandbox_id,
+        dockerfile=dockerfile, shared_mounts=shared_mounts or None,
+    )
 
     sb = _sandbox_record(
         new_sandbox_id, vol.provider, inst,
@@ -2947,7 +2915,7 @@ async def session_resume(session_id: str, request: Request):
     return {
         "session_id": state.session_id,
         "agent_id": state.agent_id,
-        # Same dual-key rationale as /sessions/quick: ``sandbox_id`` for the
+        # Same dual-key rationale as /sessions: ``sandbox_id`` for the
         # REST/client convention, ``current_sandbox_id`` to match the DB
         # column + /sessions/{id} GET response shape.
         "sandbox_id": state.sandbox_id,
@@ -2959,12 +2927,33 @@ async def session_resume(session_id: str, request: Request):
 
 @app.post("/sessions")
 async def sessions_create(request: Request):
-    """Create a new session bound to a volume (lazy sandbox provisioning).
+    """Create a session. Eager by default (provision sandbox + connect).
 
-    Body requires ``volume_id``; no sandbox is provisioned at this point.
-    Returns ``{id, agent_id, volume_id, current_sandbox_id: null, connected: false}``.
+    Body:
+      - ``provision`` (bool, default ``true``): when ``false``, skip sandbox
+        provisioning and return a session shell with ``current_sandbox_id =
+        null``. The sandbox materialises on the first downstream call that
+        needs one (``/sessions/{id}/start-sandbox`` or ``/message``).
+      - Every other field (``volume_id``, ``agent_id``, ``provider``,
+        ``config``, ``env``, ``secrets``, ``cwd``, ``root``, ``dockerfile``,
+        ``shared_mounts``) — see the dispatched-to helper for details.
+
+    Collapses the old ``POST /sessions`` (lazy) and ``POST /sessions``
+    (eager) into one endpoint with consistent naming.
     """
     data = await _json_body(request)
+    if data.get("provision", True):
+        return await _sessions_create_eager(data)
+    return await _sessions_create_lazy(data)
+
+
+async def _sessions_create_lazy(data: dict) -> dict:
+    """Create a session row only — no sandbox, no ACP, no scheduler.
+
+    Used when the UI wants to render a session shell before paying the
+    provisioning cost (daytona: ~15-30 s; local: ~2-3 s). Sandbox appears
+    on the first ``/sessions/{id}/start-sandbox`` or ``/message``.
+    """
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
@@ -3002,10 +2991,6 @@ async def sessions_create(request: Request):
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
     session_id = str(uuid.uuid4())
-    # Lazy mode: no sandbox provisioning here. current_sandbox_id = None.
-    # dockerfile + shared_mounts defer to whatever the eventual
-    # /sessions/{id}/start-sandbox or first /message supplies (currently
-    # they default to none; future: body of /sessions could set them).
     await upsert_session(
         session_id, agent_id, sandbox_id=None, inner_session_id=None,
         volume_id=volume_record.id,
@@ -3022,14 +3007,12 @@ async def sessions_create(request: Request):
     }
 
 
-@app.post("/sessions/quick")
-async def sessions_quick_create(request: Request):
-    """Create agent + provision sandbox + connect in one call.
+async def _sessions_create_eager(data: dict) -> dict:
+    """Create agent + provision sandbox + connect ACP in one call.
 
-    Body requires ``volume_id``.
-    Returns {agent_id, sandbox_id, session_id, connected: true}.
+    Returns ``{agent_id, sandbox_id, current_sandbox_id, session_id,
+    inner_session_id, connected: true}`` — ready to POST /message against.
     """
-    data = await _json_body(request)
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
@@ -3088,18 +3071,15 @@ async def sessions_quick_create(request: Request):
         log.error("sessions_quick_create: ensure_volume_supervisor failed: %s", e, exc_info=True)
         raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
 
-    async def _create_once():
-        return await create_instance(
+    try:
+        instance = await _provision_with_cache_retry(
+            (volume_id, agent_type), create_instance,
             provider, agent_type, dockerfile=dockerfile,
             pre_start_commands=skill_cmds if provider != "local" else None,
             root=root, spawn_env=spawn_env,
             volume_id=volume_record.provider_ref, subpath=subpath,
-            sandbox_id=sandbox_id,
-            shared_mounts=shared_mounts or None,
+            sandbox_id=sandbox_id, shared_mounts=shared_mounts or None,
         )
-
-    try:
-        instance = await _provision_with_cache_retry(volume_id, agent_type, _create_once)
     except Exception as e:
         await delete_agent(agent_id)
         log.error("sessions_quick_create: create_instance failed (provider=%s): %s", provider, e, exc_info=True)
@@ -3124,7 +3104,7 @@ async def sessions_quick_create(request: Request):
     ))
 
     async def _cleanup_and_raise(msg_fmt: str, e: Exception) -> None:
-        """Shared teardown for post-upsert failures in /sessions/quick."""
+        """Shared teardown for post-upsert failures in /sessions."""
         await delete_agent(agent_id)
         await delete_sandbox(sandbox_id)
         _INSTANCES.pop(sandbox_id, None)
@@ -3506,6 +3486,10 @@ async def stop_session_sandbox(session_id: str):
     if sbid is None:
         return  # 204, no-op — already stopped
     sb = await get_sandbox(sbid)
+    # Snapshot BEFORE stopping compute so the volume has the latest
+    # workspace for session/load on resume.
+    inst = _INSTANCES.get(sbid)
+    await _request_supervisor_snapshot(inst)
     if sb:
         try:
             await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))

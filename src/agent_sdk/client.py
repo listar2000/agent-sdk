@@ -353,9 +353,9 @@ class Agent:
                 self.inner_session_id = data.get("inner_session_id")
                 self.id = data.get("agent_id") or self.name
             elif self.provider is not None:
-                # All-in-one via /sessions/quick
+                # All-in-one via POST /sessions (eager by default)
                 for attempt in range(3):
-                    resp = await self._client.post("/sessions/quick", json=self._registration_payload())
+                    resp = await self._client.post("/sessions", json=self._registration_payload())
                     if resp.status_code < 500 or attempt == 2:
                         break
                     await asyncio.sleep(2 ** attempt)
@@ -631,10 +631,9 @@ class _VolumesAPI:
         return Volume._from_server(r.json())
 
     async def provision(self, name: str, provider: str) -> Volume:
-        r = await self._c._http.post(f"{self._c.base_url}/volumes/provision",
-                                     json={"name": name, "provider": provider})
-        _raise_for_status(r)
-        return Volume._from_server(r.json())
+        # Historical alias for ``create`` — /volumes/provision was a trivial
+        # delegation to /volumes and has been collapsed server-side.
+        return await self.create(name, provider)
 
     async def get(self, id_or_name: str) -> Volume:
         r = await self._c._http.get(f"{self._c.base_url}/volumes/{id_or_name}")
