@@ -1653,7 +1653,7 @@ async function connect() {
     if (model) body.model = model;
     if (oauthToken) body.secrets = { CLAUDE_CODE_OAUTH_TOKEN: oauthToken };
 
-    const resp = await fetch(`${apiBase()}/sessions/quick`, {
+    const resp = await fetch(`${apiBase()}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

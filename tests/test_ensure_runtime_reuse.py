@@ -198,7 +198,7 @@ async def test_second_message_does_not_rebuild_session_state(client, monkeypatch
         p.start()
     try:
         # 1. POST /sessions/quick — creates state, constructs AcpClient once.
-        r = await client.post("/sessions/quick", json={
+        r = await client.post("/sessions", json={
             "name": "reuse-test",
             "provider": "local",
             "agent_type": "claude",

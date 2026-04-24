@@ -3,7 +3,7 @@
 These cover the critical gaps from the 2026-04-22 review (C1-C4, C6, M1):
 provisioning routes through the provider-agnostic `provision_sandbox` wrapper;
 docker/local return a real URL from the `_INSTANCES` cache; the
-`/sandboxes/provision` REST endpoint reads the provider from the request body.
+`/sandboxes` REST endpoint reads the provider from the request body.
 
 All provider-side I/O is mocked — no live docker/local/daytona required.
 """
@@ -230,7 +230,7 @@ async def test_ensure_supervisor_url_falls_back_to_listen_port_on_cold_start(set
 
 
 # ---------------------------------------------------------------------------
-# C4: /sandboxes/provision honors the request-body `provider`
+# C4: /sandboxes honors the request-body `provider`
 # ---------------------------------------------------------------------------
 
 
@@ -243,7 +243,7 @@ async def client(setup):
 
 @pytest.mark.asyncio
 async def test_sandbox_provision_endpoint_dispatches_on_provider(client):
-    """POST /sandboxes/provision with provider=docker routes to docker, not daytona."""
+    """POST /sandboxes with provider=docker routes to docker, not daytona."""
     from api.models import VolumeRecord
     await dbmod.upsert_volume(
         VolumeRecord(id="v_d", name="v_d", provider="docker",
@@ -268,7 +268,7 @@ async def test_sandbox_provision_endpoint_dispatches_on_provider(client):
          patch("api.server.ensure_volume_supervisor",
                new=AsyncMock(return_value=None)):
         r = await client.post(
-            "/sandboxes/provision",
+            "/sandboxes",
             json={
                 "provider": "docker",
                 "volume_id": "v_d",
@@ -296,13 +296,13 @@ async def test_sandbox_provision_endpoint_dispatches_on_provider(client):
 # A volume created with provider=docker must not be used to provision a
 # sandbox on provider=daytona. The server should reject the mismatch cleanly
 # (HTTP 400) rather than silently run the wrong provider or crash midway.
-# Covers both entry points: POST /sandboxes and POST /sandboxes/provision.
+# Covers both entry points: POST /sandboxes and POST /sandboxes.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_cross_provider_volume_rejection_via_provision_endpoint(client):
-    """POST /sandboxes/provision must reject mismatched provider vs. volume."""
+    """POST /sandboxes must reject mismatched provider vs. volume."""
     from api.models import VolumeRecord
     await dbmod.upsert_volume(
         VolumeRecord(id="v_docker", name="v_docker", provider="docker",
@@ -319,7 +319,7 @@ async def test_cross_provider_volume_rejection_via_provision_endpoint(client):
          patch("api.server.ensure_volume_supervisor",
                new=AsyncMock(return_value=None)):
         r = await client.post(
-            "/sandboxes/provision",
+            "/sandboxes",
             json={
                 "provider": "daytona",
                 "volume_id": "v_docker",

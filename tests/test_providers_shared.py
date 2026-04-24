@@ -224,7 +224,7 @@ def test_build_env_prefix_rejects_injection_attempt_end_to_end():
 
 def test_pop_env_and_secrets_rejects_shell_metachar_keys():
     """``_pop_env_and_secrets`` (used by /sessions/new, /sessions/{id}/resume,
-    /sandboxes/provision) must 400 on any non-POSIX env or secrets key.
+    /sandboxes) must 400 on any non-POSIX env or secrets key.
     Defence-in-depth: ``_build_env_prefix`` rejects too, but we want the
     error surfaced at the HTTP layer so clients get a clean 400."""
     from fastapi import HTTPException
@@ -242,7 +242,7 @@ def test_pop_env_and_secrets_rejects_shell_metachar_keys():
 
 def test_forbid_auth_keys_in_env_also_rejects_shell_metachars():
     """``_forbid_auth_keys_in_env`` guards ``config.env`` for POST /agents
-    and POST /sandboxes/provision. Both auth-key smuggling and shell-metachar
+    and POST /sandboxes. Both auth-key smuggling and shell-metachar
     keys must 400."""
     from fastapi import HTTPException
 

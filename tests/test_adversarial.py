@@ -1110,7 +1110,7 @@ class TestServerEndpointAdversarial:
                                 provider_ref="dt-x", status="ready")
         with patch("api.server.create_instance", side_effect=ValueError("Unknown provider: 'badprovider'")), \
              patch("api.server.get_volume", return_value=fake_vol):
-            resp = await async_client.post("/sessions/quick", json={
+            resp = await async_client.post("/sessions", json={
                 "name": "test",
                 "provider": "badprovider",
                 "agent_type": "claude",
@@ -1128,7 +1128,7 @@ class TestServerEndpointAdversarial:
         with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")), \
              patch("api.server.get_volume", return_value=fake_vol), \
              patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
-            resp = await async_client.post("/sessions/quick", json={
+            resp = await async_client.post("/sessions", json={
                 "name": "test",
                 "provider": "daytona",
                 "agent_type": "claude",

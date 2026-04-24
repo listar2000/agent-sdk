@@ -170,7 +170,7 @@ def test_server_handlers_emit_every_field_the_sdk_reads():
 
     # (endpoint_marker, required_fields_the_sdk_reads)
     expectations = [
-        ("/sessions/quick",
+        ("/sessions",
          ["agent_id", "sandbox_id", "inner_session_id", "session_id"]),
         ("/sessions/{session_id}/resume",
          ["agent_id", "sandbox_id", "inner_session_id"]),

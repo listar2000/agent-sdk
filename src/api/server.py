@@ -998,7 +998,7 @@ _CONFIG_KEYS = (
 
 # Keys that were once inside AgentConfig but now live on session / sandbox
 # rows. `/agents` POST rejects them with 400 so callers migrate cleanly;
-# `/sessions/quick` and `/sessions` consume them and route to the right row.
+# `/sessions` and `/sessions` consume them and route to the right row.
 _AGENT_REJECTED_KEYS = ("cwd", "env", "dockerfile", "dockerfile_content", "shared_mounts")
 
 
@@ -1183,7 +1183,7 @@ async def create_agent(request: Request):
                 400,
                 f"'{k}' no longer belongs to agent config. "
                 "cwd → session; env → session; dockerfile + shared_mounts → sandbox. "
-                "Set these on POST /sessions or /sessions/quick instead.",
+                "Set these on POST /sessions or /sessions instead.",
             )
     config = AgentConfig.from_dict(config_data)
     await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
@@ -1268,9 +1268,9 @@ async def _resolve_or_default_volume(
 ) -> "VolumeRecord":
     """Resolve an explicit volume id/name or fall back to the per-provider default.
 
-    Four endpoints share this contract (``POST /sandboxes``, ``/sandboxes/provision``,
-    ``/sessions``, ``/sessions/quick``). Raises ``HTTPException(404)`` for an
-    unknown id/name and ``HTTPException(502)`` if default-volume provisioning fails.
+    Three endpoints share this contract (``POST /sandboxes``, ``/sessions``,
+    ``/sessions``). Raises ``HTTPException(404)`` for an unknown
+    id/name and ``HTTPException(502)`` if default-volume provisioning fails.
     """
     if volume_id and isinstance(volume_id, str):
         return await _resolve_volume(volume_id)
@@ -1369,15 +1369,6 @@ async def create_volume(body: _VolumeCreateBody):
             )
         raise
     return vol
-
-
-@app.post("/volumes/provision")
-async def provision_volume(body: _VolumeCreateBody):
-    """Create + wait for ready. For Daytona, create_daytona_volume already
-    polls until the backend volume is in 'ready' state, so this is equivalent
-    to POST /volumes today. Kept as a separate endpoint for API parity with
-    /sandboxes/provision."""
-    return await create_volume(body)
 
 
 @app.get("/volumes")
@@ -1516,52 +1507,6 @@ async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/sandboxes")
-async def create_sandbox(request: Request):
-    data = await _json_body(request)
-    provider = data.get("provider", "local")
-    agent_type = data.get("agent_type", "claude")
-    root = data.get("root", "/tmp")
-    subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
-    vol = await _resolve_or_default_volume(data.get("volume_id"), provider)
-    _validate_subpath(subpath)
-    if provider != vol.provider:
-        raise HTTPException(
-            400,
-            f"provider {provider!r} does not match volume.provider {vol.provider!r}",
-        )
-    dockerfile = _materialize_dockerfile(data)
-    shared_mounts = data.get("shared_mounts") or None
-    sandbox_id = str(uuid.uuid4())
-    try:
-        instance = await _provision_with_cache_retry(
-            (vol.id, agent_type), create_instance,
-            provider, agent_type, dockerfile=dockerfile, root=root,
-            volume_id=vol.provider_ref, subpath=subpath,
-            sandbox_id=sandbox_id, shared_mounts=shared_mounts,
-        )
-    except Exception as e:
-        raise HTTPException(502, f"Provider '{provider}' failed: {e}")
-
-    _INSTANCES[sandbox_id] = instance
-    record = _sandbox_record(
-        sandbox_id, provider, instance,
-        volume_id=vol.id, subpath=subpath, root_fallback=root,
-        dockerfile=dockerfile,
-        shared_mounts=list(shared_mounts) if shared_mounts else [],
-    )
-    await upsert_sandbox(record)
-    # Dual-key: ``sandbox_id`` for /sandboxes/provision parity; ``id`` stays
-    # for the plain REST resource contract.
-    return {
-        "id": sandbox_id, "sandbox_id": sandbox_id,
-        "provider": provider, "sandbox_ref": record.sandbox_ref,
-        "status": "running", "root": record.root,
-        "volume_id": vol.id, "subpath": subpath,
-        "listen_port": instance.port, "url": instance.url or None,
-    }
-
-
 @app.get("/sandboxes")
 async def list_sandboxes_route():
     sandboxes = await list_sandboxes()
@@ -1644,16 +1589,17 @@ async def delete_sandbox_route(sandbox_id: str):
     return {"status": "deleted"}
 
 
-@app.post("/sandboxes/provision")
-async def provision_sandbox_route(request: Request):
-    """Provision a sandbox on the provider selected by the request body.
+@app.post("/sandboxes")
+async def create_sandbox(request: Request):
+    """Create a sandbox on the provider selected by the request body.
 
     Body: ``{"volume_id": ..., "subpath": ..., "provider": "daytona"|"docker"|"local",
               "agent_type": ..., "config": {...}}``
 
     For Daytona the returned instance has no supervisor yet (started lazily by
     ``ensure_runtime``). For Docker/Local the supervisor is already running.
-    Returns ``{sandbox_id, status}``.
+    Returns ``{id, sandbox_id, sandbox_ref, status, provider, root, volume_id,
+    subpath, listen_port, url}``.
     """
     data = await _json_body(request)
     agent_type = data.get("agent_type", "claude")
@@ -1712,19 +1658,24 @@ async def provision_sandbox_route(request: Request):
         raise HTTPException(502, f"Failed to provision sandbox: {e}")
 
     _INSTANCES[sandbox_id] = instance
-    await upsert_sandbox(_sandbox_record(
+    record = _sandbox_record(
         sandbox_id, provider, instance,
         volume_id=vol.id, subpath=subpath, root_fallback=root,
         dockerfile=dockerfile,
         shared_mounts=list(shared_mounts) if shared_mounts else [],
-    ))
+    )
+    await upsert_sandbox(record)
 
-    # Dual-key: ``sandbox_id`` is the historic shape, ``id`` matches the
-    # plain /sandboxes POST response so both paths are interchangeable.
+    # Dual-key ``sandbox_id``/``id`` for back-compat with callers that learned
+    # either key shape. ``sandbox_ref``/``root``/``listen_port``/``url`` match
+    # the old POST /sandboxes response fields so migrating to this endpoint is
+    # a straight rename — no field lookups to rewrite.
     return {
-        "sandbox_id": sandbox_id, "id": sandbox_id,
-        "status": "provisioned",
-        "volume_id": vol.id, "subpath": subpath, "provider": provider,
+        "id": sandbox_id, "sandbox_id": sandbox_id,
+        "provider": provider, "sandbox_ref": record.sandbox_ref,
+        "status": "running",
+        "root": record.root, "volume_id": vol.id, "subpath": subpath,
+        "listen_port": instance.port, "url": instance.url or None,
     }
 
 
@@ -1799,8 +1750,8 @@ async def start_sandbox_route(sandbox_id: str):
     try:
         url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type="claude")
     except Exception as e:
-        # 502 matches POST /sandboxes and POST /sandboxes/provision —
-        # provider failures are upstream faults, not server bugs (500).
+        # 502 matches POST /sandboxes — provider failures are upstream
+        # faults, not server bugs (500).
         raise HTTPException(502, f"failed to start sandbox: {e}")
 
     # Re-fetch the record: _ensure_sandbox_alive may have created a replacement
@@ -2964,7 +2915,7 @@ async def session_resume(session_id: str, request: Request):
     return {
         "session_id": state.session_id,
         "agent_id": state.agent_id,
-        # Same dual-key rationale as /sessions/quick: ``sandbox_id`` for the
+        # Same dual-key rationale as /sessions: ``sandbox_id`` for the
         # REST/client convention, ``current_sandbox_id`` to match the DB
         # column + /sessions/{id} GET response shape.
         "sandbox_id": state.sandbox_id,
@@ -2976,12 +2927,33 @@ async def session_resume(session_id: str, request: Request):
 
 @app.post("/sessions")
 async def sessions_create(request: Request):
-    """Create a new session bound to a volume (lazy sandbox provisioning).
+    """Create a session. Eager by default (provision sandbox + connect).
 
-    Body requires ``volume_id``; no sandbox is provisioned at this point.
-    Returns ``{id, agent_id, volume_id, current_sandbox_id: null, connected: false}``.
+    Body:
+      - ``provision`` (bool, default ``true``): when ``false``, skip sandbox
+        provisioning and return a session shell with ``current_sandbox_id =
+        null``. The sandbox materialises on the first downstream call that
+        needs one (``/sessions/{id}/start-sandbox`` or ``/message``).
+      - Every other field (``volume_id``, ``agent_id``, ``provider``,
+        ``config``, ``env``, ``secrets``, ``cwd``, ``root``, ``dockerfile``,
+        ``shared_mounts``) — see the dispatched-to helper for details.
+
+    Collapses the old ``POST /sessions`` (lazy) and ``POST /sessions``
+    (eager) into one endpoint with consistent naming.
     """
     data = await _json_body(request)
+    if data.get("provision", True):
+        return await _sessions_create_eager(data)
+    return await _sessions_create_lazy(data)
+
+
+async def _sessions_create_lazy(data: dict) -> dict:
+    """Create a session row only — no sandbox, no ACP, no scheduler.
+
+    Used when the UI wants to render a session shell before paying the
+    provisioning cost (daytona: ~15-30 s; local: ~2-3 s). Sandbox appears
+    on the first ``/sessions/{id}/start-sandbox`` or ``/message``.
+    """
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
@@ -3019,10 +2991,6 @@ async def sessions_create(request: Request):
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
     session_id = str(uuid.uuid4())
-    # Lazy mode: no sandbox provisioning here. current_sandbox_id = None.
-    # dockerfile + shared_mounts defer to whatever the eventual
-    # /sessions/{id}/start-sandbox or first /message supplies (currently
-    # they default to none; future: body of /sessions could set them).
     await upsert_session(
         session_id, agent_id, sandbox_id=None, inner_session_id=None,
         volume_id=volume_record.id,
@@ -3039,14 +3007,12 @@ async def sessions_create(request: Request):
     }
 
 
-@app.post("/sessions/quick")
-async def sessions_quick_create(request: Request):
-    """Create agent + provision sandbox + connect in one call.
+async def _sessions_create_eager(data: dict) -> dict:
+    """Create agent + provision sandbox + connect ACP in one call.
 
-    Body requires ``volume_id``.
-    Returns {agent_id, sandbox_id, session_id, connected: true}.
+    Returns ``{agent_id, sandbox_id, current_sandbox_id, session_id,
+    inner_session_id, connected: true}`` — ready to POST /message against.
     """
-    data = await _json_body(request)
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
@@ -3138,7 +3104,7 @@ async def sessions_quick_create(request: Request):
     ))
 
     async def _cleanup_and_raise(msg_fmt: str, e: Exception) -> None:
-        """Shared teardown for post-upsert failures in /sessions/quick."""
+        """Shared teardown for post-upsert failures in /sessions."""
         await delete_agent(agent_id)
         await delete_sandbox(sandbox_id)
         _INSTANCES.pop(sandbox_id, None)

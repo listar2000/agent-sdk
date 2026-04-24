@@ -117,7 +117,7 @@ async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
     body: dict = {"provider": provider, "agent_type": "claude"}
     if OAUTH_TOKEN:
         body["secrets"] = {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN}
-    resp = await client.post(f"{SERVER}/sessions/quick", json=body, timeout=180)
+    resp = await client.post(f"{SERVER}/sessions", json=body, timeout=180)
     assert resp.status_code == 200, f"quick session failed ({provider}): {resp.text}"
     return resp.json()
 

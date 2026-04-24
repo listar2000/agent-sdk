@@ -123,7 +123,7 @@ async def test_provision_storm_20_concurrent_quick_creates(client):
          patch("api.server.ensure_volume_supervisor",
                new=AsyncMock(return_value=None)):
         tasks = [
-            client.post("/sessions/quick", json={
+            client.post("/sessions", json={
                 "provider": "daytona",
                 "volume_id": "v_stress",
                 "agent_type": "claude",
@@ -201,7 +201,7 @@ async def test_provision_storm_circuit_breaker_cleans_up_agent(client):
          patch("api.server.ensure_volume_supervisor",
                new=AsyncMock(return_value=None)):
         tasks = [
-            client.post("/sessions/quick", json={
+            client.post("/sessions", json={
                 "provider": "daytona",
                 "volume_id": "v_stress",
                 "agent_type": "claude",

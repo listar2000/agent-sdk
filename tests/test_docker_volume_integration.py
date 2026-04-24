@@ -655,7 +655,7 @@ async def test_label_propagation_sessions_quick_endpoint():
                        new=AsyncMock(side_effect=fake_apply)), \
                  patch("api.server._start_session_tasks", MagicMock()):
                 async with AsyncClient(transport=transport, base_url="http://test") as c:
-                    r = await c.post("/sessions/quick", json={
+                    r = await c.post("/sessions", json={
                         "provider": "docker",
                         "volume_id": "v-lbl-q",
                         "agent_type": "claude",
