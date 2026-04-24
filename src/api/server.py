@@ -983,6 +983,30 @@ async def _install_skills_locally(skills) -> None:
         log.info("skill installed: %s", stdout.decode()[-200:].strip())
 
 
+async def _build_pre_start_commands(
+    config, provider: str, user_cmds: list[str] | None,
+) -> list[str] | None:
+    """Build the combined pre-start command list for provisioning.
+
+    Concatenates skill-install commands (from ``config.skills``) with
+    caller-supplied ``user_cmds``, preserving order so skills land first.
+    For the ``local`` provider we install skills on the host and return
+    ``None`` — the local sandbox shares HOME with the server, so skill
+    install runs once on the host and user commands there would execute
+    with server privileges (deliberately unsupported).
+    """
+    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
+    if provider == "local":
+        if skill_cmds:
+            try:
+                await _install_skills_locally(config.skills)
+            except Exception as e:
+                log.error("skill install failed, continuing without skills: %s", e)
+        return None
+    combined = skill_cmds + list(user_cmds or [])
+    return combined or None
+
+
 # ---------------------------------------------------------------------------
 # Request helpers
 # ---------------------------------------------------------------------------
@@ -1627,8 +1651,9 @@ async def create_sandbox(request: Request):
             f"provider {provider!r} does not match volume.provider {vol.provider!r}",
         )
 
-    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    pre_start_commands = skill_cmds + (data.get("pre_start_commands") or [])
+    pre_start_commands = await _build_pre_start_commands(
+        config, provider, data.get("pre_start_commands") or [],
+    )
 
     # Install supervisor on the volume first — docker/local need this before
     # create_sandbox; daytona tolerates it (fast-path on cache hit).
@@ -1648,7 +1673,7 @@ async def create_sandbox(request: Request):
             provider,
             volume_ref=vol.provider_ref, subpath=subpath,
             agent_type=agent_type, dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands or None,
+            pre_start_commands=pre_start_commands,
             root=root, sandbox_id=sandbox_id,
             shared_mounts=shared_mounts or None,
         )
@@ -3050,13 +3075,12 @@ async def _sessions_create_eager(data: dict) -> dict:
     # Install skills BEFORE starting the supervisor — claude-agent-acp
     # discovers skills at process startup. For local: install on host.
     # For docker/daytona: run install commands inside the sandbox before start.
-    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    if skill_cmds and provider == "local":
-        try:
-            await _install_skills_locally(config.skills)
-        except Exception as e:
-            log.error("skill install failed, continuing without skills: %s", e)
-            skill_cmds = []
+    # Caller-supplied ``pre_start_commands`` (e.g. hive's ``uv tool install
+    # hive-evolve``) are concatenated after skill install so dependencies
+    # build on top of a skill-ready image.
+    pre_start_commands = await _build_pre_start_commands(
+        config, provider, data.get("pre_start_commands") or []
+    )
 
     sandbox_id = str(uuid.uuid4())
     subpath = f"agents/{agent_id}"
@@ -3075,7 +3099,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         instance = await _provision_with_cache_retry(
             (volume_id, agent_type), create_instance,
             provider, agent_type, dockerfile=dockerfile,
-            pre_start_commands=skill_cmds if provider != "local" else None,
+            pre_start_commands=pre_start_commands,
             root=root, spawn_env=spawn_env,
             volume_id=volume_record.provider_ref, subpath=subpath,
             sandbox_id=sandbox_id, shared_mounts=shared_mounts or None,
