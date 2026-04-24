@@ -64,11 +64,13 @@ from .daytona import (
 from . import daytona as _daytona_mod
 from . import docker as _docker_mod
 from . import local as _local_mod
+from . import modal as _modal_mod
 
 _PROVIDER_MODS = {
     "daytona": _daytona_mod,
     "docker": _docker_mod,
     "local": _local_mod,
+    "modal": _modal_mod,
 }
 
 
@@ -185,6 +187,9 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
             return ExecResult(stdout=out, stderr="", exit_code=0, stdout_truncated=trunc)
         except asyncio.TimeoutError:
             return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
+
+    elif instance.provider == "modal":
+        return await _modal_mod.exec_in_sandbox(instance, cmd, timeout=timeout)
 
     else:
         raise ValueError(f"exec_in_instance: unsupported provider {instance.provider!r}")

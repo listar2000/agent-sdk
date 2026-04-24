@@ -26,7 +26,11 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Provider constants
 # ---------------------------------------------------------------------------
 
-PORT_BASED_PROVIDERS = frozenset({"local", "docker"})
+# Providers whose recovery model is "reprovision via provision_sandbox" rather
+# than "restart supervisor inside an existing sandbox" (daytona's model).
+# local/docker reach the supervisor on localhost:<port>; modal reaches it via
+# an HTTPS tunnel; all three are recreated from scratch on miss.
+PORT_BASED_PROVIDERS = frozenset({"local", "docker", "modal"})
 
 # Auth/credential env vars that the server MUST NOT leak into sandboxes via
 # its own environment. When a sandbox spawns a supervisor, any of these keys
@@ -83,6 +87,10 @@ _SUPERVISOR_REMOTE_PORT = 9100
 _PROVIDER_VOLUME_HOME: dict[str, str] = {
     "daytona": "/home/daytona",
     "docker": "/home/agent",
+    # Modal mounts the whole volume at /v and the sandbox's pre-start shell
+    # symlinks /home/agent -> /v/agents/<subpath>, mirroring Docker's layout
+    # so downstream code can treat the two providers identically.
+    "modal": "/home/agent",
 }
 
 

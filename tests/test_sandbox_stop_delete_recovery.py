@@ -75,6 +75,21 @@ def _has_daytona() -> bool:
     return bool(DAYTONA_API_KEY and OAUTH_TOKEN)
 
 
+def _has_modal() -> bool:
+    """Modal is available if the ``modal`` SDK imports and a profile is set.
+
+    ``modal setup`` writes ~/.modal.toml with workspace credentials; we rely
+    on that rather than an env var, matching how the provider itself looks
+    up the SDK handle.
+    """
+    try:
+        import modal  # noqa: F401
+    except ImportError:
+        return False
+    modal_toml = os.path.expanduser("~/.modal.toml")
+    return bool(OAUTH_TOKEN) and os.path.exists(modal_toml)
+
+
 def _has_server() -> bool:
     try:
         return httpx.get(f"{SERVER}/health", timeout=3).status_code == 200
@@ -90,6 +105,8 @@ def _require_provider(provider: str) -> None:
         pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
     if provider == "docker" and not _has_docker():
         pytest.skip("docker not available")
+    if provider == "modal" and not _has_modal():
+        pytest.skip("modal SDK + ~/.modal.toml + CLAUDE_CODE_OAUTH_TOKEN required")
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +205,13 @@ async def _external_stop(sandbox: dict) -> None:
         except (ValueError, ProcessLookupError, TypeError):
             pass
 
+    elif provider == "modal":
+        # Modal has no stop==pause: terminate is destructive. The server
+        # recovers via the SandboxMissingError path, same as external delete.
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        await loop.run_in_executor(None, sb.terminate)
+
     print(f"\n[test] externally stopped {provider} sandbox {ref[:20]}")
 
 
@@ -278,6 +302,11 @@ async def _external_delete(sandbox: dict) -> None:
             except FileNotFoundError:
                 pass
 
+    elif provider == "modal":
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        await loop.run_in_executor(None, sb.terminate)
+
     print(f"\n[test] externally deleted {provider} sandbox {ref[:20]}")
 
 
@@ -291,6 +320,10 @@ def _extract_kv(text: str, key: str) -> str | None:
     return m.group(1).strip("`\"'") if m else None
 
 
+# Modal is omitted here: its "stop" terminates the sandbox (no pause state),
+# so recovery always yields a fresh Modal object_id — the stable-ref invariant
+# simply doesn't apply. Session continuity is covered by
+# ``test_session_resume_after_stop[modal]`` instead.
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
 @pytest.mark.asyncio
 async def test_stop_sandbox_same_sandbox_after_restart(provider):
@@ -364,7 +397,7 @@ async def _read_marker(client, session_id, marker):
     )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_server_delete_persists_workspace(provider):
     """Server-mediated DELETE triggers a cold snapshot (filesystem_cache)
@@ -405,7 +438,7 @@ async def test_server_delete_persists_workspace(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_external_delete_preserves_agent_memory(provider):
     """Out-of-band delete (daytona dashboard / docker rm) bypasses the
@@ -456,7 +489,7 @@ async def _inner_sid_in_memory(client: httpx.AsyncClient, session_id: str) -> st
     return row.get("inner_session_id") if row else None
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_session_resume_after_stop(provider):
     """Full session resume: stop sandbox between turns, reconnect, session is
@@ -496,7 +529,7 @@ async def test_session_resume_after_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_session_resume_after_delete(provider):
     """Delete sandbox between turns → NEW sandbox provisioned → session/load
@@ -538,7 +571,7 @@ async def test_session_resume_after_delete(provider):
 # Test: midstream sandbox stop (UI-flow reproduction)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_session_survives_midstream_sandbox_stop(provider):
     """SSE upstream death triggers sandbox recovery — MUST resume, not reset.
@@ -645,7 +678,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_message_immediately_after_stop(provider):
     """Turn 1 → stop sandbox → turn 2 with NO sleep. Reproduces the race
@@ -715,7 +748,7 @@ async def test_message_immediately_after_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_message_after_stop_with_delay(provider):
     """Turn 1 → stop sandbox → wait ~4s → turn 2. User-reported repro.
@@ -885,7 +918,7 @@ async def _ask_on_stream(
             raise RuntimeError(f"agent error: {evt['text']}")
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_stop_then_message(provider):
     """UI-shape repro: one persistent /events connection spans turn1 →
@@ -938,7 +971,7 @@ async def test_persistent_sse_stop_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_external_delete_then_message(provider):
     """UI repro for an OUT-OF-BAND sandbox delete (Daytona dashboard, ``docker rm``,
@@ -982,7 +1015,7 @@ async def test_persistent_sse_external_delete_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_delete_sandbox_then_message(provider):
     """UI repro for the `DELETE /sandboxes/{id}` + persistent /events flow.
