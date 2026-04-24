@@ -7,12 +7,40 @@ import shlex
 import time
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 from .. import load_dotenv
 
 log = logging.getLogger(__name__)
 
 load_dotenv()
+
+
+class _ExecResult(NamedTuple):
+    stdout: str
+    stderr: str
+    exit_code: int | None
+
+    @property
+    def ok(self) -> bool:
+        # exit_code None = SDK didn't report it → treat as OK, log warning elsewhere
+        return self.exit_code in (None, 0)
+
+
+def _run_sandbox_exec(sandbox, cmd: str, timeout: int = 120) -> "_ExecResult":
+    """Run ``cmd`` in ``sandbox`` and return stdout, stderr, and exit_code.
+
+    Defensive against SDK versions that may not expose all fields.
+    Callers that want tolerant behaviour for a command that may fail should
+    wrap their command with ``|| true`` so the shell always exits 0.
+    """
+    r = sandbox.process.exec(cmd, timeout=timeout)
+    return _ExecResult(
+        stdout=getattr(r, "result", "") or "",
+        stderr=getattr(r, "stderr", "") or "",
+        exit_code=getattr(r, "exit_code", None),
+    )
+
 
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
@@ -91,8 +119,7 @@ async def start_supervisor_in_sandbox(
                  sid8, phase, dt)
 
     def _exec(cmd: str, timeout: int = 120) -> str:
-        r = sandbox.process.exec(cmd, timeout=timeout)
-        return (r.result if hasattr(r, "result") else str(r)) or ""
+        return _run_sandbox_exec(sandbox, cmd, timeout=timeout).stdout
 
     vol_tarball = f"{_SUPERVISOR_VOLUME_DIR}/deps.tar.gz"
     vol_supervisor = f"{_SUPERVISOR_VOLUME_DIR}/supervisor.js"
@@ -232,10 +259,10 @@ async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
     """Kill a supervisor process by port inside a Daytona sandbox."""
     loop = asyncio.get_running_loop()
     try:
-        def _exec(cmd: str) -> str:
-            r = sandbox.process.exec(cmd, timeout=10)
-            return (r.result if hasattr(r, "result") else str(r)) or ""
-        await loop.run_in_executor(None, lambda: _exec(f"fuser -k {port}/tcp 2>/dev/null || true"))
+        await loop.run_in_executor(
+            None,
+            lambda: _run_sandbox_exec(sandbox, f"fuser -k {port}/tcp 2>/dev/null || true", timeout=10),
+        )
     except Exception as e:
         log.warning("kill_supervisor_in_sandbox port=%d failed: %s", port, e)
 
@@ -305,15 +332,33 @@ async def provision_daytona_sandbox(
         ))
 
     try:
-        def _exec(cmd: str, timeout: int = 120) -> str:
-            r = sandbox.process.exec(cmd, timeout=timeout)
-            return (r.result if hasattr(r, "result") else str(r)) or ""
-
-        # Run pre-start commands (skills, CLI install, etc.)
+        # Run pre-start commands (skills, CLI install, etc.).
+        # On non-zero exit the command raises so provisioning fails loudly.
+        # Callers that want tolerant behaviour should wrap their command with
+        # ``|| true`` so the shell always exits 0.
         if pre_start_commands:
             for cmd in pre_start_commands:
                 log.info("provision pre-start: %s", cmd)
-                await loop.run_in_executor(None, lambda c=cmd: _exec(c, timeout=120))
+                result = await loop.run_in_executor(
+                    None, lambda c=cmd: _run_sandbox_exec(sandbox, c, timeout=120),
+                )
+                if result.exit_code is None:
+                    log.warning(
+                        "pre-start command ran but Daytona SDK returned no exit_code "
+                        "— can't confirm success: %s", cmd,
+                    )
+                elif result.exit_code != 0:
+                    snippet = (result.stderr or result.stdout or "")[-500:]
+                    log.error(
+                        "pre-start command failed (exit=%s): %s\n---stderr---\n%s",
+                        result.exit_code, cmd, snippet,
+                    )
+                    raise RuntimeError(
+                        f"pre_start_commands failed on Daytona sandbox "
+                        f"(exit={result.exit_code}): {cmd!r}\n{snippet}"
+                    )
+                else:
+                    log.info("provision pre-start OK (exit=0): %s", cmd)
 
         log.info("sandbox provisioned: %s (no supervisor yet)", sandbox.id[:16])
         return ProviderInstance(
@@ -599,11 +644,10 @@ async def _init_volume_dirs(volume_ref: str) -> None:
         ))
 
     try:
-        def _exec(cmd: str, timeout: int = 30) -> str:
-            r = sb.process.exec(cmd, timeout=timeout)
-            return (r.result if hasattr(r, "result") else str(r)) or ""
-
-        await loop.run_in_executor(None, lambda: _exec("mkdir -p /v/shared /v/system/supervisor"))
+        await loop.run_in_executor(
+            None,
+            lambda: _run_sandbox_exec(sb, "mkdir -p /v/shared /v/system/supervisor", timeout=30),
+        )
         log.info("volume %s: initialized shared/ and system/supervisor/ dirs", volume_ref)
     finally:
         try:
@@ -768,8 +812,7 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
         npm_spec = _ACP_NPM_SPECS[agent_type]
 
         def _exec(cmd: str, timeout: int | None = 60) -> str:
-            r = sb.process.exec(cmd, timeout=timeout)
-            return (r.result if hasattr(r, "result") else str(r)) or ""
+            return _run_sandbox_exec(sb, cmd, timeout=timeout).stdout
 
         # npm install to local ephemeral FS (fast SSD), pack to a tarball,
         # place it on the volume under the staging dir.  Every shell step
