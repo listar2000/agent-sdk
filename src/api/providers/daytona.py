@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import shlex
+import time
 import uuid
 from pathlib import Path
 
@@ -72,34 +73,48 @@ async def start_supervisor_in_sandbox(
 
     Falls back to the legacy /tmp install path when no volume cache exists.
     Returns the signed preview URL for this supervisor.
+
+    Emits ``[BENCH] daytona.start_supervisor phase=<name> s=<seconds>`` log
+    lines for each critical-path phase; grep-friendly for recovery-time
+    benchmarks (scripts/bench_recovery.py).
     """
     bin_name = _acp_bin_name(agent_type)
     loop = asyncio.get_running_loop()
+    sid8 = sandbox.id[:8] if sandbox.id else "?"
+    total_t0 = time.monotonic()
+    phases: list[tuple[str, float]] = []
+
+    def _bench(phase: str, t0: float) -> None:
+        dt = time.monotonic() - t0
+        phases.append((phase, dt))
+        log.info("[BENCH] daytona.start_supervisor sandbox=%s phase=%s s=%.3f",
+                 sid8, phase, dt)
 
     def _exec(cmd: str, timeout: int = 120) -> str:
         r = sandbox.process.exec(cmd, timeout=timeout)
         return (r.result if hasattr(r, "result") else str(r)) or ""
 
-    # Check for Phase-2 volume cache: a single deps.tar.gz written by
-    # install_supervisor.  If present, extract to a per-port local dir so
-    # we never write node_modules to the slow network volume.
     vol_tarball = f"{_SUPERVISOR_VOLUME_DIR}/deps.tar.gz"
     vol_supervisor = f"{_SUPERVISOR_VOLUME_DIR}/supervisor.js"
     local_work = f"/tmp/sup-work-{port}"
 
-    # Daytona S3-backed volumes have FUSE write-to-read visibility lag
-    # (seconds), so a session sandbox created ~immediately after
-    # install_supervisor may not yet see /opt/supervisor/deps.tar.gz.
-    # Retry a handful of times before falling back to the legacy /tmp
-    # install path.
+    # (1) Cache-visibility check. S3-backed FUSE on daytona has seconds-level
+    # write-to-read propagation, so a freshly-installed supervisor may not
+    # be visible immediately. Exponential backoff instead of the old 10×1s:
+    # first check is instant for the hot path (install ran long ago); slow
+    # path still has ~6s total before giving up.
+    t0 = time.monotonic()
+    backoffs = [0.0, 0.2, 0.4, 0.8, 1.6, 3.2]  # sum ≈ 6.2 s
     check_result = "no"
-    for _attempt in range(10):
+    for delay in backoffs:
+        if delay > 0:
+            await asyncio.sleep(delay)
         check_result = await loop.run_in_executor(
             None, lambda: _exec(f"test -f {vol_tarball} && echo yes || echo no")
         )
         if check_result.strip() == "yes":
             break
-        await asyncio.sleep(1)
+    _bench("cache_check", t0)
 
     if check_result.strip() != "yes":
         diag = await loop.run_in_executor(
@@ -115,9 +130,11 @@ async def start_supervisor_in_sandbox(
         )
 
     if check_result.strip() == "yes":
-        # Volume-cached mode: extract deps tarball to local ephemeral dir.
-        # Reading one archive from the volume is fast; we never write
-        # node_modules there.
+        # (2) Volume-cached mode: extract deps tarball to local ephemeral dir
+        # AND resolve the ACP bin symlink in the same exec — one fewer
+        # sandbox.process.exec round-trip (~100-300ms savings). Emit the
+        # resolved path on a parseable ``ACP_BIN=...`` line.
+        t0 = time.monotonic()
         extract_out = await loop.run_in_executor(None, lambda: _exec(
             f"set -e && "
             f"mkdir -p {local_work} && "
@@ -125,45 +142,42 @@ async def start_supervisor_in_sandbox(
             # reads block the tar streaming decode if a chunk hasn't been
             # fetched yet and show up as silent tar data corruption.
             f"cp {vol_tarball} /tmp/deps-{port}.tar.gz && "
-            f"ls -l /tmp/deps-{port}.tar.gz && "
-            f"echo '--- tarball content sample ---' && "
-            f"tar -tzf /tmp/deps-{port}.tar.gz | grep -c 'node_modules/.bin' && "
             f"tar -C {local_work} -xzf /tmp/deps-{port}.tar.gz && "
             f"cp {vol_supervisor} {local_work}/supervisor.js && "
             f"rm -f /tmp/deps-{port}.tar.gz && "
-            f"echo '--- extracted .bin/ ---' && "
-            f"ls -la {local_work}/node_modules/.bin/{bin_name} 2>&1 && "
-            f"target=$(readlink -f {local_work}/node_modules/.bin/{bin_name}) && "
-            f"echo \"target=$target\" && "
-            f"ls -la \"$target\" && "
-            f"head -1 \"$target\" && "
             # npm install should set +x on bin entries — but tar sometimes
             # strips it when packing + extracting across hosts. Re-apply.
+            f"target=$(readlink -f {local_work}/node_modules/.bin/{bin_name}) && "
             f"chmod +x \"$target\" && "
-            f"test -x \"$target\" && echo 'bin executable' || echo 'bin NOT executable'",
+            f"echo \"ACP_BIN=$target\"",
             120,
         ))
-        log.info("start_supervisor_in_sandbox: volume cache extract for sandbox %s:\n%s",
-                 sandbox.id[:16], extract_out)
+        _bench("extract", t0)
         sup_dir = local_work
-        log.info("start_supervisor_in_sandbox: using volume cache → %s (port %d, sandbox %s)",
-                 local_work, port, sandbox.id[:16])
+        # Parse ACP_BIN=... from the extract output (last line of set -e chain).
+        acp_bin = f"{sup_dir}/node_modules/.bin/{bin_name}"
+        for line in (extract_out or "").splitlines():
+            if line.startswith("ACP_BIN="):
+                acp_bin = line[len("ACP_BIN="):].strip() or acp_bin
+                break
+        log.info("start_supervisor_in_sandbox: using volume cache → %s "
+                 "(port %d, sandbox %s, acp_bin=%s)",
+                 local_work, port, sandbox.id[:16], acp_bin)
     else:
         # Legacy path: deps are installed directly in the sandbox.
         sup_dir = _SUPERVISOR_REMOTE_DIR
+        acp_bin = f"{sup_dir}/node_modules/.bin/{bin_name}"
+        # Separate round-trip only on the legacy fallback.
+        t0 = time.monotonic()
+        resolved = await loop.run_in_executor(None, lambda: _exec(
+            f"readlink -f {sup_dir}/node_modules/.bin/{bin_name}"
+        ))
+        _bench("symlink_resolve_legacy", t0)
+        if resolved.strip():
+            acp_bin = resolved.strip()
         log.info("start_supervisor_in_sandbox: using legacy path %s (port %d, sandbox %s)",
                  _SUPERVISOR_REMOTE_DIR, port, sandbox.id[:16])
 
-    # Resolve the symlink target explicitly. node.spawn() on a symlinked
-    # script occasionally surfaces ENOENT on the symlink path even when
-    # the target resolves fine — the node runtime's execve loop doesn't
-    # always follow symlinks for script-with-shebang reliably. Passing
-    # the concrete index.js target sidesteps the class of bugs.
-    acp_bin_resolved = await loop.run_in_executor(None, lambda: _exec(
-        f"readlink -f {sup_dir}/node_modules/.bin/{bin_name}"
-    ))
-    acp_bin = (acp_bin_resolved.strip()
-               or f"{sup_dir}/node_modules/.bin/{bin_name}")
     env_prefix = _build_env_prefix(spawn_env)
     log_file = f"{sup_dir}/sup-{port}.log"
     supervisor_argv = build_supervisor_argv(
@@ -183,20 +197,33 @@ async def start_supervisor_in_sandbox(
         f"> {log_file} 2>&1 </dev/null & echo started"
     )
     start_cmd = f"sh -c {shlex.quote(inner)}"
-    await loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10))
-    # _wait_for_health already polls with backoff; no redundant pre-sleep.
 
-    signed = await loop.run_in_executor(
-        None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
+    # (3) Parallelize the detached-spawn exec with the signed-URL mint.
+    # The URL doesn't depend on whether node has booted yet, and the
+    # spawn exec returns as soon as setsid forks — both are in-flight
+    # network calls that we don't need to serialize.
+    t0 = time.monotonic()
+    _, signed = await asyncio.gather(
+        loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10)),
+        loop.run_in_executor(
+            None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
+        ),
     )
+    _bench("spawn+mint_url", t0)
     url = signed.url.rstrip("/")
 
-    if not await _wait_for_health(url, max_retries=20, interval=1):
+    t0 = time.monotonic()
+    healthy = await _wait_for_health(url, max_retries=20, interval=1)
+    _bench("health_wait", t0)
+    if not healthy:
         log_out = await loop.run_in_executor(None, lambda: _exec(f"tail -40 {log_file} 2>&1"))
         raise RuntimeError(
             f"supervisor on port {port} in sandbox {sandbox.id} failed health check; log:\n{log_out[:800]}"
         )
 
+    total_dt = time.monotonic() - total_t0
+    log.info("[BENCH] daytona.start_supervisor sandbox=%s TOTAL s=%.3f (%s)",
+             sid8, total_dt, ", ".join(f"{p}={d:.2f}" for p, d in phases))
     log.info("supervisor on port %d ready: %s (sandbox %s, dir %s)", port, url[:60], sandbox.id[:16], sup_dir)
     return url
 
