@@ -2214,6 +2214,27 @@ async def _replace_sandbox_inplace(
         )
     except Exception as e:
         raise RuntimeError(f"Failed to create replacement daytona sandbox: {e}")
+    # Daytona ``create_sandbox`` does NOT start the supervisor (by design —
+    # the agent HOME mount + volume cache extraction happen later). Without
+    # this step the returned instance has url="" and the rebind path builds
+    # an AcpClient with an empty base URL, which blows up on the very next
+    # httpx call ("Request URL is missing an 'http://' or 'https://'
+    # protocol"). See test_persistent_sse_external_delete_then_message.
+    if not inst.url:
+        # Daytona supervisor uses a fixed in-sandbox port (9100) — the
+        # Daytona signed preview maps host URLs to container ports, so
+        # every supervisor we spawn inside any daytona sandbox listens on
+        # this same port. Matches restart_daytona_supervisor's constant.
+        try:
+            inst_url = await _providers_mod.ensure_supervisor_url(
+                "daytona", inst, agent_type=agent_type,
+                root=rec.root, spawn_env=spawn_env, port=9100,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to start supervisor on replacement daytona sandbox: {e}"
+            )
+        inst.url = inst_url
     return inst, True
 
 
