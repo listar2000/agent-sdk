@@ -16,6 +16,7 @@ from .errors import (
     SandboxError, AgentBusyError, AgentTimeoutError, PromptError, StreamError,
 )
 from .persist import SessionRecord, SqliteSessionDriver
+from .server_client import ServerClient
 
 __all__ = [
     "__version__",
@@ -31,4 +32,5 @@ __all__ = [
     "SqliteSessionDriver",
     "Client",
     "Volume",
+    "ServerClient",
 ]
