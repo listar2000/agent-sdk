@@ -973,9 +973,18 @@ async def test_persistent_sse_stop_then_message(provider):
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
+@pytest.mark.timeout(240)
 async def test_persistent_sse_external_delete_then_message(provider):
     """UI repro for an OUT-OF-BAND sandbox delete (Daytona dashboard, ``docker rm``,
     ``kill -9``) with a persistent /events stream held open.
+
+    Individual timeout bumped to 240 s. The daytona path does a full
+    provision-replacement-sandbox + start-supervisor dance on turn 2
+    (see ``_replace_sandbox_inplace`` + ``ensure_supervisor_url``), and
+    with daytona-side latency variance the critical path (turn 1 LLM +
+    external-delete poll + SSE retry ladder + fresh provisioning +
+    session/load + turn 2 LLM) can hit ~100 s on a slow day. 120 s was
+    tight; 240 s matches the suite-wide ``--timeout``.
 
     Different from test_persistent_sse_delete_sandbox_then_message, this
     one does NOT go through the server's DELETE endpoint — the server
