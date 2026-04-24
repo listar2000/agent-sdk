@@ -42,7 +42,7 @@ POST /sessions
 
 Single endpoint for session creation. Defaults to **eager**: provisions a sandbox, connects ACP, starts the scheduler + SSE reader. Pass `"provision": false` in the body for the **lazy** flow — session row only, sandbox materialises on the first `/message`, `/start-sandbox`, or `/resume`.
 
-Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win. `volume_id` is optional — if omitted, a per-provider default volume is created (or reused) transparently.
+Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win. Provisioning knobs — `shared_mounts`, `pre_start_commands`, `root`, `volume_id` — are top-level only. `volume_id` is optional; if omitted, a per-provider default volume is created (or reused) transparently.
 
 ```json
 {
@@ -55,9 +55,13 @@ Config fields may be passed either at the top level (`agent_type`, `model`, `pro
   "prompt": "You are a helpful agent.",
   "tools": ["Bash", "Read", "Write"],
   "mcp_servers": {"name": {"type": "local", "command": "...", "args": []}},
-  "skills": ["rllm-org/hive#staging", "vercel-labs/agent-skills"]
+  "skills": ["rllm-org/hive#staging", "vercel-labs/agent-skills"],
+  "shared_mounts": ["shared-data"],
+  "pre_start_commands": ["uv tool install hive-evolve"]
 }
 ```
+
+`pre_start_commands` are shell commands that run inside the sandbox before the ACP supervisor starts — use them to install CLIs, lay down config files, etc. For `docker`/`daytona` they run inside the sandbox; for `local` they are ignored (the server host already runs `skills` install natively, and local has no sandbox boundary to run caller-supplied commands in safely). The effective list passed to the provider is `skills_install_commands + caller_pre_start_commands` in that order. Currently applied on the initial sandbox only — replacement sandboxes (external delete, idle-stop recovery) do not re-run them; persist anything you need durably by baking it into the volume or the sandbox image.
 
 Returns (eager):
 ```json
