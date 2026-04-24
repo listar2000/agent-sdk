@@ -3,7 +3,7 @@
 This is the **operator** client. Use it when you are a service (hive,
 admin dashboard, bench script) that creates, destroys, and introspects
 OTHER people's sessions. It is stateless — you pass ``session_id`` /
-``sandbox_id`` / ``volume_id`` in on every call; the client owns no
+``volume_id`` in on every call; the client owns no
 per-session state.
 
 If you are a user building an app that talks to YOUR OWN session, use
@@ -51,7 +51,6 @@ class ServerClient:
         async with ServerClient("https://agent-sdk.example.com", token="...") as sc:
             s = await sc.create_session(provider="daytona", model="claude-sonnet-4-6")
             await sc.send_message(s["session_id"], "hello")
-            await sc.destroy_sandbox(s["sandbox_id"])
 
     ``token`` is attached as ``Authorization: Bearer <token>`` to every
     request. Today agent-sdk doesn't gate routes on this, but sending it
@@ -110,26 +109,6 @@ class ServerClient:
         if resp.headers.get("content-type", "").startswith("application/json"):
             return resp.json()
         return resp.text
-
-    # ------------------------------------------------------------------
-    # Agents
-    # ------------------------------------------------------------------
-
-    async def create_agent(self, **body: Any) -> dict[str, Any]:
-        """``POST /agents`` — register an agent config (no sandbox)."""
-        return await self._json("POST", "/agents", json=body)
-
-    async def list_agents(self) -> list[dict[str, Any]]:
-        """``GET /agents``."""
-        return await self._json("GET", "/agents")
-
-    async def get_agent(self, agent_id: str) -> dict[str, Any]:
-        """``GET /agents/{id}``."""
-        return await self._json("GET", f"/agents/{agent_id}")
-
-    async def delete_agent(self, agent_id: str) -> None:
-        """``DELETE /agents/{id}``."""
-        await self._json("DELETE", f"/agents/{agent_id}")
 
     # ------------------------------------------------------------------
     # Volumes
@@ -212,125 +191,6 @@ class ServerClient:
         )
 
     # ------------------------------------------------------------------
-    # Sandboxes
-    # ------------------------------------------------------------------
-
-    async def create_sandbox(self, **body: Any) -> dict[str, Any]:
-        """``POST /sandboxes`` — provision a sandbox + start supervisor."""
-        return await self._json("POST", "/sandboxes", json=body)
-
-    async def list_sandboxes(self) -> list[dict[str, Any]]:
-        """``GET /sandboxes``."""
-        return await self._json("GET", "/sandboxes")
-
-    async def get_sandbox(self, sandbox_id: str) -> dict[str, Any]:
-        """``GET /sandboxes/{id}``."""
-        return await self._json("GET", f"/sandboxes/{sandbox_id}")
-
-    async def destroy_sandbox(self, sandbox_id: str) -> None:
-        """``DELETE /sandboxes/{id}`` (sessions survive with
-        ``current_sandbox_id = NULL``)."""
-        await self._json("DELETE", f"/sandboxes/{sandbox_id}")
-
-    async def rotate_sandbox_creds(
-        self, sandbox_id: str, oauth_token: str | None
-    ) -> None:
-        """``PUT /sandboxes/{id}/creds`` — update stored user creds.
-
-        NOT YET IMPLEMENTED SERVER-SIDE. Raises so callers don't
-        silently no-op the way hive's old wrapper did (which hit a
-        404'ing URL and swallowed the error). When agent-sdk adds the
-        route, replace this body with the real httpx call.
-        """
-        raise NotImplementedError(
-            "PUT /sandboxes/{id}/creds is not implemented in agent-sdk; "
-            "cred rotation must be handled some other way until it ships"
-        )
-
-    async def stop_sandbox(self, sandbox_id: str) -> dict[str, Any]:
-        """``POST /sandboxes/{id}/stop`` — volume data preserved."""
-        return await self._json("POST", f"/sandboxes/{sandbox_id}/stop")
-
-    async def start_sandbox(self, sandbox_id: str) -> dict[str, Any]:
-        """``POST /sandboxes/{id}/start`` — resume a stopped sandbox."""
-        return await self._json("POST", f"/sandboxes/{sandbox_id}/start")
-
-    async def snapshot_sandbox(self, sandbox_id: str) -> dict[str, Any]:
-        """``POST /sandboxes/{id}/snapshot``."""
-        return await self._json("POST", f"/sandboxes/{sandbox_id}/snapshot")
-
-    # Sandbox filesystem
-
-    async def sandbox_file_tree(self, sandbox_id: str) -> dict[str, Any]:
-        """``GET /sandboxes/{id}/files/tree``."""
-        return await self._json("GET", f"/sandboxes/{sandbox_id}/files/tree")
-
-    async def sandbox_file_read(
-        self, sandbox_id: str, path: str
-    ) -> dict[str, Any]:
-        """``GET /sandboxes/{id}/files/read?path=...``."""
-        return await self._json(
-            "GET", f"/sandboxes/{sandbox_id}/files/read", params={"path": path},
-        )
-
-    async def sandbox_file_edit(
-        self,
-        sandbox_id: str,
-        path: str,
-        *,
-        old_string: str,
-        new_string: str,
-        replace_all: bool = False,
-    ) -> dict[str, Any]:
-        """``POST /sandboxes/{id}/files/edit``."""
-        body: dict[str, Any] = {
-            "path": path,
-            "old_string": old_string,
-            "new_string": new_string,
-        }
-        if replace_all:
-            body["replace_all"] = True
-        return await self._json(
-            "POST", f"/sandboxes/{sandbox_id}/files/edit", json=body,
-        )
-
-    async def sandbox_file_upload(
-        self, sandbox_id: str, path: str, content_b64: str
-    ) -> dict[str, Any]:
-        """``POST /sandboxes/{id}/files/upload`` — body: ``{path, content (b64)}``."""
-        return await self._json(
-            "POST", f"/sandboxes/{sandbox_id}/files/upload",
-            json={"path": path, "content": content_b64},
-        )
-
-    async def sandbox_file_delete(
-        self, sandbox_id: str, path: str
-    ) -> dict[str, Any]:
-        """``POST /sandboxes/{id}/files/delete``."""
-        return await self._json(
-            "POST", f"/sandboxes/{sandbox_id}/files/delete", json={"path": path},
-        )
-
-    async def sandbox_file_rename(
-        self, sandbox_id: str, path: str, new_path: str
-    ) -> dict[str, Any]:
-        """``POST /sandboxes/{id}/files/rename``."""
-        return await self._json(
-            "POST", f"/sandboxes/{sandbox_id}/files/rename",
-            json={"path": path, "new_path": new_path},
-        )
-
-    async def sandbox_file_download(
-        self, sandbox_id: str, path: str
-    ) -> bytes:
-        """``GET /sandboxes/{id}/files/download?path=...`` — raw bytes."""
-        resp = await self._http.get(
-            f"/sandboxes/{sandbox_id}/files/download", params={"path": path},
-        )
-        _raise_for_status(resp)
-        return resp.content
-
-    # ------------------------------------------------------------------
     # Sessions — lifecycle
     # ------------------------------------------------------------------
 
@@ -366,18 +226,6 @@ class ServerClient:
         if isinstance(data, dict):
             return data.get("events") or []
         return data or []
-
-    async def resume_session(
-        self, session_id: str, **body: Any
-    ) -> dict[str, Any]:
-        """``POST /sessions/{id}/resume`` — auto-heals stopped/missing sandbox.
-
-        Body may carry ``env`` and ``secrets`` (PATCH semantics). Omit
-        both for the common "just wake it up" call.
-        """
-        return await self._json(
-            "POST", f"/sessions/{session_id}/resume", json=body or None,
-        )
 
     async def delete_session(self, session_id: str) -> None:
         """``DELETE /sessions/{id}`` — remove session row + cleanup.
@@ -415,19 +263,6 @@ class ServerClient:
         """``POST /sessions/{id}/config`` — patch runtime fields."""
         return await self._json(
             "POST", f"/sessions/{session_id}/config", json=config,
-        )
-
-    async def session_sandbox_exec(
-        self,
-        session_id: str,
-        command: str,
-        *,
-        timeout: int = 120,
-    ) -> dict[str, Any]:
-        """``POST /sessions/{id}/sandbox/exec``."""
-        return await self._json(
-            "POST", f"/sessions/{session_id}/sandbox/exec",
-            json={"command": command, "timeout": timeout},
         )
 
     # Session filesystem (sandbox identity hidden — session_id addresses
@@ -501,29 +336,6 @@ class ServerClient:
         )
         _raise_for_status(resp)
         return resp.content
-
-    # ------------------------------------------------------------------
-    # Sessions — sandbox lifecycle (from the session's perspective)
-    # ------------------------------------------------------------------
-
-    async def start_session_sandbox(self, session_id: str) -> dict[str, Any]:
-        """``POST /sessions/{id}/start-sandbox``."""
-        return await self._json(
-            "POST", f"/sessions/{session_id}/start-sandbox",
-        )
-
-    async def stop_session_sandbox(self, session_id: str) -> None:
-        """``POST /sessions/{id}/stop-sandbox`` (204)."""
-        await self._json("POST", f"/sessions/{session_id}/stop-sandbox")
-
-    async def reset_session_sandbox(
-        self, session_id: str, **body: Any
-    ) -> dict[str, Any]:
-        """``POST /sessions/{id}/reset-sandbox`` — tear down + re-provision."""
-        return await self._json(
-            "POST", f"/sessions/{session_id}/reset-sandbox",
-            json=body or None,
-        )
 
     # ------------------------------------------------------------------
     # Sessions — events (SSE)
