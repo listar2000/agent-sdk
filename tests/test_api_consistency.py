@@ -241,6 +241,58 @@ async def test_post_sessions_eager_missing_volume_id_uses_default(client):
 
 
 # ---------------------------------------------------------------------------
+# /sessions and /sandboxes both advertise ``pre_start_commands`` via
+# create_instance; both must forward it through to the provider. Earlier
+# /sessions silently dropped the caller's value and only forwarded skill
+# install commands — that's the bug this pins.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_sessions_forwards_pre_start_commands(client):
+    """POST /sessions must forward the caller's ``pre_start_commands`` to
+    the provider (merged with skill install commands), not drop them."""
+    from unittest.mock import patch, AsyncMock
+    from api.models import VolumeRecord
+    from api.providers._shared import ProviderInstance
+
+    v = VolumeRecord(id="vol_pre_start", name="pre-start-test",
+                     provider="daytona", provider_ref="dt-pre-start")
+    await dbmod.upsert_volume(v)
+
+    captured = {}
+    async def fake_create_instance(*a, **kw):
+        captured.update(kw)
+        return ProviderInstance(
+            provider="daytona", url="http://127.0.0.1:9101",
+            root="/home/daytona", sandbox_id="dt-sbx-ps", port=9101,
+        )
+
+    with patch("api.server.ensure_volume_supervisor",
+               new=AsyncMock(return_value=None)), \
+         patch("api.server.create_instance",
+               new=AsyncMock(side_effect=fake_create_instance)), \
+         patch("api.server.AcpClient"), \
+         patch("api.server._start_session_tasks"):
+        r = await client.post("/sessions", json={
+            "name": "ps",
+            "provider": "daytona",
+            "volume_id": v.id,
+            "skills": ["rllm-org/hive#staging"],
+            "pre_start_commands": ['uv tool install hive-evolve'],
+        })
+
+    assert r.status_code in (200, 502), r.text  # 502 if a later mock is missing
+    pre_start = captured.get("pre_start_commands") or []
+    assert any("uv tool install hive-evolve" in c for c in pre_start), (
+        f"caller's pre_start_commands dropped; got {pre_start!r}"
+    )
+    assert any("skills add" in c for c in pre_start), (
+        f"skill install commands missing; got {pre_start!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Session-recovery edge cases migrated from the deleted test_session_recovery.py.
 # The rest of that file was mock-tautology ("did the mock get called?") that
 # golden-suite recovery tests already exercise end-to-end. These two are

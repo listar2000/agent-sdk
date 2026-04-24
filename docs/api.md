@@ -42,7 +42,7 @@ POST /sessions
 
 Single endpoint for session creation. Defaults to **eager**: provisions a sandbox, connects ACP, starts the scheduler + SSE reader. Pass `"provision": false` in the body for the **lazy** flow — session row only, sandbox materialises on the first `/message`, `/start-sandbox`, or `/resume`.
 
-Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win. `volume_id` is optional — if omitted, a per-provider default volume is created (or reused) transparently.
+Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win. Provisioning knobs — `shared_mounts`, `pre_start_commands`, `root`, `volume_id` — are top-level only. `volume_id` is optional; if omitted, a per-provider default volume is created (or reused) transparently.
 
 ```json
 {
@@ -55,9 +55,13 @@ Config fields may be passed either at the top level (`agent_type`, `model`, `pro
   "prompt": "You are a helpful agent.",
   "tools": ["Bash", "Read", "Write"],
   "mcp_servers": {"name": {"type": "local", "command": "...", "args": []}},
-  "skills": ["rllm-org/hive#staging", "vercel-labs/agent-skills"]
+  "skills": ["rllm-org/hive#staging", "vercel-labs/agent-skills"],
+  "shared_mounts": ["shared-data"],
+  "pre_start_commands": ["uv tool install hive-evolve"]
 }
 ```
+
+`pre_start_commands` are shell commands that run inside the sandbox before the ACP supervisor starts — use them to install CLIs, lay down config files, etc. For `docker`/`daytona` they run inside the sandbox; for `local` they are ignored (the server host already runs `skills` install natively, and local has no sandbox boundary to run caller-supplied commands in safely). The effective list passed to the provider is `skills_install_commands + caller_pre_start_commands` in that order. Currently applied on the initial sandbox only — replacement sandboxes (external delete, idle-stop recovery) do not re-run them; persist anything you need durably by baking it into the volume or the sandbox image.
 
 Returns (eager):
 ```json
@@ -495,3 +499,67 @@ async with agent.events() as stream:
 ```
 
 Multiple concurrent `events()` contexts are allowed; each gets a fan-out copy. On connection failure, the generator raises `StreamError`.
+
+## Server-side client (operator persona)
+
+`agent_sdk.ServerClient` is a thin async wrapper over every REST route on this server. Use it from services that create, destroy, and introspect OTHER people's sessions — e.g. hive's workspace-agent bootstrap, `scripts/bench_recovery.py`, admin tooling. `Agent` stays the right choice when your code IS the user talking to its own session; `ServerClient` is the right choice when your code is the operator.
+
+```python
+from agent_sdk import ServerClient
+
+async with ServerClient(
+    base_url="https://agent-sdk.example.com",
+    token="optional-admin-bearer",
+) as sc:
+    session = await sc.create_session(provider="daytona", model="claude-sonnet-4-6")
+    await sc.send_message(session["session_id"], "hello")
+    await sc.destroy_sandbox(session["sandbox_id"])
+```
+
+### Design
+
+- **Stateless w.r.t. resources.** No per-session / per-sandbox / per-volume state lives on the instance. Every method takes the IDs it acts on as parameters — a single instance is safe to share across thousands of concurrent operations against unrelated sessions.
+- **Stateful only for transport.** The instance holds one `httpx.AsyncClient` (connection pool + bearer header). No locks, no retries, no idempotency keys.
+- **Flat surface, one method per endpoint.** No sub-namespaces. The method name mirrors the REST path; the body is pass-through. Adding a new route = adding one method.
+- **Shared error mapping with `Agent`.** HTTP ≥400 responses raise `httpx.HTTPStatusError` with the server's `{"error": ...}` body attached — same as the user-facing `Agent` class.
+- **Dependency-injection hook.** `ServerClient(base_url, http_client=...)` accepts a pre-built `httpx.AsyncClient` so callers with custom proxies, mock transports, or test harnesses don't have to subclass.
+
+### Method list
+
+Grouped by resource. Bodies are documented under the corresponding REST endpoint in the sections above.
+
+| Resource | Method | Endpoint |
+|---|---|---|
+| Agents | `create_agent(**body)` | `POST /agents` |
+| | `list_agents()` | `GET /agents` |
+| | `get_agent(id)` | `GET /agents/{id}` |
+| | `delete_agent(id)` | `DELETE /agents/{id}` |
+| Volumes | `create_volume(**body)` | `POST /volumes` |
+| | `list_volumes(provider=None)` | `GET /volumes?provider=...` |
+| | `get_volume(id_or_name)` | `GET /volumes/{id}` |
+| | `delete_volume(id_or_name, force=False)` | `DELETE /volumes/{id}` |
+| Volume files | `volume_file_tree(id, path="")` | `GET /volumes/{id}/files/tree` |
+| | `volume_file_read(id, path)` | `GET /volumes/{id}/files/read` |
+| | `volume_file_write(id, path, content)` | `POST /volumes/{id}/files/edit` (overwrite) |
+| | `volume_file_edit(id, path, old_string, new_string, replace_all=False)` | `POST /volumes/{id}/files/edit` (replace) |
+| Sandboxes | `create_sandbox(**body)` | `POST /sandboxes` |
+| | `list_sandboxes()` | `GET /sandboxes` |
+| | `get_sandbox(id)` | `GET /sandboxes/{id}` |
+| | `destroy_sandbox(id)` | `DELETE /sandboxes/{id}` |
+| | `stop_sandbox(id)` / `start_sandbox(id)` | `POST /sandboxes/{id}/stop` \| `/start` |
+| | `snapshot_sandbox(id)` | `POST /sandboxes/{id}/snapshot` |
+| Sandbox files | `sandbox_file_tree/read/edit/upload/delete/rename/download` | `/sandboxes/{id}/files/*` |
+| Sessions | `create_session(**body)` | `POST /sessions` (eager default, pass `provision=False` for lazy, `sandbox_id=...` to reuse) |
+| | `list_sessions()` | `GET /sessions` |
+| | `get_session(id)` / `get_session_status(id)` / `get_session_log(id, limit=500)` | `GET /sessions/{id}[/status\|/log]` |
+| | `resume_session(id, **body)` | `POST /sessions/{id}/resume` |
+| | `send_message(id, text, interrupt=False)` | `POST /sessions/{id}/message` |
+| | `cancel_session(id)` | `POST /sessions/{id}/cancel` |
+| | `set_session_config(id, **config)` | `POST /sessions/{id}/config` |
+| | `session_sandbox_exec(id, cmd, timeout=120)` | `POST /sessions/{id}/sandbox/exec` |
+| | `start/stop/reset_session_sandbox(id, ...)` | `POST /sessions/{id}/{start\|stop\|reset}-sandbox` |
+| | `stream_events(id)` async iterator | `GET /sessions/{id}/events` (yields raw SSE bytes) |
+| Not yet server-side | `delete_session(id)` | **raises `NotImplementedError`** — no `DELETE /sessions/{id}` route |
+| | `rotate_sandbox_creds(id, token)` | **raises `NotImplementedError`** — no `PUT /sandboxes/{id}/creds` route |
+
+The two stubs at the bottom raise rather than silently no-op. Old homegrown wrappers hit non-existent endpoints and swallowed the 404; this surface refuses to do that. When the server gains those routes, swap the `NotImplementedError` for a real httpx call.

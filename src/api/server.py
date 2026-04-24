@@ -983,6 +983,30 @@ async def _install_skills_locally(skills) -> None:
         log.info("skill installed: %s", stdout.decode()[-200:].strip())
 
 
+async def _build_pre_start_commands(
+    config, provider: str, user_cmds: list[str] | None,
+) -> list[str] | None:
+    """Build the combined pre-start command list for provisioning.
+
+    Concatenates skill-install commands (from ``config.skills``) with
+    caller-supplied ``user_cmds``, preserving order so skills land first.
+    For the ``local`` provider we install skills on the host and return
+    ``None`` — the local sandbox shares HOME with the server, so skill
+    install runs once on the host and user commands there would execute
+    with server privileges (deliberately unsupported).
+    """
+    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
+    if provider == "local":
+        if skill_cmds:
+            try:
+                await _install_skills_locally(config.skills)
+            except Exception as e:
+                log.error("skill install failed, continuing without skills: %s", e)
+        return None
+    combined = skill_cmds + list(user_cmds or [])
+    return combined or None
+
+
 # ---------------------------------------------------------------------------
 # Request helpers
 # ---------------------------------------------------------------------------
@@ -1627,8 +1651,9 @@ async def create_sandbox(request: Request):
             f"provider {provider!r} does not match volume.provider {vol.provider!r}",
         )
 
-    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    pre_start_commands = skill_cmds + (data.get("pre_start_commands") or [])
+    pre_start_commands = await _build_pre_start_commands(
+        config, provider, data.get("pre_start_commands") or [],
+    )
 
     # Install supervisor on the volume first — docker/local need this before
     # create_sandbox; daytona tolerates it (fast-path on cache hit).
@@ -1648,7 +1673,7 @@ async def create_sandbox(request: Request):
             provider,
             volume_ref=vol.provider_ref, subpath=subpath,
             agent_type=agent_type, dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands or None,
+            pre_start_commands=pre_start_commands,
             root=root, sandbox_id=sandbox_id,
             shared_mounts=shared_mounts or None,
         )
@@ -3050,13 +3075,12 @@ async def _sessions_create_eager(data: dict) -> dict:
     # Install skills BEFORE starting the supervisor — claude-agent-acp
     # discovers skills at process startup. For local: install on host.
     # For docker/daytona: run install commands inside the sandbox before start.
-    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    if skill_cmds and provider == "local":
-        try:
-            await _install_skills_locally(config.skills)
-        except Exception as e:
-            log.error("skill install failed, continuing without skills: %s", e)
-            skill_cmds = []
+    # Caller-supplied ``pre_start_commands`` (e.g. hive's ``uv tool install
+    # hive-evolve``) are concatenated after skill install so dependencies
+    # build on top of a skill-ready image.
+    pre_start_commands = await _build_pre_start_commands(
+        config, provider, data.get("pre_start_commands") or []
+    )
 
     sandbox_id = str(uuid.uuid4())
     subpath = f"agents/{agent_id}"
@@ -3075,7 +3099,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         instance = await _provision_with_cache_retry(
             (volume_id, agent_type), create_instance,
             provider, agent_type, dockerfile=dockerfile,
-            pre_start_commands=skill_cmds if provider != "local" else None,
+            pre_start_commands=pre_start_commands,
             root=root, spawn_env=spawn_env,
             volume_id=volume_record.provider_ref, subpath=subpath,
             sandbox_id=sandbox_id, shared_mounts=shared_mounts or None,
@@ -3646,18 +3670,24 @@ async def session_sandbox_exec(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_to_supervisor(
-    sandbox_id: str, method: str, path: str, *,
+async def _resolve_session_instance(session_id: str) -> ProviderInstance:
+    """Resolve a session_id to its current sandbox's ProviderInstance.
+
+    Hides sandbox identity from callers — the whole point of the
+    ``/sessions/{id}/files/*`` endpoints. Does NOT start the ACP runtime
+    (file browsing doesn't need it); only ensures the sandbox itself is live.
+    """
+    session = await _require_session_row(session_id)
+    sandbox = await ensure_sandbox(session)
+    return await _resolve_sandbox_instance(sandbox.id)
+
+
+async def _proxy_instance(
+    instance: ProviderInstance, method: str, path: str, *,
     params: dict | None = None, json: dict | None = None,
     timeout: int = 30,
 ) -> Response:
-    """Forward a request to the sandbox's supervisor and return its JSON response.
-
-    Shared by every ``/sandboxes/{id}/files/*`` endpoint that returns JSON.
-    For binary responses (see ``files/download``) the header-forwarding case is
-    handled inline since it's unique.
-    """
-    instance = await _resolve_sandbox_instance(sandbox_id)
+    """Forward a request to a sandbox's supervisor via its ProviderInstance."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.request(
@@ -3670,6 +3700,31 @@ async def _proxy_to_supervisor(
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+async def _proxy_to_supervisor(
+    sandbox_id: str, method: str, path: str, *,
+    params: dict | None = None, json: dict | None = None,
+    timeout: int = 30,
+) -> Response:
+    """Forward a request to the sandbox's supervisor and return its JSON response.
+
+    Shared by every ``/sandboxes/{id}/files/*`` endpoint that returns JSON.
+    For binary responses (see ``files/download``) the header-forwarding case is
+    handled inline since it's unique.
+    """
+    instance = await _resolve_sandbox_instance(sandbox_id)
+    return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
+
+
+async def _proxy_from_session(
+    session_id: str, method: str, path: str, *,
+    params: dict | None = None, json: dict | None = None,
+    timeout: int = 30,
+) -> Response:
+    """Session-scoped twin of ``_proxy_to_supervisor``."""
+    instance = await _resolve_session_instance(session_id)
+    return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
 
 
 @app.get("/sandboxes/{sandbox_id}/files/tree")
@@ -3730,6 +3785,10 @@ async def sandbox_files_rename(sandbox_id: str, request: Request):
 async def sandbox_files_download(sandbox_id: str, path: str):
     """Download a file as raw bytes (forwards content-type + disposition)."""
     instance = await _resolve_sandbox_instance(sandbox_id)
+    return await _download_from_instance(instance, path)
+
+
+async def _download_from_instance(instance: ProviderInstance, path: str) -> Response:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.get(f"{instance.url}/v1/files/download", params={"path": path})
@@ -3741,6 +3800,68 @@ async def sandbox_files_download(sandbox_id: str, path: str):
             )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped filesystem browsing (sandbox identity hidden from callers)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/sessions/{session_id}/files/tree")
+async def session_files_tree(session_id: str):
+    """Return the recursive directory tree of the session's sandbox."""
+    return await _proxy_from_session(session_id, "GET", "/v1/files/tree")
+
+
+@app.get("/sessions/{session_id}/files/read")
+async def session_files_read(session_id: str, path: str):
+    """Read a single file from the session's sandbox."""
+    return await _proxy_from_session(
+        session_id, "GET", "/v1/files/read", params={"path": path},
+    )
+
+
+@app.post("/sessions/{session_id}/files/edit")
+async def session_files_edit(session_id: str, request: Request):
+    """Edit or create a file. Body: same shape as ``/sandboxes/{id}/files/edit``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/edit",
+        json=await _json_body(request),
+    )
+
+
+@app.post("/sessions/{session_id}/files/upload")
+async def session_files_upload(session_id: str, request: Request):
+    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/upload",
+        json=await _json_body(request), timeout=60,
+    )
+
+
+@app.post("/sessions/{session_id}/files/delete")
+async def session_files_delete(session_id: str, request: Request):
+    """Delete a file or directory. Body: ``{"path": ...}``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/delete",
+        json=await _json_body(request),
+    )
+
+
+@app.post("/sessions/{session_id}/files/rename")
+async def session_files_rename(session_id: str, request: Request):
+    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
+    return await _proxy_from_session(
+        session_id, "POST", "/v1/files/rename",
+        json=await _json_body(request),
+    )
+
+
+@app.get("/sessions/{session_id}/files/download")
+async def session_files_download(session_id: str, path: str):
+    """Download a file as raw bytes from the session's sandbox."""
+    instance = await _resolve_session_instance(session_id)
+    return await _download_from_instance(instance, path)
 
 
 # ---------------------------------------------------------------------------
