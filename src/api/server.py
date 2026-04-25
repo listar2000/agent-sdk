@@ -1507,17 +1507,7 @@ async def volume_files_read(id_or_name: str, path: str):
         data = await _providers_mod.volume_read(vol.provider, vol.provider_ref, rel)
     except Exception as e:
         raise _volume_fs_err("Read", vol.provider, e)
-    # Known binary extensions → always base64 (even if they happen to decode as text)
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    _BINARY_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tiff",
-                    "pdf", "zip", "tar", "gz", "bz2", "xz", "7z",
-                    "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-                    "mp3", "mp4", "wav", "ogg", "avi", "mov", "mkv",
-                    "woff", "woff2", "ttf", "otf", "eot",
-                    "exe", "dll", "so", "dylib", "o", "a",
-                    "pyc", "class", "wasm"}
-    if ext in _BINARY_EXTS:
-        return {"content_base64": base64.b64encode(data).decode()}
+    # v1 response contract: text content.
     try:
         return {"content": data.decode()}
     except UnicodeDecodeError:
