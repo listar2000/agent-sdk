@@ -259,6 +259,12 @@ _MIGRATIONS = [
             END IF;
         END LOOP;
     END $$""",
+    # 2026-04-26: persist caller-supplied pre_start_commands on the session row
+    # so they can be re-run when a new sandbox is provisioned (Type 2 recovery).
+    # Only the raw user commands are stored; skill-install commands are re-merged
+    # from agent.config.skills at recovery time.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pre_start_commands"
+    " JSONB NOT NULL DEFAULT '[]'::jsonb",
 ]
 
 
@@ -506,7 +512,8 @@ async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
                          volume_id: str | None = None,
                          env: dict[str, str] | None = None,
                          secrets: dict[str, str] | None = None,
-                         cwd: str | None = None) -> None:
+                         cwd: str | None = None,
+                         pre_start_commands: list[str] | None = None) -> None:
     """Upsert a session row.
 
     PATCH-like semantics: ``env=None`` / ``secrets=None`` / ``cwd=None``
@@ -538,6 +545,10 @@ async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
         cols.append("cwd")
         vals.append(cwd)
         update_parts.append("cwd=EXCLUDED.cwd")
+    if pre_start_commands is not None:
+        cols.append("pre_start_commands")
+        vals.append(Json(pre_start_commands))
+        update_parts.append("pre_start_commands=EXCLUDED.pre_start_commands")
     placeholders = ", ".join(["%s"] * len(cols))
     col_list = ", ".join(cols)
     update_sql = ", ".join(update_parts)

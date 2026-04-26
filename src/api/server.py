@@ -2599,6 +2599,13 @@ async def _provision_new(
     # startup reconciliation (M5); other providers currently ignore it.
     new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
 
+    # Re-merge raw user commands with current agent skills so recovery
+    # always uses the latest skill configuration.
+    user_pre_start = list(session_row.get("pre_start_commands") or [])
+    pre_start_commands_merged = await _build_pre_start_commands(
+        agent.config, vol.provider, user_pre_start
+    )
+
     inst = await _provision_with_cache_retry(
         (vol.id, agent_type), _providers_mod.provision_sandbox,
         vol.provider,
@@ -2606,6 +2613,7 @@ async def _provision_new(
         agent_type=agent_type, spawn_env=spawn_env,
         root=root, sandbox_id=new_sandbox_id,
         dockerfile=dockerfile, shared_mounts=shared_mounts or None,
+        pre_start_commands=pre_start_commands_merged,
     )
 
     sb = _sandbox_record(
@@ -2841,6 +2849,7 @@ async def get_session_route(session_id: str):
         "inner_session_id": rec.get("inner_session_id"),
         "env": env,
         "secrets": {"keys": sorted(secrets.keys())},
+        "pre_start_commands": rec.get("pre_start_commands") or [],
     }
 
 
@@ -3016,11 +3025,13 @@ async def _sessions_create_lazy(data: dict) -> dict:
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
     session_id = str(uuid.uuid4())
+    lazy_user_pre_start = data.get("pre_start_commands") or []
     await upsert_session(
         session_id, agent_id, sandbox_id=None, inner_session_id=None,
         volume_id=volume_record.id,
         env=body_env or {}, secrets=body_secrets or {},
         cwd=cwd,
+        pre_start_commands=list(lazy_user_pre_start),
     )
 
     return {
@@ -3078,8 +3089,9 @@ async def _sessions_create_eager(data: dict) -> dict:
     # Caller-supplied ``pre_start_commands`` (e.g. hive's ``uv tool install
     # hive-evolve``) are concatenated after skill install so dependencies
     # build on top of a skill-ready image.
+    user_pre_start = data.get("pre_start_commands") or []
     pre_start_commands = await _build_pre_start_commands(
-        config, provider, data.get("pre_start_commands") or []
+        config, provider, user_pre_start
     )
 
     sandbox_id = str(uuid.uuid4())
@@ -3190,6 +3202,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         volume_id=volume_id,
         env=session_env, secrets=session_secrets,
         cwd=cwd,
+        pre_start_commands=list(user_pre_start),
     )
 
     # Dual-key response: ``sandbox_id`` matches /sandboxes + client code;
