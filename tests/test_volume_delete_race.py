@@ -200,18 +200,21 @@ async def test_volume_delete_force_with_multiple_sessions(client):
 
 
 # ===========================================================================
-# Scenario 6 — Concurrent _ensure_sandbox_alive auto-restart
+# Scenario 6 — Concurrent /sandboxes/{id}/start (Type 1 only)
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_concurrent_start_sandbox_auto_restarts_exactly_once(client):
-    """Two concurrent ``POST /sandboxes/{id}/start`` against a sandbox
-    whose live ProviderInstance is dead.  _ensure_sandbox_alive must
-    replace the container exactly once; both requests return 200."""
-    # Seed a docker-provider sandbox + session.  Docker sits in the
-    # PORT_BASED_PROVIDERS branch of _ensure_sandbox_alive.
+async def test_concurrent_start_sandbox_serializes_type1(client):
+    """Two concurrent ``POST /sandboxes/{id}/start`` against a stopped
+    sandbox: the per-sandbox lock must serialize them so ``start_sandbox``
+    only fires once. Both requests return 200 with the same URL.
+
+    POST /sandboxes/{id}/start is **Type 1 only** as of the recovery
+    refactor — it never auto-creates a replacement. Type 2 lives at
+    /sessions/{id}/reset-sandbox.
+    """
     await dbmod.upsert_agent(AgentRecord(
         id="a_alive", name="A", config=AgentConfig(agent_type="claude"),
     ))
@@ -222,68 +225,39 @@ async def test_concurrent_start_sandbox_auto_restarts_exactly_once(client):
     ))
     await dbmod.upsert_sandbox(SandboxRecord(
         id="sb_alive", provider="docker", sandbox_ref="dt-sb-alive",
-        status="running", root="/home/agent",
+        status="stopped", root="/home/agent",
         volume_id="v_alive", subpath="agents/a_alive/home",
         listen_port=12345,
     ))
 
-    # Pre-seed _INSTANCES with a "dead" instance — container_id is set
-    # but the health probe fails.  That forces the restart branch.
-    dead_inst = ProviderInstance(
-        provider="docker", url="http://localhost:12345",
-        root="/home/agent", sandbox_id="dt-sb-alive",
-        container_id="deadbeefdeadbeef", port=12345,
-    )
-    srv._INSTANCES["sb_alive"] = dead_inst
+    # No live ProviderInstance — sandbox is stopped.
+    srv._INSTANCES.pop("sb_alive", None)
 
-    # Mock: health probe always fails; provision_sandbox builds a fresh
-    # instance; destroy_sandbox is a no-op.  Add a small sleep in
-    # provision_sandbox so the two requests overlap and we can verify
-    # the sandbox-lock serializes them.
-    provision_count = {"n": 0}
+    start_count = {"n": 0}
+    revived_urls: set[str] = set()
 
-    # URLs of replacement instances.  After a successful restart,
-    # subsequent health probes on the NEW URL must return True, otherwise
-    # the second caller re-enters the restart branch and we count an
-    # extra provision.  This models reality: the just-provisioned
-    # container is alive.
-    healthy_urls: set[str] = set()
+    async def fake_get_status(provider, ref):
+        return "stopped"
 
-    async def fake_provision(provider, **kw):
-        provision_count["n"] += 1
-        i = provision_count["n"]
+    async def fake_start(provider, ref):
+        start_count["n"] += 1
         # Sleep so the two concurrent requests overlap at the lock.
         await asyncio.sleep(0.03)
-        url = f"http://localhost:4{i:04d}"
-        healthy_urls.add(url)
-        return ProviderInstance(
-            provider="docker",
-            url=url,
-            root="/home/agent",
-            sandbox_id=f"dt-sb-alive-new-{i}",
-            container_id=f"newcontainer{i}",
-            port=40000 + i,
-        )
-
-    destroy_count = {"n": 0}
-
-    async def fake_destroy_instance(inst):
-        destroy_count["n"] += 1
+        # After start_sandbox, the supervisor URL is alive. Second caller's
+        # fast-path health probe must succeed so it doesn't re-enter Type 1.
+        revived_urls.add("http://localhost:12345")
 
     async def fake_health(url, max_retries=2, interval=0.5):
-        return url in healthy_urls
+        return url in revived_urls
 
-    # _ensure_sandbox_alive imports destroy_instance at module level in
-    # server.py, so patch that target.  provision_sandbox is dispatched
-    # through _providers_mod (the `. import providers as _providers_mod`
-    # alias in server), so patch the attribute on the providers package.
-    with patch("api.providers._wait_for_health",
+    with patch("api.providers.get_sandbox_status",
+               new=AsyncMock(side_effect=fake_get_status)), \
+         patch("api.providers.start_sandbox",
+               new=AsyncMock(side_effect=fake_start)), \
+         patch("api.providers._wait_for_health",
                new=AsyncMock(side_effect=fake_health)), \
-         patch("api.providers.provision_sandbox",
-               new=AsyncMock(side_effect=fake_provision)), \
          patch("api.server.destroy_instance",
-               new=AsyncMock(side_effect=fake_destroy_instance)):
-        # Two concurrent start requests.
+               new=AsyncMock(return_value=None)):
         r1, r2 = await asyncio.gather(
             client.post("/sandboxes/sb_alive/start"),
             client.post("/sandboxes/sb_alive/start"),
@@ -292,32 +266,65 @@ async def test_concurrent_start_sandbox_auto_restarts_exactly_once(client):
     assert r1.status_code == 200, r1.text
     assert r2.status_code == 200, r2.text
 
-    # Exactly one provision — the sandbox lock serialized the two requests.
-    assert provision_count["n"] == 1, (
-        f"expected 1 replacement sandbox, got {provision_count['n']} "
-        "(lock is not serializing _ensure_sandbox_alive auto-restart path)"
+    # Exactly one start_sandbox call — the sandbox lock serialized the
+    # two requests; second caller saw the revived instance via the fast
+    # path.
+    assert start_count["n"] == 1, (
+        f"expected 1 start_sandbox call, got {start_count['n']} "
+        "(lock is not serializing /sandboxes/{id}/start)"
     )
 
-    # Both responses point at the same replacement URL.
-    body1 = r1.json()
-    body2 = r2.json()
-    assert body1["url"] == body2["url"], (
-        f"two starts produced different URLs: {body1} vs {body2}"
-    )
+    # Both responses point at the same revived URL.
+    assert r1.json()["url"] == r2.json()["url"]
 
-    # _INSTANCES has the new instance; dead one is gone.
+    # _INSTANCES has a live instance keyed off the same (unchanged) sandbox_ref.
     inst = srv._INSTANCES.get("sb_alive")
     assert inst is not None
-    assert inst.sandbox_id.startswith("dt-sb-alive-new-"), (
-        f"_INSTANCES still has stale instance: {inst}"
+    assert inst.sandbox_id == "dt-sb-alive", (
+        f"Type 1 must not change sandbox_ref; got {inst.sandbox_id!r}"
     )
 
-    # DB sandbox row status reflects running.  The ``sandbox_ref`` check
-    # is split out into ``test_start_sandbox_route_db_consistency_xfail``
-    # below — see that test for the cycle-9 bug description.
+    # DB sandbox row status flipped back to running; sandbox_ref unchanged.
     sb_row = await dbmod.get_sandbox("sb_alive")
     assert sb_row is not None
     assert sb_row.status == "running"
+    assert sb_row.sandbox_ref == "dt-sb-alive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_start_sandbox_returns_409_when_provider_sandbox_missing(client):
+    """``POST /sandboxes/{id}/start`` is Type 1 only. If the underlying
+    provider sandbox is gone (status="missing"), the route must return
+    409 instead of silently provisioning a replacement. Callers wanting
+    a fresh sandbox should use POST /sessions/{id}/reset-sandbox or
+    POST /sandboxes."""
+    await dbmod.upsert_agent(AgentRecord(
+        id="a_gone", name="A", config=AgentConfig(agent_type="claude"),
+    ))
+    await dbmod.upsert_volume(VolumeRecord(
+        id="v_gone", name="gone", provider="docker",
+        provider_ref="dt-gone-ref",
+        supervisor_agent_types=["claude"],
+    ))
+    await dbmod.upsert_sandbox(SandboxRecord(
+        id="sb_gone", provider="docker", sandbox_ref="dt-sb-gone",
+        status="stopped", root="/home/agent",
+        volume_id="v_gone", subpath="agents/a_gone/home",
+        listen_port=12350,
+    ))
+    srv._INSTANCES.pop("sb_gone", None)
+
+    async def fake_get_status(provider, ref):
+        return "missing"
+
+    with patch("api.providers.get_sandbox_status",
+               new=AsyncMock(side_effect=fake_get_status)):
+        r = await client.post("/sandboxes/sb_gone/start")
+
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert "missing or unrecoverable" in body.get("error", body.get("detail", ""))
 
 
 @pytest.mark.asyncio
@@ -369,67 +376,14 @@ async def test_concurrent_start_sandbox_healthy_is_noop(client):
 
 
 # ---------------------------------------------------------------------------
-# Regression: start_sandbox_route must not clobber the DB row that
-# _ensure_sandbox_alive just updated with the new sandbox_ref/listen_port.
-# Fixed in cycle 9; re-fetches the sandbox row after the restart before
-# flipping status to "running".
+# (Removed) test_start_sandbox_route_db_consistency
+#
+# This test asserted that POST /sandboxes/{id}/start, after silently
+# auto-replacing a missing docker/daytona sandbox, wrote the new
+# sandbox_ref back to the DB row. The route is now Type 1 only — it
+# returns 409 instead of auto-replacing — so the test premise no longer
+# applies. See `test_start_sandbox_returns_409_when_provider_sandbox_missing`
+# for the new strict-Type-1 contract. Auto-replacement still happens on
+# /sessions/{id}/reset-sandbox and the implicit recovery on /message,
+# both of which are exercised by the golden recovery tests.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(10)
-async def test_start_sandbox_route_db_consistency(client):
-    """After /sandboxes/{id}/start triggers a replacement (e.g., Daytona
-    terminal-state or docker missing), the sandbox row's ``sandbox_ref``
-    must point at the new container — not be clobbered back to the
-    pre-restart snapshot."""
-    await dbmod.upsert_agent(AgentRecord(
-        id="a_db", name="A", config=AgentConfig(agent_type="claude"),
-    ))
-    await dbmod.upsert_volume(VolumeRecord(
-        id="v_db", name="db", provider="docker",
-        provider_ref="dt-db-ref",
-        supervisor_agent_types=["claude"],
-    ))
-    await dbmod.upsert_sandbox(SandboxRecord(
-        id="sb_db", provider="docker", sandbox_ref="dt-sb-db-OLD",
-        status="running", root="/home/agent",
-        volume_id="v_db", subpath="agents/a_db/home",
-        listen_port=12347,
-    ))
-    srv._INSTANCES["sb_db"] = ProviderInstance(
-        provider="docker", url="http://localhost:12347",
-        root="/home/agent", sandbox_id="dt-sb-db-OLD",
-        container_id="olddead", port=12347,
-    )
-
-    healthy: set[str] = set()
-
-    async def fake_provision(provider, **kw):
-        url = "http://localhost:45001"
-        healthy.add(url)
-        return ProviderInstance(
-            provider="docker", url=url, root="/home/agent",
-            sandbox_id="dt-sb-db-NEW",
-            container_id="newalive", port=45001,
-        )
-
-    async def fake_health(url, max_retries=2, interval=0.5):
-        return url in healthy
-
-    with patch("api.providers._wait_for_health",
-               new=AsyncMock(side_effect=fake_health)), \
-         patch("api.providers.provision_sandbox",
-               new=AsyncMock(side_effect=fake_provision)), \
-         patch("api.server.destroy_instance",
-               new=AsyncMock(return_value=None)):
-        r = await client.post("/sandboxes/sb_db/start")
-    assert r.status_code == 200, r.text
-
-    # EXPECTED: DB row reflects the NEW sandbox_ref.
-    sb_row = await dbmod.get_sandbox("sb_db")
-    assert sb_row is not None
-    assert sb_row.sandbox_ref == "dt-sb-db-NEW", (
-        f"start_sandbox_route lost the new sandbox_ref. "
-        f"Got {sb_row.sandbox_ref!r}, expected 'dt-sb-db-NEW'."
-    )

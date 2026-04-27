@@ -205,6 +205,10 @@ class Agent:
         dockerfile: str | None = None,
         oauth_token: str | None = None,
         api_key: str | None = None,
+        volume_id: str | None = None,
+        pre_start_commands: list[str] | None = None,
+        shared_mounts: list[str] | None = None,
+        secrets: dict[str, str] | None = None,
     ):
         self.name = name
         self.agent_type = agent_type
@@ -223,6 +227,10 @@ class Agent:
         self.dockerfile = dockerfile
         self.session_id: str | None = session_id
         self.inner_session_id: str | None = None  # internal — set by server responses
+        self.volume_id = volume_id
+        self.pre_start_commands = pre_start_commands
+        self.shared_mounts = shared_mounts
+        self._user_secrets: dict[str, str] = dict(secrets) if secrets else {}
         self._persist: SqliteSessionDriver | None = SqliteSessionDriver(db) if db else None
 
         if api_url is None:
@@ -253,7 +261,8 @@ class Agent:
     def from_config(cls, name: str, config: dict[str, Any], **kwargs) -> "Agent":
         """Create an agent from a config dict."""
         valid_keys = {"agent_type", "model", "prompt", "cwd", "root", "tools",
-                      "mcp_servers", "skills", "dockerfile", "provider"}
+                      "mcp_servers", "skills", "dockerfile", "provider",
+                      "volume_id", "pre_start_commands", "shared_mounts", "secrets"}
         agent_kwargs = {k: v for k, v in config.items() if k in valid_keys}
         agent_kwargs.update(kwargs)
         return cls(name=name, **agent_kwargs)
@@ -293,6 +302,10 @@ class Agent:
             "dockerfile": self.dockerfile,
             "oauth_token": self._oauth_token,
             "api_key": self._api_key,
+            "volume_id": self.volume_id,
+            "pre_start_commands": self.pre_start_commands,
+            "shared_mounts": self.shared_mounts,
+            "secrets": dict(self._user_secrets) if self._user_secrets else None,
         }
         kwargs.update(overrides)
         clone_name = name or f"{self.name}-clone"
@@ -300,7 +313,8 @@ class Agent:
 
     def _registration_payload(self) -> dict[str, Any]:
         config: dict[str, Any] = {"name": self.name, "agent_type": self.agent_type}
-        for key in ("provider", "model", "cwd", "root", "prompt", "tools"):
+        for key in ("provider", "model", "cwd", "root", "prompt", "tools",
+                    "volume_id", "pre_start_commands", "shared_mounts"):
             val = getattr(self, key)
             if val is not None:
                 config[key] = val
@@ -315,11 +329,12 @@ class Agent:
         # server pops env/secrets uniformly via ``_pop_env_and_secrets`` and
         # merges them into the sandbox's ``spawn_env``. No special-case
         # oauth_token / api_key handling anywhere.
-        secrets: dict[str, str] = {}
+        # User-supplied secrets win; oauth/api fields fill in only if absent.
+        secrets: dict[str, str] = dict(self._user_secrets)
         if self._oauth_token:
-            secrets["CLAUDE_CODE_OAUTH_TOKEN"] = self._oauth_token
+            secrets.setdefault("CLAUDE_CODE_OAUTH_TOKEN", self._oauth_token)
         if self._api_key:
-            secrets["ANTHROPIC_API_KEY"] = self._api_key
+            secrets.setdefault("ANTHROPIC_API_KEY", self._api_key)
         if secrets:
             config["secrets"] = secrets
         return config
@@ -590,85 +605,3 @@ class Agent:
         await self.aclose()
 
 
-# ── Volumes API ──
-
-from dataclasses import dataclass as _dataclass, fields
-
-
-@_dataclass
-class Volume:
-    id: str
-    name: str
-    provider: str
-    provider_ref: str
-    status: str
-
-    @classmethod
-    def _from_server(cls, payload: dict) -> "Volume":
-        """Build a ``Volume`` from a server response, tolerating extra keys.
-
-        The server's ``VolumeRecord`` has grown fields (``supervisor_agent_types``
-        as of the volume-aware supervisor rollout) that this lean SDK dataclass
-        does not model. Previously ``Volume(**payload)`` raised ``TypeError``
-        the moment the server started emitting those keys. Filtering to our
-        known slots keeps the SDK forward-compatible — new server fields are
-        silently ignored, no client release required.
-        """
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in payload.items() if k in known})
-
-
-class _VolumesAPI:
-    """Client-side wrapper for /volumes REST endpoints."""
-
-    def __init__(self, client: "Client"):
-        self._c = client
-
-    async def create(self, name: str, provider: str) -> Volume:
-        r = await self._c._http.post(f"{self._c.base_url}/volumes",
-                                     json={"name": name, "provider": provider})
-        _raise_for_status(r)
-        return Volume._from_server(r.json())
-
-    async def provision(self, name: str, provider: str) -> Volume:
-        # Historical alias for ``create`` — /volumes/provision was a trivial
-        # delegation to /volumes and has been collapsed server-side.
-        return await self.create(name, provider)
-
-    async def get(self, id_or_name: str) -> Volume:
-        r = await self._c._http.get(f"{self._c.base_url}/volumes/{id_or_name}")
-        _raise_for_status(r)
-        return Volume._from_server(r.json())
-
-    async def list(self, provider: str | None = None) -> list[Volume]:
-        params = {"provider": provider} if provider else None
-        r = await self._c._http.get(f"{self._c.base_url}/volumes", params=params)
-        _raise_for_status(r)
-        return [Volume._from_server(v) for v in r.json()]
-
-    async def delete(self, id_or_name: str, force: bool = False) -> None:
-        params = {"force": "true"} if force else None
-        r = await self._c._http.delete(f"{self._c.base_url}/volumes/{id_or_name}",
-                                       params=params)
-        _raise_for_status(r)
-
-
-class Client:
-    """Top-level SDK client. For now only exposes .volumes — other resources
-    are still accessed via the Agent class."""
-
-    def __init__(self, base_url: str = "http://localhost:7778"):
-        self.base_url = base_url.rstrip("/")
-        # Lazy import to match the rest of the SDK's style.
-        import httpx
-        self._http = httpx.AsyncClient(timeout=30.0)
-        self.volumes = _VolumesAPI(self)
-
-    async def close(self) -> None:
-        await self._http.aclose()
-
-    async def __aenter__(self) -> "Client":
-        return self
-
-    async def __aexit__(self, *exc) -> None:
-        await self.close()

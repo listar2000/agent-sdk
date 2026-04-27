@@ -265,6 +265,26 @@ class ServerClient:
             "POST", f"/sessions/{session_id}/config", json=config,
         )
 
+    async def session_sandbox_exec(
+        self, session_id: str, command: str, timeout: int = 30,
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/sandbox/exec`` — run a command in the session's
+        sandbox. Platform/bootstrap use (e.g., installing tooling before the
+        agent's first turn). Not intended for interactive use by chat clients —
+        those should tool-call through the agent.
+
+        Body: {"command": str, "timeout": int}
+        Returns: {"stdout", "stderr", "exit_code", "stdout_truncated", "timed_out"}.
+
+        The underlying httpx request timeout is extended beyond ``timeout`` so
+        the server has a margin to return its timed-out response.
+        """
+        return await self._json(
+            "POST", f"/sessions/{session_id}/sandbox/exec",
+            json={"command": command, "timeout": timeout},
+            timeout=float(timeout) + 10,
+        )
+
     # Session filesystem (sandbox identity hidden — session_id addresses
     # the current sandbox; re-provisions transparently on /resume)
 

@@ -88,7 +88,7 @@ async def main():
     saved_session = agent.session_id
 
     with Timer("agent.aclose"):
-        await agent.aclose()
+        await agent._client.aclose()  # close HTTP client without server-side reap
 
     step1_total = time.monotonic() - overall_t0
     print(f"\n  ══ Step 1 total: {step1_total:.2f}s ══\n")

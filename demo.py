@@ -15,7 +15,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
-os.environ.setdefault("DATABASE_URL", os.environ["TEST_DATABASE_URL"])
+if "TEST_DATABASE_URL" in os.environ:
+    os.environ.setdefault("DATABASE_URL", os.environ["TEST_DATABASE_URL"])
+elif "DATABASE_URL" not in os.environ:
+    sys.exit("Set TEST_DATABASE_URL or DATABASE_URL (e.g. `set -a; source .env; set +a`).")
 from api import db as dbmod, server as srv  # noqa: E402
 from api.models import AgentConfig, AgentRecord  # noqa: E402
 
@@ -61,7 +64,7 @@ async def main() -> int:
                            base_url="http://test", timeout=300.0) as c:
 
         log("1  PROVISION VOLUME", "Creating a Daytona volume (persistent storage)...")
-        r = await c.post("/volumes/provision",
+        r = await c.post("/volumes",
                          json={"name": f"demo-vol-{uuid.uuid4().hex[:6]}",
                                "provider": "daytona"})
         vol = r.json()

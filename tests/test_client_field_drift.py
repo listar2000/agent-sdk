@@ -5,11 +5,12 @@ server emitted ``current_sandbox_id`` from ``/sessions/quick``. These
 tests lock in the sibling invariants we verified during the cycle-12
 audit so the same class of bug can't regress silently:
 
-* ``Volume(**server_payload)`` tolerates extra fields (the server keeps
-  growing ``VolumeRecord`` — e.g. ``supervisor_agent_types``). A strict
-  ``__init__`` would blow up on any new server column.
 * ``configure()`` / ``cancel()`` surface the server's ``{"error": "..."}``
   body instead of swallowing it into a bare ``HTTPStatusError: 400``.
+
+(Volume forward-compat tests were dropped when the legacy ``Client``
+class was removed; ``ServerClient`` returns raw dicts and is naturally
+forward-compatible with new server fields.)
 """
 from __future__ import annotations
 
@@ -32,64 +33,6 @@ def _fake_response(status_code: int, json_body=None):
     r.request = httpx.Request("POST", "http://fake/")
     r.text = ""
     return r
-
-
-# ---------------------------------------------------------------------------
-# Volume: tolerate forward-compatible server fields.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_volumes_create_ignores_unknown_server_fields():
-    """Server's VolumeRecord has ``supervisor_agent_types`` (and may grow
-    more fields). The SDK must not ``TypeError`` on ``Volume(**payload)``.
-    """
-    from agent_sdk.client import Client, Volume
-
-    payload = {
-        "id": "vol_x",
-        "name": "p",
-        "provider": "daytona",
-        "provider_ref": "dt-x",
-        "status": "ready",
-        # Future/extra fields the server emits today or tomorrow:
-        "supervisor_agent_types": ["claude", "codex"],
-        "created_at": "2026-04-22T00:00:00Z",
-    }
-
-    c = Client(base_url="http://fake")
-    with patch.object(c._http, "post",
-                      AsyncMock(return_value=_fake_response(200, payload))):
-        v = await c.volumes.create(name="p", provider="daytona")
-    assert isinstance(v, Volume)
-    assert v.id == "vol_x"
-    # The extra field must not have been passed to __init__ (AttributeError
-    # here is expected — the dataclass intentionally doesn't model it).
-    assert not hasattr(v, "supervisor_agent_types")
-    await c.close()
-
-
-@pytest.mark.asyncio
-async def test_volumes_list_ignores_unknown_server_fields():
-    from agent_sdk.client import Client, Volume
-
-    payload = [{
-        "id": "vol_1",
-        "name": "n",
-        "provider": "docker",
-        "provider_ref": "docker-1",
-        "status": "ready",
-        "supervisor_agent_types": [],
-        "whatever_new_column": 42,
-    }]
-
-    c = Client(base_url="http://fake")
-    with patch.object(c._http, "get",
-                      AsyncMock(return_value=_fake_response(200, payload))):
-        vs = await c.volumes.list()
-    assert len(vs) == 1 and isinstance(vs[0], Volume)
-    assert vs[0].name == "n"
-    await c.close()
 
 
 # ---------------------------------------------------------------------------

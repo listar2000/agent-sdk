@@ -9,7 +9,6 @@ from .client import (
     Agent, Event, Sandbox, UsageStats,
     CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE, AGENT_TYPES,
     LOCAL, DOCKER, DAYTONA, PROVIDERS,
-    Client, Volume,
 )
 from .errors import (
     AgentSDKError, AgentConnectionError, AgentNotRegisteredError,
@@ -30,7 +29,5 @@ __all__ = [
     "SandboxError", "AgentBusyError", "AgentTimeoutError", "PromptError", "StreamError",
     "SessionRecord",
     "SqliteSessionDriver",
-    "Client",
-    "Volume",
     "ServerClient",
 ]

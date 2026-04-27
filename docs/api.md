@@ -61,7 +61,9 @@ Config fields may be passed either at the top level (`agent_type`, `model`, `pro
 }
 ```
 
-`pre_start_commands` are shell commands that run inside the sandbox before the ACP supervisor starts — use them to install CLIs, lay down config files, etc. For `docker`/`daytona` they run inside the sandbox; for `local` they are ignored (the server host already runs `skills` install natively, and local has no sandbox boundary to run caller-supplied commands in safely). The effective list passed to the provider is `skills_install_commands + caller_pre_start_commands` in that order. Currently applied on the initial sandbox only — replacement sandboxes (external delete, idle-stop recovery) do not re-run them; persist anything you need durably by baking it into the volume or the sandbox image.
+`pre_start_commands` are shell commands that run inside the sandbox before the ACP supervisor starts — use them to install CLIs, lay down config files, etc. For `docker`/`daytona` they run inside the sandbox; for `local` they are ignored (the server host already runs `skills` install natively, and local has no sandbox boundary to run caller-supplied commands in safely). The effective list passed to the provider is `skills_install_commands + caller_pre_start_commands` in that order.
+
+The raw caller-supplied commands are persisted on the session row and re-run on **Type 2 recovery** (replacement sandbox — external delete, unrecoverable Daytona error, `/reset-sandbox`). **Type 1 recovery** (same VM restarted via `start_sandbox`) does not re-run them — the original side effects are still on disk. Skill-install commands are re-merged from `agent.config.skills` at recovery time, so editing skills on a long-lived agent takes effect on the next sandbox replacement. Inspect what's persisted via `GET /sessions/{id}` (response includes `pre_start_commands`).
 
 Returns (eager):
 ```json
@@ -530,36 +532,31 @@ Grouped by resource. Bodies are documented under the corresponding REST endpoint
 
 | Resource | Method | Endpoint |
 |---|---|---|
-| Agents | `create_agent(**body)` | `POST /agents` |
-| | `list_agents()` | `GET /agents` |
-| | `get_agent(id)` | `GET /agents/{id}` |
-| | `delete_agent(id)` | `DELETE /agents/{id}` |
 | Volumes | `create_volume(**body)` | `POST /volumes` |
 | | `list_volumes(provider=None)` | `GET /volumes?provider=...` |
 | | `get_volume(id_or_name)` | `GET /volumes/{id}` |
 | | `delete_volume(id_or_name, force=False)` | `DELETE /volumes/{id}` |
-| Volume files | `volume_file_tree(id, path="")` | `GET /volumes/{id}/files/tree` |
-| | `volume_file_read(id, path)` | `GET /volumes/{id}/files/read` |
-| | `volume_file_write(id, path, content)` | `POST /volumes/{id}/files/edit` (overwrite) |
-| | `volume_file_edit(id, path, old_string, new_string, replace_all=False)` | `POST /volumes/{id}/files/edit` (replace) |
-| Sandboxes | `create_sandbox(**body)` | `POST /sandboxes` |
-| | `list_sandboxes()` | `GET /sandboxes` |
-| | `get_sandbox(id)` | `GET /sandboxes/{id}` |
-| | `destroy_sandbox(id)` | `DELETE /sandboxes/{id}` |
-| | `stop_sandbox(id)` / `start_sandbox(id)` | `POST /sandboxes/{id}/stop` \| `/start` |
-| | `snapshot_sandbox(id)` | `POST /sandboxes/{id}/snapshot` |
-| Sandbox files | `sandbox_file_tree/read/edit/upload/delete/rename/download` | `/sandboxes/{id}/files/*` |
-| Sessions | `create_session(**body)` | `POST /sessions` (eager default, pass `provision=False` for lazy, `sandbox_id=...` to reuse) |
+| Volume files | `volume_file_tree(volume_id, path="")` | `GET /volumes/{id}/files/tree` |
+| | `volume_file_read(volume_id, path)` | `GET /volumes/{id}/files/read` |
+| | `volume_file_write(volume_id, path, content)` | `POST /volumes/{id}/files/edit` (overwrite) |
+| | `volume_file_edit(volume_id, path, old_string, new_string, replace_all=False)` | `POST /volumes/{id}/files/edit` (replace) |
+| Sessions | `create_session(**body)` | `POST /sessions` (eager default; pass `provision=False` for lazy) |
 | | `list_sessions()` | `GET /sessions` |
-| | `get_session(id)` / `get_session_status(id)` / `get_session_log(id, limit=500)` | `GET /sessions/{id}[/status\|/log]` |
-| | `resume_session(id, **body)` | `POST /sessions/{id}/resume` |
+| | `get_session(id)` | `GET /sessions/{id}` |
+| | `get_session_status(id)` | `GET /sessions/{id}/status` |
+| | `get_session_log(id, limit=500)` | `GET /sessions/{id}/log` |
 | | `send_message(id, text, interrupt=False)` | `POST /sessions/{id}/message` |
 | | `cancel_session(id)` | `POST /sessions/{id}/cancel` |
-| | `set_session_config(id, **config)` | `POST /sessions/{id}/config` |
-| | `session_sandbox_exec(id, cmd, timeout=120)` | `POST /sessions/{id}/sandbox/exec` |
-| | `start/stop/reset_session_sandbox(id, ...)` | `POST /sessions/{id}/{start\|stop\|reset}-sandbox` |
-| | `stream_events(id)` async iterator | `GET /sessions/{id}/events` (yields raw SSE bytes) |
-| Not yet server-side | `delete_session(id)` | **raises `NotImplementedError`** — no `DELETE /sessions/{id}` route |
-| | `rotate_sandbox_creds(id, token)` | **raises `NotImplementedError`** — no `PUT /sandboxes/{id}/creds` route |
+| | `set_session_config(id, **body)` | `POST /sessions/{id}/config` |
+| | `session_sandbox_exec(id, command, timeout=...)` | `POST /sessions/{id}/sandbox/exec` |
+| | `stream_events(id)` async iterator | `GET /sessions/{id}/events` (yields parsed event dicts) |
+| | `delete_session(id)` ⚠️ | **raises `NotImplementedError`** — no `DELETE /sessions/{id}` route yet |
+| Session files | `session_file_tree(id)` | `GET /sessions/{id}/files/tree` |
+| | `session_file_read(id, path)` | `GET /sessions/{id}/files/read` |
+| | `session_file_edit(id, path, ...)` | `POST /sessions/{id}/files/edit` |
+| | `session_file_upload(id, path, content)` | `POST /sessions/{id}/files/upload` |
+| | `session_file_delete(id, path)` | `POST /sessions/{id}/files/delete` |
+| | `session_file_rename(id, path, new_path)` | `POST /sessions/{id}/files/rename` |
+| | `session_file_download(id, path)` | `GET /sessions/{id}/files/download` |
 
-The two stubs at the bottom raise rather than silently no-op. Old homegrown wrappers hit non-existent endpoints and swallowed the 404; this surface refuses to do that. When the server gains those routes, swap the `NotImplementedError` for a real httpx call.
+`ServerClient` is intentionally focused on the session/volume lifecycle — agents and standalone sandboxes are not in its method surface. Hit the corresponding REST endpoints (`/agents`, `/sandboxes`) directly via `httpx` if you need them. `delete_session` raises rather than silently no-oping because the route is not yet implemented; replace its body with a real call once the server adds `DELETE /sessions/{id}`.

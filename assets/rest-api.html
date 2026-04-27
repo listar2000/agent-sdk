@@ -267,6 +267,10 @@
         <div class="schema-row is-new"><span class="schema-field">volume_id</span><span class="schema-type">TEXT FK NOT NULL</span><span class="schema-desc">→ volumes.id, ON DELETE RESTRICT (new)</span></div>
         <div class="schema-row is-new"><span class="schema-field">current_sandbox_id</span><span class="schema-type">TEXT FK NULL</span><span class="schema-desc">renamed from sandbox_id; nullable, ON DELETE SET NULL (was CASCADE)</span></div>
         <div class="schema-row"><span class="schema-field">inner_session_id</span><span class="schema-type">TEXT</span><span class="schema-desc">ACP session handle for CLI --resume</span></div>
+        <div class="schema-row is-new"><span class="schema-field">env</span><span class="schema-type">JSONB NOT NULL</span><span class="schema-desc">non-secret env, default {} (new)</span></div>
+        <div class="schema-row is-new"><span class="schema-field">secrets</span><span class="schema-type">JSONB NOT NULL</span><span class="schema-desc">plaintext for now, default {} (new)</span></div>
+        <div class="schema-row is-new"><span class="schema-field">cwd</span><span class="schema-type">TEXT NOT NULL</span><span class="schema-desc">default '/tmp'; per-conversation cwd (moved from agent.config) (new)</span></div>
+        <div class="schema-row is-new"><span class="schema-field">pre_start_commands</span><span class="schema-type">JSONB NOT NULL</span><span class="schema-desc">default []; replayed on Type 2 sandbox replacement (new 2026-04-26)</span></div>
       </div>
     </div>
 
