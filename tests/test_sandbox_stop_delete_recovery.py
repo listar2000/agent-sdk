@@ -1135,7 +1135,7 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
 @pytest.mark.asyncio
 async def test_persistent_sse_supervisor_killed_immediate_message(provider):
     """Prod UI race: kill supervisor, then POST /message BEFORE the server
@@ -1154,6 +1154,10 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
     'Queued for agent' forever if it's not listening for the error
     event on the rpc it just submitted (typical EventSource reconnect
     loses rpc_id subscription).
+
+    Docker variant: ``pkill supervisor.js`` takes down PID 1 and the
+    container exits, but the server's cached URL still points at the
+    dead container — same stale-cache race the test pins.
 
     Invariant: turn 2 returns a non-empty reply. Either the retry path
     rebinds and succeeds, or the error event reaches the persistent SSE.
@@ -1190,7 +1194,7 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
 
 
 
-@pytest.mark.parametrize("provider", ["daytona", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
 @pytest.mark.asyncio
 async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
     """End-to-end wiring for the UI reconnect-gap bug.
@@ -1227,9 +1231,10 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
          time out with ``TimeoutError`` because their events were
          dispatched to empty subscriber lists and dropped.
 
-    Docker excluded: ``docker exec pkill supervisor.js`` takes down
-    PID 1 and the container exits, which is a different failure mode
-    already covered by ``test_persistent_sse_external_delete_then_message``.
+    Subscriber-buffer behavior is provider-agnostic. Docker variant
+    relies on ``pkill supervisor.js`` taking down PID 1 (container
+    exits) — same UI-visible "stream closed" trigger; the test pins
+    the server-side buffer regardless of how the supervisor went away.
     """
     _require_provider(provider)
 
