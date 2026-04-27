@@ -248,7 +248,15 @@ async def _shutdown_session_state(
     state.kick_all()
     if remove and SESSIONS.get(state.session_id) is state:
         SESSIONS.pop(state.session_id, None)
-        _session_locks.pop(state.session_id, None)
+        # Intentionally do NOT pop _session_locks: _ensure_runtime_locked
+        # calls this from inside the held lock (e.g., server.py:2829 when
+        # rebuilding a stale state). Popping here would let a concurrent
+        # caller's _get_session_lock(sid) hit an empty dict and `setdefault`
+        # a fresh Lock, breaking serialization. Two _ensure_runtime_locked
+        # bodies would then run in parallel, mint two acp_session_ids, and
+        # spawn two SSE readers for the same session — the daytona persistent-
+        # SSE-after-delete race. The orphan Lock entry is small (an empty
+        # waiters deque); a separate GC pass can prune cold ones if needed.
 
 
 def _mark_turn_finished(state: SessionState, at: float | None = None) -> float:

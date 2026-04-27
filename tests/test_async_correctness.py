@@ -265,6 +265,124 @@ def test_lock_ordering_is_consistent():
 
 
 # ---------------------------------------------------------------------------
+# 4b. Session-lock identity must survive _shutdown_session_state(remove=True)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_lock_identity_stable_across_shutdown():
+    """Repro for the daytona persistent-SSE-after-delete race.
+
+    ``_shutdown_session_state(remove=True)`` (server.py:251) pops the
+    session's entry from ``_session_locks``. The next caller of
+    ``_get_session_lock(session_id)`` then creates a brand-new
+    ``asyncio.Lock`` via ``setdefault`` — different identity from the
+    one any in-flight code may have already acquired.
+
+    The downstream consequence (proven by the next test): two
+    concurrent ``_ensure_runtime_locked`` callers each take their OWN
+    lock, run their critical sections in parallel, and spawn two
+    independent SSE readers for the same session. POST /message events
+    land on one state; the persistent /events subscriber is on the
+    other. Events are lost.
+    """
+    from api import server as srv
+    from api.models import SessionState
+
+    sid = "lock-identity-" + str(id(object()))
+    lock_before = srv._get_session_lock(sid)
+
+    state = SessionState(session_id=sid, agent_id="a", sandbox_id="sb")
+    srv.SESSIONS[sid] = state
+
+    with patch.object(srv, "_close_session_gracefully", AsyncMock()):
+        await srv._shutdown_session_state(state, remove=True, force=True)
+
+    lock_after = srv._get_session_lock(sid)
+
+    assert lock_before is lock_after, (
+        "session lock identity broke across _shutdown_session_state("
+        "remove=True): callers waiting on the pre-shutdown lock are no "
+        "longer serialized against callers that arrive after. Cause: "
+        "_session_locks.pop in server.py:251."
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_session_lock_serializes_after_inner_shutdown():
+    """Direct race repro: ``_ensure_runtime_locked`` (server.py:2829, 2839)
+    calls ``_shutdown_session_state(remove=True)`` *while holding the
+    session lock*. The pop happens inside the held critical section, so
+    the locked caller continues with the (now popped) lock object while
+    a concurrent caller sees an empty ``_session_locks`` dict and creates
+    a fresh, independent lock via ``setdefault``. Both end up "in" the
+    lock simultaneously.
+
+    This is the actual race observed in the daytona persistent-SSE-after-
+    delete test, with two ``acp_session_id`` UUIDs minted 511 ms apart for
+    the same session_id.
+    """
+    from api import server as srv
+    from api.models import SessionState
+
+    sid = "lock-race-" + str(id(object()))
+    state = SessionState(session_id=sid, agent_id="a", sandbox_id="sb")
+    srv.SESSIONS[sid] = state
+
+    enter_count = {"n": 0, "max_concurrent": 0}
+    holder_in = asyncio.Event()
+    holder_release = asyncio.Event()
+
+    async def holder():
+        """Mimics ``_ensure_runtime_locked``: take the lock, then call
+        ``_shutdown_session_state(remove=True)`` from inside the locked
+        region (server.py:2829), then keep doing work."""
+        lock = srv._get_session_lock(sid)
+        async with lock:
+            enter_count["n"] += 1
+            enter_count["max_concurrent"] = max(
+                enter_count["max_concurrent"], enter_count["n"],
+            )
+            holder_in.set()
+            # Inside the critical section: trigger _shutdown_session_state
+            # which pops _session_locks[sid] even though we're still here.
+            with patch.object(srv, "_close_session_gracefully", AsyncMock()):
+                await srv._shutdown_session_state(state, remove=True, force=True)
+            await holder_release.wait()
+            enter_count["n"] -= 1
+
+    async def latecomer():
+        """Concurrent caller arriving after the pop happened."""
+        await holder_in.wait()
+        # Yield so holder's _shutdown_session_state runs before we acquire.
+        await asyncio.sleep(0.01)
+        lock = srv._get_session_lock(sid)  # would be lock-β if popped
+        async with lock:
+            enter_count["n"] += 1
+            enter_count["max_concurrent"] = max(
+                enter_count["max_concurrent"], enter_count["n"],
+            )
+            enter_count["n"] -= 1
+
+    t_holder = asyncio.create_task(holder())
+    t_late = asyncio.create_task(latecomer())
+
+    # Give the latecomer time to enter; if serialization works it will block.
+    await asyncio.sleep(0.1)
+    holder_release.set()
+    await asyncio.gather(t_holder, t_late)
+
+    assert enter_count["max_concurrent"] == 1, (
+        f"two concurrent session-lock critical sections overlapped "
+        f"(max_concurrent={enter_count['max_concurrent']}). The holder "
+        f"called _shutdown_session_state(remove=True) which popped "
+        f"_session_locks[sid] from inside the lock; the latecomer's "
+        f"_get_session_lock then created a fresh lock via setdefault. "
+        f"Serialization invariant violated."
+    )
+
+
+# ---------------------------------------------------------------------------
 # 5. Port allocator atomicity under concurrent callers
 # ---------------------------------------------------------------------------
 
