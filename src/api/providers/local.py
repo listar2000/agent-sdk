@@ -388,6 +388,22 @@ def _lookup_proc(ref: str) -> subprocess.Popen | None:
     return _PROCESSES.get(ref)
 
 
+def _resolve_proc_and_ref(inst: ProviderInstance) -> tuple[subprocess.Popen | None, str | None]:
+    """Find the live Popen + sandbox ref for this provider instance.
+
+    Tries ``inst.process`` first (Type 1 in-place restart preserves it
+    across rebinds), then falls back to the _PROCESSES registry by
+    sandbox_ref. Either or both may be None — caller decides what to do.
+    """
+    ref = getattr(inst, "sandbox_id", None) if hasattr(inst, "sandbox_id") else None
+    proc: subprocess.Popen | None = None
+    if hasattr(inst, "process") and inst.process is not None and isinstance(inst.process, subprocess.Popen):
+        proc = inst.process
+    if proc is None and ref:
+        proc = _PROCESSES.get(ref)
+    return proc, ref
+
+
 async def get_sandbox_status(ref: str) -> str:
     """Return running / stopped / missing / error.
 
@@ -470,12 +486,7 @@ async def start_sandbox(ref: str) -> None:
 async def stop_sandbox(inst: ProviderInstance) -> None:
     """Kill the supervisor but keep spawn args cached so start_sandbox(ref)
     can revive it at the same ref. Mirrors Daytona stop semantics."""
-    ref = getattr(inst, "sandbox_id", None) if hasattr(inst, "sandbox_id") else None
-    proc: subprocess.Popen | None = None
-    if hasattr(inst, "process") and inst.process is not None and isinstance(inst.process, subprocess.Popen):
-        proc = inst.process
-    if proc is None and ref:
-        proc = _PROCESSES.get(ref)
+    proc, ref = _resolve_proc_and_ref(inst)
     if proc is not None:
         await asyncio.to_thread(_kill_proc, proc)
     if ref:
@@ -488,12 +499,7 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
     """Terminate the supervisor subprocess and wipe all cached state for
     this ref — sandbox_id, Popen, and spawn args. Subsequent
     get_sandbox_status(ref) returns 'missing'."""
-    ref = getattr(inst, "sandbox_id", None) if hasattr(inst, "sandbox_id") else None
-    proc: subprocess.Popen | None = None
-    if hasattr(inst, "process") and inst.process is not None and isinstance(inst.process, subprocess.Popen):
-        proc = inst.process
-    if proc is None and ref:
-        proc = _PROCESSES.get(ref)
+    proc, ref = _resolve_proc_and_ref(inst)
 
     if proc is not None:
         await asyncio.to_thread(_kill_proc, proc)
