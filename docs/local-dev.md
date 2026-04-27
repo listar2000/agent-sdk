@@ -101,7 +101,7 @@ Tables:
 - `agents` — agent configurations (id, name, config JSONB)
 - `volumes` — persistent storage records (id, name, provider, provider_ref, status)
 - `sandboxes` — ephemeral compute records (id, provider, sandbox_ref, status, volume_id, subpath)
-- `sessions` — session records (id, agent_id, volume_id, current_sandbox_id, inner_session_id, env, secrets)
+- `sessions` — session records (id, agent_id, volume_id, current_sandbox_id, inner_session_id, env, secrets, cwd, pre_start_commands)
 - `session_log` — event log (session_id, event_type, payload JSONB)
 
 ## Environment Variables

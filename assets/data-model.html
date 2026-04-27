@@ -669,6 +669,12 @@
               <span class="field-type">TEXT NOT NULL</span>
               <span class="field-desc">default '/tmp'. Per-conversation working directory — determines the JSONL hash (~/.claude/projects/&lt;hash&gt;/&lt;inner_sid&gt;.jsonl), so frozen at session-create time. Moved from AgentConfig 2026-04-23.</span>
             </div>
+            <div class="field is-new">
+              <div class="field-badges"><span class="badge-field-new">new</span></div>
+              <span class="field-name">pre_start_commands</span>
+              <span class="field-type">JSONB NOT NULL</span>
+              <span class="field-desc">default []. Caller-supplied shell commands run inside the sandbox before the supervisor starts. Persisted so they re-run on Type 2 recovery (replacement sandbox). Skill-install commands are merged separately at run time. Added 2026-04-26.</span>
+            </div>
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">created_at</span>
