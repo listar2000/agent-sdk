@@ -1026,34 +1026,6 @@ _CONFIG_KEYS = (
 _AGENT_REJECTED_KEYS = ("cwd", "env", "dockerfile", "dockerfile_content", "shared_mounts")
 
 
-def _forbid_auth_keys_in_env(env: dict | None, where: str) -> None:
-    """Raise 400 if a client tries to smuggle credential keys through ``env``.
-
-    ``env`` is stored plaintext and returned plain by GET endpoints; credentials
-    must go in ``secrets`` instead. Applies to both top-level ``env`` and
-    nested ``config.env``.
-
-    Also enforces POSIX env var names — blocks shell-injection via the
-    provider-layer ``_build_env_prefix`` which interpolates keys into
-    ``sh -c`` commands (the value is shlex-quoted but the key is not, so a
-    key like ``FOO;cmd;X`` would break out of ``env``'s arglist).
-    """
-    if not env:
-        return
-    from .providers import AUTH_KEYS
-    from .providers._shared import _ENV_KEY_RE
-
-    offenders = sorted(k for k in env if k in AUTH_KEYS)
-    if offenders:
-        raise HTTPException(400, f"{where}: auth keys {offenders} must be sent "
-                                 "via 'secrets', not 'env' (env is stored plain "
-                                 "and returned by GET).")
-    bad_names = sorted(k for k in env if not (isinstance(k, str) and _ENV_KEY_RE.match(k)))
-    if bad_names:
-        raise HTTPException(400, f"{where}: invalid env var name(s) {bad_names}; "
-                                 "must match [A-Za-z_][A-Za-z0-9_]*")
-
-
 def _merge_top_level_config(data: dict, config_data: dict) -> None:
     """Merge SDK top-level keys into config_data if not already present."""
     for key in _CONFIG_KEYS:
@@ -1061,8 +1033,28 @@ def _merge_top_level_config(data: dict, config_data: dict) -> None:
             config_data[key] = data[key]
 
 
-# Sentinel distinguishing "env key not present" from "env: {}" in the request body.
-_ENV_MISSING = object()
+def _coerce_env_dict(d: object, where: str) -> dict[str, str]:
+    """Coerce a raw env/secrets value to a str→str dict.
+
+    Non-dict inputs (null, string, list, …) collapse to ``{}``.
+    Non-string keys are silently dropped.  Non-POSIX keys raise 400.
+    String/int/float values are coerced via str(); other value types are
+    silently dropped.
+    """
+    from .providers._shared import _ENV_KEY_RE
+
+    if not isinstance(d, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in d.items():
+        if not isinstance(k, str):
+            continue
+        if not _ENV_KEY_RE.match(k):
+            raise HTTPException(400, f"{where}: invalid env var name {k!r}; "
+                                     "must match [A-Za-z_][A-Za-z0-9_]*")
+        if isinstance(v, (str, int, float)):
+            out[k] = str(v)
+    return out
 
 
 def _pop_env_and_secrets(
@@ -1085,29 +1077,18 @@ def _pop_env_and_secrets(
     sandbox.  The provider-layer ``_build_env_prefix`` re-validates as
     defence-in-depth.
     """
-    from .providers._shared import _ENV_KEY_RE
+    from .providers import AUTH_KEYS
 
-    def _coerce(d: object, where: str) -> dict[str, str]:
-        if not isinstance(d, dict):
-            return {}
-        out: dict[str, str] = {}
-        for k, v in d.items():
-            if not isinstance(k, str):
-                continue
-            if not _ENV_KEY_RE.match(k):
-                raise HTTPException(400, f"{where}: invalid env var name {k!r}; "
-                                         "must match [A-Za-z_][A-Za-z0-9_]*")
-            if isinstance(v, (str, int, float)):
-                out[k] = str(v)
-        return out
+    env = _coerce_env_dict(data.pop("env"), "request body 'env'") if "env" in data else None
+    secrets = _coerce_env_dict(data.pop("secrets"), "request body 'secrets'") if "secrets" in data else None
 
-    def _extract(key: str) -> dict[str, str] | None:
-        raw = data.pop(key, _ENV_MISSING)
-        return None if raw is _ENV_MISSING else _coerce(raw, f"request body {key!r}")
+    if env:
+        offenders = sorted(k for k in env if k in AUTH_KEYS)
+        if offenders:
+            raise HTTPException(400, f"request body 'env': auth keys {offenders} must be sent "
+                                     "via 'secrets', not 'env' (env is stored plain "
+                                     "and returned by GET).")
 
-    env = _extract("env")
-    secrets = _extract("secrets")
-    _forbid_auth_keys_in_env(env, "request body 'env'")
     return env, secrets
 
 
