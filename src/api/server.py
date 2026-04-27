@@ -279,6 +279,33 @@ _SSE_MAX_IDLE_RETRIES = int(os.environ.get("SSE_MAX_IDLE_RETRIES", "2"))
 # daytona preview URL.
 
 
+async def _stop_orphaned_sandbox(sandbox_id: str) -> None:
+    """Stop the supervisor for ``sandbox_id`` if no remaining sessions reference it.
+
+    Snapshots first so durability survives the stop. For local/docker this
+    kills the process; for daytona it stops the workspace (filesystem
+    preserved for resume). Exceptions are logged, not raised — caller is
+    a background reaper.
+    """
+    if any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+        return
+    _sandbox_locks.pop(sandbox_id, None)
+    instance = _INSTANCES.pop(sandbox_id, None)
+    if instance is None:
+        return
+    log.info("idle reaper: stopping sandbox %s (provider=%s)",
+             sandbox_id, instance.provider)
+    await _request_supervisor_snapshot(instance)
+    try:
+        await stop_instance(instance)
+        rec = await get_sandbox(sandbox_id)
+        if rec is not None and rec.status != STATUS_STOPPED:
+            rec.status = STATUS_STOPPED
+            await upsert_sandbox(rec)
+    except Exception as e:
+        log.warning("reaper: failed to stop sandbox %s: %s", sandbox_id, e)
+
+
 async def _reap_one_tick(now: float) -> None:
     """Single iteration of the reap loop, factored out for testability.
 
@@ -313,27 +340,7 @@ async def _reap_one_tick(now: float) -> None:
         )
         sandbox_id = state.sandbox_id
         await _shutdown_session_state(state, remove=True, mark_idle_at=now)
-        # If no other sessions use this sandbox, stop the supervisor.
-        # For local/docker: kills the process (no filesystem to preserve).
-        # For daytona: stops the workspace (filesystem preserved for resume).
-        if not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
-            _sandbox_locks.pop(sandbox_id, None)
-            instance = _INSTANCES.pop(sandbox_id, None)
-            if instance:
-                log.info("idle reaper: stopping sandbox %s (provider=%s)",
-                         sandbox_id, instance.provider)
-                # Snapshot BEFORE stop so next boot's session/load finds
-                # the JSONLs on the volume (per-turn snapshot was dropped).
-                await _request_supervisor_snapshot(instance)
-                try:
-                    await stop_instance(instance)
-                    rec = await get_sandbox(sandbox_id)
-                    if rec is not None and rec.status != STATUS_STOPPED:
-                        rec.status = STATUS_STOPPED
-                        await upsert_sandbox(rec)
-                except Exception as e:
-                    log.warning("reaper: failed to stop sandbox %s: %s",
-                                sandbox_id, e)
+        await _stop_orphaned_sandbox(sandbox_id)
 
 
 async def _idle_reaper():

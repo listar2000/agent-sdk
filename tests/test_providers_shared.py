@@ -240,16 +240,16 @@ def test_pop_env_and_secrets_rejects_shell_metachar_keys():
         assert exc.value.status_code == 400
 
 
-def test_forbid_auth_keys_in_env_also_rejects_shell_metachars():
-    """``_forbid_auth_keys_in_env`` guards ``config.env`` for POST /agents
-    and POST /sandboxes. Both auth-key smuggling and shell-metachar
-    keys must 400."""
+def test_pop_env_and_secrets_rejects_auth_key_smuggling():
+    """``_pop_env_and_secrets`` must 400 when a known credential key (e.g.
+    ANTHROPIC_API_KEY) is passed in ``env``.  Credentials must go in
+    ``secrets`` instead, because ``env`` is stored plain and returned by GET."""
     from fastapi import HTTPException
 
-    from api.server import _forbid_auth_keys_in_env
+    from api.server import _pop_env_and_secrets
 
     with pytest.raises(HTTPException) as exc:
-        _forbid_auth_keys_in_env({"FOO;x": "v"}, "test")
+        _pop_env_and_secrets({"env": {"ANTHROPIC_API_KEY": "x"}})
     assert exc.value.status_code == 400
 
 
