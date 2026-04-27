@@ -186,6 +186,16 @@ class Agent:
         text = agent.run("say hello")
     """
 
+    # Constructor kwargs whose attribute name matches the kwarg name. Drives
+    # clone() and from_config(). Special-cased fields (api_url, db, oauth_token,
+    # api_key, secrets) live on differently-named private attrs and are handled
+    # explicitly below.
+    _CLONABLE_FIELDS = (
+        "agent_type", "provider", "model", "cwd", "root", "prompt",
+        "tools", "mcp_servers", "skills", "dockerfile",
+        "volume_id", "pre_start_commands", "shared_mounts",
+    )
+
     def __init__(
         self,
         name: str,
@@ -260,10 +270,8 @@ class Agent:
     @classmethod
     def from_config(cls, name: str, config: dict[str, Any], **kwargs) -> "Agent":
         """Create an agent from a config dict."""
-        valid_keys = {"agent_type", "model", "prompt", "cwd", "root", "tools",
-                      "mcp_servers", "skills", "dockerfile", "provider",
-                      "volume_id", "pre_start_commands", "shared_mounts", "secrets"}
-        agent_kwargs = {k: v for k, v in config.items() if k in valid_keys}
+        valid = {*cls._CLONABLE_FIELDS, "secrets"}
+        agent_kwargs = {k: v for k, v in config.items() if k in valid}
         agent_kwargs.update(kwargs)
         return cls(name=name, **agent_kwargs)
 
@@ -287,26 +295,14 @@ class Agent:
 
     def clone(self, name: str | None = None, **overrides) -> "Agent":
         """Create a copy of this agent with optional config overrides."""
-        kwargs = {
-            "agent_type": self.agent_type,
-            "provider": self.provider,
-            "model": self.model,
-            "cwd": self.cwd,
-            "root": self.root,
-            "prompt": self.prompt,
+        kwargs: dict[str, Any] = {f: getattr(self, f) for f in self._CLONABLE_FIELDS}
+        kwargs.update({
             "api_url": self._api_url,
-            "tools": self.tools,
-            "mcp_servers": self.mcp_servers,
-            "skills": self.skills,
             "db": None,  # don't share persistence
-            "dockerfile": self.dockerfile,
             "oauth_token": self._oauth_token,
             "api_key": self._api_key,
-            "volume_id": self.volume_id,
-            "pre_start_commands": self.pre_start_commands,
-            "shared_mounts": self.shared_mounts,
             "secrets": dict(self._user_secrets) if self._user_secrets else None,
-        }
+        })
         kwargs.update(overrides)
         clone_name = name or f"{self.name}-clone"
         return Agent(clone_name, **kwargs)
