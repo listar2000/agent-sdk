@@ -308,19 +308,19 @@ class Agent:
         return Agent(clone_name, **kwargs)
 
     def _registration_payload(self) -> dict[str, Any]:
-        config: dict[str, Any] = {"name": self.name, "agent_type": self.agent_type}
-        for key in ("provider", "model", "cwd", "root", "prompt", "tools",
-                    "volume_id", "pre_start_commands", "shared_mounts"):
+        config: dict[str, Any] = {"name": self.name}
+        # Pass through every Agent field that's set. agent_type is always
+        # non-None (validated in __init__). dockerfile is special-cased
+        # below: server expects the file's CONTENTS under a different key.
+        for key in self._CLONABLE_FIELDS:
+            if key == "dockerfile":
+                continue
             val = getattr(self, key)
             if val is not None:
                 config[key] = val
         if self.dockerfile is not None:
             # Send file content so remote servers can use it
             config["dockerfile_content"] = Path(self.dockerfile).read_text()
-        if self.mcp_servers is not None:
-            config["mcp_servers"] = self.mcp_servers
-        if self.skills is not None:
-            config["skills"] = self.skills
         # Credentials ride through the standard ``secrets`` channel — the
         # server pops env/secrets uniformly via ``_pop_env_and_secrets`` and
         # merges them into the sandbox's ``spawn_env``. No special-case
