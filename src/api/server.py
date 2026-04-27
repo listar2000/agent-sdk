@@ -2310,12 +2310,32 @@ async def _type1_recover(
             log.warning("Type 1 start_sandbox(%s) failed: %s — falling through to Type 2",
                         sandbox_id, e)
             return None
+        url = rec.derive_url()
+        # Wait for the supervisor inside the just-restarted container/process
+        # to bind its port. Local's start_sandbox does this internally; docker's
+        # ``docker start`` returns as soon as the container is up but the node
+        # process inside still needs hundreds of ms to listen. Without this
+        # probe, the immediate rebind that follows races and hits ReadError —
+        # the caller then falls back to a (destructive) full rebuild and the
+        # /message returns 500 even though the supervisor was about to be
+        # ready.
+        from .providers import _wait_for_health
+        if not await _wait_for_health(url, max_retries=20, interval=0.5):
+            log.warning(
+                "Type 1 supervisor at %s did not become healthy after start_sandbox; "
+                "falling through to Type 2", url,
+            )
+            return None
         # Success — rebuild the in-memory ProviderInstance against the
         # same sandbox_ref + port. No DB write needed (the row didn't change).
-        if instance is not None:
-            try: await destroy_instance(instance)
-            except Exception: pass
-        url = rec.derive_url()
+        #
+        # Crucially, do NOT call destroy_instance(old) here. provider
+        # destroy_sandbox is destructive: docker → ``docker rm -f`` the
+        # container we just restarted; local → pops _PROCESSES/_SPAWN_ARGS
+        # for the freshly-respawned ref, untracking it. The old in-memory
+        # ``ProviderInstance`` Python object is GC'd when the caller
+        # overwrites _INSTANCES[sandbox_id] — that's the only cleanup
+        # needed after an in-place restart.
         revived = ProviderInstance(
             provider=provider, url=url, root=rec.root,
             sandbox_id=rec.sandbox_ref, port=rec.listen_port,
@@ -2323,6 +2343,12 @@ async def _type1_recover(
         if provider == "local":
             from .providers.local import _PROCESSES as _LOCAL_PROCS
             revived.process = _LOCAL_PROCS.get(rec.sandbox_ref)
+        if provider == "docker":
+            # Carry the container_id forward so a later Type 2 transition
+            # still has the right ID to act on.
+            revived.container_id = (
+                instance.container_id if instance is not None else rec.sandbox_ref
+            )
         return revived
 
     if provider == "daytona":
