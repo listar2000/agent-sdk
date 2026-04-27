@@ -529,26 +529,20 @@ async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
         "current_sandbox_id=EXCLUDED.current_sandbox_id",
         "inner_session_id=EXCLUDED.inner_session_id",
     ]
-    if volume_id is not None:
-        cols.append("volume_id")
-        vals.append(volume_id)
-        update_parts.append("volume_id=EXCLUDED.volume_id")
-    if env is not None:
-        cols.append("env")
-        vals.append(Json(env))
-        update_parts.append("env=EXCLUDED.env")
-    if secrets is not None:
-        cols.append("secrets")
-        vals.append(Json(secrets))
-        update_parts.append("secrets=EXCLUDED.secrets")
-    if cwd is not None:
-        cols.append("cwd")
-        vals.append(cwd)
-        update_parts.append("cwd=EXCLUDED.cwd")
-    if pre_start_commands is not None:
-        cols.append("pre_start_commands")
-        vals.append(Json(pre_start_commands))
-        update_parts.append("pre_start_commands=EXCLUDED.pre_start_commands")
+    # (column_name, raw_value, value_transform) — included only when raw is not None
+    optional = [
+        ("volume_id", volume_id, lambda v: v),
+        ("env", env, Json),
+        ("secrets", secrets, Json),
+        ("cwd", cwd, lambda v: v),
+        ("pre_start_commands", pre_start_commands, Json),
+    ]
+    for col, raw, transform in optional:
+        if raw is None:
+            continue
+        cols.append(col)
+        vals.append(transform(raw))
+        update_parts.append(f"{col}=EXCLUDED.{col}")
     placeholders = ", ".join(["%s"] * len(cols))
     col_list = ", ".join(cols)
     update_sql = ", ".join(update_parts)
