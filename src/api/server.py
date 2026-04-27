@@ -1426,10 +1426,10 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
                 )
 
     try:
-        if vol.provider == "daytona":
-            await _providers_mod.delete_daytona_volume(vol.provider_ref)
-        else:
-            await _providers_mod.delete_volume(vol.provider, vol.provider_ref)
+        # daytona.delete_volume is aliased to delete_daytona_volume; the
+        # dispatcher (_providers_mod.delete_volume) routes correctly for
+        # all providers, so no need to special-case daytona here.
+        await _providers_mod.delete_volume(vol.provider, vol.provider_ref)
     except Exception as e:
         # Swallow "gone already"-class errors (volume missing on provider side
         # — the DB row is the last copy). For Daytona also swallow 403s: the
