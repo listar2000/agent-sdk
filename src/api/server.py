@@ -1771,27 +1771,47 @@ async def snapshot_sandbox_route(sandbox_id: str):
 
 @app.post("/sandboxes/{sandbox_id}/start")
 async def start_sandbox_route(sandbox_id: str):
-    record = await _require_sandbox(sandbox_id)
-    try:
-        url, _ = await _ensure_sandbox_alive(sandbox_id, record, agent_type="claude")
-    except Exception as e:
-        # 502 matches POST /sandboxes — provider failures are upstream
-        # faults, not server bugs (500).
-        raise HTTPException(502, f"failed to start sandbox: {e}")
+    """**Type 1 only** — revive an existing sandbox in place.
 
-    # Re-fetch the record: _ensure_sandbox_alive may have created a replacement
-    # sandbox (for Daytona terminal-state / docker missing) and written a new
-    # sandbox_ref + listen_port to the DB. Upserting our local snapshot would
-    # clobber those updates with a stale sandbox_ref pointing at the dead
-    # container. Fresh fetch is authoritative.
-    fresh = await get_sandbox(sandbox_id)
-    if fresh is None:
-        # Shouldn't happen — _ensure_sandbox_alive just succeeded — but be
-        # defensive: fall through to returning the working URL.
-        return {"status": "running", "url": url}
-    fresh.status = "running"
-    await upsert_sandbox(fresh)
-    return {"status": "running", "url": url}
+    Calls ``_type1_recover`` directly (no Type 2 fallback). If the
+    underlying provider sandbox is missing or unrecoverable, returns
+    ``409 Conflict`` rather than silently provisioning a replacement.
+
+    Use ``POST /sessions/{id}/reset-sandbox`` for an explicit Type 2
+    replacement, or ``POST /sandboxes`` to create a fresh sandbox.
+    """
+    record = await _require_sandbox(sandbox_id)
+    async with _get_sandbox_lock(sandbox_id):
+        # Fast path — already running.
+        instance = _INSTANCES.get(sandbox_id)
+        if instance is not None and await _instance_is_alive(instance):
+            return {"status": "running", "url": instance.url}
+
+        spawn_env = await _spawn_env_for_sandbox(sandbox_id)
+        try:
+            revived = await _type1_recover(
+                sandbox_id, record, instance, "claude", spawn_env,
+            )
+        except Exception as e:
+            # 502 matches POST /sandboxes — provider failures are upstream
+            # faults, not server bugs (500).
+            raise HTTPException(502, f"failed to start sandbox: {e}")
+
+        if revived is None:
+            raise HTTPException(
+                409,
+                "sandbox cannot be started in place — the underlying provider "
+                "sandbox is missing or unrecoverable. Use "
+                "POST /sessions/{id}/reset-sandbox for a Type 2 replacement, "
+                "or POST /sandboxes to create a fresh one.",
+            )
+
+        _INSTANCES[sandbox_id] = revived
+        # Type 1 keeps the same sandbox_ref + listen_port — the row only
+        # needs its status flipped back to running.
+        record.status = "running"
+        await upsert_sandbox(record)
+        return {"status": "running", "url": revived.url}
 
 
 # ---------------------------------------------------------------------------
@@ -2130,23 +2150,73 @@ async def _instance_is_alive(inst: ProviderInstance) -> bool:
         return False
 
 
-async def _replace_sandbox_inplace(
+# ─────────────────────────────────────────────────────────────────────────────
+# Sandbox recovery — two flavors, one rule:
+#
+#   *If the underlying sandbox/VM still exists, revive it in place (Type 1).
+#    Otherwise provision a fresh one against the same DB row (Type 2).*
+#
+# Dispatch lives in ``_ensure_sandbox_alive``. It calls ``_type1_recover``
+# first; only if that returns ``None`` does it fall through to
+# ``_type2_recover`` (Type 2 only by construction).
+#
+#   Type 1 — in-place revive, same sandbox_ref. Cheap.
+#     Applicable when:
+#       • port-based + provider says status="stopped"
+#             → ``provider.start_sandbox(ref)`` unpauses the container,
+#               supervisor restarts on the same port.
+#       • daytona — sandbox_ref still resolves
+#             → ``restart_daytona_supervisor(ref)`` respawns the supervisor
+#               process inside the existing daytona sandbox (and starts the
+#               sandbox itself if it's in "stopped" state — that case is
+#               handled inside the function).
+#     Side effects:
+#       • pre_start_commands are NOT re-run — original side effects are still
+#         on the local filesystem.
+#       • snapshot restore is short-circuited by the
+#         ``/tmp/agent-sdk-bootstrapped`` sentinel in supervisor.js — the
+#         local ext4 already has the latest workspace bytes.
+#
+#   Type 2 — replacement, new sandbox_ref. Expensive.
+#     Triggered when Type 1 is not applicable or fails:
+#       • port-based + status missing/error/running, or start_sandbox raised
+#       • daytona + restart_daytona_supervisor raised an error that
+#         ``_should_replace_daytona_sandbox`` classifies as "this sandbox
+#         is gone — start over"
+#     Side effects:
+#       • pre_start_commands ARE re-run (replayed from the persisted session
+#         row at provision time — see ``_build_pre_start_commands``).
+#       • snapshot.tar (workspace, lifecycle-snapshotted) and agent_memory.tar
+#         (per-turn JSONLs) are extracted on first boot to repopulate the
+#         agent's HOME on the fresh local ext4.
+#
+# The DB ``sandboxes.id`` row stays stable across both — Type 1 changes
+# nothing; Type 2 rewrites ``sandbox_ref`` (and possibly ``listen_port``) but
+# preserves ``volume_id``, ``subpath``, ``dockerfile``, ``shared_mounts``.
+# Sessions point at the row by id, so no session ever sees a Type 2 transition
+# as anything more than a ``sandbox_reattach`` event before the next prompt.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _type2_recover(
     sandbox_id: str, rec: SandboxRecord, agent_type: str,
     spawn_env: dict,
-) -> tuple[ProviderInstance, bool]:
-    """Provision a fresh provider instance for ``sandbox_id``, keeping the
-    same DB row. For port-based providers always just provision_sandbox.
-    For daytona, try restart_daytona_supervisor first (supervisor died
-    inside a live sandbox); only on unrecoverable errors create a brand-new
-    daytona sandbox (replaced=True).
+) -> ProviderInstance:
+    """**Type 2 replacement** — provision a fresh provider instance for
+    ``sandbox_id``, keeping the same DB row.
 
-    dockerfile + shared_mounts come from the sandbox row itself — the
-    sandbox owns its provisioning identity, so a replacement always gets
-    the same image + mount layout.
+    Called from ``_ensure_sandbox_alive`` only after Type 1 has been ruled
+    out (sandbox missing/unrecoverable). The DB ``sandboxes.id`` row stays
+    stable; ``sandbox_ref`` (and possibly ``listen_port``) are rewritten
+    to point at the fresh provider resource. ``dockerfile`` +
+    ``shared_mounts`` + ``volume_id`` + ``subpath`` come from the existing
+    row — the sandbox owns its provisioning identity, so a replacement
+    always gets the same image + mount layout.
     """
     provider = rec.provider
     dockerfile = rec.dockerfile
     shared_mounts = list(rec.shared_mounts) if rec.shared_mounts else None
+
     if provider in PORT_BASED_PROVIDERS:
         if not rec.volume_id:
             raise RuntimeError(f"Sandbox {sandbox_id} has no volume_id")
@@ -2161,20 +2231,10 @@ async def _replace_sandbox_inplace(
                 shared_mounts=shared_mounts,
             )
         except Exception as e:
-            raise RuntimeError(f"Failed to restart sandbox: {e}")
-        return inst, False
+            raise RuntimeError(f"Failed to provision Type 2 replacement sandbox: {e}")
+        return inst
 
-    # Daytona: try supervisor-only restart first; full replace on unrecoverable.
-    from .providers import restart_daytona_supervisor
-    try:
-        return await restart_daytona_supervisor(
-            rec.sandbox_ref, agent_type, root=rec.root, spawn_env=spawn_env,
-        ), False
-    except Exception as e:
-        if not _should_replace_daytona_sandbox(e):
-            raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
-        log.warning("daytona sandbox %s unrecoverable (%s); creating replacement",
-                    rec.sandbox_ref, e)
+    # Daytona Type 2: brand-new daytona sandbox.
     dt_volume_ref = None
     if rec.volume_id:
         v = await get_volume(rec.volume_id)
@@ -2211,7 +2271,86 @@ async def _replace_sandbox_inplace(
                 f"Failed to start supervisor on replacement daytona sandbox: {e}"
             )
         inst.url = inst_url
-    return inst, True
+    return inst
+
+
+async def _type1_recover(
+    sandbox_id: str,
+    rec: SandboxRecord,
+    instance: ProviderInstance | None,
+    agent_type: str,
+    spawn_env: dict[str, str],
+) -> ProviderInstance | None:
+    """Attempt **Type 1** in-place revive — preserve the existing sandbox.
+
+    Returns a live ``ProviderInstance`` on success, ``None`` if Type 1 is
+    not applicable (caller should fall through to Type 2). Raises only on
+    errors that should NOT be retried as Type 2 (e.g. a daytona sandbox
+    that's hard-broken in a way a fresh sandbox won't fix).
+
+    Applicability rule: **the sandbox itself still exists.**
+      * port-based + status="stopped":
+            ``start_sandbox(ref)`` — unpause the container, supervisor
+            restarts on the same ref + port.
+      * daytona (any state where sandbox_ref still resolves):
+            ``restart_daytona_supervisor(ref)`` — respawn the supervisor
+            process inside the existing daytona sandbox; the function
+            internally handles "sandbox in stopped state" by issuing
+            a sandbox.start() before respawning.
+
+    Returns None when:
+      * port-based + status missing/error/running (running is a fast-path
+        miss caught by the caller before this function runs)
+      * port-based + start_sandbox raised
+      * daytona Type 1 raised an error that ``_should_replace_daytona_sandbox``
+        classifies as "this sandbox is gone — Type 2 will heal it"
+    """
+    provider = rec.provider
+
+    if provider in PORT_BASED_PROVIDERS:
+        try:
+            status = await _providers_mod.get_sandbox_status(provider, rec.sandbox_ref)
+        except Exception as e:
+            log.info("get_sandbox_status(%s) raised: %s — Type 1 unavailable, fall through to Type 2",
+                     sandbox_id, e)
+            return None
+        if status != "stopped":
+            return None
+        try:
+            await _providers_mod.start_sandbox(provider, rec.sandbox_ref)
+        except Exception as e:
+            log.warning("Type 1 start_sandbox(%s) failed: %s — falling through to Type 2",
+                        sandbox_id, e)
+            return None
+        # Success — rebuild the in-memory ProviderInstance against the
+        # same sandbox_ref + port. No DB write needed (the row didn't change).
+        if instance is not None:
+            try: await destroy_instance(instance)
+            except Exception: pass
+        url = rec.derive_url()
+        revived = ProviderInstance(
+            provider=provider, url=url, root=rec.root,
+            sandbox_id=rec.sandbox_ref, port=rec.listen_port,
+        )
+        if provider == "local":
+            from .providers.local import _PROCESSES as _LOCAL_PROCS
+            revived.process = _LOCAL_PROCS.get(rec.sandbox_ref)
+        return revived
+
+    if provider == "daytona":
+        from .providers import restart_daytona_supervisor
+        try:
+            return await restart_daytona_supervisor(
+                rec.sandbox_ref, agent_type, root=rec.root, spawn_env=spawn_env,
+            )
+        except Exception as e:
+            if _should_replace_daytona_sandbox(e):
+                log.warning("daytona sandbox %s unrecoverable (%s); falling through to Type 2",
+                            rec.sandbox_ref, e)
+                return None
+            raise RuntimeError(f"Failed to recover daytona sandbox: {e}")
+
+    return None
 
 
 async def _ensure_sandbox_alive(
@@ -2220,11 +2359,22 @@ async def _ensure_sandbox_alive(
     agent_type: str = "claude",
     spawn_env: dict[str, str] | None = None,
 ) -> tuple[str, bool]:
-    """Ensure the supervisor for ``sandbox_id`` is reachable. Restart if needed.
+    """Ensure the supervisor for ``sandbox_id`` is reachable. Single dispatch
+    point for both Type 1 (in-place revive) and Type 2 (replacement) recovery.
 
-    Returns ``(url, replaced)`` where replaced=True means a fresh Daytona
-    sandbox had to be created (new daytona sandbox_ref). Port-based providers
-    always keep the same sandbox_ref since their restart is in-place.
+    Returns ``(url, replaced)``. ``replaced=True`` ⇔ Type 2 ran, meaning the
+    underlying sandbox_ref is brand-new. Currently no caller reads the flag,
+    but it's preserved as a telemetry signal.
+
+    Dispatch:
+        1. Fast path — instance alive in ``_INSTANCES``: return.
+        2. **Type 1** via ``_type1_recover`` — if the existing sandbox can
+           be revived, use it.
+        3. **Type 2** via ``_type2_recover`` — provision a fresh
+           sandbox against the same DB row + same volume.
+
+    Locked under ``_sandbox_lock(sandbox_id)`` so concurrent callers don't
+    double-recover.
     """
     provider = sandbox_record.provider
     async with _get_sandbox_lock(sandbox_id):
@@ -2232,6 +2382,7 @@ async def _ensure_sandbox_alive(
         if fresh is None:
             raise RuntimeError("Sandbox was deleted")
 
+        # ── Fast path ────────────────────────────────────────────────
         instance = _INSTANCES.get(sandbox_id)
         if instance is not None and await _instance_is_alive(instance):
             return instance.url, False
@@ -2239,48 +2390,22 @@ async def _ensure_sandbox_alive(
         if spawn_env is None:
             spawn_env = await _spawn_env_for_sandbox(sandbox_id)
 
-        # Port-based: try in-place start on the existing sandbox_ref before
-        # falling through to provision_sandbox. For local this respawns
-        # the supervisor using cached spawn args; for docker it runs
-        # ``docker start`` — both keep the ref stable.
-        if provider in PORT_BASED_PROVIDERS:
-            try:
-                status = await _providers_mod.get_sandbox_status(provider, fresh.sandbox_ref)
-            except Exception as e:
-                log.info("get_sandbox_status(%s) raised: %s — will reprovision", sandbox_id, e)
-                status = "missing"
-            if status == "stopped":
-                try:
-                    await _providers_mod.start_sandbox(provider, fresh.sandbox_ref)
-                except Exception as e:
-                    log.warning("start_sandbox(%s) failed: %s — reprovisioning", sandbox_id, e)
-                else:
-                    if instance is not None:
-                        try: await destroy_instance(instance)
-                        except Exception: pass
-                    url = sandbox_record.derive_url()
-                    revived = ProviderInstance(
-                        provider=provider, url=url, root=sandbox_record.root,
-                        sandbox_id=fresh.sandbox_ref, port=sandbox_record.listen_port,
-                    )
-                    if provider == "local":
-                        from .providers.local import _PROCESSES as _LOCAL_PROCS
-                        revived.process = _LOCAL_PROCS.get(fresh.sandbox_ref)
-                    _INSTANCES[sandbox_id] = revived
-                    return url, False
+        # ── Type 1: in-place revive ──────────────────────────────────
+        revived = await _type1_recover(sandbox_id, fresh, instance, agent_type, spawn_env)
+        if revived is not None:
+            _INSTANCES[sandbox_id] = revived
+            log.info("Type 1 revive succeeded for sandbox %s (provider=%s)", sandbox_id, provider)
+            return revived.url, False
 
-        # Full replacement path. For port-based providers, tear down the
-        # old process/container so its port is free for the new one. For
-        # daytona, the replacement branch inside _replace_sandbox_inplace
-        # wants to restart the supervisor INSIDE the existing sandbox —
-        # destroying the instance here would delete that sandbox out from
-        # under it, forcing a brand-new-sandbox fallback and (more
-        # importantly) breaking the subscriber-preserving rebind path.
+        # ── Type 2: provision a replacement ──────────────────────────
+        # Tear down the dead port-based instance so its port is free for the
+        # new one. Daytona's stale ProviderInstance is just a URL holder;
+        # nothing to destroy.
         if instance is not None and provider in PORT_BASED_PROVIDERS:
             try: await destroy_instance(instance)
             except Exception: pass
-        log.info("auto-restarting sandbox %s (provider=%s)", sandbox_id, provider)
-        new_instance, replaced = await _replace_sandbox_inplace(
+        log.info("Type 2 replacement for sandbox %s (provider=%s)", sandbox_id, provider)
+        new_instance = await _type2_recover(
             sandbox_id, fresh, agent_type, spawn_env,
         )
         _INSTANCES[sandbox_id] = new_instance
@@ -2293,7 +2418,7 @@ async def _ensure_sandbox_alive(
             dockerfile=fresh.dockerfile,
             shared_mounts=list(fresh.shared_mounts or []),
         ))
-        return new_instance.url, replaced
+        return new_instance.url, True
 
 
 

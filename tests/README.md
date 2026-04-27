@@ -144,7 +144,7 @@ it (daytona is 2-phase: `create_sandbox` returns `url=""` and
 /events stream.
 
 **Specific failure this catches:** if
-`_replace_sandbox_inplace`'s daytona replacement branch forgets to
+`_type2_recover`'s daytona replacement branch forgets to
 call `ensure_supervisor_url` on the freshly-created sandbox, the
 rebuild path builds `AcpClient("")` and httpx raises
 `UnsupportedProtocol: Request URL is missing an 'http://' or
@@ -271,7 +271,7 @@ If you touch any of:
   skipping it was the bug that broke #11)
 - `delete_sandbox_route` (the `force=True` + `current_sandbox_id=NULL`
   invariant)
-- `_replace_sandbox_inplace` — especially the daytona replacement
+- `_type2_recover` — especially the daytona replacement
   branch that must call `ensure_supervisor_url` on the fresh sandbox
   (the bug that broke #10)
 - `ensure_supervisor_url` or `restart_daytona_supervisor` in any provider

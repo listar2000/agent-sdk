@@ -106,13 +106,32 @@ const args = parseArgs(process.argv);
 // Ensure args.root exists and, if a snapshot is configured, restore the
 // previous workspace before starting ACP.
 //
-// Daytona-only path. Idempotent for both fresh sandboxes (empty root →
-// snapshot populates it) and stop/restart (local /home/daytona already
-// has the same state, tar extract overlays it harmlessly). Using "always
-// restore when snapshot exists" is simpler than trying to detect
-// fresh-vs-restarted: Daytona VM images pre-populate /home/daytona with
-// dotfiles (.bashrc, etc.), so a readdir-empty check false-negatives on
-// a freshly provisioned sandbox and we'd fail to restore the workspace.
+// Two boot modes (called "Type 1" / "Type 2" in server.py — see the block
+// above _type2_recover):
+//
+//   Type 1 — supervisor restart inside an EXISTING VM (daytona
+//            restart_daytona_supervisor / port-based start_sandbox).
+//            args.root on local ext4 already has the latest workspace
+//            bytes from the previous supervisor's writes; restoring from
+//            the volume tarballs is pure waste (potentially hundreds of
+//            MB of read+write on snapshot.tar) and adds 15s of FUSE-poll
+//            wait if the cold tarball isn't already visible.
+//
+//   Type 2 — fresh VM, blank args.root. The volume tarballs are the
+//            only way to repopulate session+workspace state.
+//
+// We distinguish the two with a sentinel file at SUPERVISOR_BOOT_MARKER:
+//   - /tmp survives a Type 1 boot (same VM ⇒ same /tmp)
+//   - /tmp is wiped on Type 2 (new VM ⇒ blank /tmp)
+// So the sentinel cleanly says "this VM has already been bootstrapped;
+// skip the redundant restore." Cheaper than a server-side `--fresh` arg
+// and doesn't depend on Daytona's image-level dotfile pre-population
+// (which used to make readdir-empty heuristics false-negative on Type 2).
+const SUPERVISOR_BOOT_MARKER = "/tmp/agent-sdk-bootstrapped";
+const isWarmRestart = (() => {
+  try { return fs.existsSync(SUPERVISOR_BOOT_MARKER); }
+  catch { return false; }
+})();
 try {
   fs.mkdirSync(args.root, { recursive: true });
 } catch (e) {
@@ -151,9 +170,17 @@ function _snapshotVisible(path, timeoutMs) {
   return false;
 }
 
-if (args.snapshotPath) {
-  // Layer 1: cold restore (full HOME). Best-effort — fresh sandboxes
-  // don't have this and it's fine.
+if (args.snapshotPath && isWarmRestart) {
+  // Type 1 boot — local ext4 already holds the latest workspace bytes from
+  // the previous supervisor in this VM. Skip both restore tiers; they would
+  // re-extract the exact same state we already have on disk.
+  log(`Type 1 boot detected (sentinel ${SUPERVISOR_BOOT_MARKER} present); skipping snapshot restore`);
+} else if (args.snapshotPath) {
+  // Type 2 boot — blank /home/daytona on a fresh VM. The volume tarballs
+  // are the only way to repopulate state.
+  //
+  // Layer 1: cold restore (full HOME). Best-effort — fresh agents that have
+  // never been snapshotted don't have this and it's fine.
   const coldVisible = _snapshotVisible(args.snapshotPath, 15000);
   if (coldVisible) {
     log(`restoring filesystem_cache from ${args.snapshotPath}`);
@@ -182,6 +209,15 @@ if (args.snapshotPath) {
       log(`agent_memory restore exited rc=${r.status}; continuing`);
     }
   }
+}
+
+// Drop the sentinel so the next supervisor boot inside this VM can detect
+// it as a Type 1 restart. /tmp is wiped on a fresh VM (Type 2), so the
+// sentinel correctly disappears in that case.
+try {
+  fs.writeFileSync(SUPERVISOR_BOOT_MARKER, String(Date.now()));
+} catch (e) {
+  log(`failed to write boot sentinel ${SUPERVISOR_BOOT_MARKER}: ${e.message}`);
 }
 
 // The ACP child's HOME must match args.root so Claude Code's
