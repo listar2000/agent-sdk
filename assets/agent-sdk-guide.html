@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent SDK — Developer Guide</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0f1117;
+    color: #e6edf3;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    padding: 60px;
+    min-height: 100vh;
+  }
+
+  .page-wrap { max-width: 960px; margin: 0 auto; }
+
+  .page-header { margin-bottom: 56px; }
+  .page-header h1 {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: #e6edf3;
+    margin-bottom: 8px;
+  }
+  .page-header .subtitle { font-size: 15px; color: #8b949e; margin-bottom: 24px; }
+
+  .toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .toc a {
+    font-size: 12px;
+    color: #60a5fa;
+    text-decoration: none;
+    background: rgba(59,130,246,0.08);
+    border: 1px solid rgba(59,130,246,0.2);
+    padding: 3px 10px;
+    border-radius: 20px;
+    transition: background 0.15s;
+  }
+  .toc a:hover { background: rgba(59,130,246,0.18); }
+
+  .section { margin-bottom: 64px; }
+  .section-header { margin-bottom: 20px; }
+  .section-header h2 {
+    font-size: 20px;
+    font-weight: 600;
+    color: #e6edf3;
+    letter-spacing: -0.3px;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .section-header h2 .section-icon {
+    width: 28px; height: 28px;
+    border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .section-header .section-sub { font-size: 13px; color: #6b7280; }
+
+  .subhead {
+    font-size: 14px;
+    font-weight: 600;
+    color: #d1d5db;
+    margin: 28px 0 12px;
+    letter-spacing: -0.2px;
+  }
+
+  .card {
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.08);
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+
+  .card-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: #4b5563;
+    padding: 12px 18px 0;
+  }
+
+  pre {
+    background: rgba(255,255,255,0.03);
+    border-top: 1px solid rgba(255,255,255,0.06);
+    padding: 16px 18px;
+    overflow-x: auto;
+    margin: 0;
+  }
+  code {
+    font-family: "SF Mono", "Fira Code", "Fira Mono", "Roboto Mono", monospace;
+    font-size: 12.5px;
+    color: #d1d5db;
+    line-height: 1.7;
+  }
+  pre code { color: #d1d5db; }
+
+  /* syntax highlight tokens */
+  .kw  { color: #ff7b72; }
+  .fn  { color: #d2a8ff; }
+  .st  { color: #a5d6ff; }
+  .cm  { color: #484f58; }
+  .nb  { color: #79c0ff; }
+  .nm  { color: #ffa657; }
+  .op  { color: #8b949e; }
+
+  .prose {
+    font-size: 13.5px;
+    color: #8b949e;
+    line-height: 1.7;
+    padding: 12px 18px;
+  }
+  .prose code {
+    background: rgba(255,255,255,0.07);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 12px;
+    color: #fbbf24;
+  }
+  .prose strong { color: #e6edf3; font-weight: 600; }
+  .prose ul { padding-left: 20px; margin: 8px 0; }
+  .prose li { margin: 4px 0; }
+
+  .param-table { width: 100%; border-collapse: collapse; }
+  .param-table th {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: #4b5563;
+    padding: 8px 18px;
+    text-align: left;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .param-table td {
+    padding: 7px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 12px;
+    vertical-align: top;
+  }
+  .param-table tr:last-child td { border-bottom: none; }
+  .param-name {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #79c0ff;
+    white-space: nowrap;
+  }
+  .param-type {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #6b7280;
+    white-space: nowrap;
+  }
+  .param-default {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #ffa657;
+    font-size: 11px;
+  }
+  .param-desc { color: #6b7280; }
+
+  .event-grid {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 0;
+  }
+  .event-grid .ev-type {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 12px;
+    padding: 7px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    color: #c084fc;
+  }
+  .event-grid .ev-desc {
+    font-size: 12px;
+    color: #6b7280;
+    padding: 7px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .event-grid .ev-type:last-of-type,
+  .event-grid .ev-desc:last-of-type { border-bottom: none; }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .pill {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 4px;
+    line-height: 1.6;
+  }
+  .pill-blue   { background: rgba(59,130,246,0.12); color: #60a5fa; border: 1px solid rgba(59,130,246,0.25); }
+  .pill-green  { background: rgba(34,197,94,0.12);  color: #4ade80; border: 1px solid rgba(34,197,94,0.25); }
+  .pill-purple { background: rgba(168,85,247,0.12); color: #c084fc; border: 1px solid rgba(168,85,247,0.25); }
+  .pill-amber  { background: rgba(245,158,11,0.12); color: #fbbf24; border: 1px solid rgba(245,158,11,0.25); }
+  .pill-red    { background: rgba(239,68,68,0.12);  color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
+
+  .callout {
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: #8b949e;
+    line-height: 1.7;
+    margin: 12px 18px;
+  }
+  .callout code {
+    background: rgba(255,255,255,0.07);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 12px;
+    color: #fbbf24;
+    font-family: "SF Mono", "Fira Code", monospace;
+  }
+  .callout-blue   { background: rgba(59,130,246,0.07); border: 1px solid rgba(59,130,246,0.18); }
+  .callout-amber  { background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.18); }
+  .callout-purple { background: rgba(168,85,247,0.07); border: 1px solid rgba(168,85,247,0.18); }
+
+  @media (max-width: 700px) {
+    body { padding: 24px 16px; }
+    .two-col { grid-template-columns: 1fr; }
+    .event-grid { grid-template-columns: 1fr; }
+    .event-grid .ev-desc { padding-top: 0; border-top: none; }
+  }
+</style>
+</head>
+<body>
+<div class="page-wrap">
+
+  <!-- ── Header ── -->
+  <div class="page-header">
+    <h1>Agent SDK — Developer Guide</h1>
+    <p class="subtitle">Build agents that send messages, stream responses, mount persistent volumes, and survive sandbox restarts.</p>
+    <nav class="toc">
+      <a href="#quickstart">Quick start</a>
+      <a href="#install">Install</a>
+      <a href="#agent-constructor">Agent params</a>
+      <a href="#sending">Sending messages</a>
+      <a href="#events">Events</a>
+      <a href="#resuming">Resuming</a>
+      <a href="#sandbox">Sandbox access</a>
+      <a href="#system-prompt">System prompt</a>
+      <a href="#configure">Live config</a>
+      <a href="#tools-mcp">Tools, MCP, skills</a>
+      <a href="#usage">Token usage</a>
+      <a href="#cred">Credentials</a>
+      <a href="#config-files">Config files</a>
+      <a href="#cleanup">Cleanup</a>
+      <a href="#errors">Error handling</a>
+      <a href="#server-client">ServerClient</a>
+      <a href="#pre-start">pre_start_commands</a>
+      <a href="#full-example">Full example</a>
+    </nav>
+  </div>
+
+  <!-- ── Two clients overview ── -->
+  <div class="section">
+    <div class="card">
+      <div class="prose">
+        <strong>Two clients, two personas.</strong>
+        <ul>
+          <li><code>agent_sdk.Agent</code> — <strong>user</strong>. Owns one session. Streams events, sends messages, resumes, exposes <code>agent.sandbox</code>.</li>
+          <li><code>agent_sdk.ServerClient</code> — <strong>operator</strong>. Stateless REST wrapper. Manages volumes, sessions, files for other people's sessions. Use it for schedulers, admin tools, hive workspace bootstraps.</li>
+        </ul>
+        Pick by persona, not feature: if your code <em>is</em> the user, use <code>Agent</code>; if your code is acting <em>on behalf of</em> users, use <code>ServerClient</code>.
+        <br><br>
+        <em>(There's also a small <code>agent_sdk.Client</code> with a volumes-only API — vestigial, predates <code>ServerClient</code>. Use <code>ServerClient</code> for new code.)</em>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Quick start ── -->
+  <div class="section" id="quickstart">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(59,130,246,0.15);color:#60a5fa">⚡</span>Quick start</h2>
+      <p class="section-sub">Create an agent, send a message, get a response.</p>
+    </div>
+    <div class="card">
+      <div class="card-label">Python</div>
+      <pre><code><span class="kw">import</span> asyncio
+<span class="kw">from</span> <span class="nb">agent_sdk</span> <span class="kw">import</span> <span class="nb">Agent</span>
+
+<span class="kw">async def</span> <span class="fn">main</span>():
+    agent = <span class="fn">Agent</span>(<span class="st">"my-agent"</span>, provider=<span class="st">"local"</span>)
+    text = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Say hello in one sentence."</span>)
+    <span class="fn">print</span>(text)
+
+asyncio.<span class="fn">run</span>(<span class="fn">main</span>())</code></pre>
+    </div>
+    <div class="callout callout-blue">
+      Default <code>api_url</code> is the hosted Railway server. Override with the <code>api_url=</code> kwarg or the <code>AGENT_API_URL</code> env variable. Set <code>api_url="http://localhost:7778"</code> to use a local server.
+    </div>
+  </div>
+
+  <!-- ── Install ── -->
+  <div class="section" id="install">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">📥</span>Install</h2>
+    </div>
+    <div class="card">
+      <pre><code>pip install httpx
+<span class="cm"># If you also need to run a local server:</span>
+pip install fastapi uvicorn psycopg[binary] psycopg_pool</code></pre>
+    </div>
+    <div class="callout callout-blue">
+      Set <code>CLAUDE_CODE_OAUTH_TOKEN</code> (preferred) or <code>ANTHROPIC_API_KEY</code> in your environment so the SDK can forward credentials to the sandbox.
+    </div>
+  </div>
+
+  <!-- ── Constructor ── -->
+  <div class="section" id="agent-constructor">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(168,85,247,0.15);color:#c084fc">🔧</span>Agent constructor parameters</h2>
+      <p class="section-sub">Every parameter accepted by <code style="color:#fbbf24">Agent(...)</code>.</p>
+    </div>
+    <div class="card">
+      <table class="param-table">
+        <thead>
+          <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="param-name">name</td><td class="param-type">str</td><td class="param-default">—</td><td class="param-desc">Agent identifier.</td></tr>
+          <tr><td class="param-name">agent_type</td><td class="param-type">str</td><td class="param-default">"claude"</td><td class="param-desc">One of: <code style="color:#c084fc;font-family:monospace">claude</code>, <code style="color:#c084fc;font-family:monospace">codex</code>, <code style="color:#c084fc;font-family:monospace">opencode</code>, <code style="color:#c084fc;font-family:monospace">gemini</code>, <code style="color:#c084fc;font-family:monospace">cline</code>, <code style="color:#c084fc;font-family:monospace">deepagents</code>, <code style="color:#c084fc;font-family:monospace">openhands</code>, <code style="color:#c084fc;font-family:monospace">goose</code>.</td></tr>
+          <tr><td class="param-name">provider</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Sandbox provider — <code style="color:#4ade80;font-family:monospace">local</code>, <code style="color:#4ade80;font-family:monospace">docker</code>, or <code style="color:#4ade80;font-family:monospace">daytona</code>. Required for new sessions.</td></tr>
+          <tr><td class="param-name">model</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Model override, e.g. <code style="color:#fbbf24;font-family:monospace">"haiku"</code>, <code style="color:#fbbf24;font-family:monospace">"claude-sonnet-4-6"</code>.</td></tr>
+          <tr><td class="param-name">prompt</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">System prompt — injected automatically before the first user message.</td></tr>
+          <tr><td class="param-name">cwd</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Working directory inside the sandbox.</td></tr>
+          <tr><td class="param-name">root</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Sandbox filesystem root. Defaults to <code style="color:#fbbf24;font-family:monospace">/tmp</code> on the server.</td></tr>
+          <tr><td class="param-name">tools</td><td class="param-type">list[str] | None</td><td class="param-default">None</td><td class="param-desc">Names of tools to enable — e.g. <code style="color:#fbbf24;font-family:monospace">["Bash", "Read", "Write"]</code>.</td></tr>
+          <tr><td class="param-name">mcp_servers</td><td class="param-type">dict[str, dict]</td><td class="param-default">None</td><td class="param-desc">MCP server configs keyed by name — see <a href="#tools-mcp" style="color:#60a5fa">below</a>.</td></tr>
+          <tr><td class="param-name">skills</td><td class="param-type">list[str] | dict</td><td class="param-default">None</td><td class="param-desc">npx-style skill sources, e.g. <code style="color:#fbbf24;font-family:monospace">["rllm-org/hive#staging"]</code>.</td></tr>
+          <tr><td class="param-name">dockerfile</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Path to a Dockerfile — its contents are sent to the server for sandbox image build.</td></tr>
+          <tr><td class="param-name">api_url</td><td class="param-type">str | None</td><td class="param-default">env / Railway</td><td class="param-desc">Server URL. Falls back to <code style="color:#fbbf24;font-family:monospace">AGENT_API_URL</code> env or the hosted Railway URL.</td></tr>
+          <tr><td class="param-name">session_id</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Pass to resume an existing session — server looks up everything else.</td></tr>
+          <tr><td class="param-name">sandbox_id</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Pass to attach to an existing sandbox.</td></tr>
+          <tr><td class="param-name">db</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Path to a SQLite file for local session-id persistence.</td></tr>
+          <tr><td class="param-name">oauth_token</td><td class="param-type">str | None</td><td class="param-default">env</td><td class="param-desc">Claude OAuth token. Falls back to <code style="color:#fbbf24;font-family:monospace">CLAUDE_CODE_OAUTH_TOKEN</code>.</td></tr>
+          <tr><td class="param-name">api_key</td><td class="param-type">str | None</td><td class="param-default">env</td><td class="param-desc">Anthropic API key. Falls back to <code style="color:#fbbf24;font-family:monospace">ANTHROPIC_API_KEY</code>.</td></tr>
+          <tr><td class="param-name">volume_id</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Bind the session to an existing volume by ID or name. If omitted, the server uses (or creates) <code style="color:#fbbf24;font-family:monospace">default-{provider}</code>.</td></tr>
+          <tr><td class="param-name">pre_start_commands</td><td class="param-type">list[str] | None</td><td class="param-default">None</td><td class="param-desc">Shell commands run inside the sandbox <strong>before</strong> the supervisor starts. Persisted on the session and re-run on sandbox replacement. See <a href="#pre-start" style="color:#60a5fa">below</a>.</td></tr>
+          <tr><td class="param-name">shared_mounts</td><td class="param-type">list[str] | None</td><td class="param-default">None</td><td class="param-desc">Additional read-only volume names to mount under <code style="color:#fbbf24;font-family:monospace">/mnt/shared/</code> in the sandbox.</td></tr>
+          <tr><td class="param-name">secrets</td><td class="param-type">dict[str, str]</td><td class="param-default">None</td><td class="param-desc">Extra env-var-style secrets injected into the sandbox. Merges with auto-populated <code style="color:#fbbf24;font-family:monospace">CLAUDE_CODE_OAUTH_TOKEN</code> / <code style="color:#fbbf24;font-family:monospace">ANTHROPIC_API_KEY</code>; user-supplied keys win.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Sending messages ── -->
+  <div class="section" id="sending">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">💬</span>Sending messages</h2>
+      <p class="section-sub">Four ways to interact: <code style="color:#fbbf24">arun</code>, <code style="color:#fbbf24">astream</code>, <code style="color:#fbbf24">send</code>, <code style="color:#fbbf24">run</code>.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">arun — full response as a string (most common)</div>
+      <pre><code>response = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Write a haiku about the ocean."</span>)
+<span class="fn">print</span>(response)</code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">astream — stream events as they arrive</div>
+      <pre><code><span class="kw">async for</span> event <span class="kw">in</span> agent.<span class="fn">astream</span>(<span class="st">"Tell me a long story."</span>):
+    <span class="fn">print</span>(event, end=<span class="st">""</span>, flush=<span class="nm">True</span>)  <span class="cm"># str(event) returns human-readable text</span></code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">send — fire and forget, returns rpc_id immediately</div>
+      <pre><code>rpc_id = <span class="kw">await</span> agent.<span class="fn">send</span>(<span class="st">"Start processing the dataset."</span>)
+
+<span class="cm"># Listen for results separately:</span>
+<span class="kw">async with</span> agent.<span class="fn">events</span>() <span class="kw">as</span> stream:
+    <span class="kw">async for</span> event <span class="kw">in</span> stream:
+        <span class="kw">if</span> event.<span class="fn">get</span>(<span class="st">"rpc_id"</span>) == rpc_id <span class="kw">and</span> event[<span class="st">"type"</span>] == <span class="st">"done"</span>:
+            <span class="kw">break</span></code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">run — sync wrapper around arun</div>
+      <pre><code><span class="cm"># Spins up its own asyncio event loop. Useful in scripts and notebooks.</span>
+text = agent.<span class="fn">run</span>(<span class="st">"Say hi"</span>, timeout=<span class="nm">60</span>)</code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">interrupt — cancel a running turn and inject a new message</div>
+      <pre><code><span class="cm"># All four methods accept interrupt=True:</span>
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Stop and just summarize what you have so far."</span>, interrupt=<span class="nm">True</span>)
+<span class="kw">await</span> agent.<span class="fn">send</span>(<span class="st">"Cancel and do this instead."</span>, interrupt=<span class="nm">True</span>)</code></pre>
+    </div>
+    <div class="callout callout-blue">
+      Interrupt sends <code>session/cancel</code> upstream, waits for the active prompt to drain (10s safety timeout), then queues the new message at the tail. Already-queued prompts are unaffected.
+    </div>
+
+    <div class="card">
+      <div class="card-label">cancel — drop the running prompt without replacing it</div>
+      <pre><code><span class="kw">await</span> agent.<span class="fn">cancel</span>()  <span class="cm"># best-effort; same as POST /sessions/{id}/cancel</span></code></pre>
+    </div>
+  </div>
+
+  <!-- ── Events ── -->
+  <div class="section" id="events">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(168,85,247,0.15);color:#c084fc">📡</span>Events</h2>
+      <p class="section-sub">Structured dicts from <code style="color:#fbbf24">astream()</code> and <code style="color:#fbbf24">events()</code>. <code style="color:#fbbf24">str(event)</code> returns human-readable text.</p>
+    </div>
+
+    <div class="card">
+      <div class="event-grid">
+        <div class="ev-type">text</div><div class="ev-desc">A chunk of assistant text. Field: <code style="color:#fbbf24;font-family:monospace">text</code>.</div>
+        <div class="ev-type">reasoning</div><div class="ev-desc">Internal reasoning (Claude extended thinking). Field: <code style="color:#fbbf24;font-family:monospace">text</code>.</div>
+        <div class="ev-type">tool</div><div class="ev-desc">A tool call. Fields: <code style="color:#fbbf24;font-family:monospace">tool_name</code>, <code style="color:#fbbf24;font-family:monospace">tool_input</code>, <code style="color:#fbbf24;font-family:monospace">tool_use_id</code>.</div>
+        <div class="ev-type">tool_result</div><div class="ev-desc">Tool result. Fields: <code style="color:#fbbf24;font-family:monospace">tool_use_id</code>, <code style="color:#fbbf24;font-family:monospace">result</code>.</div>
+        <div class="ev-type">usage</div><div class="ev-desc">Token / cost stats. Fields: <code style="color:#fbbf24;font-family:monospace">inputTokens</code>, <code style="color:#fbbf24;font-family:monospace">outputTokens</code>, <code style="color:#fbbf24;font-family:monospace">totalCostUsd</code>.</div>
+        <div class="ev-type">done</div><div class="ev-desc">Turn complete. Last event in a stream. Field: <code style="color:#fbbf24;font-family:monospace">stop_reason</code> (e.g. <code style="color:#fbbf24;font-family:monospace">end_turn</code>, <code style="color:#fbbf24;font-family:monospace">cancelled</code>).</div>
+        <div class="ev-type">error</div><div class="ev-desc">Server-side error frame. Raised as <code style="color:#fbbf24;font-family:monospace">PromptError</code> from <code style="color:#fbbf24;font-family:monospace">astream</code>; yielded as a dict from <code style="color:#fbbf24;font-family:monospace">events()</code>.</div>
+        <div class="ev-type">sandbox_reattach</div><div class="ev-desc">Emitted when the session transparently reprovisioned its sandbox against the same volume. Fields: <code style="color:#fbbf24;font-family:monospace">old_sandbox_id</code>, <code style="color:#fbbf24;font-family:monospace">new_sandbox_id</code>.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Branching on event type</div>
+      <pre><code><span class="kw">async for</span> event <span class="kw">in</span> agent.<span class="fn">astream</span>(<span class="st">"Analyze this codebase."</span>):
+    <span class="kw">if</span> event[<span class="st">"type"</span>] == <span class="st">"text"</span>:
+        <span class="fn">print</span>(event[<span class="st">"text"</span>], end=<span class="st">""</span>)
+    <span class="kw">elif</span> event[<span class="st">"type"</span>] == <span class="st">"tool"</span>:
+        <span class="fn">print</span>(<span class="st">f"\n[calling {event['tool_name']}({event.get('tool_input', {})})]"</span>)
+    <span class="kw">elif</span> event[<span class="st">"type"</span>] == <span class="st">"usage"</span>:
+        <span class="fn">print</span>(<span class="st">f"\ntokens: {event.get('inputTokens', 0)} in / {event.get('outputTokens', 0)} out"</span>)
+    <span class="kw">elif</span> event[<span class="st">"type"</span>] == <span class="st">"done"</span>:
+        <span class="kw">break</span></code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">events() — long-lived subscription, all events for the session</div>
+      <pre><code><span class="kw">async with</span> agent.<span class="fn">events</span>() <span class="kw">as</span> stream:
+    <span class="kw">async for</span> ev <span class="kw">in</span> stream:
+        <span class="kw">if</span> ev.<span class="fn">get</span>(<span class="st">"type"</span>) == <span class="st">"error"</span>:
+            <span class="fn">log</span>.<span class="fn">error</span>(ev)  <span class="cm"># yielded, not raised</span>
+        <span class="kw">elif</span> ev.<span class="fn">get</span>(<span class="st">"type"</span>) == <span class="st">"done"</span>:
+            <span class="kw">break</span></code></pre>
+    </div>
+  </div>
+
+  <!-- ── Conversation continuity / resuming ── -->
+  <div class="section" id="resuming">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">🔄</span>Conversation continuity &amp; resuming</h2>
+      <p class="section-sub">Sessions persist in Postgres and survive sandbox death + server restart.</p>
+    </div>
+
+    <div class="two-col">
+      <div class="card">
+        <div class="card-label">Multi-turn — context accumulates automatically</div>
+        <pre><code>agent = <span class="fn">Agent</span>(<span class="st">"assistant"</span>, provider=<span class="st">"local"</span>)
+
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"My name is Alice."</span>)
+reply = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"What's my name?"</span>)
+<span class="cm"># "Your name is Alice."</span></code></pre>
+      </div>
+      <div class="card">
+        <div class="card-label">Resume from a different process</div>
+        <pre><code><span class="cm"># First run:</span>
+agent = <span class="fn">Agent</span>(<span class="st">"worker"</span>, provider=<span class="st">"local"</span>)
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Remember 42."</span>)
+saved_id = agent.session_id
+
+<span class="cm"># Later (different process):</span>
+agent = <span class="fn">Agent</span>(<span class="st">"worker"</span>, session_id=saved_id)
+reply = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"What number?"</span>)
+<span class="cm"># "42"</span></code></pre>
+      </div>
+    </div>
+
+    <div class="callout callout-purple">
+      <strong>Sandbox reattach is automatic.</strong> The session row stores <code>volume_id</code>, so when the previous sandbox is reaped or killed, the next <code>/message</code> reprovisions a fresh sandbox that mounts the same volume. Claude CLI then runs <code>session/load</code> from the on-disk transcript. You'll see a <code>sandbox_reattach</code> event before the first text of that turn.
+    </div>
+
+    <div class="subhead">reset_session — start fresh</div>
+    <div class="card">
+      <pre><code>agent.<span class="fn">reset_session</span>()  <span class="cm"># clears session_id, sandbox_id; next call re-registers</span></code></pre>
+    </div>
+  </div>
+
+  <!-- ── Sandbox access ── -->
+  <div class="section" id="sandbox">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(245,158,11,0.15);color:#fbbf24">📦</span>Sandbox access</h2>
+      <p class="section-sub">Direct exec/read/write/ls on the agent's sandbox. Bypasses the conversation.</p>
+    </div>
+    <div class="card">
+      <pre><code>agent = <span class="fn">Agent</span>(<span class="st">"dev"</span>, provider=<span class="st">"local"</span>, cwd=<span class="st">"/tmp"</span>)
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Create notes.txt with 'hello world'."</span>)
+
+<span class="cm"># Read a file directly</span>
+content = <span class="kw">await</span> agent.sandbox.<span class="fn">read_file</span>(<span class="st">"/tmp/notes.txt"</span>)
+
+<span class="cm"># Run a shell command</span>
+result = <span class="kw">await</span> agent.sandbox.<span class="fn">exec</span>(<span class="st">"ls /tmp"</span>, timeout=<span class="nm">30</span>)
+<span class="fn">print</span>(result[<span class="st">"stdout"</span>])
+<span class="cm"># also: stderr, exit_code, stdout_truncated, timed_out</span>
+
+<span class="cm"># Write a file</span>
+<span class="kw">await</span> agent.sandbox.<span class="fn">write_file</span>(<span class="st">"/tmp/config.json"</span>, <span class="st">'{"debug": true}'</span>)
+
+<span class="cm"># List a directory</span>
+<span class="fn">print</span>(<span class="kw">await</span> agent.sandbox.<span class="fn">ls</span>(<span class="st">"/tmp"</span>))</code></pre>
+    </div>
+  </div>
+
+  <!-- ── System prompt ── -->
+  <div class="section" id="system-prompt">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(59,130,246,0.15);color:#60a5fa">📝</span>System prompt</h2>
+      <p class="section-sub">Pin a role or behavior for the lifetime of the session.</p>
+    </div>
+    <div class="card">
+      <pre><code>agent = <span class="fn">Agent</span>(
+    <span class="st">"analyst"</span>,
+    provider=<span class="st">"local"</span>,
+    prompt=<span class="st">"You are a data analyst. Always format numbers with commas."</span>,
+)
+reply = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"What is 1000000 + 234567?"</span>)
+<span class="cm"># "1,234,567"</span></code></pre>
+    </div>
+    <div class="callout callout-amber">
+      The prompt is wrapped in <code>&lt;system-context&gt;</code> tags and injected before the <strong>first</strong> user message. It is <strong>not</strong> re-sent each turn.
+    </div>
+  </div>
+
+  <!-- ── Live config ── -->
+  <div class="section" id="configure">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(168,85,247,0.15);color:#c084fc">🎚</span>Live config — configure()</h2>
+      <p class="section-sub">Change model, permission mode, or thinking depth at runtime.</p>
+    </div>
+    <div class="card">
+      <pre><code><span class="kw">await</span> agent.<span class="fn">configure</span>(
+    mode=<span class="st">"bypassPermissions"</span>,        <span class="cm"># or "default", "acceptEdits"</span>
+    model=<span class="st">"claude-sonnet-4-6"</span>,
+    thought_level=<span class="st">"high"</span>,             <span class="cm"># "off" | "low" | "medium" | "high"</span>
+)</code></pre>
+    </div>
+  </div>
+
+  <!-- ── Tools, MCP, skills ── -->
+  <div class="section" id="tools-mcp">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">🛠</span>Tools, MCP servers, skills</h2>
+      <p class="section-sub">Extend the agent's capabilities at registration time.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Tools — restrict to a whitelist</div>
+      <pre><code>agent = <span class="fn">Agent</span>(
+    <span class="st">"safe-bot"</span>, provider=<span class="st">"local"</span>,
+    tools=[<span class="st">"Read"</span>, <span class="st">"Grep"</span>, <span class="st">"Bash"</span>],
+)</code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">MCP servers — extend with custom tools</div>
+      <pre><code>agent = <span class="fn">Agent</span>(
+    <span class="st">"with-mcp"</span>, provider=<span class="st">"local"</span>,
+    mcp_servers={
+        <span class="st">"my-mcp"</span>: {
+            <span class="st">"type"</span>: <span class="st">"local"</span>,
+            <span class="st">"command"</span>: <span class="st">"node"</span>,
+            <span class="st">"args"</span>: [<span class="st">"path/to/server.js"</span>],
+        },
+    },
+)</code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Skills — npx-installable agent skill bundles</div>
+      <pre><code>agent = <span class="fn">Agent</span>(
+    <span class="st">"with-skills"</span>, provider=<span class="st">"daytona"</span>,
+    skills=[
+        <span class="st">"rllm-org/hive#staging"</span>,
+        <span class="st">"vercel-labs/agent-skills"</span>,
+    ],
+)
+<span class="cm"># Skills are installed inside the sandbox before the supervisor starts.</span>
+<span class="cm"># For local provider, skill installs run on the host.</span></code></pre>
+    </div>
+  </div>
+
+  <!-- ── Token usage ── -->
+  <div class="section" id="usage">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">📊</span>Token usage</h2>
+      <p class="section-sub">Cumulative stats on <code style="color:#fbbf24">agent.usage</code>.</p>
+    </div>
+    <div class="card">
+      <pre><code>agent = <span class="fn">Agent</span>(<span class="st">"worker"</span>, provider=<span class="st">"local"</span>)
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Write a poem."</span>)
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Write another."</span>)
+
+<span class="fn">print</span>(agent.usage.input_tokens)
+<span class="fn">print</span>(agent.usage.output_tokens)
+<span class="fn">print</span>(agent.usage.total_tokens)
+<span class="fn">print</span>(agent.usage.total_cost_usd)
+<span class="fn">print</span>(agent.usage.call_count)</code></pre>
+    </div>
+  </div>
+
+  <!-- ── Credentials ── -->
+  <div class="section" id="cred">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(239,68,68,0.15);color:#f87171">🔑</span>Per-request credentials</h2>
+      <p class="section-sub">Run a session under a specific user's Claude account.</p>
+    </div>
+    <div class="card">
+      <pre><code>agent = <span class="fn">Agent</span>(
+    <span class="st">"per-user"</span>, provider=<span class="st">"daytona"</span>,
+    oauth_token=user_oauth_token,        <span class="cm"># preferred</span>
+    api_key=user_anthropic_key,          <span class="cm"># fallback</span>
+)
+<span class="cm"># Resolution order: oauth_token arg > CLAUDE_CODE_OAUTH_TOKEN env</span>
+<span class="cm">#                  > api_key arg > ANTHROPIC_API_KEY env</span></code></pre>
+    </div>
+    <div class="callout callout-amber">
+      Credentials never persist to the agent-sdk database. They travel in the request body, are merged into the supervisor's <code>spawn_env</code>, and are scoped to that sandbox. If you supply OAuth, the server scrubs its own <code>ANTHROPIC_API_KEY</code> from that sandbox so there's no silent fallback.
+    </div>
+    <div class="callout callout-blue">
+      The SDK refuses to forward credentials to a plain <code>http://</code> server (other than localhost). Use HTTPS in production.
+    </div>
+  </div>
+
+  <!-- ── Config files ── -->
+  <div class="section" id="config-files">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(168,85,247,0.15);color:#c084fc">📂</span>Config files &amp; cloning</h2>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Load from JSON or YAML</div>
+      <pre><code><span class="cm"># configs/coder.json</span>
+<span class="cm">#   {"agent_type":"claude","model":"haiku","provider":"local",</span>
+<span class="cm">#    "prompt":"You are a coder.","cwd":"/workspace"}</span>
+
+agent = <span class="nb">Agent</span>.<span class="fn">from_file</span>(<span class="st">"configs/coder.json"</span>, api_url=<span class="st">"http://localhost:7778"</span>)
+agent2 = <span class="nb">Agent</span>.<span class="fn">from_config</span>(<span class="st">"adhoc"</span>, {<span class="st">"agent_type"</span>: <span class="st">"claude"</span>, <span class="st">"provider"</span>: <span class="st">"local"</span>})</code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Clone — same config, different name</div>
+      <pre><code>base = <span class="fn">Agent</span>(<span class="st">"base"</span>, provider=<span class="st">"local"</span>, model=<span class="st">"haiku"</span>, prompt=<span class="st">"Be concise."</span>)
+workers = [base.<span class="fn">clone</span>(<span class="st">f"worker-{i}"</span>) <span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="nm">3</span>)]
+results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*[w.<span class="fn">arun</span>(<span class="st">"Summarize AI."</span>) <span class="kw">for</span> w <span class="kw">in</span> workers])</code></pre>
+    </div>
+  </div>
+
+  <!-- ── Cleanup ── -->
+  <div class="section" id="cleanup">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(59,130,246,0.15);color:#60a5fa">🧹</span>Cleanup</h2>
+    </div>
+    <div class="card">
+      <div class="card-label">Context manager — automatic</div>
+      <pre><code><span class="kw">async with</span> <span class="fn">Agent</span>(<span class="st">"worker"</span>, provider=<span class="st">"local"</span>) <span class="kw">as</span> agent:
+    <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Do the task."</span>)
+<span class="cm"># aclose() runs automatically — server-side reap + http close</span></code></pre>
+    </div>
+    <div class="card">
+      <div class="card-label">Manual</div>
+      <pre><code>agent = <span class="fn">Agent</span>(<span class="st">"worker"</span>, provider=<span class="st">"local"</span>)
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Do the task."</span>)
+<span class="kw">await</span> agent.<span class="fn">aclose</span>()  <span class="cm"># reaps server-side session, then closes httpx client</span>
+
+<span class="cm"># Close only the HTTP client (e.g. you want to reap externally):</span>
+<span class="kw">await</span> agent._client.<span class="fn">aclose</span>()</code></pre>
+    </div>
+  </div>
+
+  <!-- ── Error handling ── -->
+  <div class="section" id="errors">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(239,68,68,0.15);color:#f87171">⚠️</span>Error handling</h2>
+    </div>
+    <div class="card">
+      <div class="event-grid">
+        <div class="ev-type" style="color:#f87171">AgentNotRegisteredError</div><div class="ev-desc">Operation called before registration; usually internal.</div>
+        <div class="ev-type" style="color:#f87171">AgentBusyError</div><div class="ev-desc">Agent is mid-prompt — wait, queue, or use <code style="color:#fbbf24;font-family:monospace">interrupt=True</code>.</div>
+        <div class="ev-type" style="color:#f87171">AgentTimeoutError</div><div class="ev-desc">No response within the configured timeout.</div>
+        <div class="ev-type" style="color:#f87171">AgentConnectionError</div><div class="ev-desc">Could not reach the server.</div>
+        <div class="ev-type" style="color:#f87171">PromptError</div><div class="ev-desc">Server returned an error frame mid-stream. Has <code style="color:#fbbf24;font-family:monospace">.kind</code> and <code style="color:#fbbf24;font-family:monospace">.data</code> attributes (e.g. <code style="color:#fbbf24;font-family:monospace">sandbox_process_died</code>, <code style="color:#fbbf24;font-family:monospace">timeout</code>).</div>
+        <div class="ev-type" style="color:#f87171">StreamError</div><div class="ev-desc">SSE connection dropped before <code style="color:#fbbf24;font-family:monospace">done</code> arrived.</div>
+      </div>
+    </div>
+    <div class="card">
+      <pre><code><span class="kw">from</span> <span class="nb">agent_sdk.errors</span> <span class="kw">import</span> AgentBusyError, PromptError, StreamError
+
+<span class="kw">try</span>:
+    text = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Do something."</span>)
+<span class="kw">except</span> AgentBusyError:
+    <span class="fn">print</span>(<span class="st">"Busy — retry or use interrupt=True"</span>)
+<span class="kw">except</span> PromptError <span class="kw">as</span> e:
+    <span class="fn">print</span>(<span class="st">f"Agent error: kind={e.kind} msg={e}"</span>)
+<span class="kw">except</span> StreamError <span class="kw">as</span> e:
+    <span class="fn">print</span>(<span class="st">f"Connection lost: {e}"</span>)</code></pre>
+    </div>
+  </div>
+
+  <!-- ── ServerClient ── -->
+  <div class="section" id="server-client">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(168,85,247,0.15);color:#c084fc">🖥</span>ServerClient <span class="pill pill-purple" style="vertical-align:middle">operator</span></h2>
+      <p class="section-sub">Stateless wrapper over every REST route. Use this for schedulers, admin tools, hive workspace bootstraps — anything that creates and manages other people's sessions.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Basic usage</div>
+      <pre><code><span class="kw">from</span> <span class="nb">agent_sdk</span> <span class="kw">import</span> ServerClient
+
+<span class="kw">async with</span> <span class="fn">ServerClient</span>(<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> sc:
+    session = <span class="kw">await</span> sc.<span class="fn">create_session</span>(
+        provider=<span class="st">"local"</span>, model=<span class="st">"haiku"</span>,
+        name=<span class="st">"worker"</span>, agent_type=<span class="st">"claude"</span>,
+        secrets={<span class="st">"CLAUDE_CODE_OAUTH_TOKEN"</span>: os.environ[<span class="st">"CLAUDE_CODE_OAUTH_TOKEN"</span>]},
+    )
+    sid = session[<span class="st">"session_id"</span>]
+
+    <span class="kw">await</span> sc.<span class="fn">send_message</span>(sid, <span class="st">"Write hello world in Python."</span>)
+    <span class="kw">async for</span> chunk <span class="kw">in</span> sc.<span class="fn">stream_events</span>(sid):
+        <span class="fn">print</span>(chunk, end=<span class="st">""</span>)  <span class="cm"># raw SSE bytes — parse however you like</span>
+
+    result = <span class="kw">await</span> sc.<span class="fn">session_sandbox_exec</span>(sid, <span class="st">"echo hello"</span>)
+    <span class="fn">print</span>(result[<span class="st">"stdout"</span>])
+
+    log = <span class="kw">await</span> sc.<span class="fn">get_session_log</span>(sid, limit=<span class="nm">200</span>)
+    status = <span class="kw">await</span> sc.<span class="fn">get_session_status</span>(sid)</code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Method index — grouped by resource</div>
+      <table class="param-table">
+        <thead><tr><th>Resource</th><th>Method</th><th>Endpoint</th></tr></thead>
+        <tbody>
+          <tr><td class="param-name">Volumes</td><td class="param-name">create_volume(**body)</td><td class="param-type">POST /volumes</td></tr>
+          <tr><td></td><td class="param-name">list_volumes(provider=None)</td><td class="param-type">GET /volumes</td></tr>
+          <tr><td></td><td class="param-name">get_volume(id_or_name)</td><td class="param-type">GET /volumes/{id}</td></tr>
+          <tr><td></td><td class="param-name">delete_volume(id_or_name, force=False)</td><td class="param-type">DELETE /volumes/{id}</td></tr>
+          <tr><td class="param-name">Volume files</td><td class="param-name">volume_file_tree(id, path="")</td><td class="param-type">GET /volumes/{id}/files/tree</td></tr>
+          <tr><td></td><td class="param-name">volume_file_read(id, path)</td><td class="param-type">GET /volumes/{id}/files/read</td></tr>
+          <tr><td></td><td class="param-name">volume_file_write(id, path, content)</td><td class="param-type">POST /volumes/{id}/files/edit</td></tr>
+          <tr><td></td><td class="param-name">volume_file_edit(id, path, old, new)</td><td class="param-type">POST /volumes/{id}/files/edit</td></tr>
+          <tr><td class="param-name">Sessions</td><td class="param-name">create_session(**body)</td><td class="param-type">POST /sessions</td></tr>
+          <tr><td></td><td class="param-name">list_sessions()</td><td class="param-type">GET /sessions</td></tr>
+          <tr><td></td><td class="param-name">get_session(id)</td><td class="param-type">GET /sessions/{id}</td></tr>
+          <tr><td></td><td class="param-name">get_session_status(id)</td><td class="param-type">GET /sessions/{id}/status</td></tr>
+          <tr><td></td><td class="param-name">get_session_log(id, limit=500)</td><td class="param-type">GET /sessions/{id}/log</td></tr>
+          <tr><td></td><td class="param-name">send_message(id, text, interrupt=False)</td><td class="param-type">POST /sessions/{id}/message</td></tr>
+          <tr><td></td><td class="param-name">cancel_session(id)</td><td class="param-type">POST /sessions/{id}/cancel</td></tr>
+          <tr><td></td><td class="param-name">set_session_config(id, **body)</td><td class="param-type">POST /sessions/{id}/config</td></tr>
+          <tr><td></td><td class="param-name">session_sandbox_exec(id, cmd, timeout=...)</td><td class="param-type">POST /sessions/{id}/sandbox/exec</td></tr>
+          <tr><td></td><td class="param-name">stream_events(id) — async iterator</td><td class="param-type">GET /sessions/{id}/events</td></tr>
+          <tr><td></td><td class="param-name">delete_session(id) ⚠️</td><td class="param-type">raises NotImplementedError</td></tr>
+          <tr><td class="param-name">Session files</td><td class="param-name">session_file_tree / read / edit / upload / delete / rename / download</td><td class="param-type">/sessions/{id}/files/*</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout callout-blue">
+      <strong>Stateless w.r.t. resources.</strong> One <code>ServerClient</code> instance is safe across thousands of concurrent operations against unrelated sessions. The only state it owns is one <code>httpx.AsyncClient</code> connection pool plus the bearer header.
+    </div>
+  </div>
+
+  <!-- ── pre_start_commands ── -->
+  <div class="section" id="pre-start">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(245,158,11,0.15);color:#fbbf24">🚀</span>pre_start_commands</h2>
+      <p class="section-sub">Shell commands that run inside the sandbox <strong>before</strong> the supervisor starts. Persisted on the session row and replayed when the sandbox is replaced.</p>
+    </div>
+
+    <div class="card">
+      <div class="prose">
+        Use <code>pre_start_commands</code> to install CLIs, drop config files, or seed state that has to be ready before the agent boots. The full lifecycle:
+        <ul>
+          <li><strong>Initial provision:</strong> commands run inside the new sandbox.</li>
+          <li><strong>Type 2 recovery</strong> (sandbox replaced — external delete, unrecoverable Daytona error, <code>/reset-sandbox</code>): commands re-run on the replacement sandbox.</li>
+          <li><strong>Type 1 recovery</strong> (same sandbox restarted via <code>start_sandbox</code>): commands do <em>not</em> re-run — the original side-effects are still on disk.</li>
+          <li>Skill-install commands are re-merged from <code>agent.config.skills</code> at recovery time, so editing skills on a long-lived agent takes effect on the next sandbox replacement.</li>
+          <li>For <code>local</code> provider, <code>pre_start_commands</code> are ignored — there's no sandbox boundary to safely run caller commands in.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">via Agent — pass pre_start_commands directly</div>
+      <pre><code>agent = <span class="fn">Agent</span>(
+    <span class="st">"deploy-bot"</span>, provider=<span class="st">"daytona"</span>,
+    cwd=<span class="st">"/home/daytona"</span>,
+    pre_start_commands=[
+        <span class="st">"npm install -g cowsay"</span>,
+        <span class="st">"echo 'project=foo' &gt; /home/daytona/.env"</span>,
+    ],
+    shared_mounts=[<span class="st">"shared-data"</span>],          <span class="cm"># RO mount under /mnt/shared/</span>
+    secrets={<span class="st">"GITHUB_TOKEN"</span>: gh_token},      <span class="cm"># merges with auto OAuth/API key</span>
+)
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"verify environment"</span>)
+<span class="cm"># Commands have already run; cowsay is on PATH inside the sandbox.</span></code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">via ServerClient — operator persona</div>
+      <pre><code><span class="kw">async with</span> <span class="fn">ServerClient</span>(<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> sc:
+    session = <span class="kw">await</span> sc.<span class="fn">create_session</span>(
+        provider=<span class="st">"daytona"</span>,
+        name=<span class="st">"deploy-bot"</span>, agent_type=<span class="st">"claude"</span>,
+        cwd=<span class="st">"/home/daytona"</span>,
+        pre_start_commands=[<span class="st">"npm install -g cowsay"</span>],
+        secrets={<span class="st">"CLAUDE_CODE_OAUTH_TOKEN"</span>: os.environ[<span class="st">"CLAUDE_CODE_OAUTH_TOKEN"</span>]},
+    )
+    sid = session[<span class="st">"session_id"</span>]
+
+    <span class="cm"># Inspect what was persisted:</span>
+    s = <span class="kw">await</span> sc.<span class="fn">get_session</span>(sid)
+    <span class="fn">print</span>(s[<span class="st">"pre_start_commands"</span>])</code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Replay verification — destroy the sandbox, send a new message, watch them re-run</div>
+      <pre><code><span class="cm"># Force a Type 2 recovery (replacement sandbox):</span>
+<span class="kw">async with</span> httpx.<span class="fn">AsyncClient</span>(base_url=<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> raw:
+    <span class="kw">await</span> raw.<span class="fn">post</span>(<span class="st">f"/sessions/{agent.session_id}/reset-sandbox"</span>)
+
+<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"verify environment"</span>)
+<span class="cm"># pre_start_commands re-ran on the replacement sandbox before the supervisor started.</span></code></pre>
+    </div>
+  </div>
+
+  <!-- ── Full example ── -->
+  <div class="section" id="full-example">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">🚀</span>Full example</h2>
+      <p class="section-sub">Multi-turn coding session with persistent volume, sandbox verification, and cost tracking.</p>
+    </div>
+    <div class="card">
+      <pre><code><span class="kw">import</span> asyncio, os
+<span class="kw">from</span> <span class="nb">agent_sdk</span> <span class="kw">import</span> <span class="nb">Agent</span>
+
+<span class="kw">async def</span> <span class="fn">main</span>():
+    <span class="kw">async with</span> <span class="fn">Agent</span>(
+        <span class="st">"coder"</span>,
+        provider=<span class="st">"daytona"</span>,
+        model=<span class="st">"haiku"</span>,
+        cwd=<span class="st">"/home/daytona"</span>,
+        prompt=<span class="st">"You are an expert Python developer. Keep responses short."</span>,
+        tools=[<span class="st">"Bash"</span>, <span class="st">"Read"</span>, <span class="st">"Write"</span>],
+        pre_start_commands=[<span class="st">"npm install -g cowsay"</span>],
+        api_url=<span class="st">"http://localhost:7778"</span>,
+    ) <span class="kw">as</span> agent:
+
+        <span class="cm"># Turn 1</span>
+        <span class="fn">print</span>(<span class="kw">await</span> agent.<span class="fn">arun</span>(
+            <span class="st">"Write a function that reverses a string. Save it to reverse.py."</span>,
+        ))
+
+        <span class="cm"># Turn 2 — context preserved</span>
+        <span class="fn">print</span>(<span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"Now write a unit test for that function."</span>))
+
+        <span class="cm"># Verify directly via sandbox — no conversation round-trip</span>
+        content = <span class="kw">await</span> agent.sandbox.<span class="fn">read_file</span>(<span class="st">"/home/daytona/reverse.py"</span>)
+        <span class="fn">print</span>(<span class="st">"\n--- reverse.py ---\n"</span> + content)
+
+        <span class="cm"># pre_start_commands installed cowsay; confirm it's on PATH</span>
+        cowsay = <span class="kw">await</span> agent.sandbox.<span class="fn">exec</span>(<span class="st">"which cowsay"</span>)
+        <span class="fn">print</span>(<span class="st">"cowsay path:"</span>, cowsay[<span class="st">"stdout"</span>].<span class="fn">strip</span>())
+
+        <span class="fn">print</span>(<span class="st">f"\nTotal cost: ${agent.usage.total_cost_usd:.4f}"</span>)
+
+asyncio.<span class="fn">run</span>(<span class="fn">main</span>())</code></pre>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
