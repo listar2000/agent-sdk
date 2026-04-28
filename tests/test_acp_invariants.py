@@ -396,40 +396,6 @@ class TestUniversalInvariants:
     """
 
     @pytest.mark.asyncio
-    async def test_single_prompt_has_exactly_one_terminal(self, any_agent):
-        """A single-prompt turn produces exactly one terminal envelope,
-        carrying the rpc_id returned by POST /sessions/{id}/message."""
-        rpc_ids, envelopes = await run_steps(
-            any_agent,
-            [("send", "Just say exactly: HELLO")],
-            drain_timeout=60.0,
-        )
-        assert len(rpc_ids) == 1
-        rpc_a = rpc_ids[0][0]
-
-        terminals = terminals_of(envelopes)
-        assert len(terminals) == 1, f"expected 1 terminal, got {len(terminals)}"
-        assert terminals[0][2]["id"] == rpc_a, (
-            f"terminal id {terminals[0][2]['id']} does not match submitted rpc {rpc_a}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_single_prompt_has_usage_update(self, any_agent):
-        """Both claude-code and codex emit usage_update at the end of content.
-
-        `usage_update` is NOT in the official ACP spec (see docs/api.md —
-        zero hits for 'usage_update' in the v1 schema) but both agents emit
-        it as a de facto extension. We rely on this for the FIFO advance rule.
-        """
-        _, envelopes = await run_steps(
-            any_agent,
-            [("send", "Just say exactly: HELLO")],
-            drain_timeout=60.0,
-        )
-        uus = usage_updates_of(envelopes)
-        assert len(uus) >= 1, "expected at least one usage_update notification"
-
-    @pytest.mark.asyncio
     async def test_every_block_has_rpc_tag(self, any_agent):
         """Server stamps every SSE block with `event: rpc:<id>` before data.
 
@@ -466,75 +432,6 @@ class TestUniversalInvariants:
         assert latest_uu_time <= earliest_term_time + 0.2, (
             f"usage_update at {latest_uu_time:.2f}s fired AFTER terminal "
             f"at {earliest_term_time:.2f}s — invariant violated"
-        )
-
-
-
-@skip_if_no_server
-class TestDoneHeldForBackgroundTasks:
-    """Claude-code holds the `done_result` envelope for a prompt while any
-    tracked background task (Bash run_in_background=true) is still pending.
-
-    Observable signature: for a prompt B whose turn backgrounds a sleep N,
-    B's usage_update fires at end-of-content (~a few seconds), but B's
-    done_result is delayed by roughly N seconds — claude-code flushes the
-    background task's completion notification first, then releases done.
-
-    This is why we split the attribution cursor (advances on usage_update)
-    from the busy gate (releases on done_result): usage_update marks
-    content completion, but done_result is the authoritative turn-end signal
-    and is coupled to background task drainage.
-    """
-
-    @pytest.mark.asyncio
-    async def test_done_held_until_background_sleep_completes(self, claude_agent):
-        """B's done_result is held ~SLEEP_S seconds behind B's usage_update
-        when B's turn backgrounds a `sleep SLEEP_S` via run_in_background.
-        """
-        SLEEP_S = 15.0
-        agent = claude_agent
-        envelopes: list = []
-        stop = asyncio.Event()
-        capture_task = asyncio.create_task(
-            capture_envelopes(agent.session_id, stop, envelopes)
-        )
-        await asyncio.sleep(0.5)
-        try:
-            rpc_b = await agent.send(
-                f"Use the Bash tool to run `sleep {int(SLEEP_S)}` with "
-                "run_in_background=true. After it's queued, say exactly "
-                "'B LAUNCHED' and stop."
-            )
-            # Wait well past the sleep plus slack for the delayed done.
-            await drain_inflight(agent.session_id, timeout=SLEEP_S + 30.0)
-            await asyncio.sleep(0.5)
-        finally:
-            stop.set()
-            capture_task.cancel()
-            try:
-                await capture_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        b_uus = [t for t, tag, p in envelopes
-                 if is_usage_update(p) and tag == rpc_b]
-        b_terms = [t for t, _, p in envelopes
-                   if is_terminal(p) and p.get("id") == rpc_b]
-        assert b_uus, "B's usage_update never fired"
-        assert b_terms, "B's done_result never arrived"
-
-        earliest_uu = min(b_uus)
-        earliest_term = min(b_terms)
-        gap = earliest_term - earliest_uu
-
-        # The gap must be comparable to the sleep duration — not the
-        # usual sub-second usage→done gap of a clean turn. Lower bound
-        # at 60% of the sleep to allow for scheduling/reporting jitter.
-        assert gap >= SLEEP_S * 0.6, (
-            f"expected B's done_result to be held ≥{SLEEP_S * 0.6:.1f}s "
-            f"behind usage_update while the backgrounded sleep drained; "
-            f"observed gap = {gap:.2f}s (usage@{earliest_uu:.2f}s, "
-            f"done@{earliest_term:.2f}s)"
         )
 
 

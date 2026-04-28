@@ -1490,12 +1490,42 @@ class TestDaytonaStateFix:
 class TestLockCleanup:
     """Test that locks are cleaned up on session/sandbox deletion."""
 
-    def test_session_lock_cleaned_on_shutdown(self):
-        """Verify _shutdown_session_state pops session locks."""
+    def test_session_lock_kept_alive_across_shutdown(self):
+        """``_shutdown_session_state`` must NOT pop session locks.
+
+        Commit 009dd63 made this an explicit invariant: ``_ensure_runtime_locked``
+        calls ``_shutdown_session_state`` from inside the held session lock when
+        rebuilding stale state. Popping here would let a concurrent
+        ``_get_session_lock(sid)`` ``setdefault`` a fresh ``Lock``, breaking
+        serialization and letting two ensure-runtime bodies run in parallel.
+        """
         import inspect
         from api.server import _shutdown_session_state
         source = inspect.getsource(_shutdown_session_state)
-        assert "_session_locks.pop" in source
+        assert "_session_locks.pop" not in source, (
+            "_shutdown_session_state must keep session lock entries alive — "
+            "see comment in server.py at the SESSIONS.pop site"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_lock_survives_shutdown_e2e(self):
+        """End-to-end: a lock obtained for ``sid`` must persist after the
+        session it was guarding is shut down."""
+        from api.server import (
+            _shutdown_session_state, _session_locks, SESSIONS, _get_session_lock,
+        )
+        from api.models import SessionState
+        sid = "test-lock-survives-shutdown"
+        state = SessionState(session_id=sid, agent_id="a", sandbox_id="s")
+        SESSIONS[sid] = state
+        lock = _get_session_lock(sid)
+        try:
+            await _shutdown_session_state(state, remove=True, force=True)
+            assert sid in _session_locks, "lock entry must persist after shutdown"
+            assert _session_locks[sid] is lock, "same lock object preserved"
+        finally:
+            _session_locks.pop(sid, None)
+            SESSIONS.pop(sid, None)
 
     def test_sandbox_lock_cleaned_on_delete(self):
         """Verify delete_sandbox_route pops sandbox locks."""

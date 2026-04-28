@@ -62,7 +62,7 @@ async def test_ensure_sandbox_creates_when_none(setup):
     assert sb is not None
     assert len(created) == 1
     assert created[0]["volume_id"] == "dt-v"
-    assert created[0]["subpath"] == "agents/a1/home"
+    assert created[0]["subpath"] == "agents/a1"
 
 
 @pytest.mark.asyncio
@@ -71,7 +71,7 @@ async def test_ensure_sandbox_returns_existing_when_running(setup):
     from api.models import SandboxRecord
     sb = SandboxRecord(id="sb1", provider="daytona", sandbox_ref="dt-live",
                        status="running", root="/home/daytona",
-                       volume_id="v1", subpath="agents/a1/home")
+                       volume_id="v1", subpath="agents/a1")
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb1")
 
@@ -93,7 +93,7 @@ async def test_ensure_sandbox_reprovisions_when_missing_emits_reattach(setup):
     from api.models import SandboxRecord
     dead = SandboxRecord(id="sb_dead", provider="daytona", sandbox_ref="dt-dead",
                          status="running", root="/home/daytona",
-                         volume_id="v1", subpath="agents/a1/home")
+                         volume_id="v1", subpath="agents/a1")
     await dbmod.upsert_sandbox(dead)
     await dbmod.set_session_current_sandbox("s1", "sb_dead")
 
@@ -133,7 +133,7 @@ async def test_ensure_sandbox_starts_stopped(setup):
     from api.models import SandboxRecord
     sb = SandboxRecord(id="sb1", provider="daytona", sandbox_ref="dt-paused",
                        status="stopped", root="/home/daytona",
-                       volume_id="v1", subpath="agents/a1/home")
+                       volume_id="v1", subpath="agents/a1")
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb1")
 
@@ -159,7 +159,7 @@ async def test_ensure_runtime_reuses_healthy_state(setup):
     from api.models import SandboxRecord, SessionState
     sb = SandboxRecord(id="sb1", provider="daytona", sandbox_ref="dt-r",
                        status="running", root="/home/daytona",
-                       volume_id="v1", subpath="agents/a1/home")
+                       volume_id="v1", subpath="agents/a1")
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb1")
 
@@ -223,7 +223,7 @@ async def test_ensure_sandbox_creates_across_providers(setup, provider):
     # volume_ref (daytona uses `volume_id`, others `volume_ref`)
     assert "volume_ref" in created[0] or "volume_id" in created[0]
     # subpath always present
-    assert created[0].get("subpath") == "agents/a1/home"
+    assert created[0].get("subpath") == "agents/a1"
     # Docker/Local: listen_port should be persisted.
     if provider != "daytona":
         assert sb.listen_port == 9999
@@ -237,7 +237,7 @@ async def test_ensure_sandbox_reuses_existing_running_across_providers(setup, pr
     from api.models import SandboxRecord
     sb = SandboxRecord(id="sb1", provider=provider, sandbox_ref=f"{provider}-live",
                        status="running", root="/home/x",
-                       volume_id="v1", subpath="agents/a1/home",
+                       volume_id="v1", subpath="agents/a1",
                        listen_port=9999 if provider != "daytona" else None)
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb1")
@@ -266,7 +266,7 @@ async def test_ensure_runtime_rebuilds_when_missing(setup):
     from api.models import SandboxRecord
     sb = SandboxRecord(id="sb1", provider="daytona", sandbox_ref="dt-r",
                        status="running", root="/home/daytona",
-                       volume_id="v1", subpath="agents/a1/home")
+                       volume_id="v1", subpath="agents/a1")
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb1")
 
@@ -474,7 +474,7 @@ async def test_ensure_runtime_raises_when_supervisor_never_healthy(setup):
     from api.models import SandboxRecord
     sb = SandboxRecord(id="sb_timeout", provider="daytona", sandbox_ref="dt-r",
                        status="running", root="/home/daytona",
-                       volume_id="v1", subpath="agents/a1/home")
+                       volume_id="v1", subpath="agents/a1")
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb_timeout")
     srv.SESSIONS.pop("s1", None)
