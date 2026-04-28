@@ -2203,6 +2203,13 @@ def _process_sse_block(
 _DAYTONA_UNRECOVERABLE_TOKENS = (
     "not found", "destroyed", "destroying",
     "terminal state", "unrecoverable", "unknown",
+    # A sandbox whose supervisor can't come up healthy is functionally
+    # dead — a fresh sandbox on the same volume + subpath heals it
+    # (session/load reads the persisted JSONL on the new sandbox).
+    # Without these two tokens, _type1_recover keeps re-raising and the
+    # caller never tries Type 2; users see 500s on every reconnect to
+    # that wedged sandbox.
+    "failed health check", "did not become",
 )
 
 
