@@ -284,11 +284,14 @@ Explicit lifecycle control over the session's ephemeral sandbox. None of these a
 
 ```
 POST /sessions/{session_id}/start-sandbox    — pre-warm a sandbox eagerly (idempotent)
-POST /sessions/{session_id}/stop-sandbox     — kill current sandbox; next /message lazy-provisions a fresh one
-POST /sessions/{session_id}/reset-sandbox    — kill current + provision a fresh replacement in one call
+POST /sessions/{session_id}/hibernate        — pause compute; keep state and the same sandbox for resume
+POST /sessions/{session_id}/reset-sandbox    — destroy current + provision a fresh replacement in one call
+POST /sessions/{session_id}/stop-sandbox     — DEPRECATED alias of /hibernate; returns 204 for compatibility
 ```
 
-`start-sandbox` and `reset-sandbox` return `{"sandbox_id": "..."}` on success. `stop-sandbox` returns 204.
+`start-sandbox` and `reset-sandbox` return `{"sandbox_id": "..."}` on success. `hibernate` returns `{"status", "sandbox_id", "session_in_memory"}` (200). `stop-sandbox` returns 204.
+
+`hibernate` stops the underlying compute (SIGTERM / `daytona.stop()`), flips the sandbox row to `status=stopped`, and keeps both the in-memory `SessionState` and the `current_sandbox_id` pointer intact — the next `/message` rebinds the SAME sandbox in place. Pass `?force=true` to cancel-and-drain in-flight prompts before pausing. If the last `/events` subscriber drops while a session is hibernated, the in-memory state is evicted automatically (next request rebuilds from the DB row).
 
 ### Cancel running prompt
 

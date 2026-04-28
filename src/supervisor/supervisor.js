@@ -40,7 +40,7 @@ const SNAPSHOT_EXCLUDES = [
 //
 //  - filesystem_cache.tar: full HOME tarball. Heavy (workspace files,
 //    user scratch, etc.). Written only on lifecycle events
-//    (/stop-sandbox, /delete, idle reap, graceful SIGTERM, explicit
+//    (/hibernate, /delete, idle reap, graceful SIGTERM, explicit
 //    POST /v1/snapshot). Old name: "snapshot.tar".
 //
 //  - agent_memory.tar: small tarball of the per-agent session-state

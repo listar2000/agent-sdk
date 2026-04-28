@@ -167,7 +167,13 @@ async def test_start_sandbox_provisions_eagerly(client):
 
 
 @pytest.mark.asyncio
-async def test_stop_sandbox_clears_pointer(client):
+async def test_hibernate_keeps_pointer_and_stops_row(client):
+    """``POST /sessions/{id}/hibernate`` must preserve the
+    ``current_sandbox_id`` pointer and the sandbox row (flipped to
+    ``STATUS_STOPPED``) so the next ``/message`` can revive the SAME
+    sandbox in place. Use ``/reset-sandbox`` for the wipe-and-replace
+    semantic.
+    """
     from api.models import AgentConfig, AgentRecord, VolumeRecord, SandboxRecord
     await dbmod.upsert_agent(AgentRecord(id="agent_k", name="K", config=AgentConfig()))
     await dbmod.upsert_volume(VolumeRecord(id="vol_k", name="vk", provider="daytona",
@@ -180,13 +186,18 @@ async def test_stop_sandbox_clears_pointer(client):
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox(sid, "sb_k")
 
-    with patch("api.providers.destroy_daytona", new=AsyncMock(return_value=None)):
-        r = await client.post(f"/sessions/{sid}/stop-sandbox")
-    assert r.status_code == 204, f"got {r.status_code}: {r.text}"
+    with patch("api.providers.daytona.stop_daytona", new=AsyncMock(return_value=None)):
+        r = await client.post(f"/sessions/{sid}/hibernate")
+    assert r.status_code == 200, f"got {r.status_code}: {r.text}"
+    body = r.json()
+    assert body["status"] in {"hibernated", "already_stopped"}, body
+    assert body["sandbox_id"] == "sb_k"
+
     sess = await dbmod.get_session(sid)
-    assert sess["current_sandbox_id"] is None
-    # Sandbox row should also be gone.
-    assert await dbmod.get_sandbox("sb_k") is None
+    assert sess["current_sandbox_id"] == "sb_k", "pointer must survive hibernate"
+    row = await dbmod.get_sandbox("sb_k")
+    assert row is not None, "sandbox row must survive hibernate"
+    assert row.status == "stopped"
 
 
 @pytest.mark.asyncio
