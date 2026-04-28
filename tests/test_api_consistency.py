@@ -120,8 +120,12 @@ async def test_start_sandbox_provider_failure_returns_502(client):
     async def blow_up(*a, **kw):
         raise RuntimeError("simulated provider outage")
 
+    # ``/sandboxes/{id}/start`` is Type-1-only since the start_sandbox_route
+    # rewrite — it calls ``_type1_recover`` directly, not ``_ensure_sandbox_alive``.
+    # The "provider blew up" branch is the ``except Exception`` around
+    # _type1_recover that returns 502.
     with patch(
-        "api.server._ensure_sandbox_alive", new=AsyncMock(side_effect=blow_up)
+        "api.server._type1_recover", new=AsyncMock(side_effect=blow_up)
     ):
         r = await client.post(f"/sandboxes/{sb.id}/start")
 

@@ -85,7 +85,7 @@ async def _mk_fixtures(include_sandbox: bool, include_pointer: bool,
         await dbmod.upsert_sandbox(SandboxRecord(
             id=sandbox_id, provider="daytona", sandbox_ref="dt-fuzz",
             status=sandbox_status, root="/home/daytona",
-            volume_id="v1", subpath="agents/a1/home",
+            volume_id="v1", subpath="agents/a1",
         ))
 
     async with dbmod.get_db() as conn:
@@ -212,7 +212,7 @@ async def test_ensure_sandbox_state_matrix(
         await dbmod.upsert_sandbox(SandboxRecord(
             id=phantom_id, provider="daytona", sandbox_ref="dt-phantom",
             status="running", root="/home/daytona",
-            volume_id="v1", subpath="agents/a1/home",
+            volume_id="v1", subpath="agents/a1",
         ))
         await dbmod.set_session_current_sandbox("s1", phantom_id)
         # Now delete the sandbox to make the pointer dangle.
