@@ -3147,6 +3147,14 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
         await upsert_sandbox(sb)
         return sb
     if status in ("missing", "error"):
+        # Snapshot the provisioning identity BEFORE delete_sandbox wipes
+        # the row — without this, the replacement boots with empty
+        # shared_mounts and the snapshot dockerfile, so /mnt/<name> dirs
+        # the agent expected silently disappear and any custom image is
+        # downgraded to the default. Symptom in production: orchestrator
+        # container's /mnt/7 is empty after a sandbox went missing.
+        saved_dockerfile = sb.dockerfile
+        saved_shared_mounts = list(sb.shared_mounts) if sb.shared_mounts else None
         if status == "error":
             try:
                 await _providers_mod.destroy_sandbox(vol.provider, _synthesize_instance(sb))
@@ -3154,7 +3162,11 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
                 pass
         await delete_sandbox(sb.id)
         await set_session_current_sandbox(session_id, None)
-        return await _provision_new(fresh, previous_id=current_id)
+        return await _provision_new(
+            fresh, previous_id=current_id,
+            dockerfile=saved_dockerfile,
+            shared_mounts=saved_shared_mounts,
+        )
     raise HTTPException(500, f"Unknown sandbox status: {status}")
 
 
