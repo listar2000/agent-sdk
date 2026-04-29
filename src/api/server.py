@@ -3845,31 +3845,50 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
         session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
         event_type=EVT_USER_MESSAGE, payload={"text": message, "prompt_id": rpc_id},
     )
+    def _is_transient_supervisor_failure(e: Exception) -> bool:
+        # Transport-level: supervisor died mid-handshake.
+        if isinstance(e, (httpx.ConnectError, httpx.RemoteProtocolError,
+                          httpx.ReadError)):
+            return True
+        # Daytona signed proxy URL invalidation manifests as 502/503/504 on
+        # the supervisor's HTTP surface even while the supervisor process
+        # is alive — the proxy returns gateway errors for a few seconds
+        # after a fresh URL is minted for the same port. A rebind picks up
+        # the latest URL, retry then succeeds.
+        if isinstance(e, httpx.HTTPStatusError):
+            return e.response.status_code in (502, 503, 504)
+        return False
+
     try:
         _, _, state = await ensure_session_live(session_id)
         await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
         return
-    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as first_err:
-        # The supervisor died between `_reader_connected` observing it up
-        # and our prompt submit. Clear the flag so the next
-        # ensure_session_live is forced through the rebind path, then
-        # retry once. Handles the kill-then-immediately-send race for UI
-        # flows that don't add any delay.
-        log.warning("prompt for session %s failed with %s; forcing rebind + retry",
-                    session_id, type(first_err).__name__)
-        state._reader_connected = False
-        try:
-            _, _, state = await ensure_session_live(session_id)
-            await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
-            return
-        except Exception as e:
-            err = e
+    except Exception as first_err:
+        if not _is_transient_supervisor_failure(first_err):
+            err = first_err
             tb = traceback.format_exc()
-            log.exception("retry after rebind also failed for session %s", session_id)
-    except Exception as e:
-        err = e
-        tb = traceback.format_exc()
-        log.exception("prompt failed for session %s", session_id)
+            log.exception("prompt failed for session %s", session_id)
+        else:
+            # The supervisor died (or its signed Daytona URL was invalidated)
+            # between `_reader_connected` observing it up and our prompt
+            # submit. Clear the flag so the next ensure_session_live is
+            # forced through the rebind path, then retry once. Handles both
+            # the kill-then-immediately-send race for UI flows that don't add
+            # any delay AND the Daytona stale-signed-URL 502 churn during
+            # cascading recovery.
+            log.warning(
+                "prompt for session %s failed with %s; forcing rebind + retry",
+                session_id, type(first_err).__name__,
+            )
+            state._reader_connected = False
+            try:
+                _, _, state = await ensure_session_live(session_id)
+                await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
+                return
+            except Exception as e:
+                err = e
+                tb = traceback.format_exc()
+                log.exception("retry after rebind also failed for session %s", session_id)
 
     body = ""
     http_status: int | None = None
@@ -3967,8 +3986,25 @@ async def post_session_message(session_id: str, request: Request):
 
 @app.get("/sessions/{session_id}/events")
 async def session_events(session_id: str):
-    """SSE stream for a session. Recovers reaped sessions automatically."""
-    _, _, state = await ensure_session_live(session_id)
+    """SSE stream for a session. Recovers reaped sessions automatically.
+
+    Live-state shortcut: if SESSIONS already holds a live state for this
+    session, just subscribe — skip ensure_session_live's rebind path.
+    Reasoning: /events is a subscriber, not a driver. A persistent /events
+    stream that reconnects mid-recovery (UI's EventSource retry, the
+    _PersistentSse helper in tests) MUST NOT trigger a second rebind while
+    a prompt is in flight on the prior acp_session_id — doing so swaps
+    state.acp_session_id and orphans the in-flight prompt's reply events
+    on the now-abandoned ACP stream. The test would then time out waiting
+    for events that will never reach its rpc_id queue. Cold-start (state
+    missing) and hibernated (needs revival) still go through the full
+    ensure path.
+    """
+    cached_state = SESSIONS.get(session_id)
+    if cached_state is not None and not cached_state.is_hibernated:
+        state = cached_state
+    else:
+        _, _, state = await ensure_session_live(session_id)
     shutdown = state.shutdown
 
     async def _proxy_stream():
