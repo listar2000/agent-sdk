@@ -86,7 +86,6 @@ from .providers import (
     create_instance,
     default_cwd_for_provider,
     destroy_instance,
-    exec_in_instance,
     free_sandbox_port,
     kill_supervisor_in_sandbox,
     stop_instance,
@@ -4010,12 +4009,16 @@ async def session_set_config(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
+async def _resolve_sandbox_instance(
+    sandbox_id: str,
+    *,
+    agent_type: str = "claude",
+    spawn_env: dict[str, str] | None = None,
+) -> ProviderInstance:
     """Get a live ProviderInstance for a sandbox, auto-starting if needed.
 
-    Raises HTTPException on failure. Uses agent_type="claude" for auto-start
-    because all agent types share the same supervisor.js — only the ACP binary
-    differs, and file browsing doesn't need ACP at all.
+    Raises HTTPException on failure. Session-scoped callers pass the session's
+    agent_type/spawn_env so recovery restarts the same runtime shape.
     """
     # Fast path: cached port-based instance is live as-is. Daytona preview
     # URLs can expire while the in-memory instance stays cached, so those
@@ -4026,7 +4029,10 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
 
     sandbox_record = await _require_sandbox(sandbox_id)
     try:
-        await _ensure_sandbox_alive(sandbox_id, sandbox_record)
+        await _ensure_sandbox_alive(
+            sandbox_id, sandbox_record,
+            agent_type=agent_type, spawn_env=spawn_env,
+        )
     except Exception as e:
         raise HTTPException(502, f"failed to start sandbox: {e}")
     instance = _INSTANCES.get(sandbox_id)
@@ -4056,23 +4062,23 @@ async def session_sandbox_exec(session_id: str, request: Request):
         raise HTTPException(400, "command required")
     timeout = min(data.get("timeout", 30), 300)
 
-    _, sandbox, _ = await ensure_session_live(session_id)
-
-    # Build a ProviderInstance from the SandboxRecord for exec.
-    # exec_in_instance only needs provider + sandbox_id (=sandbox_ref) for Daytona.
-    instance = ProviderInstance(
-        provider=sandbox.provider,
-        url="",
-        root=sandbox.root,
-        sandbox_id=sandbox.sandbox_ref,
-        container_id=sandbox.sandbox_ref if sandbox.provider == "docker" else None,
+    response = await _proxy_from_session(
+        session_id, "POST", "/v1/exec",
+        json={"command": command, "timeout": timeout},
+        timeout=timeout + 5,
     )
-
+    if response.status_code >= 400:
+        return response
     try:
-        result = await exec_in_instance(instance, command, timeout=timeout)
-        return result.to_dict()
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        payload = json.loads(response.body)
+    except Exception:
+        return response
+    if not isinstance(payload, dict):
+        return response
+    payload.setdefault("stdout_truncated", False)
+    payload.setdefault("stderr_truncated", False)
+    payload.setdefault("timed_out", False)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -4084,12 +4090,18 @@ async def _resolve_session_instance(session_id: str) -> ProviderInstance:
     """Resolve a session_id to its current sandbox's ProviderInstance.
 
     Hides sandbox identity from callers — the whole point of the
-    ``/sessions/{id}/files/*`` endpoints. Does NOT start the ACP runtime
-    (file browsing doesn't need it); only ensures the sandbox itself is live.
+    session-scoped file and sandbox APIs. Does NOT start the ACP runtime;
+    only ensures the sandbox supervisor itself is live.
     """
     session = await _require_session_row(session_id)
     sandbox = await ensure_sandbox(session)
-    return await _resolve_sandbox_instance(sandbox.id)
+    agent = await get_agent(session["agent_id"])
+    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+    return await _resolve_sandbox_instance(
+        sandbox.id,
+        agent_type=agent_type,
+        spawn_env=_build_spawn_env_from_row(session),
+    )
 
 
 async def _proxy_instance(
