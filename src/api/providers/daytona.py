@@ -466,8 +466,11 @@ async def restart_daytona_supervisor(
     # Without this, an external stop that's still in progress makes
     # `sandbox.start()` reject with "Sandbox state change in progress",
     # which kills the fast recovery path that preserves /events
-    # subscribers. Max ~15s wait — matches Daytona's typical stop latency.
-    sandbox, state_str = await _wait_for_stable_daytona_state(daytona, daytona_sandbox_id)
+    # subscribers. Bumped from 15 s → 45 s after observing 2x concurrent
+    # load take ~30 s for Daytona's stopping→stopped transition to land.
+    sandbox, state_str = await _wait_for_stable_daytona_state(
+        daytona, daytona_sandbox_id, max_wait_s=45.0,
+    )
     if state_str not in ("started", "running"):
         log.info("starting stopped daytona sandbox %s (state=%s)",
                  daytona_sandbox_id, state_str)
