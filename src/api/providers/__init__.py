@@ -186,8 +186,15 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
                 timeout=timeout + 5,
             )
             out = (r.result if hasattr(r, "result") else str(r)) or ""
+            err = (r.stderr if hasattr(r, "stderr") else "") or ""
+            code = r.exit_code if hasattr(r, "exit_code") else None
             out, trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
-            return ExecResult(stdout=out, stderr="", exit_code=0, stdout_truncated=trunc)
+            return ExecResult(
+                stdout=out,
+                stderr=err,
+                exit_code=code,
+                stdout_truncated=trunc,
+            )
         except asyncio.TimeoutError:
             return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
 
