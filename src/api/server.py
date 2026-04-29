@@ -3935,15 +3935,9 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
         event_type=EVT_USER_MESSAGE, payload={"text": message, "prompt_id": rpc_id},
     )
     def _is_transient_supervisor_failure(e: Exception) -> bool:
-        # Transport-level: supervisor died mid-handshake. ReadTimeout and
-        # CloseError cover the "client.aclose() called by a concurrent
-        # rebind while this prompt POST was awaiting a response" case —
-        # without them, the watchdog-triggered rebind closes the old
-        # client to abort the hung POST but the resulting exception
-        # falls through to the generic error path instead of retrying.
+        # Transport-level: supervisor died mid-handshake.
         if isinstance(e, (httpx.ConnectError, httpx.RemoteProtocolError,
-                          httpx.ReadError, httpx.ReadTimeout,
-                          httpx.CloseError)):
+                          httpx.ReadError)):
             return True
         # Daytona signed proxy URL invalidation manifests as 502/503/504 on
         # the supervisor's HTTP surface even while the supervisor process
