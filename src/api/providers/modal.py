@@ -857,11 +857,19 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
     src = f"/v/{src_rel}"
     dst = f"/v/{dst_rel}"
     dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
+    settle_check = (
+        f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
+        f"if [ -e {shlex.quote(dst)} ] && [ ! -e {shlex.quote(src)} ]; then exit 0; fi; "
+        f"sleep 0.1; "
+        f"done; "
+        f"echo __RENAME_NOT_VISIBLE__; exit 98"
+    )
     if overwrite:
         shell = (
             f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
             f"mkdir -p {shlex.quote(dst_parent)} && "
-            f"mv -- {shlex.quote(src)} {shlex.quote(dst)}"
+            f"mv -- {shlex.quote(src)} {shlex.quote(dst)} && "
+            f"{settle_check}"
         )
     else:
         shell = (
@@ -871,7 +879,8 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
             f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi; "
             f"ln {shlex.quote(src)} {shlex.quote(dst)} || "
             f"{{ if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; else exit 1; fi; }}; "
-            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}"
+            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}; "
+            f"{settle_check}"
         )
     rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
     if rc != 0:
@@ -881,6 +890,8 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
             raise VolumeFileExistsError(new_path)
         if b"__UNSUPPORTED_DIR__" in out:
             raise NotImplementedError("atomic no-overwrite directory rename is not supported")
+        if b"__RENAME_NOT_VISIBLE__" in out:
+            raise RuntimeError("volume_rename postcondition failed: destination not visible")
         raise RuntimeError(
             f"modal volume_rename failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
         )
