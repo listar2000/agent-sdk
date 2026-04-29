@@ -119,7 +119,55 @@ async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
         body["secrets"] = {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN}
     resp = await client.post(f"{SERVER}/sessions", json=body, timeout=180)
     assert resp.status_code == 200, f"quick session failed ({provider}): {resp.text}"
-    return resp.json()
+    sess = resp.json()
+    # Register for autouse-fixture teardown so the daytona/docker/local
+    # sandbox provisioned by this session is destroyed even if the test
+    # body raises. Defence-in-depth alongside the ``agent_sdk_origin``
+    # label on every daytona create — if the test crashes after this
+    # call but before its own cleanup, the fixture finalizer still runs.
+    _CREATED_SESSIONS.append(sess["session_id"])
+    return sess
+
+
+# Sessions registered by `_quick_session` during the current test.
+# Cleared and acted on by the ``_auto_destroy_test_sandboxes`` autouse
+# fixture defined further down. Module-level rather than fixture-local so
+# `_quick_session` callers don't need to plumb an extra param.
+_CREATED_SESSIONS: list[str] = []
+
+
+@pytest.fixture(autouse=True)
+def _auto_destroy_test_sandboxes():
+    """For every test that calls ``_quick_session``, destroy the sandbox(es)
+    it created at teardown — even if the test body or its own ``finally``
+    block didn't get there. Uses the server's ``DELETE /sandboxes/{id}``
+    so the in-memory ``_INSTANCES`` cache, the DB row, and the actual
+    daytona/docker/local compute are all torn down together.
+
+    Errors are swallowed (best-effort cleanup) and the underlying daytona
+    sandbox still has the ``agent_sdk_origin`` label as a backup so a
+    crashed-mid-cleanup orphan can be picked up by
+    ``scripts/cleanup_daytona_orphans.py``.
+    """
+    _CREATED_SESSIONS.clear()
+    yield
+    sessions = list(_CREATED_SESSIONS)
+    _CREATED_SESSIONS.clear()
+    if not sessions:
+        return
+    with httpx.Client() as c:
+        for sid in sessions:
+            try:
+                r = c.get(f"{SERVER}/sessions/{sid}", timeout=5)
+                if r.status_code != 200:
+                    continue
+                sb_id = r.json().get("current_sandbox_id")
+                if not sb_id:
+                    continue
+                c.delete(f"{SERVER}/sandboxes/{sb_id}", timeout=30)
+            except Exception:
+                # Best-effort — label-based cleanup catches the rest.
+                pass
 
 
 async def _get_sandbox(client: httpx.AsyncClient, session_id: str) -> dict:
