@@ -790,3 +790,65 @@ async def volume_write(ref: str, path: str, content: bytes) -> None:
         raise RuntimeError(
             f"modal volume_write failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
         )
+
+
+async def volume_upload(ref: str, path: str, content: bytes) -> None:
+    """Upload bytes to ``<volume>/<path>``."""
+    await volume_write(ref, path, content)
+
+
+async def volume_mkdir(ref: str, path: str) -> None:
+    """Create a directory at ``<volume>/<path>``."""
+    rel = _safe_rel(path)
+    if not rel:
+        raise ValueError("modal volume_mkdir: path required")
+    target = f"/v/{rel}"
+    rc, _out, err = await _run_volume_shell(
+        ref, f"mkdir -p {shlex.quote(target)}", timeout=60,
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"modal volume_mkdir failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
+        )
+
+
+async def volume_delete(ref: str, path: str) -> None:
+    """Delete a file or directory at ``<volume>/<path>``."""
+    rel = _safe_rel(path)
+    if not rel:
+        raise ValueError("modal volume_delete: path required")
+    target = f"/v/{rel}"
+    shell = (
+        f"if [ ! -e {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
+        f"rm -rf -- {shlex.quote(target)}"
+    )
+    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
+    if rc != 0:
+        if b"__MISSING__" in out:
+            raise FileNotFoundError(f"{path} not found on volume {ref}")
+        raise RuntimeError(
+            f"modal volume_delete failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
+        )
+
+
+async def volume_rename(ref: str, path: str, new_path: str) -> None:
+    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
+    src_rel = _safe_rel(path)
+    dst_rel = _safe_rel(new_path)
+    if not src_rel or not dst_rel:
+        raise ValueError("modal volume_rename: path and new_path required")
+    src = f"/v/{src_rel}"
+    dst = f"/v/{dst_rel}"
+    dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
+    shell = (
+        f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+        f"mkdir -p {shlex.quote(dst_parent)} && "
+        f"mv -- {shlex.quote(src)} {shlex.quote(dst)}"
+    )
+    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
+    if rc != 0:
+        if b"__MISSING__" in out:
+            raise FileNotFoundError(f"{path} not found on volume {ref}")
+        raise RuntimeError(
+            f"modal volume_rename failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
+        )
