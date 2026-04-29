@@ -197,10 +197,24 @@ if (args.snapshotPath && isWarmRestart) {
   // Layer 2: agent-memory overlay (per-turn snapshot of session dirs).
   // This is the tier that carries conversation JSONLs, so even if
   // filesystem_cache is stale (no cold snapshot since last turn), the
-  // latest turn's memory still wins. No visibility poll — if it's
-  // missing, we just have no post-cold state to overlay.
+  // latest turn's memory still wins.
+  //
+  // Use _snapshotVisible (poll) instead of a single existsSync. After
+  // an external sandbox delete, the prior sandbox's last per-turn write
+  // to agent_memory.tar may take 5-15 s to be visible on the new sandbox's
+  // S3-backed FUSE mount under concurrent load — and a single existsSync
+  // at boot can miss it, silently dropping turn-N conversation state
+  // and forcing claude-agent-acp's session/load to return -32603 forever
+  // (the JSONL never lands on /home/daytona). Polling the same way
+  // filesystem_cache.tar does closes that race.
+  //
+  // Trade-off: a truly fresh sandbox with no agent_memory.tar yet pays
+  // up to the poll-timeout cost (currently ~10s) on first boot. Worth it:
+  // the alternative is silent context loss on every Type 2 replacement
+  // under load, which the test_session_resume_after_delete[daytona]
+  // ``inner_after == inner_before`` invariant deliberately catches.
   const memPath = _agentMemoryPath(args.snapshotPath);
-  if (memPath && fs.existsSync(memPath)) {
+  if (memPath && _snapshotVisible(memPath, 10000)) {
     log(`restoring agent_memory from ${memPath}`);
     const r = spawnSync("tar", ["-xf", memPath, "-C", args.root], {
       stdio: ["ignore", "inherit", "inherit"],
@@ -208,6 +222,8 @@ if (args.snapshotPath && isWarmRestart) {
     if (r.status !== 0) {
       log(`agent_memory restore exited rc=${r.status}; continuing`);
     }
+  } else if (memPath) {
+    log(`agent_memory ${memPath} not visible after 10s — skipping overlay restore`);
   }
 }
 
