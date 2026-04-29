@@ -70,7 +70,8 @@ async def test_release_endpoint_calls_pool_and_returns_snapshot_info(setup):
                                         snapshot_version=2)
 
     # Mock pool.release so this test doesn't try to talk to daytona.
-    with patch("api.sandbox.runtime.get_pool") as get_pool:
+    with patch("api.sandbox.get_pool") as get_pool, \
+         patch("api.sandbox.runtime.get_pool", new=get_pool):
         get_pool.return_value.release = AsyncMock(return_value=None)
         async with AsyncClient(
             transport=ASGITransport(app=srv.app),
@@ -90,7 +91,8 @@ async def test_release_endpoint_calls_pool_and_returns_snapshot_info(setup):
 async def test_release_endpoint_idempotent_on_unknown_session(setup):
     """Releasing a session_id with no DB row: pool.release is a no-op,
     deserialize(None) → UnknownSandboxState with no snapshot."""
-    with patch("api.sandbox.runtime.get_pool") as get_pool:
+    with patch("api.sandbox.get_pool") as get_pool, \
+         patch("api.sandbox.runtime.get_pool", new=get_pool):
         get_pool.return_value.release = AsyncMock(return_value=None)
         async with AsyncClient(
             transport=ASGITransport(app=srv.app),

@@ -4301,6 +4301,50 @@ async def _hibernate_session_id(session_id: str, force: bool) -> dict:
             "session_in_memory": True}
 
 
+@app.post("/sessions/{session_id}/message+stream")
+async def post_message_stream_route(session_id: str, request: Request):
+    """**New phase-2 endpoint** (per docs/ephemeral-sandbox-design.md §7).
+
+    Submits a prompt and streams the reply directly as SSE — collapses
+    today's two-step ``POST /message`` (returns rpc_id) +
+    ``GET /events`` (subscribe) into a single request/response stream.
+    Multi-subscriber ``GET /events`` is preserved alongside; this
+    endpoint is for callers that just want the reply they're waiting
+    on.
+
+    Backed by ``api.sandbox.SessionPool`` + the per-prompt supervisor
+    SSE stream inside ``SandboxSession.execute_prompt`` — no persistent
+    server↔supervisor connection.
+
+    The legacy ``POST /sessions/{id}/message`` (returning rpc_id) and
+    ``GET /sessions/{id}/events`` (multi-subscriber) routes are
+    untouched and continue to work for callers that need them.
+    """
+    from fastapi.responses import StreamingResponse
+
+    from api.sandbox import get_pool
+
+    body = await _json_body(request)
+    message = body.get("message")
+    if not message:
+        raise HTTPException(400, "message required")
+
+    pool = get_pool()
+
+    async def _gen():
+        try:
+            session = await pool.get_session(session_id)
+            async for event in session.execute_prompt(message):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            err = {"type": "error", "error": {
+                "message": str(e), "exception_type": type(e).__name__,
+            }}
+            yield f"data: {json.dumps(err)}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
 @app.post("/sessions/{session_id}/release")
 async def release_session_route(session_id: str):
     """**New phase-2 endpoint** (per docs/ephemeral-sandbox-design.md §7).
