@@ -307,6 +307,19 @@ class Agent:
         clone_name = name or f"{self.name}-clone"
         return Agent(clone_name, **kwargs)
 
+    def _secrets_payload(self) -> dict[str, str]:
+        # Credentials ride through the standard ``secrets`` channel — the
+        # server pops env/secrets uniformly via ``_pop_env_and_secrets`` and
+        # merges them into the sandbox's ``spawn_env``. No special-case
+        # oauth_token / api_key handling anywhere.
+        # User-supplied secrets win; oauth/api fields fill in only if absent.
+        secrets: dict[str, str] = dict(self._user_secrets)
+        if self._oauth_token:
+            secrets.setdefault("CLAUDE_CODE_OAUTH_TOKEN", self._oauth_token)
+        if self._api_key:
+            secrets.setdefault("ANTHROPIC_API_KEY", self._api_key)
+        return secrets
+
     def _registration_payload(self) -> dict[str, Any]:
         config: dict[str, Any] = {"name": self.name}
         # Pass through every Agent field that's set. agent_type is always
@@ -321,16 +334,7 @@ class Agent:
         if self.dockerfile is not None:
             # Send file content so remote servers can use it
             config["dockerfile_content"] = Path(self.dockerfile).read_text()
-        # Credentials ride through the standard ``secrets`` channel — the
-        # server pops env/secrets uniformly via ``_pop_env_and_secrets`` and
-        # merges them into the sandbox's ``spawn_env``. No special-case
-        # oauth_token / api_key handling anywhere.
-        # User-supplied secrets win; oauth/api fields fill in only if absent.
-        secrets: dict[str, str] = dict(self._user_secrets)
-        if self._oauth_token:
-            secrets.setdefault("CLAUDE_CODE_OAUTH_TOKEN", self._oauth_token)
-        if self._api_key:
-            secrets.setdefault("ANTHROPIC_API_KEY", self._api_key)
+        secrets = self._secrets_payload()
         if secrets:
             config["secrets"] = secrets
         return config
@@ -349,10 +353,9 @@ class Agent:
                 # Resume by session_id alone. Ship credentials so the respawned
                 # supervisor runs under the caller's Claude token, not the server's.
                 resume_body: dict[str, Any] = {}
-                if self._oauth_token:
-                    resume_body["oauth_token"] = self._oauth_token
-                if self._api_key:
-                    resume_body["api_key"] = self._api_key
+                secrets = self._secrets_payload()
+                if secrets:
+                    resume_body["secrets"] = secrets
                 resp = await self._client.post(
                     f"/sessions/{self.session_id}/resume",
                     json=resume_body or None,
@@ -599,5 +602,3 @@ class Agent:
 
     async def __aexit__(self, *args):
         await self.aclose()
-
-

@@ -223,6 +223,12 @@ async def test_second_message_does_not_rebuild_session_state(client, monkeypatch
             "/message, calling AcpClient() a second time and running "
             "session/load against a just-created inner session."
         )
+        # Patching _start_session_tasks to a no-op means _start_sse_reader
+        # never ran, so _reader_alive / _reader_connected are False. Real
+        # production traffic always has these True after /sessions returns
+        # (the reader is started synchronously). Simulate that condition so
+        # _ensure_state_live takes the fast path it would in production.
+        state._reader_connected = True
 
         # 2. First /message — must reuse the existing state.
         r = await client.post(f"/sessions/{sid}/message", json={"message": "hello"})
@@ -250,9 +256,13 @@ async def test_second_message_does_not_rebuild_session_state(client, monkeypatch
 
         # The URL the second message's client saw (if any) must match the
         # original — another symptom of a rebuild would be a brand-new URL.
-        assert _FakeAcpClient.seen_urls == ["http://127.0.0.1:54321"], (
+        # The provisioning runs through the real local provider, so the URL
+        # is whatever port was allocated; we just assert there's exactly one
+        # and it matches the SessionState's supervisor_url.
+        assert _FakeAcpClient.seen_urls == [state.supervisor_url], (
             f"AcpClient was asked to talk to unexpected URLs: "
-            f"{_FakeAcpClient.seen_urls}"
+            f"{_FakeAcpClient.seen_urls} (expected single entry "
+            f"matching supervisor_url={state.supervisor_url!r})"
         )
     finally:
         for p in patches:

@@ -1125,7 +1125,15 @@ class TestServerEndpointAdversarial:
         from api.models import VolumeRecord
         fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
                                 provider_ref="dt-x", status="ready")
-        with patch("api.server.create_instance", side_effect=RuntimeError("circuit breaker open for daytona")), \
+        # Eager session-create flows through _provision_sandbox_core →
+        # _provision_with_cache_retry → providers.provision_sandbox. Patch
+        # the dispatch-layer entry point so the mock survives the wrapper
+        # chain. (Earlier the test patched api.server.create_instance, which
+        # the eager flow no longer calls after the funnel-through refactor.)
+        async def boom(*args, **kwargs):
+            raise RuntimeError("circuit breaker open for daytona")
+
+        with patch("api.providers.provision_sandbox", new=boom), \
              patch("api.server.get_volume", return_value=fake_vol), \
              patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
             resp = await async_client.post("/sessions", json={

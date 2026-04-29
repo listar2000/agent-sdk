@@ -6,7 +6,15 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+
+# ── Closed enums (Literal aliases) ──
+# Provider names and sandbox statuses are closed sets — narrowing them
+# lets type-checkers catch the silent-drop bug class (e.g. a dict literal
+# that maps "daytona"+"docker" but forgets "local"+"modal").
+Provider = Literal["local", "docker", "daytona", "modal"]
+SandboxStatus = Literal["running", "stopped", "error", "creating", "missing"]
 
 
 @dataclass
@@ -70,9 +78,9 @@ class AgentRecord:
 @dataclass
 class SandboxRecord:
     id: str
-    provider: str
+    provider: Provider
     sandbox_ref: str
-    status: str = "stopped"
+    status: SandboxStatus = "stopped"
     root: str = "/tmp"
     volume_id: str | None = None
     subpath: str | None = None
@@ -104,10 +112,13 @@ class SandboxRecord:
 class VolumeRecord:
     id: str
     name: str
-    provider: str
+    provider: Provider
     provider_ref: str
     status: str = "ready"
     supervisor_agent_types: list[str] = field(default_factory=list)
+
+
+SessionLifecycle = Literal["live", "hibernated"]
 
 
 @dataclass
@@ -120,6 +131,12 @@ class SessionState:
     inner_session_id: str | None = None
     agent_type: str = "claude"  # claude | codex (selects ProviderAdapter)
     client: object | None = None  # AcpClient, typed loosely to avoid circular import
+    # Hibernation is now explicit state. The two writers below keep this
+    # in sync with _INSTANCES on the server side: _hibernate_session flips
+    # to "hibernated" right after popping _INSTANCES; _rebind_state flips
+    # back to "live" right after repopulating it. New sessions are "live"
+    # by default since both construction sites are post-supervisor-attach.
+    lifecycle: SessionLifecycle = "live"
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     last_event_id: str | None = None  # SSE cursor — skip events before this ID
     last_activity: float = field(default_factory=time.time)
@@ -164,6 +181,10 @@ class SessionState:
     @property
     def agent_busy(self) -> bool:
         return self.active_rpc_id is not None
+
+    @property
+    def is_hibernated(self) -> bool:
+        return self.lifecycle == "hibernated"
 
     # ── Session-scoped subscribers (receive all events) ──
 

@@ -5,6 +5,7 @@ Run: uvicorn src.api.server:app --port 7778
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -85,11 +87,11 @@ from .providers import (
     create_instance,
     default_cwd_for_provider,
     destroy_instance,
-    exec_in_instance,
     free_sandbox_port,
     kill_supervisor_in_sandbox,
     stop_instance,
 )
+from .providers._shared import _PROVIDER_VOLUME_HOME
 from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_secrets
 from .sse import (
@@ -334,6 +336,7 @@ async def _hibernate_session(state: SessionState) -> None:
     # Drop the in-process instance entry AFTER provider stop / DB flip so a
     # crash mid-stop leaves enough state for reconcile to find the container.
     _INSTANCES.pop(sandbox_id, None)
+    state.lifecycle = "hibernated"
 
     # Return the per-session supervisor port to the per-sandbox allocator
     # (provider-agnostic). Today only daytona allocates one; others run a
@@ -370,12 +373,41 @@ async def _hibernate_session(state: SessionState) -> None:
         await _shutdown_session_state(state, remove=True, force=True)
 
 
-def _is_hibernated(state: SessionState) -> bool:
-    """A session is hibernated when its sandbox has no live in-process
-    instance. ``_hibernate_session`` pops ``_INSTANCES``; ``_rebind_state``
-    repopulates it on resume — so this single check captures both.
+async def _ensure_provider_sandbox_stopped(sandbox_id: str | None) -> None:
+    """Defensively retry ``stop_sandbox`` at the provider before we drop
+    our last in-memory reference to a sandbox.
+
+    Backstops the silent-leak class: ``_hibernate_session`` swallows
+    transient ``stop_sandbox`` failures (logs WARNING, flips DB to
+    STOPPED, sets ``lifecycle="hibernated"``, pops ``_INSTANCES``), so
+    the eviction paths that fire later believe the sandbox is stopped
+    when it may still be RUNNING in the cloud (Daytona, Modal). Without
+    this retry the workspace orphans in the provider with zero
+    server-side memory of it.
+
+    No-op when:
+      * ``sandbox_id`` is None.
+      * ``_INSTANCES`` still has an entry — the caller's hot-path teardown
+        owns destruction of live instances.
+      * Another live ``SessionState`` still references the sandbox.
+      * The sandbox row is gone from the DB (already cleaned up).
     """
-    return state.sandbox_id not in _INSTANCES
+    if not sandbox_id:
+        return
+    if sandbox_id in _INSTANCES:
+        return
+    if any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+        return
+    sb = await get_sandbox(sandbox_id)
+    if sb is None:
+        return
+    try:
+        await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))
+    except Exception as e:
+        log.warning(
+            "defensive stop_sandbox at eviction failed for %s (provider=%s): %s",
+            sandbox_id, sb.provider, e,
+        )
 
 
 async def _maybe_evict_hibernated(state: SessionState) -> None:
@@ -394,12 +426,12 @@ async def _maybe_evict_hibernated(state: SessionState) -> None:
         return
     if state.shutdown.is_set():
         return  # already torn down
-    if not _is_hibernated(state):
+    if not state.is_hibernated:
         return  # sandbox is still up — keep state for the running session
     async with _get_session_lock(state.session_id):
         # Re-check under lock: a new /events handler may have subscribed,
         # or a /message may have woken the sandbox between our checks.
-        if state._session_subscribers or not _is_hibernated(state):
+        if state._session_subscribers or not state.is_hibernated:
             return
         if state.active_rpc_id is not None or state.pending_prompts:
             return
@@ -409,7 +441,12 @@ async def _maybe_evict_hibernated(state: SessionState) -> None:
             "evicting hibernated session %s after last subscriber dropped",
             state.session_id,
         )
+        sandbox_id = state.sandbox_id
         await _shutdown_session_state(state, remove=True, force=True)
+        # Defensive stop AFTER shutdown so the helper's "still in use"
+        # check (any(s.sandbox_id == ...) over SESSIONS) doesn't see
+        # this very session and bail out.
+        await _ensure_provider_sandbox_stopped(sandbox_id)
 
 
 async def _reap_one_tick(now: float) -> None:
@@ -448,7 +485,7 @@ async def _reap_one_tick(now: float) -> None:
                 continue
             if state.active_rpc_id is not None or state.pending_prompts:
                 continue
-            if state.sandbox_id in _INSTANCES:
+            if not state.is_hibernated:
                 # Running session: hibernate compute. _hibernate_session
                 # also evicts state inline if no subscribers are attached.
                 log.info(
@@ -467,11 +504,54 @@ async def _reap_one_tick(now: float) -> None:
                     "(idle %.0fs, no subscribers)",
                     state.session_id, now - idle_since,
                 )
+                sandbox_id = state.sandbox_id
                 await _shutdown_session_state(
                     state, remove=True, force=True, mark_idle_at=now,
                 )
+                # See note in _maybe_evict_hibernated — defensive stop
+                # must follow shutdown so the "still in use" guard
+                # doesn't trip on the session being evicted.
+                await _ensure_provider_sandbox_stopped(sandbox_id)
             # else: hibernated + has subscribers — wait for them to drop;
             # /events finally → _maybe_evict_hibernated handles eviction.
+
+
+def _sweep_session_locks() -> int:
+    """Drop ``_session_locks`` entries for sessions no longer in SESSIONS,
+    provided the lock is fully idle.
+
+    The existing comment at ``_shutdown_session_state`` justifies *not*
+    popping locks at session-evict time: a concurrent ``_ensure_runtime_locked``
+    that's mid-acquire on the same session_id would otherwise see a fresh
+    Lock from ``_get_session_lock(sid).setdefault`` and run in parallel with
+    the original holder. We preserve that invariant here by sweeping ONLY
+    when the lock is unlocked AND has no waiters — at that point no caller
+    holds a stale reference, so a future ``_get_session_lock(sid)`` minting
+    a new Lock cannot race.
+
+    ``asyncio.Lock._waiters`` is CPython-internal but stable (it's a
+    ``collections.deque`` of suspended ``acquire`` futures). The alternative
+    — bookkeeping a "last touched" timestamp at every acquire — is hotter
+    than this once-per-reaper-tick sweep.
+    """
+    if not _session_locks:
+        return 0
+    pruned = 0
+    for sid in list(_session_locks):
+        if sid in SESSIONS:
+            continue
+        lock = _session_locks.get(sid)
+        if lock is None or lock.locked():
+            continue
+        if getattr(lock, "_waiters", None):
+            continue
+        # Re-check under the same tick — a concurrent /sessions create may
+        # have just landed an entry into SESSIONS.
+        if sid in SESSIONS:
+            continue
+        if _session_locks.pop(sid, None) is not None:
+            pruned += 1
+    return pruned
 
 
 async def _idle_reaper():
@@ -479,6 +559,10 @@ async def _idle_reaper():
     while True:
         await asyncio.sleep(REAPER_TICK_S)
         await _reap_one_tick(time.time())
+        pruned = _sweep_session_locks()
+        if pruned:
+            log.info("idle reaper: pruned %d cold session_locks (now %d)",
+                     pruned, len(_session_locks))
 
 
 @asynccontextmanager
@@ -500,7 +584,11 @@ async def lifespan(app):
         except Exception as e:
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
-    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local")])
+    # All four providers go through the dispatch; ones without a
+    # reconcile_on_startup hook (daytona, local, currently modal too) no-op.
+    # Listing modal here means the moment its module gains a reconcile hook
+    # we don't have to remember to wire it up.
+    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
 
     reaper = asyncio.create_task(_idle_reaper())
     yield
@@ -782,6 +870,7 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     state.acp_session_id = new_acp_session_id
     state.inner_session_id = new_inner_sid
     state.last_event_id = None  # old cursor is meaningless on the new session
+    state.lifecycle = "live"
     # Close the old client in the background — the next turn doesn't need
     # to wait for the TCP teardown.
     if old_client is not None:
@@ -841,12 +930,111 @@ async def _recover_after_disconnect(state: SessionState) -> bool:
         return False
 
 
+@dataclass
+class _SseDisconnectInfo:
+    """Result of one upstream SSE connection attempt.
+
+    ``connected_successfully`` is True iff we got past raise_for_status and
+    started reading chunks (regardless of whether drain later errored). Used
+    by the outer loop to reset the retry budget — a 30-second drain followed
+    by a transient error counts as "had one good connection," not "20 bad
+    attempts."
+    """
+    reason: str                       # "upstream_eof" or "ExceptionType: msg"
+    connected_successfully: bool
+    supervisor_dead: bool             # cheap port-based fast-fail signal
+
+
+async def _sse_reader_connect_and_drain(
+    state: SessionState,
+    attempt: int,
+    text_parts: list[str],
+    thinking_parts: list[str],
+) -> _SseDisconnectInfo:
+    """Open one upstream stream and drain it. Returns when the stream ends.
+
+    CancelledError propagates to the caller; the outer reader's try/finally
+    is the single owner of cancellation cleanup.
+    """
+    reader_buffer = ""
+    disconnect_reason = "upstream_eof"
+    connected = False
+    sse_http = httpx.AsyncClient(
+        base_url=state.client.base_url, timeout=None, proxy=None,
+    )
+    try:
+        try:
+            headers = {"Accept": "text/event-stream"}
+            if state.last_event_id:
+                headers["Last-Event-ID"] = state.last_event_id
+            log.info("[SSE-READER] connecting upstream stream for session %s "
+                     "(attempt=%d, last_event_id=%s)",
+                     state.session_id, attempt, state.last_event_id or "-")
+            async with sse_http.stream(
+                "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
+            ) as resp:
+                resp.raise_for_status()
+                connected = True
+                state._reader_connected = True
+                log.info("[SSE-READER] upstream stream connected for session %s "
+                         "(attempt=%d, status=%d)",
+                         state.session_id, attempt, resp.status_code)
+                async for chunk in resp.aiter_text():
+                    if state.shutdown.is_set():
+                        log.info("[SSE-READER] session %s shutting down; "
+                                 "exiting drain", state.session_id)
+                        break
+                    reader_buffer += chunk
+                    while "\n\n" in reader_buffer:
+                        block, reader_buffer = reader_buffer.split("\n\n", 1)
+                        _broadcast_one_block(
+                            state, block, parse_sse_data(block),
+                            text_parts, thinking_parts,
+                        )
+        except asyncio.CancelledError:
+            log.info("[SSE-READER] reader task cancelled for session %s",
+                     state.session_id)
+            raise
+        except Exception as e:
+            disconnect_reason = f"{type(e).__name__}: {e}"
+            log.warning("[SSE-READER] upstream reader error for session %s "
+                        "on attempt %d: %s",
+                        state.session_id, attempt, disconnect_reason)
+        else:
+            log.warning("[SSE-READER] upstream stream ended for session %s "
+                        "on attempt %d without an exception",
+                        state.session_id, attempt)
+    finally:
+        state._reader_connected = False
+        try:
+            await sse_http.aclose()
+        except Exception:
+            pass
+
+    # Fast-fail on confirmed-dead supervisors: port-based providers expose a
+    # subprocess we can cheaply check, so we can skip the full retry ladder
+    # (~35s of backoff) when the supervisor is definitely gone.
+    cached_inst = _INSTANCES.get(state.sandbox_id)
+    supervisor_dead = (
+        cached_inst is not None
+        and cached_inst.process is not None
+        and not _instance_process_alive(cached_inst)
+    )
+    return _SseDisconnectInfo(
+        reason=disconnect_reason,
+        connected_successfully=connected,
+        supervisor_dead=supervisor_dead,
+    )
+
+
 def _start_sse_reader(state: SessionState) -> None:
     """Start a background task that reads SSE from the upstream /v1/acp/{id}
     endpoint and broadcasts chunks to subscriber queues. Called at session
     creation so events are captured before any prompt is sent.
 
-    Works with the supervisor which exposes the POST+SSE JSON-RPC surface.
+    The reader's recovery state machine (retry, recover, give-up) is
+    expressed at the top of ``_reader``; the per-connection mechanics live
+    in ``_sse_reader_connect_and_drain``.
     """
     if state._reader_alive:
         log.info("[SSE-READER] start requested but reader already alive for session %s",
@@ -866,89 +1054,34 @@ def _start_sse_reader(state: SessionState) -> None:
         attempt = 0
         try:
             while not state.shutdown.is_set():
-                reader_buffer = ""
-                sse_http = None
-                disconnect_reason = "upstream_eof"
-                try:
-                    attempt += 1
-                    headers = {"Accept": "text/event-stream"}
-                    if state.last_event_id:
-                        headers["Last-Event-ID"] = state.last_event_id
-                    log.info("[SSE-READER] connecting upstream stream for session %s "
-                             "(attempt=%d, last_event_id=%s)",
-                             state.session_id, attempt, state.last_event_id or "-")
-                    sse_http = httpx.AsyncClient(
-                        base_url=state.client.base_url, timeout=None, proxy=None,
-                    )
-                    async with sse_http.stream(
-                        "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
-                    ) as resp:
-                        resp.raise_for_status()
-                        reconnect_delay_s = 1.0
-                        attempt = 0
-                        state._reader_connected = True
-                        log.info("[SSE-READER] upstream stream connected for session %s "
-                                 "(attempt=%d, status=%d)",
-                                 state.session_id, attempt, resp.status_code)
-                        async for chunk in resp.aiter_text():
-                            if state.shutdown.is_set():
-                                log.info("[SSE-READER] session %s shutting down; "
-                                         "exiting reader loop", state.session_id)
-                                return
-                            reader_buffer += chunk
-                            while "\n\n" in reader_buffer:
-                                block, reader_buffer = reader_buffer.split("\n\n", 1)
-                                _broadcast_one_block(
-                                    state, block, parse_sse_data(block),
-                                    text_parts, thinking_parts,
-                                )
-                except asyncio.CancelledError:
-                    log.info("[SSE-READER] reader task cancelled for session %s",
-                             state.session_id)
-                    raise
-                except Exception as e:
-                    disconnect_reason = f"{type(e).__name__}: {e}"
-                    log.warning("[SSE-READER] upstream reader error for session %s "
-                                "on attempt %d: %s",
-                                state.session_id, attempt, disconnect_reason)
-                else:
-                    log.warning("[SSE-READER] upstream stream ended for session %s "
-                                "on attempt %d without an exception",
-                                state.session_id, attempt)
-                finally:
-                    state._reader_connected = False
-                    if sse_http is not None:
-                        try:
-                            await sse_http.aclose()
-                        except Exception:
-                            pass
+                attempt += 1
+                info = await _sse_reader_connect_and_drain(
+                    state, attempt, text_parts, thinking_parts,
+                )
+                if info.connected_successfully:
+                    # Successful connect resets the retry budget for the
+                    # next failure — the original code did this inline at
+                    # the top of the stream block (line ~887 of the old
+                    # version), so a 30-second healthy drain followed by a
+                    # transient drop counts as one fresh attempt, not N.
+                    attempt = 0
+                    reconnect_delay_s = 1.0
 
                 if state.shutdown.is_set():
                     return
 
-                # Fast-fail on confirmed-dead supervisors: for port-based
-                # providers we can cheaply check the subprocess in _INSTANCES
-                # and skip the full exponential-backoff ladder (~35s) when
-                # the supervisor is definitely gone.
-                cached_inst = _INSTANCES.get(state.sandbox_id)
-                supervisor_dead = (
-                    cached_inst is not None
-                    and cached_inst.process is not None
-                    and not _instance_process_alive(cached_inst)
-                )
-
                 if (_sse_reader_disconnect_is_recoverable(state)
                         and attempt <= _SSE_MAX_IDLE_RETRIES
-                        and not supervisor_dead):
+                        and not info.supervisor_dead):
                     log.warning("[SSE-READER] recoverable upstream disconnect for "
                                 "session %s (%s); reconnecting in %.1fs (attempt %d/%d)",
-                                state.session_id, disconnect_reason,
+                                state.session_id, info.reason,
                                 reconnect_delay_s, attempt, _SSE_MAX_IDLE_RETRIES)
                     await asyncio.sleep(reconnect_delay_s)
                     reconnect_delay_s = min(reconnect_delay_s * 2, 10.0)
                     continue
 
-                if supervisor_dead:
+                if info.supervisor_dead:
                     log.info(
                         "[SSE-READER] supervisor process dead for session %s — "
                         "skipping retry ladder, going straight to sandbox recovery",
@@ -956,7 +1089,7 @@ def _start_sse_reader(state: SessionState) -> None:
                     )
 
                 # Retries exhausted — try to recover the sandbox before giving up.
-                if not state.shutdown.is_set() and await _recover_after_disconnect(state):
+                if await _recover_after_disconnect(state):
                     attempt = 0
                     reconnect_delay_s = 1.0
                     continue
@@ -964,7 +1097,7 @@ def _start_sse_reader(state: SessionState) -> None:
                 log.warning(
                     "[SSE-READER] unrecoverable upstream disconnect for session %s (%s) "
                     "(shutdown=%s, agent_busy=%s, pending=%d, in_SESSIONS=%s)",
-                    state.session_id, disconnect_reason, state.shutdown.is_set(),
+                    state.session_id, info.reason, state.shutdown.is_set(),
                     state.agent_busy, len(state.pending_prompts),
                     state.session_id in SESSIONS,
                 )
@@ -2079,6 +2212,25 @@ async def admin_reap_session(session_id: str):
             except Exception as e:
                 log.warning("admin reap: stop failed for %s: %s",
                             sandbox_id, e)
+        else:
+            # _INSTANCES already empty (session was hibernated before reap).
+            # Hibernate may have left the provider sandbox RUNNING if its
+            # stop_sandbox call failed transiently. Retry stop here so the
+            # operator's "make sure this is gone" hammer actually gets it
+            # gone at the cloud provider, not just out of server memory.
+            sb = await get_sandbox(sandbox_id)
+            if sb is not None:
+                try:
+                    await _providers_mod.stop_sandbox(
+                        sb.provider, _synthesize_instance(sb),
+                    )
+                    stopped_provider = sb.provider
+                except Exception as e:
+                    log.warning(
+                        "admin reap: defensive stop_sandbox failed for %s "
+                        "(provider=%s): %s",
+                        sandbox_id, sb.provider, e,
+                    )
 
     return {
         "session_id": session_id,
@@ -2694,8 +2846,8 @@ async def _provision_with_cache_retry(cache_key, fn, /, *args, **kwargs):
 async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     """Idempotently install the supervisor + ACP binary on a volume.
 
-    Cross-worker serialization uses a Postgres advisory lock keyed on
-    ``hash((volume_id, agent_type))``.  Fast path: if the
+    Cross-worker serialization uses a Postgres advisory lock keyed on a
+    stable digest of ``(volume_id, agent_type)``.  Fast path: if the
     ``volumes.supervisor_agent_types`` cache already lists this agent_type,
     return immediately without touching the DB beyond the initial read.
 
@@ -2738,9 +2890,10 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     if agent_type in (vol.supervisor_agent_types or []):
         return  # already installed
 
-    # Compute a positive 63-bit key (pg advisory locks take a bigint; mask
-    # off the sign bit for safety).
-    lock_key = hash((volume_id, agent_type)) & 0x7FFFFFFFFFFFFFFF
+    # Compute a stable positive 63-bit key (pg advisory locks take a bigint;
+    # mask off the sign bit for safety).
+    digest = hashlib.sha256(f"{volume_id}\0{agent_type}".encode()).digest()
+    lock_key = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
     # Step 1 + 2: double-check cache, then acquire a session-scoped advisory
     # lock OUTSIDE a transaction so we can release the connection while
@@ -2916,6 +3069,96 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
     raise HTTPException(500, f"Unknown sandbox status: {status}")
 
 
+@dataclass
+class _ProvisionedSandbox:
+    """Result of the shared provisioning core: live instance + (un-persisted)
+    sandbox record. Caller decides how to write to the DB."""
+    instance: ProviderInstance
+    record: SandboxRecord
+
+
+async def _resolve_sandbox_root(provider: str, explicit: str | None) -> str | None:
+    """Pick the sandbox HOME path for `provider`.
+
+    Returns:
+      * the caller's explicit root if set
+      * None for ``local`` (provider fills it from the volume subpath itself)
+      * the canonical ``_PROVIDER_VOLUME_HOME`` entry otherwise
+
+    Raises HTTPException(500) for an unknown provider — better than silently
+    passing ``root=None`` downstream and letting a sandbox land outside its
+    volume mount.
+    """
+    if explicit is not None:
+        return explicit
+    if provider == "local":
+        return None
+    root = _PROVIDER_VOLUME_HOME.get(provider)
+    if root is None:
+        raise HTTPException(
+            500,
+            f"no default root for provider {provider!r}; "
+            "register one in _shared._PROVIDER_VOLUME_HOME",
+        )
+    return root
+
+
+async def _provision_sandbox_core(
+    *,
+    volume: VolumeRecord,
+    agent_id: str,
+    agent_config: AgentConfig,
+    spawn_env: dict[str, str],
+    user_pre_start: list[str],
+    dockerfile: str | None,
+    shared_mounts: list[str] | None,
+    explicit_root: str | None = None,
+    sandbox_id: str | None = None,
+) -> _ProvisionedSandbox:
+    """Single-source provisioning: ensure supervisor → resolve root →
+    provision_sandbox → build SandboxRecord.
+
+    Caller is responsible for persisting the returned record (the two
+    callers — _provision_new and the eager session-create path — write
+    in different transactional contexts: _provision_new bundles the
+    sandbox INSERT with the session-row UPDATE, the eager flow does
+    them separately because the session row is written later).
+    """
+    agent_type = agent_config.agent_type or "claude"
+    subpath = f"agents/{agent_id}"
+
+    # Supervisor install is idempotent (cache hit in volumes table on reruns).
+    await ensure_volume_supervisor(volume.id, agent_type)
+
+    root = await _resolve_sandbox_root(volume.provider, explicit_root)
+    new_sandbox_id = sandbox_id or f"sb_{uuid.uuid4().hex[:12]}"
+
+    # Re-merge raw user commands with current agent skills so recovery
+    # always uses the latest skill configuration.
+    pre_start_commands = await _build_pre_start_commands(
+        agent_config, volume.provider, user_pre_start
+    )
+
+    instance = await _provision_with_cache_retry(
+        (volume.id, agent_type), _providers_mod.provision_sandbox,
+        volume.provider,
+        volume_ref=volume.provider_ref, subpath=subpath,
+        agent_type=agent_type, spawn_env=spawn_env,
+        root=root, sandbox_id=new_sandbox_id,
+        dockerfile=dockerfile, shared_mounts=shared_mounts or None,
+        pre_start_commands=pre_start_commands,
+    )
+
+    record = _sandbox_record(
+        new_sandbox_id, volume.provider, instance,
+        volume_id=volume.id, subpath=subpath,
+        root_fallback=instance.root or root or "/tmp",
+        dockerfile=dockerfile,
+        shared_mounts=shared_mounts,
+    )
+    return _ProvisionedSandbox(instance=instance, record=record)
+
+
 async def _provision_new(
     session_row: dict, previous_id: str | None,
     *,
@@ -2930,54 +3173,27 @@ async def _provision_new(
     durable source of truth once created.
     """
     agent_id = session_row["agent_id"]
-    subpath = f"agents/{agent_id}"
     vol, agent = await asyncio.gather(
         get_volume(session_row["volume_id"]),
         get_agent(agent_id),
     )
     if vol is None:
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
-    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+    if agent is None or agent.config is None:
+        raise HTTPException(500, f"Session's agent {agent_id} missing")
 
-    # Supervisor install is idempotent (cache hit in volumes table on reruns).
-    await ensure_volume_supervisor(vol.id, agent_type)
-
-    spawn_env = _build_spawn_env_from_row(session_row)
-
-    # Provider-specific default root. Daytona mounts per-agent at /home/daytona;
-    # docker at /home/agent; local fills it in from the volume path.
-    root = {"daytona": "/home/daytona", "docker": "/home/agent"}.get(vol.provider)
-
-    # Generate the sandbox_id up-front so we can tag the underlying
-    # container/process with it. Docker uses this as a label for
-    # startup reconciliation (M5); other providers currently ignore it.
-    new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
-
-    # Re-merge raw user commands with current agent skills so recovery
-    # always uses the latest skill configuration.
-    user_pre_start = list(session_row.get("pre_start_commands") or [])
-    pre_start_commands_merged = await _build_pre_start_commands(
-        agent.config, vol.provider, user_pre_start
-    )
-
-    inst = await _provision_with_cache_retry(
-        (vol.id, agent_type), _providers_mod.provision_sandbox,
-        vol.provider,
-        volume_ref=vol.provider_ref, subpath=subpath,
-        agent_type=agent_type, spawn_env=spawn_env,
-        root=root, sandbox_id=new_sandbox_id,
-        dockerfile=dockerfile, shared_mounts=shared_mounts or None,
-        pre_start_commands=pre_start_commands_merged,
-    )
-
-    sb = _sandbox_record(
-        new_sandbox_id, vol.provider, inst,
-        volume_id=vol.id, subpath=subpath,
-        root_fallback=root or "/tmp",
+    provisioned = await _provision_sandbox_core(
+        volume=vol,
+        agent_id=agent_id,
+        agent_config=agent.config,
+        spawn_env=_build_spawn_env_from_row(session_row),
+        user_pre_start=list(session_row.get("pre_start_commands") or []),
         dockerfile=dockerfile,
         shared_mounts=shared_mounts,
+        explicit_root=None,  # use provider default
     )
-    _INSTANCES[sb.id] = inst
+    sb = provisioned.record
+    _INSTANCES[sb.id] = provisioned.instance
 
     # Atomic: insert the sandbox row + link session->sandbox in one
     # transaction so a crash between writes can't orphan the sandbox.
@@ -3437,61 +3653,47 @@ async def _sessions_create_eager(data: dict) -> dict:
     session_secrets = body_secrets or {}
     spawn_env = _merge_env(session_env, session_secrets)
 
-    # Install skills BEFORE starting the supervisor — claude-agent-acp
-    # discovers skills at process startup. For local: install on host.
-    # For docker/daytona: run install commands inside the sandbox before start.
-    # Caller-supplied ``pre_start_commands`` (e.g. hive's ``uv tool install
-    # hive-evolve``) are concatenated after skill install so dependencies
-    # build on top of a skill-ready image.
-    user_pre_start = data.get("pre_start_commands") or []
-    pre_start_commands = await _build_pre_start_commands(
-        config, provider, user_pre_start
-    )
-
+    user_pre_start = list(data.get("pre_start_commands") or [])
     sandbox_id = str(uuid.uuid4())
-    subpath = f"agents/{agent_id}"
 
-    # Install supervisor on the volume before spawning the sandbox.
-    # Docker/Local need supervisor.js + node_modules under the volume at create
-    # time. Idempotent fast-path on cache hit.
+    # Single-source provisioning. _provision_sandbox_core handles
+    # ensure_volume_supervisor, root resolution against _PROVIDER_VOLUME_HOME,
+    # and the underlying provision_sandbox call. The eager flow's only
+    # divergence from _provision_new is what we do AFTER provisioning
+    # (resolve supervisor URL → ACP attach → session row), not how we
+    # provision.
     try:
-        await ensure_volume_supervisor(volume_id, agent_type)
-    except Exception as e:
-        await delete_agent(agent_id)
-        log.error("sessions_quick_create: ensure_volume_supervisor failed: %s", e, exc_info=True)
-        raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
-
-    try:
-        instance = await _provision_with_cache_retry(
-            (volume_id, agent_type), create_instance,
-            provider, agent_type, dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands,
-            root=root, spawn_env=spawn_env,
-            volume_id=volume_record.provider_ref, subpath=subpath,
-            sandbox_id=sandbox_id, shared_mounts=shared_mounts or None,
+        provisioned = await _provision_sandbox_core(
+            volume=volume_record,
+            agent_id=agent_id,
+            agent_config=config,
+            spawn_env=spawn_env,
+            user_pre_start=user_pre_start,
+            dockerfile=dockerfile,
+            shared_mounts=shared_mounts,
+            explicit_root=root,
+            sandbox_id=sandbox_id,
         )
+    except HTTPException:
+        await delete_agent(agent_id)
+        raise
     except Exception as e:
         await delete_agent(agent_id)
-        log.error("sessions_quick_create: create_instance failed (provider=%s): %s", provider, e, exc_info=True)
-        # 503 + Retry-After tells callers to back off on circuit-breaker trips.
+        log.error("sessions_quick_create: provisioning failed (provider=%s): %s",
+                  provider, e, exc_info=True)
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
+    instance = provisioned.instance
     _INSTANCES[sandbox_id] = instance
-    # Now that the provider has computed its effective root, use that as the
-    # authoritative path for both the sandbox row and the session's cwd so
-    # session/new runs with the same path the supervisor's HOME points at.
-    # This is what makes volume-persistence tests work on local (HOME lands
-    # on the volume subpath rather than /tmp).
-    effective_root = instance.root or root or "/tmp"
+    # Effective root drives both the sandbox row and the session's cwd —
+    # session/new must run with the same path the supervisor's HOME points
+    # at so volume-persisted JSONLs land where Claude expects to find them.
+    effective_root = provisioned.record.root
     if cwd is None:
         cwd = effective_root
-    await upsert_sandbox(_sandbox_record(
-        sandbox_id, provider, instance,
-        volume_id=volume_id, subpath=subpath, root_fallback=effective_root,
-        dockerfile=dockerfile, shared_mounts=shared_mounts,
-    ))
+    await upsert_sandbox(provisioned.record)
 
     async def _cleanup_and_raise(msg_fmt: str, e: Exception) -> None:
         """Shared teardown for post-upsert failures in /sessions."""
@@ -4067,12 +4269,16 @@ async def session_set_config(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
+async def _resolve_sandbox_instance(
+    sandbox_id: str,
+    *,
+    agent_type: str = "claude",
+    spawn_env: dict[str, str] | None = None,
+) -> ProviderInstance:
     """Get a live ProviderInstance for a sandbox, auto-starting if needed.
 
-    Raises HTTPException on failure. Uses agent_type="claude" for auto-start
-    because all agent types share the same supervisor.js — only the ACP binary
-    differs, and file browsing doesn't need ACP at all.
+    Raises HTTPException on failure. Session-scoped callers pass the session's
+    agent_type/spawn_env so recovery restarts the same runtime shape.
     """
     # Fast path: cached port-based instance is live as-is. Daytona preview
     # URLs can expire while the in-memory instance stays cached, so those
@@ -4083,7 +4289,10 @@ async def _resolve_sandbox_instance(sandbox_id: str) -> ProviderInstance:
 
     sandbox_record = await _require_sandbox(sandbox_id)
     try:
-        await _ensure_sandbox_alive(sandbox_id, sandbox_record)
+        await _ensure_sandbox_alive(
+            sandbox_id, sandbox_record,
+            agent_type=agent_type, spawn_env=spawn_env,
+        )
     except Exception as e:
         raise HTTPException(502, f"failed to start sandbox: {e}")
     instance = _INSTANCES.get(sandbox_id)
@@ -4113,22 +4322,23 @@ async def session_sandbox_exec(session_id: str, request: Request):
         raise HTTPException(400, "command required")
     timeout = min(data.get("timeout", 30), 300)
 
-    _, sandbox, _ = await ensure_session_live(session_id)
-
-    # Build a ProviderInstance from the SandboxRecord for exec.
-    # exec_in_instance only needs provider + sandbox_id (=sandbox_ref) for Daytona.
-    instance = ProviderInstance(
-        provider=sandbox.provider,
-        url="",
-        root=sandbox.root,
-        sandbox_id=sandbox.sandbox_ref,
+    response = await _proxy_from_session(
+        session_id, "POST", "/v1/exec",
+        json={"command": command, "timeout": timeout},
+        timeout=timeout + 5,
     )
-
+    if response.status_code >= 400:
+        return response
     try:
-        result = await exec_in_instance(instance, command, timeout=timeout)
-        return result.to_dict()
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        payload = json.loads(response.body)
+    except Exception:
+        return response
+    if not isinstance(payload, dict):
+        return response
+    payload.setdefault("stdout_truncated", False)
+    payload.setdefault("stderr_truncated", False)
+    payload.setdefault("timed_out", False)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -4140,12 +4350,18 @@ async def _resolve_session_instance(session_id: str) -> ProviderInstance:
     """Resolve a session_id to its current sandbox's ProviderInstance.
 
     Hides sandbox identity from callers — the whole point of the
-    ``/sessions/{id}/files/*`` endpoints. Does NOT start the ACP runtime
-    (file browsing doesn't need it); only ensures the sandbox itself is live.
+    session-scoped file and sandbox APIs. Does NOT start the ACP runtime;
+    only ensures the sandbox supervisor itself is live.
     """
     session = await _require_session_row(session_id)
     sandbox = await ensure_sandbox(session)
-    return await _resolve_sandbox_instance(sandbox.id)
+    agent = await get_agent(session["agent_id"])
+    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+    return await _resolve_sandbox_instance(
+        sandbox.id,
+        agent_type=agent_type,
+        spawn_env=_build_spawn_env_from_row(session),
+    )
 
 
 async def _proxy_instance(
