@@ -195,36 +195,27 @@ if (args.snapshotPath && isWarmRestart) {
   }
 
   // Layer 2: agent-memory overlay (per-turn snapshot of session dirs).
-  // This is the tier that carries conversation JSONLs, so even if
-  // filesystem_cache is stale (no cold snapshot since last turn), the
-  // latest turn's memory still wins.
+  // This is the tier that carries conversation JSONLs (.claude, .codex,
+  // etc.). Critically, agent_memory.tar is written EVERY TURN, while
+  // the cold filesystem_cache.tar is only written on graceful shutdown
+  // (POST /v1/snapshot). For the common Type 2 case — sandbox externally
+  // deleted between turns under concurrent load — there is no graceful
+  // shutdown, so cold is often missing while memory IS present (just
+  // not yet visible on the new sandbox's S3-FUSE mount). Polling for
+  // memory is what carries the conversation forward; without it,
+  // supervisor.js skips restore, claude-agent-acp's session/load
+  // returns -32603, and the test_session_resume_after_delete[daytona]
+  // and test_session_resume_after_stop[daytona] invariants
+  // ``inner_after == inner_before`` deliberately catch the silent
+  // context loss.
   //
-  // Visibility strategy is asymmetric on purpose:
-  //
-  //   • coldVisible == true  → previous session existed on this volume,
-  //     so agent_memory.tar should also exist; poll up to 10 s for
-  //     S3-FUSE propagation. After an external sandbox delete under
-  //     concurrent load, the prior sandbox's last per-turn write to
-  //     agent_memory.tar can take 5-15 s to be visible on the new
-  //     sandbox's mount, and a single existsSync misses it — silently
-  //     dropping turn-N state and forcing claude-agent-acp's
-  //     session/load to return -32603 forever (the JSONL never lands
-  //     on /home/daytona). Polling closes that race.
-  //
-  //   • coldVisible == false → fresh sandbox; agent_memory.tar almost
-  //     certainly doesn't exist either. A single existsSync is enough,
-  //     and we MUST NOT poll the full 10 s here — combined with the
-  //     15 s cold poll it would push supervisor startup past the
-  //     server-side _wait_for_health(20 s) budget and the freshly-
-  //     provisioned sandbox would be torn down as "supervisor failed
-  //     health check".
+  // Use the same _snapshotVisible(10000) poll the cold tier uses;
+  // ``ls $parent`` invalidates mountpoint-s3's stale dentry cache so
+  // existsSync sees the file once S3 propagates. Server-side
+  // _wait_for_health budget on daytona (35 s) is sized to cover both
+  // polls running back-to-back on a fresh boot.
   const memPath = _agentMemoryPath(args.snapshotPath);
-  const memVisible = memPath && (
-    coldVisible
-      ? _snapshotVisible(memPath, 10000)
-      : fs.existsSync(memPath)
-  );
-  if (memPath && memVisible) {
+  if (memPath && _snapshotVisible(memPath, 10000)) {
     log(`restoring agent_memory from ${memPath}`);
     const r = spawnSync("tar", ["-xf", memPath, "-C", args.root], {
       stdio: ["ignore", "inherit", "inherit"],
@@ -232,7 +223,7 @@ if (args.snapshotPath && isWarmRestart) {
     if (r.status !== 0) {
       log(`agent_memory restore exited rc=${r.status}; continuing`);
     }
-  } else if (memPath && coldVisible) {
+  } else if (memPath) {
     log(`agent_memory ${memPath} not visible after 10s — skipping overlay restore`);
   }
 }
