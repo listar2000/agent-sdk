@@ -363,6 +363,7 @@ async function refresh() {
         <div class="info">
           <div class="s-name">${escHtml(name)}</div>
           ${sub ? `<div class="s-sub">${escHtml(sub)}</div>` : ''}
+          ${s.sandbox_ref ? `<div title="${escHtml(s.sandbox_ref)}" style="font-family:ui-monospace,monospace;font-size:0.62rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(s.sandbox_ref)}</div>` : ''}
         </div>
         <span class="s-badge ${s.agent_busy ? 'badge-running' : 'badge-idle'}">${s.agent_busy ? 'running' : 'idle'}</span>
       </li>`;

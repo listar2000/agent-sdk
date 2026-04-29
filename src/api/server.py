@@ -2151,12 +2151,24 @@ async def start_sandbox_route(sandbox_id: str):
 @app.get("/admin/sessions")
 async def admin_list_sessions():
     """List in-memory sessions and instances. Useful for debugging cleanup."""
+    session_rows = list(SESSIONS.values())
+
+    async def _sandbox_ref(s):
+        try:
+            rec = await get_sandbox(s.sandbox_id) if s.sandbox_id else None
+            return rec.sandbox_ref if rec else None
+        except Exception:
+            return None
+
+    refs = await asyncio.gather(*(_sandbox_ref(s) for s in session_rows))
+
     return {
         "sessions": [
             {
                 "session_id": s.session_id,
                 "agent_id": s.agent_id,
                 "current_sandbox_id": s.sandbox_id,
+                "sandbox_ref": ref,
                 "inner_session_id": s.inner_session_id,
                 "agent_busy": s.agent_busy,
                 "active_rpc_id": s.active_rpc_id,
@@ -2165,7 +2177,7 @@ async def admin_list_sessions():
                 "rpc_subscribers": sum(len(qs) for qs in s._rpc_subscribers.values()),
                 "shutdown": s.shutdown.is_set(),
             }
-            for s in SESSIONS.values()
+            for s, ref in zip(session_rows, refs)
         ],
         "instances": [
             {
