@@ -373,6 +373,43 @@ async def _hibernate_session(state: SessionState) -> None:
         await _shutdown_session_state(state, remove=True, force=True)
 
 
+async def _ensure_provider_sandbox_stopped(sandbox_id: str | None) -> None:
+    """Defensively retry ``stop_sandbox`` at the provider before we drop
+    our last in-memory reference to a sandbox.
+
+    Backstops the silent-leak class: ``_hibernate_session`` swallows
+    transient ``stop_sandbox`` failures (logs WARNING, flips DB to
+    STOPPED, sets ``lifecycle="hibernated"``, pops ``_INSTANCES``), so
+    the eviction paths that fire later believe the sandbox is stopped
+    when it may still be RUNNING in the cloud (Daytona, Modal). Without
+    this retry the workspace orphans in the provider with zero
+    server-side memory of it.
+
+    No-op when:
+      * ``sandbox_id`` is None.
+      * ``_INSTANCES`` still has an entry — the caller's hot-path teardown
+        owns destruction of live instances.
+      * Another live ``SessionState`` still references the sandbox.
+      * The sandbox row is gone from the DB (already cleaned up).
+    """
+    if not sandbox_id:
+        return
+    if sandbox_id in _INSTANCES:
+        return
+    if any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
+        return
+    sb = await get_sandbox(sandbox_id)
+    if sb is None:
+        return
+    try:
+        await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))
+    except Exception as e:
+        log.warning(
+            "defensive stop_sandbox at eviction failed for %s (provider=%s): %s",
+            sandbox_id, sb.provider, e,
+        )
+
+
 async def _maybe_evict_hibernated(state: SessionState) -> None:
     """If a hibernated session has lost its last subscriber, fully evict
     the in-memory ``SessionState``.
@@ -404,7 +441,12 @@ async def _maybe_evict_hibernated(state: SessionState) -> None:
             "evicting hibernated session %s after last subscriber dropped",
             state.session_id,
         )
+        sandbox_id = state.sandbox_id
         await _shutdown_session_state(state, remove=True, force=True)
+        # Defensive stop AFTER shutdown so the helper's "still in use"
+        # check (any(s.sandbox_id == ...) over SESSIONS) doesn't see
+        # this very session and bail out.
+        await _ensure_provider_sandbox_stopped(sandbox_id)
 
 
 async def _reap_one_tick(now: float) -> None:
@@ -462,9 +504,14 @@ async def _reap_one_tick(now: float) -> None:
                     "(idle %.0fs, no subscribers)",
                     state.session_id, now - idle_since,
                 )
+                sandbox_id = state.sandbox_id
                 await _shutdown_session_state(
                     state, remove=True, force=True, mark_idle_at=now,
                 )
+                # See note in _maybe_evict_hibernated — defensive stop
+                # must follow shutdown so the "still in use" guard
+                # doesn't trip on the session being evicted.
+                await _ensure_provider_sandbox_stopped(sandbox_id)
             # else: hibernated + has subscribers — wait for them to drop;
             # /events finally → _maybe_evict_hibernated handles eviction.
 
@@ -2106,6 +2153,25 @@ async def admin_reap_session(session_id: str):
             except Exception as e:
                 log.warning("admin reap: stop failed for %s: %s",
                             sandbox_id, e)
+        else:
+            # _INSTANCES already empty (session was hibernated before reap).
+            # Hibernate may have left the provider sandbox RUNNING if its
+            # stop_sandbox call failed transiently. Retry stop here so the
+            # operator's "make sure this is gone" hammer actually gets it
+            # gone at the cloud provider, not just out of server memory.
+            sb = await get_sandbox(sandbox_id)
+            if sb is not None:
+                try:
+                    await _providers_mod.stop_sandbox(
+                        sb.provider, _synthesize_instance(sb),
+                    )
+                    stopped_provider = sb.provider
+                except Exception as e:
+                    log.warning(
+                        "admin reap: defensive stop_sandbox failed for %s "
+                        "(provider=%s): %s",
+                        sandbox_id, sb.provider, e,
+                    )
 
     return {
         "session_id": session_id,

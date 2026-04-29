@@ -685,15 +685,37 @@ async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Uniform API — each provider module exposes these names. Daytona's internals
-# already have the right shape, so alias instead of writing thin wrappers.
+# already have the right shape, so dispatch via thin wrappers that re-resolve
+# the underlying name on each call. Module-level aliases (``foo = bar``) bind
+# once at import and break ``unittest.mock.patch("api.providers.daytona.bar")``
+# silently — the alias keeps pointing at the original. The wrappers below
+# look the name up at call time so patching either the wrapper or the
+# underlying name works as expected.
 # ---------------------------------------------------------------------------
 
-create_volume = create_daytona_volume
-delete_volume = delete_daytona_volume
-get_sandbox_status = get_daytona_sandbox_status
-start_sandbox = start_daytona
-destroy_sandbox = destroy_daytona
-stop_sandbox = stop_daytona
+
+async def create_volume(*args, **kwargs):
+    return await create_daytona_volume(*args, **kwargs)
+
+
+async def delete_volume(*args, **kwargs):
+    return await delete_daytona_volume(*args, **kwargs)
+
+
+async def get_sandbox_status(*args, **kwargs):
+    return await get_daytona_sandbox_status(*args, **kwargs)
+
+
+async def start_sandbox(*args, **kwargs):
+    return await start_daytona(*args, **kwargs)
+
+
+async def destroy_sandbox(*args, **kwargs):
+    return await destroy_daytona(*args, **kwargs)
+
+
+async def stop_sandbox(*args, **kwargs):
+    return await stop_daytona(*args, **kwargs)
 
 
 async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,

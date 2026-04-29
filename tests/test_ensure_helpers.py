@@ -163,13 +163,17 @@ async def test_ensure_runtime_reuses_healthy_state(setup):
     await dbmod.upsert_sandbox(sb)
     await dbmod.set_session_current_sandbox("s1", "sb1")
 
-    # Pre-populate in-memory state
+    # Pre-populate in-memory state. _reader_connected=True takes the
+    # fastest fast-path in _ensure_state_live (line 897) — "reader is
+    # actively streaming, no probe needed". Without this the function
+    # falls through to _rebind_state which hits real Daytona.
     fake_client = AsyncMock()
     fake_client.base_url = "http://existing"
     state = SessionState(session_id="s1", agent_id="a1", sandbox_id="sb1",
                          acp_session_id="acp1", inner_session_id="inner1",
                          agent_type="claude", client=fake_client,
                          supervisor_url="http://existing")
+    state._reader_connected = True
     srv.SESSIONS["s1"] = state
 
     with patch("api.providers._wait_for_health",
