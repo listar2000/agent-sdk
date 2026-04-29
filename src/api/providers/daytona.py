@@ -1087,6 +1087,40 @@ async def volume_read(ref: str, path: str) -> bytes:
         raise RuntimeError(f"volume_read: malformed base64: {exc}") from exc
 
 
+async def volume_download(ref: str, path: str) -> bytes:
+    """Read raw bytes from ``<volume>/<path>`` via Daytona's filesystem API.
+
+    This bypasses ``volume_read``'s exec/stdout path by using Daytona's
+    dedicated file-download endpoint through the SDK.
+    """
+    rel = _safe_path(None, path or "")
+    if not rel:
+        raise ValueError("volume_download: path required")
+    target = "/v/" + rel
+    inst = await _get_or_create_utility(ref)
+    if not inst.sandbox_id:
+        raise RuntimeError("volume_download: utility sandbox_id missing")
+
+    loop = asyncio.get_running_loop()
+    daytona_client = _get_daytona_client()
+    try:
+        sandbox = await loop.run_in_executor(
+            None, lambda: daytona_client.get(inst.sandbox_id)
+        )
+    except Exception as e:
+        raise RuntimeError(f"volume_download: get sandbox failed: {e}") from e
+
+    try:
+        return await loop.run_in_executor(
+            None, lambda: sandbox.fs.download_file(target)
+        )
+    except Exception as e:
+        msg = str(e)
+        if "not found" in msg.lower() or "404" in msg:
+            raise FileNotFoundError(f"{path} not found on volume {ref}") from e
+        raise RuntimeError(f"volume_download failed: {msg}") from e
+
+
 async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write ``content`` to ``<volume>/<path>`` via a short-lived utility sandbox."""
     rel = _safe_path(None, path or "")

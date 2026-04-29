@@ -1633,6 +1633,24 @@ async def volume_files_read(id_or_name: str, path: str):
         return {"content_base64": base64.b64encode(data).decode()}
 
 
+@app.get("/volumes/{id_or_name}/files/download")
+async def volume_files_download(id_or_name: str, path: str):
+    """Download a volume file as raw bytes."""
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(path)
+    try:
+        data = await _providers_mod.volume_download(vol.provider, vol.provider_ref, rel)
+    except Exception as e:
+        raise _volume_fs_err("Download", vol.provider, e)
+
+    filename = path.rsplit("/", 1)[-1] or "download"
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"content-disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.post("/volumes/{id_or_name}/files/edit", status_code=204)
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
     vol = await _resolve_volume(id_or_name)

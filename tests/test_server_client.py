@@ -135,6 +135,17 @@ async def test_volume_file_read():
 
 
 @pytest.mark.asyncio
+async def test_volume_file_download_returns_raw_bytes():
+    raw = b"%PDF-1.7\n" + b"x" * (2 * 1024 * 1024)
+    rec = _Recorder(raw, content_type="application/octet-stream")
+    async with _make_client(rec) as sc:
+        out = await sc.volume_file_download("v1", "test.pdf")
+    assert out == raw
+    assert rec.last.url.path == "/volumes/v1/files/download"
+    assert dict(rec.last.url.params) == {"path": "test.pdf"}
+
+
+@pytest.mark.asyncio
 async def test_volume_file_write_posts_content():
     rec = _Recorder(None, status=204, content_type="")
     async with _make_client(rec) as sc:
