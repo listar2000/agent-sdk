@@ -733,7 +733,21 @@ async def delete_daytona_volume(provider_ref: str) -> None:
 
 
 async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
-    """Return one of: 'running' | 'stopped' | 'missing' | 'error'."""
+    """Return one of: 'running' | 'stopped' | 'missing' | 'error'.
+
+    The caller (``_ensure_sandbox_locked``) treats ``error`` as
+    unrecoverable: it destroys the sandbox + nukes the DB row + provisions
+    a brand-new replacement (Type 2). So transitional states like
+    ``stopping`` / ``starting`` (5–30 s under load) MUST classify by their
+    target state, not as ``error`` — otherwise an in-flight stop or boot
+    that races a POST /message destroys the live sandbox the caller is
+    trying to recover.
+
+    Default for an unrecognized state is ``running`` rather than ``error``
+    for the same reason: a future Daytona state name we haven't seen yet
+    should fall through to ``_wait_for_health`` / ``start_sandbox``, not
+    to destroy + Type 2.
+    """
     try:
         client = _get_daytona_client()
         sb = await asyncio.to_thread(client.get, sandbox_ref)
@@ -744,11 +758,16 @@ async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
         return "error"
     state = (getattr(sb, "state", None) or "")
     state_str = (state.value if hasattr(state, "value") else str(state)).lower()
-    if state_str in ("started", "running"):
+    if state_str in ("started", "running", "starting",
+                     "pulling_image", "creating", "resizing"):
         return "running"
-    if state_str in ("stopped", "paused"):
+    if state_str in ("stopped", "paused", "stopping"):
         return "stopped"
-    return "error"
+    if state_str in ("destroyed", "destroying", "archived"):
+        return "missing"
+    if state_str == "error":
+        return "error"
+    return "running"
 
 
 # ---------------------------------------------------------------------------
