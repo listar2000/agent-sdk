@@ -90,6 +90,7 @@ from .providers import (
     kill_supervisor_in_sandbox,
     stop_instance,
 )
+from .providers._shared import _PROVIDER_VOLUME_HOME
 from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_secrets
 from .sse import (
@@ -500,7 +501,11 @@ async def lifespan(app):
         except Exception as e:
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
-    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local")])
+    # All four providers go through the dispatch; ones without a
+    # reconcile_on_startup hook (daytona, local, currently modal too) no-op.
+    # Listing modal here means the moment its module gains a reconcile hook
+    # we don't have to remember to wire it up.
+    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
 
     reaper = asyncio.create_task(_idle_reaper())
     yield
@@ -2886,9 +2891,21 @@ async def _provision_new(
 
     spawn_env = _build_spawn_env_from_row(session_row)
 
-    # Provider-specific default root. Daytona mounts per-agent at /home/daytona;
-    # docker at /home/agent; local fills it in from the volume path.
-    root = {"daytona": "/home/daytona", "docker": "/home/agent"}.get(vol.provider)
+    # Provider-specific default root. local fills it in from the volume path
+    # itself; the others mount the agent's HOME at a fixed path. Routing
+    # through _PROVIDER_VOLUME_HOME keeps this site honest — adding a new
+    # provider that doesn't register a home there will fail loudly here
+    # instead of silently producing root=None.
+    if vol.provider == "local":
+        root = None
+    else:
+        root = _PROVIDER_VOLUME_HOME.get(vol.provider)
+        if root is None:
+            raise HTTPException(
+                500,
+                f"no default root for provider {vol.provider!r}; "
+                "register one in _shared._PROVIDER_VOLUME_HOME",
+            )
 
     # Generate the sandbox_id up-front so we can tag the underlying
     # container/process with it. Docker uses this as a label for

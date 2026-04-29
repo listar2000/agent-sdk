@@ -6,7 +6,15 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+
+# ── Closed enums (Literal aliases) ──
+# Provider names and sandbox statuses are closed sets — narrowing them
+# lets type-checkers catch the silent-drop bug class (e.g. a dict literal
+# that maps "daytona"+"docker" but forgets "local"+"modal").
+Provider = Literal["local", "docker", "daytona", "modal"]
+SandboxStatus = Literal["running", "stopped", "error", "creating", "missing"]
 
 
 @dataclass
@@ -70,9 +78,9 @@ class AgentRecord:
 @dataclass
 class SandboxRecord:
     id: str
-    provider: str
+    provider: Provider
     sandbox_ref: str
-    status: str = "stopped"
+    status: SandboxStatus = "stopped"
     root: str = "/tmp"
     volume_id: str | None = None
     subpath: str | None = None
@@ -104,7 +112,7 @@ class SandboxRecord:
 class VolumeRecord:
     id: str
     name: str
-    provider: str
+    provider: Provider
     provider_ref: str
     status: str = "ready"
     supervisor_agent_types: list[str] = field(default_factory=list)

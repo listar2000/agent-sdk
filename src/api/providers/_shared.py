@@ -12,8 +12,12 @@ import re
 import shlex
 import socket
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from ..models import Provider
 
 log = logging.getLogger(__name__)
 
@@ -124,7 +128,7 @@ class SandboxMissingError(Exception):
 @dataclass
 class ProviderInstance:
     """A running ACP supervisor instance."""
-    provider: str              # "local", "daytona", or "docker"
+    provider: "Provider"       # "local" | "docker" | "daytona" | "modal"
     url: str                   # http:// base URL
     root: str = "/tmp"         # filesystem root for the sandbox
     sandbox_id: str | None = None  # Daytona sandbox ID (if daytona)
