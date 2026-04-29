@@ -79,8 +79,10 @@ def _register_default_providers() -> None:
     """
     from .providers.daytona import DaytonaSandboxSession
     from .providers.docker import DockerSandboxSession
+    from .providers.unix_local import UnixLocalSandboxSession
     register("daytona", _adapt(DaytonaSandboxSession))
     register("docker", _adapt(DockerSandboxSession))
+    register("unix_local", _adapt(UnixLocalSandboxSession))
     register("unknown", _adapt(DaytonaSandboxSession))  # default-to-daytona
 
 
