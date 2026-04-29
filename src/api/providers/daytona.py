@@ -298,10 +298,10 @@ async def start_supervisor_in_sandbox(
 
     t0 = time.monotonic()
     # Budget covers worst-case Type 2 boot inside supervisor.js: cold
-    # snapshot poll (15 s) + agent_memory poll (10 s) + ACP child spawn
-    # (~2 s) + a bit of slack. Type 1 (warm restart, sentinel present)
-    # finishes in <2 s and exits this poll on the first probe.
-    healthy = await _wait_for_health(url, max_retries=35, interval=1)
+    # snapshot poll (15 s) + agent_memory poll (15 s) + ACP child spawn
+    # (~2 s) + slack. Type 1 (warm restart, sentinel present) finishes
+    # in <2 s and exits this poll on the first probe.
+    healthy = await _wait_for_health(url, max_retries=45, interval=1)
     _bench("health_wait", t0)
     if not healthy:
         log_out = await loop.run_in_executor(None, lambda: _exec(f"tail -40 {log_file} 2>&1"))

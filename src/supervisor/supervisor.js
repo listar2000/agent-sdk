@@ -209,13 +209,16 @@ if (args.snapshotPath && isWarmRestart) {
   // ``inner_after == inner_before`` deliberately catch the silent
   // context loss.
   //
-  // Use the same _snapshotVisible(10000) poll the cold tier uses;
-  // ``ls $parent`` invalidates mountpoint-s3's stale dentry cache so
-  // existsSync sees the file once S3 propagates. Server-side
-  // _wait_for_health budget on daytona (35 s) is sized to cover both
-  // polls running back-to-back on a fresh boot.
+  // Use the same _snapshotVisible poll the cold tier uses, with the same
+  // 15 s budget — ``ls $parent`` invalidates mountpoint-s3's stale dentry
+  // cache so existsSync sees the file once S3 propagates. 10 s was too
+  // tight under 2x concurrent load (FUSE propagation took >10 s and the
+  // overlay was silently skipped, dropping turn-N JSONLs and forcing
+  // claude-agent-acp's session/load to return -32603 forever). Server-side
+  // _wait_for_health budget on daytona (45 s) covers worst-case
+  // 15 + 15 + ACP-spawn back-to-back on a fresh Type 2 boot.
   const memPath = _agentMemoryPath(args.snapshotPath);
-  if (memPath && _snapshotVisible(memPath, 10000)) {
+  if (memPath && _snapshotVisible(memPath, 15000)) {
     log(`restoring agent_memory from ${memPath}`);
     const r = spawnSync("tar", ["-xf", memPath, "-C", args.root], {
       stdio: ["ignore", "inherit", "inherit"],
@@ -224,7 +227,7 @@ if (args.snapshotPath && isWarmRestart) {
       log(`agent_memory restore exited rc=${r.status}; continuing`);
     }
   } else if (memPath) {
-    log(`agent_memory ${memPath} not visible after 10s — skipping overlay restore`);
+    log(`agent_memory ${memPath} not visible after 15s — skipping overlay restore`);
   }
 }
 
