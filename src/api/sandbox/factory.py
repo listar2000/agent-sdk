@@ -78,7 +78,9 @@ def _register_default_providers() -> None:
     provider SDKs unless they're actually present.
     """
     from .providers.daytona import DaytonaSandboxSession
+    from .providers.docker import DockerSandboxSession
     register("daytona", _adapt(DaytonaSandboxSession))
+    register("docker", _adapt(DockerSandboxSession))
     register("unknown", _adapt(DaytonaSandboxSession))  # default-to-daytona
 
 

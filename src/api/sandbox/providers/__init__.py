@@ -8,5 +8,6 @@ Phase 2 sub-task 2 starts with daytona because it's the most complex;
 docker/local/modal follow.
 """
 from .daytona import DaytonaSandboxSession
+from .docker import DockerSandboxSession
 
-__all__ = ["DaytonaSandboxSession"]
+__all__ = ["DaytonaSandboxSession", "DockerSandboxSession"]
