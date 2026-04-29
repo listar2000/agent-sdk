@@ -19,7 +19,9 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -31,6 +33,14 @@ from agent_sdk.client import Agent  # noqa: E402
 
 def _payload(agent: Agent) -> dict:
     return agent._registration_payload()
+
+
+def _fake_response(status_code: int = 200, json_body: dict | None = None) -> httpx.Response:
+    return httpx.Response(
+        status_code,
+        json=json_body or {},
+        request=httpx.Request("POST", "http://test/"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +69,49 @@ def test_registration_payload_puts_api_key_in_secrets():
     p = _payload(a)
     assert p["secrets"].get("ANTHROPIC_API_KEY") == "sk-ant-secret"
     assert "api_key" not in p
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_resume_by_session_id_puts_credentials_in_secrets(monkeypatch):
+    """Resume uses the same credential channel as session creation.
+
+    The server's /sessions/{id}/resume handler only consumes ``env`` and
+    ``secrets``. Top-level oauth_token/api_key fields are ignored, so a
+    resume request must not send that legacy shape.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    agent = Agent(
+        "restored",
+        session_id="sess-123",
+        api_url="http://localhost:7778",
+        oauth_token="resume-oauth",
+        api_key="resume-api-key",
+    )
+    post = AsyncMock(return_value=_fake_response(
+        json_body={
+            "session_id": "sess-123",
+            "agent_id": "agent-1",
+            "sandbox_id": "sb-1",
+            "inner_session_id": "inner-1",
+        }
+    ))
+    monkeypatch.setattr(agent._client, "post", post)
+
+    await agent._ensure_registered()
+
+    _, kwargs = post.await_args
+    assert kwargs["json"] == {
+        "secrets": {
+            "CLAUDE_CODE_OAUTH_TOKEN": "resume-oauth",
+            "ANTHROPIC_API_KEY": "resume-api-key",
+        }
+    }
+    assert "oauth_token" not in kwargs["json"]
+    assert "api_key" not in kwargs["json"]
+    await agent._client.aclose()
 
 
 @pytest.mark.timeout(5)

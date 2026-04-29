@@ -349,10 +349,13 @@ class Agent:
                 # Resume by session_id alone. Ship credentials so the respawned
                 # supervisor runs under the caller's Claude token, not the server's.
                 resume_body: dict[str, Any] = {}
+                secrets: dict[str, str] = dict(self._user_secrets)
                 if self._oauth_token:
-                    resume_body["oauth_token"] = self._oauth_token
+                    secrets.setdefault("CLAUDE_CODE_OAUTH_TOKEN", self._oauth_token)
                 if self._api_key:
-                    resume_body["api_key"] = self._api_key
+                    secrets.setdefault("ANTHROPIC_API_KEY", self._api_key)
+                if secrets:
+                    resume_body["secrets"] = secrets
                 resp = await self._client.post(
                     f"/sessions/{self.session_id}/resume",
                     json=resume_body or None,
@@ -599,5 +602,4 @@ class Agent:
 
     async def __aexit__(self, *args):
         await self.aclose()
-
 

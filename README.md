@@ -101,7 +101,7 @@ agent = Agent("worker", provider="daytona", oauth_token=user_oauth_token)
 await agent.arun("Hello")
 ```
 
-Credentials travel in the request body to `POST /sessions` (and `/sessions/{id}/resume`), are applied as per-sandbox env vars inside the supervisor, and are never persisted to the agent-sdk database. When OAuth is supplied, the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback to shared credentials. The SDK refuses to send credentials to a plaintext-HTTP server — use `https://` or a `localhost` URL.
+Credentials travel in the `secrets` request field to `POST /sessions` and `POST /sessions/{id}/resume`, are stored on the session row for future recovery, are redacted from read APIs, and are applied as per-sandbox env vars inside the supervisor. When OAuth is supplied, the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback to shared credentials. The SDK refuses to send credentials to a plaintext-HTTP server — use `https://` or a `localhost` URL.
 
 Obtaining the OAuth token (`claude setup-token` or equivalent) is the caller's responsibility — the agent-sdk only forwards what it's handed.
 

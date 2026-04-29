@@ -5,6 +5,7 @@ Run: uvicorn src.api.server:app --port 7778
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -2635,8 +2636,8 @@ async def _provision_with_cache_retry(cache_key, fn, /, *args, **kwargs):
 async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     """Idempotently install the supervisor + ACP binary on a volume.
 
-    Cross-worker serialization uses a Postgres advisory lock keyed on
-    ``hash((volume_id, agent_type))``.  Fast path: if the
+    Cross-worker serialization uses a Postgres advisory lock keyed on a
+    stable digest of ``(volume_id, agent_type)``.  Fast path: if the
     ``volumes.supervisor_agent_types`` cache already lists this agent_type,
     return immediately without touching the DB beyond the initial read.
 
@@ -2679,9 +2680,10 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     if agent_type in (vol.supervisor_agent_types or []):
         return  # already installed
 
-    # Compute a positive 63-bit key (pg advisory locks take a bigint; mask
-    # off the sign bit for safety).
-    lock_key = hash((volume_id, agent_type)) & 0x7FFFFFFFFFFFFFFF
+    # Compute a stable positive 63-bit key (pg advisory locks take a bigint;
+    # mask off the sign bit for safety).
+    digest = hashlib.sha256(f"{volume_id}\0{agent_type}".encode()).digest()
+    lock_key = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
     # Step 1 + 2: double-check cache, then acquire a session-scoped advisory
     # lock OUTSIDE a transaction so we can release the connection while
@@ -4063,6 +4065,7 @@ async def session_sandbox_exec(session_id: str, request: Request):
         url="",
         root=sandbox.root,
         sandbox_id=sandbox.sandbox_ref,
+        container_id=sandbox.sandbox_ref if sandbox.provider == "docker" else None,
     )
 
     try:

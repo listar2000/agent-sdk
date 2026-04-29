@@ -265,7 +265,7 @@ considered active, so the next queued prompt cannot start yet. See
 POST /sessions/{session_id}/resume
 ```
 
-No body. Looks up everything from the DB and ensures a live sandbox — reprovisioning against the session's volume if the prior sandbox was killed or reaped. Returns:
+Optional body accepts `env` and `secrets` with PATCH semantics (`missing` keeps stored values, `{}` clears, an object replaces). Looks up everything else from the DB and ensures a live sandbox — reprovisioning against the session's volume if the prior sandbox was killed or reaped. Returns:
 ```json
 {
   "session_id": "uuid",

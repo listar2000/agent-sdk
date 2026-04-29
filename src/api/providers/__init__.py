@@ -153,6 +153,7 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
     if instance.provider == "local":
         proc = await asyncio.create_subprocess_shell(
             cmd,
+            cwd=instance.root,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -160,10 +161,11 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
 
     elif instance.provider == "docker":
         docker = shutil.which("docker")
-        if not docker or not instance.container_id:
+        container_id = instance.container_id or instance.sandbox_id
+        if not docker or not container_id:
             raise RuntimeError("docker not available or no container_id")
         proc = await asyncio.create_subprocess_exec(
-            docker, "exec", instance.container_id, "sh", "-c", cmd,
+            docker, "exec", container_id, "sh", "-c", cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
