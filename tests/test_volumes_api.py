@@ -330,3 +330,88 @@ async def test_volume_files_edit_and_read(client):
                              params={"path": "shared/x.txt"})
         assert r.status_code == 200
         assert r.json()["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_volume_files_upload_mkdir_delete_rename_dispatch(client):
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_f2", name="files-test-2", provider="daytona", provider_ref="dt-f2")
+    await dbmod.upsert_volume(v)
+
+    calls: list[tuple[str, str, tuple]] = []
+
+    async def fake_upload(ref, path, content):
+        calls.append(("upload", ref, (path, content)))
+
+    async def fake_mkdir(ref, path):
+        calls.append(("mkdir", ref, (path,)))
+
+    async def fake_delete(ref, path):
+        calls.append(("delete", ref, (path,)))
+
+    async def fake_rename(ref, path, new_path):
+        calls.append(("rename", ref, (path, new_path)))
+
+    with patch("api.providers.daytona.volume_upload", new=AsyncMock(side_effect=fake_upload)), \
+         patch("api.providers.daytona.volume_mkdir", new=AsyncMock(side_effect=fake_mkdir)), \
+         patch("api.providers.daytona.volume_delete", new=AsyncMock(side_effect=fake_delete)), \
+         patch("api.providers.daytona.volume_rename", new=AsyncMock(side_effect=fake_rename)):
+        r = await client.post(
+            f"/volumes/{v.id}/files/upload",
+            json={"path": "shared/u.bin", "content": "AQI="},
+        )
+        assert r.status_code == 204
+        r = await client.post(f"/volumes/{v.id}/files/mkdir", json={"path": "shared/docs"})
+        assert r.status_code == 204
+        r = await client.post(f"/volumes/{v.id}/files/delete", json={"path": "shared/old.txt"})
+        assert r.status_code == 204
+        r = await client.post(
+            f"/volumes/{v.id}/files/rename",
+            json={"path": "shared/a.txt", "new_path": "shared/b.txt"},
+        )
+        assert r.status_code == 204
+
+    assert calls == [
+        ("upload", "dt-f2", ("shared/u.bin", b"\x01\x02")),
+        ("mkdir", "dt-f2", ("shared/docs",)),
+        ("delete", "dt-f2", ("shared/old.txt",)),
+        ("rename", "dt-f2", ("shared/a.txt", "shared/b.txt")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_volume_files_upload_rejects_invalid_base64(client):
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_f3", name="files-test-3", provider="daytona", provider_ref="dt-f3")
+    await dbmod.upsert_volume(v)
+    r = await client.post(
+        f"/volumes/{v.id}/files/upload",
+        json={"path": "shared/u.bin", "content": "!!not-base64!!"},
+    )
+    assert r.status_code == 400
+    detail = ""
+    try:
+        detail = (r.json().get("detail") or r.json().get("error") or "").lower()
+    except Exception:
+        detail = r.text.lower()
+    assert "base64" in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route,body,patch_target", [
+    ("mkdir", {"path": "bad\npath"}, "api.providers.daytona.volume_mkdir"),
+    ("delete", {"path": "bad\npath"}, "api.providers.daytona.volume_delete"),
+    ("rename", {"path": "ok.txt", "new_path": "bad\npath"}, "api.providers.daytona.volume_rename"),
+    ("upload", {"path": "bad\npath", "content": "AQI="}, "api.providers.daytona.volume_upload"),
+])
+async def test_new_volume_file_routes_reject_control_chars(client, route, body, patch_target):
+    from api.models import VolumeRecord
+    v = VolumeRecord(id=f"vol_{route}", name=f"vol-{route}", provider="daytona", provider_ref=f"dt-{route}")
+    await dbmod.upsert_volume(v)
+
+    async def blow_up(*_a, **_kw):
+        raise AssertionError("provider must not be called on invalid path")
+
+    with patch(patch_target, new=AsyncMock(side_effect=blow_up)):
+        r = await client.post(f"/volumes/{v.id}/files/{route}", json=body)
+    assert r.status_code == 400, f"{route}: {r.status_code} {r.text}"

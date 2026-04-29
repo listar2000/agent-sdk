@@ -672,3 +672,53 @@ async def volume_write(ref: str, path: str, content: bytes) -> None:
             os.close(parent_fd)
 
     await asyncio.to_thread(_write)
+
+
+async def volume_upload(ref: str, path: str, content: bytes) -> None:
+    """Upload bytes to ``<volume>/<path>``."""
+    await volume_write(ref, path, content)
+
+
+async def volume_mkdir(ref: str, path: str) -> None:
+    """Create a directory at ``<volume>/<path>``."""
+    target = await asyncio.to_thread(_safe_join, ref, path or "")
+    if target == os.path.realpath(ref):
+        raise ValueError("volume_mkdir: path required")
+    await asyncio.to_thread(lambda: os.makedirs(target, exist_ok=True))
+
+
+async def volume_delete(ref: str, path: str) -> None:
+    """Delete a file or directory at ``<volume>/<path>``."""
+    target = await asyncio.to_thread(_safe_join, ref, path or "")
+    if target == os.path.realpath(ref):
+        raise ValueError("volume_delete: path required")
+
+    def _delete() -> None:
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+            return
+        if os.path.isfile(target):
+            os.remove(target)
+            return
+        raise FileNotFoundError(path)
+
+    await asyncio.to_thread(_delete)
+
+
+async def volume_rename(ref: str, path: str, new_path: str) -> None:
+    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
+    src = await asyncio.to_thread(_safe_join, ref, path or "")
+    dst = await asyncio.to_thread(_safe_join, ref, new_path or "")
+    root = os.path.realpath(ref)
+    if src == root or dst == root:
+        raise ValueError("volume_rename: path and new_path required")
+
+    def _rename() -> None:
+        if not os.path.exists(src):
+            raise FileNotFoundError(path)
+        parent = os.path.dirname(dst)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        os.replace(src, dst)
+
+    await asyncio.to_thread(_rename)
