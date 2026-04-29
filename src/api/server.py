@@ -871,6 +871,7 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     state.inner_session_id = new_inner_sid
     state.last_event_id = None  # old cursor is meaningless on the new session
     state.lifecycle = "live"
+    state._rebound_at = time.time()
     # Close the old client in the background — the next turn doesn't need
     # to wait for the TCP teardown.
     if old_client is not None:
@@ -882,6 +883,9 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
              state.session_id, new_url, new_acp_session_id)
 
 
+_REBIND_TRUST_WINDOW_S = 10.0
+
+
 async def _ensure_state_live(state: SessionState, sandbox: SandboxRecord) -> None:
     """Ensure `state` points at a live, healthy supervisor. Caller holds
     the session lock.
@@ -889,12 +893,23 @@ async def _ensure_state_live(state: SessionState, sandbox: SandboxRecord) -> Non
     Fast paths, in order:
       (1) reader is actively streaming an upstream connection → trust it,
           no probe needed (saves ~100ms on the hot /message path).
-      (2) port-based fast-fail: cached subprocess confirmed dead → skip
+      (2) state was just rebound within ``_REBIND_TRUST_WINDOW_S`` seconds
+          → trust the URL without probing. Breaks the cascade where
+          POST /message rebinds, then the persistent /events reconnect (or
+          a second concurrent caller) probes the freshly-minted Daytona
+          signed URL while it's still warming up, gets a transient 502,
+          and rebinds AGAIN — orphaning the in-flight prompt's reply
+          events on the now-abandoned acp_session_id.
+      (3) port-based fast-fail: cached subprocess confirmed dead → skip
           probe, go straight to rebind.
-      (3) health-probe the current URL; return if it answers.
+      (4) health-probe the current URL; return if it answers.
     Slow path: rebind in place (preserves subscribers).
     """
     if state.supervisor_url and state._reader_connected:
+        return
+    if (state.supervisor_url
+            and state._rebound_at
+            and (time.time() - state._rebound_at) < _REBIND_TRUST_WINDOW_S):
         return
     from .providers import _wait_for_health
     if state.supervisor_url and state._reader_alive:
@@ -3351,6 +3366,7 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
         agent_type=agent_type, client=client,
         supervisor_url=supervisor_url, supervisor_port=supervisor_port,
     )
+    state._rebound_at = time.time()
     SESSIONS[session_id] = state
     _start_session_tasks(state)
     return state
@@ -3751,6 +3767,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         client=client,
         supervisor_url=url, supervisor_port=supervisor_port,
     )
+    state._rebound_at = time.time()
     SESSIONS[session_id] = state
     _start_session_tasks(state)
     await upsert_session(

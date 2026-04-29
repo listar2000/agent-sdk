@@ -150,6 +150,16 @@ class SessionState:
     # "supervisor is definitely responsive" signal the hot-path fast-check
     # uses to skip a redundant health probe on every POST /message.
     _reader_connected: bool = field(default=False, repr=False)
+    # Wall-clock time of the last successful _rebind_state call. The
+    # _ensure_state_live fast-path trusts a recently-rebound URL without
+    # re-probing, breaking the rebind cascade we see on Daytona under load:
+    # POST /message rebinds → the persistent /events stream breaks (because
+    # the old supervisor died) → the UI reconnects /events → ensure_session_live
+    # health-probes the just-minted Daytona signed URL → Daytona's proxy
+    # returns 502 for a few seconds after the supervisor swap → rebind fires
+    # AGAIN, swapping acp_session_id mid-flight and orphaning the prompt's
+    # reply events on the now-abandoned ACP stream.
+    _rebound_at: float = field(default=0.0, repr=False)
     _log_chain: object | None = field(default=None, repr=False)
     errors: deque = field(default_factory=lambda: deque(maxlen=100), repr=False)
 
