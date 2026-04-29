@@ -245,6 +245,62 @@ async def test_read_rejects_control_chars(client, bad_path):
 
 
 @pytest.mark.asyncio
+async def test_volume_files_download_returns_raw_bytes(client):
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_d1", name="files-download", provider="daytona", provider_ref="dt-d1")
+    await dbmod.upsert_volume(v)
+
+    payload = b"\xab" * (2 * 1024 * 1024)
+    calls = []
+
+    async def fake_download(ref, path):
+        calls.append((ref, path))
+        return payload
+
+    with patch("api.providers.daytona.volume_download", new=AsyncMock(side_effect=fake_download)):
+        r = await client.get(f"/volumes/{v.id}/files/download", params={"path": "shared/big.bin"})
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/octet-stream")
+    assert int(r.headers["content-length"]) == len(payload)
+    assert r.content == payload
+    assert calls == [("dt-d1", "shared/big.bin")]
+
+
+@pytest.mark.asyncio
+async def test_volume_files_download_404_on_missing(client):
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_d2", name="files-download-404", provider="daytona", provider_ref="dt-d2")
+    await dbmod.upsert_volume(v)
+
+    with patch(
+        "api.providers.daytona.volume_download",
+        new=AsyncMock(side_effect=FileNotFoundError("nope.txt not found on volume dt-d2")),
+    ):
+        r = await client.get(f"/volumes/{v.id}/files/download", params={"path": "nope.txt"})
+
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_volume_files_download_path_traversal_blocked(client):
+    from api.models import VolumeRecord
+    v = VolumeRecord(id="vol_d3", name="files-download-bad-path", provider="daytona", provider_ref="dt-d3")
+    await dbmod.upsert_volume(v)
+
+    async def blow_up(*a, **kw):
+        raise AssertionError("provider must not be called on invalid path")
+
+    with patch("api.providers.daytona.volume_download", new=AsyncMock(side_effect=blow_up)):
+        r = await client.get(
+            f"/volumes/{v.id}/files/download",
+            params={"path": "../../../etc/passwd"},
+        )
+
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_volume_files_edit_and_read(client):
     """File ops dispatch through the volume's provider module."""
     from api.models import VolumeRecord

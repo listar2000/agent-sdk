@@ -621,6 +621,11 @@ async def volume_read(ref: str, path: str) -> bytes:
     return await asyncio.to_thread(_read)
 
 
+async def volume_download(ref: str, path: str) -> bytes:
+    """Read raw bytes from ``<volume>/<path>`` for the download endpoint."""
+    return await volume_read(ref, path)
+
+
 async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write to the volume. Creates parent dirs. Symlink-escape is rejected.
 

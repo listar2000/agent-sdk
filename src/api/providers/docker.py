@@ -688,6 +688,11 @@ async def volume_read(ref: str, path: str) -> bytes:
         raise RuntimeError(f"volume_read: malformed base64 output: {exc}") from exc
 
 
+async def volume_download(ref: str, path: str) -> bytes:
+    """Read raw bytes from ``<volume>/<path>`` for the download endpoint."""
+    return await volume_read(ref, path)
+
+
 async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write ``content`` to ``<volume>/<path>`` (atomic mkdir -p + tee base64 -d)."""
     rel = _safe_rel(path)

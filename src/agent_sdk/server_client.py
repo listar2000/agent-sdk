@@ -151,6 +151,16 @@ class ServerClient:
             "GET", f"/volumes/{volume_id}/files/read", params={"path": path},
         )
 
+    async def volume_file_download(
+        self, volume_id: str, path: str
+    ) -> bytes:
+        """``GET /volumes/{id}/files/download?path=...`` — raw bytes."""
+        resp = await self._http.get(
+            f"/volumes/{volume_id}/files/download", params={"path": path},
+        )
+        _raise_for_status(resp)
+        return resp.content
+
     async def volume_file_write(
         self, volume_id: str, path: str, content: str = "",
     ) -> None:

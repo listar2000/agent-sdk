@@ -204,7 +204,7 @@ _DISPATCH_FNS = frozenset({
     "create_volume", "delete_volume", "get_sandbox_status",
     "start_sandbox", "destroy_sandbox", "stop_sandbox",
     "ensure_supervisor_url", "install_supervisor",
-    "volume_tree", "volume_read", "volume_write",
+    "volume_tree", "volume_read", "volume_download", "volume_write",
 })
 
 
