@@ -1240,8 +1240,17 @@ async def _attach_acp_session(
             # ``test_session_resume_after_delete[daytona]`` invariant
             # ``inner_after == inner_before`` deliberately catches.
             #
-            # Backoffs sum to ~31s — well below the 180s prompt budget but
-            # long enough to absorb FUSE propagation under concurrent load.
+            # Backoffs sum to ~95s — well below the 180s prompt budget
+            # (Type 2 reprovision ~25s + this ~95s + actual prompt ~5s
+            # leaves ~55s margin) but long enough to absorb FUSE
+            # propagation under 2x concurrent test load, where the new
+            # sandbox's S3-FUSE mount has been observed to take >34 s
+            # to expose a JSONL written by the previous sandbox on the
+            # same volume. Cap at 16s per attempt — going higher just
+            # widens the loss-of-context window without buying much
+            # more headroom (FUSE either catches up in <90 s or it
+            # stays stuck for the whole prompt budget).
+            #
             # Only -32603 is retried; other errors (auth, schema) fall
             # through to the session/new path immediately.
             load_params = {
@@ -1249,7 +1258,7 @@ async def _attach_acp_session(
                 "cwd": cwd,
                 "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
             }
-            backoffs = [1.0, 2.0, 4.0, 8.0, 16.0]
+            backoffs = [1.0, 2.0, 4.0, 8.0, 16.0, 16.0, 16.0, 16.0, 16.0]
             last_err: Exception | None = None
             for attempt in range(len(backoffs) + 1):
                 try:
