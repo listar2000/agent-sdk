@@ -7,8 +7,10 @@ recovery code. The classes here are not yet wired into the REST handlers
 in ``src/api/server.py`` — that wiring lands in subsequent phase-2
 commits.
 """
+from .factory import make_session, register
 from .liveness import Liveness, LivenessState
 from .pool import SessionPool
+from .runtime import get_pool, shutdown_pool
 from .session import BaseSandboxSession
 from .state import (
     DaytonaSandboxState,
@@ -35,5 +37,9 @@ __all__ = [
     "UnixLocalSandboxState",
     "UnknownSandboxState",
     "deserialize",
+    "get_pool",
+    "make_session",
+    "register",
     "serialize",
+    "shutdown_pool",
 ]
