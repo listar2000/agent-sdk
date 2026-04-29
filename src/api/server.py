@@ -1586,6 +1586,20 @@ class _VolumeEditBody(BaseModel):
     content: str  # plain text for v1
 
 
+class _VolumeUploadBody(BaseModel):
+    path: str
+    content: str  # base64-encoded
+
+
+class _VolumePathBody(BaseModel):
+    path: str
+
+
+class _VolumeRenameBody(BaseModel):
+    path: str
+    new_path: str
+
+
 def _safe_path(p: str) -> str:
     """Normalize a volume-relative path; HTTP 400 on any violation.
 
@@ -1661,6 +1675,51 @@ async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
         )
     except Exception as e:
         raise _volume_fs_err("Edit", vol.provider, e)
+
+
+@app.post("/volumes/{id_or_name}/files/upload", status_code=204)
+async def volume_files_upload(id_or_name: str, body: _VolumeUploadBody):
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(body.path)
+    try:
+        payload = base64.b64decode(body.content, validate=True)
+    except Exception as e:
+        raise HTTPException(400, f"invalid base64 content: {e}")
+    try:
+        await _providers_mod.volume_upload(vol.provider, vol.provider_ref, rel, payload)
+    except Exception as e:
+        raise _volume_fs_err("Upload", vol.provider, e)
+
+
+@app.post("/volumes/{id_or_name}/files/mkdir", status_code=204)
+async def volume_files_mkdir(id_or_name: str, body: _VolumePathBody):
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(body.path)
+    try:
+        await _providers_mod.volume_mkdir(vol.provider, vol.provider_ref, rel)
+    except Exception as e:
+        raise _volume_fs_err("Mkdir", vol.provider, e)
+
+
+@app.post("/volumes/{id_or_name}/files/delete", status_code=204)
+async def volume_files_delete(id_or_name: str, body: _VolumePathBody):
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(body.path)
+    try:
+        await _providers_mod.volume_delete(vol.provider, vol.provider_ref, rel)
+    except Exception as e:
+        raise _volume_fs_err("Delete", vol.provider, e)
+
+
+@app.post("/volumes/{id_or_name}/files/rename", status_code=204)
+async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
+    vol = await _resolve_volume(id_or_name)
+    src = _safe_path(body.path)
+    dst = _safe_path(body.new_path)
+    try:
+        await _providers_mod.volume_rename(vol.provider, vol.provider_ref, src, dst)
+    except Exception as e:
+        raise _volume_fs_err("Rename", vol.provider, e)
 
 
 # ---------------------------------------------------------------------------

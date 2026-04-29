@@ -1137,3 +1137,57 @@ async def volume_write(ref: str, path: str, content: bytes) -> None:
     res = await _run_in_utility_sandbox(ref, cmd)
     if res.exit_code != 0:
         raise RuntimeError(f"volume_write failed: {res.stderr[:400]}")
+
+
+async def volume_upload(ref: str, path: str, content: bytes) -> None:
+    """Upload bytes to ``<volume>/<path>``."""
+    await volume_write(ref, path, content)
+
+
+async def volume_mkdir(ref: str, path: str) -> None:
+    """Create a directory at ``<volume>/<path>``."""
+    rel = _safe_path(None, path or "")
+    if not rel:
+        raise ValueError("volume_mkdir: path required")
+    target = "/v/" + rel
+    res = await _run_in_utility_sandbox(ref, f"mkdir -p {shlex.quote(target)}")
+    if res.exit_code != 0:
+        raise RuntimeError(f"volume_mkdir failed: {res.stderr[:400]}")
+
+
+async def volume_delete(ref: str, path: str) -> None:
+    """Delete a file or directory at ``<volume>/<path>``."""
+    rel = _safe_path(None, path or "")
+    if not rel:
+        raise ValueError("volume_delete: path required")
+    target = "/v/" + rel
+    cmd = (
+        f"if [ ! -e {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
+        f"rm -rf -- {shlex.quote(target)}"
+    )
+    res = await _run_in_utility_sandbox(ref, cmd)
+    if res.exit_code != 0:
+        if "__MISSING__" in (res.stdout or ""):
+            raise FileNotFoundError(f"{path} not found on volume {ref}")
+        raise RuntimeError(f"volume_delete failed: {res.stderr[:400]}")
+
+
+async def volume_rename(ref: str, path: str, new_path: str) -> None:
+    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
+    src_rel = _safe_path(None, path or "")
+    dst_rel = _safe_path(None, new_path or "")
+    if not src_rel or not dst_rel:
+        raise ValueError("volume_rename: path and new_path required")
+    src = "/v/" + src_rel
+    dst = "/v/" + dst_rel
+    dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
+    cmd = (
+        f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+        f"mkdir -p {shlex.quote(dst_parent)} && "
+        f"mv -- {shlex.quote(src)} {shlex.quote(dst)}"
+    )
+    res = await _run_in_utility_sandbox(ref, cmd)
+    if res.exit_code != 0:
+        if "__MISSING__" in (res.stdout or ""):
+            raise FileNotFoundError(f"{path} not found on volume {ref}")
+        raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")

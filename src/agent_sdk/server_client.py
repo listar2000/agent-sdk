@@ -17,6 +17,7 @@ does, read ``docs/api.md``. Adding a new route means adding one method.
 """
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -198,6 +199,39 @@ class ServerClient:
             body["replace_all"] = True
         await self._json(
             "POST", f"/volumes/{volume_id}/files/edit", json=body,
+        )
+
+    async def volume_file_upload(
+        self, volume_id: str, path: str, content: bytes,
+    ) -> None:
+        """``POST /volumes/{id}/files/upload`` — binary-safe upload."""
+        payload = base64.b64encode(content).decode("ascii")
+        await self._json(
+            "POST", f"/volumes/{volume_id}/files/upload",
+            json={"path": path, "content": payload},
+        )
+
+    async def volume_file_mkdir(self, volume_id: str, path: str) -> None:
+        """``POST /volumes/{id}/files/mkdir``."""
+        await self._json(
+            "POST", f"/volumes/{volume_id}/files/mkdir",
+            json={"path": path},
+        )
+
+    async def volume_file_delete(self, volume_id: str, path: str) -> None:
+        """``POST /volumes/{id}/files/delete``."""
+        await self._json(
+            "POST", f"/volumes/{volume_id}/files/delete",
+            json={"path": path},
+        )
+
+    async def volume_file_rename(
+        self, volume_id: str, path: str, new_path: str,
+    ) -> None:
+        """``POST /volumes/{id}/files/rename``."""
+        await self._json(
+            "POST", f"/volumes/{volume_id}/files/rename",
+            json={"path": path, "new_path": new_path},
         )
 
     # ------------------------------------------------------------------

@@ -221,6 +221,31 @@ async def test_volume_tree_lists_entries(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_volume_mkdir_upload_rename_delete(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+
+    await local.volume_mkdir(ref, "shared/docs")
+    assert (Path(ref) / "shared" / "docs").is_dir()
+
+    await local.volume_upload(ref, "shared/docs/a.txt", b"hello")
+    assert (Path(ref) / "shared" / "docs" / "a.txt").read_bytes() == b"hello"
+
+    await local.volume_rename(ref, "shared/docs/a.txt", "shared/docs/b.txt")
+    assert not (Path(ref) / "shared" / "docs" / "a.txt").exists()
+    assert (Path(ref) / "shared" / "docs" / "b.txt").read_bytes() == b"hello"
+
+    await local.volume_delete(ref, "shared/docs/b.txt")
+    assert not (Path(ref) / "shared" / "docs" / "b.txt").exists()
+
+    await local.volume_delete(ref, "shared/docs")
+    assert not (Path(ref) / "shared" / "docs").exists()
+
+
+@pytest.mark.asyncio
 async def test_volume_read_rejects_symlink_escape(tmp_path, monkeypatch):
     """A symlink inside the volume pointing to /etc/passwd must not be
     readable via volume_read — realpath containment check rejects it."""

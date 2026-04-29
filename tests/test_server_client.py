@@ -168,6 +168,48 @@ async def test_volume_file_edit_string_replace():
     }
 
 
+@pytest.mark.asyncio
+async def test_volume_file_upload_posts_base64_content():
+    rec = _Recorder(None, status=204, content_type="")
+    async with _make_client(rec) as sc:
+        await sc.volume_file_upload("v1", "b.bin", b"\x00\x01hi")
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/volumes/v1/files/upload"
+    body = json.loads(rec.last.content)
+    assert body["path"] == "b.bin"
+    assert body["content"] == "AAFoaQ=="
+
+
+@pytest.mark.asyncio
+async def test_volume_file_mkdir_posts_path():
+    rec = _Recorder(None, status=204, content_type="")
+    async with _make_client(rec) as sc:
+        await sc.volume_file_mkdir("v1", "docs")
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/volumes/v1/files/mkdir"
+    assert json.loads(rec.last.content) == {"path": "docs"}
+
+
+@pytest.mark.asyncio
+async def test_volume_file_delete_posts_path():
+    rec = _Recorder(None, status=204, content_type="")
+    async with _make_client(rec) as sc:
+        await sc.volume_file_delete("v1", "docs/a.txt")
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/volumes/v1/files/delete"
+    assert json.loads(rec.last.content) == {"path": "docs/a.txt"}
+
+
+@pytest.mark.asyncio
+async def test_volume_file_rename_posts_src_and_dst():
+    rec = _Recorder(None, status=204, content_type="")
+    async with _make_client(rec) as sc:
+        await sc.volume_file_rename("v1", "docs/a.txt", "docs/b.txt")
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/volumes/v1/files/rename"
+    assert json.loads(rec.last.content) == {"path": "docs/a.txt", "new_path": "docs/b.txt"}
+
+
 # ---------------------------------------------------------------------------
 # Session filesystem (session_id addresses the current sandbox)
 # ---------------------------------------------------------------------------
