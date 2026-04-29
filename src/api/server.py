@@ -2902,6 +2902,96 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
     raise HTTPException(500, f"Unknown sandbox status: {status}")
 
 
+@dataclass
+class _ProvisionedSandbox:
+    """Result of the shared provisioning core: live instance + (un-persisted)
+    sandbox record. Caller decides how to write to the DB."""
+    instance: ProviderInstance
+    record: SandboxRecord
+
+
+async def _resolve_sandbox_root(provider: str, explicit: str | None) -> str | None:
+    """Pick the sandbox HOME path for `provider`.
+
+    Returns:
+      * the caller's explicit root if set
+      * None for ``local`` (provider fills it from the volume subpath itself)
+      * the canonical ``_PROVIDER_VOLUME_HOME`` entry otherwise
+
+    Raises HTTPException(500) for an unknown provider — better than silently
+    passing ``root=None`` downstream and letting a sandbox land outside its
+    volume mount.
+    """
+    if explicit is not None:
+        return explicit
+    if provider == "local":
+        return None
+    root = _PROVIDER_VOLUME_HOME.get(provider)
+    if root is None:
+        raise HTTPException(
+            500,
+            f"no default root for provider {provider!r}; "
+            "register one in _shared._PROVIDER_VOLUME_HOME",
+        )
+    return root
+
+
+async def _provision_sandbox_core(
+    *,
+    volume: VolumeRecord,
+    agent_id: str,
+    agent_config: AgentConfig,
+    spawn_env: dict[str, str],
+    user_pre_start: list[str],
+    dockerfile: str | None,
+    shared_mounts: list[str] | None,
+    explicit_root: str | None = None,
+    sandbox_id: str | None = None,
+) -> _ProvisionedSandbox:
+    """Single-source provisioning: ensure supervisor → resolve root →
+    provision_sandbox → build SandboxRecord.
+
+    Caller is responsible for persisting the returned record (the two
+    callers — _provision_new and the eager session-create path — write
+    in different transactional contexts: _provision_new bundles the
+    sandbox INSERT with the session-row UPDATE, the eager flow does
+    them separately because the session row is written later).
+    """
+    agent_type = agent_config.agent_type or "claude"
+    subpath = f"agents/{agent_id}"
+
+    # Supervisor install is idempotent (cache hit in volumes table on reruns).
+    await ensure_volume_supervisor(volume.id, agent_type)
+
+    root = await _resolve_sandbox_root(volume.provider, explicit_root)
+    new_sandbox_id = sandbox_id or f"sb_{uuid.uuid4().hex[:12]}"
+
+    # Re-merge raw user commands with current agent skills so recovery
+    # always uses the latest skill configuration.
+    pre_start_commands = await _build_pre_start_commands(
+        agent_config, volume.provider, user_pre_start
+    )
+
+    instance = await _provision_with_cache_retry(
+        (volume.id, agent_type), _providers_mod.provision_sandbox,
+        volume.provider,
+        volume_ref=volume.provider_ref, subpath=subpath,
+        agent_type=agent_type, spawn_env=spawn_env,
+        root=root, sandbox_id=new_sandbox_id,
+        dockerfile=dockerfile, shared_mounts=shared_mounts or None,
+        pre_start_commands=pre_start_commands,
+    )
+
+    record = _sandbox_record(
+        new_sandbox_id, volume.provider, instance,
+        volume_id=volume.id, subpath=subpath,
+        root_fallback=instance.root or root or "/tmp",
+        dockerfile=dockerfile,
+        shared_mounts=shared_mounts,
+    )
+    return _ProvisionedSandbox(instance=instance, record=record)
+
+
 async def _provision_new(
     session_row: dict, previous_id: str | None,
     *,
@@ -2916,66 +3006,27 @@ async def _provision_new(
     durable source of truth once created.
     """
     agent_id = session_row["agent_id"]
-    subpath = f"agents/{agent_id}"
     vol, agent = await asyncio.gather(
         get_volume(session_row["volume_id"]),
         get_agent(agent_id),
     )
     if vol is None:
         raise HTTPException(500, f"Session's volume {session_row['volume_id']} missing")
-    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
+    if agent is None or agent.config is None:
+        raise HTTPException(500, f"Session's agent {agent_id} missing")
 
-    # Supervisor install is idempotent (cache hit in volumes table on reruns).
-    await ensure_volume_supervisor(vol.id, agent_type)
-
-    spawn_env = _build_spawn_env_from_row(session_row)
-
-    # Provider-specific default root. local fills it in from the volume path
-    # itself; the others mount the agent's HOME at a fixed path. Routing
-    # through _PROVIDER_VOLUME_HOME keeps this site honest — adding a new
-    # provider that doesn't register a home there will fail loudly here
-    # instead of silently producing root=None.
-    if vol.provider == "local":
-        root = None
-    else:
-        root = _PROVIDER_VOLUME_HOME.get(vol.provider)
-        if root is None:
-            raise HTTPException(
-                500,
-                f"no default root for provider {vol.provider!r}; "
-                "register one in _shared._PROVIDER_VOLUME_HOME",
-            )
-
-    # Generate the sandbox_id up-front so we can tag the underlying
-    # container/process with it. Docker uses this as a label for
-    # startup reconciliation (M5); other providers currently ignore it.
-    new_sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
-
-    # Re-merge raw user commands with current agent skills so recovery
-    # always uses the latest skill configuration.
-    user_pre_start = list(session_row.get("pre_start_commands") or [])
-    pre_start_commands_merged = await _build_pre_start_commands(
-        agent.config, vol.provider, user_pre_start
-    )
-
-    inst = await _provision_with_cache_retry(
-        (vol.id, agent_type), _providers_mod.provision_sandbox,
-        vol.provider,
-        volume_ref=vol.provider_ref, subpath=subpath,
-        agent_type=agent_type, spawn_env=spawn_env,
-        root=root, sandbox_id=new_sandbox_id,
-        dockerfile=dockerfile, shared_mounts=shared_mounts or None,
-        pre_start_commands=pre_start_commands_merged,
-    )
-
-    sb = _sandbox_record(
-        new_sandbox_id, vol.provider, inst,
-        volume_id=vol.id, subpath=subpath,
-        root_fallback=root or "/tmp",
+    provisioned = await _provision_sandbox_core(
+        volume=vol,
+        agent_id=agent_id,
+        agent_config=agent.config,
+        spawn_env=_build_spawn_env_from_row(session_row),
+        user_pre_start=list(session_row.get("pre_start_commands") or []),
         dockerfile=dockerfile,
         shared_mounts=shared_mounts,
+        explicit_root=None,  # use provider default
     )
-    _INSTANCES[sb.id] = inst
+    sb = provisioned.record
+    _INSTANCES[sb.id] = provisioned.instance
 
     # Atomic: insert the sandbox row + link session->sandbox in one
     # transaction so a crash between writes can't orphan the sandbox.
@@ -3435,61 +3486,47 @@ async def _sessions_create_eager(data: dict) -> dict:
     session_secrets = body_secrets or {}
     spawn_env = _merge_env(session_env, session_secrets)
 
-    # Install skills BEFORE starting the supervisor — claude-agent-acp
-    # discovers skills at process startup. For local: install on host.
-    # For docker/daytona: run install commands inside the sandbox before start.
-    # Caller-supplied ``pre_start_commands`` (e.g. hive's ``uv tool install
-    # hive-evolve``) are concatenated after skill install so dependencies
-    # build on top of a skill-ready image.
-    user_pre_start = data.get("pre_start_commands") or []
-    pre_start_commands = await _build_pre_start_commands(
-        config, provider, user_pre_start
-    )
-
+    user_pre_start = list(data.get("pre_start_commands") or [])
     sandbox_id = str(uuid.uuid4())
-    subpath = f"agents/{agent_id}"
 
-    # Install supervisor on the volume before spawning the sandbox.
-    # Docker/Local need supervisor.js + node_modules under the volume at create
-    # time. Idempotent fast-path on cache hit.
+    # Single-source provisioning. _provision_sandbox_core handles
+    # ensure_volume_supervisor, root resolution against _PROVIDER_VOLUME_HOME,
+    # and the underlying provision_sandbox call. The eager flow's only
+    # divergence from _provision_new is what we do AFTER provisioning
+    # (resolve supervisor URL → ACP attach → session row), not how we
+    # provision.
     try:
-        await ensure_volume_supervisor(volume_id, agent_type)
-    except Exception as e:
-        await delete_agent(agent_id)
-        log.error("sessions_quick_create: ensure_volume_supervisor failed: %s", e, exc_info=True)
-        raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
-
-    try:
-        instance = await _provision_with_cache_retry(
-            (volume_id, agent_type), create_instance,
-            provider, agent_type, dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands,
-            root=root, spawn_env=spawn_env,
-            volume_id=volume_record.provider_ref, subpath=subpath,
-            sandbox_id=sandbox_id, shared_mounts=shared_mounts or None,
+        provisioned = await _provision_sandbox_core(
+            volume=volume_record,
+            agent_id=agent_id,
+            agent_config=config,
+            spawn_env=spawn_env,
+            user_pre_start=user_pre_start,
+            dockerfile=dockerfile,
+            shared_mounts=shared_mounts,
+            explicit_root=root,
+            sandbox_id=sandbox_id,
         )
+    except HTTPException:
+        await delete_agent(agent_id)
+        raise
     except Exception as e:
         await delete_agent(agent_id)
-        log.error("sessions_quick_create: create_instance failed (provider=%s): %s", provider, e, exc_info=True)
-        # 503 + Retry-After tells callers to back off on circuit-breaker trips.
+        log.error("sessions_quick_create: provisioning failed (provider=%s): %s",
+                  provider, e, exc_info=True)
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
+    instance = provisioned.instance
     _INSTANCES[sandbox_id] = instance
-    # Now that the provider has computed its effective root, use that as the
-    # authoritative path for both the sandbox row and the session's cwd so
-    # session/new runs with the same path the supervisor's HOME points at.
-    # This is what makes volume-persistence tests work on local (HOME lands
-    # on the volume subpath rather than /tmp).
-    effective_root = instance.root or root or "/tmp"
+    # Effective root drives both the sandbox row and the session's cwd —
+    # session/new must run with the same path the supervisor's HOME points
+    # at so volume-persisted JSONLs land where Claude expects to find them.
+    effective_root = provisioned.record.root
     if cwd is None:
         cwd = effective_root
-    await upsert_sandbox(_sandbox_record(
-        sandbox_id, provider, instance,
-        volume_id=volume_id, subpath=subpath, root_fallback=effective_root,
-        dockerfile=dockerfile, shared_mounts=shared_mounts,
-    ))
+    await upsert_sandbox(provisioned.record)
 
     async def _cleanup_and_raise(msg_fmt: str, e: Exception) -> None:
         """Shared teardown for post-upsert failures in /sessions."""
