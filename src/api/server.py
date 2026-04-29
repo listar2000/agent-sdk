@@ -1218,24 +1218,74 @@ async def _attach_acp_session(
     mcp = agent_record.config.mcp_servers if agent_record.config else None
 
     if inner_sid:
+        # Handshake exactly once. Re-handshaking on each session/load
+        # retry corrupts claude-agent-acp's session-id table — observed
+        # as "session not recognized" 4xx on the very next /v1/acp call.
         try:
             await client.handshake(acp_session_id, agent_type)
-            await client._send_rpc(acp_session_id, "session/load", {
+        except Exception as hs_err:
+            log.warning(
+                "ACP handshake failed (inner_sid=%s, cwd=%s): %r — "
+                "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
+                inner_sid, cwd, hs_err,
+            )
+        else:
+            # Retry session/load on transient ACP -32603 ("Internal error").
+            # On Daytona, freshly-provisioned Type 2 replacement sandboxes mount
+            # the session JSONL via S3-backed FUSE; the file exists in the
+            # volume but takes a few seconds to be visible inside the new
+            # sandbox. claude-agent-acp's session/load reads the file and
+            # returns -32603 if it's not yet visible. Without retry we fall
+            # back to session/new and lose the prior conversation, which the
+            # ``test_session_resume_after_delete[daytona]`` invariant
+            # ``inner_after == inner_before`` deliberately catches.
+            #
+            # Backoffs sum to ~31s — well below the 180s prompt budget but
+            # long enough to absorb FUSE propagation under concurrent load.
+            # Only -32603 is retried; other errors (auth, schema) fall
+            # through to the session/new path immediately.
+            load_params = {
                 "sessionId": inner_sid,
                 "cwd": cwd,
                 "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
-            })
-            client.set_inner_session_id(acp_session_id, inner_sid)
-            try:
-                await client.set_mode(acp_session_id, "bypassPermissions")
-            except Exception:
-                pass
-            return inner_sid, False
-        except Exception as load_err:
+            }
+            backoffs = [1.0, 2.0, 4.0, 8.0, 16.0]
+            last_err: Exception | None = None
+            for attempt in range(len(backoffs) + 1):
+                try:
+                    await client._send_rpc(
+                        acp_session_id, "session/load", load_params,
+                    )
+                    client.set_inner_session_id(acp_session_id, inner_sid)
+                    try:
+                        await client.set_mode(acp_session_id, "bypassPermissions")
+                    except Exception:
+                        pass
+                    if attempt > 0:
+                        log.info(
+                            "session/load succeeded after %d retries "
+                            "(inner_sid=%s, cwd=%s)",
+                            attempt, inner_sid, cwd,
+                        )
+                    return inner_sid, False
+                except RuntimeError as load_err:
+                    last_err = load_err
+                    if "[-32603]" not in str(load_err):
+                        break  # non-transient — fall back to session/new
+                    if attempt < len(backoffs):
+                        log.info(
+                            "session/load -32603 on attempt %d "
+                            "(inner_sid=%s); retrying in %.1fs",
+                            attempt + 1, inner_sid, backoffs[attempt],
+                        )
+                        await asyncio.sleep(backoffs[attempt])
+                except Exception as load_err:
+                    last_err = load_err
+                    break  # connection/transport error — fall back
             log.warning(
-                "session/load failed (inner_sid=%s, cwd=%s): %r — "
+                "session/load failed after retries (inner_sid=%s, cwd=%s): %r — "
                 "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
-                inner_sid, cwd, load_err,
+                inner_sid, cwd, last_err,
             )
 
     # Genuinely fresh (no inner_sid) or load failed — start a new session.
