@@ -4301,6 +4301,36 @@ async def _hibernate_session_id(session_id: str, force: bool) -> dict:
             "session_in_memory": True}
 
 
+@app.post("/sessions/{session_id}/release")
+async def release_session_route(session_id: str):
+    """**New phase-2 endpoint** (per docs/ephemeral-sandbox-design.md §7).
+
+    Snapshots the session's compute and releases the lease. Backed by
+    ``api.sandbox.SessionPool.release``. Idempotent — calling on a
+    session that has no active lease is a no-op returning the current
+    snapshot pointer.
+
+    Differs from the legacy ``/hibernate`` and ``/stop-sandbox`` routes:
+    those operate on the in-memory ``SessionState`` + ``sandboxes`` row;
+    this operates on the new ``SandboxSession`` pool. Both will work
+    during the migration; phase 3 deletes the legacy routes once
+    callers have migrated.
+    """
+    from api.sandbox import deserialize, get_pool
+    from api.sandbox.db_bindings import load_sandbox_state
+
+    pool = get_pool()
+    await pool.release(session_id)
+
+    payload = await load_sandbox_state(session_id)
+    state = deserialize(payload)
+    return {
+        "lifecycle": "hibernated",
+        "snapshot_path": state.snapshot_path,
+        "snapshot_version": state.snapshot_version,
+    }
+
+
 @app.post("/sessions/{session_id}/hibernate")
 async def hibernate_session_route(session_id: str, request: Request):
     """Hibernate a session: stop the sandbox compute, but keep the live
