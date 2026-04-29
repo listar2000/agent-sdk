@@ -288,6 +288,20 @@ _SSE_MAX_IDLE_RETRIES = int(os.environ.get("SSE_MAX_IDLE_RETRIES", "2"))
 # and the 5-retry ladder was dominated by time wasted hammering a dead
 # daytona preview URL.
 
+# Per-stream read timeout for the upstream SSE drain. The supervisor
+# (src/supervisor/supervisor.js) sends a `: heartbeat\n\n` SSE comment
+# every SSE_HEARTBEAT_MS=25_000 ms, so under healthy operation we get a
+# chunk at least every 25 s. Without a read timeout, daytona's signed
+# preview proxy holds the TCP connection alive for ~5 minutes after the
+# supervisor inside the sandbox dies — the SSE stream looks "open" but
+# silent, and an in-flight prompt POST hangs on the same dead supervisor
+# until the proxy's idle timeout finally drops the connection. Setting
+# this to ~2x the heartbeat interval lets us declare the stream dead
+# within ~60 s instead of ~300 s, which keeps recovery within the
+# 180 s test budget for `test_session_resume_after_delete[daytona]`
+# even when the freshly-provisioned replacement sandbox dies again.
+_SSE_READ_TIMEOUT_S = float(os.environ.get("SSE_READ_TIMEOUT", "60"))
+
 
 async def _hibernate_session(state: SessionState) -> None:
     """Stop the sandbox compute, then either keep ``SessionState`` for a
@@ -939,10 +953,18 @@ class _SseDisconnectInfo:
     by the outer loop to reset the retry budget — a 30-second drain followed
     by a transient error counts as "had one good connection," not "20 bad
     attempts."
+
+    ``received_any_chunk`` distinguishes "drained data" from "connected and
+    sat silent until the read timeout fired". Without that distinction a
+    connect-then-silent loop would reset the retry budget on every iteration
+    (because connected=True), preventing _recover_after_disconnect from ever
+    firing when the supervisor is dead but daytona's proxy keeps the TCP
+    connection alive.
     """
     reason: str                       # "upstream_eof" or "ExceptionType: msg"
     connected_successfully: bool
     supervisor_dead: bool             # cheap port-based fast-fail signal
+    received_any_chunk: bool = False
 
 
 async def _sse_reader_connect_and_drain(
@@ -959,8 +981,17 @@ async def _sse_reader_connect_and_drain(
     reader_buffer = ""
     disconnect_reason = "upstream_eof"
     connected = False
+    received_any_chunk = False
+    # Bound the per-chunk read at 2x the supervisor's heartbeat interval.
+    # supervisor.js sends a `: heartbeat\n\n` SSE comment every 25 s, so
+    # any 60 s gap means the supervisor (or the path to it) is gone — and
+    # we must not wait the ~5 min daytona proxy idle timeout to find out.
     sse_http = httpx.AsyncClient(
-        base_url=state.client.base_url, timeout=None, proxy=None,
+        base_url=state.client.base_url,
+        timeout=httpx.Timeout(
+            connect=10.0, read=_SSE_READ_TIMEOUT_S, write=10.0, pool=10.0,
+        ),
+        proxy=None,
     )
     try:
         try:
@@ -980,6 +1011,7 @@ async def _sse_reader_connect_and_drain(
                          "(attempt=%d, status=%d)",
                          state.session_id, attempt, resp.status_code)
                 async for chunk in resp.aiter_text():
+                    received_any_chunk = True
                     if state.shutdown.is_set():
                         log.info("[SSE-READER] session %s shutting down; "
                                  "exiting drain", state.session_id)
@@ -1020,10 +1052,18 @@ async def _sse_reader_connect_and_drain(
         and cached_inst.process is not None
         and not _instance_process_alive(cached_inst)
     )
+    # Daytona analogue: if we connected but never saw a single chunk before
+    # the read timeout fired, the supervisor (or the path to it) is dead —
+    # heartbeats every 25 s mean any silent 60 s window is unrecoverable.
+    # Treat this as supervisor_dead so the outer loop bypasses the connect
+    # retry ladder and goes straight to _recover_after_disconnect.
+    if connected and not received_any_chunk:
+        supervisor_dead = True
     return _SseDisconnectInfo(
         reason=disconnect_reason,
         connected_successfully=connected,
         supervisor_dead=supervisor_dead,
+        received_any_chunk=received_any_chunk,
     )
 
 
@@ -1058,12 +1098,16 @@ def _start_sse_reader(state: SessionState) -> None:
                 info = await _sse_reader_connect_and_drain(
                     state, attempt, text_parts, thinking_parts,
                 )
-                if info.connected_successfully:
-                    # Successful connect resets the retry budget for the
-                    # next failure — the original code did this inline at
-                    # the top of the stream block (line ~887 of the old
-                    # version), so a 30-second healthy drain followed by a
-                    # transient drop counts as one fresh attempt, not N.
+                if info.connected_successfully and info.received_any_chunk:
+                    # Successful connect that actually drained data resets
+                    # the retry budget for the next failure — a 30-second
+                    # healthy drain followed by a transient drop counts as
+                    # one fresh attempt, not N. We DO NOT reset on
+                    # connect-without-data: with a per-chunk read timeout
+                    # in place, a connect-then-silent loop on a dead
+                    # supervisor (daytona's proxy keeps the TCP open after
+                    # the supervisor dies) would otherwise reset the budget
+                    # on every iteration and never reach _recover.
                     attempt = 0
                     reconnect_delay_s = 1.0
 
@@ -3846,9 +3890,15 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
         event_type=EVT_USER_MESSAGE, payload={"text": message, "prompt_id": rpc_id},
     )
     def _is_transient_supervisor_failure(e: Exception) -> bool:
-        # Transport-level: supervisor died mid-handshake.
+        # Transport-level: supervisor died mid-handshake. ReadTimeout and
+        # CloseError cover the "client.aclose() called by a concurrent
+        # rebind while this prompt POST was awaiting a response" case —
+        # without them, the watchdog-triggered rebind closes the old
+        # client to abort the hung POST but the resulting exception
+        # falls through to the generic error path instead of retrying.
         if isinstance(e, (httpx.ConnectError, httpx.RemoteProtocolError,
-                          httpx.ReadError)):
+                          httpx.ReadError, httpx.ReadTimeout,
+                          httpx.CloseError)):
             return True
         # Daytona signed proxy URL invalidation manifests as 502/503/504 on
         # the supervisor's HTTP surface even while the supervisor process
@@ -3962,7 +4012,22 @@ async def post_session_message(session_id: str, request: Request):
 
     interrupt = data.get("interrupt", False)
 
-    _, _, state = await ensure_session_live(session_id)
+    # Fast path mirrors GET /events: if a live in-memory state already
+    # exists, just enqueue — don't take the session lock. ensure_session_live
+    # holds that lock for the entire ensure_state_live → rebind sequence,
+    # which on a daytona Type 2 replacement (sandbox externally deleted →
+    # provision fresh sandbox + supervisor) takes ~25 s. POST /message
+    # callers typically have a ~30 s client-side timeout (e.g. tests'
+    # _send_message), and a concurrent SSE-reader-driven recovery already
+    # holding the lock would tip them past that. The scheduler's per-prompt
+    # ensure_session_live still runs immediately before each
+    # state.client.prompt(), so a stale URL still gets rebound — just on the
+    # scheduler thread instead of blocking the POST handler.
+    cached_state = SESSIONS.get(session_id)
+    if cached_state is not None and not cached_state.is_hibernated:
+        state = cached_state
+    else:
+        _, _, state = await ensure_session_live(session_id)
 
     if interrupt and state.agent_busy:
         await _cancel_and_drain(state)
