@@ -54,6 +54,7 @@ from ._shared import (
     _wait_for_health,
     build_supervisor_argv,
     ProviderInstance,
+    VolumeFileExistsError,
     _build_volume_mounts,
     normalize_find_output,
 )
@@ -1233,6 +1234,18 @@ async def volume_download(ref: str, path: str) -> bytes:
         raise RuntimeError(f"volume_download failed: {msg}") from e
 
 
+async def volume_exists(ref: str, path: str) -> bool:
+    """Return whether ``<volume>/<path>`` exists."""
+    rel = _safe_path(None, path or "")
+    target = "/v/" + rel if rel else "/v"
+    res = await _run_in_utility_sandbox(ref, f"test -e {shlex.quote(target)}")
+    if res.exit_code == 0:
+        return True
+    if res.exit_code == 1:
+        return False
+    raise RuntimeError(f"volume_exists failed: {res.stderr[:400]}")
+
+
 async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write ``content`` to ``<volume>/<path>`` via a short-lived utility sandbox."""
     rel = _safe_path(None, path or "")
@@ -1284,7 +1297,7 @@ async def volume_delete(ref: str, path: str) -> None:
         raise RuntimeError(f"volume_delete failed: {res.stderr[:400]}")
 
 
-async def volume_rename(ref: str, path: str, new_path: str) -> None:
+async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
     """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
     src_rel = _safe_path(None, path or "")
     dst_rel = _safe_path(None, new_path or "")
@@ -1293,13 +1306,28 @@ async def volume_rename(ref: str, path: str, new_path: str) -> None:
     src = "/v/" + src_rel
     dst = "/v/" + dst_rel
     dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
-    cmd = (
-        f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-        f"mkdir -p {shlex.quote(dst_parent)} && "
-        f"mv -- {shlex.quote(src)} {shlex.quote(dst)}"
-    )
+    if overwrite:
+        cmd = (
+            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+            f"mkdir -p {shlex.quote(dst_parent)} && "
+            f"mv -- {shlex.quote(src)} {shlex.quote(dst)}"
+        )
+    else:
+        cmd = (
+            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
+            f"if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; fi; "
+            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi; "
+            f"ln {shlex.quote(src)} {shlex.quote(dst)} || "
+            f"{{ if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; else exit 1; fi; }}; "
+            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}"
+        )
     res = await _run_in_utility_sandbox(ref, cmd)
     if res.exit_code != 0:
         if "__MISSING__" in (res.stdout or ""):
             raise FileNotFoundError(f"{path} not found on volume {ref}")
+        if "__EXISTS__" in (res.stdout or ""):
+            raise VolumeFileExistsError(new_path)
+        if "__UNSUPPORTED_DIR__" in (res.stdout or ""):
+            raise NotImplementedError("atomic no-overwrite directory rename is not supported")
         raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")

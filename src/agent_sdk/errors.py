@@ -17,6 +17,14 @@ class SandboxError(AgentSDKError):
     """Error from the sandbox provider."""
 
 
+class VolumeFileExistsError(AgentSDKError):
+    """Destination already exists during a no-overwrite volume rename."""
+
+    def __init__(self, path: str | None = None, message: str | None = None):
+        self.path = path
+        super().__init__(message or (f"destination exists: {path}" if path else "destination exists"))
+
+
 class AgentBusyError(AgentSDKError):
     """Agent is already processing a message."""
 

@@ -380,6 +380,56 @@ async def test_volume_files_upload_mkdir_delete_rename_dispatch(client):
 
 
 @pytest.mark.asyncio
+async def test_volume_files_rename_overwrite_false_dispatches_and_409s(client):
+    from api.models import VolumeRecord
+    from api.providers import VolumeFileExistsError
+
+    v = VolumeRecord(id="vol_rename_no_overwrite", name="files-rename-no-overwrite", provider="daytona", provider_ref="dt-rn")
+    await dbmod.upsert_volume(v)
+
+    calls = []
+
+    async def fake_rename(ref, path, new_path, *, overwrite=True):
+        calls.append((ref, path, new_path, overwrite))
+
+    with patch("api.providers.daytona.volume_rename", new=AsyncMock(side_effect=fake_rename)):
+        r = await client.post(
+            f"/volumes/{v.id}/files/rename",
+            json={"path": "shared/a.txt", "new_path": "shared/b.txt", "overwrite": False},
+        )
+    assert r.status_code == 204
+    assert calls == [("dt-rn", "shared/a.txt", "shared/b.txt", False)]
+
+    with patch(
+        "api.providers.daytona.volume_rename",
+        new=AsyncMock(side_effect=VolumeFileExistsError("shared/b.txt")),
+    ):
+        r = await client.post(
+            f"/volumes/{v.id}/files/rename",
+            json={"path": "shared/a.txt", "new_path": "shared/b.txt", "overwrite": False},
+        )
+    assert r.status_code == 409
+    assert r.json() == {"error": "exists", "path": "shared/b.txt"}
+
+
+@pytest.mark.asyncio
+async def test_volume_files_exists_dispatches(client):
+    from api.models import VolumeRecord
+
+    v = VolumeRecord(id="vol_exists", name="files-exists", provider="daytona", provider_ref="dt-exists")
+    await dbmod.upsert_volume(v)
+
+    async def fake_exists(ref, path):
+        assert (ref, path) == ("dt-exists", "shared/a.txt")
+        return True
+
+    with patch("api.providers.daytona.volume_exists", new=AsyncMock(side_effect=fake_exists)):
+        r = await client.get(f"/volumes/{v.id}/files/exists", params={"path": "shared/a.txt"})
+    assert r.status_code == 200
+    assert r.json() == {"exists": True}
+
+
+@pytest.mark.asyncio
 async def test_volume_files_upload_rejects_invalid_base64(client):
     from api.models import VolumeRecord
     v = VolumeRecord(id="vol_f3", name="files-test-3", provider="daytona", provider_ref="dt-f3")

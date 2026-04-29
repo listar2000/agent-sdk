@@ -238,11 +238,78 @@ async def test_volume_mkdir_upload_rename_delete(tmp_path, monkeypatch):
     assert not (Path(ref) / "shared" / "docs" / "a.txt").exists()
     assert (Path(ref) / "shared" / "docs" / "b.txt").read_bytes() == b"hello"
 
+    await local.volume_upload(ref, "shared/docs/c.txt", b"new")
+    await local.volume_rename(ref, "shared/docs/c.txt", "shared/docs/b.txt")
+    assert not (Path(ref) / "shared" / "docs" / "c.txt").exists()
+    assert (Path(ref) / "shared" / "docs" / "b.txt").read_bytes() == b"new"
+
     await local.volume_delete(ref, "shared/docs/b.txt")
     assert not (Path(ref) / "shared" / "docs" / "b.txt").exists()
 
     await local.volume_delete(ref, "shared/docs")
     assert not (Path(ref) / "shared" / "docs").exists()
+
+
+@pytest.mark.asyncio
+async def test_volume_rename_no_overwrite_success_and_collision(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import VolumeFileExistsError, local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+
+    await local.volume_upload(ref, "shared/a.txt", b"A")
+    await local.volume_rename(ref, "shared/a.txt", "shared/example/a.txt", overwrite=False)
+    assert not (Path(ref) / "shared" / "a.txt").exists()
+    assert (Path(ref) / "shared" / "example" / "a.txt").read_bytes() == b"A"
+
+    await local.volume_upload(ref, "shared/b.txt", b"B")
+    with pytest.raises(VolumeFileExistsError):
+        await local.volume_rename(ref, "shared/b.txt", "shared/example/a.txt", overwrite=False)
+    assert (Path(ref) / "shared" / "b.txt").read_bytes() == b"B"
+    assert (Path(ref) / "shared" / "example" / "a.txt").read_bytes() == b"A"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_volume_rename_no_overwrite_one_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import VolumeFileExistsError, local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+    await local.volume_upload(ref, "shared/src1.txt", b"one")
+    await local.volume_upload(ref, "shared/src2.txt", b"two")
+
+    results = await asyncio.gather(
+        local.volume_rename(ref, "shared/src1.txt", "shared/dst.txt", overwrite=False),
+        local.volume_rename(ref, "shared/src2.txt", "shared/dst.txt", overwrite=False),
+        return_exceptions=True,
+    )
+
+    assert sum(result is None for result in results) == 1
+    assert sum(isinstance(result, VolumeFileExistsError) for result in results) == 1
+    assert (Path(ref) / "shared" / "dst.txt").read_bytes() in {b"one", b"two"}
+    remaining_sources = [
+        p.read_bytes()
+        for p in [Path(ref) / "shared" / "src1.txt", Path(ref) / "shared" / "src2.txt"]
+        if p.exists()
+    ]
+    assert len(remaining_sources) == 1
+    assert remaining_sources[0] in {b"one", b"two"}
+    assert remaining_sources[0] != (Path(ref) / "shared" / "dst.txt").read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_volume_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+    await local.volume_upload(ref, "shared/exists.txt", b"yes")
+
+    assert await local.volume_exists(ref, "shared/exists.txt") is True
+    assert await local.volume_exists(ref, "shared/missing.txt") is False
 
 
 @pytest.mark.asyncio

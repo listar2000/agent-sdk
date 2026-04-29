@@ -24,6 +24,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from agent_sdk import VolumeFileExistsError  # noqa: E402
 from agent_sdk.server_client import ServerClient  # noqa: E402
 
 
@@ -208,6 +209,39 @@ async def test_volume_file_rename_posts_src_and_dst():
     assert rec.last.method == "POST"
     assert rec.last.url.path == "/volumes/v1/files/rename"
     assert json.loads(rec.last.content) == {"path": "docs/a.txt", "new_path": "docs/b.txt"}
+
+
+@pytest.mark.asyncio
+async def test_volume_file_rename_posts_overwrite_false_only_when_requested():
+    rec = _Recorder(None, status=204, content_type="")
+    async with _make_client(rec) as sc:
+        await sc.volume_file_rename("v1", "docs/a.txt", "docs/b.txt", overwrite=False)
+    assert rec.last.method == "POST"
+    assert rec.last.url.path == "/volumes/v1/files/rename"
+    assert json.loads(rec.last.content) == {
+        "path": "docs/a.txt",
+        "new_path": "docs/b.txt",
+        "overwrite": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_volume_file_rename_409_exists_maps_to_specific_error():
+    rec = _Recorder({"error": "exists", "path": "docs/b.txt"}, status=409)
+    async with _make_client(rec) as sc:
+        with pytest.raises(VolumeFileExistsError) as exc:
+            await sc.volume_file_rename("v1", "docs/a.txt", "docs/b.txt", overwrite=False)
+    assert exc.value.path == "docs/b.txt"
+
+
+@pytest.mark.asyncio
+async def test_volume_file_exists_returns_boolean():
+    rec = _Recorder({"exists": True})
+    async with _make_client(rec) as sc:
+        assert await sc.volume_file_exists("v1", "docs/a.txt") is True
+    assert rec.last.method == "GET"
+    assert rec.last.url.path == "/volumes/v1/files/exists"
+    assert dict(rec.last.url.params) == {"path": "docs/a.txt"}
 
 
 # ---------------------------------------------------------------------------

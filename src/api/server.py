@@ -83,6 +83,7 @@ from .providers import (
     PORT_BASED_PROVIDERS,
     ProviderInstance,
     SandboxMissingError,
+    VolumeFileExistsError,
     allocate_sandbox_port,
     create_instance,
     default_cwd_for_provider,
@@ -1809,6 +1810,7 @@ class _VolumePathBody(BaseModel):
 class _VolumeRenameBody(BaseModel):
     path: str
     new_path: str
+    overwrite: bool = True
 
 
 def _safe_path(p: str) -> str:
@@ -1876,6 +1878,17 @@ async def volume_files_download(id_or_name: str, path: str):
     )
 
 
+@app.get("/volumes/{id_or_name}/files/exists")
+async def volume_files_exists(id_or_name: str, path: str):
+    vol = await _resolve_volume(id_or_name)
+    rel = _safe_path(path)
+    try:
+        exists = await _providers_mod.volume_exists(vol.provider, vol.provider_ref, rel)
+    except Exception as e:
+        raise _volume_fs_err("Exists", vol.provider, e)
+    return {"exists": exists}
+
+
 @app.post("/volumes/{id_or_name}/files/edit", status_code=204)
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
     vol = await _resolve_volume(id_or_name)
@@ -1928,7 +1941,13 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
     src = _safe_path(body.path)
     dst = _safe_path(body.new_path)
     try:
-        await _providers_mod.volume_rename(vol.provider, vol.provider_ref, src, dst)
+        kwargs = {} if body.overwrite else {"overwrite": False}
+        await _providers_mod.volume_rename(vol.provider, vol.provider_ref, src, dst, **kwargs)
+    except VolumeFileExistsError:
+        return JSONResponse(
+            {"error": "exists", "path": body.new_path},
+            status_code=409,
+        )
     except Exception as e:
         raise _volume_fs_err("Rename", vol.provider, e)
 
