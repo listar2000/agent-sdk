@@ -1177,23 +1177,16 @@ async def _attach_acp_session(
         # session/load can transiently fail with ACP "Internal error"
         # right after a fresh sandbox provisions on Daytona — the volume
         # FUSE mount hasn't propagated yet, so the JSONL ``inner_sid`` lives
-        # in isn't visible to claude-agent-acp. Retry with progressively
-        # longer backoffs before falling back to session/new (which would
-        # lose conversation context). Each attempt is ~200 ms when the
-        # JSONL is genuinely missing; the backoff schedule is tuned so the
-        # total wait (~25 s worst case) fits well under the
+        # in isn't visible to claude-agent-acp. Retry a couple of times with
+        # a short sleep before falling back to session/new (which would lose
+        # conversation context). Each attempt is cheap (~200 ms when JSONL
+        # is missing); 3 attempts adds at most ~3 s, well under the
         # _attach_acp_session timeout (120 s in _ensure_runtime_locked).
-        # Observed: under 2x concurrent test load on Daytona, the FUSE
-        # propagation can take 5-10 s; 3 attempts at 0/1/2 s wasn't enough.
         load_err: Exception | None = None
-        # Backoff schedule (sleeps applied BEFORE each retry, not after
-        # the last). Sleeps: 0, 1, 2, 4, 6, 8 — total ~21 s before
-        # giving up. First attempt is immediate.
-        backoffs = (0.0, 1.0, 2.0, 4.0, 6.0, 8.0)
-        for attempt, sleep_before in enumerate(backoffs):
+        for attempt in range(3):
             try:
-                if sleep_before > 0:
-                    await asyncio.sleep(sleep_before)
+                if attempt > 0:
+                    await asyncio.sleep(1.0 * attempt)  # 1s, 2s
                 await client.handshake(acp_session_id, agent_type)
                 await client._send_rpc(acp_session_id, "session/load", {
                     "sessionId": inner_sid,
@@ -1218,11 +1211,11 @@ async def _attach_acp_session(
                 # signature of a transient JSONL-not-yet-visible miss. Other
                 # errors (auth, transport) won't self-heal and burning a
                 # retry on them just delays the session/new fallback.
-                if attempt < len(backoffs) - 1 and "32603" in repr(e):
+                if attempt < 2 and "32603" in repr(e):
                     log.info(
-                        "session/load attempt %d/%d failed with %r; "
+                        "session/load attempt %d/3 failed with %r; "
                         "retrying after backoff (inner_sid=%s)",
-                        attempt + 1, len(backoffs), e, inner_sid,
+                        attempt + 1, e, inner_sid,
                     )
                     continue
                 break
