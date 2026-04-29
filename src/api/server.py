@@ -1174,74 +1174,64 @@ async def _attach_acp_session(
     mcp = agent_record.config.mcp_servers if agent_record.config else None
 
     if inner_sid:
-        # ACP handshake is per-connection setup ("initialize" RPC) and MUST
-        # only run once per AcpClient — calling it multiple times confuses
-        # claude-agent-acp's session-id table and corrupts subsequent calls.
-        # We saw 5/14 tests regress when the original retry version called
-        # handshake on every attempt.
-        #
-        # session/load can still transiently fail with ACP "Internal error"
-        # (-32603) right after a fresh sandbox provisions on Daytona — the
-        # volume FUSE mount hasn't propagated yet, so the JSONL the
-        # inner_sid lives in isn't visible to claude-agent-acp. Retry
-        # session/load (NOT handshake) with progressively longer backoffs
-        # before falling back to session/new (which would lose conversation
-        # context).
-        try:
-            await client.handshake(acp_session_id, agent_type)
-        except Exception as handshake_err:
-            log.warning(
-                "ACP handshake failed (inner_sid=%s, cwd=%s): %r — "
-                "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
-                inner_sid, cwd, handshake_err,
-            )
-        else:
-            load_err: Exception | None = None
-            # Sleeps applied BEFORE each retry, not after the last.
-            # 0, 1, 2, 4, 6, 8 — total ~21 s in the worst case, well under
-            # the _attach_acp_session 120 s timeout. First attempt is
-            # immediate so the hot path (FUSE already visible) pays nothing.
-            backoffs = (0.0, 1.0, 2.0, 4.0, 6.0, 8.0)
-            for attempt, sleep_before in enumerate(backoffs):
+        # session/load can transiently fail with ACP "Internal error"
+        # right after a fresh sandbox provisions on Daytona — the volume
+        # FUSE mount hasn't propagated yet, so the JSONL ``inner_sid`` lives
+        # in isn't visible to claude-agent-acp. Retry with progressively
+        # longer backoffs before falling back to session/new (which would
+        # lose conversation context). Each attempt is ~200 ms when the
+        # JSONL is genuinely missing; the backoff schedule is tuned so the
+        # total wait (~25 s worst case) fits well under the
+        # _attach_acp_session timeout (120 s in _ensure_runtime_locked).
+        # Observed: under 2x concurrent test load on Daytona, the FUSE
+        # propagation can take 5-10 s; 3 attempts at 0/1/2 s wasn't enough.
+        load_err: Exception | None = None
+        # Backoff schedule (sleeps applied BEFORE each retry, not after
+        # the last). Sleeps: 0, 1, 2, 4, 6, 8 — total ~21 s before
+        # giving up. First attempt is immediate.
+        backoffs = (0.0, 1.0, 2.0, 4.0, 6.0, 8.0)
+        for attempt, sleep_before in enumerate(backoffs):
+            try:
+                if sleep_before > 0:
+                    await asyncio.sleep(sleep_before)
+                await client.handshake(acp_session_id, agent_type)
+                await client._send_rpc(acp_session_id, "session/load", {
+                    "sessionId": inner_sid,
+                    "cwd": cwd,
+                    "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
+                })
+                if attempt > 0:
+                    log.info(
+                        "session/load succeeded on retry (inner_sid=%s, "
+                        "attempt=%d) — likely volume FUSE propagation lag",
+                        inner_sid, attempt + 1,
+                    )
+                client.set_inner_session_id(acp_session_id, inner_sid)
                 try:
-                    if sleep_before > 0:
-                        await asyncio.sleep(sleep_before)
-                    await client._send_rpc(acp_session_id, "session/load", {
-                        "sessionId": inner_sid,
-                        "cwd": cwd,
-                        "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
-                    })
-                    if attempt > 0:
-                        log.info(
-                            "session/load succeeded on retry (inner_sid=%s, "
-                            "attempt=%d) — likely volume FUSE propagation lag",
-                            inner_sid, attempt + 1,
-                        )
-                    client.set_inner_session_id(acp_session_id, inner_sid)
-                    try:
-                        await client.set_mode(acp_session_id, "bypassPermissions")
-                    except Exception:
-                        pass
-                    return inner_sid, False
-                except Exception as e:
-                    load_err = e
-                    # Only retry on -32603 ("Internal error") — that's the
-                    # signature of a JSONL-not-yet-visible miss. Other
-                    # failures won't self-heal.
-                    if attempt < len(backoffs) - 1 and "32603" in repr(e):
-                        log.info(
-                            "session/load attempt %d/%d failed with %r; "
-                            "retrying after backoff (inner_sid=%s)",
-                            attempt + 1, len(backoffs), e, inner_sid,
-                        )
-                        continue
-                    break
+                    await client.set_mode(acp_session_id, "bypassPermissions")
+                except Exception:
+                    pass
+                return inner_sid, False
+            except Exception as e:
+                load_err = e
+                # Only retry on "Internal error" / -32603 — that's the
+                # signature of a transient JSONL-not-yet-visible miss. Other
+                # errors (auth, transport) won't self-heal and burning a
+                # retry on them just delays the session/new fallback.
+                if attempt < len(backoffs) - 1 and "32603" in repr(e):
+                    log.info(
+                        "session/load attempt %d/%d failed with %r; "
+                        "retrying after backoff (inner_sid=%s)",
+                        attempt + 1, len(backoffs), e, inner_sid,
+                    )
+                    continue
+                break
 
-            log.warning(
-                "session/load failed (inner_sid=%s, cwd=%s): %r — "
-                "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
-                inner_sid, cwd, load_err,
-            )
+        log.warning(
+            "session/load failed (inner_sid=%s, cwd=%s): %r — "
+            "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
+            inner_sid, cwd, load_err,
+        )
 
     # Genuinely fresh (no inner_sid) or load failed — start a new session.
     await _apply_config_and_initialize(
