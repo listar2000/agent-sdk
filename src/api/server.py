@@ -303,6 +303,40 @@ _SSE_MAX_IDLE_RETRIES = int(os.environ.get("SSE_MAX_IDLE_RETRIES", "2"))
 _SSE_READ_TIMEOUT_S = float(os.environ.get("SSE_READ_TIMEOUT", "60"))
 
 
+def _compute_supervisor_version() -> str:
+    """Short hash of supervisor.js content. Used to invalidate the per-volume
+    install cache when the supervisor source changes — without this, an updated
+    supervisor.js (e.g., the agent_memory.tar visibility-poll fix) wouldn't be
+    re-deployed to volumes whose ``supervisor_agent_types`` cache already lists
+    the agent_type. Auto-deploys on next server restart, no manual DB write."""
+    try:
+        sup_path = Path(__file__).resolve().parents[1] / "supervisor" / "supervisor.js"
+        return hashlib.sha256(sup_path.read_bytes()).hexdigest()[:8]
+    except Exception:
+        # If supervisor.js is somehow missing (test stubs, packaging quirks),
+        # fall back to a placeholder so the cache key remains stable. The
+        # fast path will then always treat the cache as authoritative.
+        return "unknown"
+
+
+_SUPERVISOR_VERSION = _compute_supervisor_version()
+
+
+def _versioned_agent_type(agent_type: str) -> str:
+    """Cache key combining agent_type with the current supervisor.js hash.
+
+    A bare ``agent_type`` (e.g., ``"claude"``) cached under an older
+    supervisor.js would silently keep stale logic on the volume forever.
+    Including the hash means the install_supervisor cache is implicitly
+    invalidated whenever supervisor.js changes — a future call to
+    ``ensure_volume_supervisor`` for the same agent_type sees a different
+    cache key, falls through to install, and writes the new versioned
+    key on success.
+    """
+    return f"{agent_type}@{_SUPERVISOR_VERSION}"
+
+
+
 async def _hibernate_session(state: SessionState) -> None:
     """Stop the sandbox compute, then either keep ``SessionState`` for a
     fast UI resume or evict it if no UI is watching.
@@ -2934,13 +2968,19 @@ async def _provision_with_cache_retry(cache_key, fn, /, *args, **kwargs):
     except RuntimeError as e:
         if not any(marker in str(e) for marker in _STALE_CACHE_MARKERS):
             raise
-        log.warning("stale-cache on volume %s agent=%s: %s — reinstalling",
-                    vol_id, agent_type, e)
+        # Clear the cache entry for the CURRENT supervisor version so
+        # ensure_volume_supervisor falls through to install on the retry.
+        # If the cache somehow still holds an older versioned key, leave
+        # it alone — it's already invalid (won't match the live cache_key)
+        # and a future install will overwrite it.
+        versioned = _versioned_agent_type(agent_type)
+        log.warning("stale-cache on volume %s agent=%s (key=%s): %s — reinstalling",
+                    vol_id, agent_type, versioned, e)
         async with get_db() as conn:
             await conn.execute(
                 "UPDATE volumes SET supervisor_agent_types = "
                 "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
-                (agent_type, vol_id),
+                (versioned, vol_id),
             )
         await ensure_volume_supervisor(vol_id, agent_type)
         return await fn(*args, **kwargs)
@@ -2986,16 +3026,21 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     semantics.  Acceptable because the alternative is holding a pool
     connection for minutes, which is more expensive operationally.
     """
+    # Cache key is versioned by supervisor.js content hash so a stale entry
+    # under a prior version (e.g., before the agent_memory.tar visibility-poll
+    # fix) doesn't keep the old logic pinned on the volume.
+    cache_key = _versioned_agent_type(agent_type)
+
     # Fast path (no lock): check cache — 99% of calls hit this.
     vol = await get_volume(volume_id)
     if vol is None:
         raise HTTPException(500, f"Volume {volume_id} not found")
-    if agent_type in (vol.supervisor_agent_types or []):
-        return  # already installed
+    if cache_key in (vol.supervisor_agent_types or []):
+        return  # already installed at this supervisor version
 
     # Compute a stable positive 63-bit key (pg advisory locks take a bigint;
     # mask off the sign bit for safety).
-    digest = hashlib.sha256(f"{volume_id}\0{agent_type}".encode()).digest()
+    digest = hashlib.sha256(f"{volume_id}\0{cache_key}".encode()).digest()
     lock_key = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
     # Step 1 + 2: double-check cache, then acquire a session-scoped advisory
@@ -3011,7 +3056,7 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
         if row is None:
             raise HTTPException(500, f"Volume {volume_id} not found")
         installed = list(row.get("supervisor_agent_types") or [])
-        if agent_type in installed:
+        if cache_key in installed:
             return
         provider = row["provider"]
         provider_ref = row["provider_ref"]
@@ -3048,11 +3093,11 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
                 (volume_id,),
             )).fetchone()
             installed2 = list((row2 or {}).get("supervisor_agent_types") or [])
-            if agent_type in installed2:
+            if cache_key in installed2:
                 return
 
             log.info("ensure_volume_supervisor: installing %s on volume %s",
-                     agent_type, volume_id)
+                     cache_key, volume_id)
             # Step 4: slow provider call with the connection in autocommit (not
             # in a transaction) so idle-in-transaction timers don't fire.
             await _providers_mod.install_supervisor(provider, provider_ref, agent_type)
@@ -3061,10 +3106,10 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
                 "UPDATE volumes SET supervisor_agent_types = "
                 "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
                 "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
-                (agent_type, volume_id, agent_type),
+                (cache_key, volume_id, cache_key),
             )
             log.info("ensure_volume_supervisor: done installing %s on volume %s",
-                     agent_type, volume_id)
+                     cache_key, volume_id)
         finally:
             # Release the advisory lock explicitly — a failure here is survivable
             # (the lock auto-releases on connection close).
