@@ -90,6 +90,7 @@ async def test_volume_rename_no_overwrite_uses_link_unlink(monkeypatch):
     assert "rm --" in cmd
     assert "mv --" not in cmd
     assert "__EXISTS__" in cmd
+    assert "__RENAME_NOT_VISIBLE__" in cmd
     assert "/v/shared/a.txt" in cmd
     assert "/v/shared/sub/b.txt" in cmd
 
@@ -107,3 +108,15 @@ async def test_volume_rename_no_overwrite_exists_maps_to_error(monkeypatch):
             "vol-ref", "shared/a.txt", "shared/sub/b.txt", overwrite=False,
         )
     assert exc.value.path == "shared/sub/b.txt"
+
+
+@pytest.mark.asyncio
+async def test_volume_rename_postcondition_failure_maps_to_runtime_error(monkeypatch):
+    from api.providers import daytona
+
+    async def fake_run(_ref: str, _cmd: str, timeout: int = 30):
+        return SimpleNamespace(stdout="__RENAME_NOT_VISIBLE__", stderr="", exit_code=98)
+
+    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
+    with pytest.raises(RuntimeError, match="postcondition failed"):
+        await daytona.volume_rename("vol-ref", "shared/a.txt", "shared/sub/b.txt")
