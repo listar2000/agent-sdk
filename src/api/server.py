@@ -16,6 +16,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -840,12 +841,111 @@ async def _recover_after_disconnect(state: SessionState) -> bool:
         return False
 
 
+@dataclass
+class _SseDisconnectInfo:
+    """Result of one upstream SSE connection attempt.
+
+    ``connected_successfully`` is True iff we got past raise_for_status and
+    started reading chunks (regardless of whether drain later errored). Used
+    by the outer loop to reset the retry budget — a 30-second drain followed
+    by a transient error counts as "had one good connection," not "20 bad
+    attempts."
+    """
+    reason: str                       # "upstream_eof" or "ExceptionType: msg"
+    connected_successfully: bool
+    supervisor_dead: bool             # cheap port-based fast-fail signal
+
+
+async def _sse_reader_connect_and_drain(
+    state: SessionState,
+    attempt: int,
+    text_parts: list[str],
+    thinking_parts: list[str],
+) -> _SseDisconnectInfo:
+    """Open one upstream stream and drain it. Returns when the stream ends.
+
+    CancelledError propagates to the caller; the outer reader's try/finally
+    is the single owner of cancellation cleanup.
+    """
+    reader_buffer = ""
+    disconnect_reason = "upstream_eof"
+    connected = False
+    sse_http = httpx.AsyncClient(
+        base_url=state.client.base_url, timeout=None, proxy=None,
+    )
+    try:
+        try:
+            headers = {"Accept": "text/event-stream"}
+            if state.last_event_id:
+                headers["Last-Event-ID"] = state.last_event_id
+            log.info("[SSE-READER] connecting upstream stream for session %s "
+                     "(attempt=%d, last_event_id=%s)",
+                     state.session_id, attempt, state.last_event_id or "-")
+            async with sse_http.stream(
+                "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
+            ) as resp:
+                resp.raise_for_status()
+                connected = True
+                state._reader_connected = True
+                log.info("[SSE-READER] upstream stream connected for session %s "
+                         "(attempt=%d, status=%d)",
+                         state.session_id, attempt, resp.status_code)
+                async for chunk in resp.aiter_text():
+                    if state.shutdown.is_set():
+                        log.info("[SSE-READER] session %s shutting down; "
+                                 "exiting drain", state.session_id)
+                        break
+                    reader_buffer += chunk
+                    while "\n\n" in reader_buffer:
+                        block, reader_buffer = reader_buffer.split("\n\n", 1)
+                        _broadcast_one_block(
+                            state, block, parse_sse_data(block),
+                            text_parts, thinking_parts,
+                        )
+        except asyncio.CancelledError:
+            log.info("[SSE-READER] reader task cancelled for session %s",
+                     state.session_id)
+            raise
+        except Exception as e:
+            disconnect_reason = f"{type(e).__name__}: {e}"
+            log.warning("[SSE-READER] upstream reader error for session %s "
+                        "on attempt %d: %s",
+                        state.session_id, attempt, disconnect_reason)
+        else:
+            log.warning("[SSE-READER] upstream stream ended for session %s "
+                        "on attempt %d without an exception",
+                        state.session_id, attempt)
+    finally:
+        state._reader_connected = False
+        try:
+            await sse_http.aclose()
+        except Exception:
+            pass
+
+    # Fast-fail on confirmed-dead supervisors: port-based providers expose a
+    # subprocess we can cheaply check, so we can skip the full retry ladder
+    # (~35s of backoff) when the supervisor is definitely gone.
+    cached_inst = _INSTANCES.get(state.sandbox_id)
+    supervisor_dead = (
+        cached_inst is not None
+        and cached_inst.process is not None
+        and not _instance_process_alive(cached_inst)
+    )
+    return _SseDisconnectInfo(
+        reason=disconnect_reason,
+        connected_successfully=connected,
+        supervisor_dead=supervisor_dead,
+    )
+
+
 def _start_sse_reader(state: SessionState) -> None:
     """Start a background task that reads SSE from the upstream /v1/acp/{id}
     endpoint and broadcasts chunks to subscriber queues. Called at session
     creation so events are captured before any prompt is sent.
 
-    Works with the supervisor which exposes the POST+SSE JSON-RPC surface.
+    The reader's recovery state machine (retry, recover, give-up) is
+    expressed at the top of ``_reader``; the per-connection mechanics live
+    in ``_sse_reader_connect_and_drain``.
     """
     if state._reader_alive:
         log.info("[SSE-READER] start requested but reader already alive for session %s",
@@ -865,89 +965,34 @@ def _start_sse_reader(state: SessionState) -> None:
         attempt = 0
         try:
             while not state.shutdown.is_set():
-                reader_buffer = ""
-                sse_http = None
-                disconnect_reason = "upstream_eof"
-                try:
-                    attempt += 1
-                    headers = {"Accept": "text/event-stream"}
-                    if state.last_event_id:
-                        headers["Last-Event-ID"] = state.last_event_id
-                    log.info("[SSE-READER] connecting upstream stream for session %s "
-                             "(attempt=%d, last_event_id=%s)",
-                             state.session_id, attempt, state.last_event_id or "-")
-                    sse_http = httpx.AsyncClient(
-                        base_url=state.client.base_url, timeout=None, proxy=None,
-                    )
-                    async with sse_http.stream(
-                        "GET", f"/v1/acp/{state.acp_session_id}", headers=headers,
-                    ) as resp:
-                        resp.raise_for_status()
-                        reconnect_delay_s = 1.0
-                        attempt = 0
-                        state._reader_connected = True
-                        log.info("[SSE-READER] upstream stream connected for session %s "
-                                 "(attempt=%d, status=%d)",
-                                 state.session_id, attempt, resp.status_code)
-                        async for chunk in resp.aiter_text():
-                            if state.shutdown.is_set():
-                                log.info("[SSE-READER] session %s shutting down; "
-                                         "exiting reader loop", state.session_id)
-                                return
-                            reader_buffer += chunk
-                            while "\n\n" in reader_buffer:
-                                block, reader_buffer = reader_buffer.split("\n\n", 1)
-                                _broadcast_one_block(
-                                    state, block, parse_sse_data(block),
-                                    text_parts, thinking_parts,
-                                )
-                except asyncio.CancelledError:
-                    log.info("[SSE-READER] reader task cancelled for session %s",
-                             state.session_id)
-                    raise
-                except Exception as e:
-                    disconnect_reason = f"{type(e).__name__}: {e}"
-                    log.warning("[SSE-READER] upstream reader error for session %s "
-                                "on attempt %d: %s",
-                                state.session_id, attempt, disconnect_reason)
-                else:
-                    log.warning("[SSE-READER] upstream stream ended for session %s "
-                                "on attempt %d without an exception",
-                                state.session_id, attempt)
-                finally:
-                    state._reader_connected = False
-                    if sse_http is not None:
-                        try:
-                            await sse_http.aclose()
-                        except Exception:
-                            pass
+                attempt += 1
+                info = await _sse_reader_connect_and_drain(
+                    state, attempt, text_parts, thinking_parts,
+                )
+                if info.connected_successfully:
+                    # Successful connect resets the retry budget for the
+                    # next failure — the original code did this inline at
+                    # the top of the stream block (line ~887 of the old
+                    # version), so a 30-second healthy drain followed by a
+                    # transient drop counts as one fresh attempt, not N.
+                    attempt = 0
+                    reconnect_delay_s = 1.0
 
                 if state.shutdown.is_set():
                     return
 
-                # Fast-fail on confirmed-dead supervisors: for port-based
-                # providers we can cheaply check the subprocess in _INSTANCES
-                # and skip the full exponential-backoff ladder (~35s) when
-                # the supervisor is definitely gone.
-                cached_inst = _INSTANCES.get(state.sandbox_id)
-                supervisor_dead = (
-                    cached_inst is not None
-                    and cached_inst.process is not None
-                    and not _instance_process_alive(cached_inst)
-                )
-
                 if (_sse_reader_disconnect_is_recoverable(state)
                         and attempt <= _SSE_MAX_IDLE_RETRIES
-                        and not supervisor_dead):
+                        and not info.supervisor_dead):
                     log.warning("[SSE-READER] recoverable upstream disconnect for "
                                 "session %s (%s); reconnecting in %.1fs (attempt %d/%d)",
-                                state.session_id, disconnect_reason,
+                                state.session_id, info.reason,
                                 reconnect_delay_s, attempt, _SSE_MAX_IDLE_RETRIES)
                     await asyncio.sleep(reconnect_delay_s)
                     reconnect_delay_s = min(reconnect_delay_s * 2, 10.0)
                     continue
 
-                if supervisor_dead:
+                if info.supervisor_dead:
                     log.info(
                         "[SSE-READER] supervisor process dead for session %s — "
                         "skipping retry ladder, going straight to sandbox recovery",
@@ -955,7 +1000,7 @@ def _start_sse_reader(state: SessionState) -> None:
                     )
 
                 # Retries exhausted — try to recover the sandbox before giving up.
-                if not state.shutdown.is_set() and await _recover_after_disconnect(state):
+                if await _recover_after_disconnect(state):
                     attempt = 0
                     reconnect_delay_s = 1.0
                     continue
@@ -963,7 +1008,7 @@ def _start_sse_reader(state: SessionState) -> None:
                 log.warning(
                     "[SSE-READER] unrecoverable upstream disconnect for session %s (%s) "
                     "(shutdown=%s, agent_busy=%s, pending=%d, in_SESSIONS=%s)",
-                    state.session_id, disconnect_reason, state.shutdown.is_set(),
+                    state.session_id, info.reason, state.shutdown.is_set(),
                     state.agent_busy, len(state.pending_prompts),
                     state.session_id in SESSIONS,
                 )
