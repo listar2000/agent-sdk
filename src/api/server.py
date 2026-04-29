@@ -335,6 +335,7 @@ async def _hibernate_session(state: SessionState) -> None:
     # Drop the in-process instance entry AFTER provider stop / DB flip so a
     # crash mid-stop leaves enough state for reconcile to find the container.
     _INSTANCES.pop(sandbox_id, None)
+    state.lifecycle = "hibernated"
 
     # Return the per-session supervisor port to the per-sandbox allocator
     # (provider-agnostic). Today only daytona allocates one; others run a
@@ -371,14 +372,6 @@ async def _hibernate_session(state: SessionState) -> None:
         await _shutdown_session_state(state, remove=True, force=True)
 
 
-def _is_hibernated(state: SessionState) -> bool:
-    """A session is hibernated when its sandbox has no live in-process
-    instance. ``_hibernate_session`` pops ``_INSTANCES``; ``_rebind_state``
-    repopulates it on resume — so this single check captures both.
-    """
-    return state.sandbox_id not in _INSTANCES
-
-
 async def _maybe_evict_hibernated(state: SessionState) -> None:
     """If a hibernated session has lost its last subscriber, fully evict
     the in-memory ``SessionState``.
@@ -395,12 +388,12 @@ async def _maybe_evict_hibernated(state: SessionState) -> None:
         return
     if state.shutdown.is_set():
         return  # already torn down
-    if not _is_hibernated(state):
+    if not state.is_hibernated:
         return  # sandbox is still up — keep state for the running session
     async with _get_session_lock(state.session_id):
         # Re-check under lock: a new /events handler may have subscribed,
         # or a /message may have woken the sandbox between our checks.
-        if state._session_subscribers or not _is_hibernated(state):
+        if state._session_subscribers or not state.is_hibernated:
             return
         if state.active_rpc_id is not None or state.pending_prompts:
             return
@@ -449,7 +442,7 @@ async def _reap_one_tick(now: float) -> None:
                 continue
             if state.active_rpc_id is not None or state.pending_prompts:
                 continue
-            if state.sandbox_id in _INSTANCES:
+            if not state.is_hibernated:
                 # Running session: hibernate compute. _hibernate_session
                 # also evicts state inline if no subscribers are attached.
                 log.info(
@@ -787,6 +780,7 @@ async def _rebind_state(state: SessionState, sandbox_record: SandboxRecord) -> N
     state.acp_session_id = new_acp_session_id
     state.inner_session_id = new_inner_sid
     state.last_event_id = None  # old cursor is meaningless on the new session
+    state.lifecycle = "live"
     # Close the old client in the background — the next turn doesn't need
     # to wait for the TCP teardown.
     if old_client is not None:

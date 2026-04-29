@@ -118,6 +118,9 @@ class VolumeRecord:
     supervisor_agent_types: list[str] = field(default_factory=list)
 
 
+SessionLifecycle = Literal["live", "hibernated"]
+
+
 @dataclass
 class SessionState:
     """In-memory runtime state binding an agent to a sandbox."""
@@ -128,6 +131,12 @@ class SessionState:
     inner_session_id: str | None = None
     agent_type: str = "claude"  # claude | codex (selects ProviderAdapter)
     client: object | None = None  # AcpClient, typed loosely to avoid circular import
+    # Hibernation is now explicit state. The two writers below keep this
+    # in sync with _INSTANCES on the server side: _hibernate_session flips
+    # to "hibernated" right after popping _INSTANCES; _rebind_state flips
+    # back to "live" right after repopulating it. New sessions are "live"
+    # by default since both construction sites are post-supervisor-attach.
+    lifecycle: SessionLifecycle = "live"
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     last_event_id: str | None = None  # SSE cursor — skip events before this ID
     last_activity: float = field(default_factory=time.time)
@@ -172,6 +181,10 @@ class SessionState:
     @property
     def agent_busy(self) -> bool:
         return self.active_rpc_id is not None
+
+    @property
+    def is_hibernated(self) -> bool:
+        return self.lifecycle == "hibernated"
 
     # ── Session-scoped subscribers (receive all events) ──
 
