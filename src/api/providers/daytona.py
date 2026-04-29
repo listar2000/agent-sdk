@@ -79,6 +79,47 @@ _DAYTONA_VOLUME_MOUNT = "/vol"
 _SNAPSHOT_PATH = f"{_DAYTONA_VOLUME_MOUNT}/snapshot.tar"
 
 
+# Labels stamped on every Daytona sandbox we create. Two purposes:
+#
+#   • Identify orphans for cleanup. Tests routinely create sandboxes that
+#     can't all be torn down on every failure path — set
+#     ``AGENT_SDK_ORIGIN=test`` (e.g., in conftest.py or pytest env) and
+#     a future ``daytona.list(labels={"agent_sdk_origin": "test"})``
+#     finds exactly the test-origin orphans without needing to enumerate
+#     the whole shared account. Production sandboxes default to
+#     ``"production"`` so the same query never touches them.
+#
+#   • Provenance in the Daytona dashboard — every sandbox shows
+#     ``agent_sdk=1`` and ``agent_sdk_purpose`` so an operator opening
+#     the UI can tell at a glance which sandboxes belong to which path
+#     (per-session compute, supervisor install, volume maintenance) and
+#     correlate by ``agent_sdk_sandbox_id`` back to the agent-sdk DB row.
+#
+# Keep the keyspace stable — cleanup scripts and dashboards key off
+# these exact strings.
+_LABEL_AGENT_SDK = "agent_sdk"
+_LABEL_ORIGIN = "agent_sdk_origin"
+_LABEL_PURPOSE = "agent_sdk_purpose"
+_LABEL_SANDBOX_ID = "agent_sdk_sandbox_id"
+
+
+def _sandbox_labels(purpose: str, sandbox_id: str | None = None) -> dict[str, str]:
+    """Build the label dict for a Daytona sandbox we're about to create.
+
+    ``purpose`` is one of ``"session"``, ``"install"``, ``"volume-op"``.
+    ``sandbox_id`` is the agent-sdk DB row id (only meaningful for
+    ``"session"``).
+    """
+    labels = {
+        _LABEL_AGENT_SDK: "1",
+        _LABEL_ORIGIN: os.environ.get("AGENT_SDK_ORIGIN", "production"),
+        _LABEL_PURPOSE: purpose,
+    }
+    if sandbox_id:
+        labels[_LABEL_SANDBOX_ID] = sandbox_id
+    return labels
+
+
 def _get_daytona_client():
     """Get a Daytona SDK client. Raises ImportError or RuntimeError on failure."""
     from daytona_sdk import Daytona, DaytonaConfig
@@ -320,6 +361,8 @@ async def provision_daytona_sandbox(
     volume_id: str | None = None,
     subpath: str | None = None,
     shared_mounts: list[str] | None = None,
+    sandbox_id: str | None = None,
+    purpose: str = "session",
 ) -> ProviderInstance:
     """Create a Daytona sandbox with 3 volume mounts, but do NOT install deps
     or start a supervisor (those are handled by ensure_volume_supervisor and
@@ -360,19 +403,20 @@ async def provision_daytona_sandbox(
     create_timeout = 300 if dockerfile else 60
 
     volumes = _build_volume_mounts(volume_id, subpath, shared_mounts)
+    labels = _sandbox_labels(purpose, sandbox_id=sandbox_id)
 
     if use_snapshot:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes,
+                volumes=volumes, labels=labels,
             ), timeout=create_timeout,
         ))
     else:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromImageParams(
                 image=image, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes,
+                volumes=volumes, labels=labels,
             ), timeout=create_timeout,
         ))
 
@@ -672,12 +716,14 @@ async def _init_volume_dirs(volume_ref: str) -> None:
 
     # Mount the whole volume at /v (no subpath) so we can create dirs.
     volumes = [VolumeMount(volume_id=volume_ref, mount_path="/v")]
+    init_labels = _sandbox_labels("volume-op")
 
     if use_snapshot:
         sb = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot, auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=init_labels,
             ), timeout=120,
         ))
     else:
@@ -685,6 +731,7 @@ async def _init_volume_dirs(volume_ref: str) -> None:
             CreateSandboxFromImageParams(
                 image="node:22-slim", auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=init_labels,
             ), timeout=120,
         ))
 
@@ -855,12 +902,14 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
 
     # Mount whole system/ so staging + final share the mount and mv can rename.
     volumes = [VolumeMount(volume_id=volume_ref, mount_path="/work", subpath="system")]
+    install_labels = _sandbox_labels("install")
 
     if use_snapshot:
         sb = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot, auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=install_labels,
             ), timeout=120,
         ))
     else:
@@ -868,6 +917,7 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
             CreateSandboxFromImageParams(
                 image="node:22-slim", auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=install_labels,
             ), timeout=120,
         ))
 
@@ -975,7 +1025,7 @@ async def create_sandbox(
     root: str | None = None,
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
-    sandbox_id: str | None = None,  # accepted for parity; daytona has no labels
+    sandbox_id: str | None = None,  # forwarded into the sandbox's labels
     shared_mounts: list[str] | None = None,
 ) -> ProviderInstance:
     """Uniform ``create_sandbox`` for the Daytona provider.
@@ -985,9 +1035,12 @@ async def create_sandbox(
     shared mounts) but does NOT start a supervisor; the caller must run
     ``ensure_supervisor_url`` before talking to the supervisor.
 
-    ``spawn_env`` / ``port`` / ``sandbox_id`` are accepted for parity with
-    docker/local but are unused here — the supervisor is started later with
-    its own env + port, and Daytona has no container-label concept.
+    ``spawn_env`` / ``port`` are accepted for parity with docker/local but
+    are unused here — the supervisor is started later with its own env +
+    port. ``sandbox_id`` IS used: it lands in the Daytona sandbox's
+    ``agent_sdk_sandbox_id`` label so an operator can correlate a Daytona
+    dashboard entry back to the agent-sdk DB row, and so a cleanup script
+    can target a specific orphan by id.
     """
     # Per-session sandboxes always root at /home/daytona — the supervisor
     # will mkdir it, restore from the volume snapshot, and use it as HOME.
@@ -1002,6 +1055,8 @@ async def create_sandbox(
         volume_id=volume_ref,
         subpath=subpath,
         shared_mounts=shared_mounts,
+        sandbox_id=sandbox_id,
+        purpose="session",
     )
 
 
@@ -1045,6 +1100,7 @@ async def _get_or_create_utility(ref: str) -> "ProviderInstance":
         log.info("daytona utility sandbox: provisioning for volume %s", ref[:16])
         inst = await provision_daytona_sandbox(
             agent_type="claude", volume_id=ref, subpath=None,
+            purpose="volume-op",
         )
         _utility_cache[ref] = (inst, _time.monotonic())
         _ensure_utility_reaper()
