@@ -469,11 +469,53 @@ async def _reap_one_tick(now: float) -> None:
             # /events finally → _maybe_evict_hibernated handles eviction.
 
 
+def _sweep_session_locks() -> int:
+    """Drop ``_session_locks`` entries for sessions no longer in SESSIONS,
+    provided the lock is fully idle.
+
+    The existing comment at ``_shutdown_session_state`` justifies *not*
+    popping locks at session-evict time: a concurrent ``_ensure_runtime_locked``
+    that's mid-acquire on the same session_id would otherwise see a fresh
+    Lock from ``_get_session_lock(sid).setdefault`` and run in parallel with
+    the original holder. We preserve that invariant here by sweeping ONLY
+    when the lock is unlocked AND has no waiters — at that point no caller
+    holds a stale reference, so a future ``_get_session_lock(sid)`` minting
+    a new Lock cannot race.
+
+    ``asyncio.Lock._waiters`` is CPython-internal but stable (it's a
+    ``collections.deque`` of suspended ``acquire`` futures). The alternative
+    — bookkeeping a "last touched" timestamp at every acquire — is hotter
+    than this once-per-reaper-tick sweep.
+    """
+    if not _session_locks:
+        return 0
+    pruned = 0
+    for sid in list(_session_locks):
+        if sid in SESSIONS:
+            continue
+        lock = _session_locks.get(sid)
+        if lock is None or lock.locked():
+            continue
+        if getattr(lock, "_waiters", None):
+            continue
+        # Re-check under the same tick — a concurrent /sessions create may
+        # have just landed an entry into SESSIONS.
+        if sid in SESSIONS:
+            continue
+        if _session_locks.pop(sid, None) is not None:
+            pruned += 1
+    return pruned
+
+
 async def _idle_reaper():
     """Background task: close idle sessions that have been inactive too long."""
     while True:
         await asyncio.sleep(REAPER_TICK_S)
         await _reap_one_tick(time.time())
+        pruned = _sweep_session_locks()
+        if pruned:
+            log.info("idle reaper: pruned %d cold session_locks (now %d)",
+                     pruned, len(_session_locks))
 
 
 @asynccontextmanager
