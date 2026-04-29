@@ -134,8 +134,10 @@ async def start_supervisor_in_sandbox(
         existing = await loop.run_in_executor(None, lambda: _exec(
             # `-m 2` request-timeout, `-o /dev/null -w '%{http_code}'`
             # prints just the status line so we can string-match cheaply.
+            # NOTE: supervisor exposes /v1/health (matches _wait_for_health
+            # in providers/_shared.py), not /healthz.
             f"curl -s -m 2 -o /dev/null -w '%{{http_code}}' "
-            f"http://127.0.0.1:{port}/healthz 2>/dev/null || echo 000",
+            f"http://127.0.0.1:{port}/v1/health 2>/dev/null || echo 000",
             10,
         ))
     except Exception as e:
