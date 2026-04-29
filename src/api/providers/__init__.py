@@ -33,6 +33,7 @@ from ._shared import (
     ProviderInstance,
     ExecResult,
     SandboxMissingError,
+    VolumeFileExistsError,
     default_cwd_for_provider,
     _ACP_BIN_NAMES,
     _ACP_NPM_SPECS,
@@ -206,7 +207,7 @@ _DISPATCH_FNS = frozenset({
     "create_volume", "delete_volume", "get_sandbox_status",
     "start_sandbox", "destroy_sandbox", "stop_sandbox",
     "ensure_supervisor_url", "install_supervisor",
-    "volume_tree", "volume_read", "volume_download", "volume_write",
+    "volume_tree", "volume_read", "volume_download", "volume_exists", "volume_write",
     "volume_upload", "volume_mkdir", "volume_delete", "volume_rename",
 })
 

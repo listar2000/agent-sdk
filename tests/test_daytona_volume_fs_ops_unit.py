@@ -67,3 +67,43 @@ async def test_volume_rename_creates_parent_and_moves(monkeypatch):
     assert "mv --" in cmd
     assert "/v/shared/a.txt" in cmd
     assert "/v/shared/sub/b.txt" in cmd
+
+
+@pytest.mark.asyncio
+async def test_volume_rename_no_overwrite_uses_link_unlink(monkeypatch):
+    from api.providers import daytona
+
+    calls: list[str] = []
+
+    async def fake_run(_ref: str, cmd: str, timeout: int = 30):
+        calls.append(cmd)
+        return SimpleNamespace(stdout="", stderr="", exit_code=0)
+
+    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
+    await daytona.volume_rename(
+        "vol-ref", "shared/a.txt", "shared/sub/b.txt", overwrite=False,
+    )
+
+    assert calls
+    cmd = calls[0]
+    assert "ln " in cmd
+    assert "rm --" in cmd
+    assert "mv --" not in cmd
+    assert "__EXISTS__" in cmd
+    assert "/v/shared/a.txt" in cmd
+    assert "/v/shared/sub/b.txt" in cmd
+
+
+@pytest.mark.asyncio
+async def test_volume_rename_no_overwrite_exists_maps_to_error(monkeypatch):
+    from api.providers import VolumeFileExistsError, daytona
+
+    async def fake_run(_ref: str, _cmd: str, timeout: int = 30):
+        return SimpleNamespace(stdout="__EXISTS__", stderr="", exit_code=17)
+
+    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
+    with pytest.raises(VolumeFileExistsError) as exc:
+        await daytona.volume_rename(
+            "vol-ref", "shared/a.txt", "shared/sub/b.txt", overwrite=False,
+        )
+    assert exc.value.path == "shared/sub/b.txt"

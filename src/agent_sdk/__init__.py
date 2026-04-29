@@ -12,7 +12,8 @@ from .client import (
 )
 from .errors import (
     AgentSDKError, AgentConnectionError, AgentNotRegisteredError,
-    SandboxError, AgentBusyError, AgentTimeoutError, PromptError, StreamError,
+    SandboxError, VolumeFileExistsError, AgentBusyError, AgentTimeoutError,
+    PromptError, StreamError,
 )
 from .persist import SessionRecord, SqliteSessionDriver
 from .server_client import ServerClient
@@ -26,7 +27,7 @@ __all__ = [
     "CLAUDE", "CODEX", "OPENCODE", "GEMINI", "CLINE", "DEEPAGENTS", "OPENHANDS", "GOOSE", "AGENT_TYPES",
     "LOCAL", "DOCKER", "DAYTONA", "PROVIDERS",
     "AgentSDKError", "AgentConnectionError", "AgentNotRegisteredError",
-    "SandboxError", "AgentBusyError", "AgentTimeoutError", "PromptError", "StreamError",
+    "SandboxError", "VolumeFileExistsError", "AgentBusyError", "AgentTimeoutError", "PromptError", "StreamError",
     "SessionRecord",
     "SqliteSessionDriver",
     "ServerClient",
