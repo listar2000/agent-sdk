@@ -9,6 +9,12 @@ docker/local/modal follow.
 """
 from .daytona import DaytonaSandboxSession
 from .docker import DockerSandboxSession
+from .modal import ModalSandboxSession
 from .unix_local import UnixLocalSandboxSession
 
-__all__ = ["DaytonaSandboxSession", "DockerSandboxSession", "UnixLocalSandboxSession"]
+__all__ = [
+    "DaytonaSandboxSession",
+    "DockerSandboxSession",
+    "ModalSandboxSession",
+    "UnixLocalSandboxSession",
+]
