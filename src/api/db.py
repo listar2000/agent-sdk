@@ -265,6 +265,103 @@ _MIGRATIONS = [
     # from agent.config.skills at recovery time.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pre_start_commands"
     " JSONB NOT NULL DEFAULT '[]'::jsonb",
+    # 2026-04-29: phase 1 of the ephemeral-sandbox refactor (see
+    # docs/ephemeral-sandbox-design.md). Adds sessions.sandbox_state JSONB +
+    # triggers that maintain it from sandboxes/agents/sessions rows. Dual-write
+    # only — no reads change. Phase 2 makes sandbox_state the source of truth;
+    # phase 3 drops the sandboxes table and these triggers.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_state JSONB",
+    """CREATE OR REPLACE FUNCTION _ephemeral_compute_sandbox_state(
+           sb_id TEXT, agent_id_in TEXT, pre_start_in JSONB
+       ) RETURNS JSONB AS $$
+       DECLARE
+           sb RECORD;
+           agent_type TEXT;
+       BEGIN
+           SELECT a.config->>'agent_type' INTO agent_type
+               FROM agents a WHERE a.id = agent_id_in;
+           IF sb_id IS NULL THEN
+               RETURN jsonb_build_object(
+                   'type',             'unknown',
+                   'sandbox_id',       NULL,
+                   'snapshot_path',    NULL,
+                   'snapshot_version', 0,
+                   'listen_port',      NULL,
+                   'recipe', jsonb_build_object(
+                       'dockerfile',          NULL,
+                       'shared_mounts',       '[]'::jsonb,
+                       'root',                NULL,
+                       'agent_type',          COALESCE(agent_type, 'claude'),
+                       'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
+                   )
+               );
+           END IF;
+           SELECT * INTO sb FROM sandboxes WHERE id = sb_id;
+           IF NOT FOUND THEN
+               -- Sandbox row was deleted out-of-band but session still
+               -- references it; collapse to no-compute shape.
+               RETURN jsonb_build_object(
+                   'type',             'unknown',
+                   'sandbox_id',       NULL,
+                   'snapshot_path',    NULL,
+                   'snapshot_version', 0,
+                   'listen_port',      NULL,
+                   'recipe', jsonb_build_object(
+                       'dockerfile',          NULL,
+                       'shared_mounts',       '[]'::jsonb,
+                       'root',                NULL,
+                       'agent_type',          COALESCE(agent_type, 'claude'),
+                       'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
+                   )
+               );
+           END IF;
+           RETURN jsonb_build_object(
+               'type',             sb.provider,
+               'sandbox_id',       sb.sandbox_ref,
+               'snapshot_path',    NULL,
+               'snapshot_version', 0,
+               'listen_port',      sb.listen_port,
+               'recipe', jsonb_build_object(
+                   'dockerfile',          sb.dockerfile,
+                   'shared_mounts',       COALESCE(sb.shared_mounts, '[]'::jsonb),
+                   'root',                sb.root,
+                   'agent_type',          COALESCE(agent_type, 'claude'),
+                   'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
+               )
+           );
+       END $$ LANGUAGE plpgsql""",
+    """CREATE OR REPLACE FUNCTION _ephemeral_sync_sandbox_state_from_sandboxes()
+       RETURNS TRIGGER AS $$
+       BEGIN
+           UPDATE sessions s
+           SET sandbox_state = _ephemeral_compute_sandbox_state(
+               NEW.id, s.agent_id, s.pre_start_commands
+           )
+           WHERE s.current_sandbox_id = NEW.id;
+           RETURN NEW;
+       END $$ LANGUAGE plpgsql""",
+    """CREATE OR REPLACE FUNCTION _ephemeral_sync_sandbox_state_from_sessions()
+       RETURNS TRIGGER AS $$
+       BEGIN
+           NEW.sandbox_state := _ephemeral_compute_sandbox_state(
+               NEW.current_sandbox_id, NEW.agent_id, NEW.pre_start_commands
+           );
+           RETURN NEW;
+       END $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS _ephemeral_sandboxes_sync ON sandboxes",
+    """CREATE TRIGGER _ephemeral_sandboxes_sync
+       AFTER INSERT OR UPDATE ON sandboxes
+       FOR EACH ROW EXECUTE FUNCTION _ephemeral_sync_sandbox_state_from_sandboxes()""",
+    "DROP TRIGGER IF EXISTS _ephemeral_sessions_sync ON sessions",
+    """CREATE TRIGGER _ephemeral_sessions_sync
+       BEFORE INSERT OR UPDATE OF current_sandbox_id, agent_id, pre_start_commands ON sessions
+       FOR EACH ROW EXECUTE FUNCTION _ephemeral_sync_sandbox_state_from_sessions()""",
+    # One-shot backfill so existing rows aren't NULL until next write.
+    """UPDATE sessions s
+       SET sandbox_state = _ephemeral_compute_sandbox_state(
+           s.current_sandbox_id, s.agent_id, s.pre_start_commands
+       )
+       WHERE s.sandbox_state IS NULL""",
 ]
 
 
