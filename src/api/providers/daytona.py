@@ -121,6 +121,49 @@ async def start_supervisor_in_sandbox(
     def _exec(cmd: str, timeout: int = 120) -> str:
         return _run_sandbox_exec(sandbox, cmd, timeout=timeout).stdout
 
+    # (0) Idempotency fast-path: if a supervisor is already healthy on
+    # this port (left over from a prior call in the same sandbox), skip
+    # the 2-3 s extract+spawn dance and just mint a fresh signed URL
+    # pointing at it. Cuts the recovery cascade time dramatically when
+    # the SSE reader's _recover_after_disconnect fires concurrently with
+    # POST /message's _ensure_state_live → _rebind_state — both end up
+    # here under separate sandbox locks, and without this they each
+    # respawn node, churning the signed URL twice for no gain.
+    t0 = time.monotonic()
+    try:
+        existing = await loop.run_in_executor(None, lambda: _exec(
+            # `-m 2` request-timeout, `-o /dev/null -w '%{http_code}'`
+            # prints just the status line so we can string-match cheaply.
+            f"curl -s -m 2 -o /dev/null -w '%{{http_code}}' "
+            f"http://127.0.0.1:{port}/healthz 2>/dev/null || echo 000",
+            10,
+        ))
+    except Exception as e:
+        # Not fatal — fall through to the normal spawn path.
+        existing = "000"
+        log.debug("idempotency probe raised for sandbox=%s port=%d: %s",
+                  sid8, port, e)
+    _bench("idempotency_probe", t0)
+    if existing.strip() == "200":
+        t0 = time.monotonic()
+        signed = await loop.run_in_executor(
+            None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
+        )
+        _bench("mint_url_only", t0)
+        url = signed.url.rstrip("/")
+        total_dt = time.monotonic() - total_t0
+        log.info(
+            "[BENCH] daytona.start_supervisor sandbox=%s TOTAL s=%.3f "
+            "(reused-existing %s)",
+            sid8, total_dt,
+            ", ".join(f"{p}={d:.2f}" for p, d in phases),
+        )
+        log.info(
+            "supervisor on port %d already running, reusing: %s "
+            "(sandbox %s)", port, url[:60], sandbox.id[:16],
+        )
+        return url
+
     vol_tarball = f"{_SUPERVISOR_VOLUME_DIR}/deps.tar.gz"
     vol_supervisor = f"{_SUPERVISOR_VOLUME_DIR}/supervisor.js"
     local_work = f"/tmp/sup-work-{port}"
