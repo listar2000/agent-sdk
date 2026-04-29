@@ -79,6 +79,18 @@ _DAYTONA_VOLUME_MOUNT = "/vol"
 _SNAPSHOT_PATH = f"{_DAYTONA_VOLUME_MOUNT}/snapshot.tar"
 
 
+# Single label so test orphans can be identified and bulk-deleted via
+# ``daytona.list(labels={"agent_sdk_origin": "test"})``. Production
+# sandboxes default to ``"production"`` so the same query never touches
+# them. Set ``AGENT_SDK_ORIGIN=test`` in the test process before launching
+# the server.
+_LABEL_ORIGIN = "agent_sdk_origin"
+
+
+def _sandbox_labels() -> dict[str, str]:
+    return {_LABEL_ORIGIN: os.environ.get("AGENT_SDK_ORIGIN", "production")}
+
+
 def _get_daytona_client():
     """Get a Daytona SDK client. Raises ImportError or RuntimeError on failure."""
     from daytona_sdk import Daytona, DaytonaConfig
@@ -120,6 +132,51 @@ async def start_supervisor_in_sandbox(
 
     def _exec(cmd: str, timeout: int = 120) -> str:
         return _run_sandbox_exec(sandbox, cmd, timeout=timeout).stdout
+
+    # (0) Idempotency fast-path: if a supervisor is already healthy on
+    # this port (left over from a prior call in the same sandbox), skip
+    # the 2-3 s extract+spawn dance and just mint a fresh signed URL
+    # pointing at it. Cuts the recovery cascade time dramatically when
+    # the SSE reader's _recover_after_disconnect fires concurrently with
+    # POST /message's _ensure_state_live → _rebind_state — both end up
+    # here under separate sandbox locks, and without this they each
+    # respawn node, churning the signed URL twice for no gain.
+    t0 = time.monotonic()
+    try:
+        existing = await loop.run_in_executor(None, lambda: _exec(
+            # `-m 2` request-timeout, `-o /dev/null -w '%{http_code}'`
+            # prints just the status line so we can string-match cheaply.
+            # NOTE: supervisor exposes /v1/health (matches _wait_for_health
+            # in providers/_shared.py), not /healthz.
+            f"curl -s -m 2 -o /dev/null -w '%{{http_code}}' "
+            f"http://127.0.0.1:{port}/v1/health 2>/dev/null || echo 000",
+            10,
+        ))
+    except Exception as e:
+        # Not fatal — fall through to the normal spawn path.
+        existing = "000"
+        log.debug("idempotency probe raised for sandbox=%s port=%d: %s",
+                  sid8, port, e)
+    _bench("idempotency_probe", t0)
+    if existing.strip() == "200":
+        t0 = time.monotonic()
+        signed = await loop.run_in_executor(
+            None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
+        )
+        _bench("mint_url_only", t0)
+        url = signed.url.rstrip("/")
+        total_dt = time.monotonic() - total_t0
+        log.info(
+            "[BENCH] daytona.start_supervisor sandbox=%s TOTAL s=%.3f "
+            "(reused-existing %s)",
+            sid8, total_dt,
+            ", ".join(f"{p}={d:.2f}" for p, d in phases),
+        )
+        log.info(
+            "supervisor on port %d already running, reusing: %s "
+            "(sandbox %s)", port, url[:60], sandbox.id[:16],
+        )
+        return url
 
     vol_tarball = f"{_SUPERVISOR_VOLUME_DIR}/deps.tar.gz"
     vol_supervisor = f"{_SUPERVISOR_VOLUME_DIR}/supervisor.js"
@@ -240,7 +297,11 @@ async def start_supervisor_in_sandbox(
     url = signed.url.rstrip("/")
 
     t0 = time.monotonic()
-    healthy = await _wait_for_health(url, max_retries=20, interval=1)
+    # Budget covers worst-case Type 2 boot inside supervisor.js: cold
+    # snapshot poll (15 s) + agent_memory poll (15 s) + ACP child spawn
+    # (~2 s) + slack. Type 1 (warm restart, sentinel present) finishes
+    # in <2 s and exits this poll on the first probe.
+    healthy = await _wait_for_health(url, max_retries=45, interval=1)
     _bench("health_wait", t0)
     if not healthy:
         log_out = await loop.run_in_executor(None, lambda: _exec(f"tail -40 {log_file} 2>&1"))
@@ -315,19 +376,20 @@ async def provision_daytona_sandbox(
     create_timeout = 300 if dockerfile else 60
 
     volumes = _build_volume_mounts(volume_id, subpath, shared_mounts)
+    labels = _sandbox_labels()
 
     if use_snapshot:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes,
+                volumes=volumes, labels=labels,
             ), timeout=create_timeout,
         ))
     else:
         sandbox = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromImageParams(
                 image=image, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes,
+                volumes=volumes, labels=labels,
             ), timeout=create_timeout,
         ))
 
@@ -404,8 +466,11 @@ async def restart_daytona_supervisor(
     # Without this, an external stop that's still in progress makes
     # `sandbox.start()` reject with "Sandbox state change in progress",
     # which kills the fast recovery path that preserves /events
-    # subscribers. Max ~15s wait — matches Daytona's typical stop latency.
-    sandbox, state_str = await _wait_for_stable_daytona_state(daytona, daytona_sandbox_id)
+    # subscribers. Bumped from 15 s → 45 s after observing 2x concurrent
+    # load take ~30 s for Daytona's stopping→stopped transition to land.
+    sandbox, state_str = await _wait_for_stable_daytona_state(
+        daytona, daytona_sandbox_id, max_wait_s=45.0,
+    )
     if state_str not in ("started", "running"):
         log.info("starting stopped daytona sandbox %s (state=%s)",
                  daytona_sandbox_id, state_str)
@@ -627,12 +692,14 @@ async def _init_volume_dirs(volume_ref: str) -> None:
 
     # Mount the whole volume at /v (no subpath) so we can create dirs.
     volumes = [VolumeMount(volume_id=volume_ref, mount_path="/v")]
+    init_labels = _sandbox_labels()
 
     if use_snapshot:
         sb = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot, auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=init_labels,
             ), timeout=120,
         ))
     else:
@@ -640,6 +707,7 @@ async def _init_volume_dirs(volume_ref: str) -> None:
             CreateSandboxFromImageParams(
                 image="node:22-slim", auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=init_labels,
             ), timeout=120,
         ))
 
@@ -665,7 +733,21 @@ async def delete_daytona_volume(provider_ref: str) -> None:
 
 
 async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
-    """Return one of: 'running' | 'stopped' | 'missing' | 'error'."""
+    """Return one of: 'running' | 'stopped' | 'missing' | 'error'.
+
+    The caller (``_ensure_sandbox_locked``) treats ``error`` as
+    unrecoverable: it destroys the sandbox + nukes the DB row + provisions
+    a brand-new replacement (Type 2). So transitional states like
+    ``stopping`` / ``starting`` (5–30 s under load) MUST classify by their
+    target state, not as ``error`` — otherwise an in-flight stop or boot
+    that races a POST /message destroys the live sandbox the caller is
+    trying to recover.
+
+    Default for an unrecognized state is ``running`` rather than ``error``
+    for the same reason: a future Daytona state name we haven't seen yet
+    should fall through to ``_wait_for_health`` / ``start_sandbox``, not
+    to destroy + Type 2.
+    """
     try:
         client = _get_daytona_client()
         sb = await asyncio.to_thread(client.get, sandbox_ref)
@@ -676,11 +758,16 @@ async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
         return "error"
     state = (getattr(sb, "state", None) or "")
     state_str = (state.value if hasattr(state, "value") else str(state)).lower()
-    if state_str in ("started", "running"):
+    if state_str in ("started", "running", "starting",
+                     "pulling_image", "creating", "resizing"):
         return "running"
-    if state_str in ("stopped", "paused"):
+    if state_str in ("stopped", "paused", "stopping"):
         return "stopped"
-    return "error"
+    if state_str in ("destroyed", "destroying", "archived"):
+        return "missing"
+    if state_str == "error":
+        return "error"
+    return "running"
 
 
 # ---------------------------------------------------------------------------
@@ -810,12 +897,14 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
 
     # Mount whole system/ so staging + final share the mount and mv can rename.
     volumes = [VolumeMount(volume_id=volume_ref, mount_path="/work", subpath="system")]
+    install_labels = _sandbox_labels()
 
     if use_snapshot:
         sb = await loop.run_in_executor(None, lambda: daytona.create(
             CreateSandboxFromSnapshotParams(
                 snapshot=snapshot, auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=install_labels,
             ), timeout=120,
         ))
     else:
@@ -823,6 +912,7 @@ async def install_supervisor(volume_ref: str, agent_type: str) -> None:
             CreateSandboxFromImageParams(
                 image="node:22-slim", auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=install_labels,
             ), timeout=120,
         ))
 
@@ -930,7 +1020,7 @@ async def create_sandbox(
     root: str | None = None,
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
-    sandbox_id: str | None = None,  # accepted for parity; daytona has no labels
+    sandbox_id: str | None = None,  # accepted for parity; unused here
     shared_mounts: list[str] | None = None,
 ) -> ProviderInstance:
     """Uniform ``create_sandbox`` for the Daytona provider.
@@ -942,7 +1032,7 @@ async def create_sandbox(
 
     ``spawn_env`` / ``port`` / ``sandbox_id`` are accepted for parity with
     docker/local but are unused here — the supervisor is started later with
-    its own env + port, and Daytona has no container-label concept.
+    its own env + port, and Daytona doesn't take a name on create.
     """
     # Per-session sandboxes always root at /home/daytona — the supervisor
     # will mkdir it, restore from the volume snapshot, and use it as HOME.

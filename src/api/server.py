@@ -288,6 +288,54 @@ _SSE_MAX_IDLE_RETRIES = int(os.environ.get("SSE_MAX_IDLE_RETRIES", "2"))
 # and the 5-retry ladder was dominated by time wasted hammering a dead
 # daytona preview URL.
 
+# Per-stream read timeout for the upstream SSE drain. The supervisor
+# (src/supervisor/supervisor.js) sends a `: heartbeat\n\n` SSE comment
+# every SSE_HEARTBEAT_MS=25_000 ms, so under healthy operation we get a
+# chunk at least every 25 s. Without a read timeout, daytona's signed
+# preview proxy holds the TCP connection alive for ~5 minutes after the
+# supervisor inside the sandbox dies — the SSE stream looks "open" but
+# silent, and an in-flight prompt POST hangs on the same dead supervisor
+# until the proxy's idle timeout finally drops the connection. Setting
+# this to ~2x the heartbeat interval lets us declare the stream dead
+# within ~60 s instead of ~300 s, which keeps recovery within the
+# 180 s test budget for `test_session_resume_after_delete[daytona]`
+# even when the freshly-provisioned replacement sandbox dies again.
+_SSE_READ_TIMEOUT_S = float(os.environ.get("SSE_READ_TIMEOUT", "60"))
+
+
+def _compute_supervisor_version() -> str:
+    """Short hash of supervisor.js content. Used to invalidate the per-volume
+    install cache when the supervisor source changes — without this, an updated
+    supervisor.js (e.g., the agent_memory.tar visibility-poll fix) wouldn't be
+    re-deployed to volumes whose ``supervisor_agent_types`` cache already lists
+    the agent_type. Auto-deploys on next server restart, no manual DB write."""
+    try:
+        sup_path = Path(__file__).resolve().parents[1] / "supervisor" / "supervisor.js"
+        return hashlib.sha256(sup_path.read_bytes()).hexdigest()[:8]
+    except Exception:
+        # If supervisor.js is somehow missing (test stubs, packaging quirks),
+        # fall back to a placeholder so the cache key remains stable. The
+        # fast path will then always treat the cache as authoritative.
+        return "unknown"
+
+
+_SUPERVISOR_VERSION = _compute_supervisor_version()
+
+
+def _versioned_agent_type(agent_type: str) -> str:
+    """Cache key combining agent_type with the current supervisor.js hash.
+
+    A bare ``agent_type`` (e.g., ``"claude"``) cached under an older
+    supervisor.js would silently keep stale logic on the volume forever.
+    Including the hash means the install_supervisor cache is implicitly
+    invalidated whenever supervisor.js changes — a future call to
+    ``ensure_volume_supervisor`` for the same agent_type sees a different
+    cache key, falls through to install, and writes the new versioned
+    key on success.
+    """
+    return f"{agent_type}@{_SUPERVISOR_VERSION}"
+
+
 
 async def _hibernate_session(state: SessionState) -> None:
     """Stop the sandbox compute, then either keep ``SessionState`` for a
@@ -939,10 +987,18 @@ class _SseDisconnectInfo:
     by the outer loop to reset the retry budget — a 30-second drain followed
     by a transient error counts as "had one good connection," not "20 bad
     attempts."
+
+    ``received_any_chunk`` distinguishes "drained data" from "connected and
+    sat silent until the read timeout fired". Without that distinction a
+    connect-then-silent loop would reset the retry budget on every iteration
+    (because connected=True), preventing _recover_after_disconnect from ever
+    firing when the supervisor is dead but daytona's proxy keeps the TCP
+    connection alive.
     """
     reason: str                       # "upstream_eof" or "ExceptionType: msg"
     connected_successfully: bool
     supervisor_dead: bool             # cheap port-based fast-fail signal
+    received_any_chunk: bool = False
 
 
 async def _sse_reader_connect_and_drain(
@@ -959,8 +1015,17 @@ async def _sse_reader_connect_and_drain(
     reader_buffer = ""
     disconnect_reason = "upstream_eof"
     connected = False
+    received_any_chunk = False
+    # Bound the per-chunk read at 2x the supervisor's heartbeat interval.
+    # supervisor.js sends a `: heartbeat\n\n` SSE comment every 25 s, so
+    # any 60 s gap means the supervisor (or the path to it) is gone — and
+    # we must not wait the ~5 min daytona proxy idle timeout to find out.
     sse_http = httpx.AsyncClient(
-        base_url=state.client.base_url, timeout=None, proxy=None,
+        base_url=state.client.base_url,
+        timeout=httpx.Timeout(
+            connect=10.0, read=_SSE_READ_TIMEOUT_S, write=10.0, pool=10.0,
+        ),
+        proxy=None,
     )
     try:
         try:
@@ -980,6 +1045,7 @@ async def _sse_reader_connect_and_drain(
                          "(attempt=%d, status=%d)",
                          state.session_id, attempt, resp.status_code)
                 async for chunk in resp.aiter_text():
+                    received_any_chunk = True
                     if state.shutdown.is_set():
                         log.info("[SSE-READER] session %s shutting down; "
                                  "exiting drain", state.session_id)
@@ -1020,10 +1086,18 @@ async def _sse_reader_connect_and_drain(
         and cached_inst.process is not None
         and not _instance_process_alive(cached_inst)
     )
+    # Daytona analogue: if we connected but never saw a single chunk before
+    # the read timeout fired, the supervisor (or the path to it) is dead —
+    # heartbeats every 25 s mean any silent 60 s window is unrecoverable.
+    # Treat this as supervisor_dead so the outer loop bypasses the connect
+    # retry ladder and goes straight to _recover_after_disconnect.
+    if connected and not received_any_chunk:
+        supervisor_dead = True
     return _SseDisconnectInfo(
         reason=disconnect_reason,
         connected_successfully=connected,
         supervisor_dead=supervisor_dead,
+        received_any_chunk=received_any_chunk,
     )
 
 
@@ -1058,12 +1132,16 @@ def _start_sse_reader(state: SessionState) -> None:
                 info = await _sse_reader_connect_and_drain(
                     state, attempt, text_parts, thinking_parts,
                 )
-                if info.connected_successfully:
-                    # Successful connect resets the retry budget for the
-                    # next failure — the original code did this inline at
-                    # the top of the stream block (line ~887 of the old
-                    # version), so a 30-second healthy drain followed by a
-                    # transient drop counts as one fresh attempt, not N.
+                if info.connected_successfully and info.received_any_chunk:
+                    # Successful connect that actually drained data resets
+                    # the retry budget for the next failure — a 30-second
+                    # healthy drain followed by a transient drop counts as
+                    # one fresh attempt, not N. We DO NOT reset on
+                    # connect-without-data: with a per-chunk read timeout
+                    # in place, a connect-then-silent loop on a dead
+                    # supervisor (daytona's proxy keeps the TCP open after
+                    # the supervisor dies) would otherwise reset the budget
+                    # on every iteration and never reach _recover.
                     attempt = 0
                     reconnect_delay_s = 1.0
 
@@ -2843,13 +2921,19 @@ async def _provision_with_cache_retry(cache_key, fn, /, *args, **kwargs):
     except RuntimeError as e:
         if not any(marker in str(e) for marker in _STALE_CACHE_MARKERS):
             raise
-        log.warning("stale-cache on volume %s agent=%s: %s — reinstalling",
-                    vol_id, agent_type, e)
+        # Clear the cache entry for the CURRENT supervisor version so
+        # ensure_volume_supervisor falls through to install on the retry.
+        # If the cache somehow still holds an older versioned key, leave
+        # it alone — it's already invalid (won't match the live cache_key)
+        # and a future install will overwrite it.
+        versioned = _versioned_agent_type(agent_type)
+        log.warning("stale-cache on volume %s agent=%s (key=%s): %s — reinstalling",
+                    vol_id, agent_type, versioned, e)
         async with get_db() as conn:
             await conn.execute(
                 "UPDATE volumes SET supervisor_agent_types = "
                 "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
-                (agent_type, vol_id),
+                (versioned, vol_id),
             )
         await ensure_volume_supervisor(vol_id, agent_type)
         return await fn(*args, **kwargs)
@@ -2895,16 +2979,21 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
     semantics.  Acceptable because the alternative is holding a pool
     connection for minutes, which is more expensive operationally.
     """
+    # Cache key is versioned by supervisor.js content hash so a stale entry
+    # under a prior version (e.g., before the agent_memory.tar visibility-poll
+    # fix) doesn't keep the old logic pinned on the volume.
+    cache_key = _versioned_agent_type(agent_type)
+
     # Fast path (no lock): check cache — 99% of calls hit this.
     vol = await get_volume(volume_id)
     if vol is None:
         raise HTTPException(500, f"Volume {volume_id} not found")
-    if agent_type in (vol.supervisor_agent_types or []):
-        return  # already installed
+    if cache_key in (vol.supervisor_agent_types or []):
+        return  # already installed at this supervisor version
 
     # Compute a stable positive 63-bit key (pg advisory locks take a bigint;
     # mask off the sign bit for safety).
-    digest = hashlib.sha256(f"{volume_id}\0{agent_type}".encode()).digest()
+    digest = hashlib.sha256(f"{volume_id}\0{cache_key}".encode()).digest()
     lock_key = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
     # Step 1 + 2: double-check cache, then acquire a session-scoped advisory
@@ -2920,7 +3009,7 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
         if row is None:
             raise HTTPException(500, f"Volume {volume_id} not found")
         installed = list(row.get("supervisor_agent_types") or [])
-        if agent_type in installed:
+        if cache_key in installed:
             return
         provider = row["provider"]
         provider_ref = row["provider_ref"]
@@ -2957,11 +3046,11 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
                 (volume_id,),
             )).fetchone()
             installed2 = list((row2 or {}).get("supervisor_agent_types") or [])
-            if agent_type in installed2:
+            if cache_key in installed2:
                 return
 
             log.info("ensure_volume_supervisor: installing %s on volume %s",
-                     agent_type, volume_id)
+                     cache_key, volume_id)
             # Step 4: slow provider call with the connection in autocommit (not
             # in a transaction) so idle-in-transaction timers don't fire.
             await _providers_mod.install_supervisor(provider, provider_ref, agent_type)
@@ -2970,10 +3059,10 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
                 "UPDATE volumes SET supervisor_agent_types = "
                 "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
                 "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
-                (agent_type, volume_id, agent_type),
+                (cache_key, volume_id, cache_key),
             )
             log.info("ensure_volume_supervisor: done installing %s on volume %s",
-                     agent_type, volume_id)
+                     cache_key, volume_id)
         finally:
             # Release the advisory lock explicitly — a failure here is survivable
             # (the lock auto-releases on connection close).
@@ -3070,6 +3159,14 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
         await upsert_sandbox(sb)
         return sb
     if status in ("missing", "error"):
+        # Snapshot the provisioning identity BEFORE delete_sandbox wipes
+        # the row — without this, the replacement boots with empty
+        # shared_mounts and the snapshot dockerfile, so /mnt/<name> dirs
+        # the agent expected silently disappear and any custom image is
+        # downgraded to the default. Symptom in production: orchestrator
+        # container's /mnt/7 is empty after a sandbox went missing.
+        saved_dockerfile = sb.dockerfile
+        saved_shared_mounts = list(sb.shared_mounts) if sb.shared_mounts else None
         if status == "error":
             try:
                 await _providers_mod.destroy_sandbox(vol.provider, _synthesize_instance(sb))
@@ -3077,7 +3174,11 @@ async def _ensure_sandbox_locked(session_row: dict) -> SandboxRecord:
                 pass
         await delete_sandbox(sb.id)
         await set_session_current_sandbox(session_id, None)
-        return await _provision_new(fresh, previous_id=current_id)
+        return await _provision_new(
+            fresh, previous_id=current_id,
+            dockerfile=saved_dockerfile,
+            shared_mounts=saved_shared_mounts,
+        )
     raise HTTPException(500, f"Unknown sandbox status: {status}")
 
 
@@ -3857,31 +3958,50 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
         session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
         event_type=EVT_USER_MESSAGE, payload={"text": message, "prompt_id": rpc_id},
     )
+    def _is_transient_supervisor_failure(e: Exception) -> bool:
+        # Transport-level: supervisor died mid-handshake.
+        if isinstance(e, (httpx.ConnectError, httpx.RemoteProtocolError,
+                          httpx.ReadError)):
+            return True
+        # Daytona signed proxy URL invalidation manifests as 502/503/504 on
+        # the supervisor's HTTP surface even while the supervisor process
+        # is alive — the proxy returns gateway errors for a few seconds
+        # after a fresh URL is minted for the same port. A rebind picks up
+        # the latest URL, retry then succeeds.
+        if isinstance(e, httpx.HTTPStatusError):
+            return e.response.status_code in (502, 503, 504)
+        return False
+
     try:
         _, _, state = await ensure_session_live(session_id)
         await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
         return
-    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as first_err:
-        # The supervisor died between `_reader_connected` observing it up
-        # and our prompt submit. Clear the flag so the next
-        # ensure_session_live is forced through the rebind path, then
-        # retry once. Handles the kill-then-immediately-send race for UI
-        # flows that don't add any delay.
-        log.warning("prompt for session %s failed with %s; forcing rebind + retry",
-                    session_id, type(first_err).__name__)
-        state._reader_connected = False
-        try:
-            _, _, state = await ensure_session_live(session_id)
-            await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
-            return
-        except Exception as e:
-            err = e
+    except Exception as first_err:
+        if not _is_transient_supervisor_failure(first_err):
+            err = first_err
             tb = traceback.format_exc()
-            log.exception("retry after rebind also failed for session %s", session_id)
-    except Exception as e:
-        err = e
-        tb = traceback.format_exc()
-        log.exception("prompt failed for session %s", session_id)
+            log.exception("prompt failed for session %s", session_id)
+        else:
+            # The supervisor died (or its signed Daytona URL was invalidated)
+            # between `_reader_connected` observing it up and our prompt
+            # submit. Clear the flag so the next ensure_session_live is
+            # forced through the rebind path, then retry once. Handles both
+            # the kill-then-immediately-send race for UI flows that don't add
+            # any delay AND the Daytona stale-signed-URL 502 churn during
+            # cascading recovery.
+            log.warning(
+                "prompt for session %s failed with %s; forcing rebind + retry",
+                session_id, type(first_err).__name__,
+            )
+            state._reader_connected = False
+            try:
+                _, _, state = await ensure_session_live(session_id)
+                await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
+                return
+            except Exception as e:
+                err = e
+                tb = traceback.format_exc()
+                log.exception("retry after rebind also failed for session %s", session_id)
 
     body = ""
     http_status: int | None = None
@@ -3955,7 +4075,22 @@ async def post_session_message(session_id: str, request: Request):
 
     interrupt = data.get("interrupt", False)
 
-    _, _, state = await ensure_session_live(session_id)
+    # Fast path mirrors GET /events: if a live in-memory state already
+    # exists, just enqueue — don't take the session lock. ensure_session_live
+    # holds that lock for the entire ensure_state_live → rebind sequence,
+    # which on a daytona Type 2 replacement (sandbox externally deleted →
+    # provision fresh sandbox + supervisor) takes ~25 s. POST /message
+    # callers typically have a ~30 s client-side timeout (e.g. tests'
+    # _send_message), and a concurrent SSE-reader-driven recovery already
+    # holding the lock would tip them past that. The scheduler's per-prompt
+    # ensure_session_live still runs immediately before each
+    # state.client.prompt(), so a stale URL still gets rebound — just on the
+    # scheduler thread instead of blocking the POST handler.
+    cached_state = SESSIONS.get(session_id)
+    if cached_state is not None and not cached_state.is_hibernated:
+        state = cached_state
+    else:
+        _, _, state = await ensure_session_live(session_id)
 
     if interrupt and state.agent_busy:
         await _cancel_and_drain(state)
@@ -3979,8 +4114,25 @@ async def post_session_message(session_id: str, request: Request):
 
 @app.get("/sessions/{session_id}/events")
 async def session_events(session_id: str):
-    """SSE stream for a session. Recovers reaped sessions automatically."""
-    _, _, state = await ensure_session_live(session_id)
+    """SSE stream for a session. Recovers reaped sessions automatically.
+
+    Live-state shortcut: if SESSIONS already holds a live state for this
+    session, just subscribe — skip ensure_session_live's rebind path.
+    Reasoning: /events is a subscriber, not a driver. A persistent /events
+    stream that reconnects mid-recovery (UI's EventSource retry, the
+    _PersistentSse helper in tests) MUST NOT trigger a second rebind while
+    a prompt is in flight on the prior acp_session_id — doing so swaps
+    state.acp_session_id and orphans the in-flight prompt's reply events
+    on the now-abandoned ACP stream. The test would then time out waiting
+    for events that will never reach its rpc_id queue. Cold-start (state
+    missing) and hibernated (needs revival) still go through the full
+    ensure path.
+    """
+    cached_state = SESSIONS.get(session_id)
+    if cached_state is not None and not cached_state.is_hibernated:
+        state = cached_state
+    else:
+        _, _, state = await ensure_session_live(session_id)
     shutdown = state.shutdown
 
     async def _proxy_stream():

@@ -195,12 +195,30 @@ if (args.snapshotPath && isWarmRestart) {
   }
 
   // Layer 2: agent-memory overlay (per-turn snapshot of session dirs).
-  // This is the tier that carries conversation JSONLs, so even if
-  // filesystem_cache is stale (no cold snapshot since last turn), the
-  // latest turn's memory still wins. No visibility poll — if it's
-  // missing, we just have no post-cold state to overlay.
+  // This is the tier that carries conversation JSONLs (.claude, .codex,
+  // etc.). Critically, agent_memory.tar is written EVERY TURN, while
+  // the cold filesystem_cache.tar is only written on graceful shutdown
+  // (POST /v1/snapshot). For the common Type 2 case — sandbox externally
+  // deleted between turns under concurrent load — there is no graceful
+  // shutdown, so cold is often missing while memory IS present (just
+  // not yet visible on the new sandbox's S3-FUSE mount). Polling for
+  // memory is what carries the conversation forward; without it,
+  // supervisor.js skips restore, claude-agent-acp's session/load
+  // returns -32603, and the test_session_resume_after_delete[daytona]
+  // and test_session_resume_after_stop[daytona] invariants
+  // ``inner_after == inner_before`` deliberately catch the silent
+  // context loss.
+  //
+  // Use the same _snapshotVisible poll the cold tier uses, with the same
+  // 15 s budget — ``ls $parent`` invalidates mountpoint-s3's stale dentry
+  // cache so existsSync sees the file once S3 propagates. 10 s was too
+  // tight under 2x concurrent load (FUSE propagation took >10 s and the
+  // overlay was silently skipped, dropping turn-N JSONLs and forcing
+  // claude-agent-acp's session/load to return -32603 forever). Server-side
+  // _wait_for_health budget on daytona (45 s) covers worst-case
+  // 15 + 15 + ACP-spawn back-to-back on a fresh Type 2 boot.
   const memPath = _agentMemoryPath(args.snapshotPath);
-  if (memPath && fs.existsSync(memPath)) {
+  if (memPath && _snapshotVisible(memPath, 15000)) {
     log(`restoring agent_memory from ${memPath}`);
     const r = spawnSync("tar", ["-xf", memPath, "-C", args.root], {
       stdio: ["ignore", "inherit", "inherit"],
@@ -208,6 +226,8 @@ if (args.snapshotPath && isWarmRestart) {
     if (r.status !== 0) {
       log(`agent_memory restore exited rc=${r.status}; continuing`);
     }
+  } else if (memPath) {
+    log(`agent_memory ${memPath} not visible after 15s — skipping overlay restore`);
   }
 }
 
