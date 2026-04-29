@@ -193,3 +193,39 @@ async def test_exec_in_instance_docker_uses_sandbox_id_as_container_fallback(mon
     assert result.stdout == "ok\n"
     assert captured["args"][:4] == ("/usr/bin/docker", "exec", "container-abc123", "sh")
     assert captured["args"][4:] == ("-c", "echo ok")
+
+
+@pytest.mark.asyncio
+async def test_exec_in_instance_daytona_preserves_exit_code_and_stderr(monkeypatch):
+    """Daytona exec must surface real exit_code/stderr for shell-based file ops."""
+    instance = providers.ProviderInstance(
+        provider="daytona", url="", root="/home/daytona", sandbox_id="sb-daytona-1",
+    )
+
+    class _FakeLoop:
+        async def run_in_executor(self, _executor, fn):
+            return fn()
+
+    class _FakeSandbox:
+        class process:
+            @staticmethod
+            def exec(_cmd, timeout=30):
+                return SimpleNamespace(result="out", stderr="bad", exit_code=17)
+
+    class _FakeClient:
+        @staticmethod
+        def get(_sandbox_id):
+            return _FakeSandbox()
+
+    async def _passthrough(awaitable, timeout=None):
+        return await awaitable
+
+    monkeypatch.setattr(providers, "_get_daytona_client", lambda: _FakeClient())
+    monkeypatch.setattr(providers.asyncio, "get_running_loop", lambda: _FakeLoop())
+    monkeypatch.setattr(providers.asyncio, "wait_for", _passthrough)
+
+    result = await providers.exec_in_instance(instance, "exit 17")
+
+    assert result.stdout == "out"
+    assert result.stderr == "bad"
+    assert result.exit_code == 17
