@@ -243,6 +243,45 @@ class BaseSandboxSession(abc.ABC):
         """Final teardown of in-memory tasks. Doesn't touch the daytona
         side. Idempotent."""
 
+    # --- Cancel: best-effort interrupt of an in-flight execute_prompt ---
+
+    async def cancel_active_prompt(self) -> None:
+        """Send ``session/cancel`` notification to the supervisor's ACP
+        child so the in-flight turn aborts.
+
+        Best-effort — JSON-RPC notification has no response. The actual
+        ``done`` event arrives via the existing ``execute_prompt`` SSE
+        stream. Caller is responsible for waiting on it (or the
+        broadcast queue) if they need synchronous-cancel semantics.
+
+        No-op when the session has no live supervisor URL or no
+        attached ACP session — there's nothing to cancel.
+        """
+        import httpx  # local: avoid pulling httpx into the module-load path
+
+        if (
+            self._supervisor_url is None
+            or self._inner_session_id is None
+            or self._acp_session_id is None
+        ):
+            return
+        cancel_payload = {
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": self._inner_session_id},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{self._supervisor_url}/v1/acp/{self._acp_session_id}",
+                    json=cancel_payload,
+                )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "cancel_active_prompt failed for session %s", self.session_id,
+            )
+
     # --- Liveness probe hook (subclass overrides if it has a cheap probe) ---
 
     async def _liveness_probe(self) -> bool:
