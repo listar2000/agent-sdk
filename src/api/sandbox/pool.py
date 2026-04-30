@@ -127,6 +127,35 @@ class SessionPool:
         No I/O — just whether the pool currently holds a session."""
         return session_id in self._active
 
+    async def reap_idle(self, idle_s: float) -> int:
+        """Hibernate every active session whose last observed activity is
+        older than ``idle_s``. Returns the count of sessions released.
+
+        Activity = last chunk observed by ``execute_prompt`` (tracked on
+        the session's ``Liveness._last_chunk_at``). Heartbeats from the
+        supervisor count as activity, so a session stays warm for the
+        duration of any in-flight prompt regardless of how long it runs.
+        """
+        import time as _time
+        now = _time.monotonic()
+        stale = []
+        for sid, sess in list(self._active.items()):
+            last = sess.liveness._last_chunk_at
+            if last is None:
+                # Never observed a chunk — likely a session that started
+                # but hasn't had a prompt yet. Use creation as a proxy
+                # by giving it the full idle window from now.
+                sess.liveness._last_chunk_at = now
+                continue
+            if (now - last) > idle_s:
+                stale.append(sid)
+        for sid in stale:
+            try:
+                await self.release(sid)
+            except Exception:
+                log.exception("reap_idle: release(%s) failed", sid)
+        return len(stale)
+
     def find_by_sandbox_id(self, sandbox_id: str) -> BaseSandboxSession | None:
         """Reverse lookup: find an active session whose underlying compute
         carries this provider sandbox id. Used by ``/sandboxes/{id}/files/*``

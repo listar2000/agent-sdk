@@ -26,6 +26,14 @@ from .state import SandboxState
 # Sentinel placed on a subscriber's queue to signal end-of-stream.
 _END = object()
 
+# Sentinel yielded from ``subscribe()`` when no event has arrived for
+# ``_HEARTBEAT_INTERVAL_S``. The /events handler renders these as SSE
+# comment lines (``: heartbeat\n\n``) so intermediaries (nginx, CF,
+# browser EventSource) don't close idle connections during quiet periods
+# between prompts.
+_HEARTBEAT = object()
+_HEARTBEAT_INTERVAL_S = 20.0
+
 # Bound on the per-session event replay buffer. Late subscribers (UI
 # reconnects after a "stream closed" hiccup) replay this buffer first,
 # then receive live broadcasts. A new POST /message that fires before
@@ -253,6 +261,12 @@ class BaseSandboxSession(abc.ABC):
         recent events FIRST, then live broadcasts. This protects the UI
         reconnect-gap case (events for a POST /message arriving while
         no subscriber was listening would otherwise be dropped).
+
+        Heartbeat: when the queue stays idle for ``_HEARTBEAT_INTERVAL_S``
+        the iterator yields a ``_HEARTBEAT`` sentinel so the /events
+        handler can emit an SSE comment line. Without this, nginx /
+        cloudflare / browser EventSource close idle persistent
+        connections between prompts.
         """
         sid = str(uuid.uuid4())
         # Bounded queue: slow subscribers drop events rather than backpressuring
@@ -269,7 +283,13 @@ class BaseSandboxSession(abc.ABC):
         self._subscribers[sid] = q
         try:
             while True:
-                event = await q.get()
+                try:
+                    event = await asyncio.wait_for(
+                        q.get(), timeout=_HEARTBEAT_INTERVAL_S,
+                    )
+                except asyncio.TimeoutError:
+                    yield _HEARTBEAT
+                    continue
                 if event is _END:
                     return
                 yield event

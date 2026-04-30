@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from api.sse import extract_sse_tag, iter_sse_blocks, parse_acp_event
+from api.sse import iter_sse_blocks, parse_acp_event
 from agent_sdk.errors import (
     AgentConnectionError, AgentNotRegisteredError, AgentBusyError,
     AgentTimeoutError, StreamError, PromptError,
@@ -470,14 +470,6 @@ class Agent:
 
     # ── Core: astream ──
 
-    @asynccontextmanager
-    async def _sse_stream(self, message: str, *, interrupt: bool = False):
-        """Open SSE connection, submit message, yield (blocks, rpc_id)."""
-        async with self._open_sse() as sse:
-            async with self._prompt_lock:
-                rpc_id = await self._post_message(message, interrupt=interrupt)
-            yield iter_sse_blocks(sse), rpc_id
-
     async def astream(
         self,
         message: str,
@@ -486,8 +478,14 @@ class Agent:
     ) -> AsyncIterator[Event]:
         """Send a message and stream events.
 
+        Uses ``POST /sessions/{id}/message+stream`` — single round-trip:
+        the response body IS the SSE event stream. No rpc_id correlation
+        needed (only this caller's events flow on this connection), so
+        the legacy ``POST /message`` + separate ``GET /events`` two-step
+        is collapsed.
+
         Yields ``Event`` dicts. ``str(event)`` returns human-readable text,
-        so ``print(ev, end="")`` works naturally.  Access structured fields
+        so ``print(ev, end="")`` works naturally. Access structured fields
         via ``ev["type"]``, ``ev["text"]``, etc.
 
         Event types: ``text``, ``reasoning``, ``tool``, ``tool_result``,
@@ -497,29 +495,35 @@ class Agent:
         connection loss.
         """
         await self._ensure_registered()
-        async with self._sse_stream(message, interrupt=interrupt) as (blocks, rpc_id):
-            try:
-                async for block in blocks:
-                    tag = extract_sse_tag(block)
-                    if tag is not None and tag != rpc_id:
-                        continue
-                    raw = parse_acp_event(block, rpc_id)
-                    if raw is None:
-                        continue
-                    event = Event(raw)
-                    if event["type"] == "done":
+        body = {"message": self._prepare_message(message), "interrupt": interrupt}
+        try:
+            async with self._prompt_lock:
+                async with self._client.stream(
+                    "POST",
+                    f"/sessions/{self.session_id}/message+stream",
+                    json=body,
+                    headers={"Accept": "text/event-stream"},
+                    timeout=httpx.Timeout(30.0, read=None),
+                ) as sse:
+                    _raise_for_status(sse)
+                    async for block in iter_sse_blocks(sse):
+                        raw = parse_acp_event(block, None)
+                        if raw is None:
+                            continue
+                        event = Event(raw)
+                        if event["type"] == "done":
+                            yield event
+                            return
+                        if event["type"] == "error":
+                            raise PromptError(
+                                f"[{self.name}] {event['text']}",
+                                kind=event.get("kind"),
+                                data=event.get("data"),
+                            )
                         yield event
-                        return
-                    if event["type"] == "error":
-                        raise PromptError(
-                            f"[{self.name}] {event['text']}",
-                            kind=event.get("kind"),
-                            data=event.get("data"),
-                        )
-                    yield event
-                raise StreamError(f"[{self.name}] Connection closed before response completed")
-            except httpx.ReadTimeout:
-                raise StreamError(f"[{self.name}] Connection lost (no heartbeat from server)")
+                    raise StreamError(f"[{self.name}] Connection closed before response completed")
+        except httpx.ReadTimeout:
+            raise StreamError(f"[{self.name}] Connection lost (no heartbeat from server)")
 
     # ── Core: arun ──
 
@@ -588,12 +592,15 @@ class Agent:
     async def aclose(self) -> None:
         if self.session_id and self._registered:
             try:
+                # Hibernate: snapshot + provider pause. Next POST /message
+                # cold-resumes from the snapshot. Calling /release directly
+                # avoids the /admin/sessions/{id}/reap alias.
                 await self._client.post(
-                    f"/admin/sessions/{self.session_id}/reap",
+                    f"/sessions/{self.session_id}/release",
                     timeout=httpx.Timeout(5.0, read=10.0),
                 )
             except Exception as exc:
-                log.debug("aclose: reap session %s failed (ignored): %s", self.session_id, exc)
+                log.debug("aclose: release session %s failed (ignored): %s", self.session_id, exc)
             self._registered = False
         await self._client.aclose()
 

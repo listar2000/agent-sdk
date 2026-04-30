@@ -109,7 +109,7 @@ async def _cancel_task(task) -> None:
 async def lifespan(app):
     """App lifespan: init DB + pool, run startup reconciliation, then
     on shutdown release every active SandboxSession (snapshot first)."""
-    from api.sandbox import shutdown_pool
+    from api.sandbox.runtime import shutdown_pool, start_reaper
 
     _configure_logging()
     init_db()
@@ -122,6 +122,11 @@ async def lifespan(app):
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
+
+    # Background reaper: hibernates sessions idle > AGENT_SDK_REAPER_IDLE_S
+    # (default 180s). Snapshot+pause via pool.release; next message
+    # cold-resumes from the snapshot.
+    await start_reaper()
 
     yield
 
@@ -1044,13 +1049,19 @@ async def session_events(session_id: str):
     pool = get_pool()
     session = await pool.get_session(session_id)
 
+    from api.sandbox.session import _HEARTBEAT
+
     async def _gen():
         async for item in session.subscribe():
-            # Subscribers receive either:
+            # Subscribers receive one of:
+            #   - ``_HEARTBEAT`` sentinel after an idle interval — emit an
+            #     SSE comment so intermediaries don't close the connection.
             #   - (rpc_id, raw_sse_block) tuples from execute_prompt — emit
             #     with ``event: rpc:<id>`` tag so test/UI code can correlate.
             #   - parsed event dicts from non-prompt sources — emit as data:.
-            if isinstance(item, tuple) and len(item) == 2:
+            if item is _HEARTBEAT:
+                yield ": heartbeat\n\n"
+            elif isinstance(item, tuple) and len(item) == 2:
                 rpc_id, block = item
                 yield f"event: rpc:{rpc_id}\n{block}\n\n"
             else:
