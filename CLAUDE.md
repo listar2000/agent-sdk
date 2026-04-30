@@ -14,3 +14,17 @@ Launch the dev server for the golden tests with `scripts/launch_server_test.sh`
 `AGENT_SDK_ORIGIN=test` so daytona sandboxes get labelled `agent_sdk_origin=test`
 and stay isolatable from real production traffic — `cleanup_daytona_orphans.py`
 greps that label.
+
+## Daytona-specific notes
+
+The daytona golden suite runs cleanly under `-n auto` as of #42 (POST /message
+no longer blocks on cold-recovery; transition-aware probe handles
+`starting`/`stopping`/etc. without spurious teardowns). If it suddenly starts
+failing with `Total disk limit exceeded. Maximum allowed: 2000GiB`, that's
+NOT a code regression — it's orphaned sandboxes from a previous failed run
+accumulating on the Daytona side. Run:
+
+    python scripts/cleanup_daytona_orphans.py --origin test --yes
+
+(default `--origin` is `production`, which only touches sandboxes from
+non-test servers — the test wrapper sets `AGENT_SDK_ORIGIN=test`.)
