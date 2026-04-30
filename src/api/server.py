@@ -99,13 +99,6 @@ def _configure_logging() -> None:
 # DB + in-memory state
 # ---------------------------------------------------------------------------
 
-_sandbox_locks: dict[str, asyncio.Lock] = {}
-
-
-def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
-    return _sandbox_locks.setdefault(sandbox_id, asyncio.Lock())
-
-
 # Strong references to fire-and-forget background tasks (the per-prompt
 # persisters spawned by POST /message). The event loop only holds weak
 # refs to tasks, so a caller that does ``asyncio.create_task(coro())``
@@ -983,10 +976,7 @@ async def delete_sandbox_route(sandbox_id: str):
     except Exception as e:
         log.warning("DELETE /sandboxes %s: pool.release failed: %s", sandbox_id, e)
 
-    async with _get_sandbox_lock(sandbox_id):
-        _sandbox_locks.pop(sandbox_id, None)
-        await delete_sandbox(sandbox_id)
-
+    await delete_sandbox(sandbox_id)
     return {"status": "deleted"}
 
 
