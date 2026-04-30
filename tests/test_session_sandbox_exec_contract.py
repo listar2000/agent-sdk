@@ -51,19 +51,15 @@ async def _post_exec(command: str = "pwd"):
 
 @pytest.mark.asyncio
 async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
-    """The route delegates to the shared session supervisor proxy."""
-    instance = providers.ProviderInstance(
-        provider="local", url="http://sandbox.fake", root="/tmp/sandbox",
-    )
+    """The route delegates to ``_proxy_from_session``, which itself
+    resolves the session's supervisor URL via the SessionPool."""
     calls: list[dict] = []
 
-    async def fake_resolve_session_instance(session_id: str):
-        calls.append({"kind": "resolve", "session_id": session_id})
-        return instance
-
-    async def fake_proxy_instance(inst, method, path, *, params=None, json=None, timeout=30):
+    async def fake_proxy_from_session(session_id, method, path, *,
+                                      params=None, json=None, timeout=30):
         calls.append({
-            "kind": "proxy", "instance": inst, "method": method, "path": path,
+            "kind": "proxy", "session_id": session_id,
+            "method": method, "path": path,
             "params": params, "json": json, "timeout": timeout,
         })
         return Response(
@@ -72,8 +68,7 @@ async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
             media_type="application/json",
         )
 
-    monkeypatch.setattr(srv, "_resolve_session_instance", fake_resolve_session_instance)
-    monkeypatch.setattr(srv, "_proxy_instance", fake_proxy_instance)
+    monkeypatch.setattr(srv, "_proxy_from_session", fake_proxy_from_session)
 
     r = await _post_exec("echo ok")
 
@@ -82,16 +77,15 @@ async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
     assert r.json()["stdout_truncated"] is False
     assert r.json()["stderr_truncated"] is False
     assert r.json()["timed_out"] is False
-    assert calls[0] == {"kind": "resolve", "session_id": "sess-1"}
-    assert calls[1] == {
+    assert calls == [{
         "kind": "proxy",
-        "instance": instance,
+        "session_id": "sess-1",
         "method": "POST",
         "path": "/v1/exec",
         "params": None,
         "json": {"command": "echo ok", "timeout": 5},
         "timeout": 10,
-    }
+    }]
 
 
 # test_resolve_session_instance_uses_session_agent_type_and_spawn_env

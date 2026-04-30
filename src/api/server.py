@@ -1885,45 +1885,12 @@ async def session_sandbox_exec(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_session_instance(session_id: str) -> ProviderInstance:
-    """Resolve a session_id to a ProviderInstance pointing at its
-    supervisor URL via the SessionPool. ``pool.get_session()`` brings
-    the compute up if needed; ``supervisor_url`` is set as part of
-    ``SandboxSession.start()``.
-
-    The ProviderInstance shim is kept (vs. returning the URL string
-    directly) so ``_proxy_instance`` / ``_download_from_instance``
-    don't need signature changes."""
+async def _resolve_supervisor_url(session_id: str) -> str:
+    """Resolve a session_id to its supervisor URL via the SessionPool.
+    ``pool.get_session()`` brings the compute up if needed;
+    ``supervisor_url`` is set as part of ``SandboxSession.start()``."""
     from api.sandbox import get_pool
-
-    pool_session = await get_pool().get_session(session_id)
-    state = pool_session.state
-    return ProviderInstance(
-        provider=getattr(state, "type", "unknown"),
-        url=pool_session.supervisor_url or "",
-        root=(state.recipe.root if state.recipe else None) or "/tmp",
-        sandbox_id=getattr(state, "sandbox_id", None),
-    )
-
-
-async def _proxy_instance(
-    instance: ProviderInstance, method: str, path: str, *,
-    params: dict | None = None, json: dict | None = None,
-    timeout: int = 30,
-) -> Response:
-    """Forward a request to a sandbox's supervisor via its ProviderInstance."""
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.request(
-                method, f"{instance.url}{path}", params=params, json=json,
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    return (await get_pool().get_session(session_id)).supervisor_url or ""
 
 
 async def _proxy_from_session(
@@ -1934,15 +1901,27 @@ async def _proxy_from_session(
     """Forward a request to the session's supervisor (resolved through
     the SessionPool) and return its JSON response. Used by every
     session-scoped file proxy."""
-    instance = await _resolve_session_instance(session_id)
-    return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
+    url = await _resolve_supervisor_url(session_id)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.request(
+                method, f"{url}{path}", params=params, json=json,
+            )
+            return Response(
+                content=r.content,
+                status_code=r.status_code,
+                media_type="application/json",
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 
 
-
-async def _download_from_instance(instance: ProviderInstance, path: str) -> Response:
+async def _download_from_session(session_id: str, path: str) -> Response:
+    """Stream a download from the session's supervisor."""
+    url = await _resolve_supervisor_url(session_id)
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(f"{instance.url}/v1/files/download", params={"path": path})
+            r = await client.get(f"{url}/v1/files/download", params={"path": path})
             return Response(
                 content=r.content,
                 status_code=r.status_code,
@@ -2011,8 +1990,7 @@ async def session_files_rename(session_id: str, request: Request):
 @app.get("/sessions/{session_id}/files/download")
 async def session_files_download(session_id: str, path: str):
     """Download a file as raw bytes from the session's sandbox."""
-    instance = await _resolve_session_instance(session_id)
-    return await _download_from_instance(instance, path)
+    return await _download_from_session(session_id, path)
 
 
 # ---------------------------------------------------------------------------
