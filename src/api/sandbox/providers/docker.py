@@ -132,7 +132,9 @@ class DockerSandboxSession(BaseSandboxSession):
     # execute_prompt: per-prompt supervisor SSE stream                    #
     # ------------------------------------------------------------------ #
 
-    async def execute_prompt(self, message: str) -> AsyncIterator[Any]:
+    async def execute_prompt(
+        self, message: str, *, rpc_id: str | None = None,
+    ) -> AsyncIterator[Any]:
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("DockerSandboxSession.execute_prompt called before start()")
 
@@ -142,7 +144,8 @@ class DockerSandboxSession(BaseSandboxSession):
         from .daytona import _parse_sse_block
         import asyncio
 
-        rpc_id = str(uuid4())
+        if rpc_id is None:
+            rpc_id = str(uuid4())
         prompt_payload = {
             "jsonrpc": "2.0",
             "id": rpc_id,

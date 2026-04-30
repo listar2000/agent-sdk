@@ -66,10 +66,17 @@ class BaseSandboxSession(abc.ABC):
         ``unknown``."""
 
     @abc.abstractmethod
-    async def execute_prompt(self, message: str) -> AsyncIterator[Any]:
+    async def execute_prompt(
+        self, message: str, *, rpc_id: str | None = None,
+    ) -> AsyncIterator[Any]:
         """Open an SSE stream from the supervisor for this one prompt;
         drain it; close it; broadcast each event to subscribers AND yield
-        to the caller. Errors propagate as exceptions."""
+        to the caller. Errors propagate as exceptions.
+
+        If ``rpc_id`` is supplied, the JSON-RPC envelope sent to the
+        supervisor uses it (so callers can correlate events to a tag
+        they returned to the user). If None, a fresh uuid is generated.
+        """
 
     @abc.abstractmethod
     async def stop(self) -> None:

@@ -104,13 +104,16 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         except Exception:
             return False
 
-    async def execute_prompt(self, message: str) -> AsyncIterator[Any]:
+    async def execute_prompt(
+        self, message: str, *, rpc_id: str | None = None,
+    ) -> AsyncIterator[Any]:
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("UnixLocalSandboxSession.execute_prompt called before start()")
 
         from .daytona import _parse_sse_block
 
-        rpc_id = str(uuid4())
+        if rpc_id is None:
+            rpc_id = str(uuid4())
         prompt_payload = {
             "jsonrpc": "2.0",
             "id": rpc_id,
