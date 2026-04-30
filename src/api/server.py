@@ -141,14 +141,6 @@ def _configure_logging() -> None:
 _BG_TASKS: set[asyncio.Task] = set()
 
 
-def _spawn_bg(coro) -> asyncio.Task:
-    """Create a background task and hold a strong reference to it."""
-    task = asyncio.create_task(coro)
-    _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
-    return task
-
-
 async def _cancel_task(task) -> None:
     """Cancel an asyncio task and await its completion so cleanup code runs."""
     if task is None or task.done():
@@ -288,93 +280,6 @@ async def health():
 # ---------------------------------------------------------------------------
 
 
-async def _apply_config_and_initialize(
-    client: AcpClient,
-    config: AgentConfig,
-    acp_session_id: str,
-    cwd: str,
-) -> None:
-    """Initialize the ACP session with MCP server config (session/new path)."""
-    await client.initialize(
-        acp_session_id,
-        config.agent_type or "claude",
-        cwd=cwd,
-        mcp_servers=config.mcp_servers,
-    )
-
-
-async def _attach_acp_session(
-    client: AcpClient,
-    acp_session_id: str,
-    agent_record: AgentRecord,
-    *,
-    inner_sid: str | None,
-    cwd: str,
-) -> tuple[str | None, bool]:
-    """Attach to an ACP session — resume if possible, otherwise start fresh.
-
-    Single source of truth for "how do we obtain an ``inner_session_id`` on
-    this ACP connection". Every call site that needs an attached ACP session
-    (POST /message recovery, SSE-reader upstream-disconnect recovery, and
-    initial ``sessions_quick_create``) routes through here, so the invariant
-    *"always try ``session/load`` when we have an ``inner_session_id``, only
-    create a new one when genuinely fresh or when load actually fails"*
-    lives in one place and can't be accidentally skipped.
-
-    Behavior:
-      - If ``inner_sid`` is truthy → handshake + ``session/load``. On
-        success, the agent's prior conversation is preserved and this
-        returns ``(inner_sid, False)``.
-      - If ``inner_sid`` is ``None`` OR ``session/load`` raises → fall back
-        to ``session/new`` via ``_apply_config_and_initialize`` and return
-        ``(new_inner_sid, True)``.
-      - The fallback-after-failure case logs a loud WARNING: it means the
-        agent's conversation context was lost unexpectedly (e.g., the
-        session JSONL isn't where Claude Code expects it) and callers
-        should treat this as a bug signal rather than steady state.
-
-    Idempotent in the useful sense: calling with the same ``inner_sid`` on
-    a fresh ``AcpClient`` should always reattach to the same conversation.
-    """
-    agent_type = (
-        (agent_record.config.agent_type or "claude")
-        if agent_record.config else "claude"
-    )
-    mcp = agent_record.config.mcp_servers if agent_record.config else None
-
-    if inner_sid:
-        try:
-            await client.handshake(acp_session_id, agent_type)
-            await client._send_rpc(acp_session_id, "session/load", {
-                "sessionId": inner_sid,
-                "cwd": cwd,
-                "mcpServers": _mcp_dict_to_acp_array(mcp) if mcp else [],
-            })
-            client.set_inner_session_id(acp_session_id, inner_sid)
-            try:
-                await client.set_mode(acp_session_id, "bypassPermissions")
-            except Exception:
-                pass
-            return inner_sid, False
-        except Exception as load_err:
-            log.warning(
-                "session/load failed (inner_sid=%s, cwd=%s): %r — "
-                "falling back to session/new; CONVERSATION CONTEXT WILL BE LOST",
-                inner_sid, cwd, load_err,
-            )
-
-    # Genuinely fresh (no inner_sid) or load failed — start a new session.
-    await _apply_config_and_initialize(
-        client, agent_record.config, acp_session_id, cwd,
-    )
-    return client.get_inner_session_id(acp_session_id), True
-
-
-# ---------------------------------------------------------------------------
-# Skills provisioning (npx skills)
-# ---------------------------------------------------------------------------
-
-
 def _normalize_skills(skills) -> list[str]:
     """Normalize skills config into a list of source strings for ``npx skills add``.
 
@@ -421,49 +326,6 @@ async def _install_skills_locally(skills) -> None:
         if proc.returncode != 0:
             raise RuntimeError(f"skill install failed: {stderr.decode()[:500]}")
         log.info("skill installed: %s", stdout.decode()[-200:].strip())
-
-
-async def _build_pre_start_commands(
-    config, provider: str, user_cmds: list[str] | None,
-) -> list[str] | None:
-    """Build the combined pre-start command list for provisioning.
-
-    Concatenates skill-install commands (from ``config.skills``) with
-    caller-supplied ``user_cmds``, preserving order so skills land first.
-    For the ``local`` provider we install skills on the host and return
-    ``None`` — the local sandbox shares HOME with the server, so skill
-    install runs once on the host and user commands there would execute
-    with server privileges (deliberately unsupported).
-    """
-    skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    if provider == "local":
-        if skill_cmds:
-            try:
-                await _install_skills_locally(config.skills)
-            except Exception as e:
-                log.error("skill install failed, continuing without skills: %s", e)
-        return None
-    combined = skill_cmds + list(user_cmds or [])
-    return combined or None
-
-
-# ---------------------------------------------------------------------------
-# Request helpers
-# ---------------------------------------------------------------------------
-
-_CONFIG_KEYS = (
-    "model",
-    "prompt",
-    "tools",
-    "mcp_servers",
-    "skills",
-    "agent_type",
-)
-
-# Keys that were once inside AgentConfig but now live on session / sandbox
-# rows. `/agents` POST rejects them with 400 so callers migrate cleanly;
-# `/sessions` and `/sessions` consume them and route to the right row.
-_AGENT_REJECTED_KEYS = ("cwd", "env", "dockerfile", "dockerfile_content", "shared_mounts")
 
 
 def _merge_top_level_config(data: dict, config_data: dict) -> None:
