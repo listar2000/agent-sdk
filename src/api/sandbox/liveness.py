@@ -93,6 +93,15 @@ class Liveness:
         observes the dead supervisor (the test 7 race) — the in-memory
         ``alive`` cache from the previous prompt's last chunk would
         otherwise short-circuit and we'd POST to a dead URL.
+
+        Note on transient probe failures: making the probe itself
+        retry-tolerant is the responsibility of each provider's
+        ``_liveness_probe`` (e.g. Daytona's signed-URL proxy returns
+        502 for ~1-2s after a fresh URL — those probes do internal
+        retries before returning False). Doing the retry there rather
+        than caching positive signals here avoids the test-7 race
+        where a recently-alive but now-dead supervisor would be
+        wrongly trusted.
         """
         if not force_probe:
             if self._state == "alive" and not self._stale_after_idle():

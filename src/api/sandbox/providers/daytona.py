@@ -189,15 +189,87 @@ class DaytonaSandboxSession(BaseSandboxSession):
         return await self.liveness.is_alive(force_probe=force_probe)
 
     async def _liveness_probe(self) -> bool:
-        """Cheap GET /v1/health against the supervisor URL."""
-        if self._supervisor_url is None:
+        """Liveness probe layered for Daytona's actual semantics.
+
+        Layer 1 — fast path: GET /v1/health against the signed URL.
+        Returns True on 200; returns False on 4xx (supervisor up but
+        said no); falls through on 5xx / connection errors.
+
+        Layer 2 — transition-aware: on layer-1 failure, consult the
+        Daytona control plane for sandbox state. If the sandbox is in
+        a transitional state (starting / stopping / pulling_image /
+        resizing / archiving / destroying), poll for stable state up
+        to 10s then retry the probe — the URL was failing because the
+        sandbox was mid-transition, not because the supervisor died.
+        If the sandbox is in a stable non-started state (stopped,
+        paused, error, archived, destroyed), return False — caller
+        cold-recovers via restart_daytona_supervisor (which itself
+        does the longer 45s _wait_for_stable). If the sandbox IS
+        started but the URL still fails after one retry, the supervisor
+        process inside is dead — return False.
+
+        Why not unconditionally call the control plane: every layer-1
+        success path stays a single HTTP RTT against the signed URL.
+        Only the failure path pays the extra ~100ms Daytona API call.
+        """
+        if self._supervisor_url is None or self._daytona_sandbox is None:
             return False
+
+        async def _probe_url() -> tuple[bool, int | None]:
+            """Returns (alive, status_code or None on connection error)."""
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    resp = await client.get(f"{self._supervisor_url}/v1/health")
+                return resp.status_code == 200, resp.status_code
+            except Exception:
+                return False, None
+
+        ok, status = await _probe_url()
+        if ok:
+            return True
+        # 4xx: supervisor is up but said no — don't retry, don't query state.
+        if status is not None and 400 <= status < 500:
+            return False
+
+        # Layer 2: consult sandbox state. Transitional → wait + retry.
+        sandbox_state = await self._daytona_sandbox_state()
+        TRANSITIONAL = {
+            "starting", "stopping", "pulling_image", "resizing",
+            "archiving", "destroying", "creating",
+        }
+        if sandbox_state in TRANSITIONAL:
+            # Wait briefly for the sandbox to leave the transitional
+            # state. We poll state rather than re-probing in a loop
+            # because the URL won't recover before state stabilises.
+            import asyncio as _asyncio
+            for _ in range(20):  # 20 * 0.5s = 10s
+                await _asyncio.sleep(0.5)
+                sandbox_state = await self._daytona_sandbox_state()
+                if sandbox_state not in TRANSITIONAL:
+                    break
+            # Stable now — give the URL one more shot.
+            ok, _ = await _probe_url()
+            return ok
+
+        # Stable non-started or supervisor-dead-inside-live-sandbox.
+        # Either way the caller's cold-recovery is the right move.
+        return False
+
+    async def _daytona_sandbox_state(self) -> str:
+        """Fetch current Daytona sandbox state string. Empty on error
+        — caller treats unknown state as non-transitional."""
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                resp = await client.get(f"{self._supervisor_url}/v1/health")
-                return resp.status_code == 200
+            from daytona_sdk import Daytona, DaytonaConfig
+            import os as _os
+            client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
+            loop = asyncio.get_running_loop()
+            sb = await loop.run_in_executor(
+                None, lambda: client.get(self._daytona_sandbox.id),
+            )
+            raw = sb.state
+            return (raw.value if hasattr(raw, "value") else str(raw)).lower()
         except Exception:
-            return False
+            return ""
 
     # ------------------------------------------------------------------ #
     # execute_prompt: per-prompt supervisor SSE stream                    #
@@ -211,9 +283,6 @@ class DaytonaSandboxSession(BaseSandboxSession):
         Per docs §7. No persistent server↔supervisor connection — opens
         on demand, closes at stopReason. Each event is broadcast to all
         subscribers and yielded to the caller.
-
-        For the wiring commit (sub-task 3) this is what replaces the
-        persistent _sse_reader_task in server.py.
         """
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("DaytonaSandboxSession.execute_prompt called before start()")

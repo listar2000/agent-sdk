@@ -99,13 +99,6 @@ def _configure_logging() -> None:
 # DB + in-memory state
 # ---------------------------------------------------------------------------
 
-_sandbox_locks: dict[str, asyncio.Lock] = {}
-
-
-def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
-    return _sandbox_locks.setdefault(sandbox_id, asyncio.Lock())
-
-
 # Strong references to fire-and-forget background tasks (the per-prompt
 # persisters spawned by POST /message). The event loop only holds weak
 # refs to tasks, so a caller that does ``asyncio.create_task(coro())``
@@ -124,29 +117,20 @@ async def lifespan(app):
     init_db()
     await init_pool()
 
-    # Startup reconciliation: cross-reference live provider state with
-    # DB sandbox rows so orphan containers/processes are reaped and
-    # survivors are reattached to _INSTANCES. Run per-provider reconciles
-    # in parallel so a slow provider doesn't serialize boot: in practice
-    # only Docker does real work (~seconds of ``docker ps``+``docker
-    # inspect``); daytona/local are no-ops, but future providers that
-    # talk to remote APIs should not queue behind docker.
+    # Startup reconciliation: kill orphan containers labeled with a
+    # sandbox_id whose DB row is gone or marked deleted. Per-provider in
+    # parallel so a slow provider doesn't serialise boot. In practice
+    # only Docker does real work; daytona/local/modal are no-ops today.
     async def _safe_reconcile(prov: str) -> None:
         try:
             await _providers_mod.reconcile_sandboxes(prov)
         except Exception as e:
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
-    # All four providers go through the dispatch; ones without a
-    # reconcile_on_startup hook (daytona, local, currently modal too) no-op.
-    # Listing modal here means the moment its module gains a reconcile hook
-    # we don't have to remember to wire it up.
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
 
-    # SessionPool's idle reaper hibernates pool sessions per
-    # docs/ephemeral-sandbox-design.md §6. The legacy SESSIONS-dict
-    # reaper was deleted in Phase 4 — pool.reap_idle is now the only
-    # eviction path.
+    # SessionPool owns idle eviction now (per
+    # docs/ephemeral-sandbox-design.md §6).
     from api.sandbox import start_reaper, shutdown_pool
     await start_reaper()
 
@@ -707,8 +691,24 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
 
 
 class _VolumeEditBody(BaseModel):
+    """Body for ``POST /volumes/{id}/files/edit``. Two shapes:
+
+    * Overwrite: ``{path, content}`` — write ``content`` as the
+      new file body (creating the file if needed).
+    * Search/replace: ``{path, old_string, new_string, replace_all?}``
+      — read the file, ``str.replace`` the substring, write back.
+      Server-side at the provider's volume layer; no sandbox needed.
+      ``replace_all`` defaults to false (single replacement; raises if
+      ``old_string`` matches more than once, mirroring the supervisor's
+      session-scoped /files/edit semantics).
+
+    Validation: at least one of ``content`` / ``old_string`` must be
+    present. ``content`` and ``old_string`` are mutually exclusive."""
     path: str
-    content: str  # plain text for v1
+    content: str | None = None
+    old_string: str | None = None
+    new_string: str | None = None
+    replace_all: bool = False
 
 
 class _VolumeUploadBody(BaseModel):
@@ -806,10 +806,54 @@ async def volume_files_exists(id_or_name: str, path: str):
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
     vol = await _resolve_volume(id_or_name)
     rel = _safe_path(body.path)
-    try:
-        await _providers_mod.volume_write(
-            vol.provider, vol.provider_ref, rel, body.content.encode()
+
+    # Validate the two shapes are not mixed.
+    if body.content is not None and body.old_string is not None:
+        raise HTTPException(
+            400, "supply either ``content`` (overwrite) or "
+                 "``old_string``+``new_string`` (search/replace), not both",
         )
+    if body.content is None and body.old_string is None:
+        raise HTTPException(
+            400, "must supply either ``content`` (overwrite) or "
+                 "``old_string`` (search/replace)",
+        )
+
+    try:
+        if body.content is not None:
+            # Overwrite mode — single provider call.
+            await _providers_mod.volume_write(
+                vol.provider, vol.provider_ref, rel, body.content.encode(),
+            )
+            return
+        # Search/replace at the volume layer (no sandbox required):
+        # read → str.replace → write. Same semantics as the
+        # supervisor's session-scoped /files/edit, but driven directly
+        # against the provider's volume primitives so callers don't
+        # need a live sandbox to edit files on the volume.
+        existing = (
+            await _providers_mod.volume_read(vol.provider, vol.provider_ref, rel)
+        ).decode("utf-8", errors="replace")
+        old = body.old_string or ""
+        new = body.new_string or ""
+        if not body.replace_all:
+            occurrences = existing.count(old)
+            if occurrences == 0:
+                raise HTTPException(404, f"old_string not found in {rel!r}")
+            if occurrences > 1:
+                raise HTTPException(
+                    409,
+                    f"old_string matches {occurrences} times in {rel!r}; "
+                    "pass replace_all=true to replace all",
+                )
+            updated = existing.replace(old, new, 1)
+        else:
+            updated = existing.replace(old, new)
+        await _providers_mod.volume_write(
+            vol.provider, vol.provider_ref, rel, updated.encode(),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise _volume_fs_err("Edit", vol.provider, e)
 
@@ -932,10 +976,7 @@ async def delete_sandbox_route(sandbox_id: str):
     except Exception as e:
         log.warning("DELETE /sandboxes %s: pool.release failed: %s", sandbox_id, e)
 
-    async with _get_sandbox_lock(sandbox_id):
-        _sandbox_locks.pop(sandbox_id, None)
-        await delete_sandbox(sandbox_id)
-
+    await delete_sandbox(sandbox_id)
     return {"status": "deleted"}
 
 
@@ -946,16 +987,12 @@ async def delete_sandbox_route(sandbox_id: str):
 
 @app.get("/admin/sessions")
 async def admin_list_sessions():
-    """List in-memory pool sessions. Useful for the dashboard + cleanup
-    debugging.
+    """List in-memory pool sessions for the dashboard + cleanup debugging.
 
-    Reads from the SessionPool's ``_active`` dict — that's the only
-    in-memory session registry now (legacy ``SESSIONS``/``_INSTANCES``
-    were either deleted or are no longer written to). The legacy
-    response shape is preserved so ``ui/dashboard.html`` doesn't
-    have to change: ``sessions[].agent_busy``/``active_rpc_id``/etc.
-    are constants since the pool's per-prompt SSE replaced the
-    persistent reader's busy-flag bookkeeping.
+    The legacy response shape is preserved so ``ui/dashboard.html``
+    doesn't have to change: ``sessions[].agent_busy`` /
+    ``active_rpc_id`` / etc. are constants — the pool's per-prompt SSE
+    replaced the persistent reader's busy-flag bookkeeping.
     """
     from api.sandbox import get_pool
     pool = get_pool()
@@ -967,11 +1004,9 @@ async def admin_list_sessions():
                 "current_sandbox_id": getattr(sess.state, "sandbox_id", None),
                 "sandbox_ref": getattr(sess.state, "sandbox_id", None),
                 "inner_session_id": sess._inner_session_id,
-                # ``agent_busy`` historically meant "a prompt is mid-flight";
-                # the pool model tracks per-prompt SSE inside ``execute_prompt``
-                # without exposing busy bookkeeping. The most meaningful
-                # observable proxy is "someone is watching events" — that's
-                # what the dashboard's "running" badge actually reads.
+                # "active subscriber" is the closest pool-level proxy for
+                # the dashboard's "running" badge — there's no per-prompt
+                # busy flag in the pool (per-prompt SSE replaces it).
                 "agent_busy": len(sess._subscribers) > 0,
                 "active_rpc_id": None,
                 "pending_count": 0,
@@ -1048,16 +1083,14 @@ async def get_session_route(session_id: str):
 
 @app.get("/sessions/{session_id}/status")
 async def session_status(session_id: str):
-    """Get session runtime status including last activity timestamp.
+    """Session runtime status including last activity. Routes through
+    SessionPool — brings the SandboxSession up if it's been reaped.
 
-    Routes through the SessionPool — ``pool.get_session`` brings the
-    SandboxSession up if it's been reaped. The legacy SessionState
-    fields ``agent_busy`` / ``active_rpc_id`` / ``pending_count`` /
-    ``session_subscriber_count`` / ``rpc_subscriber_count`` /
-    ``has_client`` / ``available_commands`` no longer have meaningful
-    pool equivalents (per-prompt SSE replaced the persistent reader,
-    and the pool's own subscriber list isn't a queue) — those keys
-    are kept in the response for shape-back-compat with constants."""
+    Several response keys (``agent_busy`` / ``active_rpc_id`` /
+    ``pending_count`` / ``rpc_subscriber_count`` / ``available_commands``)
+    are constants — the pool has no equivalent bookkeeping after
+    per-prompt SSE replaced the persistent reader. Kept for response-
+    shape back-compat with the dashboard."""
     from api.sandbox import get_pool
 
     pool_session = await get_pool().get_session(session_id)
@@ -1084,6 +1117,45 @@ async def session_status(session_id: str):
     }
 
 
+@app.get("/sessions/{session_id}/sandbox")
+async def session_sandbox_info(session_id: str):
+    """Sandbox metadata read straight from the SessionPool — no
+    sandboxes-table dependency.
+
+    Returns the same shape as ``GET /sandboxes/{id}`` (provider,
+    sandbox_ref, status, root, url for port-based providers,
+    marker_path for local) so test helpers and admin UIs that need
+    sandbox info can stay in session-id space and avoid the
+    sandbox-row-id round trip. Brings the SandboxSession up if it's
+    been hibernated."""
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+    state = pool_session.state
+    # Pool's state.type for unix is ``unix_local``; the legacy
+    # ``/sandboxes/{id}`` route returned ``local`` and downstream
+    # tooling (test helpers, dashboard) keys on that. Normalise.
+    provider = getattr(state, "type", "unknown")
+    if provider == "unix_local":
+        provider = "local"
+    sandbox_ref = getattr(state, "sandbox_id", None)
+    result: dict = {
+        "session_id": session_id,
+        "provider": provider,
+        "sandbox_ref": sandbox_ref,
+        "status": "running" if sandbox_ref else "missing",
+        "root": (state.recipe.root if state.recipe else None) or "/tmp",
+    }
+    url = pool_session.supervisor_url
+    if url:
+        result["url"] = url
+    if provider == "local" and sandbox_ref:
+        from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
+        args = _LOCAL_SPAWN_ARGS.get(sandbox_ref)
+        if args and args.get("marker_path"):
+            result["marker_path"] = args["marker_path"]
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Session log read endpoints
 # ---------------------------------------------------------------------------
@@ -1104,7 +1176,7 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 
 
 # ---------------------------------------------------------------------------
-# Session endpoints (keyed by session_id, use ensure_session_live)
+# Session endpoints (keyed by session_id, route through SessionPool)
 # ---------------------------------------------------------------------------
 
 
@@ -1187,8 +1259,9 @@ async def _sessions_create_lazy(data: dict) -> dict:
     """Create a session row only — no sandbox, no ACP, no scheduler.
 
     Used when the UI wants to render a session shell before paying the
-    provisioning cost (daytona: ~15-30 s; local: ~2-3 s). Sandbox appears
-    on the first ``/sessions/{id}/start-sandbox`` or ``/message``.
+    provisioning cost (daytona: ~15-30 s; local: ~2-3 s). The sandbox
+    appears on the first ``POST /sessions/{id}/message`` (the pool
+    cold-creates on demand).
     """
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
@@ -1351,11 +1424,10 @@ async def _sessions_create_eager(data: dict) -> dict:
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
-    # Back-compat shim: legacy callers (and the test helpers) still read
-    # ``current_sandbox_id`` and call ``GET /sandboxes/{id}`` against the
-    # sandboxes table. The pool only updates ``sandbox_state`` JSONB, so
-    # we mirror the row here. Removed once the sandboxes table itself
-    # goes away (the next cleanup PR).
+    # Back-compat shim: GET /sandboxes/{id} + DELETE /sandboxes/{id}
+    # (used by recovery test cleanup) still read the sandboxes table,
+    # which the pool's sandbox_state JSONB doesn't populate. Mirror the
+    # row here. Drop once those callers move to session-scoped routes.
     provider_ref = getattr(pool_session.state, "sandbox_id", None)
     sandbox_row_id = f"sb_{uuid.uuid4().hex[:12]}"
     if provider_ref:
@@ -1371,27 +1443,11 @@ async def _sessions_create_eager(data: dict) -> dict:
         ))
         await set_session_current_sandbox(session_id, sandbox_row_id)
 
-    # Caller may pass ``model`` / ``mode`` / ``thought_level`` at session
-    # create time as a convenience over a separate POST /config call.
-    # Forward them now while the supervisor's still warm — saves a round
-    # trip and matches what the SDK does. Best-effort: a transient ACP
-    # failure shouldn't blow up the create response.
-    #
-    # Look in BOTH ``data`` (top-level) and ``config_data`` (nested) —
-    # ``_merge_top_level_config`` above already promoted ``model`` from
-    # data into config_data, so ``data.get("model")`` returns None for
-    # the common SDK shape that sets it at the top level.
-    for key, method in (("model", "set_model"), ("mode", "set_mode"),
-                        ("thought_level", "set_thought_level")):
-        val = data.get(key) if data.get(key) is not None else config_data.get(key)
-        if val is not None:
-            log.info("sessions_create_eager: forwarding %s(%r) to session %s",
-                     method, val, session_id)
-            try:
-                await getattr(pool_session, method)(val)
-            except Exception as e:
-                log.warning("sessions_create_eager: %s(%r) failed: %s",
-                            method, val, e)
+    # Forward model/mode/thought_level so callers don't have to follow
+    # POST /sessions with a separate POST /config. Read both top-level
+    # and config_data because ``_merge_top_level_config`` already moved
+    # ``model`` into config_data. Best-effort.
+    await _forward_session_config(pool_session, data, config_data)
 
     return {
         "agent_id": agent_id,
@@ -1403,6 +1459,37 @@ async def _sessions_create_eager(data: dict) -> dict:
         "inner_session_id": pool_session._inner_session_id,
         "connected": True,
     }
+
+
+_SESSION_CONFIG_FIELDS = (
+    ("model", "set_model"),
+    ("mode", "set_mode"),
+    ("thought_level", "set_thought_level"),
+)
+
+
+async def _forward_session_config(
+    pool_session,
+    data: dict,
+    config_data: dict | None = None,
+) -> None:
+    """Apply caller-provided ``model`` / ``mode`` / ``thought_level`` to a
+    pool session via ACP ``set_*``. Best-effort: a transient ACP failure
+    logs and continues. Fields are looked up first in ``data`` (top-level
+    body — what the SDK sends), then in ``config_data`` (nested body —
+    what ``_merge_top_level_config`` may have promoted ``model`` into)."""
+    cfg = config_data or {}
+    for key, method in _SESSION_CONFIG_FIELDS:
+        val = data.get(key)
+        if val is None:
+            val = cfg.get(key)
+        if val is None:
+            continue
+        try:
+            await getattr(pool_session, method)(val)
+        except Exception as e:
+            log.warning("forward %s(%r) to session %s failed: %s",
+                        method, val, pool_session.session_id, e)
 
 
 async def _resolve_log_sandbox_id(session) -> str | None:
@@ -1514,33 +1601,49 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
 
 @app.post("/sessions/{session_id}/message")
 async def post_session_message(session_id: str, request: Request):
-    """Submit a prompt. Returns ``{rpc_id, status}`` immediately; events
-    flow via GET /events (multi-subscriber) or via the response body of
-    POST /message+stream (single-call).
-
-    Routes through ``api.sandbox.SessionPool`` (per
-    ``docs/ephemeral-sandbox-design.md`` §6 / §7): pool.get_session
-    cold-starts or warm-reuses the SandboxSession; execute_prompt opens
-    a per-prompt supervisor SSE for this prompt only and broadcasts to
-    /events subscribers via session._broadcast.
+    """Fire-and-forget execution. Returns ``{rpc_id, status}`` immediately;
+    events get persisted to ``session_log`` and broadcast to any
+    ``/events`` subscribers. Internally the same SSE generator that
+    backs ``POST /message+stream`` runs in a background task with the
+    response body discarded — single execution path for both endpoints.
     """
-    from api.sandbox import get_pool
-
     data = await _json_body(request)
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
 
     rpc_id = str(uuid.uuid4())
-    pool = get_pool()
-    session = await pool.get_session(session_id)
-    await _persist_user_message(session, message, rpc_id)
 
-    # Hold a strong reference so the task isn't GC'd mid-flight.
-    task = asyncio.create_task(_persist_prompt_events(session, message, rpc_id))
+    async def _drain() -> None:
+        async for _ in _execute_and_stream_sse(session_id, message, rpc_id):
+            pass
+
+    task = asyncio.create_task(_drain())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
+
+
+async def _log_session_acquire_error(session_id: str, rpc_id: str,
+                                     err: Exception) -> None:
+    """Best-effort error log when pool.get_session fails before we have
+    a session object to broadcast through. Writes the error to
+    session_log so /sessions/{id}/log readers see it.
+    """
+    try:
+        await log_event(
+            session_id=session_id, agent_id="", sandbox_id=None,
+            event_type=EVT_ERROR,
+            payload={
+                "prompt_id": rpc_id,
+                "kind": type(err).__name__,
+                "message": str(err)[:500],
+                "phase": "pool.get_session",
+            },
+        )
+    except Exception:
+        log.exception("failed to log session-acquire error for %s rpc=%s",
+                      session_id, rpc_id)
 
 
 # Track in-flight POST /message background drains so asyncio doesn't GC them.
@@ -1597,105 +1700,116 @@ async def session_events(session_id: str):
 async def post_session_message_stream(session_id: str, request: Request):
     """Submit a prompt and stream the reply as SSE in a single round-trip.
 
-    Convenience over the legacy two-step (``POST /message`` returns
-    ``rpc_id``; client opens ``GET /events`` to consume). This endpoint
-    returns the SSE stream as the response body — same protocol shape
-    as ``GET /events``, scoped to a single prompt.
+    Convenience over the two-step (``POST /message`` returns ``rpc_id``;
+    client opens ``GET /events`` to consume). This endpoint returns the
+    SSE stream as the response body — same wire format as ``GET /events``
+    (``event: rpc:<id>\\n<raw_block>\\n\\n``), scoped to a single
+    prompt. ``: heartbeat\\n\\n`` lines keep idle connections open
+    through nginx / cloudflare.
 
     Body: ``{"message": str, "interrupt": bool?}``. ``interrupt`` is
-    accepted for API parity but currently a no-op on the pool path
-    (in-flight prompts are scoped to their own ``execute_prompt``
-    coroutine; cancel-and-drain semantics belong with a future
-    ``/cancel`` cutover).
-
-    Returns: ``text/event-stream`` of the SSE blocks for this prompt
-    only. Wire format matches ``GET /events`` —
-    ``event: rpc:<id>\\n<raw_block>\\n\\n`` — so the SDK's
-    ``parse_acp_event`` works unchanged. ``: heartbeat\\n\\n`` lines
-    keep idle connections open through nginx / cloudflare.
+    accepted for API parity but currently a no-op on the pool path —
+    use ``POST /sessions/{id}/cancel`` to abort an in-flight turn.
 
     Both POST /message and GET /events continue to work unchanged for
     callers that need separate submit + multi-subscriber semantics.
     """
-    from api.sandbox import get_pool
-    from api.sandbox.session import _HEARTBEAT
-
     data = await _json_body(request)
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
 
-    pool = get_pool()
-    session = await pool.get_session(session_id)
     rpc_id = str(uuid.uuid4())
-    await _persist_user_message(session, message, rpc_id)
-
-    async def _stream():
-        # Subscribe BEFORE kicking off execute_prompt so broadcasts
-        # from the supervisor's first chunks land in our queue. The
-        # subscribe() generator registers the queue synchronously
-        # before its first ``await q.get()``, so create_task'ing
-        # _drive after entering the loop is race-free: drive only
-        # runs once the event loop yields at our q.get().
-        sub_iter = session.subscribe()
-
-        # The persister both drives execute_prompt AND writes session_log
-        # rows for each yielded event — same shared drain so /message and
-        # /message+stream produce identical log timelines.
-        async def _drive():
-            await _persist_prompt_events(session, message, rpc_id)
-
-        drive_task: asyncio.Task | None = None
-        try:
-            async for item in sub_iter:
-                if drive_task is None:
-                    # First iteration entered subscribe() body and
-                    # registered our queue; safe to start driving.
-                    drive_task = asyncio.create_task(_drive())
-                if item is _HEARTBEAT:
-                    yield ": heartbeat\n\n"
-                    continue
-                if isinstance(item, tuple) and len(item) == 2:
-                    tag, block = item
-                    # Filter to this prompt only — concurrent /events
-                    # subscribers may have triggered other prompts whose
-                    # blocks share the queue.
-                    if tag != rpc_id:
-                        continue
-                    yield f"event: rpc:{tag}\n{block}\n\n"
-                    if "stop_reason" in block or '"type":"done"' in block:
-                        return
-                # Parsed-dict broadcasts (errors, non-prompt notifications)
-                # are emitted as ``data:`` blocks for SDK parity with /events.
-                elif isinstance(item, dict):
-                    if item.get("rpc_id") != rpc_id:
-                        continue
-                    yield f"data: {json.dumps(item)}\n\n"
-                    if item.get("type") == "error":
-                        return
-        finally:
-            # _stream returns the moment the ``done`` block reaches the
-            # subscriber queue — but the persister (driven by
-            # execute_prompt's yield) is one async hop behind it, still
-            # awaiting log_event(turn_end). Await it (bounded) so the
-            # turn_end row lands before the response generator closes.
-            # Never cancel: a mid-write cancel leaves the DB connection
-            # in BAD state and the pool has to discard it. The timeout
-            # is the only escape hatch.
-            if drive_task is not None and not drive_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-
     return StreamingResponse(
-        _stream(),
+        _execute_and_stream_sse(session_id, message, rpc_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
+    """Canonical execution path: cold-recover (if needed) → log
+    user_message → subscribe + drive → emit per-rpc SSE blocks.
+
+    Used as the response body of ``POST /message+stream`` and as the
+    sole drain inside the background task fired by ``POST /message``.
+    Single source of truth for "execute one prompt and persist its
+    events" — both endpoints exercise identical persistence + broadcast
+    behaviour.
+
+    Yields SSE lines (``event:``/``data:``/``: heartbeat``) terminated
+    by ``\\n\\n``. The first yield is an immediate heartbeat so a
+    streaming client knows the request is alive while ``pool.get_session``
+    cold-recovers (30-60s on Daytona under contended control plane).
+    """
+    from api.sandbox import get_pool
+    from api.sandbox.session import _HEARTBEAT
+
+    yield ": heartbeat\n\n"
+
+    try:
+        session = await get_pool().get_session(session_id)
+    except Exception as e:
+        log.exception("pool.get_session(%s) failed for rpc=%s",
+                      session_id, rpc_id)
+        await _log_session_acquire_error(session_id, rpc_id, e)
+        err = {"type": "error", "rpc_id": rpc_id,
+               "error": {"message": str(e)[:500],
+                         "exception_type": type(e).__name__}}
+        yield f"data: {json.dumps(err)}\n\n"
+        return
+
+    await _persist_user_message(session, message, rpc_id)
+
+    # Eager registration so drive_task can start immediately — the
+    # generator-form ``subscribe()`` defers queue registration to the
+    # first iteration, which means a producer started before iterating
+    # would broadcast into a queue that hasn't been registered yet
+    # AND the consumer would block up to _HEARTBEAT_INTERVAL_S (20s)
+    # waiting for the empty queue to surface a sentinel before drive
+    # ever runs. The two-step split eliminates that 20s phantom delay.
+    sid, q = session.register_subscriber()
+
+    async def _drive():
+        await _persist_prompt_events(session, message, rpc_id)
+
+    drive_task = asyncio.create_task(_drive())
+    try:
+        async for item in session.iterate_subscriber(sid, q):
+            if item is _HEARTBEAT:
+                yield ": heartbeat\n\n"
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                tag, block = item
+                # Filter to this prompt only — concurrent /events
+                # subscribers may have triggered other prompts whose
+                # blocks share the queue.
+                if tag != rpc_id:
+                    continue
+                yield f"event: rpc:{tag}\n{block}\n\n"
+                if "stop_reason" in block or '"type":"done"' in block:
+                    return
+            elif isinstance(item, dict):
+                if item.get("rpc_id") != rpc_id:
+                    continue
+                yield f"data: {json.dumps(item)}\n\n"
+                if item.get("type") == "error":
+                    return
+    finally:
+        # The generator returns the moment the ``done`` block reaches
+        # us — but the persister (driven by execute_prompt's yield) is
+        # one async hop behind, still awaiting log_event(turn_end).
+        # Await it (bounded) so the turn_end row lands before we
+        # close. Never cancel: a mid-write cancel leaves the DB
+        # connection in BAD state and the pool has to discard it.
+        if drive_task is not None and not drive_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
 
 @app.post("/sessions/{session_id}/cancel")
@@ -1705,9 +1819,8 @@ async def session_cancel(session_id: str):
     Best-effort: sends ``session/cancel`` (JSON-RPC notification) to
     the supervisor's ACP child via the SessionPool. The ACP child
     aborts the turn; the ``done`` event arrives on the same SSE
-    subscribers that ``POST /message`` opened. If no session is
-    currently leased by the pool, this is a no-op (returns 200) —
-    same shape as the legacy "not busy" branch.
+    subscribers that ``POST /message`` opened. No active lease →
+    returns ``{"status": "ok", "detail": "no active lease"}``.
     """
     from api.sandbox import get_pool
 
@@ -1726,12 +1839,7 @@ async def release_session_route(session_id: str):
     Backed by ``api.sandbox.SessionPool.release``: writes a fresh
     filesystem snapshot to the volume and pauses (never deletes) the
     sandbox. Idempotent — a session with no active lease is a no-op.
-
-    Distinct from the legacy ``/hibernate`` and ``/stop-sandbox`` routes:
-    those operate on the in-memory ``SessionState`` + ``sandboxes`` row
-    plumbing. This endpoint targets the SessionPool that POST /message
-    and GET /events already use, so the snapshot here is exactly what
-    the next pool-mediated prompt restores from.
+    The next pool-mediated prompt restores from this snapshot.
     """
     from api.sandbox import deserialize, get_pool
     from api.sandbox.db_bindings import load_sandbox_state
@@ -1748,6 +1856,41 @@ async def release_session_route(session_id: str):
     }
 
 
+@app.delete("/sessions/{session_id}", status_code=204)
+async def delete_session_route(session_id: str):
+    """Release the pool lease and delete the session row.
+
+    Idempotent — missing session returns 204, not 404, so callers can
+    use this as a "make sure this session is gone" primitive without
+    branching on prior state. The underlying daytona/docker/local
+    sandbox is *paused* (via ``pool.release``), not destroyed —
+    matches ``DELETE /sandboxes/{id}`` semantics, and label-based
+    cleanup scripts (``cleanup_daytona_orphans.py``) reclaim the
+    compute later.
+    """
+    from api.sandbox import get_pool
+    try:
+        await get_pool().release(session_id)
+    except Exception as e:
+        log.warning("DELETE /sessions/%s: pool.release failed: %s",
+                    session_id, e)
+    # Drop the session row + any sandbox row currently linked to it via
+    # the back-compat shim. ``ON DELETE CASCADE`` on session_log handles
+    # that side; ``current_sandbox_id`` is FK with ``ON DELETE SET NULL``
+    # but we want to clean the row up entirely, so target it explicitly.
+    sess = await get_session(session_id)
+    if sess is not None:
+        sb_id = sess.get("current_sandbox_id")
+        if sb_id:
+            try:
+                await delete_sandbox(sb_id)
+            except Exception as e:
+                log.warning("DELETE /sessions/%s: delete_sandbox(%s) failed: %s",
+                            session_id, sb_id, e)
+        async with get_db() as conn:
+            await conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+
 @app.post("/sessions/{session_id}/config")
 async def session_set_config(session_id: str, request: Request):
     """Set mode/model/thought_level for a session via the SessionPool."""
@@ -1755,16 +1898,8 @@ async def session_set_config(session_id: str, request: Request):
     from api.sandbox import get_pool
 
     pool_session = await get_pool().get_session(session_id)
-    try:
-        if "mode" in data:
-            await pool_session.set_mode(data["mode"])
-        if "model" in data:
-            await pool_session.set_model(data["model"])
-        if "thought_level" in data:
-            await pool_session.set_thought_level(data["thought_level"])
-        return {"status": "ok"}
-    except Exception as e:
-        raise HTTPException(502, str(e))
+    await _forward_session_config(pool_session, data)
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
@@ -1812,45 +1947,12 @@ async def session_sandbox_exec(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_session_instance(session_id: str) -> ProviderInstance:
-    """Resolve a session_id to a ProviderInstance pointing at its
-    supervisor URL via the SessionPool. ``pool.get_session()`` brings
-    the compute up if needed; ``supervisor_url`` is set as part of
-    ``SandboxSession.start()``.
-
-    The ProviderInstance shim is kept (vs. returning the URL string
-    directly) so ``_proxy_instance`` / ``_download_from_instance``
-    don't need signature changes."""
+async def _resolve_supervisor_url(session_id: str) -> str:
+    """Resolve a session_id to its supervisor URL via the SessionPool.
+    ``pool.get_session()`` brings the compute up if needed;
+    ``supervisor_url`` is set as part of ``SandboxSession.start()``."""
     from api.sandbox import get_pool
-
-    pool_session = await get_pool().get_session(session_id)
-    state = pool_session.state
-    return ProviderInstance(
-        provider=getattr(state, "type", "unknown"),
-        url=pool_session.supervisor_url or "",
-        root=(state.recipe.root if state.recipe else None) or "/tmp",
-        sandbox_id=getattr(state, "sandbox_id", None),
-    )
-
-
-async def _proxy_instance(
-    instance: ProviderInstance, method: str, path: str, *,
-    params: dict | None = None, json: dict | None = None,
-    timeout: int = 30,
-) -> Response:
-    """Forward a request to a sandbox's supervisor via its ProviderInstance."""
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.request(
-                method, f"{instance.url}{path}", params=params, json=json,
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    return (await get_pool().get_session(session_id)).supervisor_url or ""
 
 
 async def _proxy_from_session(
@@ -1861,15 +1963,27 @@ async def _proxy_from_session(
     """Forward a request to the session's supervisor (resolved through
     the SessionPool) and return its JSON response. Used by every
     session-scoped file proxy."""
-    instance = await _resolve_session_instance(session_id)
-    return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
+    url = await _resolve_supervisor_url(session_id)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.request(
+                method, f"{url}{path}", params=params, json=json,
+            )
+            return Response(
+                content=r.content,
+                status_code=r.status_code,
+                media_type="application/json",
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 
 
-
-async def _download_from_instance(instance: ProviderInstance, path: str) -> Response:
+async def _download_from_session(session_id: str, path: str) -> Response:
+    """Stream a download from the session's supervisor."""
+    url = await _resolve_supervisor_url(session_id)
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(f"{instance.url}/v1/files/download", params={"path": path})
+            r = await client.get(f"{url}/v1/files/download", params={"path": path})
             return Response(
                 content=r.content,
                 status_code=r.status_code,
@@ -1938,8 +2052,7 @@ async def session_files_rename(session_id: str, request: Request):
 @app.get("/sessions/{session_id}/files/download")
 async def session_files_download(session_id: str, path: str):
     """Download a file as raw bytes from the session's sandbox."""
-    instance = await _resolve_session_instance(session_id)
-    return await _download_from_instance(instance, path)
+    return await _download_from_session(session_id, path)
 
 
 # ---------------------------------------------------------------------------

@@ -142,6 +142,16 @@ class TestLiveness:
 
     @pytest.mark.asyncio
     async def test_force_probe_runs_even_when_alive(self):
+        """``force_probe=True`` must override the cached ``alive`` state.
+        The "test 7" race (external supervisor kill between prompts —
+        see test_persistent_sse_supervisor_killed_immediate_message) makes
+        the cached signal stale-positive: supervisor was alive when we
+        last observed a chunk, but is dead now. force_probe MUST hit
+        the probe to detect this. Tolerance for transient probe failures
+        (e.g. Daytona's signed-URL 502 propagation) is the responsibility
+        of the per-provider _liveness_probe (bounded retry there), not
+        this oracle's caching policy.
+        """
         probe_calls = []
 
         async def _probe() -> bool:

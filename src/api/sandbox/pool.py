@@ -1,8 +1,11 @@
 """SessionPool — the entire recovery surface, in one method.
 
-Per ``docs/ephemeral-sandbox-design.md`` §6. Replaces today's four
-recovery functions plus _INSTANCES dict plus _session_locks plus
-is_hibernated flag plus _ensure_state_live plus _rebind_state.
+Per ``docs/ephemeral-sandbox-design.md`` §6. Replaced the legacy
+recovery chain (``_ensure_sandbox_alive`` / ``_type1_recover`` /
+``_type2_recover`` / ``_rebind_state``) plus the in-memory
+``_INSTANCES`` and ``SESSIONS`` registries plus the ``_session_locks``
+dict plus the ``is_hibernated`` flag — all gone, all replaced by this
+one class.
 
 At-most-one active SandboxSession per session_id. Concurrent
 ``get_session`` calls for the same session_id serialise on
@@ -29,8 +32,10 @@ SessionFactory = Callable[[str, SandboxState], BaseSandboxSession]
 
 
 # Type for the function that loads sandbox_state JSONB for a session_id.
-# Real impl reads from sessions.sandbox_state under SELECT ... FOR UPDATE
-# (per docs §15.2). Tests can pass a mock.
+# Real impl reads from sessions.sandbox_state. Single-process
+# serialization uses the per-session asyncio lock below; multi-process
+# would need a single transaction wrapping the whole load→start→save
+# sequence (see db_bindings.py module docstring). Tests can pass a mock.
 LoadState = Callable[[str], "asyncio.Future[dict[str, Any] | None]"]
 SaveState = Callable[[str, dict[str, Any]], "asyncio.Future[None]"]
 
@@ -166,11 +171,35 @@ class SessionPool:
                 return sess
         return None
 
-    async def shutdown_all(self) -> None:
+    async def shutdown_all(self, *, per_session_timeout_s: float = 10.0) -> None:
         """Stop the world: snapshot + shutdown every active session.
-        Used at server-graceful-shutdown."""
-        for sid in list(self._active.keys()):
-            await self.release(sid)
+
+        Used at server-graceful-shutdown. Releases run in parallel and
+        each is bounded by ``per_session_timeout_s`` so one hung provider
+        (Daytona signed-URL 502, docker daemon stalled) can't block the
+        whole shutdown. A timed-out release is logged and dropped — the
+        in-memory session is still removed via ``_active.pop`` inside
+        ``release``, so the next start cleanly cold-recovers.
+        """
+        async def _bounded(sid: str) -> None:
+            try:
+                await asyncio.wait_for(
+                    self.release(sid), timeout=per_session_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "shutdown_all: release(%s) exceeded %.1fs, dropping",
+                    sid, per_session_timeout_s,
+                )
+                # release acquired the lock but didn't finish; pop the
+                # active entry so a cold recovery doesn't see the stale
+                # session object on next get_session.
+                self._active.pop(sid, None)
+
+        await asyncio.gather(
+            *(_bounded(sid) for sid in list(self._active.keys())),
+            return_exceptions=True,
+        )
 
 
 async def _safe_shutdown(session: BaseSandboxSession) -> None:

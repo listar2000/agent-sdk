@@ -497,25 +497,17 @@ async def ensure_supervisor_url(
 # ---------------------------------------------------------------------------
 
 async def reconcile_on_startup() -> None:
-    """Kill orphan containers and rebuild ``_INSTANCES`` from labeled survivors.
-
-    On server restart, the in-process ``_INSTANCES`` map (used by the
-    port allocator / destroy path) is empty. Without reconciliation the
-    server has no way to reattach to containers that are still running
-    and would accumulate orphaned containers over time.
+    """Force-remove orphan containers labeled with a stale sandbox_id.
 
     For each container labeled ``agent-sdk.sandbox-id=<id>``:
-
-    * Look up the DB sandbox row (via ``api.db.get_sandbox``).
-    * If no DB row exists, or the row is marked ``deleted``, force-remove
-      the container — it's an orphan.
-    * ``stopped`` rows are NOT orphans: a stopped row + an exited
-      container is a legitimate resumable pair waiting for
-      ``docker start``.  Force-removing that container would erase
-      state the user is about to resume.
-    * Otherwise inspect the container for its published host port and
-      reconstruct a ``ProviderInstance`` in ``_INSTANCES`` keyed by the
-      sandbox_id, so later destroy/stop calls can find it.
+      * No DB row, or row marked ``deleted`` → ``docker rm -f`` (orphan).
+      * ``stopped`` rows are NOT orphans — a stopped row + exited
+        container is a legitimate resumable pair waiting for ``docker
+        start``; removing the container would erase state the user is
+        about to resume.
+      * Live rows: leave alone. The SessionPool resolves compute on
+        demand via ``state.sandbox_id``; there's no per-process
+        ``_INSTANCES`` cache to repopulate anymore.
 
     Failures on individual containers are logged but never raised so a
     single bad container can't prevent the server from starting.
@@ -539,14 +531,11 @@ async def reconcile_on_startup() -> None:
         log.warning("docker reconcile: ps failed: %s", e)
         return
 
-    # Live import so tests that patch _INSTANCES in api.server see the same
-    # dict. The module-level singleton in api.server is the source of truth.
-    try:
-        from .. import server as srv
-        instances_map = srv._INSTANCES  # type: ignore[attr-defined]
-    except Exception:
-        instances_map = None
-
+    # Reconcile only does orphan cleanup now: any container labeled with
+    # an unknown / deleted sandbox_id gets force-removed. The legacy
+    # "rebuild _INSTANCES entry for survivors" branch is gone — the
+    # SessionPool resolves compute through ``state.sandbox_id`` on each
+    # ``pool.get_session`` call, no per-process cache to repopulate.
     for line in out.decode(errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -560,9 +549,9 @@ async def reconcile_on_startup() -> None:
         except Exception as e:
             log.warning("docker reconcile: get_sandbox(%s) failed: %s", sandbox_id, e)
             continue
-        # "stopped" is NOT orphan — it's a resumable pair (DB row + exited
-        # container waiting for docker start).  Only ``deleted`` (or no row
-        # at all) qualifies the container as an orphan.
+        # "stopped" rows are NOT orphans — they're resumable pairs (DB
+        # row + exited container waiting for docker start). Only deleted
+        # rows (or none) qualify the container as an orphan.
         is_orphan = (
             sb is None
             or getattr(sb, "status", None) == "deleted"
@@ -578,43 +567,6 @@ async def reconcile_on_startup() -> None:
                 log.warning(
                     "docker reconcile: rm -f %s failed: %s", container_id[:12], e
                 )
-            continue
-
-        # Live (or resumable) survivor — rebuild an instance entry so
-        # destroy_sandbox / stop_sandbox can find the container by port.
-        if instances_map is None:
-            continue
-        try:
-            port_out = await _run_docker_checked(
-                "inspect",
-                "--format",
-                "{{(index (index .NetworkSettings.Ports \""
-                f"{_SUPERVISOR_CONTAINER_PORT}/tcp"
-                "\") 0).HostPort}}",
-                container_id,
-                timeout=15,
-            )
-            port_s = port_out.decode(errors="replace").strip()
-            port = int(port_s) if port_s else None
-        except Exception as e:
-            log.warning(
-                "docker reconcile: inspect %s port failed: %s",
-                container_id[:12], e,
-            )
-            port = None
-        url = f"http://localhost:{port}" if port else ""
-        instances_map[sandbox_id] = ProviderInstance(
-            provider="docker",
-            url=url,
-            root=getattr(sb, "root", _AGENT_HOME_IN),
-            sandbox_id=container_id,
-            container_id=container_id,
-            port=port,
-        )
-        log.info(
-            "docker reconcile: reattached sandbox_id=%s container=%s port=%s state=%s",
-            sandbox_id, container_id[:12], port, state,
-        )
 
 
 # ---------------------------------------------------------------------------

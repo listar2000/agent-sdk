@@ -137,11 +137,9 @@ async def start_supervisor_in_sandbox(
     # (0) Idempotency fast-path: if a supervisor is already healthy on
     # this port (left over from a prior call in the same sandbox), skip
     # the 2-3 s extract+spawn dance and just mint a fresh signed URL
-    # pointing at it. Cuts the recovery cascade time dramatically when
-    # the SSE reader's _recover_after_disconnect fires concurrently with
-    # POST /message's _ensure_state_live → _rebind_state — both end up
-    # here under separate sandbox locks, and without this they each
-    # respawn node, churning the signed URL twice for no gain.
+    # pointing at it. Saves redundant respawns when concurrent recovery
+    # paths (Type 1 retries, pool resume + a parallel cancel) both land
+    # here under separate sandbox locks.
     t0 = time.monotonic()
     try:
         existing = await loop.run_in_executor(None, lambda: _exec(
@@ -736,18 +734,17 @@ async def delete_daytona_volume(provider_ref: str) -> None:
 async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
     """Return one of: 'running' | 'stopped' | 'missing' | 'error'.
 
-    The caller (``_ensure_sandbox_locked``) treats ``error`` as
-    unrecoverable: it destroys the sandbox + nukes the DB row + provisions
-    a brand-new replacement (Type 2). So transitional states like
-    ``stopping`` / ``starting`` (5–30 s under load) MUST classify by their
-    target state, not as ``error`` — otherwise an in-flight stop or boot
-    that races a POST /message destroys the live sandbox the caller is
-    trying to recover.
+    Callers (the SessionPool's recovery path) treat ``error`` as
+    unrecoverable and provision a brand-new replacement. Transitional
+    states like ``stopping`` / ``starting`` (5–30 s under load) MUST
+    classify by their target state, not as ``error`` — otherwise an
+    in-flight stop or boot that races a POST /message destroys the
+    live sandbox the caller is trying to recover.
 
-    Default for an unrecognized state is ``running`` rather than ``error``
-    for the same reason: a future Daytona state name we haven't seen yet
-    should fall through to ``_wait_for_health`` / ``start_sandbox``, not
-    to destroy + Type 2.
+    Default for an unrecognized state is ``running`` rather than
+    ``error`` for the same reason: a future Daytona state name we
+    haven't seen yet should fall through to ``_wait_for_health`` /
+    ``start_sandbox``, not to destroy + replace.
     """
     try:
         client = _get_daytona_client()
