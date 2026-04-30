@@ -44,6 +44,15 @@ class BaseSandboxSession(abc.ABC):
         # Subscriber fan-out: persistent across many execute_prompt calls
         # so that GET /events can stay open across N prompts.
         self._subscribers: dict[str, asyncio.Queue[Any]] = {}
+        # Set by concrete start(); used by file-proxy endpoints to talk
+        # to the supervisor without going through ACP.
+        self._supervisor_url: str | None = None
+
+    @property
+    def supervisor_url(self) -> str | None:
+        """Public read of the supervisor URL set by ``start()``. None
+        before start or after shutdown. Used by file-browse endpoints."""
+        return self._supervisor_url
 
     # --- Lifecycle methods (concrete subclasses override) ---
 

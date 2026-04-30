@@ -125,7 +125,7 @@ async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
     # body raises. Defence-in-depth alongside the ``agent_sdk_origin``
     # label on every daytona create — if the test crashes after this
     # call but before its own cleanup, the fixture finalizer still runs.
-    _CREATED_SESSIONS.append(sess["session_id"])
+    _CREATED_SESSIONS.append(sess["id"])
     return sess
 
 
@@ -181,7 +181,7 @@ async def _send_message(client: httpx.AsyncClient, session_id: str, message: str
     resp = await client.post(
         f"{SERVER}/sessions/{session_id}/message",
         json={"message": message},
-        timeout=30,
+        timeout=PROMPT_TIMEOUT,
     )
     assert resp.status_code == 200, f"message post failed: {resp.text}"
     return resp.json()["rpc_id"]
@@ -380,7 +380,7 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         # Baseline: verify sandbox is live and record sandbox_ref from the API
@@ -457,7 +457,7 @@ async def test_server_delete_persists_workspace(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         reply1 = await _write_marker_and_read(client, session_id, marker)
@@ -504,7 +504,7 @@ async def test_external_delete_preserves_agent_memory(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner={inner_before}")
 
@@ -553,7 +553,7 @@ async def test_session_resume_after_stop(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
@@ -592,7 +592,7 @@ async def test_session_resume_after_delete(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
@@ -653,7 +653,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
 
@@ -756,7 +756,7 @@ async def test_message_immediately_after_stop(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
 
@@ -818,7 +818,7 @@ async def test_message_after_stop_with_delay(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
 
@@ -987,7 +987,7 @@ async def test_persistent_sse_stop_then_message(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         async with _PersistentSse(client, session_id) as sse:
@@ -1048,7 +1048,7 @@ async def test_persistent_sse_external_delete_then_message(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         async with _PersistentSse(client, session_id) as sse:
@@ -1096,7 +1096,7 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
@@ -1155,7 +1155,7 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         async with _PersistentSse(client, session_id) as sse:
@@ -1214,7 +1214,7 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         async with _PersistentSse(client, session_id) as sse:
@@ -1288,7 +1288,7 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         async with _PersistentSse(client, session_id) as sse:
@@ -1377,7 +1377,7 @@ async def test_session_survives_supervisor_dir_wiped_from_volume():
 
     async with httpx.AsyncClient() as client:
         sess = await _quick_session(client, provider)
-        session_id = sess["session_id"]
+        session_id = sess["id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         reply1 = await _ask(client, session_id, "Reply with a single short word.")

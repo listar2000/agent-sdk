@@ -1,6 +1,6 @@
 """REST API server — agent/sandbox/session orchestration layer.
 
-Run: uvicorn src.api.server:app --port 7778
+Run: uvicorn api.server:app --port 7778
 """
 
 import asyncio
@@ -31,7 +31,6 @@ from .db import (
     add_supervisor_agent_type,
     close_pool,
     delete_agent,
-    delete_sandbox,
     delete_volume,
     get_agent,
     get_any_session_for_sandbox,
@@ -44,64 +43,24 @@ from .db import (
     init_db,
     init_pool,
     list_agents,
-    list_sandboxes,
     list_volumes,
     log_event,
     update_session_env,
     update_session_secrets,
-    set_session_current_sandbox,
     upsert_agent,
-    upsert_sandbox,
     upsert_session,
     upsert_volume,
 )
 from .models import (
-    _KICK_SENTINEL,
-    EVT_ASSISTANT_MESSAGE,
-    EVT_ERROR,
-    EVT_REASONING,
-    EVT_TOOL_CALL,
-    EVT_TOOL_RESULT,
-    EVT_USAGE,
-    EVT_USER_MESSAGE,
     STATUS_RUNNING,
-    STATUS_STOPPED,
     AgentConfig,
     AgentRecord,
     SandboxRecord,
     VolumeRecord,
 )
 from . import providers as _providers_mod
-from .providers import (
-    PORT_BASED_PROVIDERS,
-    ProviderInstance,
-    SandboxMissingError,
-    allocate_sandbox_port,
-    create_instance,
-    default_cwd_for_provider,
-    destroy_instance,
-    free_sandbox_port,
-    kill_supervisor_in_sandbox,
-    stop_instance,
-)
+from .providers import ProviderInstance, default_cwd_for_provider
 from .providers._shared import _safe_path as _shared_safe_path
-from .sse import (
-    UT_COMMANDS_UPDATE,
-    UT_MESSAGE_CHUNK,
-    UT_MESSAGE_DELTA,
-    UT_THOUGHT_CHUNK,
-    UT_TOOL_CALL,
-    UT_TOOL_CALL_UPDATE,
-    UT_TOOL_STARTED,
-    UT_USAGE_UPDATE,
-    UT_USAGE_UPDATED,
-    classify_message_content,
-    extract_tool_call_id,
-    extract_tool_name,
-    extract_tool_response,
-    parse_acp_payload,
-    parse_sse_data,
-)
 
 log = logging.getLogger(__name__)
 
@@ -238,13 +197,6 @@ async def _require_agent(agent_id: str) -> AgentRecord:
     return rec
 
 
-async def _require_sandbox(sandbox_id: str) -> SandboxRecord:
-    rec = await get_sandbox(sandbox_id)
-    if rec is None:
-        raise HTTPException(404, "sandbox not found")
-    return rec
-
-
 async def _require_session_row(session_id: str) -> dict:
     rec = await get_session(session_id)
     if rec is None:
@@ -306,19 +258,25 @@ def _skills_install_commands(skills) -> list[str]:
     return [f"npx -y skills add {shlex.quote(source)} --all -g" for source in sources]
 
 
-async def _install_skills_locally(skills) -> None:
-    """Install skills on the local host (for the local provider)."""
-    for cmd in _skills_install_commands(skills):
-        log.info("installing skill (local): %s", cmd)
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        if proc.returncode != 0:
-            raise RuntimeError(f"skill install failed: {stderr.decode()[:500]}")
-        log.info("skill installed: %s", stdout.decode()[-200:].strip())
+_CONFIG_KEYS = (
+    "model",
+    "prompt",
+    "tools",
+    "mcp_servers",
+    "skills",
+    "agent_type",
+)
+
+# Keys that were once inside AgentConfig but now live on session / sandbox
+# rows. `/agents` POST rejects them with 400 so callers migrate cleanly;
+# `/sessions` consumes them and routes them to the right row/state.
+_AGENT_REJECTED_KEYS = (
+    "cwd",
+    "env",
+    "dockerfile",
+    "dockerfile_content",
+    "shared_mounts",
+)
 
 
 def _merge_top_level_config(data: dict, config_data: dict) -> None:
@@ -396,18 +354,6 @@ def _build_spawn_env_from_row(rec: dict) -> dict[str, str]:
     return _merge_env(rec.get("env") or {}, rec.get("secrets") or {})
 
 
-async def _spawn_env_for_sandbox(sandbox_id: str) -> dict[str, str]:
-    """Best-effort spawn_env for a sandbox-level operation (start/exec/etc).
-
-    All sessions on a given sandbox share the same supervisor process, so any
-    session on the sandbox has the right env/secrets. If no session exists yet
-    (e.g. provisioned but unused), returns ``{}`` — strict-mode will still
-    strip auth keys, so auto-recovery simply has nothing extra to inject.
-    """
-    rec = await get_any_session_for_sandbox(sandbox_id)
-    return _build_spawn_env_from_row(rec) if rec else {}
-
-
 def _merge_env(*sources: dict[str, str] | None) -> dict[str, str]:
     """Merge env dicts (later sources win); None is treated as empty."""
     out: dict[str, str] = {}
@@ -415,51 +361,6 @@ def _merge_env(*sources: dict[str, str] | None) -> dict[str, str]:
         if s:
             out.update(s)
     return out
-
-
-def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
-    """Write dockerfile_content from request data to a temp file. Returns path or None."""
-    path = data.get(key)
-    if path:
-        return path
-    content = data.get("dockerfile_content")
-    if not content:
-        return None
-    tmp = tempfile.NamedTemporaryFile(suffix=".Dockerfile", delete=False, mode="w")
-    tmp.write(content)
-    tmp.close()
-    return tmp.name
-
-
-def _sandbox_record(
-    sandbox_id: str,
-    provider: str,
-    instance: ProviderInstance,
-    *,
-    volume_id: str,
-    subpath: str,
-    root_fallback: str = "/tmp",
-    status: str = STATUS_RUNNING,
-    dockerfile: str | None = None,
-    shared_mounts: list[str] | None = None,
-) -> SandboxRecord:
-    """Build a SandboxRecord from a freshly-provisioned ProviderInstance.
-
-    ``dockerfile`` + ``shared_mounts`` are the provisioning identity of the
-    sandbox — frozen at create time, read unchanged by later recoveries.
-    """
-    return SandboxRecord(
-        id=sandbox_id,
-        provider=provider,
-        sandbox_ref=instance.sandbox_id or sandbox_id,
-        status=status,
-        root=instance.root or root_fallback,
-        volume_id=volume_id,
-        subpath=subpath,
-        listen_port=instance.port,
-        dockerfile=dockerfile,
-        shared_mounts=shared_mounts or [],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -515,12 +416,6 @@ async def delete_agent_route(agent_id: str):
 
 
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-# Subpath: POSIX-ish relative path, no traversal, no shell/comma/newline.
-# Docker ``--mount`` parses the value as comma-separated k=v; a subpath of
-# ``foo,readonly`` would inject an unintended mount flag. Local provider
-# further runs ``_safe_path`` on it. We pre-filter at the HTTP layer so all
-# three providers see a path that can't smuggle metacharacters.
-_SUBPATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,255}$")
 
 
 class _VolumeCreateBody(BaseModel):
@@ -538,20 +433,6 @@ def _validate_volume_name(name: str) -> None:
     """
     if not isinstance(name, str) or not _VOLUME_NAME_RE.match(name):
         raise HTTPException(400, "volume name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-
-
-def _validate_subpath(subpath: str) -> None:
-    """Reject subpaths that could inject into docker mount flags or escape."""
-    if not isinstance(subpath, str) or not _SUBPATH_RE.match(subpath):
-        raise HTTPException(
-            400,
-            "subpath must match [A-Za-z0-9][A-Za-z0-9._/-]{0,255} "
-            "(no traversal, commas, or whitespace)",
-        )
-    # Defence-in-depth: reject ``..`` segment even though the regex already
-    # blocks that as a whole-segment match.
-    if any(seg == ".." for seg in subpath.split("/")):
-        raise HTTPException(400, "subpath must not contain '..'")
 
 
 async def _resolve_volume(id_or_name: str) -> "VolumeRecord":
@@ -1092,8 +973,6 @@ async def _sessions_create_lazy(data: dict) -> dict:
     }
 
 
-
-
 @app.post("/sessions/{session_id}/message")
 async def post_session_message(session_id: str, request: Request):
     """Submit a prompt. Returns ``{rpc_id, status}``; events flow via
@@ -1244,79 +1123,108 @@ async def release_session_route(session_id: str):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Filesystem proxy: forwards /v1/files/* to the supervisor on a live sandbox  #
+# --------------------------------------------------------------------------- #
+
+
+async def _supervisor_url_for_session(session_id: str) -> str:
+    """Resolve a session_id to a live supervisor URL.
+
+    Cold-starts the SandboxSession if it isn't in the pool. Per the
+    ephemeral design (docs §6) the pool is the only authority on which
+    compute is alive."""
+    from api.sandbox import get_pool
+    session = await get_pool().get_session(session_id)
+    url = session.supervisor_url
+    if url is None:
+        raise HTTPException(503, f"session {session_id} has no supervisor url")
+    return url
+
+
+def _supervisor_url_for_sandbox(sandbox_id: str) -> str:
+    """Reverse-lookup a provider sandbox_id to a supervisor URL.
+
+    Sandbox identity isn't durable in the ephemeral model, so we only
+    resolve sandboxes the pool currently holds. If nothing is active
+    with this id, return 404."""
+    from api.sandbox import get_pool
+    sess = get_pool().find_by_sandbox_id(sandbox_id)
+    if sess is None or sess.supervisor_url is None:
+        raise HTTPException(404, f"sandbox {sandbox_id} not active")
+    return sess.supervisor_url
+
+
+async def _proxy_files(
+    supervisor_url: str, method: str, path: str, *, timeout: float = 30, **kw,
+) -> Response:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.request(method, f"{supervisor_url}{path}", **kw)
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/json"),
+    )
+
+
+async def _proxy_download(supervisor_url: str, path: str) -> Response:
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(f"{supervisor_url}/v1/files/download", params={"path": path})
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/octet-stream"),
+        headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
+    )
+
+
 @app.get("/sandboxes/{sandbox_id}/files/tree")
 async def sandbox_files_tree(sandbox_id: str):
-    """Return the recursive directory tree of the sandbox root."""
-    return await _proxy_to_supervisor(sandbox_id, "GET", "/v1/files/tree")
+    return await _proxy_files(_supervisor_url_for_sandbox(sandbox_id), "GET", "/v1/files/tree")
 
 
 @app.get("/sandboxes/{sandbox_id}/files/read")
 async def sandbox_files_read(sandbox_id: str, path: str):
-    """Read a single file. Supervisor enforces path-traversal protection."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "GET", "/v1/files/read", params={"path": path},
+    return await _proxy_files(
+        _supervisor_url_for_sandbox(sandbox_id), "GET", "/v1/files/read", params={"path": path},
     )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/edit")
 async def sandbox_files_edit(sandbox_id: str, request: Request):
-    """Edit or create a file.
-
-    Body: ``{"path": ..., "old_string": ..., "new_string": ..., "replace_all": bool}``.
-    When ``old_string`` is empty, writes/creates the file with ``new_string`` as content.
-    """
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/edit",
+    return await _proxy_files(
+        _supervisor_url_for_sandbox(sandbox_id), "POST", "/v1/files/edit",
         json=await _json_body(request),
     )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/upload")
 async def sandbox_files_upload(sandbox_id: str, request: Request):
-    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/upload",
+    return await _proxy_files(
+        _supervisor_url_for_sandbox(sandbox_id), "POST", "/v1/files/upload",
         json=await _json_body(request), timeout=60,
     )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/delete")
 async def sandbox_files_delete(sandbox_id: str, request: Request):
-    """Delete a file or directory. Body: ``{"path": ...}``."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/delete",
+    return await _proxy_files(
+        _supervisor_url_for_sandbox(sandbox_id), "POST", "/v1/files/delete",
         json=await _json_body(request),
     )
 
 
 @app.post("/sandboxes/{sandbox_id}/files/rename")
 async def sandbox_files_rename(sandbox_id: str, request: Request):
-    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/rename",
+    return await _proxy_files(
+        _supervisor_url_for_sandbox(sandbox_id), "POST", "/v1/files/rename",
         json=await _json_body(request),
     )
 
 
 @app.get("/sandboxes/{sandbox_id}/files/download")
 async def sandbox_files_download(sandbox_id: str, path: str):
-    """Download a file as raw bytes (forwards content-type + disposition)."""
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    return await _download_from_instance(instance, path)
-
-
-async def _download_from_instance(instance: ProviderInstance, path: str) -> Response:
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(f"{instance.url}/v1/files/download", params={"path": path})
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type=r.headers.get("content-type", "application/octet-stream"),
-                headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
+    return await _proxy_download(_supervisor_url_for_sandbox(sandbox_id), path)
 
 
 # ---------------------------------------------------------------------------
@@ -1326,59 +1234,52 @@ async def _download_from_instance(instance: ProviderInstance, path: str) -> Resp
 
 @app.get("/sessions/{session_id}/files/tree")
 async def session_files_tree(session_id: str):
-    """Return the recursive directory tree of the session's sandbox."""
-    return await _proxy_from_session(session_id, "GET", "/v1/files/tree")
+    return await _proxy_files(await _supervisor_url_for_session(session_id), "GET", "/v1/files/tree")
 
 
 @app.get("/sessions/{session_id}/files/read")
 async def session_files_read(session_id: str, path: str):
-    """Read a single file from the session's sandbox."""
-    return await _proxy_from_session(
-        session_id, "GET", "/v1/files/read", params={"path": path},
+    return await _proxy_files(
+        await _supervisor_url_for_session(session_id), "GET", "/v1/files/read",
+        params={"path": path},
     )
 
 
 @app.post("/sessions/{session_id}/files/edit")
 async def session_files_edit(session_id: str, request: Request):
-    """Edit or create a file. Body: same shape as ``/sandboxes/{id}/files/edit``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/edit",
+    return await _proxy_files(
+        await _supervisor_url_for_session(session_id), "POST", "/v1/files/edit",
         json=await _json_body(request),
     )
 
 
 @app.post("/sessions/{session_id}/files/upload")
 async def session_files_upload(session_id: str, request: Request):
-    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/upload",
+    return await _proxy_files(
+        await _supervisor_url_for_session(session_id), "POST", "/v1/files/upload",
         json=await _json_body(request), timeout=60,
     )
 
 
 @app.post("/sessions/{session_id}/files/delete")
 async def session_files_delete(session_id: str, request: Request):
-    """Delete a file or directory. Body: ``{"path": ...}``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/delete",
+    return await _proxy_files(
+        await _supervisor_url_for_session(session_id), "POST", "/v1/files/delete",
         json=await _json_body(request),
     )
 
 
 @app.post("/sessions/{session_id}/files/rename")
 async def session_files_rename(session_id: str, request: Request):
-    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/rename",
+    return await _proxy_files(
+        await _supervisor_url_for_session(session_id), "POST", "/v1/files/rename",
         json=await _json_body(request),
     )
 
 
 @app.get("/sessions/{session_id}/files/download")
 async def session_files_download(session_id: str, path: str):
-    """Download a file as raw bytes from the session's sandbox."""
-    instance = await _resolve_session_instance(session_id)
-    return await _download_from_instance(instance, path)
+    return await _proxy_download(await _supervisor_url_for_session(session_id), path)
 
 
 # ---------------------------------------------------------------------------

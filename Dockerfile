@@ -19,4 +19,4 @@ RUN cd src/supervisor && npm install --silent
 
 EXPOSE 7778
 
-CMD uvicorn src.api.server:app --host 0.0.0.0 --port ${PORT:-7778}
+CMD uvicorn api.server:app --host 0.0.0.0 --port ${PORT:-7778}

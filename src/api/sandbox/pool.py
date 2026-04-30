@@ -120,6 +120,16 @@ class SessionPool:
         No I/O — just whether the pool currently holds a session."""
         return session_id in self._active
 
+    def find_by_sandbox_id(self, sandbox_id: str) -> BaseSandboxSession | None:
+        """Reverse lookup: find an active session whose underlying compute
+        carries this provider sandbox id. Used by ``/sandboxes/{id}/files/*``
+        endpoints — sandbox identity isn't durable, but if the compute is
+        currently running we know who owns it."""
+        for sess in self._active.values():
+            if getattr(sess.state, "sandbox_id", None) == sandbox_id:
+                return sess
+        return None
+
     async def shutdown_all(self) -> None:
         """Stop the world: snapshot + shutdown every active session.
         Used at server-graceful-shutdown."""

@@ -91,6 +91,7 @@ if [ "${#PIDS[@]}" -gt 0 ]; then
 fi
 
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/agent_sdk_server
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 echo "Starting local server on http://localhost:7778 ..."
-exec "${VENV_PYTHON}" -m uvicorn src.api.server:app --host 0.0.0.0 --port 7778
+exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port 7778
