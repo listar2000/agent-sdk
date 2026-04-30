@@ -1601,16 +1601,11 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
 
 @app.post("/sessions/{session_id}/message")
 async def post_session_message(session_id: str, request: Request):
-    """Submit a prompt. Returns ``{rpc_id, status}`` immediately; events
-    flow via GET /events (multi-subscriber) or via the response body of
-    POST /message+stream (single-call).
-
-    Truly fire-and-forget: ``pool.get_session`` (which may cold-recover
-    a hibernated/dead sandbox — 30-60s on Daytona under contended
-    control-plane load) runs INSIDE the background task, not before
-    the response. Subscribers on ``/events`` see the recovery delay as
-    silence, then the prompt's events. Errors during recovery surface
-    as ``error`` broadcasts on the session's subscriber fanout.
+    """Fire-and-forget execution. Returns ``{rpc_id, status}`` immediately;
+    events get persisted to ``session_log`` and broadcast to any
+    ``/events`` subscribers. Internally the same SSE generator that
+    backs ``POST /message+stream`` runs in a background task with the
+    response body discarded — single execution path for both endpoints.
     """
     data = await _json_body(request)
     message = data.get("message")
@@ -1619,23 +1614,11 @@ async def post_session_message(session_id: str, request: Request):
 
     rpc_id = str(uuid.uuid4())
 
-    async def _drive() -> None:
-        from api.sandbox import get_pool
-        try:
-            session = await get_pool().get_session(session_id)
-        except Exception as e:
-            log.exception("pool.get_session(%s) failed for rpc=%s",
-                          session_id, rpc_id)
-            # No session object → can't broadcast via session._broadcast.
-            # The /events stream remains silent for this rpc; the only
-            # observable signal is the absence of any event with this
-            # rpc_id. Caller's per-rpc deadline will fire.
-            await _log_session_acquire_error(session_id, rpc_id, e)
-            return
-        await _persist_user_message(session, message, rpc_id)
-        await _persist_prompt_events(session, message, rpc_id)
+    async def _drain() -> None:
+        async for _ in _execute_and_stream_sse(session_id, message, rpc_id):
+            pass
 
-    task = asyncio.create_task(_drive())
+    task = asyncio.create_task(_drain())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
@@ -1731,85 +1714,102 @@ async def post_session_message_stream(session_id: str, request: Request):
     Both POST /message and GET /events continue to work unchanged for
     callers that need separate submit + multi-subscriber semantics.
     """
-    from api.sandbox import get_pool
-    from api.sandbox.session import _HEARTBEAT
-
     data = await _json_body(request)
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
 
-    pool = get_pool()
-    session = await pool.get_session(session_id)
     rpc_id = str(uuid.uuid4())
-    await _persist_user_message(session, message, rpc_id)
-
-    async def _stream():
-        # Subscribe BEFORE kicking off execute_prompt so broadcasts
-        # from the supervisor's first chunks land in our queue. The
-        # subscribe() generator registers the queue synchronously
-        # before its first ``await q.get()``, so create_task'ing
-        # _drive after entering the loop is race-free: drive only
-        # runs once the event loop yields at our q.get().
-        sub_iter = session.subscribe()
-
-        # The persister both drives execute_prompt AND writes session_log
-        # rows for each yielded event — same shared drain so /message and
-        # /message+stream produce identical log timelines.
-        async def _drive():
-            await _persist_prompt_events(session, message, rpc_id)
-
-        drive_task: asyncio.Task | None = None
-        try:
-            async for item in sub_iter:
-                if drive_task is None:
-                    # First iteration entered subscribe() body and
-                    # registered our queue; safe to start driving.
-                    drive_task = asyncio.create_task(_drive())
-                if item is _HEARTBEAT:
-                    yield ": heartbeat\n\n"
-                    continue
-                if isinstance(item, tuple) and len(item) == 2:
-                    tag, block = item
-                    # Filter to this prompt only — concurrent /events
-                    # subscribers may have triggered other prompts whose
-                    # blocks share the queue.
-                    if tag != rpc_id:
-                        continue
-                    yield f"event: rpc:{tag}\n{block}\n\n"
-                    if "stop_reason" in block or '"type":"done"' in block:
-                        return
-                # Parsed-dict broadcasts (errors, non-prompt notifications)
-                # are emitted as ``data:`` blocks for SDK parity with /events.
-                elif isinstance(item, dict):
-                    if item.get("rpc_id") != rpc_id:
-                        continue
-                    yield f"data: {json.dumps(item)}\n\n"
-                    if item.get("type") == "error":
-                        return
-        finally:
-            # _stream returns the moment the ``done`` block reaches the
-            # subscriber queue — but the persister (driven by
-            # execute_prompt's yield) is one async hop behind it, still
-            # awaiting log_event(turn_end). Await it (bounded) so the
-            # turn_end row lands before the response generator closes.
-            # Never cancel: a mid-write cancel leaves the DB connection
-            # in BAD state and the pool has to discard it. The timeout
-            # is the only escape hatch.
-            if drive_task is not None and not drive_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-
     return StreamingResponse(
-        _stream(),
+        _execute_and_stream_sse(session_id, message, rpc_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
+    """Canonical execution path: cold-recover (if needed) → log
+    user_message → subscribe + drive → emit per-rpc SSE blocks.
+
+    Used as the response body of ``POST /message+stream`` and as the
+    sole drain inside the background task fired by ``POST /message``.
+    Single source of truth for "execute one prompt and persist its
+    events" — both endpoints exercise identical persistence + broadcast
+    behaviour.
+
+    Yields SSE lines (``event:``/``data:``/``: heartbeat``) terminated
+    by ``\\n\\n``. The first yield is an immediate heartbeat so a
+    streaming client knows the request is alive while ``pool.get_session``
+    cold-recovers (30-60s on Daytona under contended control plane).
+    """
+    from api.sandbox import get_pool
+    from api.sandbox.session import _HEARTBEAT
+
+    yield ": heartbeat\n\n"
+
+    try:
+        session = await get_pool().get_session(session_id)
+    except Exception as e:
+        log.exception("pool.get_session(%s) failed for rpc=%s",
+                      session_id, rpc_id)
+        await _log_session_acquire_error(session_id, rpc_id, e)
+        err = {"type": "error", "rpc_id": rpc_id,
+               "error": {"message": str(e)[:500],
+                         "exception_type": type(e).__name__}}
+        yield f"data: {json.dumps(err)}\n\n"
+        return
+
+    await _persist_user_message(session, message, rpc_id)
+
+    # Eager registration so drive_task can start immediately — the
+    # generator-form ``subscribe()`` defers queue registration to the
+    # first iteration, which means a producer started before iterating
+    # would broadcast into a queue that hasn't been registered yet
+    # AND the consumer would block up to _HEARTBEAT_INTERVAL_S (20s)
+    # waiting for the empty queue to surface a sentinel before drive
+    # ever runs. The two-step split eliminates that 20s phantom delay.
+    sid, q = session.register_subscriber()
+
+    async def _drive():
+        await _persist_prompt_events(session, message, rpc_id)
+
+    drive_task = asyncio.create_task(_drive())
+    try:
+        async for item in session.iterate_subscriber(sid, q):
+            if item is _HEARTBEAT:
+                yield ": heartbeat\n\n"
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                tag, block = item
+                # Filter to this prompt only — concurrent /events
+                # subscribers may have triggered other prompts whose
+                # blocks share the queue.
+                if tag != rpc_id:
+                    continue
+                yield f"event: rpc:{tag}\n{block}\n\n"
+                if "stop_reason" in block or '"type":"done"' in block:
+                    return
+            elif isinstance(item, dict):
+                if item.get("rpc_id") != rpc_id:
+                    continue
+                yield f"data: {json.dumps(item)}\n\n"
+                if item.get("type") == "error":
+                    return
+    finally:
+        # The generator returns the moment the ``done`` block reaches
+        # us — but the persister (driven by execute_prompt's yield) is
+        # one async hop behind, still awaiting log_event(turn_end).
+        # Await it (bounded) so the turn_end row lands before we
+        # close. Never cancel: a mid-write cancel leaves the DB
+        # connection in BAD state and the pool has to discard it.
+        if drive_task is not None and not drive_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
 
 @app.post("/sessions/{session_id}/cancel")

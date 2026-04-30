@@ -357,20 +357,19 @@ class BaseSandboxSession(abc.ABC):
     # --- Subscriber fan-out (kept here so multi-subscriber GET /events
     #     works without per-provider plumbing) ---
 
-    async def subscribe(self) -> AsyncIterator[Any]:
-        """Yield every event broadcast to this session until either the
-        consumer closes the iterator or the session shuts down.
+    def register_subscriber(self) -> tuple[str, "asyncio.Queue[Any]"]:
+        """Eagerly register a subscriber queue (sync) so callers can
+        kick off the producer (e.g. ``execute_prompt``) before iterating.
 
-        Replay path: new subscribers receive the per-session buffer of
-        recent events FIRST, then live broadcasts. This protects the UI
-        reconnect-gap case (events for a POST /message arriving while
-        no subscriber was listening would otherwise be dropped).
-
-        Heartbeat: when the queue stays idle for ``_HEARTBEAT_INTERVAL_S``
-        the iterator yields a ``_HEARTBEAT`` sentinel so the /events
-        handler can emit an SSE comment line. Without this, nginx /
-        cloudflare / browser EventSource close idle persistent
-        connections between prompts.
+        Returns ``(sid, queue)``. Caller passes both back to
+        ``iterate_subscriber`` to drain. Splitting registration from
+        iteration matters because ``async def`` generators don't run
+        their body — including queue registration — until the first
+        ``__anext__()`` call. Without this split, a producer started
+        after ``subscribe()`` returns the generator object but BEFORE
+        the first iteration would broadcast events that nothing has
+        registered to receive — and the consumer would block up to
+        ``_HEARTBEAT_INTERVAL_S`` waiting for the queue to fill.
         """
         sid = str(uuid.uuid4())
         # Bounded queue: slow subscribers drop events rather than backpressuring
@@ -385,6 +384,19 @@ class BaseSandboxSession(abc.ABC):
             except asyncio.QueueFull:
                 break
         self._subscribers[sid] = q
+        return sid, q
+
+    async def iterate_subscriber(
+        self, sid: str, q: "asyncio.Queue[Any]",
+    ) -> AsyncIterator[Any]:
+        """Drain a subscriber queue registered via ``register_subscriber``.
+
+        Yields a ``_HEARTBEAT`` sentinel after each idle window of
+        ``_HEARTBEAT_INTERVAL_S`` so the /events handler can emit an
+        SSE comment line; otherwise nginx / cloudflare / browser
+        EventSource close idle persistent connections between prompts.
+        Cleans up the registration on exit.
+        """
         try:
             while True:
                 try:
@@ -399,6 +411,19 @@ class BaseSandboxSession(abc.ABC):
                 yield event
         finally:
             self._subscribers.pop(sid, None)
+
+    async def subscribe(self) -> AsyncIterator[Any]:
+        """Convenience wrapper: register + iterate. Suits callers that
+        don't need to start a producer mid-flight (e.g. ``GET /events``).
+
+        For producer-driven flows, prefer the explicit two-step:
+        ``sid, q = session.register_subscriber()``;
+        ``task = asyncio.create_task(producer())``;
+        ``async for item in session.iterate_subscriber(sid, q): ...``
+        """
+        sid, q = self.register_subscriber()
+        async for item in self.iterate_subscriber(sid, q):
+            yield item
 
     def _broadcast(self, event: Any) -> None:
         """Append to replay buffer + fan out to every active subscriber.
