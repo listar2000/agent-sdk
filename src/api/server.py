@@ -270,17 +270,9 @@ def _mark_turn_finished(state: SessionState, at: float | None = None) -> float:
     return finished_at
 
 
-def _session_idle_since(state: SessionState) -> float:
-    """When did this session most recently become fully idle?"""
-    return state.turn_completed_at or state.last_activity
-
-
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-
-IDLE_TIMEOUT_S = int(os.environ.get("SANDBOX_IDLE_TIMEOUT", "300"))  # 5 min default
-REAPER_TICK_S = int(os.environ.get("SANDBOX_REAPER_TICK", "60"))
 _SSE_MAX_IDLE_RETRIES = int(os.environ.get("SSE_MAX_IDLE_RETRIES", "2"))
 # Upper bound on consecutive reconnect attempts before triggering sandbox
 # recovery. Was 5 (~25s of backoff) — cut to 2 (~3s) because the unified
@@ -2032,47 +2024,52 @@ async def start_sandbox_route(sandbox_id: str, request: Request):
 
 @app.get("/admin/sessions")
 async def admin_list_sessions():
-    """List in-memory sessions and instances. Useful for debugging cleanup."""
-    session_rows = list(SESSIONS.values())
+    """List in-memory pool sessions. Useful for the dashboard + cleanup
+    debugging.
 
-    async def _sandbox_ref(s):
-        try:
-            rec = await get_sandbox(s.sandbox_id) if s.sandbox_id else None
-            return rec.sandbox_ref if rec else None
-        except Exception:
-            return None
-
-    refs = await asyncio.gather(*(_sandbox_ref(s) for s in session_rows))
-
+    Reads from the SessionPool's ``_active`` dict — that's the only
+    in-memory session registry now (legacy ``SESSIONS``/``_INSTANCES``
+    were either deleted or are no longer written to). The legacy
+    response shape is preserved so ``ui/dashboard.html`` doesn't
+    have to change: ``sessions[].agent_busy``/``active_rpc_id``/etc.
+    are constants since the pool's per-prompt SSE replaced the
+    persistent reader's busy-flag bookkeeping.
+    """
+    from api.sandbox import get_pool
+    pool = get_pool()
     return {
         "sessions": [
             {
-                "session_id": s.session_id,
-                "agent_id": s.agent_id,
-                "current_sandbox_id": s.sandbox_id,
-                "sandbox_ref": ref,
-                "inner_session_id": s.inner_session_id,
-                "agent_busy": s.agent_busy,
-                "active_rpc_id": s.active_rpc_id,
-                "pending_count": len(s.pending_prompts),
-                "session_subscribers": len(s._session_subscribers),
-                "rpc_subscribers": sum(len(qs) for qs in s._rpc_subscribers.values()),
-                "shutdown": s.shutdown.is_set(),
+                "session_id": sid,
+                "agent_id": sess._agent_id,
+                "current_sandbox_id": getattr(sess.state, "sandbox_id", None),
+                "sandbox_ref": getattr(sess.state, "sandbox_id", None),
+                "inner_session_id": sess._inner_session_id,
+                # ``agent_busy`` historically meant "a prompt is mid-flight";
+                # the pool model tracks per-prompt SSE inside ``execute_prompt``
+                # without exposing busy bookkeeping. The most meaningful
+                # observable proxy is "someone is watching events" — that's
+                # what the dashboard's "running" badge actually reads.
+                "agent_busy": len(sess._subscribers) > 0,
+                "active_rpc_id": None,
+                "pending_count": 0,
+                "session_subscribers": len(sess._subscribers),
+                "rpc_subscribers": 0,
+                "shutdown": False,
             }
-            for s, ref in zip(session_rows, refs)
+            for sid, sess in pool._active.items()  # noqa: SLF001 — admin readout
         ],
         "instances": [
             {
-                "sandbox_id": sid,
-                "provider": inst.provider,
-                "url": inst.url,
-                "port": inst.port,
-                "container_id": inst.container_id[:12] if inst.container_id else None,
-                "process_alive": (
-                    inst.process is not None and inst.process.returncode is None
-                ),
+                "sandbox_id": getattr(sess.state, "sandbox_id", None),
+                "provider": getattr(sess.state, "type", "unknown"),
+                "url": sess.supervisor_url,
+                "port": getattr(sess.state, "listen_port", None),
+                "container_id": None,
+                "process_alive": sess.supervisor_url is not None,
             }
-            for sid, inst in _INSTANCES.items()
+            for _sid, sess in pool._active.items()  # noqa: SLF001
+            if sess.supervisor_url is not None
         ],
     }
 
@@ -3285,28 +3282,39 @@ async def get_session_route(session_id: str):
 
 @app.get("/sessions/{session_id}/status")
 async def session_status(session_id: str):
-    """Get session runtime status including last activity timestamp."""
-    _, _, state = await ensure_session_live(session_id)
+    """Get session runtime status including last activity timestamp.
+
+    Routes through the SessionPool — ``pool.get_session`` brings the
+    SandboxSession up if it's been reaped. The legacy SessionState
+    fields ``agent_busy`` / ``active_rpc_id`` / ``pending_count`` /
+    ``session_subscriber_count`` / ``rpc_subscriber_count`` /
+    ``has_client`` / ``available_commands`` no longer have meaningful
+    pool equivalents (per-prompt SSE replaced the persistent reader,
+    and the pool's own subscriber list isn't a queue) — those keys
+    are kept in the response for shape-back-compat with constants."""
+    from api.sandbox import get_pool
+
+    pool_session = await get_pool().get_session(session_id)
+    state = pool_session.state
+    last_chunk = pool_session.liveness._last_chunk_at
     now = time.time()
     return {
-        "session_id": state.session_id,
-        "agent_id": state.agent_id,
-        "current_sandbox_id": state.sandbox_id,
-        "inner_session_id": state.inner_session_id,
-        "agent_busy": state.agent_busy,
-        "active_rpc_id": state.active_rpc_id,
-        "pending_count": len(state.pending_prompts),
-        "session_subscriber_count": len(state._session_subscribers),
-        "rpc_subscriber_count": sum(len(qs) for qs in state._rpc_subscribers.values()),
-        "last_activity": state.last_activity,
-        "idle_seconds": round(
-            now - (state.turn_completed_at or state.last_activity), 1
-        ),
-        "has_client": state.client is not None,
-        "shutdown_requested": state.shutdown.is_set(),
-        "available_commands": state.available_commands,
-        "supervisor_url": state.supervisor_url,
-        "supervisor_port": state.supervisor_port,
+        "session_id": session_id,
+        "agent_id": pool_session._agent_id,
+        "current_sandbox_id": getattr(state, "sandbox_id", None),
+        "inner_session_id": pool_session._inner_session_id,
+        "agent_busy": False,
+        "active_rpc_id": None,
+        "pending_count": 0,
+        "session_subscriber_count": len(pool_session._subscribers),
+        "rpc_subscriber_count": 0,
+        "last_activity": last_chunk,
+        "idle_seconds": round(now - last_chunk, 1) if last_chunk else None,
+        "has_client": pool_session.supervisor_url is not None,
+        "shutdown_requested": False,
+        "available_commands": [],
+        "supervisor_url": pool_session.supervisor_url,
+        "supervisor_port": getattr(state, "listen_port", None),
     }
 
 
@@ -3794,25 +3802,6 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
     )
 
 
-def _submit_prompt(state: SessionState, rpc_id: str, message: str) -> None:
-    """Enqueue a prompt and wake the scheduler loop. Returns immediately."""
-    state.pending_prompts.append(PendingPrompt(rpc_id=rpc_id, message=message))
-    state._prompt_ready.set()
-
-
-async def _cancel_and_drain(state: SessionState) -> None:
-    """Cancel the active prompt and wait for it to reach a terminal state."""
-    if not state.agent_busy:
-        return
-    await state.client.cancel_prompt(state.acp_session_id)
-    try:
-        await asyncio.wait_for(state._prompt_done.wait(), timeout=_CANCEL_DRAIN_TIMEOUT)
-    except asyncio.TimeoutError:
-        log.warning(
-            "_cancel_and_drain: timed out waiting for rpc %s", state.active_rpc_id
-        )
-
-
 @app.post("/sessions/{session_id}/message")
 async def post_session_message(session_id: str, request: Request):
     """Submit a prompt. Returns ``{rpc_id, status}`` immediately; events
@@ -4127,58 +4116,21 @@ async def reset_session_sandbox(session_id: str, request: Request):
 
 @app.post("/sessions/{session_id}/config")
 async def session_set_config(session_id: str, request: Request):
-    """Set mode/model/thought_level for a session."""
+    """Set mode/model/thought_level for a session via the SessionPool."""
     data = await _json_body(request)
-    _, _, state = await ensure_session_live(session_id)
+    from api.sandbox import get_pool
+
+    pool_session = await get_pool().get_session(session_id)
     try:
         if "mode" in data:
-            await state.client.set_mode(state.acp_session_id, data["mode"])
+            await pool_session.set_mode(data["mode"])
         if "model" in data:
-            await state.client.set_model(state.acp_session_id, data["model"])
+            await pool_session.set_model(data["model"])
         if "thought_level" in data:
-            await state.client.set_thought_level(
-                state.acp_session_id, data["thought_level"]
-            )
+            await pool_session.set_thought_level(data["thought_level"])
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(502, str(e))
-
-
-# ---------------------------------------------------------------------------
-# Sandbox instance resolution
-# ---------------------------------------------------------------------------
-
-
-async def _resolve_sandbox_instance(
-    sandbox_id: str,
-    *,
-    agent_type: str = "claude",
-    spawn_env: dict[str, str] | None = None,
-) -> ProviderInstance:
-    """Get a live ProviderInstance for a sandbox, auto-starting if needed.
-
-    Raises HTTPException on failure. Session-scoped callers pass the session's
-    agent_type/spawn_env so recovery restarts the same runtime shape.
-    """
-    # Fast path: cached port-based instance is live as-is. Daytona preview
-    # URLs can expire while the in-memory instance stays cached, so those
-    # fall through to the liveness check below.
-    instance = _INSTANCES.get(sandbox_id)
-    if instance and instance.provider in PORT_BASED_PROVIDERS:
-        return instance
-
-    sandbox_record = await _require_sandbox(sandbox_id)
-    try:
-        await _ensure_sandbox_alive(
-            sandbox_id, sandbox_record,
-            agent_type=agent_type, spawn_env=spawn_env,
-        )
-    except Exception as e:
-        raise HTTPException(502, f"failed to start sandbox: {e}")
-    instance = _INSTANCES.get(sandbox_id)
-    if not instance:
-        raise HTTPException(409, "sandbox not running")
-    return instance
 
 
 # ---------------------------------------------------------------------------
@@ -4228,45 +4180,22 @@ async def session_sandbox_exec(session_id: str, request: Request):
 
 async def _resolve_session_instance(session_id: str) -> ProviderInstance:
     """Resolve a session_id to a ProviderInstance pointing at its
-    supervisor URL.
+    supervisor URL via the SessionPool. ``pool.get_session()`` brings
+    the compute up if needed; ``supervisor_url`` is set as part of
+    ``SandboxSession.start()``.
 
-    Routes through the SessionPool — that's what owns the compute
-    lease and knows when to revive the sandbox. Returns a minimal
-    ProviderInstance shim around ``session.supervisor_url`` because
-    every caller of this helper only reads ``.url`` (and, for
-    daytona, ``.sandbox_id``); the ProviderInstance type is kept so
-    the legacy ``_proxy_instance`` / ``_download_from_instance``
-    signatures don't have to change in this PR.
-
-    Falls back to the legacy ``_resolve_sandbox_instance`` path only
-    when the pool can't produce a supervisor URL — defensive net for
-    edge cases pending PR-D3's full legacy deletion.
-    """
+    The ProviderInstance shim is kept (vs. returning the URL string
+    directly) so ``_proxy_instance`` / ``_download_from_instance``
+    don't need signature changes."""
     from api.sandbox import get_pool
 
-    pool = get_pool()
-    pool_session = await pool.get_session(session_id)
-    url = pool_session.supervisor_url
-    if url:
-        state = pool_session.state
-        return ProviderInstance(
-            provider=getattr(state, "type", "unknown"),
-            url=url,
-            root=(state.recipe.root if state.recipe else None) or "/tmp",
-            sandbox_id=getattr(state, "sandbox_id", None),
-        )
-
-    # Defensive fallback: pool.get_session ought to have brought up
-    # the supervisor. If not, fall back to the legacy ensure-alive
-    # plumbing so file requests don't 502 on an edge case.
-    session = await _require_session_row(session_id)
-    sandbox = await ensure_sandbox(session)
-    agent = await get_agent(session["agent_id"])
-    agent_type = (agent.config.agent_type if agent and agent.config else "claude")
-    return await _resolve_sandbox_instance(
-        sandbox.id,
-        agent_type=agent_type,
-        spawn_env=_build_spawn_env_from_row(session),
+    pool_session = await get_pool().get_session(session_id)
+    state = pool_session.state
+    return ProviderInstance(
+        provider=getattr(state, "type", "unknown"),
+        url=pool_session.supervisor_url or "",
+        root=(state.recipe.root if state.recipe else None) or "/tmp",
+        sandbox_id=getattr(state, "sandbox_id", None),
     )
 
 
@@ -4290,27 +4219,14 @@ async def _proxy_instance(
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 
 
-async def _proxy_to_supervisor(
-    sandbox_id: str, method: str, path: str, *,
-    params: dict | None = None, json: dict | None = None,
-    timeout: int = 30,
-) -> Response:
-    """Forward a request to the sandbox's supervisor and return its JSON response.
-
-    Shared by every ``/sandboxes/{id}/files/*`` endpoint that returns JSON.
-    For binary responses (see ``files/download``) the header-forwarding case is
-    handled inline since it's unique.
-    """
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
-
-
 async def _proxy_from_session(
     session_id: str, method: str, path: str, *,
     params: dict | None = None, json: dict | None = None,
     timeout: int = 30,
 ) -> Response:
-    """Session-scoped twin of ``_proxy_to_supervisor``."""
+    """Forward a request to the session's supervisor (resolved through
+    the SessionPool) and return its JSON response. Used by every
+    session-scoped file proxy."""
     instance = await _resolve_session_instance(session_id)
     return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
 
