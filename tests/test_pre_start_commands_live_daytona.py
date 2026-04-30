@@ -127,11 +127,20 @@ async def test_live_daytona_realistic_workflow_via_sdk(sdk: ServerClient):
 
         await asyncio.sleep(1.5)
 
-        # ── Phase 2: Type 2 recovery via /reset-sandbox ───────────────────
-        # Not exposed on ServerClient (operator-persona hides internal
-        # routes); reach through the underlying http client.
-        r = await sdk._http.post(f"/sessions/{sid}/reset-sandbox", timeout=300)
-        assert r.status_code == 200, f"reset failed: {r.status_code} {r.text}"
+        # ── Phase 2: Type 2 recovery via /release + /message ──────────────
+        # /reset-sandbox was removed when the deprecated routes were
+        # collapsed. The pool path is "release the lease, then prompt
+        # again" — the next get_session takes the cold-create branch
+        # because the released SandboxSession's compute is gone.
+        # /release is exposed on the SDK; /message we drive directly via
+        # the underlying http client because we're not consuming the SSE
+        # body here, just triggering a cold-create.
+        rel = await sdk._http.post(f"/sessions/{sid}/release", timeout=120)
+        assert rel.status_code == 200, f"release failed: {rel.status_code} {rel.text}"
+        r = await sdk._http.post(
+            f"/sessions/{sid}/message", json={"message": "ping"}, timeout=300,
+        )
+        assert r.status_code == 200, f"message failed: {r.status_code} {r.text}"
 
         # CLAUDE.md still correct on the new sandbox (via SDK).
         f2 = await sdk.session_file_read(sid, "CLAUDE.md")

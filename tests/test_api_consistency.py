@@ -86,43 +86,11 @@ async def test_post_non_object_body_returns_400(client, path, body):
 # coverage in test_session_files_routes.
 
 
-# ---------------------------------------------------------------------------
-# POST /sandboxes/{id}/start: provider failure is 502, not 500.
-#
-# 500 is reserved for "server bug" — a provider that can't restart a
-# sandbox is upstream-fault territory, matching /sandboxes and
-# /sandboxes which already use 502 for the same class.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_sandbox_provider_failure_returns_502(client):
-    from api.models import VolumeRecord, SandboxRecord
-
-    v = VolumeRecord(id="vol_start_fail", name="sf",
-                     provider="daytona", provider_ref="dt-sf")
-    await dbmod.upsert_volume(v)
-    sb = SandboxRecord(id="sb_start_fail", provider="daytona",
-                       sandbox_ref="dt-sbx-sf", status="stopped",
-                       root="/home/daytona", volume_id=v.id, subpath="x")
-    await dbmod.upsert_sandbox(sb)
-
-    async def blow_up(*a, **kw):
-        raise RuntimeError("simulated provider outage")
-
-    # ``/sandboxes/{id}/start`` is Type-1-only since the start_sandbox_route
-    # rewrite — it calls ``_type1_recover`` directly, not ``_ensure_sandbox_alive``.
-    # The "provider blew up" branch is the ``except Exception`` around
-    # _type1_recover that returns 502.
-    with patch(
-        "api.server._type1_recover", new=AsyncMock(side_effect=blow_up)
-    ):
-        r = await client.post(f"/sandboxes/{sb.id}/start")
-
-    assert r.status_code == 502, f"got {r.status_code}: {r.text}"
-    body = r.json()
-    assert "error" in body
-    assert "simulated provider outage" in body["error"]
+# test_start_sandbox_provider_failure_returns_502 was removed: the
+# deprecated ``POST /sandboxes/{id}/start`` route + the ``_type1_recover``
+# helper it patched are both gone. Callers use ``POST /sessions/{id}/message``
+# which provisions on demand through the SessionPool; provider-failure
+# error mapping for that path is covered in test_sandbox_stop_delete_recovery.
 
 
 # test_post_sandboxes_provision_exposes_both_id_and_sandbox_id was

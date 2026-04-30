@@ -183,92 +183,6 @@ app.add_middleware(
 )
 
 
-# Endpoints scheduled for removal once SessionPool covers the same surface
-# end-to-end. Keys are the FastAPI path-template strings; the matching
-# request emits ``Deprecation: true`` + ``Sunset: <date>`` + a ``Link``
-# pointing at the replacement, per RFC 8594. Callers (notably the SDK)
-# log a DeprecationWarning when they observe these.
-_DEPRECATED_ROUTES: dict[str, str] = {
-    "/sandboxes": "POST /sessions creates sessions + their compute lazily through SessionPool",
-    "/sandboxes/{sandbox_id}/start": "Pool brings the compute back on the next POST /sessions/{id}/message",
-    "/sandboxes/{sandbox_id}/stop": "POST /sessions/{id}/release snapshots + pauses via SessionPool",
-    "/sandboxes/{sandbox_id}/snapshot": "POST /sessions/{id}/release writes the snapshot via SessionPool",
-    "/sandboxes/{sandbox_id}/files/tree": "GET /sessions/{session_id}/files/tree",
-    "/sandboxes/{sandbox_id}/files/read": "GET /sessions/{session_id}/files/read",
-    "/sandboxes/{sandbox_id}/files/edit": "POST /sessions/{session_id}/files/edit",
-    "/sandboxes/{sandbox_id}/files/upload": "POST /sessions/{session_id}/files/upload",
-    "/sandboxes/{sandbox_id}/files/delete": "POST /sessions/{session_id}/files/delete",
-    "/sandboxes/{sandbox_id}/files/rename": "POST /sessions/{session_id}/files/rename",
-    "/sandboxes/{sandbox_id}/files/download": "GET /sessions/{session_id}/files/download",
-    "/sessions/{session_id}/start-sandbox": "POST /sessions/{id}/message — pool provisions on demand",
-    "/sessions/{session_id}/reset-sandbox": "POST /sessions/{id}/release then POST /sessions/{id}/message",
-}
-_DEPRECATION_SUNSET = "Wed, 31 Dec 2026 00:00:00 GMT"
-
-
-@app.middleware("http")
-async def _deprecation_headers_middleware(request: Request, call_next):
-    """Stamp RFC 8594 deprecation headers onto responses for routes in
-    ``_DEPRECATED_ROUTES``. Lookup is by FastAPI's matched path template
-    (so it doesn't depend on the concrete sandbox/session id), and only
-    fires when the route actually matched — 404s pass through clean."""
-    response = await call_next(request)
-    route = request.scope.get("route")
-    template = getattr(route, "path", None)
-    note = _DEPRECATED_ROUTES.get(template) if template else None
-    if note is not None:
-        response.headers["Deprecation"] = "true"
-        response.headers["Sunset"] = _DEPRECATION_SUNSET
-        response.headers["Link"] = f'<{template}>; rel="deprecation"'
-        response.headers["X-Deprecation-Note"] = note
-    return response
-
-
-def _warn_deprecated(route_template: str) -> None:
-    """Server-side ``warnings.warn(DeprecationWarning)`` for a deprecated
-    handler. Pairs with the HTTP ``Deprecation`` header (which only
-    surfaces to HTTP callers): a Python program importing this module
-    and calling the handler in-process (or watching the warnings stream)
-    sees the same migration pointer the SDK does."""
-    import warnings as _warnings
-    note = _DEPRECATED_ROUTES.get(route_template, "endpoint is deprecated")
-    _warnings.warn(
-        f"{route_template} is deprecated (sunset: {_DEPRECATION_SUNSET}) — {note}",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-
-
-async def _session_id_from_sandbox_id(sandbox_id: str) -> str:
-    """Reverse-lookup helper for the deprecated ``/sandboxes/{id}/...``
-    routes that need to forward into the SessionPool — those endpoints
-    take the sandbox row id, but the pool keys on session_id.
-
-    Strategy: try ``sessions.current_sandbox_id`` first (DB-backed
-    pointer kept in sync by the dual-write trigger). Falls back to a
-    pool reverse-lookup keyed on ``state.sandbox_id`` (the provider
-    UUID, looked up via the sandbox row's ``sandbox_ref``) so
-    pool-mediated sandboxes that haven't been pinned to a session row
-    are still resolvable.
-
-    Raises 404 if no session owns this sandbox.
-    """
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT id FROM sessions WHERE current_sandbox_id = %s LIMIT 1",
-            (sandbox_id,),
-        )).fetchone()
-    if row is not None:
-        return row["id"]
-    record = await get_sandbox(sandbox_id)
-    if record is not None and record.sandbox_ref:
-        from api.sandbox import get_pool
-        pool_session = get_pool().find_by_sandbox_id(record.sandbox_ref)
-        if pool_session is not None:
-            return pool_session.session_id
-    raise HTTPException(404, f"sandbox {sandbox_id} not bound to any session")
-
-
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException):
     """Uniform error shape: ``{"error": ...}`` for string details, pass-through for dict."""
@@ -1023,57 +937,6 @@ async def delete_sandbox_route(sandbox_id: str):
         await delete_sandbox(sandbox_id)
 
     return {"status": "deleted"}
-
-
-@app.post("/sandboxes/{sandbox_id}/stop")
-async def stop_sandbox_route(sandbox_id: str):
-    """**Deprecated** — use ``POST /sessions/{session_id}/release``.
-
-    Resolves ``session_id`` from the sandbox row and delegates to the
-    ``/release`` handler so the implementation stays in one place.
-    Returns the legacy ``{"status": "stopped"}`` shape for callers
-    that haven't migrated their response parsing yet.
-    """
-    _warn_deprecated("/sandboxes/{sandbox_id}/stop")
-    await _require_sandbox(sandbox_id)
-    sid = await _session_id_from_sandbox_id(sandbox_id)
-    await release_session_route(sid)
-    return {"status": "stopped"}
-
-
-@app.post("/sandboxes/{sandbox_id}/snapshot")
-async def snapshot_sandbox_route(sandbox_id: str):
-    """**Deprecated** — use ``POST /sessions/{session_id}/release``.
-
-    The pool's release path is the only snapshot+pause flow — no
-    snapshot-without-pause primitive (per-turn snapshots in
-    ``supervisor.js`` already cover the "save without stopping"
-    case). Forwards to the ``/release`` handler.
-    """
-    _warn_deprecated("/sandboxes/{sandbox_id}/snapshot")
-    await _require_sandbox(sandbox_id)
-    sid = await _session_id_from_sandbox_id(sandbox_id)
-    await release_session_route(sid)
-    return {"status": "ok"}
-
-
-@app.post("/sandboxes/{sandbox_id}/start")
-async def start_sandbox_route(sandbox_id: str, request: Request):
-    """**Deprecated** — use ``POST /sessions/{session_id}/resume`` (or
-    just ``POST /message``, which provisions on demand).
-
-    Resolves ``session_id`` from the sandbox row and delegates to
-    ``/resume`` so the SessionPool revival path stays in one place.
-    Returns the legacy ``{"status": "running", "url": ...}`` shape.
-    """
-    _warn_deprecated("/sandboxes/{sandbox_id}/start")
-    await _require_sandbox(sandbox_id)
-    sid = await _session_id_from_sandbox_id(sandbox_id)
-    await session_resume(sid, request)
-    from api.sandbox import get_pool
-    pool_session = get_pool()._active.get(sid)  # noqa: SLF001 — the lease just acquired
-    url = pool_session.supervisor_url if pool_session is not None else None
-    return {"status": "running", "url": url}
 
 
 # ---------------------------------------------------------------------------
@@ -1856,21 +1719,6 @@ async def session_cancel(session_id: str):
     return {"status": "ok"}
 
 
-@app.post("/sessions/{session_id}/start-sandbox")
-async def start_session_sandbox(session_id: str):
-    """**Deprecated** — POST /sessions/{id}/message provisions on demand.
-
-    Forwards to ``SessionPool.get_session(session_id)`` so callers that
-    relied on eager pre-warming still get the same effect: the pool
-    constructs the SandboxSession and runs ``start()`` (which boots
-    the supervisor + attaches ACP) before this returns.
-    """
-    _warn_deprecated("/sessions/{session_id}/start-sandbox")
-    from api.sandbox import get_pool
-    pool_session = await get_pool().get_session(session_id)
-    return {"sandbox_id": getattr(pool_session.state, "sandbox_id", None)}
-
-
 @app.post("/sessions/{session_id}/release")
 async def release_session_route(session_id: str):
     """Snapshot + drop the SessionPool's lease on this session's compute.
@@ -1898,56 +1746,6 @@ async def release_session_route(session_id: str):
         "snapshot_path": getattr(state, "snapshot_path", None),
         "snapshot_version": getattr(state, "snapshot_version", 0),
     }
-
-
-@app.post("/sessions/{session_id}/reset-sandbox")
-async def reset_session_sandbox(session_id: str, request: Request):
-    """**Deprecated** — use ``POST /sessions/{id}/release`` then
-    ``POST /sessions/{id}/message`` (the pool's cold-create path).
-
-    Implementation: drops the pool's lease (no snapshot — we're
-    discarding state on purpose), nulls ``sandbox_state.sandbox_id``
-    so the next ``get_session`` cold-creates instead of reattaching,
-    then re-leases via the pool.
-
-    Body fields ``dockerfile`` / ``shared_mounts`` are accepted for
-    back-compat but ignored — the pool's recipe comes from the
-    persisted ``sandbox_state`` JSONB and changing it requires a
-    direct write to that column.
-    """
-    _warn_deprecated("/sessions/{session_id}/reset-sandbox")
-    try:
-        await _json_body(request)
-    except HTTPException:
-        pass  # empty body is fine
-
-    from psycopg.types.json import Json
-    from api.sandbox import deserialize, get_pool, serialize
-    from api.sandbox.db_bindings import load_sandbox_state
-
-    pool = get_pool()
-    # Drop the active lease (compute will be torn down by shutdown_all
-    # path inside release; without a snapshot since we're resetting).
-    try:
-        await pool.release(session_id)
-    except Exception:
-        pass
-
-    # Null sandbox_id so get_session takes the cold-create branch
-    # instead of trying to reattach to the (about-to-be-destroyed) one.
-    payload = await load_sandbox_state(session_id)
-    state = deserialize(payload)
-    state.sandbox_id = None
-    state.snapshot_path = None
-    state.snapshot_version = 0
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
-            (Json(serialize(state)), session_id),
-        )
-
-    pool_session = await pool.get_session(session_id)
-    return {"sandbox_id": getattr(pool_session.state, "sandbox_id", None)}
 
 
 @app.post("/sessions/{session_id}/config")
