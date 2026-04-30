@@ -315,7 +315,18 @@ class ServerClient:
     async def send_message(
         self, session_id: str, text: str, *, interrupt: bool = False
     ) -> dict[str, Any]:
-        """``POST /sessions/{id}/message``."""
+        """``POST /sessions/{id}/message`` — fire-and-forget.
+
+        Returns ``{rpc_id, status}`` immediately; events flow into
+        ``session_log`` and are broadcast to any ``/events`` subscribers.
+        Use when the caller doesn't need to read the reply (e.g.
+        background orchestration that polls ``get_session_log`` later).
+
+        For "submit + read reply in one call," use
+        :meth:`send_message_stream`. For "subscribe to all events on
+        the session" (multi-subscriber, dashboard pattern), use
+        :meth:`stream_events`.
+        """
         return await self._json(
             "POST", f"/sessions/{session_id}/message",
             json={"message": text, "interrupt": interrupt},
@@ -434,6 +445,11 @@ class ServerClient:
     ) -> AsyncIterator[bytes]:
         """``GET /sessions/{id}/events`` — yields raw SSE bytes.
 
+        Multi-subscriber: every concurrent ``/events`` connection on a
+        session gets a copy of every event (across all prompts on the
+        session, plus heartbeat sentinels). Suits the dashboard / UI
+        case where multiple tabs need to mirror the same session live.
+
         Caller is responsible for SSE framing (split on ``\\n\\n``). On
         disconnect, close the generator; the upstream stream is
         cancelled. Proxies that want to rebroadcast the stream should
@@ -441,6 +457,29 @@ class ServerClient:
         """
         async with self._http.stream(
             "GET", f"/sessions/{session_id}/events",
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            _raise_for_status(resp)
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+
+    async def send_message_stream(
+        self, session_id: str, text: str, *, interrupt: bool = False,
+    ) -> AsyncIterator[bytes]:
+        """``POST /sessions/{id}/message+stream`` — submit a prompt and
+        stream the SSE response in a single round-trip.
+
+        Yields raw SSE bytes scoped to the prompt's ``rpc_id`` only —
+        no per-rpc filtering needed on the caller side. Suits SDK
+        callers that want one-shot "send + collect reply" semantics
+        without the two-step coordination of ``send_message`` +
+        ``stream_events``.
+
+        Caller is responsible for SSE framing (split on ``\\n\\n``).
+        """
+        async with self._http.stream(
+            "POST", f"/sessions/{session_id}/message+stream",
+            json={"message": text, "interrupt": interrupt},
             headers={"Accept": "text/event-stream"},
         ) as resp:
             _raise_for_status(resp)
