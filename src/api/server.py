@@ -73,7 +73,6 @@ from .models import (
     STATUS_STOPPED,
     AgentConfig,
     AgentRecord,
-    PendingPrompt,
     SandboxRecord,
     VolumeRecord,
 )
