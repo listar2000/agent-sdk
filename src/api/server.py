@@ -2024,47 +2024,47 @@ async def start_sandbox_route(sandbox_id: str, request: Request):
 
 @app.get("/admin/sessions")
 async def admin_list_sessions():
-    """List in-memory sessions and instances. Useful for debugging cleanup."""
-    session_rows = list(SESSIONS.values())
+    """List in-memory pool sessions. Useful for the dashboard + cleanup
+    debugging.
 
-    async def _sandbox_ref(s):
-        try:
-            rec = await get_sandbox(s.sandbox_id) if s.sandbox_id else None
-            return rec.sandbox_ref if rec else None
-        except Exception:
-            return None
-
-    refs = await asyncio.gather(*(_sandbox_ref(s) for s in session_rows))
-
+    Reads from the SessionPool's ``_active`` dict — that's the only
+    in-memory session registry now (legacy ``SESSIONS``/``_INSTANCES``
+    were either deleted or are no longer written to). The legacy
+    response shape is preserved so ``ui/dashboard.html`` doesn't
+    have to change: ``sessions[].agent_busy``/``active_rpc_id``/etc.
+    are constants since the pool's per-prompt SSE replaced the
+    persistent reader's busy-flag bookkeeping.
+    """
+    from api.sandbox import get_pool
+    pool = get_pool()
     return {
         "sessions": [
             {
-                "session_id": s.session_id,
-                "agent_id": s.agent_id,
-                "current_sandbox_id": s.sandbox_id,
-                "sandbox_ref": ref,
-                "inner_session_id": s.inner_session_id,
-                "agent_busy": s.agent_busy,
-                "active_rpc_id": s.active_rpc_id,
-                "pending_count": len(s.pending_prompts),
-                "session_subscribers": len(s._session_subscribers),
-                "rpc_subscribers": sum(len(qs) for qs in s._rpc_subscribers.values()),
-                "shutdown": s.shutdown.is_set(),
+                "session_id": sid,
+                "agent_id": sess._agent_id,
+                "current_sandbox_id": getattr(sess.state, "sandbox_id", None),
+                "sandbox_ref": getattr(sess.state, "sandbox_id", None),
+                "inner_session_id": sess._inner_session_id,
+                "agent_busy": False,
+                "active_rpc_id": None,
+                "pending_count": 0,
+                "session_subscribers": len(sess._subscribers),
+                "rpc_subscribers": 0,
+                "shutdown": False,
             }
-            for s, ref in zip(session_rows, refs)
+            for sid, sess in pool._active.items()  # noqa: SLF001 — admin readout
         ],
         "instances": [
             {
-                "sandbox_id": sid,
-                "provider": inst.provider,
-                "url": inst.url,
-                "port": inst.port,
-                "container_id": inst.container_id[:12] if inst.container_id else None,
-                "process_alive": (
-                    inst.process is not None and inst.process.returncode is None
-                ),
+                "sandbox_id": getattr(sess.state, "sandbox_id", None),
+                "provider": getattr(sess.state, "type", "unknown"),
+                "url": sess.supervisor_url,
+                "port": getattr(sess.state, "listen_port", None),
+                "container_id": None,
+                "process_alive": sess.supervisor_url is not None,
             }
-            for sid, inst in _INSTANCES.items()
+            for _sid, sess in pool._active.items()  # noqa: SLF001
+            if sess.supervisor_url is not None
         ],
     }
 
