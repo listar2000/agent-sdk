@@ -32,8 +32,10 @@ SessionFactory = Callable[[str, SandboxState], BaseSandboxSession]
 
 
 # Type for the function that loads sandbox_state JSONB for a session_id.
-# Real impl reads from sessions.sandbox_state under SELECT ... FOR UPDATE
-# (per docs §15.2). Tests can pass a mock.
+# Real impl reads from sessions.sandbox_state. Single-process
+# serialization uses the per-session asyncio lock below; multi-process
+# would need a single transaction wrapping the whole load→start→save
+# sequence (see db_bindings.py module docstring). Tests can pass a mock.
 LoadState = Callable[[str], "asyncio.Future[dict[str, Any] | None]"]
 SaveState = Callable[[str, dict[str, Any]], "asyncio.Future[None]"]
 
