@@ -226,6 +226,45 @@ async def _ask(client: httpx.AsyncClient, session_id: str, message: str) -> str:
 # Provider-specific external stop/delete (simulate crash/kill, bypass server API)
 # ---------------------------------------------------------------------------
 
+def _local_supervisor_pid(sandbox: dict) -> int | None:
+    """Find the supervisor PID for a local-provider sandbox.
+
+    The supervisor process under the pool flow isn't surfaced via ``pid`` on
+    ``GET /sandboxes/{id}`` (only the legacy ``_INSTANCES`` path populated
+    that field). Discover it from properties that ARE always exposed: the
+    URL's port (port-based providers always expose ``url``) — the supervisor
+    is the only process bound to that port. Tries ``lsof`` first (most
+    portable), falls back to ``pgrep -f`` matching the supervisor's
+    ``--port <port>`` cmdline arg in case lsof is unavailable.
+    """
+    pid = sandbox.get("pid")
+    if pid is not None:
+        try:
+            return int(pid)
+        except (TypeError, ValueError):
+            return None
+    url = sandbox.get("url") or ""
+    try:
+        port = int(url.rsplit(":", 1)[-1].split("/", 1)[0])
+    except (ValueError, IndexError):
+        return None
+
+    for argv in (
+        ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+        ["pgrep", "-f", rf"supervisor\.js .*--port {port}\b"],
+    ):
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.SubprocessError):
+            continue
+        for line in result.stdout.strip().splitlines():
+            try:
+                return int(line.strip())
+            except ValueError:
+                continue
+    return None
+
+
 async def _external_stop(sandbox: dict) -> None:
     provider = sandbox["provider"]
     ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
@@ -243,15 +282,12 @@ async def _external_stop(sandbox: dict) -> None:
         ))
 
     elif provider == "local":
-        # Kill the supervisor PID. Read it from the ``pid`` field if the
-        # server exposes one (sandbox_ref may be a stable UUID, not the
-        # PID, once the local provider supports restart-same-ref). Fall
-        # back to treating ref itself as the PID for older server shapes.
-        pid_str = sandbox.get("pid") or ref
-        try:
-            os.kill(int(pid_str), 9)
-        except (ValueError, ProcessLookupError, TypeError):
-            pass
+        pid = await loop.run_in_executor(None, _local_supervisor_pid, sandbox)
+        if pid is not None:
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     elif provider == "modal":
         # Modal has no stop==pause: terminate is destructive. The server
@@ -287,11 +323,14 @@ async def _kill_supervisor_in_sandbox(sandbox: dict) -> None:
         )
 
     elif provider == "local":
-        pid_str = sandbox.get("pid") or ref
-        try:
-            os.kill(int(pid_str), 9)
-        except (ValueError, ProcessLookupError, TypeError):
-            pass
+        # Local has no separate "supervisor inside sandbox" — the supervisor
+        # IS the sandbox process. Same kill path as _external_stop.
+        pid = await loop.run_in_executor(None, _local_supervisor_pid, sandbox)
+        if pid is not None:
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     elif provider == "docker":
         # docker exec into the container and kill the supervisor PID 1.

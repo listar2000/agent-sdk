@@ -3486,34 +3486,43 @@ async def _sessions_create_lazy(data: dict) -> dict:
 
 
 async def _sessions_create_eager(data: dict) -> dict:
-    """Create agent + provision sandbox + connect ACP in one call.
+    """Create agent + provision compute via SessionPool + attach ACP in one call.
 
-    Returns ``{agent_id, sandbox_id, current_sandbox_id, session_id,
-    inner_session_id, connected: true}`` — ready to POST /message against.
+    Returns ``{agent_id, sandbox_id, current_sandbox_id, session_id, id,
+    inner_session_id, volume_id, connected: true}`` — ready to POST
+    /message against immediately.
+
+    Implementation: writes the agent + session rows + initial
+    ``sandbox_state`` JSONB, then calls ``pool.get_session(session_id)``
+    which runs the cold-create path (provisions sandbox, brings up
+    supervisor, runs ACP ``session/new``, persists ``inner_session_id``
+    on the session row).
     """
+    from psycopg.types.json import Json
+
+    from api.sandbox import (
+        DaytonaSandboxState,
+        DockerSandboxState,
+        ModalSandboxState,
+        Recipe,
+        UnixLocalSandboxState,
+        get_pool,
+        serialize,
+    )
+
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
     provider = data.get("provider", "local")
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), provider)
-    volume_id = volume_record.id
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
 
-    # Pull session-level and sandbox-level fields out of the request body
-    # before building AgentConfig (which is pure identity now).
-    # ``root`` and ``cwd`` default to ``None`` — each provider fills in a
-    # sensible default (local: the per-agent volume subpath; docker:
-    # /home/agent; daytona: /home/daytona). Hardcoding a /tmp default here
-    # caused initial sandboxes to write outside the volume while replacements
-    # landed on the volume, breaking volume-persistence tests.
     cwd = data.get("cwd", config_data.pop("cwd", None))
     root = data.get("root", config_data.pop("root", None))
     dockerfile = _materialize_dockerfile({**config_data, **data})
     shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
-    # Drop any dockerfile_content key that may have landed in config_data;
-    # _materialize_dockerfile already consumed it above.
     config_data.pop("dockerfile_content", None)
     config_data.pop("dockerfile", None)
 
@@ -3521,131 +3530,95 @@ async def _sessions_create_eager(data: dict) -> dict:
     config = AgentConfig.from_dict({**config_data, "agent_type": agent_type})
     await upsert_agent(AgentRecord(id=agent_id, name=data.get("name"), config=config))
 
-    session_env = body_env or {}
-    session_secrets = body_secrets or {}
-    spawn_env = _merge_env(session_env, session_secrets)
-
     user_pre_start = list(data.get("pre_start_commands") or [])
-    sandbox_id = str(uuid.uuid4())
 
-    # Single-source provisioning. _provision_sandbox_core handles
-    # ensure_volume_supervisor, root resolution against _PROVIDER_VOLUME_HOME,
-    # and the underlying provision_sandbox call. The eager flow's only
-    # divergence from _provision_new is what we do AFTER provisioning
-    # (resolve supervisor URL → ACP attach → session row), not how we
-    # provision.
-    try:
-        provisioned = await _provision_sandbox_core(
-            volume=volume_record,
-            agent_id=agent_id,
-            agent_config=config,
-            spawn_env=spawn_env,
-            user_pre_start=user_pre_start,
-            dockerfile=dockerfile,
-            shared_mounts=shared_mounts,
-            explicit_root=root,
-            sandbox_id=sandbox_id,
+    # Default cwd matches the per-provider HOME the first sandbox boots into,
+    # so session/new and every later session/load share the JSONL hash key.
+    if cwd is None:
+        cwd = (
+            str(Path(volume_record.provider_ref) / f"agents/{agent_id}")
+            if provider == "local"
+            else default_cwd_for_provider(provider)
         )
+
+    state_cls = {
+        "daytona": DaytonaSandboxState,
+        "docker": DockerSandboxState,
+        "local": UnixLocalSandboxState,
+        "unix_local": UnixLocalSandboxState,
+        "modal": ModalSandboxState,
+    }.get(provider)
+    if state_cls is None:
+        await delete_agent(agent_id)
+        raise HTTPException(400, f"unsupported provider: {provider!r}")
+    initial_state = state_cls(recipe=Recipe(
+        agent_type=agent_type,
+        dockerfile=dockerfile,
+        shared_mounts=list(shared_mounts) if shared_mounts else [],
+        root=root,
+        pre_start_commands=user_pre_start,
+    ))
+
+    session_id = str(uuid.uuid4())
+    await upsert_session(
+        session_id, agent_id, sandbox_id=None, inner_session_id=None,
+        volume_id=volume_record.id,
+        env=body_env or {}, secrets=body_secrets or {},
+        cwd=cwd,
+        pre_start_commands=user_pre_start,
+    )
+    # Pre-populate sandbox_state so pool.get_session knows the recipe on
+    # first call. The dual-write trigger fires on UPDATE OF
+    # current_sandbox_id/agent_id/pre_start_commands/volume_id (NOT on
+    # sandbox_state itself), so this UPDATE doesn't get clobbered.
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
+            (Json(serialize(initial_state)), session_id),
+        )
+
+    pool = get_pool()
+    try:
+        pool_session = await pool.get_session(session_id)
     except HTTPException:
         await delete_agent(agent_id)
         raise
     except Exception as e:
         await delete_agent(agent_id)
-        log.error("sessions_quick_create: provisioning failed (provider=%s): %s",
+        log.error("sessions_create_eager: pool.get_session failed (provider=%s): %s",
                   provider, e, exc_info=True)
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
-    instance = provisioned.instance
-    _INSTANCES[sandbox_id] = instance
-    # Effective root drives both the sandbox row and the session's cwd —
-    # session/new must run with the same path the supervisor's HOME points
-    # at so volume-persisted JSONLs land where Claude expects to find them.
-    effective_root = provisioned.record.root
-    if cwd is None:
-        cwd = effective_root
-    await upsert_sandbox(provisioned.record)
+    # Back-compat shim: legacy callers (and the test helpers) still read
+    # ``current_sandbox_id`` and call ``GET /sandboxes/{id}`` against the
+    # sandboxes table. The pool only updates ``sandbox_state`` JSONB, so
+    # we mirror the row here. Removed once the sandboxes table itself
+    # goes away (the next cleanup PR).
+    provider_ref = getattr(pool_session.state, "sandbox_id", None)
+    sandbox_row_id = f"sb_{uuid.uuid4().hex[:12]}"
+    if provider_ref:
+        await upsert_sandbox(SandboxRecord(
+            id=sandbox_row_id, provider=provider, sandbox_ref=provider_ref,
+            status="running",
+            root=(pool_session.state.recipe.root or "/tmp"),
+            volume_id=volume_record.id,
+            subpath=pool_session._subpath or f"agents/{agent_id}",
+            listen_port=getattr(pool_session.state, "listen_port", None),
+            dockerfile=dockerfile,
+            shared_mounts=list(shared_mounts) if shared_mounts else [],
+        ))
+        await set_session_current_sandbox(session_id, sandbox_row_id)
 
-    async def _cleanup_and_raise(msg_fmt: str, e: Exception) -> None:
-        """Shared teardown for post-upsert failures in /sessions."""
-        await delete_agent(agent_id)
-        await delete_sandbox(sandbox_id)
-        _INSTANCES.pop(sandbox_id, None)
-        try:
-            await destroy_instance(instance)
-        except Exception as de:
-            log.warning("sessions_quick_create cleanup: destroy_instance failed: %s", de)
-        raise HTTPException(502, msg_fmt.format(e=e))
-
-    # For Daytona, create_instance returns url="" (supervisor started lazily);
-    # fill it in now so AcpClient has a real endpoint. Docker/Local already
-    # started the supervisor inside create_sandbox.
-    url = instance.url
-    if not url:
-        supervisor_port = allocate_sandbox_port(sandbox_id)
-        try:
-            url = await _providers_mod.ensure_supervisor_url(
-                provider, instance,
-                agent_type=agent_type, root=instance.root or root,
-                spawn_env=spawn_env, port=supervisor_port,
-            )
-        except Exception as e:
-            free_sandbox_port(sandbox_id, supervisor_port)
-            await _cleanup_and_raise("Failed to start supervisor: {e}", e)
-    else:
-        supervisor_port = instance.port
-
-    acp_session_id = str(uuid.uuid4())
-    session_id = str(uuid.uuid4())
-    client = AcpClient(url)
-    # Brand-new session → inner_sid=None, so _attach_acp_session goes
-    # straight to session/new. Routing through the shared helper keeps
-    # sessions_quick_create / _ensure_runtime_locked / SSE-reader recovery
-    # all using a single attach path, so the invariant "session/load first
-    # when we have an inner_sid" can't accidentally get skipped here later.
-    synthetic_agent = AgentRecord(id=agent_id, name=data.get("name"), config=config)
-    try:
-        inner_session_id, _ = await _attach_acp_session(
-            client, acp_session_id, synthetic_agent,
-            inner_sid=None, cwd=cwd,
-        )
-    except Exception as e:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        await _cleanup_and_raise("Failed to connect to ACP supervisor: {e}", e)
-    state = SessionState(
-        session_id=session_id, agent_id=agent_id, sandbox_id=sandbox_id,
-        acp_session_id=acp_session_id, inner_session_id=inner_session_id,
-        agent_type=config.agent_type or "claude",
-        client=client,
-        supervisor_url=url, supervisor_port=supervisor_port,
-    )
-    SESSIONS[session_id] = state
-    # _start_session_tasks (legacy SSE reader + scheduler) intentionally
-    # not called: POST /message uses the SessionPool path instead, so the
-    # persistent reader and the scheduler loop have nothing to drive.
-    # The SessionState entry is kept in SESSIONS only for back-compat
-    # with the few endpoints that still read it (e.g. /admin/sessions
-    # legacy fields); deletion of SESSIONS itself follows in a later PR.
-    await upsert_session(
-        session_id, agent_id, sandbox_id, inner_session_id,
-        volume_id=volume_id,
-        env=session_env, secrets=session_secrets,
-        cwd=cwd,
-        pre_start_commands=list(user_pre_start),
-    )
-
-    # Dual-key response: ``sandbox_id`` matches /sandboxes + client code;
-    # ``current_sandbox_id`` matches the DB column + /sessions/{id} GET.
     return {
         "agent_id": agent_id,
-        "sandbox_id": sandbox_id,
-        "current_sandbox_id": sandbox_id,
+        "sandbox_id": sandbox_row_id if provider_ref else None,
+        "current_sandbox_id": sandbox_row_id if provider_ref else None,
         "session_id": session_id,
-        "inner_session_id": inner_session_id,
+        "id": session_id,
+        "volume_id": volume_record.id,
+        "inner_session_id": pool_session._inner_session_id,
         "connected": True,
     }
 
