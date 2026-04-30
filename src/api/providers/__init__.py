@@ -144,11 +144,6 @@ async def destroy_instance(instance: ProviderInstance) -> None:
     await _dispatch_mod(instance.provider).destroy_sandbox(instance)
 
 
-async def stop_instance(instance: ProviderInstance) -> None:
-    """Stop a supervisor instance (resumable). For local/docker, same as destroy."""
-    await _dispatch_mod(instance.provider).stop_sandbox(instance)
-
-
 async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
     """Run a shell command in the sandbox environment."""
     if instance.provider == "local":

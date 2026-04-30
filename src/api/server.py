@@ -1230,8 +1230,9 @@ async def _sessions_create_lazy(data: dict) -> dict:
     """Create a session row only — no sandbox, no ACP, no scheduler.
 
     Used when the UI wants to render a session shell before paying the
-    provisioning cost (daytona: ~15-30 s; local: ~2-3 s). Sandbox appears
-    on the first ``/sessions/{id}/start-sandbox`` or ``/message``.
+    provisioning cost (daytona: ~15-30 s; local: ~2-3 s). The sandbox
+    appears on the first ``POST /sessions/{id}/message`` (the pool
+    cold-creates on demand).
     """
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
@@ -1394,11 +1395,10 @@ async def _sessions_create_eager(data: dict) -> dict:
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
-    # Back-compat shim: legacy callers (and the test helpers) still read
-    # ``current_sandbox_id`` and call ``GET /sandboxes/{id}`` against the
-    # sandboxes table. The pool only updates ``sandbox_state`` JSONB, so
-    # we mirror the row here. Removed once the sandboxes table itself
-    # goes away (the next cleanup PR).
+    # Back-compat shim: GET /sandboxes/{id} + DELETE /sandboxes/{id}
+    # (used by recovery test cleanup) still read the sandboxes table,
+    # which the pool's sandbox_state JSONB doesn't populate. Mirror the
+    # row here. Drop once those callers move to session-scoped routes.
     provider_ref = getattr(pool_session.state, "sandbox_id", None)
     sandbox_row_id = f"sb_{uuid.uuid4().hex[:12]}"
     if provider_ref:
@@ -1414,27 +1414,11 @@ async def _sessions_create_eager(data: dict) -> dict:
         ))
         await set_session_current_sandbox(session_id, sandbox_row_id)
 
-    # Caller may pass ``model`` / ``mode`` / ``thought_level`` at session
-    # create time as a convenience over a separate POST /config call.
-    # Forward them now while the supervisor's still warm — saves a round
-    # trip and matches what the SDK does. Best-effort: a transient ACP
-    # failure shouldn't blow up the create response.
-    #
-    # Look in BOTH ``data`` (top-level) and ``config_data`` (nested) —
-    # ``_merge_top_level_config`` above already promoted ``model`` from
-    # data into config_data, so ``data.get("model")`` returns None for
-    # the common SDK shape that sets it at the top level.
-    for key, method in (("model", "set_model"), ("mode", "set_mode"),
-                        ("thought_level", "set_thought_level")):
-        val = data.get(key) if data.get(key) is not None else config_data.get(key)
-        if val is not None:
-            log.info("sessions_create_eager: forwarding %s(%r) to session %s",
-                     method, val, session_id)
-            try:
-                await getattr(pool_session, method)(val)
-            except Exception as e:
-                log.warning("sessions_create_eager: %s(%r) failed: %s",
-                            method, val, e)
+    # Forward model/mode/thought_level so callers don't have to follow
+    # POST /sessions with a separate POST /config. Read both top-level
+    # and config_data because ``_merge_top_level_config`` already moved
+    # ``model`` into config_data. Best-effort.
+    await _forward_session_config(pool_session, data, config_data)
 
     return {
         "agent_id": agent_id,
@@ -1446,6 +1430,37 @@ async def _sessions_create_eager(data: dict) -> dict:
         "inner_session_id": pool_session._inner_session_id,
         "connected": True,
     }
+
+
+_SESSION_CONFIG_FIELDS = (
+    ("model", "set_model"),
+    ("mode", "set_mode"),
+    ("thought_level", "set_thought_level"),
+)
+
+
+async def _forward_session_config(
+    pool_session,
+    data: dict,
+    config_data: dict | None = None,
+) -> None:
+    """Apply caller-provided ``model`` / ``mode`` / ``thought_level`` to a
+    pool session via ACP ``set_*``. Best-effort: a transient ACP failure
+    logs and continues. Fields are looked up first in ``data`` (top-level
+    body — what the SDK sends), then in ``config_data`` (nested body —
+    what ``_merge_top_level_config`` may have promoted ``model`` into)."""
+    cfg = config_data or {}
+    for key, method in _SESSION_CONFIG_FIELDS:
+        val = data.get(key)
+        if val is None:
+            val = cfg.get(key)
+        if val is None:
+            continue
+        try:
+            await getattr(pool_session, method)(val)
+        except Exception as e:
+            log.warning("forward %s(%r) to session %s failed: %s",
+                        method, val, pool_session.session_id, e)
 
 
 async def _resolve_log_sandbox_id(session) -> str | None:
@@ -1786,16 +1801,8 @@ async def session_set_config(session_id: str, request: Request):
     from api.sandbox import get_pool
 
     pool_session = await get_pool().get_session(session_id)
-    try:
-        if "mode" in data:
-            await pool_session.set_mode(data["mode"])
-        if "model" in data:
-            await pool_session.set_model(data["model"])
-        if "thought_level" in data:
-            await pool_session.set_thought_level(data["thought_level"])
-        return {"status": "ok"}
-    except Exception as e:
-        raise HTTPException(502, str(e))
+    await _forward_session_config(pool_session, data)
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
