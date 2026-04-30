@@ -1605,29 +1605,62 @@ async def post_session_message(session_id: str, request: Request):
     flow via GET /events (multi-subscriber) or via the response body of
     POST /message+stream (single-call).
 
-    Routes through ``api.sandbox.SessionPool`` (per
-    ``docs/ephemeral-sandbox-design.md`` §6 / §7): pool.get_session
-    cold-starts or warm-reuses the SandboxSession; execute_prompt opens
-    a per-prompt supervisor SSE for this prompt only and broadcasts to
-    /events subscribers via session._broadcast.
+    Truly fire-and-forget: ``pool.get_session`` (which may cold-recover
+    a hibernated/dead sandbox — 30-60s on Daytona under contended
+    control-plane load) runs INSIDE the background task, not before
+    the response. Subscribers on ``/events`` see the recovery delay as
+    silence, then the prompt's events. Errors during recovery surface
+    as ``error`` broadcasts on the session's subscriber fanout.
     """
-    from api.sandbox import get_pool
-
     data = await _json_body(request)
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
 
     rpc_id = str(uuid.uuid4())
-    pool = get_pool()
-    session = await pool.get_session(session_id)
-    await _persist_user_message(session, message, rpc_id)
 
-    # Hold a strong reference so the task isn't GC'd mid-flight.
-    task = asyncio.create_task(_persist_prompt_events(session, message, rpc_id))
+    async def _drive() -> None:
+        from api.sandbox import get_pool
+        try:
+            session = await get_pool().get_session(session_id)
+        except Exception as e:
+            log.exception("pool.get_session(%s) failed for rpc=%s",
+                          session_id, rpc_id)
+            # No session object → can't broadcast via session._broadcast.
+            # The /events stream remains silent for this rpc; the only
+            # observable signal is the absence of any event with this
+            # rpc_id. Caller's per-rpc deadline will fire.
+            await _log_session_acquire_error(session_id, rpc_id, e)
+            return
+        await _persist_user_message(session, message, rpc_id)
+        await _persist_prompt_events(session, message, rpc_id)
+
+    task = asyncio.create_task(_drive())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
+
+
+async def _log_session_acquire_error(session_id: str, rpc_id: str,
+                                     err: Exception) -> None:
+    """Best-effort error log when pool.get_session fails before we have
+    a session object to broadcast through. Writes the error to
+    session_log so /sessions/{id}/log readers see it.
+    """
+    try:
+        await log_event(
+            session_id=session_id, agent_id="", sandbox_id=None,
+            event_type=EVT_ERROR,
+            payload={
+                "prompt_id": rpc_id,
+                "kind": type(err).__name__,
+                "message": str(err)[:500],
+                "phase": "pool.get_session",
+            },
+        )
+    except Exception:
+        log.exception("failed to log session-acquire error for %s rpc=%s",
+                      session_id, rpc_id)
 
 
 # Track in-flight POST /message background drains so asyncio doesn't GC them.
