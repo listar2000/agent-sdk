@@ -78,12 +78,8 @@ from .providers import (
     PORT_BASED_PROVIDERS,
     ProviderInstance,
     VolumeFileExistsError,
-    allocate_sandbox_port,
-    create_instance,
     default_cwd_for_provider,
     destroy_instance,
-    free_sandbox_port,
-    kill_supervisor_in_sandbox,
     stop_instance,
 )
 from .providers._shared import _safe_path as _shared_safe_path
@@ -1078,18 +1074,12 @@ async def get_sandbox_route(sandbox_id: str):
             result["url"] = record.derive_url()
         except Exception:
             pass
-    # Expose the supervisor's current PID for local provider so callers
-    # that need to send signals (e.g. test harnesses) can do so without
-    # coupling to the shape of sandbox_ref. Docker's container_id + daytona's
-    # sandbox_id fill the same role on their own providers. Also expose
-    # the alive-marker file path so an external "delete" can remove just
-    # the marker without disturbing home (preserving volume semantics).
+    # Local provider exposes the alive-marker path so an external "delete"
+    # simulation can remove just the marker without disturbing home —
+    # preserves the volume-persistence test invariants. PID isn't surfaced
+    # anymore (was tied to the legacy ``_INSTANCES`` cache); test helpers
+    # discover the supervisor by its listening port instead.
     if record.provider == "local":
-        inst = _INSTANCES.get(record.id)
-        if inst is not None and inst.process is not None:
-            pid = getattr(inst.process, "pid", None)
-            if pid is not None:
-                result["pid"] = pid
         from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
         args = _LOCAL_SPAWN_ARGS.get(record.sandbox_ref)
         if args and args.get("marker_path"):
