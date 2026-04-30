@@ -338,280 +338,6 @@ def _versioned_agent_type(agent_type: str) -> str:
 
 
 
-async def _hibernate_session(state: SessionState) -> None:
-    """Stop the sandbox compute, then either keep ``SessionState`` for a
-    fast UI resume or evict it if no UI is watching.
-
-    The next POST ``/message`` against this session goes through
-    ``_ensure_runtime_locked`` → ``_ensure_state_live`` → ``_rebind_state``,
-    which sees ``supervisor_url=None`` and a DB row with ``STATUS_STOPPED``
-    and revives the same sandbox in place. After eviction, the next
-    request rebuilds ``SessionState`` from the DB row first.
-
-    Caller MUST hold ``_get_session_lock(state.session_id)`` — this races
-    with /message's ensure path otherwise.
-
-    Pre: ``state.active_rpc_id is None`` and ``state.pending_prompts`` is
-    empty. The endpoint gates on this; the reaper does too.
-
-    Subscriber policy:
-      • Subscribers attached → keep state, leave queues bound, silent
-        stream until next turn rebinds the SSE reader. Eviction fires
-        from ``/events`` finally when the LAST subscriber drops.
-      • No subscribers → evict immediately (no UI to benefit from cached
-        state; otherwise headless callers would leak ``SessionState``
-        forever since their drop trigger never fires).
-    """
-    sandbox_id = state.sandbox_id
-    sb = await get_sandbox(sandbox_id)
-
-    # Snapshot the supervisor BEFORE stopping compute so the next session/load
-    # on resume finds the JSONLs on the volume.
-    await _request_supervisor_snapshot(_INSTANCES.get(sandbox_id))
-
-    # Stop compute uniformly across providers via the DB row. Robust to
-    # a stale or missing _INSTANCES entry. For daytona this stops the
-    # workspace (pauses billing); for docker/local this kills the
-    # container/process.
-    if sb is not None:
-        try:
-            await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))
-        except Exception as e:
-            log.warning("hibernate: stop_sandbox failed for %s: %s", sandbox_id, e)
-        if sb.status != STATUS_STOPPED:
-            sb.status = STATUS_STOPPED
-            await upsert_sandbox(sb)
-
-    # Drop the in-process instance entry AFTER provider stop / DB flip so a
-    # crash mid-stop leaves enough state for reconcile to find the container.
-    _INSTANCES.pop(sandbox_id, None)
-    state.lifecycle = "hibernated"
-
-    # Return the per-session supervisor port to the per-sandbox allocator
-    # (provider-agnostic). Today only daytona allocates one; others run a
-    # single supervisor per sandbox at a fixed port and never set this field.
-    if state.supervisor_port is not None:
-        free_sandbox_port(sandbox_id, state.supervisor_port)
-
-    # Cancel the SSE reader — the upstream stream just closed and we don't
-    # want it racing rebind. The scheduler stays parked on _prompt_ready;
-    # ensure_state_live restarts the reader when the next message arrives.
-    await _cancel_task(state._reader_task)
-    state._reader_task = None
-    state._reader_alive = False
-    state._reader_connected = False
-    state.supervisor_url = None
-    state.supervisor_port = None
-
-    state.last_activity = time.time()
-    log.info("hibernated session %s (sandbox %s, provider=%s, subs=%d)",
-             state.session_id, sandbox_id,
-             sb.provider if sb else "?",
-             len(state._session_subscribers))
-
-    # If nobody is watching this session, skip the "keep state in memory"
-    # half — there is no UI to benefit from a fast rebind, and a headless
-    # caller would otherwise leak SessionState forever (the
-    # subscriber-drop eviction trigger never fires when no subscriber
-    # ever existed). Symmetric with _maybe_evict_hibernated; the gates
-    # we already passed at the call site (no active_rpc, no pending,
-    # session lock held) cover the same conditions.
-    if not state._session_subscribers and SESSIONS.get(state.session_id) is state:
-        log.info("hibernated session %s has no subscribers — evicting state",
-                 state.session_id)
-        await _shutdown_session_state(state, remove=True, force=True)
-
-
-async def _ensure_provider_sandbox_stopped(sandbox_id: str | None) -> None:
-    """Defensively retry ``stop_sandbox`` at the provider before we drop
-    our last in-memory reference to a sandbox.
-
-    Backstops the silent-leak class: ``_hibernate_session`` swallows
-    transient ``stop_sandbox`` failures (logs WARNING, flips DB to
-    STOPPED, sets ``lifecycle="hibernated"``, pops ``_INSTANCES``), so
-    the eviction paths that fire later believe the sandbox is stopped
-    when it may still be RUNNING in the cloud (Daytona, Modal). Without
-    this retry the workspace orphans in the provider with zero
-    server-side memory of it.
-
-    No-op when:
-      * ``sandbox_id`` is None.
-      * ``_INSTANCES`` still has an entry — the caller's hot-path teardown
-        owns destruction of live instances.
-      * Another live ``SessionState`` still references the sandbox.
-      * The sandbox row is gone from the DB (already cleaned up).
-    """
-    if not sandbox_id:
-        return
-    if sandbox_id in _INSTANCES:
-        return
-    if any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
-        return
-    sb = await get_sandbox(sandbox_id)
-    if sb is None:
-        return
-    try:
-        await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))
-    except Exception as e:
-        log.warning(
-            "defensive stop_sandbox at eviction failed for %s (provider=%s): %s",
-            sandbox_id, sb.provider, e,
-        )
-
-
-async def _maybe_evict_hibernated(state: SessionState) -> None:
-    """If a hibernated session has lost its last subscriber, fully evict
-    the in-memory ``SessionState``.
-
-    Called from the ``/events`` ``finally`` block right after
-    ``unsubscribe_session``. Cheap when not applicable — the early returns
-    avoid acquiring the session lock unless we're actually going to evict.
-
-    Conversation history and the sandboxes DB row stay intact; the next
-    request rebuilds ``SessionState`` from the row via the normal recovery
-    path.
-    """
-    if state._session_subscribers:
-        return
-    if state.shutdown.is_set():
-        return  # already torn down
-    if not state.is_hibernated:
-        return  # sandbox is still up — keep state for the running session
-    async with _get_session_lock(state.session_id):
-        # Re-check under lock: a new /events handler may have subscribed,
-        # or a /message may have woken the sandbox between our checks.
-        if state._session_subscribers or not state.is_hibernated:
-            return
-        if state.active_rpc_id is not None or state.pending_prompts:
-            return
-        if SESSIONS.get(state.session_id) is not state:
-            return  # already evicted by another path
-        log.info(
-            "evicting hibernated session %s after last subscriber dropped",
-            state.session_id,
-        )
-        sandbox_id = state.sandbox_id
-        await _shutdown_session_state(state, remove=True, force=True)
-        # Defensive stop AFTER shutdown so the helper's "still in use"
-        # check (any(s.sandbox_id == ...) over SESSIONS) doesn't see
-        # this very session and bail out.
-        await _ensure_provider_sandbox_stopped(sandbox_id)
-
-
-async def _reap_one_tick(now: float) -> None:
-    """Single iteration of the reap loop, factored out for testability.
-
-    Hibernates any session idle past ``IDLE_TIMEOUT_S`` with no active or
-    pending prompts. Subscribers no longer pin the sandbox open — an
-    actively-watched but quiet UI gets hibernated too, and the session
-    state survives the pause so resume is a single rebind. Full eviction
-    of the in-memory state is driven by the last subscriber dropping
-    (see ``_maybe_evict_hibernated``), not by this loop.
-
-    Sessions whose sandbox is already stopped (``sandbox_id not in
-    _INSTANCES``) are skipped — there's nothing left to hibernate.
-    Durability lives at turn-end in the supervisor; the snapshot here is
-    a belt-and-suspenders pre-stop save.
-    """
-    busy = sum(1 for s in SESSIONS.values() if s.agent_busy)
-    readers = sum(1 for s in SESSIONS.values() if s._reader_alive)
-    subs = sum(len(s._session_subscribers) for s in SESSIONS.values())
-    log.info(
-        "idle reaper tick: sessions=%d busy=%d readers=%d subs=%d instances=%d",
-        len(SESSIONS), busy, readers, subs, len(_INSTANCES),
-    )
-
-    for state in list(SESSIONS.values()):
-        if state.active_rpc_id is not None or state.pending_prompts:
-            continue
-        idle_since = _session_idle_since(state)
-        if now - idle_since < IDLE_TIMEOUT_S:
-            continue
-        async with _get_session_lock(state.session_id):
-            # Re-check under the lock — a concurrent /message may have
-            # picked up work between the outer guards and here.
-            if SESSIONS.get(state.session_id) is not state:
-                continue
-            if state.active_rpc_id is not None or state.pending_prompts:
-                continue
-            if not state.is_hibernated:
-                # Running session: hibernate compute. _hibernate_session
-                # also evicts state inline if no subscribers are attached.
-                log.info(
-                    "idle reaper: hibernating session %s (idle %.0fs, subs=%d)",
-                    state.session_id, now - idle_since,
-                    len(state._session_subscribers),
-                )
-                state.turn_completed_at = now
-                await _hibernate_session(state)
-            elif not state._session_subscribers:
-                # Already-hibernated stuck state with no subscribers — the
-                # subscriber-drop trigger would never fire here, so the
-                # reaper is the only path. Evict directly.
-                log.info(
-                    "idle reaper: evicting hibernated idle session %s "
-                    "(idle %.0fs, no subscribers)",
-                    state.session_id, now - idle_since,
-                )
-                sandbox_id = state.sandbox_id
-                await _shutdown_session_state(
-                    state, remove=True, force=True, mark_idle_at=now,
-                )
-                # See note in _maybe_evict_hibernated — defensive stop
-                # must follow shutdown so the "still in use" guard
-                # doesn't trip on the session being evicted.
-                await _ensure_provider_sandbox_stopped(sandbox_id)
-            # else: hibernated + has subscribers — wait for them to drop;
-            # /events finally → _maybe_evict_hibernated handles eviction.
-
-
-def _sweep_session_locks() -> int:
-    """Drop ``_session_locks`` entries for sessions no longer in SESSIONS,
-    provided the lock is fully idle.
-
-    The existing comment at ``_shutdown_session_state`` justifies *not*
-    popping locks at session-evict time: a concurrent ``_ensure_runtime_locked``
-    that's mid-acquire on the same session_id would otherwise see a fresh
-    Lock from ``_get_session_lock(sid).setdefault`` and run in parallel with
-    the original holder. We preserve that invariant here by sweeping ONLY
-    when the lock is unlocked AND has no waiters — at that point no caller
-    holds a stale reference, so a future ``_get_session_lock(sid)`` minting
-    a new Lock cannot race.
-
-    ``asyncio.Lock._waiters`` is CPython-internal but stable (it's a
-    ``collections.deque`` of suspended ``acquire`` futures). The alternative
-    — bookkeeping a "last touched" timestamp at every acquire — is hotter
-    than this once-per-reaper-tick sweep.
-    """
-    if not _session_locks:
-        return 0
-    pruned = 0
-    for sid in list(_session_locks):
-        if sid in SESSIONS:
-            continue
-        lock = _session_locks.get(sid)
-        if lock is None or lock.locked():
-            continue
-        if getattr(lock, "_waiters", None):
-            continue
-        # Re-check under the same tick — a concurrent /sessions create may
-        # have just landed an entry into SESSIONS.
-        if sid in SESSIONS:
-            continue
-        if _session_locks.pop(sid, None) is not None:
-            pruned += 1
-    return pruned
-
-
-async def _idle_reaper():
-    """Background task: close idle sessions that have been inactive too long."""
-    while True:
-        await asyncio.sleep(REAPER_TICK_S)
-        await _reap_one_tick(time.time())
-        pruned = _sweep_session_locks()
-        if pruned:
-            log.info("idle reaper: pruned %d cold session_locks (now %d)",
-                     pruned, len(_session_locks))
 
 
 @asynccontextmanager
@@ -639,15 +365,14 @@ async def lifespan(app):
     # we don't have to remember to wire it up.
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
 
-    # Cutover (Phase 2b): hibernate idle pool sessions via SessionPool's
-    # reaper. Legacy ``_idle_reaper`` continues to scan SESSIONS dict for
-    # back-compat with sessions that haven't migrated through pool yet.
+    # SessionPool's idle reaper hibernates pool sessions per
+    # docs/ephemeral-sandbox-design.md §6. The legacy SESSIONS-dict
+    # reaper was deleted in Phase 4 — pool.reap_idle is now the only
+    # eviction path.
     from api.sandbox import start_reaper, shutdown_pool
     await start_reaper()
 
-    reaper = asyncio.create_task(_idle_reaper())
     yield
-    await _cancel_task(reaper)
     try:
         await shutdown_pool()
     except Exception as e:
@@ -700,6 +425,47 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Endpoints scheduled for removal once SessionPool covers the same surface
+# end-to-end. Keys are the FastAPI path-template strings; the matching
+# request emits ``Deprecation: true`` + ``Sunset: <date>`` + a ``Link``
+# pointing at the replacement, per RFC 8594. Callers (notably the SDK)
+# log a DeprecationWarning when they observe these.
+_DEPRECATED_ROUTES: dict[str, str] = {
+    "/sandboxes": "POST /sessions creates sessions + their compute lazily through SessionPool",
+    "/sandboxes/{sandbox_id}/start": "Pool brings the compute back on the next POST /sessions/{id}/message",
+    "/sandboxes/{sandbox_id}/stop": "POST /sessions/{id}/release snapshots + pauses via SessionPool",
+    "/sandboxes/{sandbox_id}/snapshot": "POST /sessions/{id}/release writes the snapshot via SessionPool",
+    "/sandboxes/{sandbox_id}/files/tree": "GET /sessions/{session_id}/files/tree",
+    "/sandboxes/{sandbox_id}/files/read": "GET /sessions/{session_id}/files/read",
+    "/sandboxes/{sandbox_id}/files/edit": "POST /sessions/{session_id}/files/edit",
+    "/sandboxes/{sandbox_id}/files/upload": "POST /sessions/{session_id}/files/upload",
+    "/sandboxes/{sandbox_id}/files/delete": "POST /sessions/{session_id}/files/delete",
+    "/sandboxes/{sandbox_id}/files/rename": "POST /sessions/{session_id}/files/rename",
+    "/sandboxes/{sandbox_id}/files/download": "GET /sessions/{session_id}/files/download",
+    "/sessions/{session_id}/start-sandbox": "POST /sessions/{id}/message — pool provisions on demand",
+    "/sessions/{session_id}/reset-sandbox": "POST /sessions/{id}/release then POST /sessions/{id}/message",
+}
+_DEPRECATION_SUNSET = "Wed, 31 Dec 2026 00:00:00 GMT"
+
+
+@app.middleware("http")
+async def _deprecation_headers_middleware(request: Request, call_next):
+    """Stamp RFC 8594 deprecation headers onto responses for routes in
+    ``_DEPRECATED_ROUTES``. Lookup is by FastAPI's matched path template
+    (so it doesn't depend on the concrete sandbox/session id), and only
+    fires when the route actually matched — 404s pass through clean."""
+    response = await call_next(request)
+    route = request.scope.get("route")
+    template = getattr(route, "path", None)
+    note = _DEPRECATED_ROUTES.get(template) if template else None
+    if note is not None:
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = _DEPRECATION_SUNSET
+        response.headers["Link"] = f'<{template}>; rel="deprecation"'
+        response.headers["X-Deprecation-Note"] = note
+    return response
 
 
 @app.exception_handler(HTTPException)
