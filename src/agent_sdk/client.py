@@ -104,41 +104,8 @@ class UsageStats:
             self.total_cost_usd += cost
 
 
-def _check_deprecation(resp) -> None:
-    """If the server flagged this endpoint as deprecated (RFC 8594
-    ``Deprecation: true`` header), surface it once per (method, path)
-    via ``warnings.warn(DeprecationWarning)``. The note + sunset come
-    from the server's ``X-Deprecation-Note`` and ``Sunset`` headers."""
-    headers = getattr(resp, "headers", {})
-    if (headers.get("deprecation") or "").lower() != "true":
-        return
-    req = getattr(resp, "request", None)
-    method = getattr(req, "method", "?") if req else "?"
-    path = ""
-    if req is not None:
-        url = getattr(req, "url", None)
-        path = getattr(url, "path", "") if url else ""
-    key = (method, path)
-    if key in _DEPRECATION_SEEN:
-        return
-    _DEPRECATION_SEEN.add(key)
-    note = headers.get("x-deprecation-note") or "endpoint is deprecated"
-    sunset = headers.get("sunset")
-    msg = f"{method} {path} is deprecated"
-    if sunset:
-        msg += f" (sunset: {sunset})"
-    msg += f" — {note}"
-    import warnings as _warnings
-    _warnings.warn(msg, DeprecationWarning, stacklevel=3)
-
-
-_DEPRECATION_SEEN: set[tuple[str, str]] = set()
-
-
 def _raise_for_status(resp) -> None:
-    """Like resp.raise_for_status() but includes server error message.
-    Also surfaces RFC 8594 deprecation headers as DeprecationWarning."""
-    _check_deprecation(resp)
+    """Like resp.raise_for_status() but includes server error message."""
     status = getattr(resp, 'status_code', None)
     if not isinstance(status, int) or status < 400:
         return
