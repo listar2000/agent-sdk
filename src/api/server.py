@@ -3209,7 +3209,6 @@ async def _ensure_runtime_locked(session_row: dict, sandbox: SandboxRecord) -> S
         supervisor_url=supervisor_url, supervisor_port=supervisor_port,
     )
     SESSIONS[session_id] = state
-    _start_session_tasks(state)
     return state
 
 
@@ -3625,7 +3624,12 @@ async def _sessions_create_eager(data: dict) -> dict:
         supervisor_url=url, supervisor_port=supervisor_port,
     )
     SESSIONS[session_id] = state
-    _start_session_tasks(state)
+    # _start_session_tasks (legacy SSE reader + scheduler) intentionally
+    # not called: POST /message uses the SessionPool path instead, so the
+    # persistent reader and the scheduler loop have nothing to drive.
+    # The SessionState entry is kept in SESSIONS only for back-compat
+    # with the few endpoints that still read it (e.g. /admin/sessions
+    # legacy fields); deletion of SESSIONS itself follows in a later PR.
     await upsert_session(
         session_id, agent_id, sandbox_id, inner_session_id,
         volume_id=volume_id,
@@ -3644,162 +3648,6 @@ async def _sessions_create_eager(data: dict) -> dict:
         "inner_session_id": inner_session_id,
         "connected": True,
     }
-
-
-# ---------------------------------------------------------------------------
-# Scheduler loop — single owner of active_rpc_id, no locks needed
-# ---------------------------------------------------------------------------
-
-_CANCEL_DRAIN_TIMEOUT = 10  # seconds — safety cap so cancel doesn't hang
-
-
-def _start_session_tasks(state: SessionState) -> None:
-    """Start SSE reader + scheduler loop for a session."""
-    log.info(
-        "[SSE-READER] initializing session tasks for session %s (reader_alive=%s)",
-        state.session_id,
-        state._reader_alive,
-    )
-    _start_sse_reader(state)
-    if state._scheduler_task is None or state._scheduler_task.done():
-        state._scheduler_task = asyncio.create_task(_scheduler_loop(state))
-
-
-async def _scheduler_loop(state: SessionState) -> None:
-    """Process prompts one at a time. Sole writer of active_rpc_id."""
-    try:
-        while not state.shutdown.is_set():
-            await state._prompt_ready.wait()
-            if state.shutdown.is_set():
-                return
-            while state.pending_prompts and not state.shutdown.is_set():
-                pending = state.pending_prompts.popleft()
-                state.active_rpc_id = pending.rpc_id
-                state._prompt_done.clear()
-                await _execute_one_prompt(state, pending.rpc_id, pending.message)
-                state.active_rpc_id = None
-                _mark_turn_finished(state)
-                state._prompt_done.set()
-            state._prompt_ready.clear()
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        log.exception("scheduler loop died for session %s", state.session_id)
-
-
-def _classify_prompt_error(e: Exception, body: str) -> str:
-    """Categorize a prompt failure for the error payload's ``kind`` field."""
-    if isinstance(e, httpx.HTTPStatusError):
-        if e.response.status_code == 500:
-            if "agent process exited" in body or "start a new session" in body:
-                return "sandbox_process_died"
-            return "sandbox_internal_error"
-        return "http_error"
-    if isinstance(e, httpx.ConnectError):
-        return "sandbox_unreachable"
-    if isinstance(e, httpx.ReadTimeout):
-        return "timeout"
-    return "unknown"
-
-
-async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) -> None:
-    """Execute a single prompt HTTP round-trip. Called only from the scheduler loop.
-
-    Unconditionally re-runs ``ensure_session_live`` right before the
-    submit. Closes the kill-then-send race: the POST /message handler's
-    own ensure call happens before the prompt is enqueued, so a sandbox
-    that died between enqueue and scheduler pickup would otherwise get
-    the prompt sent to a dead supervisor. The ensure call here is cheap
-    on the hot path (_reader_connected skips the health probe) and
-    guarantees the client + acp_session_id we use are live.
-    """
-    session_id = state.session_id
-    await log_event(
-        session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
-        event_type=EVT_USER_MESSAGE, payload={"text": message, "prompt_id": rpc_id},
-    )
-    def _is_transient_supervisor_failure(e: Exception) -> bool:
-        # Transport-level: supervisor died mid-handshake.
-        if isinstance(e, (httpx.ConnectError, httpx.RemoteProtocolError,
-                          httpx.ReadError)):
-            return True
-        # Daytona signed proxy URL invalidation manifests as 502/503/504 on
-        # the supervisor's HTTP surface even while the supervisor process
-        # is alive — the proxy returns gateway errors for a few seconds
-        # after a fresh URL is minted for the same port. A rebind picks up
-        # the latest URL, retry then succeeds.
-        if isinstance(e, httpx.HTTPStatusError):
-            return e.response.status_code in (502, 503, 504)
-        return False
-
-    try:
-        _, _, state = await ensure_session_live(session_id)
-        await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
-        return
-    except Exception as first_err:
-        if not _is_transient_supervisor_failure(first_err):
-            err = first_err
-            tb = traceback.format_exc()
-            log.exception("prompt failed for session %s", session_id)
-        else:
-            # The supervisor died (or its signed Daytona URL was invalidated)
-            # between `_reader_connected` observing it up and our prompt
-            # submit. Clear the flag so the next ensure_session_live is
-            # forced through the rebind path, then retry once. Handles both
-            # the kill-then-immediately-send race for UI flows that don't add
-            # any delay AND the Daytona stale-signed-URL 502 churn during
-            # cascading recovery.
-            log.warning(
-                "prompt for session %s failed with %s; forcing rebind + retry",
-                session_id, type(first_err).__name__,
-            )
-            state._reader_connected = False
-            try:
-                _, _, state = await ensure_session_live(session_id)
-                await state.client.prompt(state.acp_session_id, message, rpc_id=rpc_id)
-                return
-            except Exception as e:
-                err = e
-                tb = traceback.format_exc()
-                log.exception("retry after rebind also failed for session %s", session_id)
-
-    body = ""
-    http_status: int | None = None
-    if isinstance(err, httpx.HTTPStatusError):
-        http_status = err.response.status_code
-        try:
-            body = err.response.text[:1000]
-        except Exception:
-            pass
-    kind = _classify_prompt_error(err, body)
-    summary = f"{type(err).__name__}: {err}" + (f" | {body}" if body else "")
-
-    state.errors.append({
-        "ts": time.time(), "rpc_id": rpc_id, "kind": kind,
-        "error": summary, "traceback": tb,
-    })
-    _mark_turn_finished(state)
-
-    error_payload = json.dumps({
-        "jsonrpc": "2.0", "id": rpc_id,
-        "error": {
-            "code": -32000, "message": summary[:500],
-            "data": {
-                "kind": kind, "exception_type": type(err).__name__,
-                "http_status": http_status, "upstream_body": body,
-                "rpc_id": rpc_id,
-            },
-        },
-    })
-    if not state.shutdown.is_set():
-        state.dispatch(rpc_id, (rpc_id, f"data: {error_payload}\n\n"))
-
-    await log_event(
-        session_id=session_id, agent_id=state.agent_id, sandbox_id=state.sandbox_id,
-        event_type=EVT_ERROR,
-        payload={"message": summary[:1000], "kind": kind,
-                 "traceback": tb[:5000], "rpc_id": rpc_id},
-    )
 
 
 @app.post("/sessions/{session_id}/message")
