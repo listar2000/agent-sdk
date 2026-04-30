@@ -1141,7 +1141,12 @@ async def session_sandbox_info(session_id: str):
     from api.sandbox import get_pool
     pool_session = await get_pool().get_session(session_id)
     state = pool_session.state
+    # Pool's state.type for unix is ``unix_local``; the legacy
+    # ``/sandboxes/{id}`` route returned ``local`` and downstream
+    # tooling (test helpers, dashboard) keys on that. Normalise.
     provider = getattr(state, "type", "unknown")
+    if provider == "unix_local":
+        provider = "local"
     sandbox_ref = getattr(state, "sandbox_id", None)
     result: dict = {
         "session_id": session_id,

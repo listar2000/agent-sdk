@@ -177,6 +177,14 @@ async def test_serverclient_session_lifecycle(sc):
         assert exec_result.get("stdout", "").strip() == "hi", exec_result
         assert exec_result.get("exit_code") == 0
 
+        # sandbox info via the session-scoped route
+        sb = await sc.get_session_sandbox(sid)
+        assert sb["session_id"] == sid
+        assert sb["provider"] == "local"
+        assert sb["sandbox_ref"], sb
+        assert sb["status"] == "running"
+        assert sb.get("url", "").startswith("http://"), sb
+
         # set_session_config (mode/model/thought_level — opus IS valid here too)
         await sc.set_session_config(sid, model="haiku")
 

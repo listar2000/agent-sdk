@@ -402,13 +402,16 @@ async def test_session_sandbox_exec_posts_command_and_timeout():
 
 
 @pytest.mark.asyncio
-async def test_delete_session_raises_not_implemented():
-    rec = _Recorder(None)
+async def test_delete_session_issues_http_delete():
+    """``DELETE /sessions/{id}`` now exists server-side; the SDK
+    method is no longer a NotImplementedError stub. Idempotent —
+    server returns 204 even for missing sessions."""
+    rec = _Recorder(None, status=204, content_type="")
     async with _make_client(rec) as sc:
-        with pytest.raises(NotImplementedError, match="DELETE /sessions"):
-            await sc.delete_session("s1")
-    # Critically: no HTTP call was made.
-    assert rec.requests == []
+        result = await sc.delete_session("s1")
+    assert result is None
+    assert rec.last.method == "DELETE"
+    assert rec.last.url.path == "/sessions/s1"
 
 
 # ---------------------------------------------------------------------------

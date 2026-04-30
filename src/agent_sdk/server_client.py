@@ -279,6 +279,13 @@ class ServerClient:
         """``GET /sessions/{id}/status``."""
         return await self._json("GET", f"/sessions/{session_id}/status")
 
+    async def get_session_sandbox(self, session_id: str) -> dict[str, Any]:
+        """``GET /sessions/{id}/sandbox`` — sandbox metadata
+        (provider, sandbox_ref, status, root, url, marker_path) read
+        from the SessionPool, no sandboxes-table round trip. Brings
+        the SandboxSession up if it's been hibernated."""
+        return await self._json("GET", f"/sessions/{session_id}/sandbox")
+
     async def get_session_log(
         self, session_id: str, *, limit: int = 500
     ) -> list[dict[str, Any]]:
