@@ -171,11 +171,35 @@ class SessionPool:
                 return sess
         return None
 
-    async def shutdown_all(self) -> None:
+    async def shutdown_all(self, *, per_session_timeout_s: float = 10.0) -> None:
         """Stop the world: snapshot + shutdown every active session.
-        Used at server-graceful-shutdown."""
-        for sid in list(self._active.keys()):
-            await self.release(sid)
+
+        Used at server-graceful-shutdown. Releases run in parallel and
+        each is bounded by ``per_session_timeout_s`` so one hung provider
+        (Daytona signed-URL 502, docker daemon stalled) can't block the
+        whole shutdown. A timed-out release is logged and dropped — the
+        in-memory session is still removed via ``_active.pop`` inside
+        ``release``, so the next start cleanly cold-recovers.
+        """
+        async def _bounded(sid: str) -> None:
+            try:
+                await asyncio.wait_for(
+                    self.release(sid), timeout=per_session_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "shutdown_all: release(%s) exceeded %.1fs, dropping",
+                    sid, per_session_timeout_s,
+                )
+                # release acquired the lock but didn't finish; pop the
+                # active entry so a cold recovery doesn't see the stale
+                # session object on next get_session.
+                self._active.pop(sid, None)
+
+        await asyncio.gather(
+            *(_bounded(sid) for sid in list(self._active.keys())),
+            return_exceptions=True,
+        )
 
 
 async def _safe_shutdown(session: BaseSandboxSession) -> None:
