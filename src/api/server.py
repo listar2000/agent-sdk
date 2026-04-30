@@ -1794,6 +1794,41 @@ async def release_session_route(session_id: str):
     }
 
 
+@app.delete("/sessions/{session_id}", status_code=204)
+async def delete_session_route(session_id: str):
+    """Release the pool lease and delete the session row.
+
+    Idempotent — missing session returns 204, not 404, so callers can
+    use this as a "make sure this session is gone" primitive without
+    branching on prior state. The underlying daytona/docker/local
+    sandbox is *paused* (via ``pool.release``), not destroyed —
+    matches ``DELETE /sandboxes/{id}`` semantics, and label-based
+    cleanup scripts (``cleanup_daytona_orphans.py``) reclaim the
+    compute later.
+    """
+    from api.sandbox import get_pool
+    try:
+        await get_pool().release(session_id)
+    except Exception as e:
+        log.warning("DELETE /sessions/%s: pool.release failed: %s",
+                    session_id, e)
+    # Drop the session row + any sandbox row currently linked to it via
+    # the back-compat shim. ``ON DELETE CASCADE`` on session_log handles
+    # that side; ``current_sandbox_id`` is FK with ``ON DELETE SET NULL``
+    # but we want to clean the row up entirely, so target it explicitly.
+    sess = await get_session(session_id)
+    if sess is not None:
+        sb_id = sess.get("current_sandbox_id")
+        if sb_id:
+            try:
+                await delete_sandbox(sb_id)
+            except Exception as e:
+                log.warning("DELETE /sessions/%s: delete_sandbox(%s) failed: %s",
+                            session_id, sb_id, e)
+        async with get_db() as conn:
+            await conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+
 @app.post("/sessions/{session_id}/config")
 async def session_set_config(session_id: str, request: Request):
     """Set mode/model/thought_level for a session via the SessionPool."""

@@ -291,17 +291,15 @@ class ServerClient:
         return data or []
 
     async def delete_session(self, session_id: str) -> None:
-        """``DELETE /sessions/{id}`` — remove session row + cleanup.
+        """``DELETE /sessions/{id}`` — release the pool lease, drop the
+        session + sandbox rows. Idempotent: missing session returns 204
+        rather than 404 so this is safe as a "make sure this is gone"
+        primitive.
 
-        NOT YET IMPLEMENTED SERVER-SIDE. Raises so callers don't
-        silently no-op the way hive's old wrapper did (404 swallowed).
-        Replace this body with a real httpx DELETE once agent-sdk adds
-        the route.
-        """
-        raise NotImplementedError(
-            "DELETE /sessions/{id} is not implemented in agent-sdk; "
-            "session cleanup must be handled some other way until it ships"
-        )
+        The underlying daytona/docker/local sandbox is *paused*, not
+        destroyed — same semantics as ``DELETE /sandboxes/{id}``."""
+        resp = await self._http.delete(f"/sessions/{session_id}")
+        _raise_for_status(resp)
 
     # ------------------------------------------------------------------
     # Sessions — runtime

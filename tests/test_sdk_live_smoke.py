@@ -184,13 +184,11 @@ async def test_serverclient_session_lifecycle(sc):
         cancel = await sc.cancel_session(sid)
         assert cancel.get("status") == "ok", cancel
     finally:
-        # ``DELETE /sessions/{id}`` doesn't exist server-side yet (the
-        # SDK's delete_session raises NotImplementedError to match);
-        # release the pool lease instead. The session row stays, which
-        # is the intended steady state until DELETE ships.
+        # Idempotent — release pool + drop the rows. Daytona/docker/local
+        # compute is paused (not destroyed); label-based scripts reclaim
+        # later. Safe to call even if a prior step blew up.
         try:
-            async with httpx.AsyncClient(timeout=30) as raw:
-                await raw.post(f"{SERVER}/sessions/{sid}/release")
+            await sc.delete_session(sid)
         except Exception:
             pass
 
