@@ -4,11 +4,13 @@ The session-scoped file API mirrors ``/sandboxes/{id}/files/*`` but
 hides sandbox identity from callers. These tests prove each route:
 
 1. Is registered on the FastAPI app.
-2. Resolves ``session_id`` → ProviderInstance via ``_resolve_session_instance``.
+2. Forwards through ``_proxy_from_session`` (which itself resolves
+   the session's supervisor URL via the SessionPool).
 3. Forwards the right verb/path/body to the sandbox's supervisor.
 
-DB and provider calls are stubbed — the module-level helpers are
-monkeypatched, so no real sandbox is provisioned.
+DB and provider calls are stubbed — ``_proxy_from_session`` and
+``_download_from_session`` are monkeypatched, so no real sandbox
+is provisioned.
 """
 from __future__ import annotations
 
