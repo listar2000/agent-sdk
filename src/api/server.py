@@ -3350,12 +3350,17 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 
 @app.post("/sessions/{session_id}/resume")
 async def session_resume(session_id: str, request: Request):
-    """Resume a session by ID. Auto-recovers sandbox if stopped.
+    """Pre-warm a session through the SessionPool — idempotent.
 
-    Body may optionally carry ``env`` and ``secrets``:
-      - ``env``:     PATCH semantics (missing=keep stored, {}=wipe, {...}=replace).
-      - ``secrets``: same semantics — stored server-side (plaintext JSONB, see
-        SECRETS_PLAINTEXT note). Used for this respawn and future auto-recoveries.
+    Equivalent to ``pool.get_session(session_id)``: cold-starts the
+    SandboxSession from ``sandbox_state`` JSONB if no lease exists,
+    or reattaches to the live one if it does. The ACP ``session/load``
+    happens inside ``SandboxSession.start()``.
+
+    Body may optionally carry ``env`` and ``secrets`` (PATCH semantics)
+    that will be persisted to the session row before the pool revives
+    the sandbox; ``_bootstrap_session`` reads them when constructing
+    the spawn environment for the supervisor.
     """
     body_env: dict[str, str] | None = None
     body_secrets: dict[str, str] | None = None
@@ -3367,8 +3372,6 @@ async def session_resume(session_id: str, request: Request):
     except Exception:
         body_env = body_secrets = None
 
-    # Persist updated env/secrets if the caller sent those fields. Failures
-    # are logged but non-fatal — a read-only DB shouldn't block the resume.
     for label, updater, value in (
         ("env", update_session_env, body_env),
         ("secrets", update_session_secrets, body_secrets),
@@ -3380,18 +3383,20 @@ async def session_resume(session_id: str, request: Request):
         except Exception as e:
             log.warning("resume: update_session_%s failed for %s: %s", label, session_id, e)
 
-    # ensure_session_live reads spawn_env from the DB row (via _build_spawn_env_from_row),
-    # so the updated env/secrets persisted above are automatically picked up.
-    _, sandbox, state = await ensure_session_live(session_id)
+    from api.sandbox import get_pool
+
+    pool = get_pool()
+    pool_session = await pool.get_session(session_id)
+    sandbox_id = getattr(pool_session.state, "sandbox_id", None)
     return {
-        "session_id": state.session_id,
-        "agent_id": state.agent_id,
-        # Same dual-key rationale as /sessions: ``sandbox_id`` for the
-        # REST/client convention, ``current_sandbox_id`` to match the DB
-        # column + /sessions/{id} GET response shape.
-        "sandbox_id": state.sandbox_id,
-        "current_sandbox_id": state.sandbox_id,
-        "inner_session_id": state.inner_session_id,
+        "session_id": session_id,
+        "agent_id": pool_session._agent_id,
+        # Dual-key for back-compat: ``sandbox_id`` is the REST/client
+        # convention; ``current_sandbox_id`` matches the DB column +
+        # /sessions/{id} GET response shape.
+        "sandbox_id": sandbox_id,
+        "current_sandbox_id": sandbox_id,
+        "inner_session_id": pool_session._inner_session_id,
         "status": "resumed",
     }
 
@@ -4014,16 +4019,22 @@ async def post_session_message_stream(session_id: str, request: Request):
 
 @app.post("/sessions/{session_id}/cancel")
 async def session_cancel(session_id: str):
-    """Cancel the active prompt and wait for it to finish."""
-    _, _, state = await ensure_session_live(session_id)
-    if not state.agent_busy:
-        return {"status": "ok", "detail": "not busy"}
-    # Raise 504 on timeout; _cancel_and_drain only logs.
-    await state.client.cancel_prompt(state.acp_session_id)
-    try:
-        await asyncio.wait_for(state._prompt_done.wait(), timeout=_CANCEL_DRAIN_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(504, f"cancel timed out (rpc {state.active_rpc_id})")
+    """Cancel the in-flight prompt on this session, if any.
+
+    Best-effort: sends ``session/cancel`` (JSON-RPC notification) to
+    the supervisor's ACP child via the SessionPool. The ACP child
+    aborts the turn; the ``done`` event arrives on the same SSE
+    subscribers that ``POST /message`` opened. If no session is
+    currently leased by the pool, this is a no-op (returns 200) —
+    same shape as the legacy "not busy" branch.
+    """
+    from api.sandbox import get_pool
+
+    pool = get_pool()
+    pool_session = pool._active.get(session_id)  # noqa: SLF001 — read-only peek
+    if pool_session is None:
+        return {"status": "ok", "detail": "no active lease"}
+    await pool_session.cancel_active_prompt()
     return {"status": "ok"}
 
 
