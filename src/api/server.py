@@ -4608,12 +4608,38 @@ async def session_sandbox_exec(session_id: str, request: Request):
 
 
 async def _resolve_session_instance(session_id: str) -> ProviderInstance:
-    """Resolve a session_id to its current sandbox's ProviderInstance.
+    """Resolve a session_id to a ProviderInstance pointing at its
+    supervisor URL.
 
-    Hides sandbox identity from callers — the whole point of the
-    session-scoped file and sandbox APIs. Does NOT start the ACP runtime;
-    only ensures the sandbox supervisor itself is live.
+    Routes through the SessionPool — that's what owns the compute
+    lease and knows when to revive the sandbox. Returns a minimal
+    ProviderInstance shim around ``session.supervisor_url`` because
+    every caller of this helper only reads ``.url`` (and, for
+    daytona, ``.sandbox_id``); the ProviderInstance type is kept so
+    the legacy ``_proxy_instance`` / ``_download_from_instance``
+    signatures don't have to change in this PR.
+
+    Falls back to the legacy ``_resolve_sandbox_instance`` path only
+    when the pool can't produce a supervisor URL — defensive net for
+    edge cases pending PR-D3's full legacy deletion.
     """
+    from api.sandbox import get_pool
+
+    pool = get_pool()
+    pool_session = await pool.get_session(session_id)
+    url = pool_session.supervisor_url
+    if url:
+        state = pool_session.state
+        return ProviderInstance(
+            provider=getattr(state, "type", "unknown"),
+            url=url,
+            root=(state.recipe.root if state.recipe else None) or "/tmp",
+            sandbox_id=getattr(state, "sandbox_id", None),
+        )
+
+    # Defensive fallback: pool.get_session ought to have brought up
+    # the supervisor. If not, fall back to the legacy ensure-alive
+    # plumbing so file requests don't 502 on an edge case.
     session = await _require_session_row(session_id)
     sandbox = await ensure_sandbox(session)
     agent = await get_agent(session["agent_id"])
