@@ -165,7 +165,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # /opt/supervisor is mounted for start_supervisor_in_sandbox().
         instance = await dt_provider.create_sandbox(
             volume_ref=volume_ref,
-            subpath=f"sessions/{self.session_id}",
+            subpath=self._subpath or f"sessions/{self.session_id}",
             agent_type=self.state.recipe.agent_type,
             dockerfile=self.state.recipe.dockerfile,
             pre_start_commands=self.state.recipe.pre_start_commands or None,

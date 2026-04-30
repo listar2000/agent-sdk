@@ -783,11 +783,17 @@ async def get_session_route(session_id: str):
     rec = await _require_session_row(session_id)
     env = rec.get("env") or {}
     secrets = rec.get("secrets") or {}
+    # Read current sandbox_id from sandbox_state (the new source of truth)
+    # so tests/UIs can resolve to a /sandboxes/{ref} for status/file ops.
+    sandbox_state = rec.get("sandbox_state") or {}
+    sandbox_id = sandbox_state.get("sandbox_id") or rec.get("current_sandbox_id")
     return {
         "session_id": rec.get("id"),
+        "id": rec.get("id"),
         "agent_id": rec.get("agent_id"),
         "volume_id": rec.get("volume_id"),
-        "current_sandbox_id": rec.get("current_sandbox_id"),
+        "current_sandbox_id": sandbox_id,
+        "sandbox_id": sandbox_id,
         "inner_session_id": rec.get("inner_session_id"),
         "env": env,
         "secrets": {"keys": sorted(secrets.keys())},
@@ -995,9 +1001,13 @@ async def post_session_message(session_id: str, request: Request):
     session = await pool.get_session(session_id)
 
     async def _drain():
+        log.info("[/message _drain] starting for session=%s rpc=%s", session_id, rpc_id)
         try:
+            n = 0
             async for _event in session.execute_prompt(message, rpc_id=rpc_id):
-                pass  # broadcast happens inside execute_prompt
+                n += 1
+            log.info("[/message _drain] done for session=%s rpc=%s events=%d",
+                     session_id, rpc_id, n)
         except Exception as e:
             log.exception("execute_prompt failed for session %s rpc=%s",
                           session_id, rpc_id)
@@ -1007,7 +1017,13 @@ async def post_session_message(session_id: str, request: Request):
                           "exception_type": type(e).__name__},
             })
 
-    asyncio.create_task(_drain())
+    # Hold a reference so the task isn't GC'd (asyncio warns about losing
+    # references to fire-and-forget tasks).
+    if not hasattr(post_session_message, "_bg_tasks"):
+        post_session_message._bg_tasks = set()
+    task = asyncio.create_task(_drain())
+    post_session_message._bg_tasks.add(task)
+    task.add_done_callback(post_session_message._bg_tasks.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
 
 
@@ -1026,8 +1042,16 @@ async def session_events(session_id: str):
     session = await pool.get_session(session_id)
 
     async def _gen():
-        async for event in session.subscribe():
-            yield f"data: {json.dumps(event)}\n\n"
+        async for item in session.subscribe():
+            # Subscribers receive either:
+            #   - (rpc_id, raw_sse_block) tuples from execute_prompt — emit
+            #     with ``event: rpc:<id>`` tag so test/UI code can correlate.
+            #   - parsed event dicts from non-prompt sources — emit as data:.
+            if isinstance(item, tuple) and len(item) == 2:
+                rpc_id, block = item
+                yield f"event: rpc:{rpc_id}\n{block}\n\n"
+            else:
+                yield f"data: {json.dumps(item)}\n\n"
 
     return StreamingResponse(
         _gen(),
@@ -1176,6 +1200,47 @@ async def _proxy_download(supervisor_url: str, path: str) -> Response:
         media_type=r.headers.get("content-type", "application/octet-stream"),
         headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
     )
+
+
+@app.get("/sandboxes/{sandbox_id}")
+async def get_sandbox_route(sandbox_id: str):
+    """Sandbox info for an active sandbox (looked up by ref through the pool).
+
+    Returns ``{id, provider, sandbox_ref, status, root, url, pid?, marker_path?}``
+    matching the legacy shape so test harnesses + UIs can hit the same
+    endpoint. Sandbox identity is no longer durable in the ephemeral
+    model — if the compute isn't currently held by the pool, returns 404.
+    """
+    from api.sandbox import get_pool
+    sess = get_pool().find_by_sandbox_id(sandbox_id)
+    if sess is None:
+        raise HTTPException(404, f"sandbox {sandbox_id} not active")
+    state = sess.state
+    provider = getattr(state, "type", "unknown")
+    if provider == "unix_local":
+        provider = "local"
+    result = {
+        "id": sandbox_id,
+        "provider": provider,
+        "sandbox_ref": sandbox_id,
+        "status": "running" if await sess.running() else "stopped",
+        "root": getattr(state, "recipe", None) and state.recipe.root or "/tmp",
+        "url": sess.supervisor_url,
+    }
+    # Local provider: expose the spawn pid + alive marker so external tests
+    # can SIGKILL the supervisor without coupling to ref shape.
+    if provider == "local":
+        try:
+            from api.providers import local as lc_provider
+            args = lc_provider._SPAWN_ARGS.get(sandbox_id) or {}
+            proc = lc_provider._lookup_proc(sandbox_id)
+            if proc is not None and proc.pid:
+                result["pid"] = proc.pid
+            if args.get("marker_path"):
+                result["marker_path"] = str(args["marker_path"])
+        except Exception:
+            pass
+    return result
 
 
 @app.get("/sandboxes/{sandbox_id}/files/tree")

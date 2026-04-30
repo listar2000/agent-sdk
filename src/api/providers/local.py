@@ -289,6 +289,10 @@ async def create_sandbox(
 
     effective_root = root or str(home_dir)
 
+    # Send supervisor stderr to a file so failed claude spawns are debuggable
+    # without restarting the server. ~/.agent-sdk/local-supervisor-<port>.log.
+    _stderr_log_path = Path.home() / ".agent-sdk" / f"local-supervisor-{port}.log"
+    _stderr_log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         proc = await asyncio.to_thread(
             subprocess.Popen,
@@ -302,7 +306,7 @@ async def create_sandbox(
             ],
             env=base_env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=open(_stderr_log_path, "ab"),
         )
     except Exception:
         async with _port_lock:

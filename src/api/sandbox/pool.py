@@ -77,18 +77,22 @@ class SessionPool:
         """
         async with self._lock(session_id):
             cached = self._active.get(session_id)
-            if cached is not None and await cached.running():
-                return cached  # warm path
-
             if cached is not None:
+                alive = await cached.running()
+                log.info("[pool.get_session] session=%s cached=True alive=%s", session_id, alive)
+                if alive:
+                    return cached
                 # Stale entry; tear down runtime in background. We don't
                 # snapshot here — compute is dead, can't snapshot reliably.
                 # The previous successful per-turn snapshot is the fallback.
                 asyncio.create_task(_safe_shutdown(cached))
+                self._active.pop(session_id, None)
 
             payload = await self._load_state(session_id)
             state = deserialize(payload)
             session = self._factory(session_id, state)
+            log.info("[pool.get_session] session=%s creating new state.type=%s sandbox_id=%s",
+                     session_id, getattr(state, "type", "?"), getattr(state, "sandbox_id", None))
             await session.start()
             await self._save_state(session_id, serialize(session.state))
             self._active[session_id] = session

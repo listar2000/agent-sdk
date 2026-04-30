@@ -62,7 +62,7 @@ class ModalSandboxSession(BaseSandboxSession):
         if instance is None:
             instance = await md_provider.create_sandbox(
                 volume_ref=volume_ref,
-                subpath=f"sessions/{self.session_id}",
+                subpath=self._subpath or f"sessions/{self.session_id}",
                 agent_type=self.state.recipe.agent_type,
                 root=self.state.recipe.root,
                 spawn_env=self._spawn_env,

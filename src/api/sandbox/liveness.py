@@ -1,5 +1,12 @@
 """Single liveness oracle per session.
 
+Note: ``alive`` state has a 30-second freshness window — after that, the
+next ``is_alive()`` call probes (matches the doc's "stale alive should
+re-verify" intent). The window matters when a sandbox is killed
+externally between prompts; without it the cached ``alive`` would let
+the next prompt POST to a dead supervisor URL.
+
+
 Replaces today's scattered liveness signals: ``state._reader_connected``,
 ``state._reader_alive``, ``_instance_process_alive``, ad-hoc
 ``_wait_for_health`` calls. Per docs/ephemeral-sandbox-design.md §15.4
@@ -37,7 +44,7 @@ class Liveness:
         self,
         *,
         probe: Callable[[], Awaitable[bool]] | None = None,
-        unknown_after_idle_s: float = 30.0,
+        unknown_after_idle_s: float = 2.0,
     ) -> None:
         self._state: LivenessState = "unknown"
         self._last_chunk_at: float | None = None

@@ -55,6 +55,8 @@ class BaseSandboxSession(abc.ABC):
         # Volume + spawn-env + cwd + ACP correlation, populated by
         # _bootstrap_session() on first start().
         self._volume_ref: str | None = None
+        self._agent_id: str | None = None
+        self._subpath: str | None = None
         self._spawn_env: dict[str, str] = {}
         self._cwd: str = "/tmp"
         self._inner_session_id: str | None = None
@@ -65,7 +67,8 @@ class BaseSandboxSession(abc.ABC):
     async def _bootstrap_session(self) -> str:
         """Idempotent: load the session row + volume from DB, install the
         per-agent supervisor on the volume if needed, hydrate
-        ``_spawn_env``, ``_cwd``, ``_inner_session_id``, and ``_volume_ref``.
+        ``_spawn_env``, ``_cwd``, ``_inner_session_id``, ``_subpath``,
+        and ``_volume_ref``.
 
         Concrete ``start()`` calls this *before* invoking the per-provider
         create/start primitives so the volume is supervisor-ready and the
@@ -94,6 +97,14 @@ class BaseSandboxSession(abc.ABC):
             )
 
         self._volume_ref = volume.provider_ref
+        self._agent_id = sess.get("agent_id")
+        # Subpath governs ACP HOME inside the sandbox. Use ``agents/<agent_id>``
+        # so multiple sessions of the same agent share Claude's
+        # ~/.claude/projects/... JSONL store — that's what makes session/load
+        # find the prior conversation. Per session_id would shard the JSONLs
+        # and break recovery (`Claude Code executable not found at .../cli.js`
+        # is the symptom: SDK ENOENT on the spawn cwd).
+        self._subpath = f"agents/{self._agent_id}" if self._agent_id else f"sessions/{self.session_id}"
         self._spawn_env = {
             **(sess.get("env") or {}),
             **(sess.get("secrets") or {}),

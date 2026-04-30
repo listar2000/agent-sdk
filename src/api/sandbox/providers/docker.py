@@ -57,16 +57,14 @@ class DockerSandboxSession(BaseSandboxSession):
 
         volume_ref = await self._bootstrap_session()
 
-        # Docker doesn't support pause/resume. If state has a container
-        # id, check if it's still alive; otherwise create fresh.
+        # If state has a container id, try to keep it (test invariant:
+        # external stop must restart same container, not provision new).
         instance = None
         if self.state.sandbox_id:
             try:
                 status = await dk_provider.get_sandbox_status(self.state.sandbox_id)
+                from api.providers import ProviderInstance
                 if status == "running":
-                    # Container alive — reuse. The existing ensure_supervisor_url
-                    # is a no-op when a supervisor is already running.
-                    from api.providers import ProviderInstance
                     instance = ProviderInstance(
                         provider="docker",
                         url=f"http://127.0.0.1:{self.state.listen_port}",
@@ -74,15 +72,25 @@ class DockerSandboxSession(BaseSandboxSession):
                         sandbox_id=self.state.sandbox_id,
                         port=self.state.listen_port,
                     )
-                # Other statuses (stopped/missing/error) → fall through to create.
+                elif status == "stopped":
+                    # Container exists but stopped (`docker stop` w/o --rm).
+                    # `docker start` revives it on the same image+volume.
+                    await dk_provider.start_sandbox(self.state.sandbox_id)
+                    instance = ProviderInstance(
+                        provider="docker",
+                        url=f"http://127.0.0.1:{self.state.listen_port}",
+                        root=self.state.recipe.root or "/home/agent",
+                        sandbox_id=self.state.sandbox_id,
+                        port=self.state.listen_port,
+                    )
+                # missing/error → fall through to create.
             except Exception:
-                # Status probe failed — fall through to create.
                 pass
 
         if instance is None:
             instance = await dk_provider.create_sandbox(
                 volume_ref=volume_ref,
-                subpath=f"sessions/{self.session_id}",
+                subpath=self._subpath or f"sessions/{self.session_id}",
                 agent_type=self.state.recipe.agent_type,
                 root=self.state.recipe.root,
                 spawn_env=self._spawn_env,
