@@ -76,12 +76,14 @@ async def test_serverclient_volume_lifecycle(sc):
     assert await sc.volume_file_exists(vol["id"], "smoke.txt") is True
     assert await sc.volume_file_exists(vol["id"], "missing.txt") is False
 
-    # overwrite via volume_file_write (volume_file_edit's search/replace
-    # signature is broken against the current server — the server's
-    # ``/volumes/{id}/files/edit`` body model only accepts ``{path, content}``;
-    # the SDK's volume_file_edit sends old_string/new_string and gets 422.
-    # Tracked separately; this smoke test covers the working surface.)
-    await sc.volume_file_write(vol["id"], "smoke.txt", "hello edited\n")
+    # search/replace via volume_file_edit — server now handles both
+    # ``{path, content}`` (overwrite, used by volume_file_write) and
+    # ``{path, old_string, new_string}`` (read → str.replace → write at
+    # the volume layer; no sandbox needed).
+    await sc.volume_file_edit(
+        vol["id"], "smoke.txt",
+        old_string="hello smoke", new_string="hello edited",
+    )
     rd2 = await sc.volume_file_read(vol["id"], "smoke.txt")
     assert "hello edited" in (rd2.get("content") or rd2.get("text") or "")
 

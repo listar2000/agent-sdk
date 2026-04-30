@@ -707,8 +707,24 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
 
 
 class _VolumeEditBody(BaseModel):
+    """Body for ``POST /volumes/{id}/files/edit``. Two shapes:
+
+    * Overwrite: ``{path, content}`` — write ``content`` as the
+      new file body (creating the file if needed).
+    * Search/replace: ``{path, old_string, new_string, replace_all?}``
+      — read the file, ``str.replace`` the substring, write back.
+      Server-side at the provider's volume layer; no sandbox needed.
+      ``replace_all`` defaults to false (single replacement; raises if
+      ``old_string`` matches more than once, mirroring the supervisor's
+      session-scoped /files/edit semantics).
+
+    Validation: at least one of ``content`` / ``old_string`` must be
+    present. ``content`` and ``old_string`` are mutually exclusive."""
     path: str
-    content: str  # plain text for v1
+    content: str | None = None
+    old_string: str | None = None
+    new_string: str | None = None
+    replace_all: bool = False
 
 
 class _VolumeUploadBody(BaseModel):
@@ -806,10 +822,54 @@ async def volume_files_exists(id_or_name: str, path: str):
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
     vol = await _resolve_volume(id_or_name)
     rel = _safe_path(body.path)
-    try:
-        await _providers_mod.volume_write(
-            vol.provider, vol.provider_ref, rel, body.content.encode()
+
+    # Validate the two shapes are not mixed.
+    if body.content is not None and body.old_string is not None:
+        raise HTTPException(
+            400, "supply either ``content`` (overwrite) or "
+                 "``old_string``+``new_string`` (search/replace), not both",
         )
+    if body.content is None and body.old_string is None:
+        raise HTTPException(
+            400, "must supply either ``content`` (overwrite) or "
+                 "``old_string`` (search/replace)",
+        )
+
+    try:
+        if body.content is not None:
+            # Overwrite mode — single provider call.
+            await _providers_mod.volume_write(
+                vol.provider, vol.provider_ref, rel, body.content.encode(),
+            )
+            return
+        # Search/replace at the volume layer (no sandbox required):
+        # read → str.replace → write. Same semantics as the
+        # supervisor's session-scoped /files/edit, but driven directly
+        # against the provider's volume primitives so callers don't
+        # need a live sandbox to edit files on the volume.
+        existing = (
+            await _providers_mod.volume_read(vol.provider, vol.provider_ref, rel)
+        ).decode("utf-8", errors="replace")
+        old = body.old_string or ""
+        new = body.new_string or ""
+        if not body.replace_all:
+            occurrences = existing.count(old)
+            if occurrences == 0:
+                raise HTTPException(404, f"old_string not found in {rel!r}")
+            if occurrences > 1:
+                raise HTTPException(
+                    409,
+                    f"old_string matches {occurrences} times in {rel!r}; "
+                    "pass replace_all=true to replace all",
+                )
+            updated = existing.replace(old, new, 1)
+        else:
+            updated = existing.replace(old, new)
+        await _providers_mod.volume_write(
+            vol.provider, vol.provider_ref, rel, updated.encode(),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise _volume_fs_err("Edit", vol.provider, e)
 
