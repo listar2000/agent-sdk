@@ -124,29 +124,20 @@ async def lifespan(app):
     init_db()
     await init_pool()
 
-    # Startup reconciliation: cross-reference live provider state with
-    # DB sandbox rows so orphan containers/processes are reaped and
-    # survivors are reattached to _INSTANCES. Run per-provider reconciles
-    # in parallel so a slow provider doesn't serialize boot: in practice
-    # only Docker does real work (~seconds of ``docker ps``+``docker
-    # inspect``); daytona/local are no-ops, but future providers that
-    # talk to remote APIs should not queue behind docker.
+    # Startup reconciliation: kill orphan containers labeled with a
+    # sandbox_id whose DB row is gone or marked deleted. Per-provider in
+    # parallel so a slow provider doesn't serialise boot. In practice
+    # only Docker does real work; daytona/local/modal are no-ops today.
     async def _safe_reconcile(prov: str) -> None:
         try:
             await _providers_mod.reconcile_sandboxes(prov)
         except Exception as e:
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
-    # All four providers go through the dispatch; ones without a
-    # reconcile_on_startup hook (daytona, local, currently modal too) no-op.
-    # Listing modal here means the moment its module gains a reconcile hook
-    # we don't have to remember to wire it up.
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
 
-    # SessionPool's idle reaper hibernates pool sessions per
-    # docs/ephemeral-sandbox-design.md §6. The legacy SESSIONS-dict
-    # reaper was deleted in Phase 4 — pool.reap_idle is now the only
-    # eviction path.
+    # SessionPool owns idle eviction now (per
+    # docs/ephemeral-sandbox-design.md §6).
     from api.sandbox import start_reaper, shutdown_pool
     await start_reaper()
 
@@ -1006,16 +997,12 @@ async def delete_sandbox_route(sandbox_id: str):
 
 @app.get("/admin/sessions")
 async def admin_list_sessions():
-    """List in-memory pool sessions. Useful for the dashboard + cleanup
-    debugging.
+    """List in-memory pool sessions for the dashboard + cleanup debugging.
 
-    Reads from the SessionPool's ``_active`` dict — that's the only
-    in-memory session registry now (legacy ``SESSIONS``/``_INSTANCES``
-    were either deleted or are no longer written to). The legacy
-    response shape is preserved so ``ui/dashboard.html`` doesn't
-    have to change: ``sessions[].agent_busy``/``active_rpc_id``/etc.
-    are constants since the pool's per-prompt SSE replaced the
-    persistent reader's busy-flag bookkeeping.
+    The legacy response shape is preserved so ``ui/dashboard.html``
+    doesn't have to change: ``sessions[].agent_busy`` /
+    ``active_rpc_id`` / etc. are constants — the pool's per-prompt SSE
+    replaced the persistent reader's busy-flag bookkeeping.
     """
     from api.sandbox import get_pool
     pool = get_pool()
@@ -1027,11 +1014,9 @@ async def admin_list_sessions():
                 "current_sandbox_id": getattr(sess.state, "sandbox_id", None),
                 "sandbox_ref": getattr(sess.state, "sandbox_id", None),
                 "inner_session_id": sess._inner_session_id,
-                # ``agent_busy`` historically meant "a prompt is mid-flight";
-                # the pool model tracks per-prompt SSE inside ``execute_prompt``
-                # without exposing busy bookkeeping. The most meaningful
-                # observable proxy is "someone is watching events" — that's
-                # what the dashboard's "running" badge actually reads.
+                # "active subscriber" is the closest pool-level proxy for
+                # the dashboard's "running" badge — there's no per-prompt
+                # busy flag in the pool (per-prompt SSE replaces it).
                 "agent_busy": len(sess._subscribers) > 0,
                 "active_rpc_id": None,
                 "pending_count": 0,
@@ -1108,16 +1093,14 @@ async def get_session_route(session_id: str):
 
 @app.get("/sessions/{session_id}/status")
 async def session_status(session_id: str):
-    """Get session runtime status including last activity timestamp.
+    """Session runtime status including last activity. Routes through
+    SessionPool — brings the SandboxSession up if it's been reaped.
 
-    Routes through the SessionPool — ``pool.get_session`` brings the
-    SandboxSession up if it's been reaped. The legacy SessionState
-    fields ``agent_busy`` / ``active_rpc_id`` / ``pending_count`` /
-    ``session_subscriber_count`` / ``rpc_subscriber_count`` /
-    ``has_client`` / ``available_commands`` no longer have meaningful
-    pool equivalents (per-prompt SSE replaced the persistent reader,
-    and the pool's own subscriber list isn't a queue) — those keys
-    are kept in the response for shape-back-compat with constants."""
+    Several response keys (``agent_busy`` / ``active_rpc_id`` /
+    ``pending_count`` / ``rpc_subscriber_count`` / ``available_commands``)
+    are constants — the pool has no equivalent bookkeeping after
+    per-prompt SSE replaced the persistent reader. Kept for response-
+    shape back-compat with the dashboard."""
     from api.sandbox import get_pool
 
     pool_session = await get_pool().get_session(session_id)
@@ -1164,7 +1147,7 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
 
 
 # ---------------------------------------------------------------------------
-# Session endpoints (keyed by session_id, use ensure_session_live)
+# Session endpoints (keyed by session_id, route through SessionPool)
 # ---------------------------------------------------------------------------
 
 
@@ -1657,22 +1640,16 @@ async def session_events(session_id: str):
 async def post_session_message_stream(session_id: str, request: Request):
     """Submit a prompt and stream the reply as SSE in a single round-trip.
 
-    Convenience over the legacy two-step (``POST /message`` returns
-    ``rpc_id``; client opens ``GET /events`` to consume). This endpoint
-    returns the SSE stream as the response body — same protocol shape
-    as ``GET /events``, scoped to a single prompt.
+    Convenience over the two-step (``POST /message`` returns ``rpc_id``;
+    client opens ``GET /events`` to consume). This endpoint returns the
+    SSE stream as the response body — same wire format as ``GET /events``
+    (``event: rpc:<id>\\n<raw_block>\\n\\n``), scoped to a single
+    prompt. ``: heartbeat\\n\\n`` lines keep idle connections open
+    through nginx / cloudflare.
 
     Body: ``{"message": str, "interrupt": bool?}``. ``interrupt`` is
-    accepted for API parity but currently a no-op on the pool path
-    (in-flight prompts are scoped to their own ``execute_prompt``
-    coroutine; cancel-and-drain semantics belong with a future
-    ``/cancel`` cutover).
-
-    Returns: ``text/event-stream`` of the SSE blocks for this prompt
-    only. Wire format matches ``GET /events`` —
-    ``event: rpc:<id>\\n<raw_block>\\n\\n`` — so the SDK's
-    ``parse_acp_event`` works unchanged. ``: heartbeat\\n\\n`` lines
-    keep idle connections open through nginx / cloudflare.
+    accepted for API parity but currently a no-op on the pool path —
+    use ``POST /sessions/{id}/cancel`` to abort an in-flight turn.
 
     Both POST /message and GET /events continue to work unchanged for
     callers that need separate submit + multi-subscriber semantics.
@@ -1765,9 +1742,8 @@ async def session_cancel(session_id: str):
     Best-effort: sends ``session/cancel`` (JSON-RPC notification) to
     the supervisor's ACP child via the SessionPool. The ACP child
     aborts the turn; the ``done`` event arrives on the same SSE
-    subscribers that ``POST /message`` opened. If no session is
-    currently leased by the pool, this is a no-op (returns 200) —
-    same shape as the legacy "not busy" branch.
+    subscribers that ``POST /message`` opened. No active lease →
+    returns ``{"status": "ok", "detail": "no active lease"}``.
     """
     from api.sandbox import get_pool
 
@@ -1786,12 +1762,7 @@ async def release_session_route(session_id: str):
     Backed by ``api.sandbox.SessionPool.release``: writes a fresh
     filesystem snapshot to the volume and pauses (never deletes) the
     sandbox. Idempotent — a session with no active lease is a no-op.
-
-    Distinct from the legacy ``/hibernate`` and ``/stop-sandbox`` routes:
-    those operate on the in-memory ``SessionState`` + ``sandboxes`` row
-    plumbing. This endpoint targets the SessionPool that POST /message
-    and GET /events already use, so the snapshot here is exactly what
-    the next pool-mediated prompt restores from.
+    The next pool-mediated prompt restores from this snapshot.
     """
     from api.sandbox import deserialize, get_pool
     from api.sandbox.db_bindings import load_sandbox_state
