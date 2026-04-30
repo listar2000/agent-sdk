@@ -413,6 +413,29 @@ async def test_volume_files_rename_overwrite_false_dispatches_and_409s(client):
 
 
 @pytest.mark.asyncio
+async def test_volume_files_rename_overwrite_false_maps_not_implemented_to_501(client):
+    from api.models import VolumeRecord
+
+    v = VolumeRecord(
+        id="vol_rename_unsupported",
+        name="files-rename-unsupported",
+        provider="daytona",
+        provider_ref="dt-rn-unsupported",
+    )
+    await dbmod.upsert_volume(v)
+
+    with patch(
+        "api.providers.daytona.volume_rename",
+        new=AsyncMock(side_effect=NotImplementedError("atomic no-overwrite unsupported")),
+    ):
+        r = await client.post(
+            f"/volumes/{v.id}/files/rename",
+            json={"path": "shared/a.txt", "new_path": "shared/b.txt", "overwrite": False},
+        )
+    assert r.status_code == 501
+
+
+@pytest.mark.asyncio
 async def test_volume_files_exists_dispatches(client):
     from api.models import VolumeRecord
 
