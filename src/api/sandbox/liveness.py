@@ -93,12 +93,19 @@ class Liveness:
         observes the dead supervisor (the test 7 race) — the in-memory
         ``alive`` cache from the previous prompt's last chunk would
         otherwise short-circuit and we'd POST to a dead URL.
+
+        Freshness floor: even with ``force_probe``, a positive signal
+        observed within the last ``unknown_after_idle_s`` is considered
+        definitive — re-probing would race the same network we just got
+        a successful response on (e.g. Daytona's signed-URL proxy after
+        a fresh URL is minted). The test 7 stop happens between prompts,
+        so its last-chunk timestamp is older than the floor by definition.
         """
-        if not force_probe:
-            if self._state == "alive" and not self._stale_after_idle():
-                return True
-            if self._state == "dead":
-                return False
+        if (self._state == "alive"
+                and not self._stale_after_idle()):
+            return True
+        if not force_probe and self._state == "dead":
+            return False
         if self._probe is None:
             return self._state == "alive"
         try:

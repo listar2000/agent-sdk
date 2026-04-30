@@ -209,6 +209,14 @@ class BaseSandboxSession(abc.ABC):
             await client.aclose()
 
         self._acp_attached = True
+        # The ACP attach above is itself a successful round-trip to the
+        # supervisor — record it as a positive liveness signal so the
+        # pool's next force_probe doesn't immediately re-probe via HTTP
+        # and race the proxy (Daytona's signed-URL proxy returns 502 for
+        # ~1-2s after a fresh URL is minted; same race class PR #20
+        # fixed in the legacy path). Stale-after-idle still triggers a
+        # real probe if the session sits idle past the freshness window.
+        self.liveness.observe_chunk()
         if self._inner_session_id:
             async with _db.get_db() as conn:
                 await conn.execute(

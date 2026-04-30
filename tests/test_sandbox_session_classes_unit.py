@@ -141,14 +141,42 @@ class TestLiveness:
         assert probe_calls == [1]
 
     @pytest.mark.asyncio
-    async def test_force_probe_runs_even_when_alive(self):
+    async def test_force_probe_respects_freshness_floor(self):
+        """A positive signal observed within ``unknown_after_idle_s`` is
+        definitive — re-probing would race the same network we just got
+        a successful response on. ``force_probe`` only overrides the
+        cached ``alive`` state when the signal is older than the floor
+        (test 7 race: external stop between prompts).
+        """
         probe_calls = []
 
         async def _probe() -> bool:
             probe_calls.append(1)
             return True
 
-        live = Liveness(probe=_probe)
-        live.observe_chunk()  # state = alive, no probe needed
+        live = Liveness(probe=_probe, unknown_after_idle_s=2.0)
+        live.observe_chunk()  # fresh positive signal
         await live.is_alive(force_probe=True)
-        assert probe_calls == [1], "force_probe should bypass the alive cache"
+        assert probe_calls == [], (
+            "fresh positive signal should short-circuit even under force_probe"
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_probe_runs_when_signal_is_stale(self):
+        """The test 7 race: external stop between prompts makes the
+        last-chunk timestamp older than the freshness floor, so
+        ``force_probe`` correctly probes and detects the dead supervisor.
+        """
+        import time as _time
+        probe_calls = []
+
+        async def _probe() -> bool:
+            probe_calls.append(1)
+            return False  # supervisor dead
+
+        live = Liveness(probe=_probe, unknown_after_idle_s=0.001)
+        live.observe_chunk()
+        await asyncio.sleep(0.01)  # exceed the freshness floor
+        result = await live.is_alive(force_probe=True)
+        assert probe_calls == [1]
+        assert result is False
