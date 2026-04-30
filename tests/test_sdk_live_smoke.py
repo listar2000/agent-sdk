@@ -239,3 +239,46 @@ async def test_agent_astream_yields_typed_dicts():
         assert seen_types & {"text", "tool", "tool_result", "reasoning"}, seen_types
     finally:
         await agent.aclose()
+
+
+async def test_agent_sandbox_helpers_round_trip():
+    """``Agent.sandbox`` shells out via ``POST /sessions/{id}/sandbox/exec``
+    for read_file / write_file / ls / exec. End-to-end smoke that:
+
+      * a freshly-registered Agent has a live sandbox right after the
+        first prompt-less ``_ensure_registered`` call (provided it was
+        constructed with ``provider=...`` so /sessions provisions
+        eagerly),
+      * write_file → read_file round-trips bytes faithfully,
+      * exec returns parsed ``stdout``/``exit_code``,
+      * ls includes the file we just wrote.
+
+    Doesn't fire any LLM prompts, so doesn't burn quota."""
+    if not await _server_up():
+        pytest.skip(f"no server at {SERVER}")
+    agent = Agent(
+        f"smoke-sb-{uuid.uuid4().hex[:8]}",
+        provider="local", api_url=SERVER, model="haiku",
+    )
+    try:
+        # _ensure_registered is private; trigger it via any public call.
+        # ``configure(model="haiku")`` is cheap and idempotent.
+        await agent.configure(model="haiku")
+
+        sb = agent.sandbox
+
+        # write → read
+        await sb.write_file("/tmp/smoke-sb.txt", "hello sandbox\n")
+        content = await sb.read_file("/tmp/smoke-sb.txt")
+        assert "hello sandbox" in content, content
+
+        # exec
+        r = await sb.exec("echo from-exec")
+        assert r["exit_code"] == 0
+        assert "from-exec" in r["stdout"]
+
+        # ls — accept either ls -la output or any line containing the file
+        listing = await sb.ls("/tmp")
+        assert "smoke-sb.txt" in listing, listing
+    finally:
+        await agent.aclose()
