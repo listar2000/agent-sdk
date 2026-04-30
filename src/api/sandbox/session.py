@@ -18,11 +18,19 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from collections import deque
+
 from .liveness import Liveness
 from .state import SandboxState
 
 # Sentinel placed on a subscriber's queue to signal end-of-stream.
 _END = object()
+
+# Bound on the per-session event replay buffer. Late subscribers (UI
+# reconnects after a "stream closed" hiccup) replay this buffer first,
+# then receive live broadcasts. A new POST /message that fires before
+# the reconnect lands here, so the user-visible "lost reply" disappears.
+_BUFFER_SIZE = 1024
 
 
 class BaseSandboxSession(abc.ABC):
@@ -49,6 +57,10 @@ class BaseSandboxSession(abc.ABC):
         # Subscriber fan-out: persistent across many execute_prompt calls
         # so that GET /events can stay open across N prompts.
         self._subscribers: dict[str, asyncio.Queue[Any]] = {}
+        # Bounded replay buffer of recent broadcasts so a UI that
+        # reconnects /events after a transient close still receives
+        # events posted during the gap. Bounded → memory bounded.
+        self._buffer: deque = deque(maxlen=_BUFFER_SIZE)
         # Set by concrete start(); used by file-proxy endpoints to talk
         # to the supervisor without going through ACP.
         self._supervisor_url: str | None = None
@@ -237,14 +249,23 @@ class BaseSandboxSession(abc.ABC):
         """Yield every event broadcast to this session until either the
         consumer closes the iterator or the session shuts down.
 
-        Late joiners only see events from subscribe-time onward; past
-        events come from the ``session_log`` table (separate concern,
-        per docs §15.1).
+        Replay path: new subscribers receive the per-session buffer of
+        recent events FIRST, then live broadcasts. This protects the UI
+        reconnect-gap case (events for a POST /message arriving while
+        no subscriber was listening would otherwise be dropped).
         """
         sid = str(uuid.uuid4())
         # Bounded queue: slow subscribers drop events rather than backpressuring
         # the source supervisor stream. Per docs §15.5 — keep today's behaviour.
-        q: asyncio.Queue[Any] = asyncio.Queue(maxsize=1024)
+        q: asyncio.Queue[Any] = asyncio.Queue(maxsize=_BUFFER_SIZE * 2)
+        # Seed the queue with the buffer BEFORE registering so concurrent
+        # broadcasts don't double-deliver: items in the queue stay ordered
+        # (replay first, then live).
+        for event in list(self._buffer):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                break
         self._subscribers[sid] = q
         try:
             while True:
@@ -256,8 +277,9 @@ class BaseSandboxSession(abc.ABC):
             self._subscribers.pop(sid, None)
 
     def _broadcast(self, event: Any) -> None:
-        """Fan out an event to every active subscriber. Slow subscribers
-        whose queue is full silently drop this event."""
+        """Append to replay buffer + fan out to every active subscriber.
+        Slow subscribers whose queue is full silently drop this event."""
+        self._buffer.append(event)
         for q in list(self._subscribers.values()):
             try:
                 q.put_nowait(event)
