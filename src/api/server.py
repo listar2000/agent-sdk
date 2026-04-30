@@ -50,6 +50,7 @@ from .db import (
     list_agents,
     list_sandboxes,
     list_volumes,
+    log_event,
     update_session_env,
     update_session_secrets,
     set_session_current_sandbox,
@@ -59,6 +60,13 @@ from .db import (
     upsert_volume,
 )
 from .models import (
+    EVT_ASSISTANT_MESSAGE,
+    EVT_ERROR,
+    EVT_REASONING,
+    EVT_TOOL_CALL,
+    EVT_TOOL_RESULT,
+    EVT_USAGE,
+    EVT_USER_MESSAGE,
     STATUS_RUNNING,
     AgentConfig,
     AgentRecord,
@@ -80,6 +88,7 @@ from .providers import (
     stop_instance,
 )
 from .providers._shared import _safe_path as _shared_safe_path
+from .redact import redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -2182,6 +2191,113 @@ async def _sessions_create_eager(data: dict) -> dict:
     }
 
 
+async def _resolve_log_sandbox_id(session) -> str | None:
+    """Resolve the ``sandboxes.id`` row PK for this pool session, suitable
+    for ``session_log.sandbox_id`` (FK → ``sandboxes(id)``).
+
+    The pool tracks the *provider* sandbox ref in ``state.sandbox_id``
+    (e.g. ``local-<uuid12>``), not the DB row PK (``sb_<hex>``). The
+    session row's ``current_sandbox_id`` is the right value here, written
+    by the back-compat shim in ``_sessions_create_eager`` and refreshed
+    by the pool-managed reset path.
+
+    Returns ``None`` if no sandbox row is currently linked — callers pass
+    that through unchanged; ``session_log.sandbox_id`` is nullable.
+    """
+    sess = await get_session(session.session_id)
+    if sess is None:
+        return None
+    return sess.get("current_sandbox_id")
+
+
+async def _persist_user_message(session, message: str, rpc_id: str) -> None:
+    """Write the EVT_USER_MESSAGE row for a freshly-submitted prompt.
+
+    Best-effort — a DB hiccup must not block the prompt from being sent
+    to the supervisor. The matching turn-end / tool / text rows are
+    written by ``_persist_prompt_events`` as ``execute_prompt`` yields.
+    """
+    try:
+        await log_event(
+            session_id=session.session_id,
+            agent_id=session._agent_id or "",
+            sandbox_id=await _resolve_log_sandbox_id(session),
+            event_type=EVT_USER_MESSAGE,
+            payload={"text": redact_secrets(message), "prompt_id": rpc_id},
+        )
+    except Exception:
+        log.exception("user_message log_event failed for session %s rpc=%s",
+                      session.session_id, rpc_id)
+
+
+# execute_prompt yields {type: ...} dicts; map their type strings to the
+# session_log EVT_ row schema the dashboard / SDK already understand. Any
+# type missing from this map is logged as-is (forward-compat with new
+# ACP update kinds).
+_EVENT_TYPE_TO_LOG = {
+    "text": EVT_ASSISTANT_MESSAGE,
+    "agent_message_chunk": EVT_ASSISTANT_MESSAGE,
+    "thought_chunk": EVT_REASONING,
+    "tool_call": EVT_TOOL_CALL,
+    "tool_call_update": EVT_TOOL_RESULT,
+    "usage_update": EVT_USAGE,
+    "usage_updated": EVT_USAGE,
+    "error": EVT_ERROR,
+    "done": "turn_end",
+}
+
+
+async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
+    """Drive ``execute_prompt`` and write one ``session_log`` row per
+    event it yields. Replaces the legacy SSE-reader log chain (deleted
+    with the rest of that plumbing in this PR).
+
+    Each row carries the rpc_id so ``/sessions/{id}/log`` can be sliced
+    by turn. Failure of a single write is non-fatal — we log and keep
+    draining so a transient DB hiccup doesn't drop the rest of the turn.
+    """
+    sandbox_id = await _resolve_log_sandbox_id(session)
+    agent_id = session._agent_id or ""
+
+    async def _write(event: dict) -> None:
+        etype = event.get("type", "event")
+        # Flatten ``raw`` (the original ACP update payload) into the row
+        # so the dashboard's permissive renderer finds tool/result/usage
+        # fields without needing the nested ``raw`` indirection.
+        payload = {k: v for k, v in event.items() if k != "type"}
+        if isinstance(payload.get("raw"), dict):
+            payload.update(payload.pop("raw"))
+        if "text" in payload:
+            payload["text"] = redact_secrets(payload["text"])
+        payload["prompt_id"] = rpc_id
+        try:
+            await log_event(
+                session_id=session.session_id,
+                agent_id=agent_id, sandbox_id=sandbox_id,
+                event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
+                payload=payload,
+            )
+        except Exception:
+            log.exception("log_event(%s) failed for session %s rpc=%s",
+                          etype, session.session_id, rpc_id)
+
+    try:
+        async for event in session.execute_prompt(message, rpc_id=rpc_id):
+            if isinstance(event, dict):
+                await _write(event)
+    except Exception as e:
+        log.exception("execute_prompt failed for session %s rpc=%s",
+                      session.session_id, rpc_id)
+        await _write({
+            "type": "error",
+            "message": str(e)[:500], "kind": type(e).__name__,
+        })
+        session._broadcast({
+            "type": "error", "rpc_id": rpc_id,
+            "error": {"message": str(e), "exception_type": type(e).__name__},
+        })
+
+
 @app.post("/sessions/{session_id}/message")
 async def post_session_message(session_id: str, request: Request):
     """Submit a prompt. Returns ``{rpc_id, status}`` immediately; events
@@ -2204,21 +2320,10 @@ async def post_session_message(session_id: str, request: Request):
     rpc_id = str(uuid.uuid4())
     pool = get_pool()
     session = await pool.get_session(session_id)
-
-    async def _drain():
-        try:
-            async for _event in session.execute_prompt(message, rpc_id=rpc_id):
-                pass  # events broadcast inside execute_prompt
-        except Exception as e:
-            log.exception("execute_prompt failed for session %s rpc=%s",
-                          session_id, rpc_id)
-            session._broadcast({
-                "type": "error", "rpc_id": rpc_id,
-                "error": {"message": str(e), "exception_type": type(e).__name__},
-            })
+    await _persist_user_message(session, message, rpc_id)
 
     # Hold a strong reference so the task isn't GC'd mid-flight.
-    task = asyncio.create_task(_drain())
+    task = asyncio.create_task(_persist_prompt_events(session, message, rpc_id))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
@@ -2309,6 +2414,7 @@ async def post_session_message_stream(session_id: str, request: Request):
     pool = get_pool()
     session = await pool.get_session(session_id)
     rpc_id = str(uuid.uuid4())
+    await _persist_user_message(session, message, rpc_id)
 
     async def _stream():
         # Subscribe BEFORE kicking off execute_prompt so broadcasts
@@ -2319,19 +2425,11 @@ async def post_session_message_stream(session_id: str, request: Request):
         # runs once the event loop yields at our q.get().
         sub_iter = session.subscribe()
 
+        # The persister both drives execute_prompt AND writes session_log
+        # rows for each yielded event — same shared drain so /message and
+        # /message+stream produce identical log timelines.
         async def _drive():
-            try:
-                async for _event in session.execute_prompt(message, rpc_id=rpc_id):
-                    pass  # broadcasts fan out via session._broadcast
-            except Exception as e:
-                log.exception(
-                    "execute_prompt failed for session %s rpc=%s",
-                    session_id, rpc_id,
-                )
-                session._broadcast({
-                    "type": "error", "rpc_id": rpc_id,
-                    "error": {"message": str(e), "exception_type": type(e).__name__},
-                })
+            await _persist_prompt_events(session, message, rpc_id)
 
         drive_task: asyncio.Task | None = None
         try:
@@ -2362,11 +2460,18 @@ async def post_session_message_stream(session_id: str, request: Request):
                     if item.get("type") == "error":
                         return
         finally:
+            # _stream returns the moment the ``done`` block reaches the
+            # subscriber queue — but the persister (driven by
+            # execute_prompt's yield) is one async hop behind it, still
+            # awaiting log_event(turn_end). Await it (bounded) so the
+            # turn_end row lands before the response generator closes.
+            # Never cancel: a mid-write cancel leaves the DB connection
+            # in BAD state and the pool has to discard it. The timeout
+            # is the only escape hatch.
             if drive_task is not None and not drive_task.done():
-                drive_task.cancel()
                 try:
-                    await drive_task
-                except (asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
+                except (asyncio.TimeoutError, Exception):
                     pass
 
     return StreamingResponse(
