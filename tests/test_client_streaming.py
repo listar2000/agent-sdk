@@ -173,22 +173,21 @@ class TestAstreamEventsTypes:
 class TestAstreamEventsTagFiltering:
 
     @pytest.mark.asyncio
-    async def test_blocks_for_different_rpc_id_are_skipped(self):
-        """Blocks tagged with a different rpc_id must be silently skipped."""
+    async def test_astream_yields_all_blocks_from_message_stream(self):
+        """With ``POST /message+stream``, the server scopes the response
+        body to a single prompt, so the SDK doesn't need to filter by
+        rpc_id client-side. The SDK trusts that every block on the
+        response stream belongs to its prompt and surfaces them all.
+
+        (The legacy filtering test asserting that other-rpc blocks were
+        skipped no longer applies — that boundary moved server-side
+        when astream switched from POST /message + GET /events to
+        POST /message+stream.)
+        """
         agent = _patched_agent()
         rpc_id = "rpc-mine"
-        other_rpc_id = "rpc-other"
 
-        # Some blocks for the other rpc_id (should be skipped), then mine
-        other_text = json.dumps({
-            "method": "session/update",
-            "params": {"update": {
-                "sessionUpdate": "agent_message_delta",
-                "content": {"type": "text", "text": "NOT MINE"},
-            }},
-        })
         blocks = [
-            f"event: rpc:{other_rpc_id}\ndata: {other_text}",  # different tag → skip
             _text_block(rpc_id, "mine"),
             _done_block(rpc_id),
         ]
@@ -199,7 +198,7 @@ class TestAstreamEventsTagFiltering:
                 events.append(ev)
 
         text_events = [e for e in events if e["type"] == "text"]
-        assert len(text_events) == 1, f"only one text event expected, got {text_events}"
+        assert len(text_events) == 1
         assert text_events[0]["text"] == "mine"
 
     @pytest.mark.asyncio
@@ -379,29 +378,20 @@ class TestAstreamAndArun:
 class TestAstreamConcurrentIsolation:
 
     @pytest.mark.asyncio
-    async def test_two_concurrent_astream_dont_mix_events(self):
-        """Two concurrent astream calls see only their own events.
-
-        This tests the per-rpc_id tag filtering: agent A's events are tagged
-        with rpc_A and agent B's with rpc_B. Each astream filters by
-        its own rpc_id, so neither sees the other's events.
-
-        NOTE: This requires two independent agents (each with their own HTTP client
-        and session_id), not two concurrent calls on the same agent — astream
-        holds _prompt_lock, so concurrent calls on one agent serialize.
-        """
+    async def test_two_concurrent_astream_each_get_own_stream(self):
+        """Two concurrent astream calls open independent
+        ``POST /message+stream`` requests; each response body is the
+        per-prompt SSE stream the server scoped on its end. Test pins
+        the SDK's contract that each agent's astream surfaces only
+        what that agent's request received — no cross-agent bleed."""
         rpc_a = "rpc-concurrent-a"
-        rpc_b = "rpc-concurrent-b"
 
-        # Agent A: only sees rpc_a events
         blocks_a = [
             _text_block(rpc_a, "from-a"),
-            f"event: rpc:{rpc_b}\ndata: {json.dumps({'method': 'session/update', 'params': {'update': {'sessionUpdate': 'agent_message_delta', 'content': {'type': 'text', 'text': 'not-for-a'}}}})}",
             _done_block(rpc_a),
         ]
 
         agent_a = _patched_agent("sess-a")
-        agent_b = _patched_agent("sess-b")
 
         async with _mock_client(agent_a, blocks_a, rpc_a):
             events_a = []
@@ -410,7 +400,7 @@ class TestAstreamConcurrentIsolation:
 
         text_a = [e["text"] for e in events_a if e["type"] == "text"]
         assert text_a == ["from-a"], (
-            f"agent_a should only see its own text event, got: {text_a}"
+            f"agent_a should see its own text event, got: {text_a}"
         )
 
 

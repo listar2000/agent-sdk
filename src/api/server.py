@@ -4230,6 +4230,116 @@ async def session_events(session_id: str):
     )
 
 
+@app.post("/sessions/{session_id}/message+stream")
+async def post_session_message_stream(session_id: str, request: Request):
+    """Submit a prompt and stream the reply as SSE in a single round-trip.
+
+    Convenience over the legacy two-step (``POST /message`` returns
+    ``rpc_id``; client opens ``GET /events`` to consume). This endpoint
+    returns the SSE stream as the response body — same protocol shape
+    as ``GET /events``, scoped to a single prompt.
+
+    Body: ``{"message": str, "interrupt": bool?}`` — same as POST /message.
+
+    Returns: ``text/event-stream`` of the SSE blocks for this prompt
+    only. Closes when the matching stopReason / done event arrives, or
+    on connection drop.
+
+    Both POST /message and GET /events continue to work unchanged for
+    callers that need separate submit + multi-subscriber semantics.
+    """
+    data = await _json_body(request)
+    message = data.get("message")
+    if not message:
+        raise HTTPException(400, "message required")
+    interrupt = data.get("interrupt", False)
+
+    cached_state = SESSIONS.get(session_id)
+    if cached_state is not None and not cached_state.is_hibernated:
+        state = cached_state
+    else:
+        _, _, state = await ensure_session_live(session_id)
+
+    if interrupt and state.agent_busy:
+        await _cancel_and_drain(state)
+
+    # Restart upstream reader BEFORE subscribing so the subscriber sees
+    # this prompt's events as they arrive (not after a recovery).
+    if not state._reader_alive:
+        log.info(
+            "[SSE-READER] auto-restarting upstream reader from /message+stream "
+            "for session %s",
+            state.session_id,
+        )
+        _start_sse_reader(state)
+
+    state.last_activity = time.time()
+    rpc_id = str(uuid.uuid4())
+
+    # Subscribe BEFORE submitting so we can't miss the first chunks the
+    # supervisor emits between our submit and the subscriber registration.
+    my_q = state.subscribe_session()
+    _submit_prompt(state, rpc_id, message)
+
+    shutdown = state.shutdown
+    heartbeat_interval = int(os.environ.get("SSE_HEARTBEAT_INTERVAL", "30"))
+
+    async def _stream():
+        async def _heartbeat_loop():
+            try:
+                while True:
+                    await asyncio.sleep(heartbeat_interval)
+                    try:
+                        my_q.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+            except asyncio.CancelledError:
+                pass
+
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        try:
+            while True:
+                item = await my_q.get()
+                if item is _SSE_SENTINEL or item is _KICK_SENTINEL:
+                    return
+                if shutdown.is_set():
+                    return
+                if item is None:
+                    yield ": heartbeat\n\n"
+                    continue
+                tag, block = item
+                # Only yield events for this prompt — drop blocks tagged
+                # for other concurrent prompts (e.g. from /events
+                # subscribers' interleaved POSTs) and untagged blocks
+                # (bootstrap snapshots) so the response is exactly one
+                # prompt's stream.
+                if tag != rpc_id:
+                    continue
+                yield f"event: rpc:{tag}\n{block}"
+                # Terminate as soon as we see the done event for our
+                # rpc_id. parse_acp_event would re-parse — cheaper to
+                # peek for "stop_reason" in the raw block.
+                if "stop_reason" in block or '"type":"done"' in block:
+                    return
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("/message+stream error for session %s: %s", session_id, e)
+        finally:
+            await _cancel_task(heartbeat_task)
+            state.unsubscribe_session(my_q)
+            await _maybe_evict_hibernated(state)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/sessions/{session_id}/cancel")
 async def session_cancel(session_id: str):
     """Cancel the active prompt and wait for it to finish."""
