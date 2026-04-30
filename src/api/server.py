@@ -1229,20 +1229,65 @@ async def admin_sessions():
 
 @app.delete("/sandboxes/{sandbox_id}")
 async def delete_sandbox_route(sandbox_id: str):
-    """Snapshot + tear down the compute associated with this sandbox_id.
+    """Snapshot, destroy the sandbox, and clear sandbox identity so the
+    next POST /message provisions a NEW sandbox_ref.
 
-    Maps the legacy ``DELETE /sandboxes/{id}`` to the new pool's
-    ``release()``. Resolves sandbox_id to its session via the pool's
-    reverse lookup. Releases the session — snapshot fires before stop,
-    then container/process is torn down. Next POST /message cold-creates.
+    Maps the legacy ``DELETE /sandboxes/{id}`` semantics: destructive
+    teardown with a cold snapshot first so workspace data survives onto
+    the replacement. Distinct from ``POST /sessions/{id}/release`` which
+    is the soft hibernate (pause + same ref on resume).
 
     Idempotent: returns 204 even if the sandbox isn't currently held.
     """
-    from api.sandbox import get_pool
+    from api.sandbox import deserialize, get_pool, serialize
+    from api.sandbox.db_bindings import load_sandbox_state, save_sandbox_state
     pool = get_pool()
     sess = pool.find_by_sandbox_id(sandbox_id)
     if sess is not None:
+        # 1) Snapshot via release() (writes filesystem_cache.tar to volume).
+        # 2) Then destroy the underlying provider sandbox so a fresh one
+        #    gets minted on the next start (test invariant: DELETE means
+        #    different sandbox_ref afterwards).
         await pool.release(sess.session_id)
+        try:
+            from importlib import import_module
+            state = sess.state
+            provider = getattr(state, "type", "unknown")
+            mod_name = {
+                "daytona": "api.providers.daytona",
+                "docker":  "api.providers.docker",
+                "unix_local": "api.providers.local",
+                "modal":   "api.providers.modal",
+            }.get(provider)
+            if mod_name and getattr(state, "sandbox_id", None):
+                from api.providers import ProviderInstance
+                provider_mod = import_module(mod_name)
+                # destroy_sandbox is idempotent across providers; missing
+                # / already-gone sandboxes are swallowed.
+                if hasattr(provider_mod, "destroy_sandbox"):
+                    await provider_mod.destroy_sandbox(ProviderInstance(
+                        provider=provider, url="",
+                        root=state.recipe.root or "/tmp",
+                        sandbox_id=state.sandbox_id,
+                    ))
+                elif hasattr(provider_mod, "destroy_daytona"):
+                    await provider_mod.destroy_daytona(ProviderInstance(
+                        provider="daytona", url="",
+                        root=state.recipe.root or "/home/daytona",
+                        sandbox_id=state.sandbox_id,
+                    ))
+        except Exception:
+            log.exception("DELETE /sandboxes %s: destroy failed", sandbox_id)
+        # Persist the cleared sandbox_id so next start cold-creates.
+        try:
+            payload = await load_sandbox_state(sess.session_id)
+            state_obj = deserialize(payload)
+            if hasattr(state_obj, "sandbox_id"):
+                state_obj.sandbox_id = None
+                state_obj.listen_port = None
+            await save_sandbox_state(sess.session_id, serialize(state_obj))
+        except Exception:
+            log.exception("DELETE /sandboxes %s: state clear failed", sandbox_id)
     return Response(status_code=204)
 
 

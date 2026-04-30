@@ -123,18 +123,26 @@ class ModalSandboxSession(BaseSandboxSession):
             },
         }
 
-        async with httpx.AsyncClient(
+        sse_client = httpx.AsyncClient(
+            base_url=self._supervisor_url,
+            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
+        )
+        post_client = httpx.AsyncClient(
             base_url=self._supervisor_url,
             timeout=httpx.Timeout(connect=10, read=_SSE_READ_TIMEOUT_S, write=10, pool=10),
-        ) as http:
-            async with http.stream("GET", f"/v1/acp/{self._acp_session_id}",
-                                    headers={"Accept": "text/event-stream"}) as sse:
+        )
+        try:
+            async with sse_client.stream(
+                "GET", f"/v1/acp/{self._acp_session_id}",
+                headers={"Accept": "text/event-stream"},
+            ) as sse:
                 sse.raise_for_status()
 
                 async def _send_prompt() -> None:
                     try:
-                        await http.post(f"/v1/acp/{self._acp_session_id}",
-                                        json=prompt_payload)
+                        await post_client.post(
+                            f"/v1/acp/{self._acp_session_id}", json=prompt_payload,
+                        )
                     except Exception:
                         log.exception("prompt POST failed for session %s", self.session_id)
 
@@ -150,7 +158,7 @@ class ModalSandboxSession(BaseSandboxSession):
                             event = _parse_sse_block(block, rpc_id)
                             if event is None:
                                 continue
-                            self._broadcast(event)
+                            self._broadcast((rpc_id, block))
                             yield event
                             if event.get("type") == "done":
                                 return
@@ -162,6 +170,9 @@ class ModalSandboxSession(BaseSandboxSession):
                         except (asyncio.CancelledError, Exception):
                             pass
                     self.liveness.observe_close()
+        finally:
+            await sse_client.aclose()
+            await post_client.aclose()
 
     async def stop(self) -> None:
         if self.state.sandbox_id is None:

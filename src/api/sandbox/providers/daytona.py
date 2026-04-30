@@ -230,22 +230,30 @@ class DaytonaSandboxSession(BaseSandboxSession):
             },
         }
 
-        async with httpx.AsyncClient(
+        # Use SEPARATE httpx clients for the SSE GET and the session/prompt
+        # POST. Sharing one client serialises both requests on the same
+        # keep-alive connection and prematurely closes the SSE stream
+        # (~1.5s after the POST lands). See unix_local for matching fix.
+        sse_client = httpx.AsyncClient(
+            base_url=self._supervisor_url,
+            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
+        )
+        post_client = httpx.AsyncClient(
             base_url=self._supervisor_url,
             timeout=httpx.Timeout(connect=10, read=_SSE_READ_TIMEOUT_S, write=10, pool=10),
-        ) as http:
-            # Open SSE stream first so we don't miss early events.
-            async with http.stream("GET", f"/v1/acp/{self._acp_session_id}",
-                                    headers={"Accept": "text/event-stream"}) as sse:
+        )
+        try:
+            async with sse_client.stream(
+                "GET", f"/v1/acp/{self._acp_session_id}",
+                headers={"Accept": "text/event-stream"},
+            ) as sse:
                 sse.raise_for_status()
 
-                # Send the prompt as a fire-and-forget POST. Its response
-                # is the JSON-RPC stopReason; we ignore it because the
-                # done event arrives via SSE too.
                 async def _send_prompt() -> None:
                     try:
-                        await http.post(f"/v1/acp/{self._acp_session_id}",
-                                        json=prompt_payload)
+                        await post_client.post(
+                            f"/v1/acp/{self._acp_session_id}", json=prompt_payload,
+                        )
                     except Exception:
                         log.exception("prompt POST failed for session %s", self.session_id)
 
@@ -261,7 +269,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
                             event = _parse_sse_block(block, rpc_id)
                             if event is None:
                                 continue
-                            self._broadcast(event)
+                            # rpc-tagged tuple so /events emits ``event: rpc:<id>``
+                            # and the legacy test/UI ``extract_sse_tag`` can
+                            # correlate per-prompt streams.
+                            self._broadcast((rpc_id, block))
                             yield event
                             if event.get("type") == "done":
                                 return
@@ -273,6 +284,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
                         except (asyncio.CancelledError, Exception):
                             pass
                     self.liveness.observe_close()
+        finally:
+            await sse_client.aclose()
+            await post_client.aclose()
 
     # ------------------------------------------------------------------ #
     # stop: snapshot + pause                                              #
