@@ -78,7 +78,10 @@ class SessionPool:
         async with self._lock(session_id):
             cached = self._active.get(session_id)
             if cached is not None:
-                alive = await cached.running()
+                # Force-probe so an externally-killed supervisor is detected
+                # immediately, even if the previous prompt's last chunk was
+                # observed seconds ago (the test 7 race class).
+                alive = await cached.running(force_probe=True)
                 log.info("[pool.get_session] session=%s cached=True alive=%s", session_id, alive)
                 if alive:
                     return cached

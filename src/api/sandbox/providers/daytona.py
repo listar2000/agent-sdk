@@ -183,10 +183,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
     # running: liveness oracle                                            #
     # ------------------------------------------------------------------ #
 
-    async def running(self) -> bool:
+    async def running(self, *, force_probe: bool = False) -> bool:
         """The single liveness oracle. Probes /v1/health when state is
         ``unknown``, otherwise returns last-observed."""
-        return await self.liveness.is_alive()
+        return await self.liveness.is_alive(force_probe=force_probe)
 
     async def _liveness_probe(self) -> bool:
         """Cheap GET /v1/health against the supervisor URL."""

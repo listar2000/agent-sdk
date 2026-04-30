@@ -191,10 +191,10 @@ class BaseSandboxSession(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def running(self) -> bool:
+    async def running(self, *, force_probe: bool = False) -> bool:
         """Single liveness oracle. Cheap fast-path via ``self.liveness``;
         falls through to a bounded supervisor probe when state is
-        ``unknown``."""
+        ``unknown``. With ``force_probe=True`` the probe always runs."""
 
     @abc.abstractmethod
     async def execute_prompt(

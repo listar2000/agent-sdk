@@ -78,21 +78,28 @@ class Liveness:
             return False
         return (time.monotonic() - self._last_chunk_at) > self._unknown_after_idle_s
 
-    async def is_alive(self, *, probe_timeout_s: float = 2.0) -> bool:
+    async def is_alive(
+        self, *, probe_timeout_s: float = 2.0, force_probe: bool = False,
+    ) -> bool:
         """Returns True iff the compute is known-alive at the moment of
         return. State machine:
-          * ``alive`` and not stale → True (no I/O)
+          * ``alive`` and not stale → True (no I/O) UNLESS ``force_probe``
           * ``dead`` → False (no I/O)
-          * ``unknown`` (or stale ``alive``) → run probe (if configured)
-            and update state from result
+          * ``unknown`` (or stale ``alive``, or ``force_probe``) → run
+            probe (if configured) and update state from result
+
+        ``force_probe=True`` is used by ``pool.get_session()`` so a
+        message arriving immediately after an external sandbox stop
+        observes the dead supervisor (the test 7 race) — the in-memory
+        ``alive`` cache from the previous prompt's last chunk would
+        otherwise short-circuit and we'd POST to a dead URL.
         """
-        if self._state == "alive" and not self._stale_after_idle():
-            return True
-        if self._state == "dead":
-            return False
-        # unknown, or alive-but-stale → probe
+        if not force_probe:
+            if self._state == "alive" and not self._stale_after_idle():
+                return True
+            if self._state == "dead":
+                return False
         if self._probe is None:
-            # No way to verify; report whatever we last observed.
             return self._state == "alive"
         try:
             result = await asyncio.wait_for(self._probe(), timeout=probe_timeout_s)

@@ -90,8 +90,8 @@ class ModalSandboxSession(BaseSandboxSession):
             self.session_id, (self.state.sandbox_id or "")[:16], instance.url,
         )
 
-    async def running(self) -> bool:
-        return await self.liveness.is_alive()
+    async def running(self, *, force_probe: bool = False) -> bool:
+        return await self.liveness.is_alive(force_probe=force_probe)
 
     async def _liveness_probe(self) -> bool:
         if self._supervisor_url is None:

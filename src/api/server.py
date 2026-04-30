@@ -904,13 +904,16 @@ async def sessions_create(request: Request):
     """
     data = await _json_body(request)
     lazy = await _sessions_create_lazy(data)
-    if data.get("provision", False):
-        # Optional pre-warm via pool. Doesn't change the response shape;
-        # subsequent POST /message would have done the same work anyway.
+    # Default eager-provision so the response carries inner_session_id and
+    # current_sandbox_id (matches what golden tests assume). Pass
+    # ``provision: false`` for the row-only flow.
+    if data.get("provision", True):
         try:
             from api.sandbox import get_pool
             session = await get_pool().get_session(lazy["id"])
             lazy["current_sandbox_id"] = session.state.sandbox_id
+            lazy["sandbox_id"] = session.state.sandbox_id
+            lazy["inner_session_id"] = getattr(session, "_inner_session_id", None)
             lazy["connected"] = True
         except Exception as e:
             log.warning("pre-warm pool.get_session failed for %s: %s", lazy["id"], e)
@@ -1200,6 +1203,47 @@ async def _proxy_download(supervisor_url: str, path: str) -> Response:
         media_type=r.headers.get("content-type", "application/octet-stream"),
         headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
     )
+
+
+@app.get("/admin/sessions")
+async def admin_sessions():
+    """Snapshot of every session currently held by the SessionPool.
+
+    Returns ``{sessions: [{session_id, inner_session_id, sandbox_id, lifecycle}]}``.
+    Used by tests/UIs to query in-memory state without touching the DB row.
+    """
+    from api.sandbox import get_pool
+    pool = get_pool()
+    out = []
+    for sid, sess in list(pool._active.items()):
+        state = sess.state
+        out.append({
+            "session_id": sid,
+            "inner_session_id": getattr(sess, "_inner_session_id", None),
+            "sandbox_id": getattr(state, "sandbox_id", None),
+            "lifecycle": "active",
+            "supervisor_url": sess.supervisor_url,
+        })
+    return {"sessions": out}
+
+
+@app.delete("/sandboxes/{sandbox_id}")
+async def delete_sandbox_route(sandbox_id: str):
+    """Snapshot + tear down the compute associated with this sandbox_id.
+
+    Maps the legacy ``DELETE /sandboxes/{id}`` to the new pool's
+    ``release()``. Resolves sandbox_id to its session via the pool's
+    reverse lookup. Releases the session — snapshot fires before stop,
+    then container/process is torn down. Next POST /message cold-creates.
+
+    Idempotent: returns 204 even if the sandbox isn't currently held.
+    """
+    from api.sandbox import get_pool
+    pool = get_pool()
+    sess = pool.find_by_sandbox_id(sandbox_id)
+    if sess is not None:
+        await pool.release(sess.session_id)
+    return Response(status_code=204)
 
 
 @app.get("/sandboxes/{sandbox_id}")
