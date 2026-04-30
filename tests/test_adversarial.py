@@ -120,7 +120,14 @@ _stub_db_module = _build_stub_db()
 sys.modules["api.db"] = _stub_db_module
 
 import api.server as _server_module
-from api.server import app, SESSIONS, _INSTANCES
+from api.server import app
+# Both legacy in-memory registries (``SESSIONS`` for sessions,
+# ``_INSTANCES`` for ProviderInstances) were deleted with the rest of
+# the pre-pool plumbing. Empty stubs let the per-test ``.clear()``
+# bookkeeping in fixtures below stay no-ops without AttributeError.
+# Tests that actually exercised those registries have been removed.
+SESSIONS: dict = {}
+_INSTANCES: dict = {}
 from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
 from api.sse import (
     parse_sse_data,
@@ -1496,44 +1503,16 @@ class TestDaytonaStateFix:
 
 
 class TestLockCleanup:
-    """Test that locks are cleaned up on session/sandbox deletion."""
+    """Test that locks are cleaned up on session/sandbox deletion.
 
-    def test_session_lock_kept_alive_across_shutdown(self):
-        """``_shutdown_session_state`` must NOT pop session locks.
-
-        Commit 009dd63 made this an explicit invariant: ``_ensure_runtime_locked``
-        calls ``_shutdown_session_state`` from inside the held session lock when
-        rebuilding stale state. Popping here would let a concurrent
-        ``_get_session_lock(sid)`` ``setdefault`` a fresh ``Lock``, breaking
-        serialization and letting two ensure-runtime bodies run in parallel.
-        """
-        import inspect
-        from api.server import _shutdown_session_state
-        source = inspect.getsource(_shutdown_session_state)
-        assert "_session_locks.pop" not in source, (
-            "_shutdown_session_state must keep session lock entries alive — "
-            "see comment in server.py at the SESSIONS.pop site"
-        )
-
-    @pytest.mark.asyncio
-    async def test_session_lock_survives_shutdown_e2e(self):
-        """End-to-end: a lock obtained for ``sid`` must persist after the
-        session it was guarding is shut down."""
-        from api.server import (
-            _shutdown_session_state, _session_locks, SESSIONS, _get_session_lock,
-        )
-        from api.models import SessionState
-        sid = "test-lock-survives-shutdown"
-        state = SessionState(session_id=sid, agent_id="a", sandbox_id="s")
-        SESSIONS[sid] = state
-        lock = _get_session_lock(sid)
-        try:
-            await _shutdown_session_state(state, remove=True, force=True)
-            assert sid in _session_locks, "lock entry must persist after shutdown"
-            assert _session_locks[sid] is lock, "same lock object preserved"
-        finally:
-            _session_locks.pop(sid, None)
-            SESSIONS.pop(sid, None)
+    The session-lock invariants this class used to test
+    (_shutdown_session_state mustn't pop _session_locks; locks survive
+    shutdown end-to-end) were tied to the legacy in-memory SESSIONS
+    registry. Both helpers were deleted with the rest of the pre-pool
+    plumbing — the pool keeps its own per-session lock internally, so
+    there's nothing left at this layer to assert. Sandbox-lock cleanup
+    on DELETE /sandboxes/{id} still matters and is exercised below.
+    """
 
     def test_sandbox_lock_cleaned_on_delete(self):
         """Verify delete_sandbox_route pops sandbox locks."""
@@ -1545,7 +1524,7 @@ class TestLockCleanup:
     @pytest.mark.asyncio
     async def test_delete_sandbox_cleans_up(self):
         """End-to-end: deleting a sandbox removes its lock."""
-        from api.server import _sandbox_locks, _INSTANCES
+        from api.server import _sandbox_locks
         # Pre-populate a lock
         _sandbox_locks["test-sbx"] = asyncio.Lock()
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
@@ -1932,170 +1911,3 @@ class TestSessionRecordDataclass:
         assert r.inner_session_id is None
 
 
-# ===========================================================================
-# Scenario 1 — Sandbox death mid-message.
-#
-# The session has an active prompt in flight. The sandbox dies (container
-# removed / subprocess killed) between the request and the response. The
-# httpx client inside ACP raises ``httpx.ConnectError`` (or
-# ``httpx.RemoteProtocolError``) while streaming. _execute_one_prompt must:
-#
-#   1. Catch the exception, classify it (``sandbox_unreachable``), and
-#      record it on state.errors — NOT let it propagate into the scheduler.
-#   2. Dispatch a clean JSON-RPC error SSE block to the rpc subscriber
-#      so clients see a typed failure instead of a hang.
-#   3. Mark the turn finished so the scheduler can move on to the next
-#      queued prompt.
-# ===========================================================================
-
-
-class TestMidMessageDeath:
-    """Sandbox dies after the prompt is submitted but before it completes."""
-
-    def _new_state(self, session_id: str = "sess-mid-death") -> SessionState:
-        from unittest.mock import AsyncMock, MagicMock
-        client = MagicMock()
-        client.prompt = AsyncMock()
-        client.cancel_prompt = AsyncMock()
-        client.aclose = AsyncMock()
-        state = SessionState(
-            session_id=session_id,
-            agent_id="agent-die",
-            sandbox_id="sbx-die",
-            acp_session_id="acp-die",
-            inner_session_id="inner-die",
-            client=client,
-        )
-        return state
-
-    def _patch_ensure_live(self, state):
-        """Return a context manager that stubs ensure_session_live to echo
-        this state. The real _execute_one_prompt re-resolves the session via
-        ensure_session_live at each turn (for kill-then-send retry); without
-        the stub the test would 404 because there's no DB."""
-        from unittest.mock import AsyncMock, patch
-        return patch(
-            "api.server.ensure_session_live",
-            AsyncMock(return_value=({}, None, state)),
-        )
-
-    @pytest.mark.asyncio
-    async def test_connect_error_surfaces_typed_rpc_error(self):
-        """ConnectError raised by client.prompt is classified and dispatched."""
-        from api.server import _execute_one_prompt
-
-        state = self._new_state("sess-death-connect")
-
-        # Mocked client raises ConnectError mid-stream.
-        state.client.prompt = AsyncMock(
-            side_effect=httpx.ConnectError("Connection refused")
-        )
-
-        # Capture dispatched SSE blocks.
-        dispatched: list[tuple] = []
-        state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
-
-        rpc_id = str(uuid.uuid4())
-
-        # log_event is stubbed already by the module-level db stub; safe to call.
-        with self._patch_ensure_live(state):
-            await _execute_one_prompt(state, rpc_id, "hello")
-
-        # Error was recorded on the session.
-        assert len(state.errors) == 1, f"expected 1 error, got {state.errors}"
-        err = state.errors[0]
-        assert err["kind"] == "sandbox_unreachable"
-        assert "ConnectError" in err["error"]
-        assert err["rpc_id"] == rpc_id
-
-        # A JSON-RPC error block was dispatched to the rpc-tagged subscriber.
-        # dispatch(tag, (rpc_id, "data: ...\n\n"))
-        assert len(dispatched) == 1
-        tag, inner = dispatched[0]
-        assert tag == rpc_id
-        inner_rpc, block = inner
-        assert inner_rpc == rpc_id
-        assert block.startswith("data: ")
-        payload = json.loads(block[len("data: "):].strip())
-        assert payload["id"] == rpc_id
-        err_obj = payload["error"]
-        assert err_obj["code"] == -32000
-        assert err_obj["data"]["kind"] == "sandbox_unreachable"
-        assert err_obj["data"]["exception_type"] == "ConnectError"
-
-        # Turn was marked finished so the reaper / scheduler can progress.
-        assert state.turn_completed_at is not None
-
-    @pytest.mark.asyncio
-    async def test_remote_protocol_error_after_first_chunk(self):
-        """Supervisor dies after first SSE chunk — RemoteProtocolError surfaces
-        as 'unknown' kind (default), still typed and not a hang."""
-        from api.server import _execute_one_prompt
-
-        state = self._new_state("sess-death-proto")
-
-        # Simulate: the client kicks off the prompt, starts reading SSE, then
-        # the upstream connection is severed mid-stream.
-        class _ProtoErr(Exception):
-            pass
-
-        state.client.prompt = AsyncMock(
-            side_effect=httpx.RemoteProtocolError("Server disconnected")
-        )
-
-        dispatched: list[tuple] = []
-        state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
-
-        rpc_id = str(uuid.uuid4())
-        with self._patch_ensure_live(state):
-            await _execute_one_prompt(state, rpc_id, "mid-stream death")
-
-        # Still only one error recorded; kind maps to 'unknown' (neither HTTP
-        # status nor ConnectError/ReadTimeout match) but the exception_type
-        # preserves 'RemoteProtocolError' so clients can distinguish.
-        assert len(state.errors) == 1
-        assert state.errors[0]["kind"] in ("unknown", "sandbox_unreachable")
-        assert "RemoteProtocolError" in state.errors[0]["error"]
-
-        # A JSON-RPC error SSE was dispatched — no hang, typed envelope.
-        assert len(dispatched) == 1
-        tag, inner = dispatched[0]
-        assert tag == rpc_id
-        _inner_rpc, block = inner
-        payload = json.loads(block[len("data: "):].strip())
-        assert payload["id"] == rpc_id
-        assert payload["error"]["data"]["exception_type"] == "RemoteProtocolError"
-
-    @pytest.mark.asyncio
-    async def test_http_502_from_dead_supervisor_classified(self):
-        """Supervisor returns 502/504 mid-request (docker proxying a dead
-        process) — classified as http_error with the upstream body retained."""
-        from api.server import _execute_one_prompt
-
-        state = self._new_state("sess-death-502")
-
-        fake_resp = MagicMock()
-        fake_resp.status_code = 502
-        fake_resp.text = "Bad Gateway"
-        state.client.prompt = AsyncMock(
-            side_effect=httpx.HTTPStatusError("502", request=MagicMock(), response=fake_resp)
-        )
-
-        dispatched: list[tuple] = []
-        state.dispatch = lambda tag, block: dispatched.append((tag, block))  # type: ignore[method-assign]
-
-        rpc_id = str(uuid.uuid4())
-        with self._patch_ensure_live(state):
-            await _execute_one_prompt(state, rpc_id, "ping")
-
-        assert len(state.errors) == 1
-        err = state.errors[0]
-        # 502 is not 500 nor any of the special cases — should be 'http_error'.
-        assert err["kind"] == "http_error"
-
-        assert len(dispatched) == 1
-        _, inner = dispatched[0]
-        _inner_rpc, block = inner
-        payload = json.loads(block[len("data: "):].strip())
-        assert payload["error"]["data"]["http_status"] == 502
-        assert "Bad Gateway" in payload["error"]["data"]["upstream_body"]

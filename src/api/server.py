@@ -5,7 +5,6 @@ Run: uvicorn src.api.server:app --port 7778
 
 import asyncio
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -67,7 +66,6 @@ from .models import (
     EVT_TOOL_RESULT,
     EVT_USAGE,
     EVT_USER_MESSAGE,
-    STATUS_RUNNING,
     AgentConfig,
     AgentRecord,
     SandboxRecord,
@@ -79,8 +77,6 @@ from .providers import (
     ProviderInstance,
     VolumeFileExistsError,
     default_cwd_for_provider,
-    destroy_instance,
-    stop_instance,
 )
 from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_secrets
@@ -103,9 +99,6 @@ def _configure_logging() -> None:
 # DB + in-memory state
 # ---------------------------------------------------------------------------
 
-# keyed by sandbox_id — keeps ProviderInstance alive for cleanup
-_INSTANCES: dict[str, ProviderInstance] = {}
-
 _sandbox_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -120,40 +113,6 @@ def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
 # Tasks self-discard from the set on completion.
 _BG_TASKS: set[asyncio.Task] = set()
 
-
-
-
-def _compute_supervisor_version() -> str:
-    """Short hash of supervisor.js content. Used to invalidate the per-volume
-    install cache when the supervisor source changes — without this, an updated
-    supervisor.js (e.g., the agent_memory.tar visibility-poll fix) wouldn't be
-    re-deployed to volumes whose ``supervisor_agent_types`` cache already lists
-    the agent_type. Auto-deploys on next server restart, no manual DB write."""
-    try:
-        sup_path = Path(__file__).resolve().parents[1] / "supervisor" / "supervisor.js"
-        return hashlib.sha256(sup_path.read_bytes()).hexdigest()[:8]
-    except Exception:
-        # If supervisor.js is somehow missing (test stubs, packaging quirks),
-        # fall back to a placeholder so the cache key remains stable. The
-        # fast path will then always treat the cache as authoritative.
-        return "unknown"
-
-
-_SUPERVISOR_VERSION = _compute_supervisor_version()
-
-
-def _versioned_agent_type(agent_type: str) -> str:
-    """Cache key combining agent_type with the current supervisor.js hash.
-
-    A bare ``agent_type`` (e.g., ``"claude"``) cached under an older
-    supervisor.js would silently keep stale logic on the volume forever.
-    Including the hash means the install_supervisor cache is implicitly
-    invalidated whenever supervisor.js changes — a future call to
-    ``ensure_volume_supervisor`` for the same agent_type sees a different
-    cache key, falls through to install, and writes the new versioned
-    key on success.
-    """
-    return f"{agent_type}@{_SUPERVISOR_VERSION}"
 
 
 
@@ -196,21 +155,6 @@ async def lifespan(app):
         await shutdown_pool()
     except Exception as e:
         log.warning("shutdown_pool failed: %s", e)
-
-    # Parallel instance teardown. Durability is already on the volume
-    # from per-turn snapshots; stop is just SIGTERM here. Falls through
-    # to stop_instance regardless of DB row state — the provider owns
-    # liveness truth.
-    async def _safe_stop(sid, inst):
-        try:
-            await stop_instance(inst)
-        except Exception as e:
-            log.warning("shutdown cleanup failed for %s: %s", sid, e)
-
-    await asyncio.gather(
-        *[_safe_stop(sid, inst) for sid, inst in list(_INSTANCES.items())]
-    )
-    _INSTANCES.clear()
     await close_pool()
 
 
@@ -392,7 +336,6 @@ async def health():
         "status": "ok",
         "sessions": len(active),
         "busy_sessions": sum(1 for s in active.values() if s._subscribers),
-        "instances": len(_INSTANCES),
     }
 
 
@@ -571,37 +514,6 @@ def _materialize_dockerfile(data: dict, key: str = "dockerfile") -> str | None:
     tmp.write(content)
     tmp.close()
     return tmp.name
-
-
-def _sandbox_record(
-    sandbox_id: str,
-    provider: str,
-    instance: ProviderInstance,
-    *,
-    volume_id: str,
-    subpath: str,
-    root_fallback: str = "/tmp",
-    status: str = STATUS_RUNNING,
-    dockerfile: str | None = None,
-    shared_mounts: list[str] | None = None,
-) -> SandboxRecord:
-    """Build a SandboxRecord from a freshly-provisioned ProviderInstance.
-
-    ``dockerfile`` + ``shared_mounts`` are the provisioning identity of the
-    sandbox — frozen at create time, read unchanged by later recoveries.
-    """
-    return SandboxRecord(
-        id=sandbox_id,
-        provider=provider,
-        sandbox_ref=instance.sandbox_id or sandbox_id,
-        status=status,
-        root=instance.root or root_fallback,
-        volume_id=volume_id,
-        subpath=subpath,
-        listen_port=instance.port,
-        dockerfile=dockerfile,
-        shared_mounts=shared_mounts or [],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1091,12 +1003,12 @@ async def get_sandbox_route(sandbox_id: str):
 async def delete_sandbox_route(sandbox_id: str):
     record = await _require_sandbox(sandbox_id)
 
-    # Phase 2 cutover bridge: if this sandbox is owned by a SessionPool
-    # session (created via POST /message → pool.get_session), release it
-    # through the pool first so the SandboxSession.stop() snapshot fires
-    # before the legacy destroy below. Match on ``sandbox_ref`` (provider
-    # UUID) — that's what the pool stores in ``state.sandbox_id`` — not
-    # the DB row PK we got in the URL.
+    # Every sandbox is now pool-owned (the legacy POST /sandboxes route
+    # that created stand-alone sandboxes is gone). Release through the
+    # pool so SandboxSession.stop() snapshots + tears down the compute,
+    # then drop the sandbox row. Match the pool by ``sandbox_ref`` (the
+    # provider UUID stored in ``state.sandbox_id``), not by the DB row
+    # PK we got from the URL.
     try:
         from api.sandbox import get_pool
         pool = get_pool()
@@ -1107,122 +1019,10 @@ async def delete_sandbox_route(sandbox_id: str):
         log.warning("DELETE /sandboxes %s: pool.release failed: %s", sandbox_id, e)
 
     async with _get_sandbox_lock(sandbox_id):
-        # Snapshot before tearing down the compute so the next sandbox
-        # provisioned on this volume's subpath can session/load with the
-        # latest workspace state (per-turn snapshot was dropped in
-        # 2026-04-23; this is the durability boundary).
-        instance = _INSTANCES.get(sandbox_id)
-        await _request_supervisor_snapshot(instance)
-        instance = _INSTANCES.pop(sandbox_id, None)
         _sandbox_locks.pop(sandbox_id, None)
         await delete_sandbox(sandbox_id)
 
-    # Teardown the process/container outside the lock (may be slow)
-    if instance:
-        try:
-            await destroy_instance(instance)
-        except Exception as e:
-            log.warning("teardown failed for sandbox %s: %s", sandbox_id, e)
-
     return {"status": "deleted"}
-
-
-@app.post("/sandboxes")
-async def create_sandbox(request: Request):
-    """**Deprecated** — use ``POST /sessions`` (creates a session +
-    SessionPool-managed compute lazily on first ``POST /message``).
-
-    Implementation kept for legacy callers that need a standalone
-    sandbox without a session. The pool model treats every sandbox as
-    session-owned, so this endpoint will be deleted after the
-    deprecation window (sunset 2026-12-31).
-
-    Body: ``{"volume_id": ..., "subpath": ..., "provider": "daytona"|"docker"|"local",
-              "agent_type": ..., "config": {...}}``
-
-    For Daytona the returned instance has no supervisor yet (started lazily by
-    ``ensure_runtime``). For Docker/Local the supervisor is already running.
-    Returns ``{id, sandbox_id, sandbox_ref, status, provider, root, volume_id,
-    subpath, listen_port, url}``.
-    """
-    _warn_deprecated("/sandboxes")
-    data = await _json_body(request)
-    agent_type = data.get("agent_type", "claude")
-    config_data = data.get("config", {})
-    _merge_top_level_config(data, config_data)
-    # Sandbox-level inputs come straight from the body now, not via AgentConfig.
-    cwd = data.get("cwd", config_data.pop("cwd", "/tmp"))
-    root = data.get("root", config_data.pop("root", cwd))
-    dockerfile = _materialize_dockerfile({**config_data, **data})
-    shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
-    config_data.pop("dockerfile", None)
-    config_data.pop("dockerfile_content", None)
-    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type})
-
-    subpath = data.get("subpath") or f"sandboxes/{uuid.uuid4().hex[:12]}/home"
-    explicit_provider = data.get("provider")
-    vol = await _resolve_or_default_volume(data.get("volume_id"), explicit_provider or "local")
-    _validate_subpath(subpath)
-    # Default the provider from the volume (so existing Daytona-only clients
-    # don't have to pass it), but let an explicit body field override for tests.
-    provider = explicit_provider or vol.provider
-    if provider != vol.provider:
-        raise HTTPException(
-            400,
-            f"provider {provider!r} does not match volume.provider {vol.provider!r}",
-        )
-
-    pre_start_commands = await _build_pre_start_commands(
-        config, provider, data.get("pre_start_commands") or [],
-    )
-
-    # Install supervisor on the volume first — docker/local need this before
-    # create_sandbox; daytona tolerates it (fast-path on cache hit).
-    try:
-        await ensure_volume_supervisor(vol.id, agent_type)
-    except Exception as e:
-        raise HTTPException(502, f"Failed to install supervisor on volume: {e}")
-
-    # Pre-allocate the DB sandbox_id so we can thread it to the provider as a
-    # container label — reconcile_on_startup cross-references live containers
-    # against DB rows by this id.
-    sandbox_id = f"sb_{uuid.uuid4().hex[:12]}"
-
-    try:
-        instance = await _provision_with_cache_retry(
-            (vol.id, agent_type), _providers_mod.provision_sandbox,
-            provider,
-            volume_ref=vol.provider_ref, subpath=subpath,
-            agent_type=agent_type, dockerfile=dockerfile,
-            pre_start_commands=pre_start_commands,
-            root=root, sandbox_id=sandbox_id,
-            shared_mounts=shared_mounts or None,
-        )
-    except Exception as e:
-        if "circuit breaker" in str(e).lower():
-            raise HTTPException(503, str(e), headers={"Retry-After": "30"})
-        raise HTTPException(502, f"Failed to provision sandbox: {e}")
-
-    _INSTANCES[sandbox_id] = instance
-    record = _sandbox_record(
-        sandbox_id, provider, instance,
-        volume_id=vol.id, subpath=subpath, root_fallback=root,
-        dockerfile=dockerfile,
-        shared_mounts=list(shared_mounts) if shared_mounts else [],
-    )
-    await upsert_sandbox(record)
-
-    # Dual-key ``sandbox_id``/``id`` for back-compat with callers that learned
-    # either key shape. ``sandbox_ref``/``root``/``listen_port``/``url`` match
-    # the old POST /sandboxes response fields so migrating to this endpoint is
-    # a straight rename — no field lookups to rewrite.
-    return {
-        "id": sandbox_id, "sandbox_id": sandbox_id,
-        "provider": provider, "sandbox_ref": record.sandbox_ref,
-        "status": "running",
-        "root": record.root, "volume_id": vol.id, "subpath": subpath,
-        "listen_port": instance.port, "url": instance.url or None,
-    }
 
 
 @app.post("/sandboxes/{sandbox_id}/stop")
@@ -1338,294 +1138,6 @@ async def admin_list_sessions():
 # ---------------------------------------------------------------------------
 
 
-
-async def _request_supervisor_snapshot(
-    target: "ProviderInstance | str | None", timeout: float = 60.0,
-) -> bool:
-    """Fire POST /v1/snapshot on the supervisor. Returns True on 200.
-
-    Accepts either a ``ProviderInstance`` (common) or a raw URL string.
-    ``None`` / missing URL short-circuits so the 4 pre-stop call sites can
-    drop their own ``if instance and instance.url`` guards.
-
-    Called before stopping or reaping a sandbox so the next boot's
-    session/load finds the JSONLs on the volume. Per-turn snapshots were
-    dropped in 2026-04-23; the durability invariant now lives here.
-    Best-effort — a failure logs but doesn't block the stop.
-    """
-    url = target if isinstance(target, str) else (target.url if target else "")
-    if not url:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            r = await c.post(f"{url}/v1/snapshot")
-            if r.status_code == 200:
-                return True
-            log.warning("supervisor snapshot returned %d: %s", r.status_code, r.text[:200])
-    except Exception as e:
-        log.warning("supervisor snapshot failed (%s): %s", url, e)
-    return False
-
-
-async def _instance_is_alive(inst: ProviderInstance) -> bool:
-    """Cheap liveness check on a cached ProviderInstance.
-
-    Port-based (local): trust the subprocess reference. Everything else
-    (docker container, daytona preview URL) uses an HTTP health probe — the
-    URL can expire or the supervisor inside a live sandbox can die
-    independently.
-    """
-    if inst.process is not None:
-        try: inst.process.poll()   # reap zombies, update returncode
-        except Exception: pass
-        return inst.process.returncode is None
-    if not inst.url:
-        return False
-    from .providers import _wait_for_health
-    try:
-        return await _wait_for_health(inst.url, max_retries=2, interval=0.5)
-    except Exception:
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sandbox recovery — two flavors, one rule:
-#
-#   *If the underlying sandbox/VM still exists, revive it in place (Type 1).
-#    Otherwise provision a fresh one against the same DB row (Type 2).*
-#
-# Dispatch lives in ``_ensure_sandbox_alive``. It calls ``_type1_recover``
-# first; only if that returns ``None`` does it fall through to
-# ``_type2_recover`` (Type 2 only by construction).
-#
-#   Type 1 — in-place revive, same sandbox_ref. Cheap.
-#     Applicable when:
-#       • port-based + provider says status="stopped"
-#             → ``provider.start_sandbox(ref)`` unpauses the container,
-#               supervisor restarts on the same port.
-#       • daytona — sandbox_ref still resolves
-#             → ``restart_daytona_supervisor(ref)`` respawns the supervisor
-#               process inside the existing daytona sandbox (and starts the
-#               sandbox itself if it's in "stopped" state — that case is
-#               handled inside the function).
-#     Side effects:
-#       • pre_start_commands are NOT re-run — original side effects are still
-#         on the local filesystem.
-#       • snapshot restore is short-circuited by the
-#         ``/tmp/agent-sdk-bootstrapped`` sentinel in supervisor.js — the
-#         local ext4 already has the latest workspace bytes.
-#
-#   Type 2 — replacement, new sandbox_ref. Expensive.
-#     Triggered when Type 1 is not applicable or fails:
-#       • port-based + status missing/error/running, or start_sandbox raised
-#       • daytona + restart_daytona_supervisor raised an error that
-#         ``_should_replace_daytona_sandbox`` classifies as "this sandbox
-#         is gone — start over"
-#     Side effects:
-#       • pre_start_commands ARE re-run (replayed from the persisted session
-#         row at provision time — see ``_build_pre_start_commands``).
-#       • snapshot.tar (workspace, lifecycle-snapshotted) and agent_memory.tar
-#         (per-turn JSONLs) are extracted on first boot to repopulate the
-#         agent's HOME on the fresh local ext4.
-#
-# The DB ``sandboxes.id`` row stays stable across both — Type 1 changes
-# nothing; Type 2 rewrites ``sandbox_ref`` (and possibly ``listen_port``) but
-# preserves ``volume_id``, ``subpath``, ``dockerfile``, ``shared_mounts``.
-# Sessions point at the row by id, so no session ever sees a Type 2 transition
-# as anything more than a ``sandbox_reattach`` event before the next prompt.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-_STALE_CACHE_MARKERS = (
-    "supervisor.js missing",
-    "ACP binary missing",
-    "call install_supervisor",
-)
-
-
-async def _provision_with_cache_retry(cache_key, fn, /, *args, **kwargs):
-    """Call ``fn(*args, **kwargs)``; on stale-install-cache markers,
-    clear the supervisor-install cache for ``cache_key`` (a
-    ``(volume_id, agent_type)`` tuple), reinstall, and retry once.
-
-    ``volumes.supervisor_agent_types`` says installed but the on-disk
-    state can diverge (ephemeral volume wiped on container restart,
-    failed install that still marked the cache). One clean-and-retry
-    self-heals; a second failure surfaces the real error.
-
-    Positional-only for the key so ``*args``/``**kwargs`` forwarded to
-    ``fn`` can contain any names (including ``volume_id`` /
-    ``agent_type``) without colliding with our own parameters.
-    """
-    vol_id, agent_type = cache_key
-    try:
-        return await fn(*args, **kwargs)
-    except RuntimeError as e:
-        if not any(marker in str(e) for marker in _STALE_CACHE_MARKERS):
-            raise
-        # Clear the cache entry for the CURRENT supervisor version so
-        # ensure_volume_supervisor falls through to install on the retry.
-        # If the cache somehow still holds an older versioned key, leave
-        # it alone — it's already invalid (won't match the live cache_key)
-        # and a future install will overwrite it.
-        versioned = _versioned_agent_type(agent_type)
-        log.warning("stale-cache on volume %s agent=%s (key=%s): %s — reinstalling",
-                    vol_id, agent_type, versioned, e)
-        async with get_db() as conn:
-            await conn.execute(
-                "UPDATE volumes SET supervisor_agent_types = "
-                "COALESCE(supervisor_agent_types, '[]'::jsonb) - %s WHERE id = %s",
-                (versioned, vol_id),
-            )
-        await ensure_volume_supervisor(vol_id, agent_type)
-        return await fn(*args, **kwargs)
-
-
-async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
-    """Idempotently install the supervisor + ACP binary on a volume.
-
-    Cross-worker serialization uses a Postgres advisory lock keyed on a
-    stable digest of ``(volume_id, agent_type)``.  Fast path: if the
-    ``volumes.supervisor_agent_types`` cache already lists this agent_type,
-    return immediately without touching the DB beyond the initial read.
-
-    Locking model (slow path):
-
-    1. Open a short transaction, re-check the cache, then release — the
-       cheap double-check lets most racers short-circuit before touching
-       the advisory-lock machinery at all.
-    2. Acquire a session-scoped ``pg_advisory_lock`` on the SAME key on
-       a dedicated autocommit connection — this is the cross-process
-       "I'm installing" signal.  ``pg_advisory_lock`` (session-scoped,
-       NOT ``pg_advisory_xact_lock``) is released automatically if the
-       backend dies or the TCP connection drops, so a crashed worker
-       can't wedge the key.
-    3. Re-check the cache under the session lock (another worker may have
-       installed between steps 1 and 2).
-    4. Run the slow provider install with NO open transaction and NO
-       connection held (the provider call talks to docker/daytona/local,
-       not to the DB).
-    5. Take a fresh short transaction to update the cache + release the
-       session lock via ``pg_advisory_unlock``.
-
-    Failure semantics: if the provider call raises, the session lock is
-    released in the ``finally`` block so a retry can re-enter immediately.
-    The volumes cache is only updated on success, so a failed install
-    leaves no footprint to undo.
-
-    Trade-off: the window between steps 1 and 2 is a race — two workers
-    can both pass the double-check and then serialize on the session lock
-    in step 2, doing the install twice.  That's harmless (the install is
-    idempotent in its own right — the second worker will short-circuit at
-    the step-3 cache re-check) but means we don't get strict "install once"
-    semantics.  Acceptable because the alternative is holding a pool
-    connection for minutes, which is more expensive operationally.
-    """
-    # Cache key is versioned by supervisor.js content hash so a stale entry
-    # under a prior version (e.g., before the agent_memory.tar visibility-poll
-    # fix) doesn't keep the old logic pinned on the volume.
-    cache_key = _versioned_agent_type(agent_type)
-
-    # Fast path (no lock): check cache — 99% of calls hit this.
-    vol = await get_volume(volume_id)
-    if vol is None:
-        raise HTTPException(500, f"Volume {volume_id} not found")
-    if cache_key in (vol.supervisor_agent_types or []):
-        return  # already installed at this supervisor version
-
-    # Compute a stable positive 63-bit key (pg advisory locks take a bigint;
-    # mask off the sign bit for safety).
-    digest = hashlib.sha256(f"{volume_id}\0{cache_key}".encode()).digest()
-    lock_key = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
-
-    # Step 1 + 2: double-check cache, then acquire a session-scoped advisory
-    # lock OUTSIDE a transaction so we can release the connection while
-    # the slow provider call runs.  We pick up a dedicated connection for
-    # the session lock so it's not tied to any pool's transaction.
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT provider, provider_ref, supervisor_agent_types FROM volumes"
-            " WHERE id = %s",
-            (volume_id,),
-        )).fetchone()
-        if row is None:
-            raise HTTPException(500, f"Volume {volume_id} not found")
-        installed = list(row.get("supervisor_agent_types") or [])
-        if cache_key in installed:
-            return
-        provider = row["provider"]
-        provider_ref = row["provider_ref"]
-
-    # Acquire a session-scoped advisory lock on a dedicated connection
-    # switched to autocommit so it isn't stuck in a long-running transaction
-    # while the slow provider call runs. ``pg_advisory_lock`` survives commits
-    # and auto-releases on connection close, so a crashed worker can't wedge
-    # the key. We MUST restore autocommit=False before returning the connection
-    # to the pool — psycopg's pool has no reset callback.
-    async with get_db() as lock_conn:
-        _restore_autocommit = False
-        try:
-            await lock_conn.set_autocommit(True)
-            _restore_autocommit = True
-        except AttributeError:
-            pass  # test fakes without set_autocommit
-        except Exception as e:
-            log.error("ensure_volume_supervisor: set_autocommit(True) failed "
-                      "(volume=%s agent=%s): %s; falling back to transactional mode",
-                      volume_id, agent_type, e)
-        try:
-            got_row = await (await lock_conn.execute(
-                "SELECT pg_try_advisory_lock(%s)", (lock_key,)
-            )).fetchone()
-            if not (got_row and got_row.get("pg_try_advisory_lock")):
-                log.info("ensure_volume_supervisor: waiting for another worker "
-                         "(volume=%s agent=%s)", volume_id, agent_type)
-                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
-
-            # Step 3: re-check cache while holding the session lock.
-            row2 = await (await lock_conn.execute(
-                "SELECT supervisor_agent_types FROM volumes WHERE id = %s",
-                (volume_id,),
-            )).fetchone()
-            installed2 = list((row2 or {}).get("supervisor_agent_types") or [])
-            if cache_key in installed2:
-                return
-
-            log.info("ensure_volume_supervisor: installing %s on volume %s",
-                     cache_key, volume_id)
-            # Step 4: slow provider call with the connection in autocommit (not
-            # in a transaction) so idle-in-transaction timers don't fire.
-            await _providers_mod.install_supervisor(provider, provider_ref, agent_type)
-            # Step 5: update the cache under the same session lock.
-            await lock_conn.execute(
-                "UPDATE volumes SET supervisor_agent_types = "
-                "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
-                "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
-                (cache_key, volume_id, cache_key),
-            )
-            log.info("ensure_volume_supervisor: done installing %s on volume %s",
-                     cache_key, volume_id)
-        finally:
-            # Release the advisory lock explicitly — a failure here is survivable
-            # (the lock auto-releases on connection close).
-            try:
-                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
-            except Exception as e:
-                log.warning("ensure_volume_supervisor: pg_advisory_unlock failed: %s", e)
-            # Restore autocommit=False before the conn returns to the pool; if
-            # restore fails, close the conn to prevent pool poisoning.
-            if _restore_autocommit:
-                try:
-                    await lock_conn.set_autocommit(False)
-                except Exception as e:
-                    log.error("ensure_volume_supervisor: failed to restore "
-                              "autocommit=False: %s; closing conn to prevent "
-                              "pool poisoning", e)
-                    try:
-                        await lock_conn.close()
-                    except Exception as close_err:
-                        log.warning("ensure_volume_supervisor: lock_conn.close() "
-                                    "failed: %s", close_err)
 
 
 @app.get("/sessions")

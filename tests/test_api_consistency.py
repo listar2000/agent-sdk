@@ -58,7 +58,6 @@ _NON_OBJECT_BODIES = ["not a dict", 123, [1, 2, 3], True]
 @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
 @pytest.mark.parametrize("path", [
     "/agents",
-    "/sandboxes",
     "/sessions",
     "/sessions/any-id/message",
     "/sessions/any-id/config",
@@ -139,42 +138,10 @@ async def test_start_sandbox_provider_failure_returns_502(client):
     assert "simulated provider outage" in body["error"]
 
 
-# ---------------------------------------------------------------------------
-# Response-shape parity:
-#
-#   POST /sandboxes -> {"id", "sandbox_id", "sandbox_ref", ...}
-#   POST /sessions/quick      -> {"sandbox_id", "current_sandbox_id", ...}
-#   POST /sessions/{id}/resume-> {"sandbox_id", "current_sandbox_id", ...}
-#
-# The session paths need both keys because the DB column is
-# ``current_sandbox_id`` but clients (agent_sdk.client) read ``sandbox_id``.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_post_sandboxes_provision_exposes_both_id_and_sandbox_id(client):
-    from api.models import VolumeRecord
-
-    v = VolumeRecord(id="vol_shape_b", name="shape-b",
-                     provider="daytona", provider_ref="dt-b")
-    await dbmod.upsert_volume(v)
-
-    class _FakeInstance:
-        sandbox_id = "dt-sbx-b"
-        port = None
-        root = "/home/daytona"
-        url = None
-
-    with patch("api.server.ensure_volume_supervisor",
-               new=AsyncMock(return_value=None)), \
-         patch("api.providers.provision_sandbox",
-               new=AsyncMock(return_value=_FakeInstance())):
-        r = await client.post("/sandboxes", json={
-            "provider": "daytona", "volume_id": v.id, "subpath": "p",
-        })
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body.get("id") == body.get("sandbox_id") is not None, body
+# test_post_sandboxes_provision_exposes_both_id_and_sandbox_id was
+# removed: the legacy ``POST /sandboxes`` route it exercised has been
+# deleted (every sandbox is session-owned now; ``POST /sessions``
+# returns the same dual ``id`` / ``sandbox_id`` shape via the pool).
 
 
 # ---------------------------------------------------------------------------
@@ -316,40 +283,9 @@ async def test_message_on_truly_gone_session_returns_404(client):
     assert r.status_code == 404, r.text
 
 
-@pytest.mark.asyncio
-async def test_resolve_sandbox_instance_refreshes_stale_daytona_instance():
-    """``_resolve_sandbox_instance`` must re-run ``_ensure_sandbox_alive`` when
-    the cached ProviderInstance's URL is stale. The Daytona preview URL has a
-    24h TTL, so a stale cache entry silently breaks reads until we refresh."""
-    from api.models import SandboxRecord
-    from api.providers import ProviderInstance
-    from api.server import _resolve_sandbox_instance, _INSTANCES
-
-    sandbox_id = "sandbox-stale-instance"
-    stale = ProviderInstance(
-        provider="daytona",
-        url="https://old-daytona-url.example.com",
-        sandbox_id="daytona-old",
-    )
-    fresh = ProviderInstance(
-        provider="daytona",
-        url="https://new-daytona-url.example.com",
-        sandbox_id="daytona-new",
-    )
-    _INSTANCES[sandbox_id] = stale
-    try:
-        async def fake_ensure(*args, **kwargs):
-            _INSTANCES[sandbox_id] = fresh
-            return fresh.url, False
-
-        with patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
-            id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
-        ))), patch(
-            "api.server._ensure_sandbox_alive", AsyncMock(side_effect=fake_ensure)
-        ) as mock_ensure:
-            resolved = await _resolve_sandbox_instance(sandbox_id)
-
-        assert resolved is fresh
-        mock_ensure.assert_awaited_once()
-    finally:
-        _INSTANCES.pop(sandbox_id, None)
+# test_resolve_sandbox_instance_refreshes_stale_daytona_instance was
+# removed: it tested ``_resolve_sandbox_instance`` (deleted),
+# ``_ensure_sandbox_alive`` (deleted), and ``_INSTANCES`` cache
+# refresh (deleted). The pool's ``get_session`` now always resolves
+# the supervisor URL through the live SandboxSession state — there's
+# no stale-cache layer to refresh.

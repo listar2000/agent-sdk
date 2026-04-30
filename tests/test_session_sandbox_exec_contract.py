@@ -35,11 +35,9 @@ class _FakeProc:
 
 @pytest.fixture(autouse=True)
 def _clear_runtime_state():
-    srv.SESSIONS.clear()
-    srv._INSTANCES.clear()
+    # Legacy SESSIONS / _INSTANCES dicts were deleted; the pool keeps
+    # its own state and these tests no longer need bookkeeping cleanup.
     yield
-    srv.SESSIONS.clear()
-    srv._INSTANCES.clear()
 
 
 async def _post_exec(command: str = "pwd"):
@@ -96,58 +94,12 @@ async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
     }
 
 
-@pytest.mark.asyncio
-async def test_resolve_session_instance_uses_session_agent_type_and_spawn_env(monkeypatch):
-    """Session-scoped sandbox recovery must not hard-code claude/default env."""
-    session = {
-        "id": "sess-1",
-        "agent_id": "agent-1",
-        "env": {"VISIBLE": "yes"},
-        "secrets": {"TOKEN": "secret"},
-    }
-    sandbox = SandboxRecord(
-        id="sb-1",
-        provider="docker",
-        sandbox_ref="container-abc123",
-        status="running",
-        root="/home/agent",
-        volume_id="vol-1",
-        subpath="agents/a1",
-    )
-    captured: dict = {}
-
-    async def fake_require_session_row(session_id: str):
-        assert session_id == "sess-1"
-        return session
-
-    async def fake_ensure_sandbox(row):
-        assert row is session
-        return sandbox
-
-    async def fake_get_agent(agent_id: str):
-        assert agent_id == "agent-1"
-        return SimpleNamespace(config=SimpleNamespace(agent_type="codex"))
-
-    async def fake_resolve_sandbox_instance(sandbox_id: str, **kwargs):
-        captured["sandbox_id"] = sandbox_id
-        captured.update(kwargs)
-        return providers.ProviderInstance(
-            provider="docker", url="http://sandbox.fake", root="/home/agent",
-        )
-
-    monkeypatch.setattr(srv, "_require_session_row", fake_require_session_row)
-    monkeypatch.setattr(srv, "ensure_sandbox", fake_ensure_sandbox)
-    monkeypatch.setattr(srv, "get_agent", fake_get_agent)
-    monkeypatch.setattr(srv, "_resolve_sandbox_instance", fake_resolve_sandbox_instance)
-
-    instance = await srv._resolve_session_instance("sess-1")
-
-    assert instance.url == "http://sandbox.fake"
-    assert captured == {
-        "sandbox_id": "sb-1",
-        "agent_type": "codex",
-        "spawn_env": {"VISIBLE": "yes", "TOKEN": "secret"},
-    }
+# test_resolve_session_instance_uses_session_agent_type_and_spawn_env
+# was removed: it tested the legacy ``ensure_sandbox`` / agent-config /
+# spawn-env wiring inside ``_resolve_session_instance``, all of which is
+# gone. The pool now resolves the session's compute directly via
+# ``pool.get_session(session_id)`` and the session row owns env/secrets,
+# so there's no wiring left at this layer to validate.
 
 
 @pytest.mark.asyncio
