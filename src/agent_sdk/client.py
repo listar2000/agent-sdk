@@ -593,13 +593,17 @@ class Agent:
 
     async def aclose(self) -> None:
         if self.session_id and self._registered:
+            # Snapshot + drop the SessionPool's lease. Pool's idle reaper
+            # would eventually catch this anyway, but releasing on close
+            # frees compute immediately and writes a fresh snapshot — the
+            # next prompt resumes from disk instead of a stale memory state.
             try:
                 await self._client.post(
-                    f"/admin/sessions/{self.session_id}/reap",
+                    f"/sessions/{self.session_id}/release",
                     timeout=httpx.Timeout(5.0, read=10.0),
                 )
             except Exception as exc:
-                log.debug("aclose: reap session %s failed (ignored): %s", self.session_id, exc)
+                log.debug("aclose: release session %s failed (ignored): %s", self.session_id, exc)
             self._registered = False
         await self._client.aclose()
 
