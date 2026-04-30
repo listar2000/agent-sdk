@@ -468,6 +468,51 @@ async def _deprecation_headers_middleware(request: Request, call_next):
     return response
 
 
+def _warn_deprecated(route_template: str) -> None:
+    """Server-side ``warnings.warn(DeprecationWarning)`` for a deprecated
+    handler. Pairs with the HTTP ``Deprecation`` header (which only
+    surfaces to HTTP callers): a Python program importing this module
+    and calling the handler in-process (or watching the warnings stream)
+    sees the same migration pointer the SDK does."""
+    import warnings as _warnings
+    note = _DEPRECATED_ROUTES.get(route_template, "endpoint is deprecated")
+    _warnings.warn(
+        f"{route_template} is deprecated (sunset: {_DEPRECATION_SUNSET}) — {note}",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+async def _session_id_from_sandbox_id(sandbox_id: str) -> str:
+    """Reverse-lookup helper for the deprecated ``/sandboxes/{id}/...``
+    routes that need to forward into the SessionPool — those endpoints
+    take the sandbox row id, but the pool keys on session_id.
+
+    Strategy: try ``sessions.current_sandbox_id`` first (DB-backed
+    pointer kept in sync by the dual-write trigger). Falls back to a
+    pool reverse-lookup keyed on ``state.sandbox_id`` (the provider
+    UUID, looked up via the sandbox row's ``sandbox_ref``) so
+    pool-mediated sandboxes that haven't been pinned to a session row
+    are still resolvable.
+
+    Raises 404 if no session owns this sandbox.
+    """
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT id FROM sessions WHERE current_sandbox_id = %s LIMIT 1",
+            (sandbox_id,),
+        )).fetchone()
+    if row is not None:
+        return row["id"]
+    record = await get_sandbox(sandbox_id)
+    if record is not None and record.sandbox_ref:
+        from api.sandbox import get_pool
+        pool_session = get_pool().find_by_sandbox_id(record.sandbox_ref)
+        if pool_session is not None:
+            return pool_session.session_id
+    raise HTTPException(404, f"sandbox {sandbox_id} not bound to any session")
+
+
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException):
     """Uniform error shape: ``{"error": ...}`` for string details, pass-through for dict."""
@@ -1833,7 +1878,13 @@ async def delete_sandbox_route(sandbox_id: str):
 
 @app.post("/sandboxes")
 async def create_sandbox(request: Request):
-    """Create a sandbox on the provider selected by the request body.
+    """**Deprecated** — use ``POST /sessions`` (creates a session +
+    SessionPool-managed compute lazily on first ``POST /message``).
+
+    Implementation kept for legacy callers that need a standalone
+    sandbox without a session. The pool model treats every sandbox as
+    session-owned, so this endpoint will be deleted after the
+    deprecation window (sunset 2026-12-31).
 
     Body: ``{"volume_id": ..., "subpath": ..., "provider": "daytona"|"docker"|"local",
               "agent_type": ..., "config": {...}}``
@@ -1843,6 +1894,7 @@ async def create_sandbox(request: Request):
     Returns ``{id, sandbox_id, sandbox_ref, status, provider, root, volume_id,
     subpath, listen_port, url}``.
     """
+    _warn_deprecated("/sandboxes")
     data = await _json_body(request)
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
@@ -1924,112 +1976,53 @@ async def create_sandbox(request: Request):
 
 @app.post("/sandboxes/{sandbox_id}/stop")
 async def stop_sandbox_route(sandbox_id: str):
-    record = await _require_sandbox(sandbox_id)
+    """**Deprecated** — use ``POST /sessions/{session_id}/release``.
 
-    # Hold the sandbox lock to prevent concurrent auto-restart
-    # from restarting the sandbox while we're stopping it.
-    #
-    # IMPORTANT: stop the provider instance BEFORE flipping status="stopped"
-    # in the DB. A crash between the flip and a successful stop_instance
-    # Only mark stopped after the provider confirms — otherwise the DB says
-    # "stopped" while a live container still runs, and reconcile treats it as
-    # an orphan. ``_INSTANCES`` must be popped *after* the DB update: if the
-    # UPDATE fails, keep the entry so retry/reconcile can still locate the
-    # container; otherwise the container is gone but the row says "running"
-    # and the next ensure call would provision a duplicate.
-    async with _get_sandbox_lock(sandbox_id):
-        instance = _INSTANCES.get(sandbox_id)
-        if instance:
-            # Snapshot before stop so the next boot's session/load finds
-            # the JSONLs on the volume (per-turn snapshot was dropped).
-            await _request_supervisor_snapshot(instance)
-            try:
-                await stop_instance(instance)
-            except Exception as e:
-                log.warning("stop_sandbox_route: stop failed for %s: %s",
-                            sandbox_id, e)
-                raise HTTPException(502, f"stop failed: {e}")
-
-        record.status = "stopped"
-        try:
-            await upsert_sandbox(record)
-        except Exception as e:
-            # Provider is stopped but DB flip failed.  Leave _INSTANCES as-is
-            # so the next reconcile or a client retry can still locate the
-            # container (already exited; upsert_sandbox is idempotent).
-            # Returning 502 prompts the client to retry.
-            log.warning(
-                "stop_sandbox_route: DB update failed for %s "
-                "(container stopped; _INSTANCES kept): %s",
-                sandbox_id, e,
-            )
-            raise HTTPException(502, f"stop succeeded but DB update failed: {e}")
-
-        # DB update succeeded — drop the in-process entry now.
-        _INSTANCES.pop(sandbox_id, None)
-
+    Resolves ``session_id`` from the sandbox row and delegates to the
+    ``/release`` handler so the implementation stays in one place.
+    Returns the legacy ``{"status": "stopped"}`` shape for callers
+    that haven't migrated their response parsing yet.
+    """
+    _warn_deprecated("/sandboxes/{sandbox_id}/stop")
+    await _require_sandbox(sandbox_id)
+    sid = await _session_id_from_sandbox_id(sandbox_id)
+    await release_session_route(sid)
     return {"status": "stopped"}
 
 
 @app.post("/sandboxes/{sandbox_id}/snapshot")
 async def snapshot_sandbox_route(sandbox_id: str):
-    """Write the sandbox's workspace to the volume. Use before risky ops
-    or when the user wants an explicit "save point". /sandboxes/{id}/stop,
-    /sessions/{id}/hibernate, and the idle reaper already do this
-    implicitly — call this endpoint only for mid-session saves.
+    """**Deprecated** — use ``POST /sessions/{session_id}/release``.
+
+    The pool's release path is the only snapshot+pause flow — no
+    snapshot-without-pause primitive (per-turn snapshots in
+    ``supervisor.js`` already cover the "save without stopping"
+    case). Forwards to the ``/release`` handler.
     """
+    _warn_deprecated("/sandboxes/{sandbox_id}/snapshot")
     await _require_sandbox(sandbox_id)
-    instance = _INSTANCES.get(sandbox_id)
-    if instance is None or not instance.url:
-        raise HTTPException(409, "sandbox not running")
-    if not await _request_supervisor_snapshot(instance.url):
-        raise HTTPException(502, "supervisor snapshot failed")
+    sid = await _session_id_from_sandbox_id(sandbox_id)
+    await release_session_route(sid)
     return {"status": "ok"}
 
 
 @app.post("/sandboxes/{sandbox_id}/start")
-async def start_sandbox_route(sandbox_id: str):
-    """**Type 1 only** — revive an existing sandbox in place.
+async def start_sandbox_route(sandbox_id: str, request: Request):
+    """**Deprecated** — use ``POST /sessions/{session_id}/resume`` (or
+    just ``POST /message``, which provisions on demand).
 
-    Calls ``_type1_recover`` directly (no Type 2 fallback). If the
-    underlying provider sandbox is missing or unrecoverable, returns
-    ``409 Conflict`` rather than silently provisioning a replacement.
-
-    Use ``POST /sessions/{id}/reset-sandbox`` for an explicit Type 2
-    replacement, or ``POST /sandboxes`` to create a fresh sandbox.
+    Resolves ``session_id`` from the sandbox row and delegates to
+    ``/resume`` so the SessionPool revival path stays in one place.
+    Returns the legacy ``{"status": "running", "url": ...}`` shape.
     """
-    record = await _require_sandbox(sandbox_id)
-    async with _get_sandbox_lock(sandbox_id):
-        # Fast path — already running.
-        instance = _INSTANCES.get(sandbox_id)
-        if instance is not None and await _instance_is_alive(instance):
-            return {"status": "running", "url": instance.url}
-
-        spawn_env = await _spawn_env_for_sandbox(sandbox_id)
-        try:
-            revived = await _type1_recover(
-                sandbox_id, record, instance, "claude", spawn_env,
-            )
-        except Exception as e:
-            # 502 matches POST /sandboxes — provider failures are upstream
-            # faults, not server bugs (500).
-            raise HTTPException(502, f"failed to start sandbox: {e}")
-
-        if revived is None:
-            raise HTTPException(
-                409,
-                "sandbox cannot be started in place — the underlying provider "
-                "sandbox is missing or unrecoverable. Use "
-                "POST /sessions/{id}/reset-sandbox for a Type 2 replacement, "
-                "or POST /sandboxes to create a fresh one.",
-            )
-
-        _INSTANCES[sandbox_id] = revived
-        # Type 1 keeps the same sandbox_ref + listen_port — the row only
-        # needs its status flipped back to running.
-        record.status = "running"
-        await upsert_sandbox(record)
-        return {"status": "running", "url": revived.url}
+    _warn_deprecated("/sandboxes/{sandbox_id}/start")
+    await _require_sandbox(sandbox_id)
+    sid = await _session_id_from_sandbox_id(sandbox_id)
+    await session_resume(sid, request)
+    from api.sandbox import get_pool
+    pool_session = get_pool()._active.get(sid)  # noqa: SLF001 — the lease just acquired
+    url = pool_session.supervisor_url if pool_session is not None else None
+    return {"status": "running", "url": url}
 
 
 # ---------------------------------------------------------------------------
@@ -4040,9 +4033,17 @@ async def session_cancel(session_id: str):
 
 @app.post("/sessions/{session_id}/start-sandbox")
 async def start_session_sandbox(session_id: str):
-    """Eagerly provision a sandbox for a session (pre-warm). Idempotent."""
-    _, sandbox, _ = await ensure_session_live(session_id)
-    return {"sandbox_id": sandbox.id}
+    """**Deprecated** — POST /sessions/{id}/message provisions on demand.
+
+    Forwards to ``SessionPool.get_session(session_id)`` so callers that
+    relied on eager pre-warming still get the same effect: the pool
+    constructs the SandboxSession and runs ``start()`` (which boots
+    the supervisor + attaches ACP) before this returns.
+    """
+    _warn_deprecated("/sessions/{session_id}/start-sandbox")
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+    return {"sandbox_id": getattr(pool_session.state, "sandbox_id", None)}
 
 
 @app.post("/sessions/{session_id}/release")
@@ -4076,48 +4077,52 @@ async def release_session_route(session_id: str):
 
 @app.post("/sessions/{session_id}/reset-sandbox")
 async def reset_session_sandbox(session_id: str, request: Request):
-    """Destroy current sandbox and provision a fresh one. Accepts optional
-    body ``{dockerfile, dockerfile_content, shared_mounts}`` to change the
-    provisioning identity; otherwise inherits from the old sandbox row."""
-    data: dict = {}
+    """**Deprecated** — use ``POST /sessions/{id}/release`` then
+    ``POST /sessions/{id}/message`` (the pool's cold-create path).
+
+    Implementation: drops the pool's lease (no snapshot — we're
+    discarding state on purpose), nulls ``sandbox_state.sandbox_id``
+    so the next ``get_session`` cold-creates instead of reattaching,
+    then re-leases via the pool.
+
+    Body fields ``dockerfile`` / ``shared_mounts`` are accepted for
+    back-compat but ignored — the pool's recipe comes from the
+    persisted ``sandbox_state`` JSONB and changing it requires a
+    direct write to that column.
+    """
+    _warn_deprecated("/sessions/{session_id}/reset-sandbox")
     try:
-        data = await _json_body(request)
+        await _json_body(request)
     except HTTPException:
         pass  # empty body is fine
-    sess = await _require_session_row(session_id)
-    old_sbid = sess.get("current_sandbox_id")
-    old_sb = await get_sandbox(old_sbid) if old_sbid else None
 
-    # Destroy compute + delete row (unlike stop, this is the real tear-down).
-    if old_sb:
-        try:
-            await _providers_mod.destroy_sandbox(old_sb.provider, _synthesize_instance(old_sb))
-        except Exception:
-            pass
-    _INSTANCES.pop(old_sbid, None) if old_sbid else None
-    state = SESSIONS.get(session_id)
-    if state is not None:
-        await _shutdown_session_state(state, remove=True, force=True)
-    if old_sbid:
-        await set_session_current_sandbox(session_id, None)
-        await delete_sandbox(old_sbid)
+    from psycopg.types.json import Json
+    from api.sandbox import deserialize, get_pool, serialize
+    from api.sandbox.db_bindings import load_sandbox_state
 
-    # Body overrides, else inherit from the old sandbox row.
-    new_dockerfile = _materialize_dockerfile(data) if data else None
-    if new_dockerfile is None:
-        new_dockerfile = old_sb.dockerfile if old_sb else None
-    if "shared_mounts" in data:
-        new_shared_mounts = data.get("shared_mounts") or []
-    else:
-        new_shared_mounts = list(old_sb.shared_mounts) if old_sb else []
+    pool = get_pool()
+    # Drop the active lease (compute will be torn down by shutdown_all
+    # path inside release; without a snapshot since we're resetting).
+    try:
+        await pool.release(session_id)
+    except Exception:
+        pass
 
-    fresh_sess = await _require_session_row(session_id)
-    async with _get_session_lock(session_id):
-        sandbox = await _provision_new(
-            fresh_sess, previous_id=old_sbid,
-            dockerfile=new_dockerfile, shared_mounts=new_shared_mounts,
+    # Null sandbox_id so get_session takes the cold-create branch
+    # instead of trying to reattach to the (about-to-be-destroyed) one.
+    payload = await load_sandbox_state(session_id)
+    state = deserialize(payload)
+    state.sandbox_id = None
+    state.snapshot_path = None
+    state.snapshot_version = 0
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
+            (Json(serialize(state)), session_id),
         )
-    return {"sandbox_id": sandbox.id}
+
+    pool_session = await pool.get_session(session_id)
+    return {"sandbox_id": getattr(pool_session.state, "sandbox_id", None)}
 
 
 @app.post("/sessions/{session_id}/config")
@@ -4312,63 +4317,51 @@ async def _proxy_from_session(
 
 @app.get("/sandboxes/{sandbox_id}/files/tree")
 async def sandbox_files_tree(sandbox_id: str):
-    """Return the recursive directory tree of the sandbox root."""
-    return await _proxy_to_supervisor(sandbox_id, "GET", "/v1/files/tree")
+    """**Deprecated** — use ``GET /sessions/{session_id}/files/tree``."""
+    _warn_deprecated("/sandboxes/{sandbox_id}/files/tree")
+    return await session_files_tree(await _session_id_from_sandbox_id(sandbox_id))
 
 
 @app.get("/sandboxes/{sandbox_id}/files/read")
 async def sandbox_files_read(sandbox_id: str, path: str):
-    """Read a single file. Supervisor enforces path-traversal protection."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "GET", "/v1/files/read", params={"path": path},
-    )
+    """**Deprecated** — use ``GET /sessions/{session_id}/files/read``."""
+    _warn_deprecated("/sandboxes/{sandbox_id}/files/read")
+    return await session_files_read(await _session_id_from_sandbox_id(sandbox_id), path)
 
 
 @app.post("/sandboxes/{sandbox_id}/files/edit")
 async def sandbox_files_edit(sandbox_id: str, request: Request):
-    """Edit or create a file.
-
-    Body: ``{"path": ..., "old_string": ..., "new_string": ..., "replace_all": bool}``.
-    When ``old_string`` is empty, writes/creates the file with ``new_string`` as content.
-    """
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/edit",
-        json=await _json_body(request),
-    )
+    """**Deprecated** — use ``POST /sessions/{session_id}/files/edit``."""
+    _warn_deprecated("/sandboxes/{sandbox_id}/files/edit")
+    return await session_files_edit(await _session_id_from_sandbox_id(sandbox_id), request)
 
 
 @app.post("/sandboxes/{sandbox_id}/files/upload")
 async def sandbox_files_upload(sandbox_id: str, request: Request):
-    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/upload",
-        json=await _json_body(request), timeout=60,
-    )
+    """**Deprecated** — use ``POST /sessions/{session_id}/files/upload``."""
+    _warn_deprecated("/sandboxes/{sandbox_id}/files/upload")
+    return await session_files_upload(await _session_id_from_sandbox_id(sandbox_id), request)
 
 
 @app.post("/sandboxes/{sandbox_id}/files/delete")
 async def sandbox_files_delete(sandbox_id: str, request: Request):
-    """Delete a file or directory. Body: ``{"path": ...}``."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/delete",
-        json=await _json_body(request),
-    )
+    """**Deprecated** — use ``POST /sessions/{session_id}/files/delete``."""
+    _warn_deprecated("/sandboxes/{sandbox_id}/files/delete")
+    return await session_files_delete(await _session_id_from_sandbox_id(sandbox_id), request)
 
 
 @app.post("/sandboxes/{sandbox_id}/files/rename")
 async def sandbox_files_rename(sandbox_id: str, request: Request):
-    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
-    return await _proxy_to_supervisor(
-        sandbox_id, "POST", "/v1/files/rename",
-        json=await _json_body(request),
-    )
+    """**Deprecated** — use ``POST /sessions/{session_id}/files/rename``."""
+    _warn_deprecated("/sandboxes/{sandbox_id}/files/rename")
+    return await session_files_rename(await _session_id_from_sandbox_id(sandbox_id), request)
 
 
 @app.get("/sandboxes/{sandbox_id}/files/download")
 async def sandbox_files_download(sandbox_id: str, path: str):
-    """Download a file as raw bytes (forwards content-type + disposition)."""
-    instance = await _resolve_sandbox_instance(sandbox_id)
-    return await _download_from_instance(instance, path)
+    """**Deprecated** — use ``GET /sessions/{session_id}/files/download``."""
+    _warn_deprecated("/sandboxes/{sandbox_id}/files/download")
+    return await session_files_download(await _session_id_from_sandbox_id(sandbox_id), path)
 
 
 async def _download_from_instance(instance: ProviderInstance, path: str) -> Response:
