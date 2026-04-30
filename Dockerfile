@@ -19,4 +19,9 @@ RUN cd src/supervisor && npm install --silent
 
 EXPOSE 7778
 
-CMD uvicorn src.api.server:app --host 0.0.0.0 --port ${PORT:-7778}
+# Import as ``api.server`` (not ``src.api.server``) so ``api.sandbox.db_bindings``
+# (which does ``from api import db``) sees the SAME ``api.db`` module that
+# ``lifespan`` initialises via ``init_pool()``. The dotted form creates two
+# distinct module objects and the pool global is invisible to the pool path.
+ENV PYTHONPATH=/app/src
+CMD uvicorn api.server:app --host 0.0.0.0 --port ${PORT:-7778}

@@ -143,6 +143,11 @@ if [ "${#PIDS[@]}" -gt 0 ]; then
 fi
 
 export DATABASE_URL="postgresql://postgres@localhost:${PG_PORT}/${PG_DB}"
+# Use ``api.server`` (not ``src.api.server``) so other modules that
+# do ``from api import db`` see the SAME ``api.db`` module — otherwise
+# the server's ``init_pool()`` and ``api.sandbox.db_bindings.get_db()``
+# end up with two different ``_pool`` globals.
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 echo "Starting local server on http://localhost:7778 ..."
-exec "${VENV_PYTHON}" -m uvicorn src.api.server:app --host 0.0.0.0 --port 7778
+exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port 7778
