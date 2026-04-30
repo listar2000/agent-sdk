@@ -1127,6 +1127,40 @@ async def session_status(session_id: str):
     }
 
 
+@app.get("/sessions/{session_id}/sandbox")
+async def session_sandbox_info(session_id: str):
+    """Sandbox metadata read straight from the SessionPool — no
+    sandboxes-table dependency.
+
+    Returns the same shape as ``GET /sandboxes/{id}`` (provider,
+    sandbox_ref, status, root, url for port-based providers,
+    marker_path for local) so test helpers and admin UIs that need
+    sandbox info can stay in session-id space and avoid the
+    sandbox-row-id round trip. Brings the SandboxSession up if it's
+    been hibernated."""
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+    state = pool_session.state
+    provider = getattr(state, "type", "unknown")
+    sandbox_ref = getattr(state, "sandbox_id", None)
+    result: dict = {
+        "session_id": session_id,
+        "provider": provider,
+        "sandbox_ref": sandbox_ref,
+        "status": "running" if sandbox_ref else "missing",
+        "root": (state.recipe.root if state.recipe else None) or "/tmp",
+    }
+    url = pool_session.supervisor_url
+    if url:
+        result["url"] = url
+    if provider == "local" and sandbox_ref:
+        from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
+        args = _LOCAL_SPAWN_ARGS.get(sandbox_ref)
+        if args and args.get("marker_path"):
+            result["marker_path"] = args["marker_path"]
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Session log read endpoints
 # ---------------------------------------------------------------------------

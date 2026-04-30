@@ -177,9 +177,12 @@ def _auto_destroy_test_sandboxes():
 
 
 async def _get_sandbox(client: httpx.AsyncClient, session_id: str) -> dict:
-    sess = await client.get(f"{SERVER}/sessions/{session_id}", timeout=10)
-    sb_id = sess.json().get("current_sandbox_id") or sess.json().get("sandbox_id")
-    sb = await client.get(f"{SERVER}/sandboxes/{sb_id}", timeout=10)
+    """Read sandbox metadata via the session-scoped route — single
+    round-trip, no sandboxes-table dependency. Returns the same shape
+    as the legacy ``GET /sandboxes/{id}`` (provider, sandbox_ref,
+    status, root, url, marker_path) so the ``_external_*`` helpers
+    don't need to change."""
+    sb = await client.get(f"{SERVER}/sessions/{session_id}/sandbox", timeout=10)
     return sb.json()
 
 
@@ -510,7 +513,11 @@ async def test_server_delete_persists_workspace(provider):
 
         sandbox = await _get_sandbox(client, session_id)
         sandbox_ref_before = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
-        sandbox_id = sandbox["id"]
+        # The back-compat shim's sandboxes-row PK lives on
+        # ``sessions.current_sandbox_id`` — fetch that to drive the
+        # legacy DELETE /sandboxes/{id} this test is contract-pinning.
+        sess = (await client.get(f"{SERVER}/sessions/{session_id}", timeout=10)).json()
+        sandbox_id = sess.get("current_sandbox_id")
         r = await client.delete(f"{SERVER}/sandboxes/{sandbox_id}", timeout=60)
         assert r.status_code in (200, 204), f"DELETE /sandboxes failed: {r.text}"
         await asyncio.sleep(3)
