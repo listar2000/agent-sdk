@@ -114,7 +114,15 @@ def _require_provider(provider: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
-    body: dict = {"provider": provider, "agent_type": "claude"}
+    # Hardcode haiku for the recovery suite — these tests fire many short
+    # prompts in parallel under -n auto, and sonnet's per-key rate limit
+    # trips long before the suite finishes. Haiku has a much higher RPM
+    # ceiling and answers tool-use prompts just as well for the tiny
+    # turns these tests exercise.
+    body: dict = {
+        "provider": provider, "agent_type": "claude",
+        "model": "claude-haiku-4-5-20251001",
+    }
     if OAUTH_TOKEN:
         body["secrets"] = {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN}
     resp = await client.post(f"{SERVER}/sessions", json=body, timeout=180)
