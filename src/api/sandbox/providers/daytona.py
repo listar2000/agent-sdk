@@ -44,6 +44,7 @@ _SSE_READ_TIMEOUT_S = 60.0
 class DaytonaSandboxSession(BaseSandboxSession):
     """One running Daytona sandbox + the supervisor + ACP child inside it."""
 
+    volume_provider = "daytona"
     state: DaytonaSandboxState  # narrow the base's SandboxState union
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -53,13 +54,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         super().__init__(session_id=session_id, state=state)
         # Filled in by start(); cleared by shutdown().
         self._daytona_sandbox: Any | None = None
-        self._supervisor_url: str | None = None
-        self._acp_session_id: str | None = None
-        self._inner_session_id: str | None = None
-        self._spawn_env: dict[str, str] = {}
-        self._volume_ref: str | None = None
-        self._cwd: str = "/home/daytona"
-        self._acp_attached = False
+        self._cwd = "/home/daytona"  # provider-specific default
 
     # ------------------------------------------------------------------ #
     # start: reattach-or-create + supervisor + ACP                        #
@@ -79,7 +74,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         from api.providers import daytona as dt_provider
         from api.providers._shared import _wait_for_health
 
-        await self._ensure_volume_supervisor(dt_provider)
+        await self._bootstrap_session()
 
         # Resolve the daytona sandbox handle: reattach, restart, or create.
         sandbox = await self._resolve_or_create_sandbox(dt_provider)
@@ -117,65 +112,12 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # one ACP child.
         if self._acp_session_id is None:
             self._acp_session_id = str(uuid4())
-        if not self._acp_attached:
-            await self._attach_acp_session()
+        await self._attach_acp()
 
         log.info(
             "DaytonaSandboxSession started: session=%s sandbox=%s url=%s",
             self.session_id, sandbox.id[:16], url,
         )
-
-    async def _ensure_volume_supervisor(self, dt_provider) -> str:
-        if self._volume_ref is not None:
-            return self._volume_ref
-
-        from api import db as _db
-
-        sess = await _db.get_session(self.session_id)
-        if sess is None:
-            raise RuntimeError(f"session {self.session_id} has no volume")
-        volume = await _db.get_volume(sess["volume_id"])
-        if volume is None or volume.provider != "daytona":
-            raise RuntimeError(f"session {self.session_id} is not backed by a daytona volume")
-
-        agent_type = self.state.recipe.agent_type
-        volume_ref = volume.provider_ref
-        self._spawn_env = {**(sess.get("env") or {}), **(sess.get("secrets") or {})}
-        self._cwd = sess.get("cwd") or self.state.recipe.root or "/home/daytona"
-        self._inner_session_id = sess.get("inner_session_id") or self._inner_session_id
-        if agent_type not in volume.supervisor_agent_types:
-            await dt_provider.install_supervisor(volume_ref, agent_type)
-            await _db.add_supervisor_agent_type(volume.id, agent_type)
-
-        self._volume_ref = volume_ref
-        return volume_ref
-
-    async def _attach_acp_session(self) -> None:
-        if self._supervisor_url is None or self._acp_session_id is None:
-            return
-
-        from api import db as _db
-        from api.acp_client import AcpClient
-
-        client = AcpClient(self._supervisor_url)
-        try:
-            await client.attach(
-                self._acp_session_id,
-                self.state.recipe.agent_type,
-                cwd=self._cwd,
-                inner_session_id=self._inner_session_id,
-            )
-            self._inner_session_id = client.get_inner_session_id(self._acp_session_id)
-        finally:
-            await client.aclose()
-
-        self._acp_attached = True
-        if self._inner_session_id:
-            async with _db.get_db() as conn:
-                await conn.execute(
-                    "UPDATE sessions SET inner_session_id = %s WHERE id = %s",
-                    (self._inner_session_id, self.session_id),
-                )
 
     async def _resolve_or_create_sandbox(self, dt_provider) -> Any:
         """The internal Type-1-vs-Type-2 decision tree, hidden from callers."""

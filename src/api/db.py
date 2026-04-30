@@ -272,17 +272,28 @@ _MIGRATIONS = [
     # phase 3 drops the sandboxes table and these triggers.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_state JSONB",
     """CREATE OR REPLACE FUNCTION _ephemeral_compute_sandbox_state(
-           sb_id TEXT, agent_id_in TEXT, pre_start_in JSONB
+           sb_id TEXT, agent_id_in TEXT, pre_start_in JSONB, volume_id_in TEXT
        ) RETURNS JSONB AS $$
        DECLARE
            sb RECORD;
            agent_type TEXT;
+           volume_provider TEXT;
+           state_type TEXT;
        BEGIN
            SELECT a.config->>'agent_type' INTO agent_type
                FROM agents a WHERE a.id = agent_id_in;
+           SELECT v.provider INTO volume_provider
+               FROM volumes v WHERE v.id = volume_id_in;
+           -- Map provider → SandboxState.type discriminator.
+           -- Provider 'local' uses class UnixLocalSandboxState (type='unix_local').
+           state_type := CASE volume_provider
+               WHEN 'local' THEN 'unix_local'
+               WHEN NULL    THEN 'unknown'
+               ELSE volume_provider
+           END;
            IF sb_id IS NULL THEN
                RETURN jsonb_build_object(
-                   'type',             'unknown',
+                   'type',             COALESCE(state_type, 'unknown'),
                    'sandbox_id',       NULL,
                    'snapshot_path',    NULL,
                    'snapshot_version', 0,
@@ -301,7 +312,7 @@ _MIGRATIONS = [
                -- Sandbox row was deleted out-of-band but session still
                -- references it; collapse to no-compute shape.
                RETURN jsonb_build_object(
-                   'type',             'unknown',
+                   'type',             COALESCE(state_type, 'unknown'),
                    'sandbox_id',       NULL,
                    'snapshot_path',    NULL,
                    'snapshot_version', 0,
@@ -316,7 +327,7 @@ _MIGRATIONS = [
                );
            END IF;
            RETURN jsonb_build_object(
-               'type',             sb.provider,
+               'type', CASE sb.provider WHEN 'local' THEN 'unix_local' ELSE sb.provider END,
                'sandbox_id',       sb.sandbox_ref,
                'snapshot_path',    NULL,
                'snapshot_version', 0,
@@ -335,7 +346,7 @@ _MIGRATIONS = [
        BEGIN
            UPDATE sessions s
            SET sandbox_state = _ephemeral_compute_sandbox_state(
-               NEW.id, s.agent_id, s.pre_start_commands
+               NEW.id, s.agent_id, s.pre_start_commands, s.volume_id
            )
            WHERE s.current_sandbox_id = NEW.id;
            RETURN NEW;
@@ -344,7 +355,7 @@ _MIGRATIONS = [
        RETURNS TRIGGER AS $$
        BEGIN
            NEW.sandbox_state := _ephemeral_compute_sandbox_state(
-               NEW.current_sandbox_id, NEW.agent_id, NEW.pre_start_commands
+               NEW.current_sandbox_id, NEW.agent_id, NEW.pre_start_commands, NEW.volume_id
            );
            RETURN NEW;
        END $$ LANGUAGE plpgsql""",
@@ -354,12 +365,12 @@ _MIGRATIONS = [
        FOR EACH ROW EXECUTE FUNCTION _ephemeral_sync_sandbox_state_from_sandboxes()""",
     "DROP TRIGGER IF EXISTS _ephemeral_sessions_sync ON sessions",
     """CREATE TRIGGER _ephemeral_sessions_sync
-       BEFORE INSERT OR UPDATE OF current_sandbox_id, agent_id, pre_start_commands ON sessions
+       BEFORE INSERT OR UPDATE OF current_sandbox_id, agent_id, pre_start_commands, volume_id ON sessions
        FOR EACH ROW EXECUTE FUNCTION _ephemeral_sync_sandbox_state_from_sessions()""",
     # One-shot backfill so existing rows aren't NULL until next write.
     """UPDATE sessions s
        SET sandbox_state = _ephemeral_compute_sandbox_state(
-           s.current_sandbox_id, s.agent_id, s.pre_start_commands
+           s.current_sandbox_id, s.agent_id, s.pre_start_commands, s.volume_id
        )
        WHERE s.sandbox_state IS NULL""",
 ]

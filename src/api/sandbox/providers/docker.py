@@ -34,6 +34,7 @@ _SSE_READ_TIMEOUT_S = 60.0
 class DockerSandboxSession(BaseSandboxSession):
     """One running Docker container + supervisor + ACP child."""
 
+    volume_provider = "docker"
     state: DockerSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -41,10 +42,7 @@ class DockerSandboxSession(BaseSandboxSession):
             state = DockerSandboxState(recipe=state.recipe)
         super().__init__(session_id=session_id, state=state)
         self._container_id: str | None = None
-        self._supervisor_url: str | None = None
-        self._acp_session_id: str | None = None
-        self._inner_session_id: str | None = None
-        self._spawn_env: dict[str, str] = {}
+        self._cwd = "/home/agent"
 
     # ------------------------------------------------------------------ #
     # start: reattach-or-create + supervisor                              #
@@ -56,6 +54,8 @@ class DockerSandboxSession(BaseSandboxSession):
 
         from api.providers import docker as dk_provider
         from api.providers._shared import _wait_for_health
+
+        volume_ref = await self._bootstrap_session()
 
         # Docker doesn't support pause/resume. If state has a container
         # id, check if it's still alive; otherwise create fresh.
@@ -81,7 +81,7 @@ class DockerSandboxSession(BaseSandboxSession):
 
         if instance is None:
             instance = await dk_provider.create_sandbox(
-                volume_ref=self.state.recipe.root or "agentsdk-default",
+                volume_ref=volume_ref,
                 subpath=f"sessions/{self.session_id}",
                 agent_type=self.state.recipe.agent_type,
                 root=self.state.recipe.root,
@@ -105,6 +105,7 @@ class DockerSandboxSession(BaseSandboxSession):
 
         if self._acp_session_id is None:
             self._acp_session_id = str(uuid4())
+        await self._attach_acp()
 
         log.info(
             "DockerSandboxSession started: session=%s container=%s url=%s",

@@ -26,16 +26,13 @@ _SSE_READ_TIMEOUT_S = 60.0
 class UnixLocalSandboxSession(BaseSandboxSession):
     """One running local supervisor.js + ACP child subprocess."""
 
+    volume_provider = "local"
     state: UnixLocalSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         if not isinstance(state, UnixLocalSandboxState):
             state = UnixLocalSandboxState(recipe=state.recipe)
         super().__init__(session_id=session_id, state=state)
-        self._supervisor_url: str | None = None
-        self._acp_session_id: str | None = None
-        self._inner_session_id: str | None = None
-        self._spawn_env: dict[str, str] = {}
 
     async def start(self) -> None:
         if self._supervisor_url is not None and await self.running():
@@ -43,6 +40,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         from api.providers import local as lc_provider
         from api.providers._shared import _wait_for_health
+
+        volume_ref = await self._bootstrap_session()
 
         instance = None
         # Local sandboxes are processes — sandbox_id is the pid as string.
@@ -63,7 +62,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         if instance is None:
             instance = await lc_provider.create_sandbox(
-                volume_ref=self.state.recipe.root or "/tmp/agentsdk-default",
+                volume_ref=volume_ref,
                 subpath=f"sessions/{self.session_id}",
                 agent_type=self.state.recipe.agent_type,
                 root=self.state.recipe.root,
@@ -85,6 +84,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         self.liveness.observe_chunk()
         if self._acp_session_id is None:
             self._acp_session_id = str(uuid4())
+        await self._attach_acp()
 
         log.info(
             "UnixLocalSandboxSession started: session=%s pid=%s url=%s",

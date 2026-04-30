@@ -25,16 +25,14 @@ _SSE_READ_TIMEOUT_S = 60.0
 class ModalSandboxSession(BaseSandboxSession):
     """One running Modal sandbox + supervisor + ACP child."""
 
+    volume_provider = "modal"
     state: ModalSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         if not isinstance(state, ModalSandboxState):
             state = ModalSandboxState(recipe=state.recipe)
         super().__init__(session_id=session_id, state=state)
-        self._supervisor_url: str | None = None
-        self._acp_session_id: str | None = None
-        self._inner_session_id: str | None = None
-        self._spawn_env: dict[str, str] = {}
+        self._cwd = "/v"
 
     async def start(self) -> None:
         if self._supervisor_url is not None and await self.running():
@@ -42,6 +40,8 @@ class ModalSandboxSession(BaseSandboxSession):
 
         from api.providers import modal as md_provider
         from api.providers._shared import _wait_for_health
+
+        volume_ref = await self._bootstrap_session()
 
         instance = None
         if self.state.sandbox_id:
@@ -61,7 +61,7 @@ class ModalSandboxSession(BaseSandboxSession):
 
         if instance is None:
             instance = await md_provider.create_sandbox(
-                volume_ref=self.state.recipe.root or "agentsdk-default",
+                volume_ref=volume_ref,
                 subpath=f"sessions/{self.session_id}",
                 agent_type=self.state.recipe.agent_type,
                 root=self.state.recipe.root,
@@ -83,6 +83,7 @@ class ModalSandboxSession(BaseSandboxSession):
         self.liveness.observe_chunk()
         if self._acp_session_id is None:
             self._acp_session_id = str(uuid4())
+        await self._attach_acp()
 
         log.info(
             "ModalSandboxSession started: session=%s sandbox=%s url=%s",
