@@ -1066,6 +1066,8 @@ _UTILITY_REAPER_TICK_S = 30.0
 _utility_cache: dict[str, tuple["ProviderInstance", float]] = {}  # ref -> (inst, last_used)
 _utility_cache_lock = asyncio.Lock()
 _utility_reaper_started = False
+_conditional_create_support_cache: dict[str, bool] = {}
+_conditional_create_probe_lock = asyncio.Lock()
 
 
 async def _get_or_create_utility(ref: str) -> "ProviderInstance":
@@ -1234,6 +1236,78 @@ async def volume_download(ref: str, path: str) -> bytes:
         raise RuntimeError(f"volume_download failed: {msg}") from e
 
 
+async def _conditional_upload_if_absent(ref: str, abs_path: str, content: bytes) -> str:
+    """Attempt atomic create-if-absent upload through Daytona toolbox.
+
+    Returns:
+      - "created" when destination was created
+      - "exists" when backend rejected due to precondition
+    Raises RuntimeError on transport/protocol failures.
+    """
+    inst = await _get_or_create_utility(ref)
+    if not inst.sandbox_id:
+        raise RuntimeError("conditional upload: utility sandbox_id missing")
+    loop = asyncio.get_running_loop()
+    daytona_client = _get_daytona_client()
+    try:
+        sandbox = await loop.run_in_executor(
+            None, lambda: daytona_client.get(inst.sandbox_id)
+        )
+    except Exception as e:
+        raise RuntimeError(f"conditional upload: get sandbox failed: {e}") from e
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
+                path=abs_path,
+                file=content,
+                _headers={"If-None-Match": "*"},
+            ),
+        )
+        return "created"
+    except Exception as e:
+        msg = str(e).lower()
+        if "412" in msg or "precondition" in msg:
+            return "exists"
+        raise RuntimeError(f"conditional upload failed: {e}") from e
+
+
+async def _daytona_supports_conditional_create(ref: str) -> bool:
+    """Detect once per volume whether toolbox upload honors If-None-Match: *."""
+    mode = (os.environ.get("DAYTONA_CONDITIONAL_CREATE_MODE", "auto") or "auto").strip().lower()
+    if mode in {"on", "true", "1", "force", "force_on"}:
+        return True
+    if mode in {"off", "false", "0", "disable", "force_off"}:
+        return False
+    cached = _conditional_create_support_cache.get(ref)
+    if cached is not None:
+        return cached
+    async with _conditional_create_probe_lock:
+        cached = _conditional_create_support_cache.get(ref)
+        if cached is not None:
+            return cached
+        probe_rel = f"system/.conditional-create-probe-{uuid.uuid4().hex}.txt"
+        probe_abs = "/v/" + probe_rel
+        try:
+            await volume_write(ref, probe_rel, b"probe-a")
+            result = await _conditional_upload_if_absent(ref, probe_abs, b"probe-b")
+            if result != "exists":
+                _conditional_create_support_cache[ref] = False
+                return False
+            current = await volume_download(ref, probe_rel)
+            supported = current == b"probe-a"
+            _conditional_create_support_cache[ref] = supported
+            return supported
+        except Exception:
+            _conditional_create_support_cache[ref] = False
+            return False
+        finally:
+            try:
+                await volume_delete(ref, probe_rel)
+            except Exception:
+                pass
+
+
 async def volume_exists(ref: str, path: str) -> bool:
     """Return whether ``<volume>/<path>`` exists."""
     rel = _safe_path(None, path or "")
@@ -1323,16 +1397,37 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
             f"{settle_check}"
         )
     else:
-        cmd = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
-            f"if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; fi; "
-            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi; "
-            f"ln {shlex.quote(src)} {shlex.quote(dst)} || "
-            f"{{ if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; else exit 1; fi; }}; "
-            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}; "
-            f"{settle_check}"
+        # Daytona volumes are object-store backed; hardlinks are not reliable.
+        # Require a real create-if-absent primitive instead of race-prone emulation.
+        if not await _daytona_supports_conditional_create(ref):
+            raise NotImplementedError(
+                "atomic no-overwrite rename is not supported on this Daytona volume backend"
+            )
+        res = await _run_in_utility_sandbox(
+            ref,
+            (
+                f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+                f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
+                f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi"
+            ),
         )
+        if res.exit_code != 0:
+            if "__MISSING__" in (res.stdout or ""):
+                raise FileNotFoundError(f"{path} not found on volume {ref}")
+            if "__UNSUPPORTED_DIR__" in (res.stdout or ""):
+                raise NotImplementedError("atomic no-overwrite directory rename is not supported")
+            raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")
+        src_bytes = await volume_download(ref, src_rel)
+        outcome = await _conditional_upload_if_absent(ref, dst, src_bytes)
+        if outcome == "exists":
+            raise VolumeFileExistsError(new_path)
+        if outcome != "created":
+            raise RuntimeError("volume_rename failed: conditional destination claim returned unknown result")
+        await volume_delete(ref, src_rel)
+        verify = await _run_in_utility_sandbox(ref, settle_check)
+        if verify.exit_code != 0:
+            raise RuntimeError("volume_rename postcondition failed: destination not visible")
+        return
     res = await _run_in_utility_sandbox(ref, cmd)
     if res.exit_code != 0:
         if "__MISSING__" in (res.stdout or ""):
