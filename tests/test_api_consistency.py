@@ -58,7 +58,6 @@ _NON_OBJECT_BODIES = ["not a dict", 123, [1, 2, 3], True]
 @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
 @pytest.mark.parametrize("path", [
     "/agents",
-    "/sandboxes",
     "/sessions",
     "/sessions/any-id/message",
     "/sessions/any-id/config",
@@ -80,97 +79,24 @@ async def test_post_non_object_body_returns_400(client, path, body):
     assert "json object" in msg or "invalid json" in msg
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("path", [
-    "/sandboxes/any-id/files/edit",
-    "/sandboxes/any-id/files/upload",
-    "/sandboxes/any-id/files/delete",
-    "/sandboxes/any-id/files/rename",
-])
-async def test_sandbox_file_forwarders_reject_non_object_body(client, path):
-    """Sandbox-file forwarders used to forward any JSON to the supervisor
-    and rely on the supervisor to reject non-object bodies.  They now
-    short-circuit at the server with the same 400 shape."""
-    r = await client.post(path, json=42)
-    assert r.status_code == 400, f"{path}: {r.status_code} {r.text}"
-    assert "error" in r.json()
+# test_sandbox_file_forwarders_reject_non_object_body was removed: the
+# deprecated ``/sandboxes/{id}/files/{op}`` thin wrappers were deleted
+# entirely. Callers should use the session-scoped routes
+# (``/sessions/{id}/files/{op}``) which have their own body-validation
+# coverage in test_session_files_routes.
 
 
-# ---------------------------------------------------------------------------
-# POST /sandboxes/{id}/start: provider failure is 502, not 500.
-#
-# 500 is reserved for "server bug" — a provider that can't restart a
-# sandbox is upstream-fault territory, matching /sandboxes and
-# /sandboxes which already use 502 for the same class.
-# ---------------------------------------------------------------------------
+# test_start_sandbox_provider_failure_returns_502 was removed: the
+# deprecated ``POST /sandboxes/{id}/start`` route + the ``_type1_recover``
+# helper it patched are both gone. Callers use ``POST /sessions/{id}/message``
+# which provisions on demand through the SessionPool; provider-failure
+# error mapping for that path is covered in test_sandbox_stop_delete_recovery.
 
 
-@pytest.mark.asyncio
-async def test_start_sandbox_provider_failure_returns_502(client):
-    from api.models import VolumeRecord, SandboxRecord
-
-    v = VolumeRecord(id="vol_start_fail", name="sf",
-                     provider="daytona", provider_ref="dt-sf")
-    await dbmod.upsert_volume(v)
-    sb = SandboxRecord(id="sb_start_fail", provider="daytona",
-                       sandbox_ref="dt-sbx-sf", status="stopped",
-                       root="/home/daytona", volume_id=v.id, subpath="x")
-    await dbmod.upsert_sandbox(sb)
-
-    async def blow_up(*a, **kw):
-        raise RuntimeError("simulated provider outage")
-
-    # ``/sandboxes/{id}/start`` is Type-1-only since the start_sandbox_route
-    # rewrite — it calls ``_type1_recover`` directly, not ``_ensure_sandbox_alive``.
-    # The "provider blew up" branch is the ``except Exception`` around
-    # _type1_recover that returns 502.
-    with patch(
-        "api.server._type1_recover", new=AsyncMock(side_effect=blow_up)
-    ):
-        r = await client.post(f"/sandboxes/{sb.id}/start")
-
-    assert r.status_code == 502, f"got {r.status_code}: {r.text}"
-    body = r.json()
-    assert "error" in body
-    assert "simulated provider outage" in body["error"]
-
-
-# ---------------------------------------------------------------------------
-# Response-shape parity:
-#
-#   POST /sandboxes -> {"id", "sandbox_id", "sandbox_ref", ...}
-#   POST /sessions/quick      -> {"sandbox_id", "current_sandbox_id", ...}
-#   POST /sessions/{id}/resume-> {"sandbox_id", "current_sandbox_id", ...}
-#
-# The session paths need both keys because the DB column is
-# ``current_sandbox_id`` but clients (agent_sdk.client) read ``sandbox_id``.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_post_sandboxes_provision_exposes_both_id_and_sandbox_id(client):
-    from api.models import VolumeRecord
-
-    v = VolumeRecord(id="vol_shape_b", name="shape-b",
-                     provider="daytona", provider_ref="dt-b")
-    await dbmod.upsert_volume(v)
-
-    class _FakeInstance:
-        sandbox_id = "dt-sbx-b"
-        port = None
-        root = "/home/daytona"
-        url = None
-
-    with patch("api.server.ensure_volume_supervisor",
-               new=AsyncMock(return_value=None)), \
-         patch("api.providers.provision_sandbox",
-               new=AsyncMock(return_value=_FakeInstance())):
-        r = await client.post("/sandboxes", json={
-            "provider": "daytona", "volume_id": v.id, "subpath": "p",
-        })
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body.get("id") == body.get("sandbox_id") is not None, body
+# test_post_sandboxes_provision_exposes_both_id_and_sandbox_id was
+# removed: the legacy ``POST /sandboxes`` route it exercised has been
+# deleted (every sandbox is session-owned now; ``POST /sessions``
+# returns the same dual ``id`` / ``sandbox_id`` shape via the pool).
 
 
 # ---------------------------------------------------------------------------
@@ -312,40 +238,9 @@ async def test_message_on_truly_gone_session_returns_404(client):
     assert r.status_code == 404, r.text
 
 
-@pytest.mark.asyncio
-async def test_resolve_sandbox_instance_refreshes_stale_daytona_instance():
-    """``_resolve_sandbox_instance`` must re-run ``_ensure_sandbox_alive`` when
-    the cached ProviderInstance's URL is stale. The Daytona preview URL has a
-    24h TTL, so a stale cache entry silently breaks reads until we refresh."""
-    from api.models import SandboxRecord
-    from api.providers import ProviderInstance
-    from api.server import _resolve_sandbox_instance, _INSTANCES
-
-    sandbox_id = "sandbox-stale-instance"
-    stale = ProviderInstance(
-        provider="daytona",
-        url="https://old-daytona-url.example.com",
-        sandbox_id="daytona-old",
-    )
-    fresh = ProviderInstance(
-        provider="daytona",
-        url="https://new-daytona-url.example.com",
-        sandbox_id="daytona-new",
-    )
-    _INSTANCES[sandbox_id] = stale
-    try:
-        async def fake_ensure(*args, **kwargs):
-            _INSTANCES[sandbox_id] = fresh
-            return fresh.url, False
-
-        with patch("api.server.get_sandbox", AsyncMock(return_value=SandboxRecord(
-            id=sandbox_id, provider="daytona", sandbox_ref="daytona-sbx", status="running",
-        ))), patch(
-            "api.server._ensure_sandbox_alive", AsyncMock(side_effect=fake_ensure)
-        ) as mock_ensure:
-            resolved = await _resolve_sandbox_instance(sandbox_id)
-
-        assert resolved is fresh
-        mock_ensure.assert_awaited_once()
-    finally:
-        _INSTANCES.pop(sandbox_id, None)
+# test_resolve_sandbox_instance_refreshes_stale_daytona_instance was
+# removed: it tested ``_resolve_sandbox_instance`` (deleted),
+# ``_ensure_sandbox_alive`` (deleted), and ``_INSTANCES`` cache
+# refresh (deleted). The pool's ``get_session`` now always resolves
+# the supervisor URL through the live SandboxSession state — there's
+# no stale-cache layer to refresh.

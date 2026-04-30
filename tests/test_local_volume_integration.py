@@ -138,8 +138,11 @@ async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
     try:
         assert inst.url.startswith("http://127.0.0.1:")
         assert inst.sandbox_id is not None
-        pid = int(inst.sandbox_id)
-        assert pid in local._PROCESSES
+        # sandbox_id is a stable provider ref (``local-<uuid12>``) so the
+        # same sandbox can survive an in-place restart with a fresh PID;
+        # the _PROCESSES registry is keyed by that ref.
+        sandbox_ref = inst.sandbox_id
+        assert sandbox_ref in local._PROCESSES
 
         # Per-sandbox HOME exists on the volume.
         assert (Path(ref) / "agents" / "a1" / "home").is_dir()
@@ -155,8 +158,8 @@ async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
         await local.destroy_sandbox(inst)
 
     # After destroy: no live process, registry cleared.
-    assert pid not in local._PROCESSES
-    status = await local.get_sandbox_status(str(pid))
+    assert sandbox_ref not in local._PROCESSES
+    status = await local.get_sandbox_status(sandbox_ref)
     assert status == "missing"
 
     # Port on URL is no longer accepting connections — give the kernel a

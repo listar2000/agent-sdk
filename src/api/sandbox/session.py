@@ -159,7 +159,14 @@ class BaseSandboxSession(abc.ABC):
 
         Concrete ``start()`` calls this after the supervisor is up and
         ``self._supervisor_url`` is set. Re-invocation after a successful
-        attach is a no-op."""
+        attach is a no-op.
+
+        Re-applies any persisted ``agents.config.model`` after each fresh
+        attach. ``set_model`` only affects the current ACP session — every
+        cold-create / Type-2 recovery mints a new ACP session that
+        defaults to ``"default"`` (sonnet 4.6), so without this replay
+        callers who set ``model="haiku"`` once would silently revert to
+        sonnet on the first sandbox restart."""
         if self._acp_attached:
             return
         if self._supervisor_url is None or self._acp_session_id is None:
@@ -179,6 +186,25 @@ class BaseSandboxSession(abc.ABC):
             self._inner_session_id = client.get_inner_session_id(
                 self._acp_session_id
             )
+            # Re-apply the persisted model selection. Read fresh from DB
+            # rather than caching on the session object — POST /config
+            # writes to agents.config so a mid-flight model change there
+            # also propagates on the next attach.
+            if self._agent_id and self._inner_session_id:
+                try:
+                    agent = await _db.get_agent(self._agent_id)
+                    model = (
+                        agent.config.model
+                        if agent and agent.config else None
+                    )
+                    if model:
+                        await client.set_model(self._acp_session_id, model)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "set_model replay failed for session %s",
+                        self.session_id,
+                    )
         finally:
             await client.aclose()
 
