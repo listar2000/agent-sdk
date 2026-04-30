@@ -2045,7 +2045,12 @@ async def admin_list_sessions():
                 "current_sandbox_id": getattr(sess.state, "sandbox_id", None),
                 "sandbox_ref": getattr(sess.state, "sandbox_id", None),
                 "inner_session_id": sess._inner_session_id,
-                "agent_busy": False,
+                # ``agent_busy`` historically meant "a prompt is mid-flight";
+                # the pool model tracks per-prompt SSE inside ``execute_prompt``
+                # without exposing busy bookkeeping. The most meaningful
+                # observable proxy is "someone is watching events" — that's
+                # what the dashboard's "running" badge actually reads.
+                "agent_busy": len(sess._subscribers) > 0,
                 "active_rpc_id": None,
                 "pending_count": 0,
                 "session_subscribers": len(sess._subscribers),
