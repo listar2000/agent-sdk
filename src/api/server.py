@@ -4433,6 +4433,35 @@ async def hibernate_session_route(session_id: str, request: Request):
     return await _hibernate_session_id(session_id, force)
 
 
+@app.post("/sessions/{session_id}/release")
+async def release_session_route(session_id: str):
+    """Snapshot + drop the SessionPool's lease on this session's compute.
+
+    Backed by ``api.sandbox.SessionPool.release``: writes a fresh
+    filesystem snapshot to the volume and pauses (never deletes) the
+    sandbox. Idempotent — a session with no active lease is a no-op.
+
+    Distinct from the legacy ``/hibernate`` and ``/stop-sandbox`` routes:
+    those operate on the in-memory ``SessionState`` + ``sandboxes`` row
+    plumbing. This endpoint targets the SessionPool that POST /message
+    and GET /events already use, so the snapshot here is exactly what
+    the next pool-mediated prompt restores from.
+    """
+    from api.sandbox import deserialize, get_pool
+    from api.sandbox.db_bindings import load_sandbox_state
+
+    pool = get_pool()
+    await pool.release(session_id)
+
+    payload = await load_sandbox_state(session_id)
+    state = deserialize(payload)
+    return {
+        "lifecycle": "hibernated",
+        "snapshot_path": getattr(state, "snapshot_path", None),
+        "snapshot_version": getattr(state, "snapshot_version", 0),
+    }
+
+
 @app.post("/sessions/{session_id}/stop-sandbox", status_code=204)
 async def stop_session_sandbox(session_id: str, request: Request):
     """**Deprecated** — alias for ``POST /sessions/{id}/hibernate``.
