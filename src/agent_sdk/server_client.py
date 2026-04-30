@@ -23,6 +23,8 @@ from typing import Any
 
 import httpx
 
+from .errors import VolumeFileExistsError
+
 
 def _raise_for_status(resp: httpx.Response) -> None:
     """Raise ``httpx.HTTPStatusError`` with the server's error body attached.
@@ -35,7 +37,14 @@ def _raise_for_status(resp: httpx.Response) -> None:
     detail = ""
     try:
         body = resp.json()
+        payload = body.get("detail") if isinstance(body.get("detail"), dict) else body
+        if resp.status_code == 409 and isinstance(payload, dict) and payload.get("error") == "exists":
+            raise VolumeFileExistsError(payload.get("path"))
         detail = body.get("error", body.get("detail", ""))
+        if isinstance(detail, dict):
+            detail = detail.get("error", str(detail))
+    except VolumeFileExistsError:
+        raise
     except Exception:
         detail = (resp.text or "")[:200]
     msg = f"HTTP {resp.status_code}"
@@ -162,6 +171,13 @@ class ServerClient:
         _raise_for_status(resp)
         return resp.content
 
+    async def volume_file_exists(self, volume_id: str, path: str) -> bool:
+        """``GET /volumes/{id}/files/exists?path=...``."""
+        body = await self._json(
+            "GET", f"/volumes/{volume_id}/files/exists", params={"path": path},
+        )
+        return bool(body["exists"])
+
     async def volume_file_write(
         self, volume_id: str, path: str, content: str = "",
     ) -> None:
@@ -226,12 +242,15 @@ class ServerClient:
         )
 
     async def volume_file_rename(
-        self, volume_id: str, path: str, new_path: str,
+        self, volume_id: str, path: str, new_path: str, *, overwrite: bool = True,
     ) -> None:
         """``POST /volumes/{id}/files/rename``."""
+        body: dict[str, Any] = {"path": path, "new_path": new_path}
+        if not overwrite:
+            body["overwrite"] = False
         await self._json(
             "POST", f"/volumes/{volume_id}/files/rename",
-            json={"path": path, "new_path": new_path},
+            json=body,
         )
 
     # ------------------------------------------------------------------

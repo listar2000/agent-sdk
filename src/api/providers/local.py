@@ -19,6 +19,7 @@ from pathlib import Path
 from ._shared import (
     AUTH_KEYS,
     ProviderInstance,
+    VolumeFileExistsError,
     _ACP_BIN_NAMES,
     _ACP_NPM_SPECS,
     _acp_bin_name,
@@ -630,6 +631,12 @@ async def volume_download(ref: str, path: str) -> bytes:
     return await volume_read(ref, path)
 
 
+async def volume_exists(ref: str, path: str) -> bool:
+    """Return whether ``<volume>/<path>`` exists."""
+    target = await asyncio.to_thread(_safe_join, ref, path or "")
+    return await asyncio.to_thread(os.path.exists, target)
+
+
 async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write to the volume. Creates parent dirs. Symlink-escape is rejected.
 
@@ -709,7 +716,7 @@ async def volume_delete(ref: str, path: str) -> None:
     await asyncio.to_thread(_delete)
 
 
-async def volume_rename(ref: str, path: str, new_path: str) -> None:
+async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
     """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
     src = await asyncio.to_thread(_safe_join, ref, path or "")
     dst = await asyncio.to_thread(_safe_join, ref, new_path or "")
@@ -723,6 +730,23 @@ async def volume_rename(ref: str, path: str, new_path: str) -> None:
         parent = os.path.dirname(dst)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        if not overwrite:
+            if os.path.isdir(src):
+                raise NotImplementedError("atomic no-overwrite directory rename is not supported")
+            try:
+                os.link(src, dst)
+            except FileExistsError as exc:
+                raise VolumeFileExistsError(new_path) from exc
+            try:
+                os.unlink(src)
+            except Exception:
+                log.exception(
+                    "volume_rename overwrite=False linked %s to %s but failed to unlink source",
+                    src,
+                    dst,
+                )
+                raise
+            return
         os.replace(src, dst)
 
     await asyncio.to_thread(_rename)

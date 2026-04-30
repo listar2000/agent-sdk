@@ -121,6 +121,14 @@ class SandboxMissingError(Exception):
     """
 
 
+class VolumeFileExistsError(FileExistsError):
+    """Raised when an atomic no-overwrite volume rename hits an existing dst."""
+
+    def __init__(self, path: str):
+        super().__init__(path)
+        self.path = path
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------

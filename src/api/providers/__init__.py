@@ -33,6 +33,7 @@ from ._shared import (
     ProviderInstance,
     ExecResult,
     SandboxMissingError,
+    VolumeFileExistsError,
     default_cwd_for_provider,
     _ACP_BIN_NAMES,
     _ACP_NPM_SPECS,
@@ -185,8 +186,15 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
                 timeout=timeout + 5,
             )
             out = (r.result if hasattr(r, "result") else str(r)) or ""
+            err = (r.stderr if hasattr(r, "stderr") else "") or ""
+            code = r.exit_code if hasattr(r, "exit_code") else None
             out, trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
-            return ExecResult(stdout=out, stderr="", exit_code=0, stdout_truncated=trunc)
+            return ExecResult(
+                stdout=out,
+                stderr=err,
+                exit_code=code,
+                stdout_truncated=trunc,
+            )
         except asyncio.TimeoutError:
             return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
 
@@ -206,7 +214,7 @@ _DISPATCH_FNS = frozenset({
     "create_volume", "delete_volume", "get_sandbox_status",
     "start_sandbox", "destroy_sandbox", "stop_sandbox",
     "ensure_supervisor_url", "install_supervisor",
-    "volume_tree", "volume_read", "volume_download", "volume_write",
+    "volume_tree", "volume_read", "volume_download", "volume_exists", "volume_write",
     "volume_upload", "volume_mkdir", "volume_delete", "volume_rename",
 })
 

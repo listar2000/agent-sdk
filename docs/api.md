@@ -386,10 +386,13 @@ GET    /volumes/{id_or_name}                 — get (name lookup supported for 
 DELETE /volumes/{id_or_name}?force=false     — delete (409 if any session still references it; force=true cascades)
 GET    /volumes/{id_or_name}/files/tree      — browse volume contents (e.g. ?path=shared/)
 GET    /volumes/{id_or_name}/files/read      — read a file (?path=…)
+GET    /volumes/{id_or_name}/files/exists    — check if a file/dir exists (?path=…)
 POST   /volumes/{id_or_name}/files/edit      — write a file (body: {path, content})
+POST   /volumes/{id_or_name}/files/rename    — rename/move (body: {path, new_path, overwrite=true})
 ```
 
 File ops are backed internally by a short-lived utility sandbox that mounts the volume; callers never need to manage one to seed data.
+For `POST /volumes/{id_or_name}/files/rename`, `overwrite` defaults to `true` for compatibility. When `overwrite=false`, the provider uses an atomic no-overwrite primitive for regular files; if `new_path` already exists the API returns HTTP 409 with `{"error": "exists", "path": new_path}` and leaves `path` untouched. Providers that cannot guarantee atomic no-overwrite semantics for a case return a clear unsupported error instead of falling back to a pre-check.
 
 `POST /volumes` body:
 
@@ -541,8 +544,10 @@ Grouped by resource. Bodies are documented under the corresponding REST endpoint
 | | `delete_volume(id_or_name, force=False)` | `DELETE /volumes/{id}` |
 | Volume files | `volume_file_tree(volume_id, path="")` | `GET /volumes/{id}/files/tree` |
 | | `volume_file_read(volume_id, path)` | `GET /volumes/{id}/files/read` |
+| | `volume_file_exists(volume_id, path)` | `GET /volumes/{id}/files/exists` |
 | | `volume_file_write(volume_id, path, content)` | `POST /volumes/{id}/files/edit` (overwrite) |
 | | `volume_file_edit(volume_id, path, old_string, new_string, replace_all=False)` | `POST /volumes/{id}/files/edit` (replace) |
+| | `volume_file_rename(volume_id, path, new_path, overwrite=True)` | `POST /volumes/{id}/files/rename` |
 | Sessions | `create_session(**body)` | `POST /sessions` (eager default; pass `provision=False` for lazy) |
 | | `list_sessions()` | `GET /sessions` |
 | | `get_session(id)` | `GET /sessions/{id}` |

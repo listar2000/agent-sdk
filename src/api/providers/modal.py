@@ -40,6 +40,7 @@ from ._shared import (
     ExecResult,
     ProviderInstance,
     SandboxMissingError,
+    VolumeFileExistsError,
     _ACP_NPM_SPECS,
     _MAX_OUTPUT_BYTES,
     _acp_bin_name,
@@ -773,6 +774,22 @@ async def volume_read(ref: str, path: str) -> bytes:
         raise RuntimeError(f"modal volume_read: malformed base64 output: {exc}") from exc
 
 
+async def volume_exists(ref: str, path: str) -> bool:
+    """Return whether ``<volume>/<path>`` exists."""
+    rel = _safe_rel(path)
+    target = f"/v/{rel}" if rel else "/v"
+    rc, _out, err = await _run_volume_shell(
+        ref, f"test -e {shlex.quote(target)}", timeout=60,
+    )
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    raise RuntimeError(
+        f"modal volume_exists failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
+    )
+
+
 async def volume_write(ref: str, path: str, content: bytes) -> None:
     """Write ``content`` to ``<volume>/<path>``."""
     rel = _safe_rel(path)
@@ -831,7 +848,7 @@ async def volume_delete(ref: str, path: str) -> None:
         )
 
 
-async def volume_rename(ref: str, path: str, new_path: str) -> None:
+async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
     """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
     src_rel = _safe_rel(path)
     dst_rel = _safe_rel(new_path)
@@ -840,15 +857,41 @@ async def volume_rename(ref: str, path: str, new_path: str) -> None:
     src = f"/v/{src_rel}"
     dst = f"/v/{dst_rel}"
     dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
-    shell = (
-        f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-        f"mkdir -p {shlex.quote(dst_parent)} && "
-        f"mv -- {shlex.quote(src)} {shlex.quote(dst)}"
+    settle_check = (
+        f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
+        f"if [ -e {shlex.quote(dst)} ] && [ ! -e {shlex.quote(src)} ]; then exit 0; fi; "
+        f"sleep 0.1; "
+        f"done; "
+        f"echo __RENAME_NOT_VISIBLE__; exit 98"
     )
+    if overwrite:
+        shell = (
+            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+            f"mkdir -p {shlex.quote(dst_parent)} && "
+            f"mv -- {shlex.quote(src)} {shlex.quote(dst)} && "
+            f"{settle_check}"
+        )
+    else:
+        shell = (
+            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
+            f"if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; fi; "
+            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi; "
+            f"ln {shlex.quote(src)} {shlex.quote(dst)} || "
+            f"{{ if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; else exit 1; fi; }}; "
+            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}; "
+            f"{settle_check}"
+        )
     rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
     if rc != 0:
         if b"__MISSING__" in out:
             raise FileNotFoundError(f"{path} not found on volume {ref}")
+        if b"__EXISTS__" in out:
+            raise VolumeFileExistsError(new_path)
+        if b"__UNSUPPORTED_DIR__" in out:
+            raise NotImplementedError("atomic no-overwrite directory rename is not supported")
+        if b"__RENAME_NOT_VISIBLE__" in out:
+            raise RuntimeError("volume_rename postcondition failed: destination not visible")
         raise RuntimeError(
             f"modal volume_rename failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
         )
