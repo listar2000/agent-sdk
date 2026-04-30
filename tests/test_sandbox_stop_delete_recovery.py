@@ -150,9 +150,11 @@ _CREATED_SESSIONS: list[str] = []
 def _auto_destroy_test_sandboxes():
     """For every test that calls ``_quick_session``, destroy the sandbox(es)
     it created at teardown — even if the test body or its own ``finally``
-    block didn't get there. Uses the server's ``DELETE /sandboxes/{id}``
-    so the in-memory ``_INSTANCES`` cache, the DB row, and the actual
-    daytona/docker/local compute are all torn down together.
+    block didn't get there. Routes through ``DELETE /sessions/{id}``: a
+    single round-trip releases the pool lease (snapshot + pause), drops
+    the back-compat sandboxes row, and deletes the session row.
+    Idempotent — missing sessions return 204, not 404, so this is safe
+    after a test that already deleted its own sandbox.
 
     Errors are swallowed (best-effort cleanup) and the underlying daytona
     sandbox still has the ``agent_sdk_origin`` label as a backup so a
@@ -168,13 +170,7 @@ def _auto_destroy_test_sandboxes():
     with httpx.Client() as c:
         for sid in sessions:
             try:
-                r = c.get(f"{SERVER}/sessions/{sid}", timeout=5)
-                if r.status_code != 200:
-                    continue
-                sb_id = r.json().get("current_sandbox_id")
-                if not sb_id:
-                    continue
-                c.delete(f"{SERVER}/sandboxes/{sb_id}", timeout=30)
+                c.delete(f"{SERVER}/sessions/{sid}", timeout=30)
             except Exception:
                 # Best-effort — label-based cleanup catches the rest.
                 pass
