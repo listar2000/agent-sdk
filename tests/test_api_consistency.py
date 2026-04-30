@@ -79,24 +79,11 @@ async def test_post_non_object_body_returns_400(client, path, body):
     assert "json object" in msg or "invalid json" in msg
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("path", [
-    "/sandboxes/any-id/files/edit",
-    "/sandboxes/any-id/files/upload",
-    "/sandboxes/any-id/files/delete",
-    "/sandboxes/any-id/files/rename",
-])
-async def test_sandbox_file_forwarders_reject_non_object_body(client, path):
-    """Sandbox-file forwarders are deprecated thin wrappers that resolve
-    ``sandbox_id → session_id`` then delegate to the session-scoped
-    endpoint. The unknown sandbox ``any-id`` resolves to 404 BEFORE the
-    body is inspected — that's a valid "this request is bad" response,
-    same shape (``{"error": ...}``), no 500. Either the legacy 400 or the
-    new 404 is acceptable; the contract is "client-error JSON, not server
-    crash."""
-    r = await client.post(path, json=42)
-    assert r.status_code in (400, 404), f"{path}: {r.status_code} {r.text}"
-    assert "error" in r.json()
+# test_sandbox_file_forwarders_reject_non_object_body was removed: the
+# deprecated ``/sandboxes/{id}/files/{op}`` thin wrappers were deleted
+# entirely. Callers should use the session-scoped routes
+# (``/sessions/{id}/files/{op}``) which have their own body-validation
+# coverage in test_session_files_routes.
 
 
 # ---------------------------------------------------------------------------

@@ -1508,6 +1508,28 @@ async def _sessions_create_eager(data: dict) -> dict:
         ))
         await set_session_current_sandbox(session_id, sandbox_row_id)
 
+    # Caller may pass ``model`` / ``mode`` / ``thought_level`` at session
+    # create time as a convenience over a separate POST /config call.
+    # Forward them now while the supervisor's still warm — saves a round
+    # trip and matches what the SDK does. Best-effort: a transient ACP
+    # failure shouldn't blow up the create response.
+    #
+    # Look in BOTH ``data`` (top-level) and ``config_data`` (nested) —
+    # ``_merge_top_level_config`` above already promoted ``model`` from
+    # data into config_data, so ``data.get("model")`` returns None for
+    # the common SDK shape that sets it at the top level.
+    for key, method in (("model", "set_model"), ("mode", "set_mode"),
+                        ("thought_level", "set_thought_level")):
+        val = data.get(key) if data.get(key) is not None else config_data.get(key)
+        if val is not None:
+            log.info("sessions_create_eager: forwarding %s(%r) to session %s",
+                     method, val, session_id)
+            try:
+                await getattr(pool_session, method)(val)
+            except Exception as e:
+                log.warning("sessions_create_eager: %s(%r) failed: %s",
+                            method, val, e)
+
     return {
         "agent_id": agent_id,
         "sandbox_id": sandbox_row_id if provider_ref else None,
@@ -2044,54 +2066,6 @@ async def _proxy_from_session(
     instance = await _resolve_session_instance(session_id)
     return await _proxy_instance(instance, method, path, params=params, json=json, timeout=timeout)
 
-
-@app.get("/sandboxes/{sandbox_id}/files/tree")
-async def sandbox_files_tree(sandbox_id: str):
-    """**Deprecated** — use ``GET /sessions/{session_id}/files/tree``."""
-    _warn_deprecated("/sandboxes/{sandbox_id}/files/tree")
-    return await session_files_tree(await _session_id_from_sandbox_id(sandbox_id))
-
-
-@app.get("/sandboxes/{sandbox_id}/files/read")
-async def sandbox_files_read(sandbox_id: str, path: str):
-    """**Deprecated** — use ``GET /sessions/{session_id}/files/read``."""
-    _warn_deprecated("/sandboxes/{sandbox_id}/files/read")
-    return await session_files_read(await _session_id_from_sandbox_id(sandbox_id), path)
-
-
-@app.post("/sandboxes/{sandbox_id}/files/edit")
-async def sandbox_files_edit(sandbox_id: str, request: Request):
-    """**Deprecated** — use ``POST /sessions/{session_id}/files/edit``."""
-    _warn_deprecated("/sandboxes/{sandbox_id}/files/edit")
-    return await session_files_edit(await _session_id_from_sandbox_id(sandbox_id), request)
-
-
-@app.post("/sandboxes/{sandbox_id}/files/upload")
-async def sandbox_files_upload(sandbox_id: str, request: Request):
-    """**Deprecated** — use ``POST /sessions/{session_id}/files/upload``."""
-    _warn_deprecated("/sandboxes/{sandbox_id}/files/upload")
-    return await session_files_upload(await _session_id_from_sandbox_id(sandbox_id), request)
-
-
-@app.post("/sandboxes/{sandbox_id}/files/delete")
-async def sandbox_files_delete(sandbox_id: str, request: Request):
-    """**Deprecated** — use ``POST /sessions/{session_id}/files/delete``."""
-    _warn_deprecated("/sandboxes/{sandbox_id}/files/delete")
-    return await session_files_delete(await _session_id_from_sandbox_id(sandbox_id), request)
-
-
-@app.post("/sandboxes/{sandbox_id}/files/rename")
-async def sandbox_files_rename(sandbox_id: str, request: Request):
-    """**Deprecated** — use ``POST /sessions/{session_id}/files/rename``."""
-    _warn_deprecated("/sandboxes/{sandbox_id}/files/rename")
-    return await session_files_rename(await _session_id_from_sandbox_id(sandbox_id), request)
-
-
-@app.get("/sandboxes/{sandbox_id}/files/download")
-async def sandbox_files_download(sandbox_id: str, path: str):
-    """**Deprecated** — use ``GET /sessions/{session_id}/files/download``."""
-    _warn_deprecated("/sandboxes/{sandbox_id}/files/download")
-    return await session_files_download(await _session_id_from_sandbox_id(sandbox_id), path)
 
 
 async def _download_from_instance(instance: ProviderInstance, path: str) -> Response:

@@ -114,14 +114,16 @@ def _require_provider(provider: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
-    # Hardcode haiku for the recovery suite — these tests fire many short
-    # prompts in parallel under -n auto, and sonnet's per-key rate limit
-    # trips long before the suite finishes. Haiku has a much higher RPM
-    # ceiling and answers tool-use prompts just as well for the tiny
-    # turns these tests exercise.
+    # Pin haiku for the recovery suite — sonnet's per-key weekly quota
+    # trips before this suite finishes when other suites have run on
+    # the same OAuth token recently. Haiku is on a separate quota
+    # bucket and answers the tiny tool-use prompts these tests exercise
+    # just as reliably. See server.py _sessions_create_eager — the
+    # ``model`` body field is forwarded via ``set_model`` after the
+    # SandboxSession is up.
     body: dict = {
         "provider": provider, "agent_type": "claude",
-        "model": "claude-haiku-4-5-20251001",
+        "model": "haiku",
     }
     if OAUTH_TOKEN:
         body["secrets"] = {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN}

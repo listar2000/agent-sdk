@@ -37,11 +37,11 @@ async def _server_up() -> bool:
 
 
 async def _create_session(c: httpx.AsyncClient) -> str:
-    # Pin haiku to keep the suite under sonnet's per-key rate limit when
-    # it runs alongside other golden suites in CI.
+    # Pin haiku to keep these tests under sonnet's exhausted weekly
+    # quota when other suites have run on the same OAuth token recently.
     r = await c.post(f"{SERVER}/sessions", json={
         "provider": "local", "agent_type": "claude", "config": {},
-        "model": "claude-haiku-4-5-20251001",
+        "model": "haiku",
     })
     r.raise_for_status()
     return r.json()["session_id"]
