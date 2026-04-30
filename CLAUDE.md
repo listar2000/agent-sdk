@@ -8,3 +8,9 @@ all available workers. Sequential runs of the daytona/docker golden suites take
 
 `-n auto` is fine even when filtering with `-k` — pytest-xdist negotiates worker
 count down to the number of selected items.
+
+Launch the dev server for the golden tests with `scripts/launch_server_test.sh`
+(NOT `launch_server_local.sh` directly). The test wrapper sets
+`AGENT_SDK_ORIGIN=test` so daytona sandboxes get labelled `agent_sdk_origin=test`
+and stay isolatable from real production traffic — `cleanup_daytona_orphans.py`
+greps that label.
