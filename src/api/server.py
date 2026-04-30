@@ -4042,12 +4042,6 @@ async def _execute_one_prompt(state: SessionState, rpc_id: str, message: str) ->
     )
 
 
-def _submit_prompt(state: SessionState, rpc_id: str, message: str) -> None:
-    """Enqueue a prompt and wake the scheduler loop. Returns immediately."""
-    state.pending_prompts.append(PendingPrompt(rpc_id=rpc_id, message=message))
-    state._prompt_ready.set()
-
-
 async def _cancel_and_drain(state: SessionState) -> None:
     """Cancel the active prompt and wait for it to reach a terminal state."""
     if not state.agent_busy:
