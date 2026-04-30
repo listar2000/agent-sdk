@@ -2318,63 +2318,6 @@ async def admin_list_sessions():
     }
 
 
-@app.post("/admin/sessions/{session_id}/reap")
-async def admin_reap_session(session_id: str):
-    """Force-reap a session synchronously: same teardown the idle reaper does
-    but without idle-time gating. Cancels the SSE reader, drops the session
-    from SESSIONS, and stops the underlying provider instance (kills the
-    supervisor + ACP child for local/docker; stops the workspace for daytona).
-
-    The session_id remains valid afterwards — POST /sessions/{id}/resume
-    will hit the recovery path: a fresh supervisor + ACP child get spawned
-    and AcpClient.initialize runs session/load against the stored
-    inner_session_id to restore conversation history.
-    """
-    state = SESSIONS.get(session_id)
-    if state is None:
-        raise HTTPException(404, "session not in memory")
-
-    sandbox_id = state.sandbox_id
-    await _shutdown_session_state(state, remove=True, force=True, mark_idle_at=time.time())
-
-    stopped_provider: str | None = None
-    if sandbox_id and not any(s.sandbox_id == sandbox_id for s in SESSIONS.values()):
-        instance = _INSTANCES.pop(sandbox_id, None)
-        if instance is not None:
-            stopped_provider = instance.provider
-            try:
-                await stop_instance(instance)
-            except Exception as e:
-                log.warning("admin reap: stop failed for %s: %s",
-                            sandbox_id, e)
-        else:
-            # _INSTANCES already empty (session was hibernated before reap).
-            # Hibernate may have left the provider sandbox RUNNING if its
-            # stop_sandbox call failed transiently. Retry stop here so the
-            # operator's "make sure this is gone" hammer actually gets it
-            # gone at the cloud provider, not just out of server memory.
-            sb = await get_sandbox(sandbox_id)
-            if sb is not None:
-                try:
-                    await _providers_mod.stop_sandbox(
-                        sb.provider, _synthesize_instance(sb),
-                    )
-                    stopped_provider = sb.provider
-                except Exception as e:
-                    log.warning(
-                        "admin reap: defensive stop_sandbox failed for %s "
-                        "(provider=%s): %s",
-                        sandbox_id, sb.provider, e,
-                    )
-
-    return {
-        "session_id": session_id,
-        "sandbox_id": sandbox_id,
-        "provider_stopped": stopped_provider,
-        "status": "reaped",
-    }
-
-
 # ---------------------------------------------------------------------------
 # Session operations (on sandbox)
 # ---------------------------------------------------------------------------
@@ -4325,109 +4268,6 @@ async def start_session_sandbox(session_id: str):
     return {"sandbox_id": sandbox.id}
 
 
-async def _hibernate_session_id(session_id: str, force: bool) -> dict:
-    """Resolve a session_id to its sandbox + SessionState and hibernate.
-
-    Backs both ``POST /sessions/{id}/hibernate`` and (since deprecation)
-    ``POST /sessions/{id}/stop-sandbox``. Raises HTTPException on caller
-    errors (session/sandbox missing, busy without force).
-
-    Returns ``{status, sandbox_id, session_in_memory}`` describing the
-    resulting state. ``status`` is one of ``hibernated`` |
-    ``already_stopped``.
-    """
-    sess = await _require_session_row(session_id)
-    sbid = sess.get("current_sandbox_id")
-    if sbid is None:
-        raise HTTPException(409, "session has no current sandbox")
-
-    state = SESSIONS.get(session_id)
-    if state is None:
-        # No live state to preserve — just stop compute and flip the row.
-        sb = await get_sandbox(sbid)
-        if sb is None:
-            raise HTTPException(404, f"sandbox {sbid} not found")
-        if sb.status == STATUS_STOPPED:
-            return {"status": "already_stopped", "sandbox_id": sbid,
-                    "session_in_memory": False}
-        await _request_supervisor_snapshot(_INSTANCES.get(sbid))
-        try:
-            await _providers_mod.stop_sandbox(sb.provider, _synthesize_instance(sb))
-        except Exception as e:
-            log.warning("hibernate: stop_sandbox failed for %s: %s", sbid, e)
-        sb.status = STATUS_STOPPED
-        await upsert_sandbox(sb)
-        _INSTANCES.pop(sbid, None)
-        return {"status": "hibernated", "sandbox_id": sbid,
-                "session_in_memory": False}
-
-    async with _get_session_lock(session_id):
-        # Re-fetch under the lock — a concurrent /reap or eviction may
-        # have dropped the state between our SESSIONS.get and the lock.
-        state = SESSIONS.get(session_id)
-        if state is None:
-            return {"status": "hibernated", "sandbox_id": sbid,
-                    "session_in_memory": False}
-
-        if state.active_rpc_id is not None or state.pending_prompts:
-            if not force:
-                raise HTTPException(
-                    409,
-                    f"session is busy (active_rpc={state.active_rpc_id}, "
-                    f"pending={len(state.pending_prompts)}); "
-                    "pass ?force=true to cancel-and-drain first",
-                )
-            await _cancel_and_drain(state)
-            # Drop any prompts that arrived while draining; caller asked
-            # for hibernate, not "process the backlog then hibernate".
-            state.pending_prompts.clear()
-
-        sb = await get_sandbox(sbid)
-        if sb is not None and sb.status == STATUS_STOPPED and sbid not in _INSTANCES:
-            return {"status": "already_stopped", "sandbox_id": sbid,
-                    "session_in_memory": True}
-
-        await _hibernate_session(state)
-
-    return {"status": "hibernated", "sandbox_id": sbid,
-            "session_in_memory": True}
-
-
-@app.post("/sessions/{session_id}/hibernate")
-async def hibernate_session_route(session_id: str, request: Request):
-    """Hibernate a session: stop the sandbox compute, but keep the live
-    ``SessionState`` in memory and the sandboxes DB row intact.
-
-    Use case: pause an idle session to stop paying for compute, then resume
-    instantly when the user comes back. The next POST ``/message`` against
-    this session goes through ``_ensure_runtime_locked`` →
-    ``_ensure_state_live`` → ``_rebind_state``, which sees the stopped row
-    and revives the SAME sandbox (same dockerfile, shared_mounts, volume,
-    inner_session_id) — no re-provision and no state rebuild.
-
-    **Compared to ``/sessions/{id}/stop-sandbox``** *(deprecated alias —
-    same behavior since 2026-04-28)*: prefer this endpoint in new code.
-
-    **Compared to ``/sessions/{id}/reset-sandbox``**: that destroys and
-    reprovisions the sandbox (different ``sandbox_ref``); hibernate
-    preserves provisioning identity completely.
-
-    Subscribers stay attached — their SSE stream goes silent until the
-    next turn rebinds the upstream reader. The browser's EventSource does
-    not see a disconnect. If the LAST subscriber drops while the session
-    is hibernated, the in-memory ``SessionState`` is evicted automatically
-    (the next request rebuilds from the DB row).
-
-    Returns 409 if the session has an in-flight RPC or queued prompts.
-    Pass ``?force=true`` to cancel-and-drain in-flight work first.
-
-    Idempotent: hibernating an already-stopped sandbox returns
-    ``status=already_stopped`` with 200.
-    """
-    force = request.query_params.get("force", "").lower() in {"1", "true", "yes"}
-    return await _hibernate_session_id(session_id, force)
-
-
 @app.post("/sessions/{session_id}/release")
 async def release_session_route(session_id: str):
     """Snapshot + drop the SessionPool's lease on this session's compute.
@@ -4455,33 +4295,6 @@ async def release_session_route(session_id: str):
         "snapshot_path": getattr(state, "snapshot_path", None),
         "snapshot_version": getattr(state, "snapshot_version", 0),
     }
-
-
-@app.post("/sessions/{session_id}/stop-sandbox", status_code=204)
-async def stop_session_sandbox(session_id: str, request: Request):
-    """**Deprecated** — alias for ``POST /sessions/{id}/hibernate``.
-
-    Behavior equivalent to ``/hibernate`` since 2026-04-28: stops the
-    sandbox compute, keeps the sandboxes DB row, and (newly) keeps the
-    in-memory ``SessionState`` so the next ``/message`` rebinds in place
-    instead of paying for a state rebuild.
-
-    Existing callers: no migration required, but new code should target
-    ``/hibernate`` directly. Returns 204 with empty body, unchanged.
-
-    Use ``/reset-sandbox`` for the tear-down-and-recreate semantic.
-    """
-    force = request.query_params.get("force", "").lower() in {"1", "true", "yes"}
-    try:
-        await _hibernate_session_id(session_id, force)
-    except HTTPException as e:
-        # Preserve the legacy 204 contract: a missing current_sandbox_id
-        # was a no-op, not a 409. Re-raise everything else.
-        if e.status_code == 409 and e.detail == "session has no current sandbox":
-            return
-        raise
-    # current_sandbox_id STAYS pointing at the row — that's how resume
-    # finds it. For the old "wipe on stop" behavior, use /reset-sandbox.
 
 
 @app.post("/sessions/{session_id}/reset-sandbox")
