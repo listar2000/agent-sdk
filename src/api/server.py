@@ -4207,96 +4207,91 @@ async def post_session_message_stream(session_id: str, request: Request):
     returns the SSE stream as the response body — same protocol shape
     as ``GET /events``, scoped to a single prompt.
 
-    Body: ``{"message": str, "interrupt": bool?}`` — same as POST /message.
+    Body: ``{"message": str, "interrupt": bool?}``. ``interrupt`` is
+    accepted for API parity but currently a no-op on the pool path
+    (in-flight prompts are scoped to their own ``execute_prompt``
+    coroutine; cancel-and-drain semantics belong with a future
+    ``/cancel`` cutover).
 
     Returns: ``text/event-stream`` of the SSE blocks for this prompt
-    only. Closes when the matching stopReason / done event arrives, or
-    on connection drop.
+    only. Wire format matches ``GET /events`` —
+    ``event: rpc:<id>\\n<raw_block>\\n\\n`` — so the SDK's
+    ``parse_acp_event`` works unchanged. ``: heartbeat\\n\\n`` lines
+    keep idle connections open through nginx / cloudflare.
 
     Both POST /message and GET /events continue to work unchanged for
     callers that need separate submit + multi-subscriber semantics.
     """
+    from api.sandbox import get_pool
+    from api.sandbox.session import _HEARTBEAT
+
     data = await _json_body(request)
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
-    interrupt = data.get("interrupt", False)
 
-    cached_state = SESSIONS.get(session_id)
-    if cached_state is not None and not cached_state.is_hibernated:
-        state = cached_state
-    else:
-        _, _, state = await ensure_session_live(session_id)
-
-    if interrupt and state.agent_busy:
-        await _cancel_and_drain(state)
-
-    # Restart upstream reader BEFORE subscribing so the subscriber sees
-    # this prompt's events as they arrive (not after a recovery).
-    if not state._reader_alive:
-        log.info(
-            "[SSE-READER] auto-restarting upstream reader from /message+stream "
-            "for session %s",
-            state.session_id,
-        )
-        _start_sse_reader(state)
-
-    state.last_activity = time.time()
+    pool = get_pool()
+    session = await pool.get_session(session_id)
     rpc_id = str(uuid.uuid4())
 
-    # Subscribe BEFORE submitting so we can't miss the first chunks the
-    # supervisor emits between our submit and the subscriber registration.
-    my_q = state.subscribe_session()
-    _submit_prompt(state, rpc_id, message)
-
-    shutdown = state.shutdown
-    heartbeat_interval = int(os.environ.get("SSE_HEARTBEAT_INTERVAL", "30"))
-
     async def _stream():
-        async def _heartbeat_loop():
-            try:
-                while True:
-                    await asyncio.sleep(heartbeat_interval)
-                    try:
-                        my_q.put_nowait(None)
-                    except asyncio.QueueFull:
-                        pass
-            except asyncio.CancelledError:
-                pass
+        # Subscribe BEFORE kicking off execute_prompt so broadcasts
+        # from the supervisor's first chunks land in our queue. The
+        # subscribe() generator registers the queue synchronously
+        # before its first ``await q.get()``, so create_task'ing
+        # _drive after entering the loop is race-free: drive only
+        # runs once the event loop yields at our q.get().
+        sub_iter = session.subscribe()
 
-        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        async def _drive():
+            try:
+                async for _event in session.execute_prompt(message, rpc_id=rpc_id):
+                    pass  # broadcasts fan out via session._broadcast
+            except Exception as e:
+                log.exception(
+                    "execute_prompt failed for session %s rpc=%s",
+                    session_id, rpc_id,
+                )
+                session._broadcast({
+                    "type": "error", "rpc_id": rpc_id,
+                    "error": {"message": str(e), "exception_type": type(e).__name__},
+                })
+
+        drive_task: asyncio.Task | None = None
         try:
-            while True:
-                item = await my_q.get()
-                if item is _SSE_SENTINEL or item is _KICK_SENTINEL:
-                    return
-                if shutdown.is_set():
-                    return
-                if item is None:
+            async for item in sub_iter:
+                if drive_task is None:
+                    # First iteration entered subscribe() body and
+                    # registered our queue; safe to start driving.
+                    drive_task = asyncio.create_task(_drive())
+                if item is _HEARTBEAT:
                     yield ": heartbeat\n\n"
                     continue
-                tag, block = item
-                # Only yield events for this prompt — drop blocks tagged
-                # for other concurrent prompts (e.g. from /events
-                # subscribers' interleaved POSTs) and untagged blocks
-                # (bootstrap snapshots) so the response is exactly one
-                # prompt's stream.
-                if tag != rpc_id:
-                    continue
-                yield f"event: rpc:{tag}\n{block}"
-                # Terminate as soon as we see the done event for our
-                # rpc_id. parse_acp_event would re-parse — cheaper to
-                # peek for "stop_reason" in the raw block.
-                if "stop_reason" in block or '"type":"done"' in block:
-                    return
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            log.warning("/message+stream error for session %s: %s", session_id, e)
+                if isinstance(item, tuple) and len(item) == 2:
+                    tag, block = item
+                    # Filter to this prompt only — concurrent /events
+                    # subscribers may have triggered other prompts whose
+                    # blocks share the queue.
+                    if tag != rpc_id:
+                        continue
+                    yield f"event: rpc:{tag}\n{block}\n\n"
+                    if "stop_reason" in block or '"type":"done"' in block:
+                        return
+                # Parsed-dict broadcasts (errors, non-prompt notifications)
+                # are emitted as ``data:`` blocks for SDK parity with /events.
+                elif isinstance(item, dict):
+                    if item.get("rpc_id") != rpc_id:
+                        continue
+                    yield f"data: {json.dumps(item)}\n\n"
+                    if item.get("type") == "error":
+                        return
         finally:
-            await _cancel_task(heartbeat_task)
-            state.unsubscribe_session(my_q)
-            await _maybe_evict_hibernated(state)
+            if drive_task is not None and not drive_task.done():
+                drive_task.cancel()
+                try:
+                    await drive_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     return StreamingResponse(
         _stream(),
