@@ -569,8 +569,8 @@
         <input id="api-url" type="text" placeholder="API URL">
       </label>
       <label class="field">
-        <span class="field-label">Sandbox ID</span>
-        <input id="sandbox-id" type="text" placeholder="Enter sandbox ID">
+        <span class="field-label">Session ID</span>
+        <input id="sandbox-id" type="text" placeholder="Enter session ID">
       </label>
       <div class="field">
         <span class="field-label">&nbsp;</span>
@@ -581,7 +581,7 @@
 
   <section id="content">
     <aside id="tree">
-      <div class="empty-state">Enter a Sandbox ID and click Load</div>
+      <div class="empty-state">Enter a Session ID and click Load</div>
     </aside>
 
     <div class="drag-handle"></div>
@@ -612,7 +612,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   apiUrl: '',
-  sandboxId: '',
+  sessionId: '',
   root: '',
   tree: null,
   expanded: new Set(),
@@ -760,10 +760,10 @@ function renderTree() {
 // Load tree from API
 async function loadTree() {
   state.apiUrl = $('api-url').value.trim().replace(/\/+$/, '');
-  state.sandboxId = $('sandbox-id').value.trim();
+  state.sessionId = $('sandbox-id').value.trim();
 
-  if (!state.apiUrl || !state.sandboxId) {
-    alert('Please enter both API URL and Sandbox ID');
+  if (!state.apiUrl || !state.sessionId) {
+    alert('Please enter both API URL and Session ID');
     return;
   }
 
@@ -771,7 +771,7 @@ async function loadTree() {
   treeEl.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
 
   try {
-    const resp = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}/files/tree`);
+    const resp = await fetch(`${state.apiUrl}/sessions/${state.sessionId}/files/tree`);
     if (!resp.ok) {
       throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
     }
@@ -779,13 +779,13 @@ async function loadTree() {
     state.tree = await resp.json();
     renderTree();
 
-    // Fetch sandbox root
+    // Fetch session metadata for the root label
     try {
-      const sbResp = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}`);
-      if (sbResp.ok) {
-        const sb = await sbResp.json();
-        state.root = sb.root || '';
-        $('root-label').textContent = state.root ? `root: ${state.root}` : '';
+      const sessResp = await fetch(`${state.apiUrl}/sessions/${state.sessionId}/status`);
+      if (sessResp.ok) {
+        const status = await sessResp.json();
+        state.root = status.supervisor_url ? '' : '';  // root not exposed on status; left blank
+        $('root-label').textContent = '';
       }
     } catch (_) {}
 
@@ -804,10 +804,10 @@ async function loadTree() {
 
 // Silent tree refresh (no loading spinner)
 async function loadTreeSilent() {
-  if (!state.apiUrl || !state.sandboxId) return;
+  if (!state.apiUrl || !state.sessionId) return;
 
   try {
-    const resp = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}/files/tree`);
+    const resp = await fetch(`${state.apiUrl}/sessions/${state.sessionId}/files/tree`);
     if (resp.ok) {
       state.tree = await resp.json();
       renderTree();
@@ -833,7 +833,7 @@ async function loadFile(path, name, size) {
   fileMeta.textContent = formatSize(size);
 
   try {
-    const resp = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}/files/read?path=${encodeURIComponent(path)}`);
+    const resp = await fetch(`${state.apiUrl}/sessions/${state.sessionId}/files/read?path=${encodeURIComponent(path)}`);
     if (!resp.ok) {
       throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
     }
@@ -960,7 +960,7 @@ async function saveEdit() {
   $('save-btn').textContent = 'Saving...';
 
   try {
-    const resp = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}/files/edit`, {
+    const resp = await fetch(`${state.apiUrl}/sessions/${state.sessionId}/files/edit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -973,7 +973,7 @@ async function saveEdit() {
     const result = await resp.json();
     if (!resp.ok) {
       // If old content changed underneath us, try write mode (overwrite)
-      const retry = await fetch(`${state.apiUrl}/sandboxes/${state.sandboxId}/files/edit`, {
+      const retry = await fetch(`${state.apiUrl}/sessions/${state.sessionId}/files/edit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

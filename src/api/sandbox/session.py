@@ -282,6 +282,37 @@ class BaseSandboxSession(abc.ABC):
                 "cancel_active_prompt failed for session %s", self.session_id,
             )
 
+    # --- ACP config: forward set_mode / set_model / set_thought_level ---
+
+    async def _acp_call(self, method_name: str, *args) -> None:
+        """Open an ``AcpClient`` against this session's supervisor and
+        invoke ``method_name(self._acp_session_id, *args)``. Used by
+        the wrapper methods below so each one stays a one-liner.
+
+        No-op (silently) if the session has no live supervisor URL or
+        no attached ACP session — same shape as ``cancel_active_prompt``."""
+        if self._supervisor_url is None or self._acp_session_id is None:
+            return
+        from api.acp_client import AcpClient  # local import: avoid cycles
+        client = AcpClient(self._supervisor_url)
+        # AcpClient indexes inner_session_ids by acp_session_id internally;
+        # mirror what attach() did so set_mode() etc can resolve it.
+        if self._inner_session_id is not None:
+            client._inner_session_ids[self._acp_session_id] = self._inner_session_id
+        try:
+            await getattr(client, method_name)(self._acp_session_id, *args)
+        finally:
+            await client.aclose()
+
+    async def set_mode(self, mode: str) -> None:
+        await self._acp_call("set_mode", mode)
+
+    async def set_model(self, model: str) -> None:
+        await self._acp_call("set_model", model)
+
+    async def set_thought_level(self, level: str) -> None:
+        await self._acp_call("set_thought_level", level)
+
     # --- Liveness probe hook (subclass overrides if it has a cheap probe) ---
 
     async def _liveness_probe(self) -> bool:
