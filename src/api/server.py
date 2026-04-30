@@ -71,7 +71,6 @@ from .models import (
     AgentConfig,
     AgentRecord,
     SandboxRecord,
-    SessionState,
     VolumeRecord,
 )
 from . import providers as _providers_mod
@@ -112,131 +111,18 @@ def _configure_logging() -> None:
 _INSTANCES: dict[str, ProviderInstance] = {}
 
 _sandbox_locks: dict[str, asyncio.Lock] = {}
-_session_locks: dict[str, asyncio.Lock] = {}
 
 
 def _get_sandbox_lock(sandbox_id: str) -> asyncio.Lock:
     return _sandbox_locks.setdefault(sandbox_id, asyncio.Lock())
 
 
-def _get_session_lock(session_id: str) -> asyncio.Lock:
-    return _session_locks.setdefault(session_id, asyncio.Lock())
-
-
-# keyed by session_id
-SESSIONS: dict[str, SessionState] = {}
-
-
-# Strong references to fire-and-forget background tasks so Python's GC can't
-# collect them mid-flight ("Task was destroyed but it is pending!" bug — the
-# event loop holds only a weak ref to tasks, so a caller that does
-# ``asyncio.create_task(coro())`` without keeping the returned Task alive
-# risks silent cancellation). Tasks self-discard from the set on completion.
+# Strong references to fire-and-forget background tasks (the per-prompt
+# persisters spawned by POST /message). The event loop only holds weak
+# refs to tasks, so a caller that does ``asyncio.create_task(coro())``
+# without keeping the returned Task alive risks silent cancellation.
+# Tasks self-discard from the set on completion.
 _BG_TASKS: set[asyncio.Task] = set()
-
-
-def _spawn_bg(coro) -> asyncio.Task:
-    """Create a background task and hold a strong reference to it."""
-    task = asyncio.create_task(coro)
-    _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
-    return task
-
-
-async def _cancel_task(task) -> None:
-    """Cancel an asyncio task and await its completion so cleanup code runs."""
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except (asyncio.CancelledError, Exception):
-        pass
-
-
-async def _close_session_gracefully(state: "SessionState") -> None:
-    """Close the HTTP connection to the ACP supervisor.
-
-    We just drop the connection — the supervisor detects the disconnect
-    and cleans up child processes. The old DELETE /v1/acp/{id} approach
-    hangs because the ACP process blocks waiting for the agent to shut down.
-    """
-    client = state.client
-    if not client:
-        return
-    state.client = None
-    try:
-        await client.aclose()
-    except Exception:
-        pass
-
-
-async def _shutdown_session_state(
-    state: SessionState,
-    *,
-    remove: bool,
-    mark_idle_at: float | None = None,
-    force: bool = False,
-) -> None:
-    """Close a runtime session and optionally remove it from the active registry."""
-    state.shutdown.set()
-    # Re-check: new work may have arrived between the caller's idle check and here.
-    # Skip this guard when force=True (e.g. ensure_runtime rebuilding a dead supervisor).
-    if not force and (
-        state.active_rpc_id is not None
-        or state.pending_prompts
-        or state._session_subscribers
-    ):
-        state.shutdown.clear()
-        return
-    idle_at = time.time() if mark_idle_at is None else mark_idle_at
-    state.turn_completed_at = idle_at
-    state.last_activity = idle_at
-    state.active_rpc_id = None
-    state.pending_prompts.clear()
-    await _cancel_task(state._scheduler_task)
-    await _cancel_task(state._reader_task)
-    # Flush any pending DB log writes so turn_end / tool_result events that
-    # were scheduled during the last prompt aren't silently dropped when the
-    # session is reaped.  Bounded wait so a hung writer can't block shutdown.
-    pending = state._log_chain
-    if pending is not None and not pending.done():
-        try:
-            await asyncio.wait_for(pending, timeout=5)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-    await _close_session_gracefully(state)
-    # Kill per-session supervisor if this session has its own. Only Daytona
-    # runs per-session supervisors here; docker/local have one-supervisor-per-
-    # sandbox handled by destroy_sandbox.
-    if state.supervisor_port is not None:
-        try:
-            sb = await get_sandbox(state.sandbox_id)
-            if sb and sb.provider == "daytona":
-                from .providers.daytona import _get_daytona_client
-                loop = asyncio.get_running_loop()
-                sandbox = await loop.run_in_executor(
-                    None, lambda: _get_daytona_client().get(sb.sandbox_ref)
-                )
-                await kill_supervisor_in_sandbox(sandbox, state.supervisor_port)
-                free_sandbox_port(state.sandbox_id, state.supervisor_port)
-        except Exception as e:
-            log.warning("failed to kill supervisor port %d for session %s: %s",
-                        state.supervisor_port, state.session_id, e)
-    # Wake any /events handler waiting on a subscriber queue; without
-    # this the UI stream stays blocked on an orphaned queue forever.
-    state.kick_all()
-    if remove and SESSIONS.get(state.session_id) is state:
-        SESSIONS.pop(state.session_id, None)
-        # Intentionally do NOT pop _session_locks: _ensure_runtime_locked
-        # calls this from inside the held lock (e.g., server.py:2829 when
-        # rebuilding a stale state). Popping here would let a concurrent
-        # caller's _get_session_lock(sid) hit an empty dict and `setdefault`
-        # a fresh Lock, breaking serialization. Two _ensure_runtime_locked
-        # bodies would then run in parallel, mint two acp_session_ids, and
-        # spawn two SSE readers for the same session — the daytona persistent-
-        # SSE-after-delete race. The orphan Lock entry is small (an empty
-        # waiters deque); a separate GC pass can prune cold ones if needed.
 
 
 
@@ -314,13 +200,6 @@ async def lifespan(app):
         await shutdown_pool()
     except Exception as e:
         log.warning("shutdown_pool failed: %s", e)
-    # force=True: a UI still holding /events would otherwise turn each
-    # shutdown into a no-op and the reader's retry ladder blocks drain.
-    await asyncio.gather(
-        *[_shutdown_session_state(s, remove=False, force=True) for s in SESSIONS.values()],
-        return_exceptions=True,
-    )
-    SESSIONS.clear()
 
     # Parallel instance teardown. Durability is already on the volume
     # from per-turn snapshots; stop is just SIGTERM here. Falls through
@@ -510,55 +389,15 @@ async def _require_session_row(session_id: str) -> dict:
 
 @app.get("/health")
 async def health():
+    from api.sandbox import get_pool
+    pool = get_pool()
+    active = pool._active  # noqa: SLF001 — read-only peek into the pool registry
     return {
         "status": "ok",
-        "sessions": len(SESSIONS),
-        "busy_sessions": sum(1 for s in SESSIONS.values() if s.agent_busy),
-        "readers_alive": sum(1 for s in SESSIONS.values() if s._reader_alive),
+        "sessions": len(active),
+        "busy_sessions": sum(1 for s in active.values() if s._subscribers),
         "instances": len(_INSTANCES),
     }
-
-
-# ---------------------------------------------------------------------------
-# Persistent SSE reader — connects to supervisor once per session
-# ---------------------------------------------------------------------------
-
-_SSE_SENTINEL = object()
-
-
-def _maybe_auto_approve_permission(payload: dict | None, state: SessionState) -> None:
-    """If the SSE payload is a session/request_permission, auto-approve it."""
-    if not payload or payload.get("method") != "session/request_permission":
-        return
-    rpc_id = payload.get("id")
-    if rpc_id is None:
-        return
-    options = payload.get("params", {}).get("options", [])
-    # Pick "allow_always" > "allow_once" > first option.
-    by_kind = {opt.get("kind"): opt.get("optionId") for opt in options}
-    option_id = (
-        by_kind.get("allow_always")
-        or by_kind.get("allow_once")
-        or (options[0].get("optionId") if options else None)
-    )
-    if not option_id:
-        return
-
-    async def _grant():
-        try:
-            resp = await state.client._client.post(
-                f"/v1/acp/{state.acp_session_id}",
-                json={"jsonrpc": "2.0", "id": rpc_id, "result": {"optionId": option_id}},
-            )
-            log.info("auto-approved permission for session %s (status=%d)",
-                     state.session_id, resp.status_code)
-        except Exception as e:
-            log.warning("auto-approve permission failed for session %s: %s",
-                        state.session_id, e)
-
-    _spawn_bg(_grant())
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1284,15 +1123,6 @@ async def delete_sandbox_route(sandbox_id: str):
         # 2026-04-23; this is the durability boundary).
         instance = _INSTANCES.get(sandbox_id)
         await _request_supervisor_snapshot(instance)
-
-        # force=True so a UI holding a persistent /events stream doesn't
-        # block the shutdown and leave a zombie state pointing at the
-        # deleted sandbox. session.current_sandbox_id NULL-outs itself
-        # via ON DELETE SET NULL on sandboxes_current_sandbox_id_fkey.
-        for state in list(SESSIONS.values()):
-            if state.sandbox_id == sandbox_id:
-                await _shutdown_session_state(state, remove=True, force=True)
-
         instance = _INSTANCES.pop(sandbox_id, None)
         _sandbox_locks.pop(sandbox_id, None)
         await delete_sandbox(sandbox_id)
@@ -1810,18 +1640,22 @@ async def ensure_volume_supervisor(volume_id: str, agent_type: str) -> None:
 
 @app.get("/sessions")
 async def list_sessions_route():
-    """List all active in-memory sessions with status."""
+    """List sessions currently leased by the SessionPool. Hibernated +
+    cold sessions don't appear here — query the DB / GET /sessions/{id}
+    directly for those."""
+    from api.sandbox import get_pool
     now = time.time()
-    return [
-        {
+    out = []
+    for s in get_pool()._active.values():  # noqa: SLF001
+        last = s.liveness._last_chunk_at  # noqa: SLF001
+        out.append({
             "session_id": s.session_id,
-            "agent_id": s.agent_id,
-            "current_sandbox_id": s.sandbox_id,
-            "idle_seconds": round(now - (s.turn_completed_at or s.last_activity), 1),
-            "shutdown_requested": s.shutdown.is_set(),
-        }
-        for s in SESSIONS.values()
-    ]
+            "agent_id": s._agent_id,  # noqa: SLF001
+            "current_sandbox_id": getattr(s.state, "sandbox_id", None),
+            "idle_seconds": round(now - last, 1) if last else None,
+            "shutdown_requested": False,
+        })
+    return out
 
 
 @app.get("/sessions/{session_id}")
@@ -1892,13 +1726,6 @@ async def session_status(session_id: str):
 
 @app.get("/sessions/{session_id}/log")
 async def get_session_log_route(session_id: str, limit: int = Query(default=500)):
-    state = SESSIONS.get(session_id)
-    pending = state._log_chain if state else None
-    if pending is not None:
-        try:
-            await pending
-        except Exception:
-            pass
     entries = await get_session_log(session_id, limit=limit)
     return [
         {
