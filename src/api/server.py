@@ -5,7 +5,6 @@ Run: uvicorn src.api.server:app --port 7778
 
 import asyncio
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -13,14 +12,11 @@ import re
 import shlex
 import tempfile
 import time
-import traceback
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-from psycopg.types.json import Json
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -31,7 +27,6 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .db import (
     add_supervisor_agent_type,
     close_pool,
@@ -89,9 +84,7 @@ from .providers import (
     kill_supervisor_in_sandbox,
     stop_instance,
 )
-from .providers._shared import _PROVIDER_VOLUME_HOME
 from .providers._shared import _safe_path as _shared_safe_path
-from .redact import redact_secrets
 from .sse import (
     UT_COMMANDS_UPDATE,
     UT_MESSAGE_CHUNK,
