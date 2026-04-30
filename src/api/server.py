@@ -639,9 +639,19 @@ async def lifespan(app):
     # we don't have to remember to wire it up.
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
 
+    # Cutover (Phase 2b): hibernate idle pool sessions via SessionPool's
+    # reaper. Legacy ``_idle_reaper`` continues to scan SESSIONS dict for
+    # back-compat with sessions that haven't migrated through pool yet.
+    from api.sandbox import start_reaper, shutdown_pool
+    await start_reaper()
+
     reaper = asyncio.create_task(_idle_reaper())
     yield
     await _cancel_task(reaper)
+    try:
+        await shutdown_pool()
+    except Exception as e:
+        log.warning("shutdown_pool failed: %s", e)
     # force=True: a UI still holding /events would otherwise turn each
     # shutdown into a no-op and the reader's retry ladder blocks drain.
     await asyncio.gather(
@@ -4082,146 +4092,88 @@ async def _cancel_and_drain(state: SessionState) -> None:
 
 @app.post("/sessions/{session_id}/message")
 async def post_session_message(session_id: str, request: Request):
-    """Submit a prompt. Queued behind the active prompt automatically.
+    """Submit a prompt. Returns ``{rpc_id, status}`` immediately; events
+    flow via GET /events (multi-subscriber) or via the response body of
+    POST /message+stream (single-call).
 
-    Pass ``interrupt: true`` to cancel the running prompt and wait for it
-    to reach a terminal state before the new prompt starts.
+    Routes through ``api.sandbox.SessionPool`` (per
+    ``docs/ephemeral-sandbox-design.md`` §6 / §7): pool.get_session
+    cold-starts or warm-reuses the SandboxSession; execute_prompt opens
+    a per-prompt supervisor SSE for this prompt only and broadcasts to
+    /events subscribers via session._broadcast.
     """
+    from api.sandbox import get_pool
+
     data = await _json_body(request)
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
 
-    interrupt = data.get("interrupt", False)
-
-    # Fast path mirrors GET /events: if a live in-memory state already
-    # exists, just enqueue — don't take the session lock. ensure_session_live
-    # holds that lock for the entire ensure_state_live → rebind sequence,
-    # which on a daytona Type 2 replacement (sandbox externally deleted →
-    # provision fresh sandbox + supervisor) takes ~25 s. POST /message
-    # callers typically have a ~30 s client-side timeout (e.g. tests'
-    # _send_message), and a concurrent SSE-reader-driven recovery already
-    # holding the lock would tip them past that. The scheduler's per-prompt
-    # ensure_session_live still runs immediately before each
-    # state.client.prompt(), so a stale URL still gets rebound — just on the
-    # scheduler thread instead of blocking the POST handler.
-    cached_state = SESSIONS.get(session_id)
-    if cached_state is not None and not cached_state.is_hibernated:
-        state = cached_state
-    else:
-        _, _, state = await ensure_session_live(session_id)
-
-    if interrupt and state.agent_busy:
-        await _cancel_and_drain(state)
-
-    # If the upstream SSE reader died while idle, recreate it before
-    # queuing the next prompt when subscribers are still waiting for events.
-    if state._session_subscribers and not state._reader_alive:
-        log.info(
-            "[SSE-READER] auto-restarting upstream reader from /message for session %s "
-            "(session_subscribers=%d)",
-            state.session_id,
-            len(state._session_subscribers),
-        )
-        _start_sse_reader(state)
-
-    state.last_activity = time.time()
     rpc_id = str(uuid.uuid4())
-    _submit_prompt(state, rpc_id, message)
+    pool = get_pool()
+    session = await pool.get_session(session_id)
+
+    async def _drain():
+        try:
+            async for _event in session.execute_prompt(message, rpc_id=rpc_id):
+                pass  # events broadcast inside execute_prompt
+        except Exception as e:
+            log.exception("execute_prompt failed for session %s rpc=%s",
+                          session_id, rpc_id)
+            session._broadcast({
+                "type": "error", "rpc_id": rpc_id,
+                "error": {"message": str(e), "exception_type": type(e).__name__},
+            })
+
+    # Hold a strong reference so the task isn't GC'd mid-flight.
+    task = asyncio.create_task(_drain())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
+
+
+# Track in-flight POST /message background drains so asyncio doesn't GC them.
+_BG_TASKS: set[asyncio.Task] = set()
 
 
 @app.get("/sessions/{session_id}/events")
 async def session_events(session_id: str):
-    """SSE stream for a session. Recovers reaped sessions automatically.
+    """SSE stream for a session. Multi-subscriber: many concurrent
+    /events connections to the same session each receive a copy of every
+    event (per ``docs/ephemeral-sandbox-design.md`` §15.1).
 
-    Live-state shortcut: if SESSIONS already holds a live state for this
-    session, just subscribe — skip ensure_session_live's rebind path.
-    Reasoning: /events is a subscriber, not a driver. A persistent /events
-    stream that reconnects mid-recovery (UI's EventSource retry, the
-    _PersistentSse helper in tests) MUST NOT trigger a second rebind while
-    a prompt is in flight on the prior acp_session_id — doing so swaps
-    state.acp_session_id and orphans the in-flight prompt's reply events
-    on the now-abandoned ACP stream. The test would then time out waiting
-    for events that will never reach its rpc_id queue. Cold-start (state
-    missing) and hibernated (needs revival) still go through the full
-    ensure path.
+    Subscribes via ``SandboxSession.subscribe()`` which:
+      * yields the per-session replay buffer first (so a UI reconnecting
+        after a transient disconnect doesn't miss events that fired
+        during the gap)
+      * then streams live broadcasts from ``execute_prompt``
+      * yields the ``_HEARTBEAT`` sentinel during idle so intermediaries
+        (nginx / cloudflare / browser EventSource) don't close the
+        connection between prompts.
     """
-    cached_state = SESSIONS.get(session_id)
-    if cached_state is not None and not cached_state.is_hibernated:
-        state = cached_state
-    else:
-        _, _, state = await ensure_session_live(session_id)
-    shutdown = state.shutdown
+    from api.sandbox import get_pool
+    from api.sandbox.session import _HEARTBEAT
 
-    async def _proxy_stream():
-        heartbeat_interval = int(os.environ.get("SSE_HEARTBEAT_INTERVAL", "30"))
+    pool = get_pool()
+    session = await pool.get_session(session_id)
 
-        # Restart persistent reader if it died (e.g., supervisor restart)
-        if not state._reader_alive:
-            log.info(
-                "[SSE-READER] auto-restarting upstream reader from /events for session %s",
-                state.session_id,
-            )
-            _start_sse_reader(state)
-
-        my_q = state.subscribe_session()
-
-        async def _heartbeat_loop():
-            # Per-connection heartbeat: put None directly on THIS subscriber's
-            # queue instead of ``state.broadcast(None)`` (which was O(N^2) across
-            # subscribers). Skip if the consumer is backlogged — real events in
-            # the queue are already keeping the connection warm.
-            try:
-                hb_count = 0
-                while True:
-                    await asyncio.sleep(heartbeat_interval)
-                    try:
-                        my_q.put_nowait(None)
-                    except asyncio.QueueFull:
-                        pass
-                    hb_count += 1
-                    if hb_count % 4 == 0:  # log every ~2 min
-                        log.debug("[HEARTBEAT] session %s: sent %d heartbeats, "
-                                  "busy=%s, subs=%d, reader=%s",
-                                  state.session_id[:8], hb_count,
-                                  state.agent_busy, len(state._session_subscribers),
-                                  state._reader_alive)
-            except asyncio.CancelledError:
-                pass
-
-        heartbeat_task = asyncio.create_task(_heartbeat_loop())
-        try:
-            while True:
-                item = await my_q.get()
-                if item is _SSE_SENTINEL or item is _KICK_SENTINEL:
-                    return
-                if shutdown.is_set():
-                    return
-                if item is None:
-                    yield ": heartbeat\n\n"
-                    continue
-
-                tag, block = item
-                if tag is None:
-                    yield block
-                else:
-                    yield f"event: rpc:{tag}\n{block}"
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            log.warning("SSE proxy error for session %s: %s", session_id, e)
-        finally:
-            await _cancel_task(heartbeat_task)
-            state.unsubscribe_session(my_q)
-            # If this was the last subscriber AND the session is hibernated,
-            # drop the in-memory state — no live UI is depending on it. The
-            # sandbox is already paused; conversation history is on disk and
-            # the DB row stays. Next request rebuilds via the recovery path.
-            await _maybe_evict_hibernated(state)
+    async def _gen():
+        async for item in session.subscribe():
+            # Subscribers receive one of:
+            #   - _HEARTBEAT sentinel after an idle window — emit SSE comment
+            #   - (rpc_id, raw_block) tuple from execute_prompt — emit
+            #     ``event: rpc:<id>\n<block>\n\n`` so test/UI can correlate
+            #   - parsed event dict from non-prompt sources — emit as data:
+            if item is _HEARTBEAT:
+                yield ": heartbeat\n\n"
+            elif isinstance(item, tuple) and len(item) == 2:
+                rpc_id, block = item
+                yield f"event: rpc:{rpc_id}\n{block}\n\n"
+            else:
+                yield f"data: {json.dumps(item)}\n\n"
 
     return StreamingResponse(
-        _proxy_stream(),
+        _gen(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

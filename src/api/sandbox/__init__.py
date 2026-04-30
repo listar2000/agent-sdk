@@ -27,6 +27,8 @@ they just don't run on the request path yet.
 """
 from .factory import make_session, register
 from .liveness import Liveness, LivenessState
+from .pool import SessionPool
+from .runtime import get_pool, shutdown_pool, start_reaper
 from .session import BaseSandboxSession
 from .state import (
     DaytonaSandboxState,
@@ -49,10 +51,14 @@ __all__ = [
     "ModalSandboxState",
     "Recipe",
     "SandboxState",
+    "SessionPool",
     "UnixLocalSandboxState",
     "UnknownSandboxState",
     "deserialize",
+    "get_pool",
     "make_session",
     "register",
     "serialize",
+    "shutdown_pool",
+    "start_reaper",
 ]

@@ -178,6 +178,33 @@ class AcpClient:
             )
         return result
 
+    async def attach(
+        self,
+        session_id: str,
+        agent: str,
+        *,
+        cwd: str = "/tmp",
+        inner_session_id: str | None = None,
+        mcp_servers: dict | None = None,
+    ) -> dict:
+        """Handshake, then load an existing ACP session or create a new one."""
+        if not inner_session_id:
+            return await self.initialize(session_id, agent, cwd=cwd, mcp_servers=mcp_servers)
+
+        result = await self.handshake(session_id, agent)
+        mcp_array = _mcp_dict_to_acp_array(mcp_servers) if mcp_servers else []
+        await self._send_rpc(
+            session_id,
+            "session/load",
+            {"sessionId": inner_session_id, "cwd": cwd, "mcpServers": mcp_array},
+        )
+        self._inner_session_ids[session_id] = inner_session_id
+        try:
+            await self.set_mode(session_id, "bypassPermissions")
+        except Exception:
+            pass
+        return result
+
     async def prompt(self, session_id: str, message: str, rpc_id: str | None = None) -> tuple[str, PromptResponse]:
         """Send a prompt and wait for the response. Returns (rpc_id, response)."""
         if session_id not in self._inner_session_ids:
