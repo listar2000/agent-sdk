@@ -265,6 +265,125 @@ _MIGRATIONS = [
     # from agent.config.skills at recovery time.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pre_start_commands"
     " JSONB NOT NULL DEFAULT '[]'::jsonb",
+    # 2026-04-30: shadow ``sandbox_state`` JSONB on the session row.
+    # Today the canonical sandbox identity lives in the ``sandboxes`` table
+    # and the session row holds ``current_sandbox_id`` as an FK. Recovery
+    # (``_ensure_sandbox_locked`` / ``_type1_recover`` / ``_type2_recover``)
+    # JOINs from sessions through sandboxes on every check.
+    #
+    # This column dual-writes the relevant fields so callers can read
+    # everything they need from the session row alone — foundation for a
+    # subsequent PR that drops the sandboxes table entirely. Writes still
+    # go to both via the trigger; reads stay through the legacy table for
+    # back-compat in this PR.
+    #
+    # Shape (mirrored from a SandboxRecord row):
+    #   { "type": <provider>, "sandbox_id": <provider_ref>,
+    #     "listen_port": int|null, "snapshot_path": str|null,
+    #     "snapshot_version": int,
+    #     "recipe": {dockerfile, shared_mounts, root, agent_type, pre_start_commands} }
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_state JSONB",
+    # Drop any leftover triggers from prior experimental branches so this
+    # migration's _sandbox_state_* triggers are the only ones writing to
+    # ``sandbox_state``. Idempotent.
+    "DROP TRIGGER IF EXISTS _ephemeral_sandboxes_sync ON sandboxes",
+    "DROP TRIGGER IF EXISTS _ephemeral_sessions_sync ON sessions",
+    "DROP FUNCTION IF EXISTS _ephemeral_sync_sandbox_state_from_sandboxes() CASCADE",
+    "DROP FUNCTION IF EXISTS _ephemeral_sync_sandbox_state_from_sessions() CASCADE",
+    "DROP FUNCTION IF EXISTS _ephemeral_compute_sandbox_state(TEXT, TEXT, JSONB, TEXT) CASCADE",
+    "DROP FUNCTION IF EXISTS _ephemeral_compute_sandbox_state(TEXT, TEXT, JSONB) CASCADE",
+    """CREATE OR REPLACE FUNCTION _compute_sandbox_state(
+           sb_id TEXT, agent_id_in TEXT, pre_start_in JSONB, volume_id_in TEXT
+       ) RETURNS JSONB AS $$
+       DECLARE
+           sb RECORD;
+           agent_type TEXT;
+           volume_provider TEXT;
+       BEGIN
+           SELECT a.config->>'agent_type' INTO agent_type
+               FROM agents a WHERE a.id = agent_id_in;
+           SELECT v.provider INTO volume_provider
+               FROM volumes v WHERE v.id = volume_id_in;
+           IF sb_id IS NULL THEN
+               RETURN jsonb_build_object(
+                   'type',             COALESCE(volume_provider, 'unknown'),
+                   'sandbox_id',       NULL,
+                   'snapshot_path',    NULL,
+                   'snapshot_version', 0,
+                   'listen_port',      NULL,
+                   'recipe', jsonb_build_object(
+                       'dockerfile',          NULL,
+                       'shared_mounts',       '[]'::jsonb,
+                       'root',                NULL,
+                       'agent_type',          COALESCE(agent_type, 'claude'),
+                       'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
+                   )
+               );
+           END IF;
+           SELECT * INTO sb FROM sandboxes WHERE id = sb_id;
+           IF NOT FOUND THEN
+               RETURN jsonb_build_object(
+                   'type',             COALESCE(volume_provider, 'unknown'),
+                   'sandbox_id',       NULL,
+                   'snapshot_path',    NULL,
+                   'snapshot_version', 0,
+                   'listen_port',      NULL,
+                   'recipe', jsonb_build_object(
+                       'dockerfile',          NULL,
+                       'shared_mounts',       '[]'::jsonb,
+                       'root',                NULL,
+                       'agent_type',          COALESCE(agent_type, 'claude'),
+                       'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
+                   )
+               );
+           END IF;
+           RETURN jsonb_build_object(
+               'type',             sb.provider,
+               'sandbox_id',       sb.sandbox_ref,
+               'snapshot_path',    NULL,
+               'snapshot_version', 0,
+               'listen_port',      sb.listen_port,
+               'recipe', jsonb_build_object(
+                   'dockerfile',          sb.dockerfile,
+                   'shared_mounts',       COALESCE(sb.shared_mounts, '[]'::jsonb),
+                   'root',                sb.root,
+                   'agent_type',          COALESCE(agent_type, 'claude'),
+                   'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
+               )
+           );
+       END $$ LANGUAGE plpgsql""",
+    """CREATE OR REPLACE FUNCTION _sync_sandbox_state_from_sandboxes()
+       RETURNS TRIGGER AS $$
+       BEGIN
+           UPDATE sessions s
+           SET sandbox_state = _compute_sandbox_state(
+               NEW.id, s.agent_id, s.pre_start_commands, s.volume_id
+           )
+           WHERE s.current_sandbox_id = NEW.id;
+           RETURN NEW;
+       END $$ LANGUAGE plpgsql""",
+    """CREATE OR REPLACE FUNCTION _sync_sandbox_state_from_sessions()
+       RETURNS TRIGGER AS $$
+       BEGIN
+           NEW.sandbox_state := _compute_sandbox_state(
+               NEW.current_sandbox_id, NEW.agent_id, NEW.pre_start_commands, NEW.volume_id
+           );
+           RETURN NEW;
+       END $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS _sandbox_state_sandboxes_sync ON sandboxes",
+    """CREATE TRIGGER _sandbox_state_sandboxes_sync
+       AFTER INSERT OR UPDATE ON sandboxes
+       FOR EACH ROW EXECUTE FUNCTION _sync_sandbox_state_from_sandboxes()""",
+    "DROP TRIGGER IF EXISTS _sandbox_state_sessions_sync ON sessions",
+    """CREATE TRIGGER _sandbox_state_sessions_sync
+       BEFORE INSERT OR UPDATE OF current_sandbox_id, agent_id, pre_start_commands, volume_id ON sessions
+       FOR EACH ROW EXECUTE FUNCTION _sync_sandbox_state_from_sessions()""",
+    # One-shot backfill so existing rows aren't NULL until next write.
+    """UPDATE sessions s
+       SET sandbox_state = _compute_sandbox_state(
+           s.current_sandbox_id, s.agent_id, s.pre_start_commands, s.volume_id
+       )
+       WHERE s.sandbox_state IS NULL""",
 ]
 
 
