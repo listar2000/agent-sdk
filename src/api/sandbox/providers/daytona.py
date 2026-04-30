@@ -211,9 +211,6 @@ class DaytonaSandboxSession(BaseSandboxSession):
         Per docs §7. No persistent server↔supervisor connection — opens
         on demand, closes at stopReason. Each event is broadcast to all
         subscribers and yielded to the caller.
-
-        For the wiring commit (sub-task 3) this is what replaces the
-        persistent _sse_reader_task in server.py.
         """
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("DaytonaSandboxSession.execute_prompt called before start()")

@@ -1,8 +1,11 @@
 """SessionPool — the entire recovery surface, in one method.
 
-Per ``docs/ephemeral-sandbox-design.md`` §6. Replaces today's four
-recovery functions plus _INSTANCES dict plus _session_locks plus
-is_hibernated flag plus _ensure_state_live plus _rebind_state.
+Per ``docs/ephemeral-sandbox-design.md`` §6. Replaced the legacy
+recovery chain (``_ensure_sandbox_alive`` / ``_type1_recover`` /
+``_type2_recover`` / ``_rebind_state``) plus the in-memory
+``_INSTANCES`` and ``SESSIONS`` registries plus the ``_session_locks``
+dict plus the ``is_hibernated`` flag — all gone, all replaced by this
+one class.
 
 At-most-one active SandboxSession per session_id. Concurrent
 ``get_session`` calls for the same session_id serialise on

@@ -21,10 +21,11 @@ async def load_sandbox_state(session_id: str) -> dict[str, Any] | None:
 
     NOTE: the lock is held only for the duration of the surrounding
     ``async with get_db()`` context, which the caller closes via the
-    ``save_sandbox_state`` write that follows. Phase 3 will tighten
-    this into an explicit transaction; for now the dual-write triggers
-    keep ``sandbox_state`` in sync with the legacy sandboxes row, so
-    the lock is correctness-belt-and-suspenders.
+    ``save_sandbox_state`` write that follows. The dual-write triggers
+    on the ``sandboxes`` table refresh ``sandbox_state`` whenever a
+    back-compat shim row is updated, so this row-level lock plus the
+    pool's own per-session lock are belt-and-suspenders for the (rare)
+    case of two server processes racing on the same session_id.
     """
     async with _db.get_db() as conn:
         row = await (await conn.execute(
@@ -39,11 +40,11 @@ async def load_sandbox_state(session_id: str) -> dict[str, Any] | None:
 async def save_sandbox_state(session_id: str, payload: dict[str, Any]) -> None:
     """Write ``sessions.sandbox_state`` JSONB for ``session_id``.
 
-    The phase 1 trigger ``_ephemeral_sessions_sync`` fires only on
-    writes to ``current_sandbox_id`` / ``agent_id`` / ``pre_start_commands``,
-    NOT on writes to ``sandbox_state`` itself, so this update is the
-    sole writer of ``sandbox_state`` here and won't be clobbered by the
-    sync trigger.
+    The dual-write trigger on ``sessions`` fires only on writes to
+    ``current_sandbox_id`` / ``agent_id`` / ``pre_start_commands`` /
+    ``volume_id``, NOT on writes to ``sandbox_state`` itself — so this
+    update is the sole writer here and won't be clobbered by the sync
+    trigger.
     """
     from psycopg.types.json import Json
     async with _db.get_db() as conn:

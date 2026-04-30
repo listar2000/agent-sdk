@@ -137,11 +137,9 @@ async def start_supervisor_in_sandbox(
     # (0) Idempotency fast-path: if a supervisor is already healthy on
     # this port (left over from a prior call in the same sandbox), skip
     # the 2-3 s extract+spawn dance and just mint a fresh signed URL
-    # pointing at it. Cuts the recovery cascade time dramatically when
-    # the SSE reader's _recover_after_disconnect fires concurrently with
-    # POST /message's _ensure_state_live → _rebind_state — both end up
-    # here under separate sandbox locks, and without this they each
-    # respawn node, churning the signed URL twice for no gain.
+    # pointing at it. Saves redundant respawns when concurrent recovery
+    # paths (Type 1 retries, pool resume + a parallel cancel) both land
+    # here under separate sandbox locks.
     t0 = time.monotonic()
     try:
         existing = await loop.run_in_executor(None, lambda: _exec(
