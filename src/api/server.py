@@ -2018,7 +2018,23 @@ async def get_sandbox_route(sandbox_id: str):
 
 @app.delete("/sandboxes/{sandbox_id}")
 async def delete_sandbox_route(sandbox_id: str):
-    await _require_sandbox(sandbox_id)
+    record = await _require_sandbox(sandbox_id)
+
+    # Phase 2 cutover bridge: if this sandbox is owned by a SessionPool
+    # session (created via POST /message → pool.get_session), release it
+    # through the pool first so the SandboxSession.stop() snapshot fires
+    # before the legacy destroy below. Match on ``sandbox_ref`` (provider
+    # UUID) — that's what the pool stores in ``state.sandbox_id`` — not
+    # the DB row PK we got in the URL.
+    try:
+        from api.sandbox import get_pool
+        pool = get_pool()
+        pool_session = pool.find_by_sandbox_id(record.sandbox_ref)
+        if pool_session is not None:
+            await pool.release(pool_session.session_id)
+    except Exception as e:
+        log.warning("DELETE /sandboxes %s: pool.release failed: %s", sandbox_id, e)
+
     async with _get_sandbox_lock(sandbox_id):
         # Snapshot before tearing down the compute so the next sandbox
         # provisioned on this volume's subpath can session/load with the
