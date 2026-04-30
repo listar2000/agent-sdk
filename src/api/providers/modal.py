@@ -579,17 +579,16 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
 
 
 # ---------------------------------------------------------------------------
-# Reconciliation — rebuild _INSTANCES after server restart
+# Reconciliation — terminate orphans on startup
 # ---------------------------------------------------------------------------
 
 async def reconcile_on_startup() -> None:
-    """Kill orphan Modal sandboxes and rebuild ``_INSTANCES`` from survivors.
+    """Terminate Modal sandboxes whose DB sandbox_id is gone or deleted.
 
-    Iterates all sandboxes under our app that carry the ``agent-sdk.sandbox-id``
-    tag. For each:
-      * No matching DB row (or row is ``deleted``) -> terminate the orphan.
-      * Otherwise -> rebuild a ``ProviderInstance`` in ``_INSTANCES`` so
-        future stop/destroy calls can find the sandbox by DB sandbox_id.
+    Iterates every sandbox under our app carrying the
+    ``agent-sdk.sandbox-id`` tag. Untagged sandboxes are left alone
+    (not ours). For tagged ones with no live / non-deleted DB row,
+    ``sb.terminate()`` reclaims the resources.
 
     Failures on individual sandboxes are logged but never raised.
     """
@@ -605,12 +604,6 @@ async def reconcile_on_startup() -> None:
     except Exception as e:
         log.warning("modal reconcile: modal unavailable: %s", e)
         return
-
-    try:
-        from .. import server as srv
-        instances_map = srv._INSTANCES  # type: ignore[attr-defined]
-    except Exception:
-        instances_map = None
 
     # ``Sandbox.list`` is an async generator — iterate via to_thread helper.
     def _list_sandboxes():
@@ -647,30 +640,6 @@ async def reconcile_on_startup() -> None:
                 await asyncio.to_thread(sb.terminate)
             except Exception as e:
                 log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
-            continue
-
-        if instances_map is None:
-            continue
-        # Refresh URL — tunnels can change after restart. Best-effort.
-        url = ""
-        try:
-            tunnels = await asyncio.to_thread(sb.tunnels, 30)
-            tun = tunnels.get(_SUPERVISOR_CONTAINER_PORT)
-            if tun:
-                url = tun.url
-        except Exception as e:
-            log.warning("modal reconcile: tunnels %s: %s", sb.object_id, e)
-        instances_map[sandbox_id] = ProviderInstance(
-            provider="modal",
-            url=url,
-            root=getattr(row, "root", _AGENT_HOME_IN),
-            sandbox_id=sb.object_id,
-            container_id=sb.object_id,
-        )
-        log.info(
-            "modal reconcile: reattached sandbox_id=%s modal_id=%s",
-            sandbox_id, sb.object_id,
-        )
 
 
 # ---------------------------------------------------------------------------
