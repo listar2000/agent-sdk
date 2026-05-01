@@ -615,6 +615,20 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: list failed: %s", e)
         return
 
+    # Source of truth for "live sandboxes": the SessionPool's
+    # ``sandbox_state.sandbox_id`` JSONB on each sessions row.
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT DISTINCT sandbox_state->>'sandbox_id' AS sid"
+                " FROM sessions"
+                " WHERE sandbox_state->>'sandbox_id' IS NOT NULL",
+            )).fetchall()
+        live_refs = {r["sid"] for r in rows}
+    except Exception as e:
+        log.warning("modal reconcile: live-session query failed: %s", e)
+        return
+
     for sb in sandboxes:
         try:
             tags = await asyncio.to_thread(sb.get_tags)
@@ -625,12 +639,13 @@ async def reconcile_on_startup() -> None:
         if not sandbox_id:
             # Untagged — not ours or created before tagging was wired.
             continue
-        try:
-            row = await dbmod.get_sandbox(sandbox_id)
-        except Exception as e:
-            log.warning("modal reconcile: get_sandbox(%s): %s", sandbox_id, e)
-            continue
-        is_orphan = row is None or getattr(row, "status", None) == "deleted"
+        # Modal tags also carry the modal sandbox object_id; the pool stores
+        # whatever was passed to create_sandbox as state.sandbox_id. Check
+        # both forms so a label-rename doesn't strand live sandboxes.
+        is_orphan = (
+            sandbox_id not in live_refs
+            and sb.object_id not in live_refs
+        )
         if is_orphan:
             log.info(
                 "modal reconcile: terminating orphan %s (sandbox_id=%s)",

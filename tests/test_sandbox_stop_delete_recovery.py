@@ -513,13 +513,12 @@ async def test_server_delete_persists_workspace(provider):
 
         sandbox = await _get_sandbox(client, session_id)
         sandbox_ref_before = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
-        # The back-compat shim's sandboxes-row PK lives on
-        # ``sessions.current_sandbox_id`` — fetch that to drive the
-        # legacy DELETE /sandboxes/{id} this test is contract-pinning.
-        sess = (await client.get(f"{SERVER}/sessions/{session_id}", timeout=10)).json()
-        sandbox_id = sess.get("current_sandbox_id")
-        r = await client.delete(f"{SERVER}/sandboxes/{sandbox_id}", timeout=60)
-        assert r.status_code in (200, 204), f"DELETE /sandboxes failed: {r.text}"
+        # POST /sessions/{id}/release is the server-API-driven equivalent
+        # of the legacy DELETE /sandboxes/{id}: snapshot to volume +
+        # drop the pool's compute lease. Next prompt cold-recovers,
+        # which is what "delete the sandbox" meant operationally.
+        r = await client.post(f"{SERVER}/sessions/{session_id}/release", timeout=60)
+        assert r.status_code in (200, 204), f"POST /release failed: {r.text}"
         await asyncio.sleep(3)
 
         reply2 = await _read_marker(client, session_id, marker)
@@ -530,12 +529,13 @@ async def test_server_delete_persists_workspace(provider):
         )
         assert "volume-test" in reply2, f"marker content missing after server DELETE: {reply2}"
 
-        sandbox_after = await _get_sandbox(client, session_id)
-        sandbox_ref_after = sandbox_after.get("sandbox_ref") or sandbox_after.get("provider_ref", "")
-        if sandbox_ref_before:
-            assert sandbox_ref_after != sandbox_ref_before, (
-                f"sandbox_ref unchanged after delete: {sandbox_ref_before!r}"
-            )
+        # Note: sandbox_ref may or may not change after release(), depending
+        # on the provider. Daytona pauses the sandbox in-place (same ref);
+        # docker/local drop compute and the next prompt provisions fresh
+        # (new ref). The contract this test pins is volume persistence —
+        # the sandbox-ref-changed assertion was an implementation detail
+        # of the legacy DELETE /sandboxes/{id} that always destroyed.
+        await _get_sandbox(client, session_id)  # smoke-check the route
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
@@ -1158,12 +1158,12 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
             )
             assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
-            # DELETE the sandbox via the server API (the exact UI path).
-            sess_row = (await client.get(f"{SERVER}/sessions/{session_id}", timeout=10)).json()
-            sbid = sess_row.get("current_sandbox_id") or sess_row.get("sandbox_id")
-            assert sbid, f"no current sandbox on session: {sess_row}"
-            r = await client.delete(f"{SERVER}/sandboxes/{sbid}", timeout=30)
-            assert r.status_code in (200, 204), f"delete sandbox failed: {r.text}"
+            # POST /sessions/{id}/release replaces the legacy DELETE
+            # /sandboxes/{id}: snapshot + drop the pool lease so the
+            # next prompt cold-recovers (the "delete sandbox" semantics
+            # the UI exercised).
+            r = await client.post(f"{SERVER}/sessions/{session_id}/release", timeout=30)
+            assert r.status_code in (200, 204), f"release failed: {r.text}"
 
             # Wait — the UI's SSE stream may observe stream-end here; the
             # _PersistentSse helper reconnects automatically.

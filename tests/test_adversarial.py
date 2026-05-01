@@ -128,7 +128,26 @@ from api.server import app
 # Tests that actually exercised those registries have been removed.
 SESSIONS: dict = {}
 _INSTANCES: dict = {}
-from api.models import AgentConfig, AgentRecord, SandboxRecord, SessionState
+from api.models import AgentConfig, AgentRecord, SessionState
+from dataclasses import dataclass, field
+
+# SandboxRecord was dropped from api.models with the sandboxes table.
+# Tests that synthesized one for stub helpers still need a value class
+# of the same shape — keep a local stand-in here so the rest of this
+# file's tests (which don't depend on the sandboxes table at all) can
+# still import and run.
+@dataclass
+class SandboxRecord:
+    id: str
+    provider: str
+    sandbox_ref: str
+    status: str = "stopped"
+    root: str = "/tmp"
+    volume_id: str | None = None
+    subpath: str | None = None
+    listen_port: int | None = None
+    dockerfile: str | None = None
+    shared_mounts: list = field(default_factory=list)
 from api.sse import (
     parse_sse_data,
     parse_acp_payload,

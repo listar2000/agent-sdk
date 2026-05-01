@@ -531,11 +531,22 @@ async def reconcile_on_startup() -> None:
         log.warning("docker reconcile: ps failed: %s", e)
         return
 
-    # Reconcile only does orphan cleanup now: any container labeled with
-    # an unknown / deleted sandbox_id gets force-removed. The legacy
-    # "rebuild _INSTANCES entry for survivors" branch is gone — the
-    # SessionPool resolves compute through ``state.sandbox_id`` on each
-    # ``pool.get_session`` call, no per-process cache to repopulate.
+    # Reconcile only does orphan cleanup now: any container whose labeled
+    # sandbox-id (= the docker container id) doesn't appear in any live
+    # session's ``sandbox_state.sandbox_id`` gets force-removed. The
+    # SessionPool's sandbox_state JSONB on ``sessions`` is the single
+    # source of truth for "what sandboxes belong to live sessions."
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT DISTINCT sandbox_state->>'sandbox_id' AS sid"
+                " FROM sessions"
+                " WHERE sandbox_state->>'sandbox_id' IS NOT NULL",
+            )).fetchall()
+        live_refs = {r["sid"] for r in rows}
+    except Exception as e:
+        log.warning("docker reconcile: live-session query failed: %s", e)
+        return
     for line in out.decode(errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -544,17 +555,13 @@ async def reconcile_on_startup() -> None:
         if len(parts) < 3:
             continue
         container_id, state, sandbox_id = parts[0], parts[1].lower(), parts[2]
-        try:
-            sb = await dbmod.get_sandbox(sandbox_id)
-        except Exception as e:
-            log.warning("docker reconcile: get_sandbox(%s) failed: %s", sandbox_id, e)
-            continue
-        # "stopped" rows are NOT orphans — they're resumable pairs (DB
-        # row + exited container waiting for docker start). Only deleted
-        # rows (or none) qualify the container as an orphan.
+        # "stopped" containers are NOT orphans if a live session still
+        # references them — they're resumable. The label may be the
+        # legacy sb_<hex> PK (pre-d5) or the container_id (post-d5);
+        # check both.
         is_orphan = (
-            sb is None
-            or getattr(sb, "status", None) == "deleted"
+            sandbox_id not in live_refs
+            and container_id not in live_refs
         )
         if is_orphan:
             log.info(
