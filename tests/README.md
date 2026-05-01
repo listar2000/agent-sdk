@@ -289,6 +289,70 @@ cheaper to run and worth running too, but `daytona` has historically
 been the one that surfaces mount/HOME bugs because its sandbox ↔ volume
 separation is strictest.
 
+## Golden — `test_attach_recovers_with_no_volume_journal.py`
+
+Companion to `test_session_resume_after_delete` (#5). Where #5 covers
+the *happy* `session/load` path — sandbox replaced after a successful
+turn, the volume's `snapshot.tar` carries the JSONL forward, the new
+sandbox's HOME gets the JSONL restored, `session/load` succeeds — this
+test covers the inverse: **the JSONL is missing from the volume** when
+the new sandbox boots, so `session/load` returns
+`-32603 Internal error` and the agent must fall back to `session/new`
+(via `acp_client.attach`'s catch-and-retry) instead of wedging.
+
+**Scenario.** Cold-create the session (which mints `inner_session_id`
+during `_attach_acp`); do **not** run a turn (so `snapshot.tar` is
+never written to the volume — the supervisor only writes it after a
+successful turn-end); external-delete the sandbox; then send a
+prompt. The new sandbox boots with an empty HOME because the volume
+had no snapshot to restore from.
+
+**Invariants:**
+- prompt returns a non-empty reply (agent recovered)
+- `inner_session_id` on the in-memory `SessionState` is **different**
+  from the pre-delete value (proving the recovery went through
+  `session/new`, not `session/load`)
+
+**Provider coverage.** Parameterized over `{daytona, docker, modal}`
+— excluded from `local` because that provider's `_external_delete`
+deliberately preserves HOME, so the JSONL never disappears and the
+failure mode can't be exercised. The fix in `acp_client.attach` is
+provider-agnostic.
+
+**Production correspondence.** Reproduced 1:1 the wooden-marmot
+incident on 2026-05-01: a stale `inner_session_id` from a previous
+sandbox (which had been deleted as part of cleaning up
+`hive-large`-snapshot zombies) was passed back to the freshly
+provisioned sandbox; `session/load` failed; every subsequent revival
+hit the same load failure; `pool.get_session`'s `start()` raised
+*after* the new sandbox was provisioned but *before*
+`db.write_sandbox_state` ran, so the DB stayed pointing at the old
+ref — and the next request created **another** new sandbox, leaking
+~30 orphans across 8 minutes. This test exercises the per-attach
+fallback. The state-persistence half (don't leak the new sandbox if
+attach fails) is a separate hardening — see Open Issues.
+
+## Open issues / follow-ups
+
+**Partial-failure leak in `pool.get_session`.** Lines 101-102:
+
+```python
+await session.start()                                          # raises
+await db.write_sandbox_state(session_id, serialize(session.state))   # never runs
+```
+
+If `start()` raises after a fresh sandbox is provisioned (any reason —
+ACP-attach failure, supervisor health timeout, …), the new
+`sandbox_ref` is never persisted and the new sandbox is never
+released. Every subsequent `get_session` reads the stale (or empty)
+ref from the DB and provisions yet another sandbox. Independent of
+the wooden-marmot fix; would have prevented the orphan-storm scaling
+even with the old `attach` semantics. Fix shape: persist the partial
+state immediately after `_resolve_or_create_sandbox` returns, *before*
+`_attach_acp`, and on `start()` failure either tear down the
+just-created sandbox or persist its ref so the next attempt reuses
+it instead of creating yet another.
+
 ### Running
 
 ```sh
@@ -298,6 +362,7 @@ scripts/launch_server_local.sh &     # or launch_server_docker.sh
 # Docker:  make sure `docker info` works.
 
 .venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -v -s
+.venv/bin/pytest tests/test_attach_recovers_with_no_volume_journal.py -v -s
 # Or scoped to a single provider:
 .venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -k daytona -v -s
 # Or the fast mechanism-only pass (no real server needed):

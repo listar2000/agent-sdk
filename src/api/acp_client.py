@@ -187,17 +187,36 @@ class AcpClient:
         inner_session_id: str | None = None,
         mcp_servers: dict | None = None,
     ) -> dict:
-        """Handshake, then load an existing ACP session or create a new one."""
+        """Handshake, then load an existing ACP session or create a new one.
+
+        If ``inner_session_id`` is provided but ``session/load`` fails — the
+        ACP server returns ``-32603 Internal error`` when the inner session
+        has no JSONL on the sandbox's HOME (e.g. the sandbox was recreated
+        and ``/vol/snapshot.tar`` was empty because no successful turn ran
+        before the previous sandbox was destroyed) — we fall back to
+        ``session/new`` instead of wedging. The agent loses conversational
+        continuity for that session, but it stays usable; without the
+        fallback every subsequent revival hits the same ``session/load``
+        failure forever.
+        """
         if not inner_session_id:
             return await self.initialize(session_id, agent, cwd=cwd, mcp_servers=mcp_servers)
 
         result = await self.handshake(session_id, agent)
         mcp_array = _mcp_dict_to_acp_array(mcp_servers) if mcp_servers else []
-        await self._send_rpc(
-            session_id,
-            "session/load",
-            {"sessionId": inner_session_id, "cwd": cwd, "mcpServers": mcp_array},
-        )
+        try:
+            await self._send_rpc(
+                session_id,
+                "session/load",
+                {"sessionId": inner_session_id, "cwd": cwd, "mcpServers": mcp_array},
+            )
+        except RuntimeError as e:
+            log.warning(
+                "session/load failed for inner_session_id=%s, falling back to "
+                "session/new (sandbox likely recreated without volume snapshot): %s",
+                inner_session_id, e,
+            )
+            return await self.initialize(session_id, agent, cwd=cwd, mcp_servers=mcp_servers)
         self._inner_session_ids[session_id] = inner_session_id
         try:
             await self.set_mode(session_id, "bypassPermissions")
