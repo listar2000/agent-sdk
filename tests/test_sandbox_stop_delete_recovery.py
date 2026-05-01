@@ -59,7 +59,13 @@ from api.sse import extract_sse_tag, parse_acp_event  # noqa: E402
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY")
 OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-PROMPT_TIMEOUT = 180
+# Modal terminate is destructive: stop=>recreate a fresh container. With a
+# warm image this is still ~3-4 min in practice (container schedule + tunnel
+# setup + supervisor boot), so the recovery budget for modal must dominate
+# the daytona/docker/local pause-resume ~10s. Daytona/docker/local successful
+# paths complete in <30s so the larger ceiling only stretches their failure
+# diagnosis time, not their happy-path runtime.
+PROMPT_TIMEOUT = 360
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +366,21 @@ async def _kill_supervisor_in_sandbox(sandbox: dict) -> None:
             capture_output=True, timeout=10,
         ))
 
+    elif provider == "modal":
+        # ``sb.exec`` runs a command in the live modal sandbox. We pkill the
+        # supervisor.js so the sandbox object stays alive but its tunnel
+        # target stops responding — same scenario as docker/daytona above.
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        proc = await loop.run_in_executor(
+            None,
+            lambda: sb.exec(
+                "bash", "-c",
+                "pkill -9 -f supervisor.js || pkill -9 -f 'node.*supervisor'",
+            ),
+        )
+        await loop.run_in_executor(None, proc.wait)
+
     print(f"[test] killed supervisor inside {provider} sandbox {ref[:20]}")
 
 
@@ -546,6 +567,110 @@ async def test_server_delete_persists_workspace(provider):
         # the sandbox-ref-changed assertion was an implementation detail
         # of the legacy DELETE /sandboxes/{id} that always destroyed.
         await _get_sandbox(sdk, session_id)  # smoke-check the route
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.asyncio
+async def test_delete_session_destroys_sandbox(provider):
+    """``DELETE /sessions/{id}`` must destroy the underlying sandbox, not
+    just pause it. Hibernation (``stop_daytona`` / ``docker stop``) is
+    correct for the idle reaper and ``POST /sessions/{id}/release`` —
+    those paths leave the session row in place so a future prompt can
+    resume. ``DELETE`` drops the session row, so the sandbox has nothing
+    to resume to: leaving it paused leaks compute against the provider
+    quota with no automatic cleanup (label-based reapers default to
+    ``--origin test`` so production orphans require manual reaping).
+
+    Reproduces the leak observed in production after hivespace's
+    ``DELETE /api/agents/{N}`` cascade: 9 deleted agents in a single day
+    left 6 paused-with-no-session-row daytona sandboxes against the
+    2000 GiB account quota.
+    """
+    _require_provider(provider)
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
+        session_id = sess["session_id"]
+        sandbox = await _get_sandbox(sdk, session_id)
+        sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+        assert sandbox_ref, f"fresh session has no sandbox_ref: {sandbox}"
+        print(f"\n[test:{provider}] session={session_id[:8]} sandbox={sandbox_ref[:24]}")
+
+        # Skip the autouse cleanup fixture's DELETE — we're calling
+        # DELETE explicitly so we can assert on its post-condition.
+        if session_id in _CREATED_SESSIONS:
+            _CREATED_SESSIONS.remove(session_id)
+
+        async with httpx.AsyncClient() as c:
+            resp = await c.delete(f"{SERVER}/sessions/{session_id}", timeout=30)
+        assert resp.status_code == 204, f"DELETE returned {resp.status_code}: {resp.text}"
+
+        try:
+            await _assert_sandbox_gone(provider, sandbox, timeout_s=20.0)
+        except AssertionError:
+            # Best-effort cleanup so we don't leak from this test itself.
+            try:
+                await _external_delete(sandbox)
+            except Exception:
+                pass
+            raise
+
+
+async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float) -> None:
+    """Poll the provider until the sandbox is no longer findable / running.
+    Raises AssertionError on timeout — meaning DELETE leaked compute.
+    """
+    ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_s
+    last_state: str | None = None
+
+    while loop.time() < deadline:
+        if provider == "daytona":
+            from daytona_sdk import Daytona, DaytonaConfig
+            daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
+            try:
+                sb = await loop.run_in_executor(None, lambda: daytona.get(ref))
+            except Exception:
+                return  # gone from daytona's index — the post-condition
+            state = getattr(sb, "state", "?")
+            last_state = state.value if hasattr(state, "value") else str(state)
+            if last_state in ("destroyed", "archived"):
+                return
+
+        elif provider == "docker":
+            result = await loop.run_in_executor(None, lambda: subprocess.run(
+                ["docker", "inspect", ref], capture_output=True, timeout=10,
+            ))
+            if result.returncode != 0:
+                return  # docker no longer knows about it
+            try:
+                meta = json.loads(result.stdout)
+                last_state = meta[0]["State"]["Status"] if meta else "?"
+            except (json.JSONDecodeError, KeyError, IndexError):
+                last_state = "?"
+
+        elif provider == "local":
+            # Local "delete" = supervisor process gone AND the sandbox
+            # marker file gone. Both are observable without server help:
+            # the supervisor PID was on the sandbox row; the marker path
+            # too. If either survives, DELETE leaked.
+            pid = _local_supervisor_pid(sandbox)
+            marker = sandbox.get("marker_path")
+            marker_alive = bool(marker and os.path.exists(marker))
+            if pid is None and not marker_alive:
+                return
+            last_state = f"pid={pid} marker_alive={marker_alive}"
+
+        await asyncio.sleep(0.5)
+
+    raise AssertionError(
+        f"DELETE /sessions/{{id}} did not destroy {provider} sandbox "
+        f"{ref!r}; last observed state: {last_state}. "
+        f"Sandbox is leaked: session row is gone (DELETE /sessions cascades "
+        f"to delete_session), so nothing can resume it; provider compute "
+        f"sits paused against quota until a manual cleanup script runs."
+    )
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
@@ -1171,7 +1296,7 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_supervisor_killed_then_message(provider):
     """Prod UI repro: supervisor process dies, sandbox stays alive.
@@ -1227,7 +1352,7 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_supervisor_killed_immediate_message(provider):
     """Prod UI race: kill supervisor, then POST /message BEFORE the server
@@ -1286,7 +1411,7 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
 
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
 @pytest.mark.asyncio
 async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
     """End-to-end wiring for the UI reconnect-gap bug.

@@ -1759,22 +1759,62 @@ async def release_session_route(session_id: str):
 
 @app.delete("/sessions/{session_id}", status_code=204)
 async def delete_session_route(session_id: str):
-    """Release the pool lease and delete the session row.
+    """Release the pool lease, destroy the underlying sandbox, and delete
+    the session row.
 
     Idempotent — missing session returns 204, not 404, so callers can
     use this as a "make sure this session is gone" primitive without
-    branching on prior state. The underlying daytona/docker/local
-    sandbox is *paused* (via ``pool.release``), not destroyed —
-    matches ``DELETE /sandboxes/{id}`` semantics, and label-based
-    cleanup scripts (``cleanup_daytona_orphans.py``) reclaim the
-    compute later.
+    branching on prior state.
+
+    The sandbox is **destroyed**, not paused. ``pool.release`` only
+    pauses (correct for the hibernate / idle-reaper paths where a future
+    prompt resumes the same sandbox). On DELETE the session row is
+    dropped, so nothing can ever resume; leaving the sandbox paused
+    leaks compute against the provider's quota with no automatic
+    cleanup (``cleanup_orphans.py`` defaults to ``--origin test`` so
+    production orphans need manual reaping).
     """
-    from api.sandbox import get_pool
+    from api import providers as _prov
+    from api.sandbox import deserialize, get_pool
+
+    # Capture sandbox ref + provider type from the DB BEFORE pool.release
+    # wipes the in-memory state. Idempotency: a missing row returns None
+    # from read_sandbox_state, and we fall through to delete_session
+    # which is also idempotent.
+    sandbox_ref: str | None = None
+    provider_type: str | None = None
+    try:
+        payload = await read_sandbox_state(session_id)
+        if payload is not None:
+            state = deserialize(payload)
+            sandbox_ref = getattr(state, "sandbox_ref", None)
+            provider_type = getattr(state, "type", None)
+    except Exception as e:
+        log.warning("DELETE /sessions/%s: read state failed: %s",
+                    session_id, e)
+
     try:
         await get_pool().release(session_id)
     except Exception as e:
         log.warning("DELETE /sessions/%s: pool.release failed: %s",
                     session_id, e)
+
+    # Destroy the sandbox via the provider's uniform ``destroy_sandbox``
+    # entry point. Best-effort — if the provider can't reach the sandbox
+    # (already gone, network blip), we still drop the session row so the
+    # caller's idempotency contract holds.
+    if provider_type and sandbox_ref:
+        try:
+            mod = _prov._PROVIDER_MODS.get(provider_type)
+            if mod is not None:
+                await mod.destroy_sandbox(_prov.ProviderInstance(
+                    provider=provider_type, url="", root="",
+                    sandbox_ref=sandbox_ref,
+                ))
+        except Exception as e:
+            log.warning("DELETE /sessions/%s: provider destroy failed (%s %s): %s",
+                        session_id, provider_type, sandbox_ref[:16], e)
+
     # Drop the session row. ``ON DELETE CASCADE`` on session_log handles
     # the log rows; ``sandbox_state`` JSONB lives on the sessions row
     # itself so it goes with the row.
