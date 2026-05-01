@@ -99,8 +99,8 @@ class SessionPool:
             payload = await self._load_state(session_id)
             state = deserialize(payload)
             session = self._factory(session_id, state)
-            log.info("[pool.get_session] session=%s creating new state.type=%s sandbox_id=%s",
-                     session_id, getattr(state, "type", "?"), getattr(state, "sandbox_id", None))
+            log.info("[pool.get_session] session=%s creating new state.type=%s sandbox_ref=%s",
+                     session_id, getattr(state, "type", "?"), getattr(state, "sandbox_ref", None))
             await session.start()
             await self._save_state(session_id, serialize(session.state))
             self._active[session_id] = session
@@ -161,13 +161,13 @@ class SessionPool:
                 log.exception("reap_idle: release(%s) failed", sid)
         return len(stale)
 
-    def find_by_sandbox_id(self, sandbox_id: str) -> BaseSandboxSession | None:
+    def find_by_sandbox_ref(self, sandbox_ref: str) -> BaseSandboxSession | None:
         """Reverse lookup: find an active session whose underlying compute
-        carries this provider sandbox id. Used by ``/sandboxes/{id}/files/*``
-        endpoints — sandbox identity isn't durable, but if the compute is
-        currently running we know who owns it."""
+        carries this provider sandbox ref. Used by reverse-lookup callers
+        — sandbox identity isn't durable, but if the compute is currently
+        running we know who owns it."""
         for sess in self._active.values():
-            if getattr(sess.state, "sandbox_id", None) == sandbox_id:
+            if getattr(sess.state, "sandbox_ref", None) == sandbox_ref:
                 return sess
         return None
 

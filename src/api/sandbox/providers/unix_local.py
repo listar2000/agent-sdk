@@ -47,16 +47,16 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         # sandbox_id here is the local provider's stable ref (local-XXXX).
         # On second start() we try to restart the SAME sandbox in place so
         # the test_stop_sandbox_same_sandbox_after_restart invariant holds.
-        if self.state.sandbox_id:
+        if self.state.sandbox_ref:
             try:
-                status = await lc_provider.get_sandbox_status(self.state.sandbox_id)
+                status = await lc_provider.get_sandbox_status(self.state.sandbox_ref)
                 from api.providers import ProviderInstance
                 if status == "running":
                     instance = ProviderInstance(
                         provider="local",
                         url=f"http://127.0.0.1:{self.state.listen_port}",
                         root=self.state.recipe.root or "/tmp",
-                        sandbox_id=self.state.sandbox_id,
+                        sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
                 elif status == "stopped":
@@ -64,12 +64,12 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     # respawn at the same ref (same volume subpath, same
                     # pre_start commands) — preserves the contract that the
                     # sandbox identity survives external stops.
-                    await lc_provider.start_sandbox(self.state.sandbox_id)
+                    await lc_provider.start_sandbox(self.state.sandbox_ref)
                     instance = ProviderInstance(
                         provider="local",
                         url=f"http://127.0.0.1:{self.state.listen_port}",
                         root=self.state.recipe.root or "/tmp",
-                        sandbox_id=self.state.sandbox_id,
+                        sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
                 # status == "missing" → fall through to create.
@@ -86,7 +86,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                 pre_start_commands=self.state.recipe.pre_start_commands or None,
                 shared_mounts=self.state.recipe.shared_mounts or None,
             )
-            self.state.sandbox_id = instance.sandbox_id
+            self.state.sandbox_ref = instance.sandbox_ref
             self.state.listen_port = instance.port
 
         self._supervisor_url = instance.url
@@ -104,7 +104,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         log.info(
             "UnixLocalSandboxSession started: session=%s pid=%s url=%s",
-            self.session_id, self.state.sandbox_id, instance.url,
+            self.session_id, self.state.sandbox_ref, instance.url,
         )
 
     async def running(self, *, force_probe: bool = False) -> bool:
@@ -204,7 +204,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             await post_client.aclose()
 
     async def stop(self) -> None:
-        if self.state.sandbox_id is None:
+        if self.state.sandbox_ref is None:
             return
         if self._supervisor_url is not None:
             try:
@@ -223,13 +223,13 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             await lc_provider.stop_sandbox(ProviderInstance(
                 provider="local", url=self._supervisor_url or "",
                 root=self.state.recipe.root or "/tmp",
-                sandbox_id=self.state.sandbox_id or "",
+                sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
         except Exception:
             log.exception("local.stop_sandbox failed for session %s", self.session_id)
         # Process is gone; clear sandbox_id so next start cold-creates.
-        self.state.sandbox_id = None
+        self.state.sandbox_ref = None
         self.state.listen_port = None
 
     async def shutdown(self) -> None:

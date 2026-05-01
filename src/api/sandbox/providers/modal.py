@@ -44,16 +44,16 @@ class ModalSandboxSession(BaseSandboxSession):
         volume_ref = await self._bootstrap_session()
 
         instance = None
-        if self.state.sandbox_id:
+        if self.state.sandbox_ref:
             try:
-                status = await md_provider.get_sandbox_status(self.state.sandbox_id)
+                status = await md_provider.get_sandbox_status(self.state.sandbox_ref)
                 if status == "running":
                     from api.providers import ProviderInstance
                     instance = ProviderInstance(
                         provider="modal",
-                        url=f"http://{self.state.sandbox_id}.modal.host:{self.state.listen_port}",
+                        url=f"http://{self.state.sandbox_ref}.modal.host:{self.state.listen_port}",
                         root=self.state.recipe.root or "/v",
-                        sandbox_id=self.state.sandbox_id,
+                        sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
             except Exception:
@@ -69,7 +69,7 @@ class ModalSandboxSession(BaseSandboxSession):
                 pre_start_commands=self.state.recipe.pre_start_commands or None,
                 shared_mounts=self.state.recipe.shared_mounts or None,
             )
-            self.state.sandbox_id = instance.sandbox_id
+            self.state.sandbox_ref = instance.sandbox_ref
             self.state.listen_port = instance.port
 
         self._supervisor_url = instance.url
@@ -87,7 +87,7 @@ class ModalSandboxSession(BaseSandboxSession):
 
         log.info(
             "ModalSandboxSession started: session=%s sandbox=%s url=%s",
-            self.session_id, (self.state.sandbox_id or "")[:16], instance.url,
+            self.session_id, (self.state.sandbox_ref or "")[:16], instance.url,
         )
 
     async def running(self, *, force_probe: bool = False) -> bool:
@@ -175,7 +175,7 @@ class ModalSandboxSession(BaseSandboxSession):
             await post_client.aclose()
 
     async def stop(self) -> None:
-        if self.state.sandbox_id is None:
+        if self.state.sandbox_ref is None:
             return
         if self._supervisor_url is not None:
             try:
@@ -197,13 +197,13 @@ class ModalSandboxSession(BaseSandboxSession):
             await md_provider.stop_sandbox(ProviderInstance(
                 provider="modal", url=self._supervisor_url or "",
                 root=self.state.recipe.root or "/v",
-                sandbox_id=self.state.sandbox_id or "",
+                sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
         except Exception:
             log.exception("modal.stop_sandbox failed for session %s", self.session_id)
         # Modal sandbox is gone; clear sandbox_id so next start cold-creates.
-        self.state.sandbox_id = None
+        self.state.sandbox_ref = None
         self.state.listen_port = None
 
     async def shutdown(self) -> None:

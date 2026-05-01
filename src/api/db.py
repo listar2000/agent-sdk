@@ -392,6 +392,15 @@ _MIGRATIONS = [
     "ALTER TABLE session_log DROP COLUMN IF EXISTS sandbox_id",
     # Drop the now-orphaned table.
     "DROP TABLE IF EXISTS sandboxes",
+    # 2026-04-30 (post-d5 rename): rename sandbox_state JSONB key
+    # ``sandbox_id`` → ``sandbox_ref``. The field always held the
+    # provider's opaque reference (e.g. Daytona sandbox UUID, docker
+    # container id, "local-<hex>"), never a DB row PK; the new name
+    # reflects that. Idempotent: only rows that still have the old key
+    # get rewritten, and the rewrite drops the old key in the same step.
+    """UPDATE sessions
+       SET sandbox_state = jsonb_set(sandbox_state - 'sandbox_id', '{sandbox_ref}', sandbox_state->'sandbox_id')
+       WHERE sandbox_state ? 'sandbox_id'""",
 ]
 
 

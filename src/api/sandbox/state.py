@@ -48,31 +48,31 @@ class UnknownSandboxState(_BaseSandboxState):
     appropriate concrete state when this is observed."""
 
     type: Literal["unknown"] = "unknown"
-    sandbox_id: None = None
+    sandbox_ref: None = None
     listen_port: None = None
 
 
 class DaytonaSandboxState(_BaseSandboxState):
     type: Literal["daytona"] = "daytona"
-    sandbox_id: str | None = None
+    sandbox_ref: str | None = None
     listen_port: int | None = None
 
 
 class DockerSandboxState(_BaseSandboxState):
     type: Literal["docker"] = "docker"
-    sandbox_id: str | None = None  # container id
+    sandbox_ref: str | None = None  # container id
     listen_port: int | None = None
 
 
 class UnixLocalSandboxState(_BaseSandboxState):
     type: Literal["unix_local", "local"] = "unix_local"
-    sandbox_id: str | None = None  # pid as string
+    sandbox_ref: str | None = None  # pid as string
     listen_port: int | None = None
 
 
 class ModalSandboxState(_BaseSandboxState):
     type: Literal["modal"] = "modal"
-    sandbox_id: str | None = None
+    sandbox_ref: str | None = None
     listen_port: int | None = None
 
 
@@ -104,6 +104,11 @@ def deserialize(payload: dict[str, Any] | None) -> SandboxState:
     # Tolerate legacy "local" alias by routing to unix_local.
     if payload.get("type") == "local":
         payload = {**payload, "type": "unix_local"}
+    # Tolerate legacy "sandbox_id" key — pre-d5 JSONB blobs used that
+    # name; the field was renamed to "sandbox_ref" to better reflect
+    # its meaning (opaque provider reference, not a DB row PK).
+    if "sandbox_id" in payload and "sandbox_ref" not in payload:
+        payload = {**payload, "sandbox_ref": payload["sandbox_id"]}
     if payload.get("type") not in _KNOWN_TYPES:
         return UnknownSandboxState()
     return _ADAPTER.validate_python(payload)

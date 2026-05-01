@@ -112,7 +112,7 @@ async def lifespan(app):
     await init_pool()
 
     # Startup reconciliation: kill orphan containers labeled with a
-    # sandbox_id whose DB row is gone or marked deleted. Per-provider in
+    # sandbox_ref whose DB row is gone or marked deleted. Per-provider in
     # parallel so a slow provider doesn't serialise boot. In practice
     # only Docker does real work; daytona/local/modal are no-ops today.
     async def _safe_reconcile(prov: str) -> None:
@@ -889,7 +889,7 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
 # Sandbox CRUD routes removed: the standalone ``sandboxes`` table is gone;
 # session-scoped routes (``GET /sessions/{id}/sandbox``,
 # ``DELETE /sessions/{id}``) replace them. Reverse lookups by sandbox_ref
-# go through ``SessionPool.find_by_sandbox_id``.
+# go through ``SessionPool.find_by_sandbox_ref``.
 
 
 # ---------------------------------------------------------------------------
@@ -913,8 +913,7 @@ async def admin_list_sessions():
             {
                 "session_id": sid,
                 "agent_id": sess._agent_id,
-                "sandbox_id": getattr(sess.state, "sandbox_id", None),
-                "sandbox_ref": getattr(sess.state, "sandbox_id", None),
+                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
                 "inner_session_id": sess._inner_session_id,
                 # "active subscriber" is the closest pool-level proxy for
                 # the dashboard's "running" badge — there's no per-prompt
@@ -930,7 +929,7 @@ async def admin_list_sessions():
         ],
         "instances": [
             {
-                "sandbox_id": getattr(sess.state, "sandbox_id", None),
+                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
                 "provider": getattr(sess.state, "type", "unknown"),
                 "url": sess.supervisor_url,
                 "port": getattr(sess.state, "listen_port", None),
@@ -963,7 +962,7 @@ async def list_sessions_route():
         out.append({
             "session_id": s.session_id,
             "agent_id": s._agent_id,  # noqa: SLF001
-            "sandbox_id": getattr(s.state, "sandbox_id", None),
+            "sandbox_ref": getattr(s.state, "sandbox_ref", None),
             "idle_seconds": round(now - last, 1) if last else None,
             "shutdown_requested": False,
         })
@@ -986,7 +985,7 @@ async def get_session_route(session_id: str):
         "session_id": rec.get("id"),
         "agent_id": rec.get("agent_id"),
         "volume_id": rec.get("volume_id"),
-        "sandbox_id": sb_state.get("sandbox_id") if isinstance(sb_state, dict) else None,
+        "sandbox_ref": sb_state.get("sandbox_ref") if isinstance(sb_state, dict) else None,
         "inner_session_id": rec.get("inner_session_id"),
         "env": env,
         "secrets": {"keys": sorted(secrets.keys())},
@@ -1013,7 +1012,7 @@ async def session_status(session_id: str):
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
-        "sandbox_id": getattr(state, "sandbox_id", None),
+        "sandbox_ref": getattr(state, "sandbox_ref", None),
         "inner_session_id": pool_session._inner_session_id,
         "agent_busy": False,
         "active_rpc_id": None,
@@ -1050,7 +1049,7 @@ async def session_sandbox_info(session_id: str):
     provider = getattr(state, "type", "unknown")
     if provider == "unix_local":
         provider = "local"
-    sandbox_ref = getattr(state, "sandbox_id", None)
+    sandbox_ref = getattr(state, "sandbox_ref", None)
     result: dict = {
         "session_id": session_id,
         "provider": provider,
@@ -1132,11 +1131,11 @@ async def session_resume(session_id: str, request: Request):
 
     pool = get_pool()
     pool_session = await pool.get_session(session_id)
-    sandbox_id = getattr(pool_session.state, "sandbox_id", None)
+    sandbox_ref = getattr(pool_session.state, "sandbox_ref", None)
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
-        "sandbox_id": sandbox_id,
+        "sandbox_ref": sandbox_ref,
         "inner_session_id": pool_session._inner_session_id,
         "status": "resumed",
     }
@@ -1148,7 +1147,7 @@ async def sessions_create(request: Request):
 
     Body:
       - ``provision`` (bool, default ``true``): when ``false``, skip sandbox
-        provisioning and return a session shell with ``sandbox_id = null``.
+        provisioning and return a session shell with `sandbox_ref = null`.
         The sandbox materialises on the first downstream call that needs
         one (``/sessions/{id}/resume`` or ``/message``).
       - Every other field (``volume_id``, ``agent_id``, ``provider``,
@@ -1222,7 +1221,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
         "id": session_id,
         "agent_id": agent_id,
         "volume_id": volume_record.id,
-        "sandbox_id": None,
+        "sandbox_ref": None,
         "connected": False,
     }
 
@@ -1230,9 +1229,9 @@ async def _sessions_create_lazy(data: dict) -> dict:
 async def _sessions_create_eager(data: dict) -> dict:
     """Create agent + provision compute via SessionPool + attach ACP in one call.
 
-    Returns ``{agent_id, sandbox_id, session_id, id, inner_session_id,
+    Returns ``{agent_id, sandbox_ref, session_id, id, inner_session_id,
     volume_id, connected: true}`` — ready to POST /message against
-    immediately. ``sandbox_id`` is the provider sandbox ref (an opaque
+    immediately. `sandbox_ref` is the provider sandbox ref (an opaque
     string), not the legacy ``sb_<hex>`` synthesized PK.
 
     Implementation: writes the agent + session rows + initial
@@ -1312,7 +1311,7 @@ async def _sessions_create_eager(data: dict) -> dict:
     )
     # Pre-populate sandbox_state so pool.get_session knows the recipe on
     # first call. The pool will overwrite this with the full state after
-    # cold-create (sandbox_id, listen_port, snapshot_path).
+    # cold-create (sandbox_ref, listen_port, snapshot_path).
     async with get_db() as conn:
         await conn.execute(
             "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
@@ -1333,11 +1332,11 @@ async def _sessions_create_eager(data: dict) -> dict:
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
-    # The pool's ``sandbox_state.sandbox_id`` IS the sandbox identity now —
+    # The pool's ``sandbox_state.sandbox_ref`` IS the sandbox identity now —
     # opaque provider ref (e.g. "abc-uuid" for Daytona, "local-abc12" for
     # unix_local). No separate ``sb_<hex>`` PK, no sandboxes-table row,
     # no dual-write trigger to mirror state into a parallel table.
-    provider_ref = getattr(pool_session.state, "sandbox_id", None)
+    provider_ref = getattr(pool_session.state, "sandbox_ref", None)
 
     # Forward model/mode/thought_level so callers don't have to follow
     # POST /sessions with a separate POST /config. Read both top-level
@@ -1347,11 +1346,11 @@ async def _sessions_create_eager(data: dict) -> dict:
 
     return {
         "agent_id": agent_id,
-        # ``sandbox_id`` is the provider sandbox ref now, not the legacy
+        # `sandbox_ref` is the provider sandbox ref now, not the legacy
         # synthesized ``sb_<hex>`` PK. SDK uses it as an opaque string
         # identifier for resume/persistence — the change in meaning is
         # transparent to callers that only check non-None / equality.
-        "sandbox_id": provider_ref,
+        "sandbox_ref": provider_ref,
         "session_id": session_id,
         "id": session_id,
         "volume_id": volume_record.id,

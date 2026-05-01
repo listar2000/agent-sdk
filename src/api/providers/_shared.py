@@ -139,7 +139,7 @@ class ProviderInstance:
     provider: "Provider"       # "local" | "docker" | "daytona" | "modal"
     url: str                   # http:// base URL
     root: str = "/tmp"         # filesystem root for the sandbox
-    sandbox_id: str | None = None  # Daytona sandbox ID (if daytona)
+    sandbox_ref: str | None = None  # provider's opaque ref (Daytona id, docker container id, local "local-<hex>")
     process: asyncio.subprocess.Process | None = None  # local subprocess
     port: int | None = 0       # local port (if local or docker)
     container_id: str | None = None  # Docker container ID (if docker)
