@@ -22,7 +22,10 @@ RUN pip install --no-cache-dir .
 
 # Pre-install the supervisor's npm deps so first-session startup doesn't
 # wait on npm and the ACP bin symlinks resolve relative to this directory.
-RUN cd src/supervisor && npm install --omit=optional --silent
+# Note: do NOT pass --omit=optional. opencode-ai's postinstall requires
+# the platform-specific opencode-linux-x64 (an optional dep) and fails
+# with "Cannot find module 'opencode-linux-x64/package.json'" otherwise.
+RUN cd src/supervisor && npm install --loglevel=warn
 
 # Symlink ``/opt/agent-sdk/runtime`` to the actual supervisor dir so
 # providers that hardcode the canonical runtime path (daytona/modal/docker

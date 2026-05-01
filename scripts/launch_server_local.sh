@@ -157,7 +157,10 @@ export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 # the ACP bins via package.json#bin. Idempotent (~1-2s warm cache).
 if command -v npm >/dev/null 2>&1; then
   echo "Ensuring src/supervisor npm deps are installed (source-tree fallback)..."
-  (cd "${REPO_ROOT}/src/supervisor" && npm install --omit=optional --silent) || {
+  # Don't pass --omit=optional. opencode-ai's postinstall requires the
+  # platform-specific opencode-linux-x64 (an optional dep) and fails with
+  # "Cannot find module 'opencode-linux-x64/package.json'" otherwise.
+  (cd "${REPO_ROOT}/src/supervisor" && npm install --silent) || {
     echo "npm install failed; the local provider's create_sandbox will" >&2
     echo "crash with 'ACP binary missing'. Install Node.js >=18 and rerun." >&2
   }

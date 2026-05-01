@@ -96,7 +96,10 @@ export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/agent_sdk_serv
 # scripts/launch_server_local.sh for the full rationale.
 if command -v npm >/dev/null 2>&1; then
   echo "Ensuring src/supervisor npm deps are installed..."
-  (cd "${REPO_ROOT}/src/supervisor" && npm install --omit=optional --silent) || true
+  # Don't pass --omit=optional. opencode-ai's postinstall requires the
+  # platform-specific opencode-linux-x64 (an optional dep) and fails with
+  # "Cannot find module 'opencode-linux-x64/package.json'" otherwise.
+  (cd "${REPO_ROOT}/src/supervisor" && npm install --silent) || true
 fi
 
 # Daytona / docker / modal providers auto-resolve from .runtime-image-tag
