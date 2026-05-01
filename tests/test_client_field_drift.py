@@ -51,13 +51,13 @@ async def test_configure_surfaces_server_error_message():
     agent.id = "err-cfg"
 
     resp = _fake_response(502, {"error": "supervisor unreachable: boom"})
-    with patch.object(agent._client, "post", AsyncMock(return_value=resp)):
+    with patch.object(agent._api._http, "request", AsyncMock(return_value=resp)):
         with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await agent.configure(mode="acceptEdits")
     # Cycle-11-style fix: error message must include server detail, not
     # just "HTTP 502".
     assert "supervisor unreachable: boom" in str(exc_info.value)
-    await agent._client.aclose()
+    await agent._api.close()
 
 
 @pytest.mark.asyncio
@@ -70,11 +70,11 @@ async def test_cancel_surfaces_server_error_message():
     agent.id = "err-cancel"
 
     resp = _fake_response(504, {"error": "cancel timed out"})
-    with patch.object(agent._client, "post", AsyncMock(return_value=resp)):
+    with patch.object(agent._api._http, "request", AsyncMock(return_value=resp)):
         with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await agent.cancel()
     assert "cancel timed out" in str(exc_info.value)
-    await agent._client.aclose()
+    await agent._api.close()
 
 
 @pytest.mark.asyncio
@@ -87,11 +87,11 @@ async def test_plain_register_surfaces_server_error_message():
     agent = Agent("err-reg", api_url="http://localhost:7778")
 
     resp = _fake_response(400, {"error": "name required"})
-    with patch.object(agent._client, "post", AsyncMock(return_value=resp)):
+    with patch.object(agent._api._http, "request", AsyncMock(return_value=resp)):
         with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await agent._ensure_registered()
     assert "name required" in str(exc_info.value)
-    await agent._client.aclose()
+    await agent._api.close()
 
 
 # ---------------------------------------------------------------------------
@@ -112,11 +112,16 @@ def test_server_handlers_emit_every_field_the_sdk_reads():
     server_src = (root / "src/api/server.py").read_text()
 
     # (endpoint_marker, required_fields_the_sdk_reads)
+    # ``sandbox_id`` was renamed to ``sandbox_ref`` when the sandboxes
+    # table was dropped (sandbox_state JSONB is now the single source of
+    # truth) — the SDK reads ``sandbox_ref`` everywhere it used to read
+    # ``sandbox_id``. See ``agent_sdk/client.py`` lines that call
+    # ``data.get("sandbox_ref")``.
     expectations = [
         ("/sessions",
-         ["agent_id", "sandbox_id", "inner_session_id", "session_id"]),
+         ["agent_id", "sandbox_ref", "inner_session_id", "session_id"]),
         ("/sessions/{session_id}/resume",
-         ["agent_id", "sandbox_id", "inner_session_id"]),
+         ["agent_id", "sandbox_ref", "inner_session_id"]),
         ("/sessions/{session_id}/message",
          ["rpc_id"]),
     ]

@@ -253,9 +253,8 @@
       <a href="#events">Events</a>
       <a href="#resuming">Resuming</a>
       <a href="#sandbox">Sandbox access</a>
-      <a href="#system-prompt">System prompt</a>
       <a href="#configure">Live config</a>
-      <a href="#tools-mcp">Tools, MCP, skills</a>
+      <a href="#tools-mcp">MCP &amp; skills</a>
       <a href="#usage">Token usage</a>
       <a href="#cred">Credentials</a>
       <a href="#config-files">Config files</a>
@@ -335,18 +334,16 @@ pip install fastapi uvicorn psycopg[binary] psycopg_pool</code></pre>
         <tbody>
           <tr><td class="param-name">name</td><td class="param-type">str</td><td class="param-default">—</td><td class="param-desc">Agent identifier.</td></tr>
           <tr><td class="param-name">agent_type</td><td class="param-type">str</td><td class="param-default">"claude"</td><td class="param-desc">One of: <code style="color:#c084fc;font-family:monospace">claude</code>, <code style="color:#c084fc;font-family:monospace">codex</code>, <code style="color:#c084fc;font-family:monospace">opencode</code>, <code style="color:#c084fc;font-family:monospace">gemini</code>, <code style="color:#c084fc;font-family:monospace">cline</code>, <code style="color:#c084fc;font-family:monospace">deepagents</code>, <code style="color:#c084fc;font-family:monospace">openhands</code>, <code style="color:#c084fc;font-family:monospace">goose</code>.</td></tr>
-          <tr><td class="param-name">provider</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Sandbox provider — <code style="color:#4ade80;font-family:monospace">local</code>, <code style="color:#4ade80;font-family:monospace">docker</code>, or <code style="color:#4ade80;font-family:monospace">daytona</code>. Required for new sessions.</td></tr>
+          <tr><td class="param-name">provider</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Sandbox provider — <code style="color:#4ade80;font-family:monospace">local</code>, <code style="color:#4ade80;font-family:monospace">docker</code>, <code style="color:#4ade80;font-family:monospace">daytona</code>, <code style="color:#4ade80;font-family:monospace">modal</code>. Required for new sessions.</td></tr>
           <tr><td class="param-name">model</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Model override, e.g. <code style="color:#fbbf24;font-family:monospace">"haiku"</code>, <code style="color:#fbbf24;font-family:monospace">"claude-sonnet-4-6"</code>.</td></tr>
-          <tr><td class="param-name">prompt</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">System prompt — injected automatically before the first user message.</td></tr>
-          <tr><td class="param-name">cwd</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Working directory inside the sandbox.</td></tr>
+          <tr><td class="param-name">cwd</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Working directory inside the sandbox. Per-conversation — keys the JSONL hash.</td></tr>
           <tr><td class="param-name">root</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Sandbox filesystem root. Defaults to <code style="color:#fbbf24;font-family:monospace">/tmp</code> on the server.</td></tr>
-          <tr><td class="param-name">tools</td><td class="param-type">list[str] | None</td><td class="param-default">None</td><td class="param-desc">Names of tools to enable — e.g. <code style="color:#fbbf24;font-family:monospace">["Bash", "Read", "Write"]</code>.</td></tr>
           <tr><td class="param-name">mcp_servers</td><td class="param-type">dict[str, dict]</td><td class="param-default">None</td><td class="param-desc">MCP server configs keyed by name — see <a href="#tools-mcp" style="color:#60a5fa">below</a>.</td></tr>
           <tr><td class="param-name">skills</td><td class="param-type">list[str] | dict</td><td class="param-default">None</td><td class="param-desc">npx-style skill sources, e.g. <code style="color:#fbbf24;font-family:monospace">["rllm-org/hive#staging"]</code>.</td></tr>
           <tr><td class="param-name">dockerfile</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Path to a Dockerfile — its contents are sent to the server for sandbox image build.</td></tr>
           <tr><td class="param-name">api_url</td><td class="param-type">str | None</td><td class="param-default">env / Railway</td><td class="param-desc">Server URL. Falls back to <code style="color:#fbbf24;font-family:monospace">AGENT_API_URL</code> env or the hosted Railway URL.</td></tr>
           <tr><td class="param-name">session_id</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Pass to resume an existing session — server looks up everything else.</td></tr>
-          <tr><td class="param-name">sandbox_id</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Pass to attach to an existing sandbox.</td></tr>
+          <tr><td class="param-name">sandbox_ref</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Provider sandbox ref (opaque). Passed only when reattaching a known sandbox; usually you let the server allocate one.</td></tr>
           <tr><td class="param-name">db</td><td class="param-type">str | None</td><td class="param-default">None</td><td class="param-desc">Path to a SQLite file for local session-id persistence.</td></tr>
           <tr><td class="param-name">oauth_token</td><td class="param-type">str | None</td><td class="param-default">env</td><td class="param-desc">Claude OAuth token. Falls back to <code style="color:#fbbf24;font-family:monospace">CLAUDE_CODE_OAUTH_TOKEN</code>.</td></tr>
           <tr><td class="param-name">api_key</td><td class="param-type">str | None</td><td class="param-default">env</td><td class="param-desc">Anthropic API key. Falls back to <code style="color:#fbbf24;font-family:monospace">ANTHROPIC_API_KEY</code>.</td></tr>
@@ -402,7 +399,7 @@ text = agent.<span class="fn">run</span>(<span class="st">"Say hi"</span>, timeo
 <span class="kw">await</span> agent.<span class="fn">send</span>(<span class="st">"Cancel and do this instead."</span>, interrupt=<span class="nm">True</span>)</code></pre>
     </div>
     <div class="callout callout-blue">
-      Interrupt sends <code>session/cancel</code> upstream, waits for the active prompt to drain (10s safety timeout), then queues the new message at the tail. Already-queued prompts are unaffected.
+      Interrupt is purely client-side: <code>cancel()</code> first, then submit. The server has no per-session prompt queue — see <code>docs/acp-boundary-problem.md</code>.
     </div>
 
     <div class="card">
@@ -427,7 +424,6 @@ text = agent.<span class="fn">run</span>(<span class="st">"Say hi"</span>, timeo
         <div class="ev-type">usage</div><div class="ev-desc">Token / cost stats. Fields: <code style="color:#fbbf24;font-family:monospace">inputTokens</code>, <code style="color:#fbbf24;font-family:monospace">outputTokens</code>, <code style="color:#fbbf24;font-family:monospace">totalCostUsd</code>.</div>
         <div class="ev-type">done</div><div class="ev-desc">Turn complete. Last event in a stream. Field: <code style="color:#fbbf24;font-family:monospace">stop_reason</code> (e.g. <code style="color:#fbbf24;font-family:monospace">end_turn</code>, <code style="color:#fbbf24;font-family:monospace">cancelled</code>).</div>
         <div class="ev-type">error</div><div class="ev-desc">Server-side error frame. Raised as <code style="color:#fbbf24;font-family:monospace">PromptError</code> from <code style="color:#fbbf24;font-family:monospace">astream</code>; yielded as a dict from <code style="color:#fbbf24;font-family:monospace">events()</code>.</div>
-        <div class="ev-type">sandbox_reattach</div><div class="ev-desc">Emitted when the session transparently reprovisioned its sandbox against the same volume. Fields: <code style="color:#fbbf24;font-family:monospace">old_sandbox_id</code>, <code style="color:#fbbf24;font-family:monospace">new_sandbox_id</code>.</div>
       </div>
     </div>
 
@@ -486,12 +482,12 @@ reply = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span c
     </div>
 
     <div class="callout callout-purple">
-      <strong>Sandbox reattach is automatic.</strong> The session row stores <code>volume_id</code>, so when the previous sandbox is reaped or killed, the next <code>/message</code> reprovisions a fresh sandbox that mounts the same volume. Claude CLI then runs <code>session/load</code> from the on-disk transcript. You'll see a <code>sandbox_reattach</code> event before the first text of that turn.
+      <strong>Sandbox reattach is automatic.</strong> The session row stores <code>volume_id</code> and the discriminated <code>sandbox_state</code> JSONB. When the previous sandbox is reaped or killed, the next call routes through <code>SessionPool.get_session()</code> — cold-creates a fresh sandbox that mounts the same volume, and the agent CLI resumes from the on-disk transcript via <code>session/load</code>. No special event surfaces — the SDK handles it transparently.
     </div>
 
     <div class="subhead">reset_session — start fresh</div>
     <div class="card">
-      <pre><code>agent.<span class="fn">reset_session</span>()  <span class="cm"># clears session_id, sandbox_id; next call re-registers</span></code></pre>
+      <pre><code>agent.<span class="fn">reset_session</span>()  <span class="cm"># clears session_id, sandbox_ref; next call re-registers</span></code></pre>
     </div>
   </div>
 
@@ -521,25 +517,6 @@ result = <span class="kw">await</span> agent.sandbox.<span class="fn">exec</span
     </div>
   </div>
 
-  <!-- ── System prompt ── -->
-  <div class="section" id="system-prompt">
-    <div class="section-header">
-      <h2><span class="section-icon" style="background:rgba(59,130,246,0.15);color:#60a5fa">📝</span>System prompt</h2>
-      <p class="section-sub">Pin a role or behavior for the lifetime of the session.</p>
-    </div>
-    <div class="card">
-      <pre><code>agent = <span class="fn">Agent</span>(
-    <span class="st">"analyst"</span>,
-    provider=<span class="st">"local"</span>,
-    prompt=<span class="st">"You are a data analyst. Always format numbers with commas."</span>,
-)
-reply = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"What is 1000000 + 234567?"</span>)
-<span class="cm"># "1,234,567"</span></code></pre>
-    </div>
-    <div class="callout callout-amber">
-      The prompt is wrapped in <code>&lt;system-context&gt;</code> tags and injected before the <strong>first</strong> user message. It is <strong>not</strong> re-sent each turn.
-    </div>
-  </div>
 
   <!-- ── Live config ── -->
   <div class="section" id="configure">
@@ -556,19 +533,11 @@ reply = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span c
     </div>
   </div>
 
-  <!-- ── Tools, MCP, skills ── -->
+  <!-- ── MCP, skills ── -->
   <div class="section" id="tools-mcp">
     <div class="section-header">
-      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">🛠</span>Tools, MCP servers, skills</h2>
-      <p class="section-sub">Extend the agent's capabilities at registration time.</p>
-    </div>
-
-    <div class="card">
-      <div class="card-label">Tools — restrict to a whitelist</div>
-      <pre><code>agent = <span class="fn">Agent</span>(
-    <span class="st">"safe-bot"</span>, provider=<span class="st">"local"</span>,
-    tools=[<span class="st">"Read"</span>, <span class="st">"Grep"</span>, <span class="st">"Bash"</span>],
-)</code></pre>
+      <h2><span class="section-icon" style="background:rgba(34,197,94,0.15);color:#4ade80">🛠</span>MCP servers &amp; skills</h2>
+      <p class="section-sub">Extend the agent's capabilities at registration time. Tool whitelisting is the agent CLI's job — set it via <code style="color:#fbbf24">configure(mode=…)</code> or in the underlying agent's own config.</p>
     </div>
 
     <div class="card">
@@ -650,8 +619,7 @@ reply = <span class="kw">await</span> agent.<span class="fn">arun</span>(<span c
     <div class="card">
       <div class="card-label">Load from JSON or YAML</div>
       <pre><code><span class="cm"># configs/coder.json</span>
-<span class="cm">#   {"agent_type":"claude","model":"haiku","provider":"local",</span>
-<span class="cm">#    "prompt":"You are a coder.","cwd":"/workspace"}</span>
+<span class="cm">#   {"agent_type":"claude","model":"haiku","provider":"local","cwd":"/workspace"}</span>
 
 agent = <span class="nb">Agent</span>.<span class="fn">from_file</span>(<span class="st">"configs/coder.json"</span>, api_url=<span class="st">"http://localhost:7778"</span>)
 agent2 = <span class="nb">Agent</span>.<span class="fn">from_config</span>(<span class="st">"adhoc"</span>, {<span class="st">"agent_type"</span>: <span class="st">"claude"</span>, <span class="st">"provider"</span>: <span class="st">"local"</span>})</code></pre>
@@ -659,7 +627,7 @@ agent2 = <span class="nb">Agent</span>.<span class="fn">from_config</span>(<span
 
     <div class="card">
       <div class="card-label">Clone — same config, different name</div>
-      <pre><code>base = <span class="fn">Agent</span>(<span class="st">"base"</span>, provider=<span class="st">"local"</span>, model=<span class="st">"haiku"</span>, prompt=<span class="st">"Be concise."</span>)
+      <pre><code>base = <span class="fn">Agent</span>(<span class="st">"base"</span>, provider=<span class="st">"local"</span>, model=<span class="st">"haiku"</span>)
 workers = [base.<span class="fn">clone</span>(<span class="st">f"worker-{i}"</span>) <span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="nm">3</span>)]
 results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*[w.<span class="fn">arun</span>(<span class="st">"Summarize AI."</span>) <span class="kw">for</span> w <span class="kw">in</span> workers])</code></pre>
     </div>
@@ -683,7 +651,7 @@ results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*
 <span class="kw">await</span> agent.<span class="fn">aclose</span>()  <span class="cm"># reaps server-side session, then closes httpx client</span>
 
 <span class="cm"># Close only the HTTP client (e.g. you want to reap externally):</span>
-<span class="kw">await</span> agent._client.<span class="fn">aclose</span>()</code></pre>
+<span class="kw">await</span> agent._api.<span class="fn">close</span>()</code></pre>
     </div>
   </div>
 
@@ -792,8 +760,8 @@ results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*
         Use <code>pre_start_commands</code> to install CLIs, drop config files, or seed state that has to be ready before the agent boots. The full lifecycle:
         <ul>
           <li><strong>Initial provision:</strong> commands run inside the new sandbox.</li>
-          <li><strong>Type 2 recovery</strong> (sandbox replaced — external delete, unrecoverable Daytona error, <code>/reset-sandbox</code>): commands re-run on the replacement sandbox.</li>
-          <li><strong>Type 1 recovery</strong> (same sandbox restarted via <code>start_sandbox</code>): commands do <em>not</em> re-run — the original side-effects are still on disk.</li>
+          <li><strong>Type 2 recovery</strong> (sandbox replaced — external delete, unrecoverable provider error): commands re-run on the replacement sandbox via the recipe stored on <code>sandbox_state</code>.</li>
+          <li><strong>Type 1 recovery</strong> (same sandbox restarted): commands do <em>not</em> re-run — the original side-effects are still on disk.</li>
           <li>Skill-install commands are re-merged from <code>agent.config.skills</code> at recovery time, so editing skills on a long-lived agent takes effect on the next sandbox replacement.</li>
           <li>For <code>local</code> provider, <code>pre_start_commands</code> are ignored — there's no sandbox boundary to safely run caller commands in.</li>
         </ul>
@@ -834,13 +802,15 @@ results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*
     </div>
 
     <div class="card">
-      <div class="card-label">Replay verification — destroy the sandbox, send a new message, watch them re-run</div>
-      <pre><code><span class="cm"># Force a Type 2 recovery (replacement sandbox):</span>
-<span class="kw">async with</span> httpx.<span class="fn">AsyncClient</span>(base_url=<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> raw:
-    <span class="kw">await</span> raw.<span class="fn">post</span>(<span class="st">f"/sessions/{agent.session_id}/reset-sandbox"</span>)
+      <div class="card-label">Replay verification — release + delete the lease, then send a new message</div>
+      <pre><code><span class="cm"># Release current compute lease (snapshot + drop) — the next call will</span>
+<span class="cm"># either Type-1 resume from snapshot or Type-2 reprovision if the snapshot</span>
+<span class="cm"># is stale / the provider sandbox is gone:</span>
+<span class="kw">async with</span> agent_sdk.<span class="fn">ApiClient</span>(<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> sc:
+    <span class="kw">await</span> sc.<span class="fn">release_session</span>(agent.session_id)
 
 <span class="kw">await</span> agent.<span class="fn">arun</span>(<span class="st">"verify environment"</span>)
-<span class="cm"># pre_start_commands re-ran on the replacement sandbox before the supervisor started.</span></code></pre>
+<span class="cm"># If a Type-2 reprovision was triggered, pre_start_commands re-ran first.</span></code></pre>
     </div>
   </div>
 
@@ -860,8 +830,6 @@ results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*
         provider=<span class="st">"daytona"</span>,
         model=<span class="st">"haiku"</span>,
         cwd=<span class="st">"/home/daytona"</span>,
-        prompt=<span class="st">"You are an expert Python developer. Keep responses short."</span>,
-        tools=[<span class="st">"Bash"</span>, <span class="st">"Read"</span>, <span class="st">"Write"</span>],
         pre_start_commands=[<span class="st">"npm install -g cowsay"</span>],
         api_url=<span class="st">"http://localhost:7778"</span>,
     ) <span class="kw">as</span> agent:

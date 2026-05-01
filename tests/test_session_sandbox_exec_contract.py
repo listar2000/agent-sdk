@@ -99,7 +99,7 @@ async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
 async def test_exec_in_instance_local_runs_with_instance_root(monkeypatch, tmp_path):
     """Local direct exec must run in the sandbox root, not the API process cwd."""
     instance = providers.ProviderInstance(
-        provider="local", url="", root=str(tmp_path), sandbox_id="local-ref",
+        provider="local", url="", root=str(tmp_path), sandbox_ref="local-ref",
     )
     captured: dict = {}
 
@@ -121,7 +121,7 @@ async def test_exec_in_instance_local_runs_with_instance_root(monkeypatch, tmp_p
 async def test_exec_in_instance_docker_uses_sandbox_id_as_container_fallback(monkeypatch):
     """Docker direct exec can run from a DB-derived instance."""
     instance = providers.ProviderInstance(
-        provider="docker", url="", root="/home/agent", sandbox_id="container-abc123",
+        provider="docker", url="", root="/home/agent", sandbox_ref="container-abc123",
     )
     captured: dict = {}
 
@@ -144,7 +144,7 @@ async def test_exec_in_instance_docker_uses_sandbox_id_as_container_fallback(mon
 async def test_exec_in_instance_daytona_preserves_exit_code_and_stderr(monkeypatch):
     """Daytona exec must surface real exit_code/stderr for shell-based file ops."""
     instance = providers.ProviderInstance(
-        provider="daytona", url="", root="/home/daytona", sandbox_id="sb-daytona-1",
+        provider="daytona", url="", root="/home/daytona", sandbox_ref="sb-daytona-1",
     )
 
     class _FakeLoop:

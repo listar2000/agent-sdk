@@ -49,19 +49,22 @@ from ._shared import (
     _acp_launch_args,
     _ACP_NPM_SPECS,
     _build_env_prefix,
+    _build_volume_mounts,
     _get_sandbox_env_vars,
+    _read_runtime_image_tag,
+    _read_runtime_snapshot_tag,
     _safe_path,
     _wait_for_health,
     build_supervisor_argv,
     ProviderInstance,
     VolumeFileExistsError,
-    _build_volume_mounts,
     normalize_find_output,
 )
 
-_SUPERVISOR_DIR = Path(__file__).resolve().parent.parent.parent / "supervisor"
-_SUPERVISOR_REMOTE_DIR = "/tmp/agent-sdk-sup"  # legacy path (pre-volume era)
-_SUPERVISOR_VOLUME_DIR = "/opt/supervisor"      # volume-mounted path (Phase 2+)
+# Phase E of docs/runtime-image-unification.md: ``_SUPERVISOR_DIR``,
+# ``_SUPERVISOR_REMOTE_DIR``, and ``_SUPERVISOR_VOLUME_DIR`` were deleted
+# along with the install/cache helpers that used them. The supervisor now
+# lives at ``/opt/agent-sdk/runtime/`` inside the daytona sandbox image.
 _SUPERVISOR_REMOTE_PORT = 9100
 
 # The agent's HOME inside a Daytona sandbox — a LOCAL ext4 directory the
@@ -177,89 +180,21 @@ async def start_supervisor_in_sandbox(
         )
         return url
 
-    vol_tarball = f"{_SUPERVISOR_VOLUME_DIR}/deps.tar.gz"
-    vol_supervisor = f"{_SUPERVISOR_VOLUME_DIR}/supervisor.js"
-    local_work = f"/tmp/sup-work-{port}"
-
-    # (1) Cache-visibility check. S3-backed FUSE on daytona has seconds-level
-    # write-to-read propagation, so a freshly-installed supervisor may not
-    # be visible immediately. Exponential backoff instead of the old 10×1s:
-    # first check is instant for the hot path (install ran long ago); slow
-    # path still has ~6s total before giving up.
-    t0 = time.monotonic()
-    backoffs = [0.0, 0.2, 0.4, 0.8, 1.6, 3.2]  # sum ≈ 6.2 s
-    check_result = "no"
-    for delay in backoffs:
-        if delay > 0:
-            await asyncio.sleep(delay)
-        check_result = await loop.run_in_executor(
-            None, lambda: _exec(f"test -f {vol_tarball} && echo yes || echo no")
-        )
-        if check_result.strip() == "yes":
-            break
-    _bench("cache_check", t0)
-
-    if check_result.strip() != "yes":
-        diag = await loop.run_in_executor(
-            None, lambda: _exec(
-                f"ls -la {_SUPERVISOR_VOLUME_DIR} 2>&1 | head -10; "
-                f"echo '---'; mount | grep -i supervisor"
-            )
-        )
-        log.warning(
-            "start_supervisor_in_sandbox: volume cache not visible after retries "
-            "(sandbox %s); /opt/supervisor contents:\n%s",
-            sandbox.id[:16], diag,
-        )
-
-    if check_result.strip() == "yes":
-        # (2) Volume-cached mode: extract deps tarball to local ephemeral dir
-        # AND resolve the ACP bin symlink in the same exec — one fewer
-        # sandbox.process.exec round-trip (~100-300ms savings). Emit the
-        # resolved path on a parseable ``ACP_BIN=...`` line.
-        t0 = time.monotonic()
-        extract_out = await loop.run_in_executor(None, lambda: _exec(
-            f"set -e && "
-            f"mkdir -p {local_work} && "
-            # Copy the tarball off the slow volume first; S3-backed FUSE
-            # reads block the tar streaming decode if a chunk hasn't been
-            # fetched yet and show up as silent tar data corruption.
-            f"cp {vol_tarball} /tmp/deps-{port}.tar.gz && "
-            f"tar -C {local_work} -xzf /tmp/deps-{port}.tar.gz && "
-            f"cp {vol_supervisor} {local_work}/supervisor.js && "
-            f"rm -f /tmp/deps-{port}.tar.gz && "
-            # npm install should set +x on bin entries — but tar sometimes
-            # strips it when packing + extracting across hosts. Re-apply.
-            f"target=$(readlink -f {local_work}/node_modules/.bin/{bin_name}) && "
-            f"chmod +x \"$target\" && "
-            f"echo \"ACP_BIN=$target\"",
-            120,
-        ))
-        _bench("extract", t0)
-        sup_dir = local_work
-        # Parse ACP_BIN=... from the extract output (last line of set -e chain).
-        acp_bin = f"{sup_dir}/node_modules/.bin/{bin_name}"
-        for line in (extract_out or "").splitlines():
-            if line.startswith("ACP_BIN="):
-                acp_bin = line[len("ACP_BIN="):].strip() or acp_bin
-                break
-        log.info("start_supervisor_in_sandbox: using volume cache → %s "
-                 "(port %d, sandbox %s, acp_bin=%s)",
-                 local_work, port, sandbox.id[:16], acp_bin)
-    else:
-        # Legacy path: deps are installed directly in the sandbox.
-        sup_dir = _SUPERVISOR_REMOTE_DIR
-        acp_bin = f"{sup_dir}/node_modules/.bin/{bin_name}"
-        # Separate round-trip only on the legacy fallback.
-        t0 = time.monotonic()
-        resolved = await loop.run_in_executor(None, lambda: _exec(
-            f"readlink -f {sup_dir}/node_modules/.bin/{bin_name}"
-        ))
-        _bench("symlink_resolve_legacy", t0)
-        if resolved.strip():
-            acp_bin = resolved.strip()
-        log.info("start_supervisor_in_sandbox: using legacy path %s (port %d, sandbox %s)",
-                 _SUPERVISOR_REMOTE_DIR, port, sandbox.id[:16])
+    # Phase E of docs/runtime-image-unification.md: the daytona sandbox boots
+    # from an image whose ``/opt/agent-sdk/runtime/`` already contains
+    # supervisor.js + every ACP bin. No volume-side cache check, no
+    # deps.tar.gz extract, no legacy /tmp install — all gone with the image.
+    # The bin path is resolved via ``package.json#bin`` (not
+    # ``node_modules/.bin/``) because daytona's image-build flattens
+    # symlinks; the underlying scripts survive but the symlinks don't.
+    from ._shared import _runtime_acp_bin_relative
+    sup_dir = "/opt/agent-sdk/runtime"
+    acp_bin = f"{sup_dir}/{_runtime_acp_bin_relative(agent_type)}"
+    log.info(
+        "start_supervisor_in_sandbox: using image runtime %s "
+        "(port %d, sandbox %s)",
+        sup_dir, port, sandbox.id[:16],
+    )
 
     env_prefix = _build_env_prefix(spawn_env)
     log_file = f"{sup_dir}/sup-{port}.log"
@@ -315,6 +250,11 @@ async def start_supervisor_in_sandbox(
     return url
 
 
+# ``_resolve_legacy_volume_supervisor`` was deleted in Phase E of
+# docs/runtime-image-unification.md — all its volume-cache + tar-extract +
+# legacy-fallback work is obsolete now that the runtime is in the image.
+
+
 async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
     """Kill a supervisor process by port inside a Daytona sandbox."""
     loop = asyncio.get_running_loop()
@@ -361,7 +301,22 @@ async def provision_daytona_sandbox(
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
 
-    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
+    # Phase E of docs/runtime-image-unification.md: the runtime is baked
+    # into the agent-sdk Docker image. Provisioning needs either a
+    # snapshot (faster cold-start, registered by ``scripts/release.sh``
+    # via Daytona's ``Image.from_dockerfile``) or an image reference. The
+    # legacy "hive-large" default is gone — it predates the runtime
+    # baking and would silently skip it.
+    #
+    # Snapshot precedence: ``DAYTONA_SNAPSHOT`` env > ``.runtime-snapshot-tag``
+    # repo file. Image precedence: ``DAYTONA_IMAGE`` > ``AGENT_SDK_IMAGE``
+    # > ``.runtime-image-tag``. The repo files are written by release.sh
+    # so a fresh checkout's daytona path "just works" without any env-var
+    # plumbing in launch scripts.
+    snapshot = (
+        os.environ.get("DAYTONA_SNAPSHOT", "").strip()
+        or (_read_runtime_snapshot_tag() or "")
+    )
     use_snapshot = dockerfile is None and snapshot.lower() not in {"", "0", "false", "image"}
 
     if dockerfile is not None:
@@ -370,7 +325,19 @@ async def provision_daytona_sandbox(
         from daytona_sdk import Image
         image = Image.from_dockerfile(dockerfile)
     elif not use_snapshot:
-        image = "node:22-slim"
+        # Same precedence as docker.create_sandbox: per-provider override >
+        # cross-provider override > committed pin.
+        image = (
+            os.environ.get("DAYTONA_IMAGE")
+            or os.environ.get("AGENT_SDK_IMAGE")
+            or _read_runtime_image_tag()
+        )
+        if not image:
+            raise RuntimeError(
+                "Daytona provisioning requires DAYTONA_IMAGE / "
+                "AGENT_SDK_IMAGE / .runtime-image-tag (produced by "
+                "scripts/release.sh)."
+            )
 
     create_timeout = 300 if dockerfile else 60
 
@@ -400,8 +367,18 @@ async def provision_daytona_sandbox(
         if pre_start_commands:
             for cmd in pre_start_commands:
                 log.info("provision pre-start: %s", cmd)
+                # Pin HOME to the daytona agent home so user commands
+                # (e.g. ``npx skills add ... -g``) write into the same
+                # ``$HOME/.claude/skills/`` directory the supervisor
+                # later spawns Claude under (cwd=/home/daytona). Without
+                # this the shell's default HOME is /root and skills end
+                # up in /root/.claude/skills/, invisible to Claude.
+                wrapped = (
+                    f"export HOME={_DAYTONA_AGENT_HOME} && "
+                    f"mkdir -p {_DAYTONA_AGENT_HOME} && {cmd}"
+                )
                 result = await loop.run_in_executor(
-                    None, lambda c=cmd: _run_sandbox_exec(sandbox, c, timeout=120),
+                    None, lambda c=wrapped: _run_sandbox_exec(sandbox, c, timeout=120),
                 )
                 if result.exit_code is None:
                     log.warning(
@@ -686,7 +663,12 @@ async def _init_volume_dirs(volume_ref: str) -> None:
     daytona = Daytona(DaytonaConfig(api_key=api_key))
     loop = asyncio.get_running_loop()
 
-    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
+    # _init_volume_dirs only runs `mkdir` on a brand-new volume — any image
+    # with a POSIX shell works. Phase E: no implicit hive-large default;
+    # operators opt into a snapshot via DAYTONA_SNAPSHOT, otherwise the
+    # ``node:22-slim`` fallback is used (volume-init does not need the
+    # agent-sdk runtime).
+    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "").strip()
     use_snapshot = snapshot.lower() not in {"", "0", "false", "image"}
 
     # Mount the whole volume at /v (no subpath) so we can create dirs.
@@ -865,147 +847,11 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     )
 
 
-async def install_supervisor(volume_ref: str, agent_type: str) -> None:
-    """Atomically install supervisor.js + ACP deps on this volume.
-
-    Writes the artifacts (``deps.tar.gz`` + ``supervisor.js``) into a sibling
-    staging dir (``system/supervisor.tmp.<uuid>/``) first, verifies both
-    sentinels are present, then atomically renames the staging dir over
-    ``system/supervisor`` via ``mv``. If any step fails the staging dir is
-    removed, leaving any previous install untouched — a retried install
-    can never end up with a half-written ``deps.tar.gz`` racing against a
-    live reader.
-
-    Mounts ``system/`` (not ``system/supervisor``) so staging and final
-    share a single mount point and ``mv`` is a rename-within-volume.
-    """
-    from daytona_sdk import (
-        Daytona, DaytonaConfig, CreateSandboxFromSnapshotParams,
-        CreateSandboxFromImageParams, VolumeMount,
-    )
-
-    api_key = os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DAYTONA_API_KEY not set")
-    daytona = Daytona(DaytonaConfig(api_key=api_key))
-    loop = asyncio.get_running_loop()
-
-    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "hive-large").strip()
-    use_snapshot = snapshot.lower() not in {"", "0", "false", "image"}
-
-    # Mount whole system/ so staging + final share the mount and mv can rename.
-    volumes = [VolumeMount(volume_id=volume_ref, mount_path="/work", subpath="system")]
-    install_labels = _sandbox_labels()
-
-    if use_snapshot:
-        sb = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot, auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=install_labels,
-            ), timeout=120,
-        ))
-    else:
-        sb = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromImageParams(
-                image="node:22-slim", auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=install_labels,
-            ), timeout=120,
-        ))
-
-    staging_name = f"supervisor.tmp.{uuid.uuid4().hex[:8]}"
-    staging_on_volume = f"/work/{staging_name}"
-    final_on_volume = "/work/supervisor"
-
-    try:
-        npm_spec = _ACP_NPM_SPECS[agent_type]
-
-        def _exec(cmd: str, timeout: int | None = 60) -> str:
-            return _run_sandbox_exec(sb, cmd, timeout=timeout).stdout
-
-        # npm install to local ephemeral FS (fast SSD), pack to a tarball,
-        # place it on the volume under the staging dir.  Every shell step
-        # uses ``set -e`` so a silent npm failure can't produce an empty
-        # node_modules that then tarballs without the acp bin.
-        local_dir = "/tmp/sup-install"
-        bin_name = _acp_bin_name(agent_type)
-        await loop.run_in_executor(None, lambda: _exec(
-            f"set -e && rm -rf {local_dir} && mkdir -p {local_dir} && "
-            f"cd {local_dir} && npm init -y >/dev/null 2>&1"
-        ))
-        install_out = await loop.run_in_executor(None, lambda: _exec(
-            f"set -e && cd {local_dir} && "
-            f"npm install --omit=optional {npm_spec} 2>&1",
-            240,
-        ))
-        # Sentinel: the ACP bin must exist after npm install.  If it
-        # doesn't, surface the npm output so the caller knows why.
-        verify = await loop.run_in_executor(None, lambda: _exec(
-            f"test -f {local_dir}/node_modules/.bin/{bin_name} && echo ok || echo missing"
-        ))
-        if verify.strip() != "ok":
-            raise RuntimeError(
-                f"npm install produced no {bin_name} at "
-                f"{local_dir}/node_modules/.bin/ — npm output:\n"
-                f"{install_out[-2000:]}"
-            )
-
-        # Build the staging dir on the volume and drop the tarball there.
-        await loop.run_in_executor(None, lambda: _exec(
-            f"set -e && mkdir -p {staging_on_volume} && "
-            f"tar -C {local_dir} -czf /tmp/deps.tar.gz . && "
-            # Sanity-check the tarball contains the acp bin before we ship
-            # it onto the slow network volume.  Cheap sanity gate.
-            f"tar -tzf /tmp/deps.tar.gz | grep -q 'node_modules/.bin/{bin_name}' && "
-            f"cp /tmp/deps.tar.gz {staging_on_volume}/deps.tar.gz && "
-            f"rm -f /tmp/deps.tar.gz && rm -rf {local_dir}",
-            120,
-        ))
-
-        # Upload supervisor.js into the staging dir via the Daytona fs API.
-        with open(_SUPERVISOR_DIR / "supervisor.js", "rb") as f:
-            sup_js_bytes = f.read()
-        await loop.run_in_executor(
-            None, lambda: sb.fs.upload_file(
-                sup_js_bytes, f"{staging_on_volume}/supervisor.js"
-            )
-        )
-
-        # Sentinel checks + atomic swap. Using shell ``test`` so a single
-        # missing file aborts before we touch the existing supervisor dir.
-        # mountpoint-s3 doesn't support rename of non-empty dirs, so we
-        # create final/ and copy contents in (idempotent via rm -rf first).
-        await loop.run_in_executor(None, lambda: _exec(
-            f"set -e && "
-            f"test -f {staging_on_volume}/deps.tar.gz && "
-            f"test -f {staging_on_volume}/supervisor.js && "
-            f"rm -rf {final_on_volume} && "
-            f"mkdir -p {final_on_volume} && "
-            f"cp -f {staging_on_volume}/deps.tar.gz {final_on_volume}/deps.tar.gz && "
-            f"cp -f {staging_on_volume}/supervisor.js {final_on_volume}/supervisor.js && "
-            f"rm -rf {staging_on_volume} && "
-            f"test -f {final_on_volume}/deps.tar.gz && "
-            f"test -f {final_on_volume}/supervisor.js && "
-            f"sync",
-            120,
-        ))
-
-        log.info("supervisor installed on volume %s for %s", volume_ref, agent_type)
-    except BaseException:
-        # Best-effort staging-dir cleanup; don't mask the original error.
-        try:
-            await loop.run_in_executor(None, lambda: sb.process.exec(
-                f"rm -rf {staging_on_volume}", timeout=30,
-            ))
-        except Exception as cleanup_err:  # pragma: no cover
-            log.warning("daytona install_supervisor staging cleanup failed: %s", cleanup_err)
-        raise
-    finally:
-        try:
-            await loop.run_in_executor(None, lambda: daytona.delete(sb))
-        except Exception:
-            pass
+# ``install_supervisor`` was deleted in Phase E of
+# docs/runtime-image-unification.md. The daytona sandbox now boots from an
+# image whose /opt/agent-sdk/runtime/ contains supervisor.js + every ACP
+# bin; ``provision_daytona_sandbox`` reads ``DAYTONA_IMAGE`` /
+# ``.runtime-image-tag`` for that image.
 
 
 async def create_sandbox(

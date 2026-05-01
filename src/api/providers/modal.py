@@ -46,6 +46,7 @@ from ._shared import (
     _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
+    _read_runtime_image_tag,
     _safe_path,
     _truncate,
     _wait_for_health,
@@ -55,17 +56,21 @@ from ._shared import (
 
 log = logging.getLogger(__name__)
 
-# Path to the canonical supervisor.js on the host (source of truth, copied
-# into the volume by install_supervisor).
-_SUPERVISOR_JS_HOST = (
-    Path(__file__).resolve().parent.parent.parent / "supervisor" / "supervisor.js"
-)
+# ``_SUPERVISOR_JS_HOST`` was deleted in Phase E of
+# docs/runtime-image-unification.md — it was used only by install_supervisor.
+
 
 # Inside-sandbox paths — matches Docker's layout so the supervisor and
 # downstream code see the same filesystem shape across providers.
 _VOLUME_MOUNT = "/v"
 _AGENT_HOME_IN = "/home/agent"
-_SUPERVISOR_IN = "/opt/supervisor"
+# ``_SUPERVISOR_IN`` was deleted in Phase E of
+# docs/runtime-image-unification.md — the supervisor lives at the fixed
+# ``_RUNTIME_IN`` path baked into the image, not symlinked from the volume.
+
+# Fixed in-image path where the agent-sdk runtime
+# (supervisor.js + node_modules) is baked at Docker build time.
+_RUNTIME_IN = "/opt/agent-sdk/runtime"
 
 # Port the supervisor listens on inside the sandbox. Modal exposes it via an
 # encrypted HTTPS tunnel whose URL is fetched from ``sb.tunnels()``.
@@ -124,18 +129,23 @@ async def _get_app():
 async def _get_image():
     """Return the shared sandbox Image (memoized).
 
-    Debian slim + nodejs/npm/git/base utilities. Kept deliberately minimal —
-    language-specific dependencies are installed at session-setup time via
-    ``pre_start_commands`` or later by the agent itself.
+    Phase E of docs/runtime-image-unification.md: built from the repo's
+    root ``Dockerfile`` so the agent-sdk runtime
+    (``/opt/agent-sdk/runtime/{supervisor.js,node_modules}``) is baked in
+    and the sandbox does NOT need a per-volume install.
     """
     global _image
     if _image is not None:
         return _image
     modal, _ = _require_modal()
-    _image = modal.Image.debian_slim().apt_install(
-        "nodejs", "npm", "git", "ca-certificates", "coreutils", "util-linux",
-        "curl", "sqlite3", "tar", "gzip",
-    )
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    dockerfile_path = repo_root / "Dockerfile"
+    if not dockerfile_path.exists():
+        raise RuntimeError(
+            f"Modal provider requires a Dockerfile at the repo root; "
+            f"not found at {dockerfile_path}"
+        )
+    _image = modal.Image.from_dockerfile(str(dockerfile_path))
     return _image
 
 
@@ -194,85 +204,10 @@ async def delete_volume(ref: str) -> None:
     log.info("modal volume %s removed", ref)
 
 
-# ---------------------------------------------------------------------------
-# Supervisor install (populate <volume>/system/supervisor/)
-# ---------------------------------------------------------------------------
-
-async def install_supervisor(volume_ref: str, agent_type: str) -> None:
-    """Populate ``<volume>/system/supervisor/`` with supervisor.js + deps.
-
-    Mirrors Docker's versioned-symlink scheme: each install writes to a fresh
-    ``system/supervisor.v<ts>.<rand>/`` directory and atomically flips the
-    ``system/supervisor`` symlink. Running sandboxes that already resolved
-    the symlink keep pointing at the old versioned dir; new sandboxes pick
-    up the new install. Old v-dirs > 24 h are garbage-collected.
-    """
-    if agent_type not in _ACP_NPM_SPECS:
-        raise ValueError(
-            f"modal install_supervisor: no npm spec for agent_type={agent_type!r}"
-        )
-    if not _SUPERVISOR_JS_HOST.exists():
-        raise RuntimeError(f"host supervisor.js missing at {_SUPERVISOR_JS_HOST}")
-
-    npm_spec = _ACP_NPM_SPECS[agent_type]
-    bin_name = _acp_bin_name(agent_type)
-    v_name = f"supervisor.v{int(time.time() * 1000):013d}.{uuid.uuid4().hex[:6]}"
-
-    # Encode host supervisor.js as base64 so it can cross the sandbox
-    # boundary via argv without file-transfer gymnastics. supervisor.js is
-    # typically tens of KB which easily fits in argv/env.
-    sup_js_bytes = _SUPERVISOR_JS_HOST.read_bytes()
-    sup_js_b64 = base64.b64encode(sup_js_bytes).decode()
-
-    v_path = f"/v/system/{v_name}"
-    link_path = "/v/system/supervisor"
-    sentinel_bin = f"{v_path}/node_modules/.bin/{bin_name}"
-
-    # GC snippet: remove supervisor.v* dirs older than 24 h that aren't the
-    # current symlink target. Same policy as docker.py.
-    gc = (
-        "CUR=$(readlink -f /v/system/supervisor 2>/dev/null || echo /dev/null); "
-        "for d in /v/system/supervisor.v*; do "
-        "  [ -d \"$d\" ] || continue; "
-        "  [ \"$d\" = \"$CUR\" ] && continue; "
-        "  age_sec=$(( $(date +%s) - $(stat -c %Y \"$d\" 2>/dev/null || echo 0) )); "
-        "  [ \"$age_sec\" -gt 86400 ] && rm -rf \"$d\"; "
-        "done; true"
-    )
-    shell = (
-        "set -e && "
-        f"mkdir -p {shlex.quote(v_path)} && "
-        f"cd {shlex.quote(v_path)} && "
-        "npm init -y >/dev/null 2>&1 && "
-        f"npm install --omit=optional --silent {shlex.quote(npm_spec)} && "
-        # Materialize supervisor.js from the base64 payload.
-        f"printf %s {shlex.quote(sup_js_b64)} | base64 -d > {shlex.quote(v_path)}/supervisor.js && "
-        f"test -f {shlex.quote(sentinel_bin)} && "
-        f"test -f {shlex.quote(v_path)}/supervisor.js && "
-        # Legacy first-install where /v/system/supervisor is a real dir: nuke
-        # and replace with symlink. Never unlink a live symlink's target.
-        f"if [ -d {shlex.quote(link_path)} ] && [ ! -L {shlex.quote(link_path)} ]; then "
-        f"  rm -rf {shlex.quote(link_path)}; "
-        "fi && "
-        f"ln -sfn {shlex.quote(v_name)} {shlex.quote(link_path)} && "
-        f"({gc})"
-    )
-    # Roll back v-dir on any failure so the volume is never left with a
-    # half-written supervisor.v* dir. Existing symlink (if any) is untouched.
-    shell_wrapped = f"({shell}) || (rm -rf {shlex.quote(v_path)}; exit 1)"
-
-    log.info("modal install_supervisor: volume=%s agent=%s v=%s", volume_ref, agent_type, v_name)
-    rc, out, err = await _run_volume_shell(volume_ref, shell_wrapped, timeout=600)
-    if rc != 0:
-        raise RuntimeError(
-            f"modal install_supervisor failed (rc={rc}): "
-            f"stdout={out.decode(errors='replace').strip()[:400]!r} "
-            f"stderr={err.decode(errors='replace').strip()[:400]!r}"
-        )
-    log.info(
-        "modal install_supervisor: volume=%s agent=%s done (pointed at %s)",
-        volume_ref, agent_type, v_name,
-    )
+# ``install_supervisor`` was deleted in Phase E of
+# docs/runtime-image-unification.md. Modal sandboxes now boot from a
+# ``modal.Image.from_dockerfile(<repo>/Dockerfile)`` whose
+# /opt/agent-sdk/runtime/ contains supervisor.js + every ACP bin.
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +223,9 @@ def _build_entrypoint_cmd(
 
     Creates the agent HOME directory, puts Docker-shaped symlinks in place,
     runs any pre-start commands, then execs the supervisor.
+
+    Phase E: the supervisor is at ``/opt/agent-sdk/runtime`` (image-baked),
+    so no ``/opt/supervisor → /v/system/supervisor`` symlink is required.
     """
     safe_sub = subpath.strip("/")
     agent_home_target = f"/v/agents/{safe_sub}"
@@ -297,11 +235,10 @@ def _build_entrypoint_cmd(
         f"mkdir -p {shlex.quote(agent_home_target)}",
         # Ensure /home and /opt exist in the slim debian image.
         "mkdir -p /home /opt",
-        # Clean + recreate symlinks so a restart can't end up with a dangling
-        # or wrong-target link.
-        f"rm -rf {_AGENT_HOME_IN} {_SUPERVISOR_IN}",
+        # Clean + recreate the agent-home symlink so a restart can't end up
+        # with a dangling or wrong-target link.
+        f"rm -rf {_AGENT_HOME_IN}",
         f"ln -s {shlex.quote(agent_home_target)} {_AGENT_HOME_IN}",
-        f"ln -s /v/system/supervisor {_SUPERVISOR_IN}",
     ]
     for name in (shared_mounts or []):
         clean = name.strip("/").replace("..", "").replace("/", "-")
@@ -347,9 +284,13 @@ async def create_sandbox(
     bin_name = _acp_bin_name(agent_type)
     agent_root = root or _AGENT_HOME_IN
     env_prefix = _build_env_prefix(spawn_env)
-    acp_path = f"{_SUPERVISOR_IN}/node_modules/.bin/{bin_name}"
+    # Resolve the ACP bin via package.json#bin (daytona/modal flatten the
+    # ``node_modules/.bin/`` symlinks during image-build).
+    from ._shared import _runtime_acp_bin_relative
+    sup_dir_in = _RUNTIME_IN
+    acp_path = f"{sup_dir_in}/{_runtime_acp_bin_relative(agent_type)}"
     supervisor_argv = build_supervisor_argv(
-        supervisor_js=f"{_SUPERVISOR_IN}/supervisor.js",
+        supervisor_js=f"{sup_dir_in}/supervisor.js",
         acp_bin=acp_path,
         acp_launch_args=_acp_launch_args(agent_type),
         port=_SUPERVISOR_CONTAINER_PORT,

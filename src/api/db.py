@@ -401,6 +401,12 @@ _MIGRATIONS = [
     """UPDATE sessions
        SET sandbox_state = jsonb_set(sandbox_state - 'sandbox_id', '{sandbox_ref}', sandbox_state->'sandbox_id')
        WHERE sandbox_state ? 'sandbox_id'""",
+    # Phase E of docs/runtime-image-unification.md: supervisor + ACP bins
+    # now ship in the agent-sdk Docker image at /opt/agent-sdk/runtime/.
+    # The per-volume install-cache column is no longer read or written.
+    # Forward-only drop — irreversible, but safe because every code path
+    # that referenced the column was deleted in the same release.
+    "ALTER TABLE volumes DROP COLUMN IF EXISTS supervisor_agent_types",
 ]
 
 
@@ -414,17 +420,26 @@ def init_db() -> None:
     DDL creates tables if missing (fresh setups).
     Migrations ALTER existing tables to the current schema (upgrades).
     Both use IF EXISTS / IF NOT EXISTS so they're idempotent.
+
+    Each migration runs in its own commit boundary. Without this, a single
+    failure (e.g. ``ALTER TABLE sandboxes`` after the table was dropped in
+    a prior release) puts the txn in ``aborted`` state and every subsequent
+    migration fails with ``current transaction is aborted``. Per-migration
+    commit means a stale legacy migration can fail loud-but-harmlessly
+    while the new ones still apply.
     """
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     try:
         for stmt in _PG_SCHEMA:
             conn.execute(stmt)
+        conn.commit()
         for stmt in _MIGRATIONS:
             try:
                 conn.execute(stmt)
+                conn.commit()
             except Exception as e:
                 log.warning("migration failed: %s — %s", stmt, e)
-        conn.commit()
+                conn.rollback()
     finally:
         conn.close()
 
@@ -528,13 +543,12 @@ async def delete_agent(agent_id: str) -> None:
 async def upsert_volume(volume: VolumeRecord) -> None:
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO volumes (id, name, provider, provider_ref, status, supervisor_agent_types)"
-            " VALUES (%s, %s, %s, %s, %s, %s)"
+            "INSERT INTO volumes (id, name, provider, provider_ref, status)"
+            " VALUES (%s, %s, %s, %s, %s)"
             " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,"
             " provider=EXCLUDED.provider, provider_ref=EXCLUDED.provider_ref,"
-            " status=EXCLUDED.status, supervisor_agent_types=EXCLUDED.supervisor_agent_types",
-            (volume.id, volume.name, volume.provider, volume.provider_ref, volume.status,
-             Json(volume.supervisor_agent_types)),
+            " status=EXCLUDED.status",
+            (volume.id, volume.name, volume.provider, volume.provider_ref, volume.status),
         )
 
 
@@ -542,7 +556,6 @@ def _row_to_volume(row: dict) -> VolumeRecord:
     return VolumeRecord(
         id=row["id"], name=row["name"], provider=row["provider"],
         provider_ref=row["provider_ref"], status=row["status"],
-        supervisor_agent_types=list(row.get("supervisor_agent_types") or []),
     )
 
 
@@ -582,15 +595,9 @@ async def delete_volume(volume_id: str) -> None:
         await conn.execute("DELETE FROM volumes WHERE id = %s", (volume_id,))
 
 
-async def add_supervisor_agent_type(volume_id: str, agent_type: str) -> None:
-    """Idempotently append agent_type to volumes.supervisor_agent_types."""
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE volumes SET supervisor_agent_types = "
-            "COALESCE(supervisor_agent_types, '[]'::jsonb) || to_jsonb(%s::text) "
-            "WHERE id = %s AND NOT (supervisor_agent_types @> to_jsonb(%s::text))",
-            (agent_type, volume_id, agent_type),
-        )
+# add_supervisor_agent_type was deleted in Phase E of
+# docs/runtime-image-unification.md — the supervisor_agent_types cache
+# is no longer used. The DB column survives until the column-drop migration.
 
 
 # ---------------------------------------------------------------------------

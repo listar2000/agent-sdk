@@ -90,7 +90,11 @@ async def test_resume_by_session_id_puts_credentials_in_secrets(monkeypatch):
         oauth_token="resume-oauth",
         api_key="resume-api-key",
     )
-    post = AsyncMock(return_value=_fake_response(
+    # Agent now layers ApiClient over an httpx.AsyncClient. ApiClient's
+    # `_json` dispatches through `_http.request(method, path, ...)`, so we
+    # must intercept `request` rather than `post`. (Not all paths pass
+    # through `_http.post` directly.)
+    request_mock = AsyncMock(return_value=_fake_response(
         json_body={
             "session_id": "sess-123",
             "agent_id": "agent-1",
@@ -98,11 +102,14 @@ async def test_resume_by_session_id_puts_credentials_in_secrets(monkeypatch):
             "inner_session_id": "inner-1",
         }
     ))
-    monkeypatch.setattr(agent._client, "post", post)
+    monkeypatch.setattr(agent._api._http, "request", request_mock)
 
     await agent._ensure_registered()
 
-    _, kwargs = post.await_args
+    args, kwargs = request_mock.await_args
+    # ApiClient.resume_session calls ``_http.request("POST", "/sessions/{id}/resume", json=...)``
+    assert args[0] == "POST"
+    assert args[1].endswith("/resume")
     assert kwargs["json"] == {
         "secrets": {
             "CLAUDE_CODE_OAUTH_TOKEN": "resume-oauth",
@@ -111,7 +118,7 @@ async def test_resume_by_session_id_puts_credentials_in_secrets(monkeypatch):
     }
     assert "oauth_token" not in kwargs["json"]
     assert "api_key" not in kwargs["json"]
-    await agent._client.aclose()
+    await agent._api.close()
 
 
 @pytest.mark.timeout(5)
@@ -174,8 +181,10 @@ def test_registration_payload_serializes_via_standard_json(monkeypatch):
         model="claude-sonnet-4-5",
         cwd="/tmp",
         root="/tmp",
-        prompt="be helpful",
-        tools=["Read", "Write"],
+        # Note: ``prompt`` and ``tools`` were removed from the Agent
+        # constructor when ACP took over those concerns; the JSON-
+        # serializability assertion is still meaningful via ``mcp_servers``
+        # which is the largest nested-dict structure on the payload.
         mcp_servers={"fs": {"command": "mcp-fs", "args": []}},
     )
     p = _payload(a)

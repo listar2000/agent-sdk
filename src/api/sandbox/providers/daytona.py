@@ -1,8 +1,7 @@
 """DaytonaSandboxSession — concrete SandboxSession for the daytona provider.
 
 Wraps existing primitives in ``src/api/providers/daytona.py`` into the
-five-method ``BaseSandboxSession`` contract. Per
-``docs/ephemeral-sandbox-design.md`` §5.
+five-method ``BaseSandboxSession`` contract.
 
 Lifecycle decisions live inside ``start()``:
   * ``state.sandbox_ref`` set, sandbox alive on Daytona  → reattach (cheapest)
@@ -12,7 +11,6 @@ Lifecycle decisions live inside ``start()``:
 No "Type 1 vs Type 2" branching outside this class — recovery just calls
 ``start()``; the class picks the cheapest path internally.
 
-NOT yet wired into server.py — phase 2 sub-task 3 is the wiring commit.
 """
 from __future__ import annotations
 

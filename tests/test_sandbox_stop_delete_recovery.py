@@ -1397,56 +1397,10 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
         )
 
 
-@pytest.mark.asyncio
-async def test_session_survives_supervisor_dir_wiped_from_volume():
-    """Stale ``volumes.supervisor_agent_types`` cache + missing supervisor.js
-    on disk: server must detect, clear the cache, reinstall, and retry.
-
-    Reproduces the production stack trace the user hit:
-      RuntimeError: supervisor.js missing at <volume>/system/supervisor/
-      supervisor.js; call install_supervisor first
-
-    The volumes table had ``supervisor_agent_types = ['claude']`` so
-    ``ensure_volume_supervisor`` took the fast-path skip, but the volume
-    dir had been wiped out-of-band (container restart with a wiped
-    ephemeral volume, a deploy that reset the bind-mount, etc.) — so
-    ``local.create_sandbox`` crashed with 500 on the NEXT /events call.
-
-    Local-only. The cache-invalidation + retry path is in ``_provision_new``;
-    daytona/docker behave the same but the local provider is the cheapest
-    way to exercise the disk-wipe.
-    """
-    provider = "local"
-    _require_provider(provider)
-
-    async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
-        session_id = sess["session_id"]
-        print(f"\n[test:{provider}] session={session_id[:8]}")
-
-        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
-        assert reply1.strip(), f"turn 1 empty: {reply1!r}"
-
-        # Destroy the current sandbox so the next /message goes through
-        # _provision_new. We need that path to hit ``create_sandbox``.
-        sandbox = await _get_sandbox(sdk, session_id)
-        await _external_delete(sandbox)
-        await asyncio.sleep(2)
-
-        # Out-of-band wipe of the supervisor dir: the volume still has its
-        # "claude installed" cache entry in Postgres, but the files are gone.
-        vol_ref = os.path.expanduser("~/.agent-sdk/volumes/default-local")
-        sup_dir = os.path.join(vol_ref, "system", "supervisor")
-        if os.path.isdir(sup_dir):
-            shutil.rmtree(sup_dir)
-            print(f"[test:{provider}] wiped {sup_dir}")
-
-        # Next turn: _provision_new → ensure_volume_supervisor (cache hit,
-        # skip install) → create_sandbox raises RuntimeError (supervisor.js
-        # missing). Server's retry path clears the cache + reinstalls + retries.
-        reply2 = await _ask(sdk, session_id, "Reply with a single short word.")
-        assert reply2.strip(), (
-            f"server did not recover from stale supervisor cache — "
-            f"the retry path in _provision_new should clear the cache and "
-            f"reinstall. Reply was: {reply2!r}"
-        )
+# ``test_session_survives_supervisor_dir_wiped_from_volume`` was deleted in
+# Phase E of docs/runtime-image-unification.md. The test exercised the
+# ``volumes.supervisor_agent_types`` cache-vs-disk-drift recovery path; that
+# path no longer exists because the supervisor + ACP bins now ship in the
+# image (``/opt/agent-sdk/runtime/``) instead of being installed onto each
+# volume's ``system/supervisor/`` dir. Wiping a non-existent volume
+# directory on a path the runtime never reads is a no-op.

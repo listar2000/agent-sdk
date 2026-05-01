@@ -2,12 +2,11 @@
 
 Base URL: `http://localhost:7778`
 
-The API has three resource groups:
+The API has two top-level resource groups:
 - **Volumes** — durable storage (CRUD, file ops). Each volume holds `~/.claude`, transcripts, and workspace for the agents that mount it.
-- **Sandboxes** — ephemeral compute leases (create, list, get, destroy, stop, start). Each sandbox mounts a volume at a subpath.
-- **Sessions** — agent conversation (messages, events, resume, cancel, config, status, logs). Each session binds to a volume; its current sandbox is swapped when the old one dies.
+- **Sessions** — agent conversation (messages, events, resume, cancel, config, status, logs, files, sandbox metadata). Each session binds to a volume; its compute lease is owned by an in-process `SessionPool` and the provider sandbox identity (`sandbox_ref`) lives in `sessions.sandbox_state` (JSONB). There is no separate `sandboxes` resource — see [`assets/data-model.html`](../assets/data-model.html).
 
-See also: [`assets/data-model.html`](../assets/data-model.html) and [`assets/rest-api.html`](../assets/rest-api.html).
+There is also a thin **Agents** group for registering an agent identity without provisioning compute.
 
 ## Health
 
@@ -17,20 +16,21 @@ GET /health
 ```json
 {
   "status": "ok",
-  "sessions": 3,
-  "busy_sessions": 1,
-  "readers_alive": 3,
-  "instances": 2
+  "sessions": 1,
+  "busy_sessions": 0
 }
 ```
+
+`sessions` is the count of sessions currently leased by the SessionPool (i.e. with live compute). `busy_sessions` is the subset that currently have at least one event subscriber attached.
 
 ## Chat UI
 
 ```
-GET /ui
+GET /ui            — chat
+GET /ui/dashboard  — admin / validation dashboard
+GET /ui/files      — filesystem browser (per session)
+GET /ui/volumes    — volume inspector
 ```
-
-Serves a browser-based chat interface for interacting with agent sessions.
 
 ## Sessions
 
@@ -40,9 +40,17 @@ Serves a browser-based chat interface for interacting with agent sessions.
 POST /sessions
 ```
 
-Single endpoint for session creation. Defaults to **eager**: provisions a sandbox, connects ACP, starts the scheduler + SSE reader. Pass `"provision": false` in the body for the **lazy** flow — session row only, sandbox materialises on the first `/message`, `/start-sandbox`, or `/resume`.
+Single endpoint for session creation. Defaults to **eager**: provisions a sandbox via the SessionPool, attaches the supervisor + ACP, persists the resulting `sandbox_state` JSONB. Pass `"provision": false` in the body for the **lazy** flow — session row only, sandbox materialises on the first `/message` or `/resume` call (the SessionPool cold-creates on demand).
 
-Config fields may be passed either at the top level (`agent_type`, `model`, `prompt`, `tools`, `mcp_servers`, `skills`, `cwd`, `dockerfile`, `dockerfile_content`) or under `config`. If both are present, values in `config` win. Provisioning knobs — `shared_mounts`, `pre_start_commands`, `root`, `volume_id` — are top-level only. `volume_id` is optional; if omitted, a per-provider default volume is created (or reused) transparently.
+Config fields belong to one of three groups:
+
+| Field | Belongs on | Notes |
+|---|---|---|
+| `agent_type`, `model`, `mcp_servers`, `skills`, `mode`, `thought_level` | agent (config) | Pure identity. Persisted on `agents.config` so cold-recovery replays them. |
+| `cwd`, `env`, `secrets` | session | Per-conversation; `cwd` keys the JSONL hash. `env`/`secrets` are PATCH-shaped (omitted = keep, `{}` = clear, `{...}` = replace). |
+| `dockerfile`, `dockerfile_content`, `shared_mounts`, `root`, `pre_start_commands`, `volume_id` | sandbox / provisioning | Frozen at provision time; survive replacement via the recipe persisted on `sandbox_state`. |
+
+Fields may be supplied at the top level OR nested under `config`. If both are present, top-level wins. `volume_id` is optional — when omitted, a per-provider default volume named `default-{provider}` is created/reused transparently.
 
 ```json
 {
@@ -52,8 +60,6 @@ Config fields may be passed either at the top level (`agent_type`, `model`, `pro
   "agent_type": "claude",
   "model": "claude-sonnet-4-6",
   "cwd": "/tmp",
-  "prompt": "You are a helpful agent.",
-  "tools": ["Bash", "Read", "Write"],
   "mcp_servers": {"name": {"type": "local", "command": "...", "args": []}},
   "skills": ["rllm-org/hive#staging", "vercel-labs/agent-skills"],
   "shared_mounts": ["shared-data"],
@@ -61,18 +67,19 @@ Config fields may be passed either at the top level (`agent_type`, `model`, `pro
 }
 ```
 
-`pre_start_commands` are shell commands that run inside the sandbox before the ACP supervisor starts — use them to install CLIs, lay down config files, etc. For `docker`/`daytona` they run inside the sandbox; for `local` they are ignored (the server host already runs `skills` install natively, and local has no sandbox boundary to run caller-supplied commands in safely). The effective list passed to the provider is `skills_install_commands + caller_pre_start_commands` in that order.
+`pre_start_commands` are shell commands that run inside the sandbox before the ACP supervisor starts — use them to install CLIs, lay down config files, etc. For `docker`/`daytona`/`modal` they run inside the sandbox; for `local` they are ignored (the server host already runs `skills` install natively, and local has no sandbox boundary to run caller-supplied commands in safely). The effective list passed to the provider is `skills_install_commands + caller_pre_start_commands` in that order.
 
-The raw caller-supplied commands are persisted on the session row and re-run on **Type 2 recovery** (replacement sandbox — external delete, unrecoverable Daytona error, `/reset-sandbox`). **Type 1 recovery** (same VM restarted via `start_sandbox`) does not re-run them — the original side effects are still on disk. Skill-install commands are re-merged from `agent.config.skills` at recovery time, so editing skills on a long-lived agent takes effect on the next sandbox replacement. Inspect what's persisted via `GET /sessions/{id}` (response includes `pre_start_commands`).
+The merged list is stored on the session row's `sandbox_state.recipe.pre_start_commands` and is re-run on **Type 2 recovery** (replacement sandbox — external delete, unrecoverable provider error). **Type 1 recovery** (same VM restarted via `start_sandbox`) does not re-run them — the original side effects are still on disk. Skill-install commands are merged at create time and survive on the recipe; editing skills on a long-lived agent takes effect on the next sandbox replacement. Inspect what's persisted via `GET /sessions/{id}` (response includes `pre_start_commands`).
 
 Returns (eager):
 ```json
 {
   "agent_id": "uuid",
-  "sandbox_id": "uuid",
-  "current_sandbox_id": "uuid",
   "session_id": "uuid",
-  "inner_session_id": "uuid",
+  "id": "uuid",
+  "volume_id": "vol-uuid",
+  "sandbox_ref": "<opaque provider sandbox ref>",
+  "inner_session_id": "<acp inner session id>",
   "connected": true
 }
 ```
@@ -83,38 +90,14 @@ Returns (lazy, `"provision": false`):
   "id": "uuid",
   "agent_id": "uuid",
   "volume_id": "vol-uuid",
-  "current_sandbox_id": null,
+  "sandbox_ref": null,
   "connected": false
 }
 ```
 
-`sandbox_id` and `current_sandbox_id` are emitted with the same value on the eager response for backward compatibility with pre-refactor clients. The old `POST /sessions/quick` endpoint was collapsed into this one; clients that hit `/sessions/quick` now get a 405.
+`sandbox_ref` is the **provider sandbox ref** (an opaque string — Daytona UUID, Docker container ID, local PID-as-string, etc.), not a server-side PK. There is no separate `current_sandbox_id` field — the sandboxes table was removed.
 
-Lazy mode accepts an additional `agent_id` field to reuse an existing agent config instead of creating a new one.
-
-```json
-{
-  "agent_id": "uuid-optional",
-  "volume_id": "vol-uuid",
-  "name": "worker-2",
-  "agent_type": "claude",
-  "model": "claude-sonnet-4-6",
-  "cwd": "/home/daytona",
-  "secrets": {"CLAUDE_CODE_OAUTH_TOKEN": "..."}
-}
-```
-
-Returns:
-
-```json
-{
-  "id": "session-uuid",
-  "agent_id": "uuid",
-  "volume_id": "vol-uuid",
-  "current_sandbox_id": null,
-  "connected": false
-}
-```
+Lazy mode accepts an optional `agent_id` field to reuse an existing agent config instead of creating a new one.
 
 ### Send message (non-blocking)
 
@@ -125,27 +108,37 @@ POST /sessions/{session_id}/message
 {"message": "analyze the dataset"}
 ```
 
-Returns `{rpc_id, status}`. The actual response streams via SSE.
+Returns `{rpc_id, status}` immediately. The request body is consumed in a background task; events are persisted to `session_log` and broadcast to any `/events` subscribers.
 
-**Interrupt flag** — cancel the running prompt and submit a new one:
+**Interrupt flag** — currently a no-op on this endpoint. Use `POST /sessions/{id}/cancel` to abort the in-flight prompt before submitting a new one.
 
+### Send message + stream reply (single round-trip)
+
+```
+POST /sessions/{session_id}/message+stream
+```
 ```json
-{"message": "stop — focus on X instead", "interrupt": true}
+{"message": "analyze the dataset"}
 ```
 
-When `interrupt: true`, the server cancels the currently running prompt, waits for it to drain (`stopReason: cancelled`), then submits the new message. Already-queued prompts are not affected. Use `GET /sessions/{id}/events` (or `Agent.events()`) to receive the response events.
+Submits a prompt and streams the reply as SSE in the response body. Same wire format as `GET /events`, scoped to a single `rpc_id`. `: heartbeat\n\n` lines keep idle connections open through nginx / cloudflare. This is what `Agent.astream()` uses.
 
-
-### SSE event stream
+### SSE event stream (multi-subscriber)
 
 ```
 GET /sessions/{session_id}/events
 ```
-The server proxies raw ACP SSE blocks and tags attributed prompt events with:
+
+Yields every event broadcast by the session's `SandboxSession` — across all prompts on the session — plus heartbeat sentinels every ~20 s of idle. Multiple concurrent `/events` connections each get a copy.
+
+The server emits per-rpc-tagged blocks:
+
 ```
 event: rpc:<rpc_id>
+<raw acp block>
 ```
-Untagged blocks are still possible (for example heartbeats or setup chatter).
+
+Untagged blocks are still possible (heartbeats, setup chatter).
 
 Event types inside `session/update` notifications:
 Some wrappers may emit `notifications/session/update`; clients should treat both forms equivalently.
@@ -160,12 +153,6 @@ Some wrappers may emit `notifications/session/update`; clients should treat both
 | `execute_tool_started` | `{_meta: {claudeCode: {toolName, toolUseId}}, rawInput: {...}}` |
 | `tool_call_update` | `{_meta: {claudeCode: {toolResponse\|toolResult, toolName, toolUseId}}}` |
 | `usage_updated` / `usage_update` | `{cost: {amount, currency}}` |
-
-In addition to ACP-proxied events, the server emits:
-
-| event | Payload |
-|---|---|
-| `sandbox_reattach` | `{old_sandbox_id, new_sandbox_id}` — emitted before the first real event of a run when the session transparently reprovisioned its sandbox against the same volume. |
 
 Prompt done:
 ```json
@@ -195,69 +182,7 @@ Prompt error:
 }
 ```
 
-Heartbeats (`: heartbeat\n\n`) are sent every 30s to keep the connection alive during long-running prompts.
-
-### Prompt queue and interrupt
-
-The server uses an explicit per-session scheduler.
-
-Each `SessionState` carries:
-
-- `active_rpc_id`: the prompt currently executing upstream, or `None`
-- `pending_prompts: deque[PendingPrompt]`: FIFO queue of submitted work
-- `_prompt_ready`: wakes the scheduler when new prompts arrive
-- `_prompt_done`: signals that the active prompt reached a terminal state
-
-`POST /sessions/{session_id}/message` always allocates a new `rpc_id`,
-appends a `PendingPrompt`, and returns immediately. The background
-scheduler loop is the only owner of `active_rpc_id`:
-
-1. wait for `_prompt_ready`
-2. pop the next pending prompt
-3. set `active_rpc_id`
-4. send `session/prompt` upstream
-5. wait for a terminal response or terminal error
-6. clear `active_rpc_id`, set `_prompt_done`, and continue
-
-`agent_busy` is therefore just `active_rpc_id is not None`.
-
-#### Interrupt flow
-
-`interrupt: true` on `/sessions/{session_id}/message` means:
-
-1. if a prompt is active, send `session/cancel`
-2. wait for `_prompt_done` with a 10 second safety timeout
-3. append the new prompt to the tail of `pending_prompts`
-
-Interrupt preserves queue order. It cancels the running turn, but it
-does not reorder or drop already-queued prompts. The standalone
-`POST /sessions/{session_id}/cancel` endpoint performs the same
-cancel-and-wait step without submitting a replacement prompt.
-
-#### Event delivery
-
-Each session has one long-lived upstream SSE reader. That reader:
-
-- keeps the ACP stream open
-- updates runtime state such as `last_event_id`
-- logs parsed events to the database
-- fans out raw SSE blocks to downstream subscribers
-
-Downstream subscribers attach to the server fan-out, not directly to ACP:
-
-- session-scoped subscribers receive every event for the session
-- RPC-scoped subscribers receive only events tagged for one `rpc_id`
-
-This keeps parsing and state transitions centralized while still letting
-multiple clients watch the same session concurrently.
-
-#### One important latency edge case
-
-If a prompt launches a background task, ACP may delay the terminal
-`done_result` until that background task reports completion. In that
-window, text and usage may already be finished but the prompt is still
-considered active, so the next queued prompt cannot start yet. See
-`tests/test_acp_invariants.py::TestDoneHeldForBackgroundTasks`.
+Heartbeats (`: heartbeat\n\n`) are sent during idle to keep the connection alive.
 
 ### Resume session
 
@@ -265,39 +190,59 @@ considered active, so the next queued prompt cannot start yet. See
 POST /sessions/{session_id}/resume
 ```
 
-Optional body accepts `env` and `secrets` with PATCH semantics (`missing` keeps stored values, `{}` clears, an object replaces). Looks up everything else from the DB and ensures a live sandbox — reprovisioning against the session's volume if the prior sandbox was killed or reaped. Returns:
+Idempotent pre-warm: routes through `SessionPool.get_session(session_id)` — cold-creates a `SandboxSession` from `sandbox_state` if no lease exists, or returns the live one if it does. The ACP `session/load` happens inside `SandboxSession.start()`.
+
+Optional body accepts `env` and `secrets` with PATCH semantics (`missing` keeps stored values, `{}` clears, an object replaces). Looks up everything else from the DB and ensures a live sandbox — reprovisioning against the session's volume if the prior sandbox was killed or reaped.
+
+Returns:
 ```json
 {
   "session_id": "uuid",
   "agent_id": "uuid",
-  "current_sandbox_id": "uuid",
+  "sandbox_ref": "<opaque provider sandbox ref>",
   "inner_session_id": "uuid",
   "status": "resumed"
 }
 ```
 
-Conversation endpoints (`/message`, `/events`, `/cancel`, `/config`, `/resume`, `/sandbox/exec`) auto-recover reaped or killed sandboxes by looking up the session in Postgres and ensuring a live sandbox mounted against the session's volume. You don't need to call resume explicitly before those calls. In-memory introspection endpoints like `/sessions` and `/sessions/{id}/status` do not trigger recovery.
+Conversation endpoints (`/message`, `/message+stream`, `/events`, `/cancel`, `/config`, `/files/*`, `/sandbox/exec`, `/acp/call`) auto-recover reaped or killed sandboxes by routing through `pool.get_session()`. You don't need to call resume explicitly before those calls. In-memory introspection endpoints like `/sessions` and `GET /sessions/{id}` (the row read) do not trigger recovery; `GET /sessions/{id}/status` and `GET /sessions/{id}/sandbox` DO trigger recovery.
 
-### Sandbox control
-
-Explicit lifecycle control over the session's ephemeral sandbox. None of these affect the session row or its bound volume.
+### Release session (hibernate)
 
 ```
-POST /sessions/{session_id}/start-sandbox    — pre-warm a sandbox eagerly (idempotent)
-POST /sessions/{session_id}/hibernate        — pause compute; keep state and the same sandbox for resume
-POST /sessions/{session_id}/reset-sandbox    — destroy current + provision a fresh replacement in one call
-POST /sessions/{session_id}/stop-sandbox     — DEPRECATED alias of /hibernate; returns 204 for compatibility
+POST /sessions/{session_id}/release
 ```
 
-`start-sandbox` and `reset-sandbox` return `{"sandbox_id": "..."}` on success. `hibernate` returns `{"status", "sandbox_id", "session_in_memory"}` (200). `stop-sandbox` returns 204.
+Snapshot the filesystem to the volume + drop the SessionPool's compute lease. Idempotent — releasing an already-released session is a no-op. The next pool-mediated call cold-recovers from the snapshot.
 
-`hibernate` stops the underlying compute (SIGTERM / `daytona.stop()`), flips the sandbox row to `status=stopped`, and keeps both the in-memory `SessionState` and the `current_sandbox_id` pointer intact — the next `/message` rebinds the SAME sandbox in place. Pass `?force=true` to cancel-and-drain in-flight prompts before pausing. If the last `/events` subscriber drops while a session is hibernated, the in-memory state is evicted automatically (next request rebuilds from the DB row).
+Returns:
+```json
+{
+  "lifecycle": "hibernated",
+  "snapshot_path": "<volume-relative path or null>",
+  "snapshot_version": 0
+}
+```
+
+Internally backed by `SessionPool.release(session_id)`. The reaper invokes the same path on idle sessions (default 180 s; tune via `AGENT_SDK_REAPER_IDLE_S`).
+
+### Delete session
+
+```
+DELETE /sessions/{session_id}
+```
+
+Releases the pool lease (snapshot + drop compute, idempotent) and deletes the session row. Returns 204 even when the session doesn't exist, so this is safe as a "make sure this is gone" primitive without a prior existence check.
+
+The underlying daytona/docker/local sandbox is *paused*, not destroyed — label-based cleanup scripts (`scripts/cleanup_daytona_orphans.py`) reclaim the compute later.
 
 ### Cancel running prompt
 
 ```
 POST /sessions/{session_id}/cancel
 ```
+
+Best-effort: sends `session/cancel` (JSON-RPC notification) to the supervisor's ACP child via the SessionPool. The ACP child aborts the turn; the `done` event arrives on the same SSE subscribers that `POST /message` opened. No active lease → returns `{"status": "ok", "detail": "no active lease"}`.
 
 ### Set session config
 
@@ -308,11 +253,28 @@ POST /sessions/{session_id}/config
 {"mode": "bypassPermissions", "model": "claude-sonnet-4-6", "thought_level": "high"}
 ```
 
+Patches the three persisted-and-replayed-on-recovery knobs: `model`, `mode`, `thought_level`. They are applied to the live ACP session AND persisted on `agents.config` so cold-recovery (Type-2) replays them via the supervisor's `_attach_acp` step. For any other ACP knob — new `configId`s Claude grows, vendor extensions, debugging — use `POST /sessions/{id}/acp/call` instead so we don't grow a new typed wrapper per knob.
+
+### Generic ACP passthrough
+
+```
+POST /sessions/{session_id}/acp/call
+```
+```json
+{"method": "session/whatever", "params": {...}, "notify": false}
+```
+
+Forwards a JSON-RPC call to the session's ACP supervisor. Auto-injects the inner `sessionId` into `params` so callers don't need to track it. `notify=true` sends as a JSON-RPC notification (no response, no rpc_id). Returns `{"result": <ACP result dict>}` for non-notify calls.
+
+**Transient** — survives only the current ACP session, lost on the next sandbox restart. For anything that must replay on cold-recovery, persist via `POST /sessions/{id}/config` (model/mode/thought_level) or by baking it into the recipe at create time.
+
 ### Other
 
 ```
-GET /sessions                        — list active sessions
-GET /sessions/{id}/status            — runtime status
+GET /sessions                        — list active (pool-leased) sessions
+GET /sessions/{id}                   — read the session row (env + redacted secret keys + sandbox_ref + pre_start_commands)
+GET /sessions/{id}/status            — runtime status (routes through SessionPool, brings up the SandboxSession if hibernated)
+GET /sessions/{id}/sandbox           — sandbox metadata (provider, sandbox_ref, status, root, url for port-based providers, marker_path for local)
 GET /sessions/{id}/log?limit=500     — event log (oldest first)
 ```
 
@@ -322,17 +284,22 @@ GET /sessions/{id}/log?limit=500     — event log (oldest first)
 |---|---|
 | `session_id` | Session ID |
 | `agent_id` | Agent ID |
-| `current_sandbox_id` | Currently-attached sandbox ID, or `null` if none is live |
+| `sandbox_ref` | Currently-bound sandbox ref (opaque provider string), or `null` if none is live |
 | `inner_session_id` | Agent-native session ID used for resume/load |
-| `agent_busy` | Whether a prompt is currently active (`active_rpc_id != null`) |
-| `active_rpc_id` | Currently running prompt ID, if any |
-| `pending_count` | Number of queued prompts |
-| `session_subscriber_count` | Number of session-scoped SSE subscribers |
-| `rpc_subscriber_count` | Number of RPC-scoped SSE subscribers |
-| `last_activity` | Unix timestamp of last session activity |
-| `idle_seconds` | Seconds since last terminal turn completion or activity |
-| `has_client` | Whether an ACP client is currently attached |
-| `shutdown_requested` | Whether runtime shutdown is set |
+| `agent_busy` | Always `false` (kept for response-shape back-compat with the dashboard; per-prompt SSE replaced the persistent reader) |
+| `active_rpc_id` | Always `null` (same reason as `agent_busy`) |
+| `pending_count` | Always `0` (same reason) |
+| `session_subscriber_count` | Number of session-scoped SSE subscribers attached to the SandboxSession |
+| `rpc_subscriber_count` | Always `0` (per-rpc subscribers were folded into the session-scoped fan-out) |
+| `last_activity` | Monotonic timestamp of last observed chunk on the session, or `null` if never |
+| `idle_seconds` | Seconds since `last_activity`, or `null` if no activity has been observed |
+| `has_client` | Whether the SandboxSession has a live supervisor URL (proxy for "is the ACP child up") |
+| `shutdown_requested` | Always `false` (constant) |
+| `available_commands` | Always `[]` (was set by the legacy persistent SSE reader) |
+| `supervisor_url` | URL the SandboxSession exposes its supervisor at, or `null` |
+| `supervisor_port` | Listen port for port-based providers (docker / local / modal), or `null` for daytona |
+
+`GET /sessions/{id}/sandbox` returns the same shape the legacy `GET /sandboxes/{id}` route used to — `{session_id, provider, sandbox_ref, status, root, url, marker_path}` — so test helpers and admin UIs that need sandbox metadata can stay in session-id space without a sandbox-row-id round trip.
 
 #### Session log event types
 
@@ -371,13 +338,30 @@ Returns:
   "stderr": "...",
   "exit_code": 0,
   "stdout_truncated": false,
+  "stderr_truncated": false,
   "timed_out": false
 }
 ```
 
+Routes through the SessionPool, so the sandbox is reprovisioned automatically if it was reaped. Does not require an active ACP session.
+
+## Session-scoped filesystem
+
+Read/write inside the session's *current* sandbox (proxied through the supervisor, which is itself reprovisioned on demand). Sandbox identity is hidden — `session_id` addresses the live sandbox, no matter how many replacements have happened.
+
+```
+GET    /sessions/{id}/files/tree
+GET    /sessions/{id}/files/read?path=…
+POST   /sessions/{id}/files/edit              — body: same shape as the volume edit (overwrite or search/replace)
+POST   /sessions/{id}/files/upload            — body: {path, content (base64)}
+POST   /sessions/{id}/files/delete            — body: {path}
+POST   /sessions/{id}/files/rename            — body: {path, new_path}
+GET    /sessions/{id}/files/download?path=…   — raw bytes
+```
+
 ## Volumes
 
-Durable storage, independent of any sandbox. Created once, live for months. Every sandbox must be created against a volume (with a subpath), and every session binds to a volume.
+Durable storage, independent of any sandbox. Created once, live for months. Every session binds to a volume.
 
 ```
 POST   /volumes                              — create + wait for status="ready"
@@ -387,12 +371,15 @@ DELETE /volumes/{id_or_name}?force=false     — delete (409 if any session stil
 GET    /volumes/{id_or_name}/files/tree      — browse volume contents (e.g. ?path=shared/)
 GET    /volumes/{id_or_name}/files/read      — read a file (?path=…)
 GET    /volumes/{id_or_name}/files/exists    — check if a file/dir exists (?path=…)
-POST   /volumes/{id_or_name}/files/edit      — write a file (body: {path, content})
-POST   /volumes/{id_or_name}/files/rename    — rename/move (body: {path, new_path, overwrite=true})
+GET    /volumes/{id_or_name}/files/download  — raw bytes (?path=…)
+POST   /volumes/{id_or_name}/files/edit      — write or search/replace a file (body: {path, content} OR {path, old_string, new_string, replace_all?})
+POST   /volumes/{id_or_name}/files/upload    — body: {path, content (base64)}
+POST   /volumes/{id_or_name}/files/mkdir     — body: {path}
+POST   /volumes/{id_or_name}/files/delete    — body: {path}
+POST   /volumes/{id_or_name}/files/rename    — body: {path, new_path, overwrite=true}
 ```
 
-File ops are backed internally by a short-lived utility sandbox that mounts the volume; callers never need to manage one to seed data.
-For `POST /volumes/{id_or_name}/files/rename`, `overwrite` defaults to `true` for compatibility. When `overwrite=false`, the provider uses an atomic no-overwrite primitive for regular files; if `new_path` already exists the API returns HTTP 409 with `{"error": "exists", "path": new_path}` and leaves `path` untouched. Providers that cannot guarantee atomic no-overwrite semantics for a case return a clear unsupported error instead of falling back to a pre-check.
+File ops operate directly against the provider's volume primitives — no live sandbox required. For `POST /volumes/{id_or_name}/files/rename`, `overwrite` defaults to `true` for compatibility. When `overwrite=false`, the provider uses an atomic no-overwrite primitive for regular files; if `new_path` already exists the API returns HTTP 409 with `{"error": "exists", "path": new_path}` and leaves `path` untouched. Providers that cannot guarantee atomic no-overwrite semantics for a case return a clear unsupported error instead of falling back to a pre-check.
 
 `POST /volumes` body:
 
@@ -400,43 +387,11 @@ For `POST /volumes/{id_or_name}/files/rename`, `overwrite` defaults to `true` fo
 {"name": "my-vol", "provider": "daytona"}
 ```
 
-Returns the volume record including `{id, name, provider, provider_ref, status}`.
-
-## Sandboxes
-
-Sandbox endpoints don't require a session. They operate directly on the sandbox infrastructure. Every sandbox is `(volume_id, subpath)`-scoped at creation: the volume is mounted at `/home/daytona` and a read-only `shared/` subpath on the same volume is mounted at `/mnt/shared`.
-
-```
-POST   /sandboxes                           — create + wait for ready (provider + optional volume_id/subpath, config, pre_start_commands, shared_mounts)
-GET    /sandboxes                           — list
-GET    /sandboxes/{id}                      — get info (includes volume_id, subpath)
-DELETE /sandboxes/{id}                      — destroy (sessions survive with current_sandbox_id = NULL)
-POST   /sandboxes/{id}/stop                 — stop (volume data preserved)
-POST   /sandboxes/{id}/start                — resume stopped sandbox
-GET    /sandboxes/{id}/files/tree           — browse the sandbox filesystem
-GET    /sandboxes/{id}/files/read?path=…    — read a file
-POST   /sandboxes/{id}/files/edit           — edit/create a file (body: {path, old_string, new_string, replace_all})
-POST   /sandboxes/{id}/files/upload         — upload a file (body: {path, content: base64})
-POST   /sandboxes/{id}/files/delete         — delete a file or directory (body: {path})
-POST   /sandboxes/{id}/files/rename         — rename/move (body: {path, new_path})
-GET    /sandboxes/{id}/files/download?path=…— download a file as raw bytes
-```
-
-`POST /sandboxes` body:
-
-```json
-{
-  "provider": "daytona",
-  "volume_id": "vol-uuid",
-  "subpath": "agents/<agent_id>/home",
-  "agent_type": "claude",
-  "root": "/home/daytona"
-}
-```
-
-`volume_id` is optional — omit to get/create `default-{provider}`. `subpath` is optional too; the server picks `sandboxes/<hex>/home` for direct `/sandboxes` callers. For session-driven creation, the server uses `subpath = agents/<agent_id>/home` so all sessions of the same agent share HOME on the volume.
+Returns the volume record `{id, name, provider, provider_ref, status}`. Volume names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
 
 ## Agents (config only)
+
+Register an agent identity without provisioning compute. Used when the caller wants to validate or stage an agent before paying provisioning cost.
 
 ```
 POST   /agents                     — register agent config (no sandbox)
@@ -444,6 +399,16 @@ GET    /agents                     — list
 GET    /agents/{id}                — get
 DELETE /agents/{id}                — delete
 ```
+
+`POST /agents` rejects keys that no longer belong to agent config — `cwd`, `env`, `dockerfile`, `dockerfile_content`, `shared_mounts` — with a 400 explaining that they must be set on `POST /sessions` instead. Agent config is `agent_type`, `model`, `mcp_servers`, `skills`, `mode`, `thought_level`.
+
+## Admin
+
+```
+GET /admin/sessions
+```
+
+Pool snapshot for the dashboard / debugging — lists every active session lease and (separately) every supervisor instance the pool currently runs. Response shape is preserved from the legacy implementation so `ui/dashboard.html` doesn't need to change.
 
 ## Client API (Python SDK)
 
@@ -464,7 +429,7 @@ response = await agent.arun("redirect", interrupt=True)
 
 ### `Agent.astream(message, *, interrupt=False) -> AsyncIterator[Event]`
 
-Send a message and stream events. If `interrupt=True`, cancels the running prompt first.
+Send a message and stream events via `POST /sessions/{id}/message+stream` (single round-trip). Yields `Event` dicts; `print(ev, end="")` works naturally.
 
 ```python
 async for ev in agent.astream("explain X"):
@@ -508,6 +473,10 @@ async with agent.events() as stream:
 
 Multiple concurrent `events()` contexts are allowed; each gets a fan-out copy. On connection failure, the generator raises `StreamError`.
 
+### `Agent.aclose()` / `async with`
+
+Closing an `Agent` calls `POST /sessions/{id}/release` to snapshot + drop the pool's compute lease, then closes the underlying `httpx.AsyncClient`. The reaper would catch idle sessions eventually, but releasing on close frees compute immediately and writes a fresh snapshot.
+
 ## Server-side client (operator persona)
 
 `agent_sdk.ApiClient` is a thin async wrapper over every REST route on this server. Use it from services that create, destroy, and introspect OTHER people's sessions — e.g. hive's workspace-agent bootstrap, `scripts/bench_recovery.py`, admin tooling. `Agent` stays the right choice when your code IS the user talking to its own session; `ApiClient` is the right choice when your code is the operator.
@@ -521,12 +490,12 @@ async with ApiClient(
 ) as sc:
     session = await sc.create_session(provider="daytona", model="claude-sonnet-4-6")
     await sc.send_message(session["session_id"], "hello")
-    await sc.destroy_sandbox(session["sandbox_id"])
+    await sc.release_session(session["session_id"])  # snapshot + drop compute
 ```
 
 ### Design
 
-- **Stateless w.r.t. resources.** No per-session / per-sandbox / per-volume state lives on the instance. Every method takes the IDs it acts on as parameters — a single instance is safe to share across thousands of concurrent operations against unrelated sessions.
+- **Stateless w.r.t. resources.** No per-session / per-volume state lives on the instance. Every method takes the IDs it acts on as parameters — a single instance is safe to share across thousands of concurrent operations against unrelated sessions.
 - **Stateful only for transport.** The instance holds one `httpx.AsyncClient` (connection pool + bearer header). No locks, no retries, no idempotency keys.
 - **Flat surface, one method per endpoint.** No sub-namespaces. The method name mirrors the REST path; the body is pass-through. Adding a new route = adding one method.
 - **Shared error mapping with `Agent`.** HTTP ≥400 responses raise `httpx.HTTPStatusError` with the server's `{"error": ...}` body attached — same as the user-facing `Agent` class.
@@ -544,27 +513,37 @@ Grouped by resource. Bodies are documented under the corresponding REST endpoint
 | | `delete_volume(id_or_name, force=False)` | `DELETE /volumes/{id}` |
 | Volume files | `volume_file_tree(volume_id, path="")` | `GET /volumes/{id}/files/tree` |
 | | `volume_file_read(volume_id, path)` | `GET /volumes/{id}/files/read` |
+| | `volume_file_download(volume_id, path)` | `GET /volumes/{id}/files/download` |
 | | `volume_file_exists(volume_id, path)` | `GET /volumes/{id}/files/exists` |
 | | `volume_file_write(volume_id, path, content)` | `POST /volumes/{id}/files/edit` (overwrite) |
-| | `volume_file_edit(volume_id, path, old_string, new_string, replace_all=False)` | `POST /volumes/{id}/files/edit` (replace) |
+| | `volume_file_edit(volume_id, path, *, old_string, new_string, replace_all=False)` | `POST /volumes/{id}/files/edit` (search/replace) |
+| | `volume_file_upload(volume_id, path, content)` | `POST /volumes/{id}/files/upload` |
+| | `volume_file_mkdir(volume_id, path)` | `POST /volumes/{id}/files/mkdir` |
+| | `volume_file_delete(volume_id, path)` | `POST /volumes/{id}/files/delete` |
 | | `volume_file_rename(volume_id, path, new_path, overwrite=True)` | `POST /volumes/{id}/files/rename` |
-| Sessions | `create_session(**body)` | `POST /sessions` (eager default; pass `provision=False` for lazy) |
+| Agents | `create_agent(**body)` | `POST /agents` |
+| Sessions — lifecycle | `create_session(**body)` | `POST /sessions` (eager default; pass `provision=False` for lazy) |
 | | `list_sessions()` | `GET /sessions` |
 | | `get_session(id)` | `GET /sessions/{id}` |
 | | `get_session_status(id)` | `GET /sessions/{id}/status` |
+| | `get_session_sandbox(id)` | `GET /sessions/{id}/sandbox` |
 | | `get_session_log(id, limit=500)` | `GET /sessions/{id}/log` |
-| | `send_message(id, text, interrupt=False)` | `POST /sessions/{id}/message` |
+| | `resume_session(id, **body)` | `POST /sessions/{id}/resume` |
+| | `release_session(id)` | `POST /sessions/{id}/release` |
+| | `delete_session(id)` | `DELETE /sessions/{id}` (idempotent — 204 even when missing) |
+| Sessions — runtime | `send_message(id, text, interrupt=False)` | `POST /sessions/{id}/message` |
+| | `send_message_stream(id, text, interrupt=False)` async iterator | `POST /sessions/{id}/message+stream` (raw SSE bytes) |
 | | `cancel_session(id)` | `POST /sessions/{id}/cancel` |
-| | `set_session_config(id, **body)` | `POST /sessions/{id}/config` |
-| | `session_sandbox_exec(id, command, timeout=...)` | `POST /sessions/{id}/sandbox/exec` |
-| | `stream_events(id)` async iterator | `GET /sessions/{id}/events` (yields parsed event dicts) |
-| | `delete_session(id)` ⚠️ | **raises `NotImplementedError`** — no `DELETE /sessions/{id}` route yet |
+| | `set_session_config(id, **config)` | `POST /sessions/{id}/config` |
+| | `acp_call(id, method, params=None, *, notify=False)` | `POST /sessions/{id}/acp/call` |
+| | `session_sandbox_exec(id, command, timeout=30)` | `POST /sessions/{id}/sandbox/exec` |
+| | `stream_events(id)` async iterator | `GET /sessions/{id}/events` (raw SSE bytes) |
 | Session files | `session_file_tree(id)` | `GET /sessions/{id}/files/tree` |
 | | `session_file_read(id, path)` | `GET /sessions/{id}/files/read` |
-| | `session_file_edit(id, path, ...)` | `POST /sessions/{id}/files/edit` |
-| | `session_file_upload(id, path, content)` | `POST /sessions/{id}/files/upload` |
+| | `session_file_edit(id, path, *, old_string, new_string, replace_all=False)` | `POST /sessions/{id}/files/edit` |
+| | `session_file_upload(id, path, content_b64)` | `POST /sessions/{id}/files/upload` |
 | | `session_file_delete(id, path)` | `POST /sessions/{id}/files/delete` |
 | | `session_file_rename(id, path, new_path)` | `POST /sessions/{id}/files/rename` |
 | | `session_file_download(id, path)` | `GET /sessions/{id}/files/download` |
 
-`ApiClient` is intentionally focused on the session/volume lifecycle — agents and standalone sandboxes are not in its method surface. Hit the corresponding REST endpoints (`/agents`, `/sandboxes`) directly via `httpx` if you need them. `delete_session` raises rather than silently no-oping because the route is not yet implemented; replace its body with a real call once the server adds `DELETE /sessions/{id}`.
+`ApiClient` is intentionally focused on the session/volume lifecycle. There is no longer a standalone `/sandboxes` resource — sandbox identity is internal to the SessionPool and surfaced via `GET /sessions/{id}/sandbox`. For advanced ACP use cases not covered by the typed wrappers, use `acp_call`.

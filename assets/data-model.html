@@ -525,86 +525,57 @@
           </div>
         </div>
 
-        <!-- sandboxes table -->
+        <!-- sandbox_state JSONB on sessions (replaces the old sandboxes table) -->
         <div class="card">
-          <div class="card-header ch-green">
+          <div class="card-header ch-cyan">
             <div class="table-name">
-              <span class="dot dot-green"></span>
-              sandboxes
+              <span class="dot dot-cyan"></span>
+              sessions.sandbox_state <span style="font-size:11px;color:#94a3b8;font-weight:400;">— JSONB on the sessions row</span>
             </div>
             <div class="badges">
-              <span class="badge badge-updated">Updated</span>
-              <span class="badge badge-green">Postgres</span>
+              <span class="badge badge-cyan">Pydantic union</span>
             </div>
           </div>
           <div class="card-body">
-            <div class="field">
-              <div class="field-badges"><span class="badge-pk">PK</span></div>
-              <span class="field-name">id</span>
-              <span class="field-type">TEXT</span>
-              <span class="field-desc">UUID</span>
+            <div class="relation-note" style="margin-top:0;margin-bottom:10px;">
+              Sandbox identity is <strong>not</strong> a separate table — it's a discriminated-union JSONB blob on the session row, owned by the in-process <code style="font-family:monospace;color:#fb923c;">SessionPool</code>. The recipe lives here too, so deleting a sandbox can't lose its provisioning fingerprint.
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">provider</span>
-              <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">"local" | "daytona" | "docker"</span>
+              <span class="field-name">type</span>
+              <span class="field-type">"daytona" | "docker" | "unix_local" | "modal" | "unknown"</span>
+              <span class="field-desc">discriminator — picks the concrete SandboxState class</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">sandbox_ref</span>
-              <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">port or sandbox_id</span>
+              <span class="field-type">TEXT | null</span>
+              <span class="field-desc">opaque provider ref (Daytona UUID, Docker container id, local PID-as-string). Null between cold-create and first start.</span>
             </div>
             <div class="field">
-              <div class="field-badges"></div>
-              <span class="field-name">status</span>
-              <span class="field-type">TEXT</span>
-              <span class="field-desc">default 'stopped'</span>
-            </div>
-            <div class="field">
-              <div class="field-badges"></div>
-              <span class="field-name">root</span>
-              <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">default '/tmp'</span>
-            </div>
-            <div class="field is-new">
-              <div class="field-badges"><span class="badge-fk">FK</span></div>
-              <span class="field-name">volume_id</span>
-              <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">→ volumes, ON DELETE RESTRICT</span>
-            </div>
-            <div class="field is-new">
-              <div class="field-badges"></div>
-              <span class="field-name">subpath</span>
-              <span class="field-type">TEXT NOT NULL</span>
-              <span class="field-desc">per-agent volume slice: agents/&lt;agent_id&gt; (holds snapshot.tar + logs). Docker/local bind-mount it at the sandbox root; Daytona mounts it at /vol and restores from snapshot.tar on boot.</span>
-            </div>
-            <div class="field is-new">
               <div class="field-badges"></div>
               <span class="field-name">listen_port</span>
-              <span class="field-type">INTEGER</span>
-              <span class="field-desc">Docker/Local port for URL reconstruction on cold-start</span>
-            </div>
-            <div class="field is-new">
-              <div class="field-badges"><span class="badge-field-new">new</span></div>
-              <span class="field-name">dockerfile</span>
-              <span class="field-type">TEXT</span>
-              <span class="field-desc">provisioning identity — path to Dockerfile used to build this sandbox image (moved from AgentConfig 2026-04-23)</span>
-            </div>
-            <div class="field is-new">
-              <div class="field-badges"><span class="badge-field-new">new</span></div>
-              <span class="field-name">shared_mounts</span>
-              <span class="field-type">JSONB NOT NULL</span>
-              <span class="field-desc">list of shared-folder names; each mounts &lt;volume&gt;/shared/&lt;name&gt; at /mnt/&lt;name&gt;. Frozen at provision time — change requires /reset-sandbox. Moved from AgentConfig 2026-04-23.</span>
+              <span class="field-type">INTEGER | null</span>
+              <span class="field-desc">port-based providers (docker/local/modal). Null for daytona — URL comes from the signed-preview API.</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">created_at</span>
-              <span class="field-type">TIMESTAMPTZ</span>
-              <span class="field-desc">default now()</span>
+              <span class="field-name">snapshot_path</span>
+              <span class="field-type">TEXT | null</span>
+              <span class="field-desc">volume-relative path to the latest filesystem snapshot</span>
             </div>
-            <div class="relation-note">Sandbox = ephemeral compute + a volume mount. Killing a sandbox never loses the session's data.</div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">snapshot_version</span>
+              <span class="field-type">INTEGER</span>
+              <span class="field-desc">monotonic version, bumped on each release/snapshot write</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">recipe</span>
+              <span class="field-type">{ agent_type, dockerfile?, shared_mounts[], root?, pre_start_commands[] }</span>
+              <span class="field-desc">provisioning fingerprint — replayed on Type-2 recovery (replacement sandbox)</span>
+            </div>
           </div>
         </div>
 
@@ -640,10 +611,10 @@
               <span class="field-desc">→ volumes, ON DELETE RESTRICT</span>
             </div>
             <div class="field is-new">
-              <div class="field-badges"><span class="badge-fk">FK</span></div>
-              <span class="field-name">current_sandbox_id</span>
-              <span class="field-type">TEXT NULL</span>
-              <span class="field-desc">→ sandboxes, ON DELETE SET NULL (was sandbox_id NOT NULL CASCADE)</span>
+              <div class="field-badges"></div>
+              <span class="field-name">sandbox_state</span>
+              <span class="field-type">JSONB</span>
+              <span class="field-desc">discriminated union (daytona | docker | unix_local | modal | unknown). Holds <code style="font-family:monospace;color:#fb923c;">sandbox_ref</code>, <code style="font-family:monospace;color:#fb923c;">listen_port</code>, <code style="font-family:monospace;color:#fb923c;">snapshot_path</code>, <code style="font-family:monospace;color:#fb923c;">snapshot_version</code>, and the provisioning <code style="font-family:monospace;color:#fb923c;">recipe</code>. Replaces the old <code style="font-family:monospace;color:#fb923c;">current_sandbox_id</code> FK.</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -680,7 +651,7 @@
               <span class="field-name">created_at</span>
               <span class="field-type">TIMESTAMPTZ</span>
             </div>
-            <div class="relation-note">Session now binds to a <strong>volume</strong> (durable). <code style="font-family:monospace;color:#fb923c;">current_sandbox_id</code> is the ephemeral compute lease — nullable, swapped transparently when the sandbox dies.</div>
+            <div class="relation-note">Session binds to a <strong>volume</strong> (durable). The active compute lease is owned in-process by the <code style="font-family:monospace;color:#fb923c;">SessionPool</code>; <code style="font-family:monospace;color:#fb923c;">sandbox_state</code> is its durable cold-recovery fingerprint, swapped transparently when the sandbox dies or is replaced.</div>
           </div>
         </div>
 
@@ -715,16 +686,10 @@
               <span class="field-desc">→ agents</span>
             </div>
             <div class="field">
-              <div class="field-badges"><span class="badge-fk">FK</span></div>
-              <span class="field-name">sandbox_id</span>
-              <span class="field-type">TEXT NULL</span>
-              <span class="field-desc">→ sandboxes, ON DELETE SET NULL</span>
-            </div>
-            <div class="field">
               <div class="field-badges"></div>
               <span class="field-name">event_type</span>
               <span class="field-type">TEXT</span>
-              <span class="field-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | turn_end | error | <strong style="color:#4ade80;">sandbox_reattach</strong></span>
+              <span class="field-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | turn_end | error</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -850,17 +815,6 @@
             </div>
             <div class="field">
               <div class="field-badges"></div>
-              <span class="field-name">prompt</span>
-              <span class="field-type">str?</span>
-              <span class="field-desc">system prompt</span>
-            </div>
-            <div class="field">
-              <div class="field-badges"></div>
-              <span class="field-name">tools</span>
-              <span class="field-type">list[str]?</span>
-            </div>
-            <div class="field">
-              <div class="field-badges"></div>
               <span class="field-name">mcp_servers</span>
               <span class="field-type">dict?</span>
               <span class="field-desc">name → config</span>
@@ -871,12 +825,25 @@
               <span class="field-type">list | dict?</span>
               <span class="field-desc">npx skills sources</span>
             </div>
-            <div class="relation-note">Stored as JSON in agents.config column. Pure agent identity — cloneable, no per-invocation state.</div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">mode</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">"default" | "plan" | "bypassPermissions" | "acceptEdits" | …</span>
+            </div>
+            <div class="field">
+              <div class="field-badges"></div>
+              <span class="field-name">thought_level</span>
+              <span class="field-type">str?</span>
+              <span class="field-desc">"low" | "medium" | "high" — Claude's "thinking" config_id</span>
+            </div>
+            <div class="relation-note">Stored as JSON in agents.config column. Pure agent identity — cloneable, no per-invocation state. <code style="font-family:monospace;color:#fb923c;">mode</code> + <code style="font-family:monospace;color:#fb923c;">thought_level</code> are persisted here so cold-recovery (Type-2) replays them via <code style="font-family:monospace;color:#fb923c;">_attach_acp</code>.</div>
             <div class="relation-note" style="margin-top:6px;">
-              <strong>Moved out of AgentConfig (2026-04-23):</strong><br>
+              <strong>Not on AgentConfig:</strong><br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">prompt</code> + <code style="font-family:monospace;color:#fb923c;">tools</code> → removed; provider CLIs handle them directly via mode / built-in defaults<br>
               &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">cwd</code> → <code style="font-family:monospace;color:#fb923c;">sessions.cwd</code> (JSONL-hash key; per-conversation)<br>
-              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">dockerfile</code> + <code style="font-family:monospace;color:#fb923c;">shared_mounts</code> → <code style="font-family:monospace;color:#fb923c;">sandboxes</code> (provisioning identity; frozen per-sandbox)<br>
-              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">env</code> → dropped; use <code style="font-family:monospace;color:#fb923c;">sessions.env</code> / <code style="font-family:monospace;color:#fb923c;">sessions.secrets</code>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">dockerfile</code> + <code style="font-family:monospace;color:#fb923c;">shared_mounts</code> + <code style="font-family:monospace;color:#fb923c;">root</code> + <code style="font-family:monospace;color:#fb923c;">pre_start_commands</code> → <code style="font-family:monospace;color:#fb923c;">sandbox_state.recipe</code> (frozen at provision time)<br>
+              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">env</code> → <code style="font-family:monospace;color:#fb923c;">sessions.env</code> / <code style="font-family:monospace;color:#fb923c;">sessions.secrets</code>
             </div>
           </div>
         </div>
@@ -894,7 +861,7 @@
           </div>
           <div class="card-body">
             <div class="method-row">
-              <span class="method-name">Agent(name, agent_type, provider, model, cwd, prompt, api_url, tools, mcp_servers, skills, db, session_id, sandbox_id, dockerfile)</span>
+              <span class="method-name">Agent(name, agent_type, provider, model, cwd, root, api_url, mcp_servers, skills, db, session_id, sandbox_ref, dockerfile, oauth_token, api_key, volume_id, pre_start_commands, shared_mounts, secrets)</span>
             </div>
             <div class="endpoint-group-label" style="padding-top:8px;">Class methods / construction</div>
             <div class="method-row">
@@ -995,6 +962,7 @@
               <div class="field-badges"></div>
               <span class="field-name">sandbox_id</span>
               <span class="field-type">str</span>
+              <span class="field-desc">vestigial — runtime is now SessionPool / SandboxSession (see docs/session-runtime-refactor.md). This dataclass survives only for response-shape back-compat.</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>

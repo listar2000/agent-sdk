@@ -1,4 +1,9 @@
-"""Data models for the AFE server: agents, sandboxes, and runtime session state."""
+"""Data models for the API server: agents, volumes, and runtime session state.
+
+Sandbox identity is not modelled here — it lives in ``sessions.sandbox_state``
+JSONB and is owned by ``api.sandbox.SessionPool`` (see
+``api.sandbox.state.SandboxState`` for the discriminated union, and
+docs/session-runtime-refactor.md for the model)."""
 
 from __future__ import annotations
 
@@ -90,7 +95,9 @@ class VolumeRecord:
     provider: Provider
     provider_ref: str
     status: str = "ready"
-    supervisor_agent_types: list[str] = field(default_factory=list)
+    # ``supervisor_agent_types`` field deleted in Phase E of
+    # docs/runtime-image-unification.md. The DB column stays (now unused)
+    # until the column-drop migration ships.
 
 
 SessionLifecycle = Literal["live", "hibernated"]
@@ -98,7 +105,14 @@ SessionLifecycle = Literal["live", "hibernated"]
 
 @dataclass
 class SessionState:
-    """In-memory runtime state binding an agent to a sandbox."""
+    """LEGACY in-memory runtime state binding an agent to a sandbox.
+
+    Vestigial: the runtime is now ``api.sandbox.SessionPool`` +
+    ``api.sandbox.session.BaseSandboxSession`` (see
+    docs/session-runtime-refactor.md). This dataclass survives only for
+    response-shape back-compat fields the dashboard reads
+    (``agent_busy``, ``active_rpc_id``, ``pending_count``) — which are
+    constants in current responses. Do not wire new code to it."""
     session_id: str
     agent_id: str
     sandbox_id: str

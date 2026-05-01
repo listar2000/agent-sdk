@@ -92,5 +92,23 @@ fi
 
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/agent_sdk_server
 
+# Local provider's source-tree runtime path. See
+# scripts/launch_server_local.sh for the full rationale.
+if command -v npm >/dev/null 2>&1; then
+  echo "Ensuring src/supervisor npm deps are installed..."
+  (cd "${REPO_ROOT}/src/supervisor" && npm install --omit=optional --silent) || true
+fi
+
+# Daytona / docker / modal providers auto-resolve from .runtime-image-tag
+# and .runtime-snapshot-tag (committed by scripts/release.sh). Print them
+# for visibility; if missing, those providers will fail with a clear
+# "run scripts/release.sh" error.
+if [[ -f "${REPO_ROOT}/.runtime-image-tag" ]]; then
+  echo "Runtime image: $(cat "${REPO_ROOT}/.runtime-image-tag")"
+fi
+if [[ -f "${REPO_ROOT}/.runtime-snapshot-tag" ]]; then
+  echo "Daytona snapshot: $(cat "${REPO_ROOT}/.runtime-snapshot-tag")"
+fi
+
 echo "Starting local server on http://localhost:7778 ..."
 exec "${VENV_PYTHON}" -m uvicorn src.api.server:app --host 0.0.0.0 --port 7778

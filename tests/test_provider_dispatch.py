@@ -82,11 +82,8 @@ async def test_volume_tree_unknown_provider():
     _assert_clear_error(excinfo.value)
 
 
-@pytest.mark.asyncio
-async def test_install_supervisor_unknown_provider():
-    with pytest.raises((ValueError, RuntimeError, KeyError)) as excinfo:
-        await providers.install_supervisor(_BOGUS, "vol-ref", "claude")
-    _assert_clear_error(excinfo.value)
+# test_install_supervisor_unknown_provider was deleted in Phase E of
+# docs/runtime-image-unification.md — install_supervisor itself is gone.
 
 
 @pytest.mark.asyncio
@@ -139,8 +136,9 @@ def test_registered_providers_are_dispatchable(provider):
     # Not all providers publish _dispatch_mod symbol; use the public path.
     assert provider in providers._PROVIDER_MODS
     mod = providers._PROVIDER_MODS[provider]
-    # Each provider exposes the uniform API functions.
-    for attr in ("create_volume", "install_supervisor", "create_sandbox"):
+    # Each provider exposes the uniform API functions. ``install_supervisor``
+    # was removed in Phase E (runtime ships in image, not on volumes).
+    for attr in ("create_volume", "create_sandbox"):
         assert hasattr(mod, attr), f"{provider}.{attr} missing"
 
 

@@ -103,10 +103,21 @@ class TestRunSandboxExec:
 # ---------------------------------------------------------------------------
 
 def _provision_ctx(sandbox):
-    """Context manager stack for provision_daytona_sandbox unit tests."""
+    """Context manager stack for provision_daytona_sandbox unit tests.
+
+    These are pre_start-failure tests, not runtime-image tests. Phase E
+    of docs/runtime-image-unification.md removed the legacy node:22-slim
+    fallback, so we set ``DAYTONA_IMAGE`` to satisfy the now-required
+    image arg. ``DAYTONA_SNAPSHOT=0`` keeps us off the snapshot branch
+    so the test still exercises the image path.
+    """
     import daytona_sdk as _dsdk
     return (
-        patch.dict(os.environ, {"DAYTONA_API_KEY": "test-key", "DAYTONA_SNAPSHOT": "0"}),
+        patch.dict(os.environ, {
+            "DAYTONA_API_KEY": "test-key",
+            "DAYTONA_SNAPSHOT": "0",
+            "DAYTONA_IMAGE": "ghcr.io/agent-sdk:test",
+        }),
         patch.object(_dsdk, "Daytona", _fake_daytona_class(sandbox)),
         patch.object(_dsdk, "DaytonaConfig", MagicMock()),
         patch("api.providers.daytona._build_volume_mounts", return_value=[]),

@@ -219,10 +219,25 @@ async def _try_create_agent(agent_type: str, name: str) -> Agent | None:
     Returns None instead of raising so fixtures can call pytest.skip() cleanly
     when a provider requires credentials the server doesn't have (e.g. codex
     needs OPENAI_API_KEY, opencode needs ACP Phase 7).
+
+    Codex tests are opt-in: they need a working OPENAI_API_KEY with quota,
+    which most dev environments don't have. Set ``RUN_CODEX_TESTS=1`` to
+    enable them. Without that flag, codex tests skip cleanly rather than
+    failing with "no terminal arrived" (the symptom of an OpenAI auth or
+    quota error from the spawned codex-acp).
     """
+    secrets: dict[str, str] = {}
+    if agent_type == "codex":
+        if os.environ.get("RUN_CODEX_TESTS") != "1":
+            return None
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key:
+            return None
+        secrets["OPENAI_API_KEY"] = key
     try:
         agent = Agent(
-            name, provider="local", api_url=BASE_URL, agent_type=agent_type
+            name, provider="local", api_url=BASE_URL, agent_type=agent_type,
+            secrets=secrets or None,
         )
         await asyncio.wait_for(agent._ensure_registered(), timeout=20.0)
         return agent
@@ -338,10 +353,7 @@ async def claude_agent(request):
             "claude agent not available (check server and ANTHROPIC_API_KEY)"
         )
     yield agent
-    try:
-        await agent.aclose()
-    except Exception:
-        pass
+    await _full_cleanup(agent)
 
 
 @pytest_asyncio.fixture
@@ -354,10 +366,7 @@ async def codex_agent(request):
             "codex agent not available (check server, codex install, and OPENAI_API_KEY)"
         )
     yield agent
-    try:
-        await agent.aclose()
-    except Exception:
-        pass
+    await _full_cleanup(agent)
 
 
 @pytest_asyncio.fixture(params=["claude", "codex"])
@@ -373,6 +382,25 @@ async def any_agent(request):
     if agent is None:
         pytest.skip(f"{agent_type} agent not available")
     yield agent
+    await _full_cleanup(agent)
+
+
+async def _full_cleanup(agent: Agent) -> None:
+    """Best-effort full teardown: delete the session (drops sandbox + DB row)
+    AND close the Agent's HTTP client.
+
+    ``Agent.aclose()`` only calls ``release_session`` (snapshot + drop pool
+    lease) — the underlying daytona/docker sandbox stays alive on its
+    provider-side state and the session row stays in DB. For test fixtures
+    we want full teardown so per-test sandboxes don't accumulate and burn
+    through the daytona account's disk quota under -n auto.
+    """
+    sid = agent.session_id
+    if sid:
+        try:
+            await agent._api.delete_session(sid)
+        except Exception as exc:
+            print(f"_full_cleanup: delete_session({sid}) raised: {exc}")
     try:
         await agent.aclose()
     except Exception:

@@ -1,6 +1,6 @@
 """SessionPool — the entire recovery surface, in one method.
 
-Per ``docs/ephemeral-sandbox-design.md`` §6. Replaced the legacy
+See ``docs/session-runtime-refactor.md``. Replaced the legacy
 recovery chain (``_ensure_sandbox_alive`` / ``_type1_recover`` /
 ``_type2_recover`` / ``_rebind_state``) plus the in-memory
 ``_INSTANCES`` and ``SESSIONS`` registries plus the ``_session_locks``

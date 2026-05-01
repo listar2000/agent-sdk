@@ -1,6 +1,9 @@
-"""Agent client SDK.
+"""Agent client SDK — user persona.
 
-Async-first Python client for the agent orchestration API.
+Async-first Python client for the agent orchestration API. Use this
+class when your code IS the user talking to its own session. For the
+operator persona (admin tooling, hive bootstrap, bench scripts) use
+``agent_sdk.ApiClient`` instead.
 
 Architecture note: The ACP protocol uses StreamableHTTP — the POST sends
 the JSON-RPC request but the response may arrive either in the POST body
@@ -9,12 +12,16 @@ by the proxy, so the SSE stream is the reliable channel for results.
 
 Layering: ``Agent`` is the high-level UX wrapper. It holds an
 ``ApiClient`` for all wire-level HTTP and adds:
-  * stateful session/sandbox tracking + persistence (sqlite)
-  * registration semantics (eager/resume/agent-only)
-  * system-prompt prepend on first message
-  * sync run() wrapper around the async core
-  * ``Sandbox`` helper for direct exec/file ops
-  * typed ``Event`` production from raw SSE bytes
+  * stateful session / ``sandbox_ref`` tracking + sqlite persistence
+  * registration semantics (eager via ``POST /sessions`` / resume by
+    ``session_id`` / agent-only registration via ``POST /agents``)
+  * sync ``run()`` wrapper around the async core
+  * ``Sandbox`` helper for direct exec/file ops on the live sandbox
+  * typed ``Event`` production from raw SSE bytes via
+    ``POST /sessions/{id}/message+stream``
+  * ``aclose()`` calls ``release_session`` on the way out so the
+    server's pool drops compute immediately instead of waiting for the
+    idle reaper.
 """
 
 import asyncio

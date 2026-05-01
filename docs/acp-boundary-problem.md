@@ -1,8 +1,9 @@
 # ACP prompt-boundary constraints
 
-This document explains why the server uses an explicit queue plus
-optional `interrupt=True` instead of forwarding multiple `session/prompt`
-requests concurrently to the same ACP session.
+This document explains why the server runs at most one prompt per
+session through the upstream ACP adapter at a time, and why
+`interrupt=True` on the SDK is implemented as cancel-then-submit
+client-side rather than a true mid-turn handoff on the wire.
 
 ## Desired properties
 
@@ -28,7 +29,7 @@ prompt loop is currently active. The adapters do not currently populate a
 stable per-chunk message identifier that would let the server separate
 "work about A" from "work about B" once those two have overlapped.
 
-So if the server simply allows multiple prompt RPCs in flight:
+So if the server simply allowed multiple prompt RPCs in flight:
 
 - B may start sooner
 - but B's tagged event stream can contain reasoning, tool work, or text
@@ -36,23 +37,39 @@ So if the server simply allows multiple prompt RPCs in flight:
 
 That makes clean per-prompt attribution unreliable.
 
-## Current server decision
+## Current server behaviour
 
-The server therefore keeps execution single-threaded per session:
+The server runs at most one `session/prompt` against the ACP child at
+a time per session. `POST /sessions/{id}/message+stream` and `POST
+/sessions/{id}/message` share one canonical execution path
+(`_execute_and_stream_sse`); both go through the SandboxSession's
+`execute_prompt`, which holds the upstream prompt lock until the
+`done` block surfaces.
 
-- one active prompt upstream
-- later prompts queued in `pending_prompts`
-- one long-lived upstream SSE reader
-- downstream fan-out from the server, not directly from ACP
+Concurrent callers see whichever serialisation the SandboxSession
+imposes — there is no explicit queue layer in front. The ACP child is
+the choke point.
 
-If the caller wants to take over quickly, they use `interrupt=True`:
+## How interrupt is implemented
 
-1. cancel the active turn
-2. wait for that turn to reach a terminal state
-3. enqueue the new prompt behind any already-queued work
+`interrupt=True` on `Agent.send()` / `Agent.arun()` / `Agent.astream()`
+is purely a client-side ordering:
 
-This preserves semantic cleanliness for prompt tagging at the cost of
-true mid-turn handoff.
+1. `await agent.cancel()` — calls `POST /sessions/{id}/cancel`, which
+   sends `session/cancel` (a JSON-RPC notification) to the supervisor's
+   ACP child
+2. wait for the cancelled prompt to reach a terminal block
+   (`stopReason: "cancelled"`)
+3. submit the new message via `POST /message` or `/message+stream`
+
+The server's `POST /message` accepts an `interrupt` boolean for
+historical wire compatibility, but on the per-prompt SSE path it is a
+no-op — the client must drive cancel-then-submit.
+
+`POST /sessions/{id}/cancel` is the single primitive: it routes
+through the SessionPool so the cancel reaches the live ACP child even
+if compute had to be cold-recovered first, and returns 200 (with
+`detail: "no active lease"` when there is nothing to cancel).
 
 ## Why not do true concurrent prompt submission
 
@@ -67,11 +84,11 @@ mid-turn queueing and clean per-prompt event attribution are in tension.
 
 ## Practical takeaway
 
-Queueing and interrupt are the public semantics the server can explain
-clearly today:
+What the server can explain clearly today:
 
-- normal submission: append to the queue
-- interrupt submission: cancel active turn, then continue in queue order
+- normal submission: serialise behind the current upstream prompt
+- interrupt submission (client-side): cancel via `/cancel`, then submit
+- `POST /sessions/{id}/cancel`: best-effort abort of the in-flight turn
 
 Anything stronger than that requires either upstream protocol support
 for semantic chunk attribution or a different agent runtime that we own.

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import shlex
 import shutil
 import time
@@ -34,6 +35,7 @@ from ._shared import (
     _find_free_port,
     _port_lock,
     _freed_ports,
+    _read_runtime_image_tag,
     _recycle_port,
     _safe_path,
     _wait_for_health,
@@ -43,21 +45,24 @@ from ._shared import (
 
 log = logging.getLogger(__name__)
 
-# Path to the canonical supervisor.js on the host (source of truth).
-_SUPERVISOR_JS_HOST = (
-    Path(__file__).resolve().parent.parent.parent / "supervisor" / "supervisor.js"
-)
+# ``_SUPERVISOR_JS_HOST`` was deleted in Phase E of
+# docs/runtime-image-unification.md — install_supervisor (the only reader)
+# is gone. ``_runtime_supervisor_js()`` resolves supervisor.js for callers.
+
 
 # Inside-container supervisor port (mapped to a random host port at create time).
 _SUPERVISOR_CONTAINER_PORT = 9100
 
-# Default images.
+# Default image for utility one-shots (e.g. ``_ensure_subpath_dir``); the
+# sandbox-runtime image is resolved at create_sandbox time from
+# DOCKER_IMAGE / AGENT_SDK_IMAGE / .runtime-image-tag.
 _UTIL_IMAGE = "alpine:3.19"
-_NODE_IMAGE = "node:20-slim"
 
 # Canonical in-container paths for sandbox mounts.
 _AGENT_HOME_IN = "/home/agent"
-_SUPERVISOR_IN = "/opt/supervisor"
+# ``_SUPERVISOR_IN`` was deleted in Phase E of
+# docs/runtime-image-unification.md — the runtime is bind-mounted to
+# ``/opt/agent-sdk/runtime`` from the host's ``_detect_runtime_path()``.
 
 
 def _require_docker() -> str:
@@ -134,109 +139,10 @@ async def delete_volume(ref: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Supervisor install (populate <volume>/system/supervisor/)
-# ---------------------------------------------------------------------------
-
-async def install_supervisor(volume_ref: str, agent_type: str) -> None:
-    """Populate ``<volume>/system/supervisor/`` with supervisor.js + deps.
-
-    Live-safe: each install writes to a fresh ``system/supervisor.v<ts>/``
-    directory and flips the ``system/supervisor`` symlink to point at it.
-    Running sandboxes that already mounted ``volume-subpath=system/supervisor``
-    keep their bind-mount pointing at the OLD versioned directory — the
-    kernel resolves the symlink once at ``docker run`` time, so a subsequent
-    install can't pull the rug out from under them.  New sandboxes created
-    after the symlink flip pick up the new install transparently.
-
-    Old versioned directories are garbage-collected at install time once
-    they're at least 24 h old — that window is longer than the longest
-    practical sandbox session, so we never delete a directory a live
-    container could still be reading.
-
-    Recovery / retry semantics from the previous staging+rename scheme
-    are preserved: on failure the staging v-dir is removed and any
-    previous ``system/supervisor`` symlink is left intact.  The very
-    first install has no symlink yet — in that case we write the
-    v-dir, point the symlink at it, and that's it.
-    """
-    if agent_type not in _ACP_NPM_SPECS:
-        raise ValueError(
-            f"docker install_supervisor: no npm spec for agent_type={agent_type!r}"
-        )
-    if not _SUPERVISOR_JS_HOST.exists():
-        raise RuntimeError(f"host supervisor.js missing at {_SUPERVISOR_JS_HOST}")
-    npm_spec = _ACP_NPM_SPECS[agent_type]
-    bin_name = _acp_bin_name(agent_type)
-    # Versioned dir name: monotonic timestamp + short random suffix so two
-    # concurrent installs on the same volume don't clobber each other.
-    v_name = f"supervisor.v{int(time.time() * 1000):013d}.{uuid.uuid4().hex[:6]}"
-
-    sentinel = f"/work/{v_name}/node_modules/.bin/{shlex.quote(bin_name)}"
-    v_path = f"/work/{shlex.quote(v_name)}"
-    link_path = "/work/supervisor"
-
-    # Shell script:
-    #   1. Build the install into /work/<v_name>/ from scratch.
-    #   2. Verify sentinels.
-    #   3. Atomically replace /work/supervisor with a symlink pointing at
-    #      /work/<v_name>.  ``ln -sfn`` does the flip without an intermediate
-    #      unlink + create race.  If /work/supervisor is a real directory
-    #      (first-install legacy layout), remove it first — but only then,
-    #      and only if it's a dir, because turning a live symlink into a
-    #      real rm -rf would nuke whatever it points at.
-    #   4. Best-effort GC of old ``supervisor.v*`` dirs older than 24 h,
-    #      skipping the one the current symlink points at.
-    gc = (
-        "CUR=$(readlink -f /work/supervisor 2>/dev/null || echo /dev/null); "
-        "for d in /work/supervisor.v*; do "
-        "  [ -d \"$d\" ] || continue; "
-        "  [ \"$d\" = \"$CUR\" ] && continue; "
-        "  age_sec=$(( $(date +%s) - $(stat -c %Y \"$d\" 2>/dev/null || echo 0) )); "
-        "  [ \"$age_sec\" -gt 86400 ] && rm -rf \"$d\"; "
-        "done; true"
-    )
-    shell = (
-        "set -e && "
-        f"mkdir -p {v_path} && "
-        f"cd {v_path} && "
-        "npm init -y >/dev/null 2>&1 && "
-        f"npm install --omit=optional --silent {shlex.quote(npm_spec)} && "
-        f"cp /src/supervisor.js {v_path}/supervisor.js && "
-        # Sentinel check — fail without touching the symlink if the install
-        # didn't produce a usable binary.
-        f"test -f {sentinel} && "
-        f"test -f {v_path}/supervisor.js && "
-        # If /work/supervisor is a real directory (legacy / first-install),
-        # swap it for a symlink. If it's already a symlink, -sfn replaces
-        # it atomically (same inode flip as rename(2) on linux).
-        f"if [ -d {link_path} ] && [ ! -L {link_path} ]; then "
-        f"  rm -rf {link_path}; "
-        "fi && "
-        f"ln -sfn {shlex.quote(v_name)} {link_path} && "
-        # Best-effort GC of stale v-dirs older than 24 h.
-        f"({gc})"
-    )
-    # Whole-command cleanup: if any step fails, remove the v-dir so the
-    # volume is never left with a half-written supervisor.v* dir. The
-    # symlink (if any) is left pointing at whatever previous dir it
-    # pointed at — that dir is untouched by this run.
-    shell_wrapped = f"({shell}) || (rm -rf {v_path}; exit 1)"
-
-    log.info("docker install_supervisor: volume=%s agent=%s v=%s", volume_ref, agent_type, v_name)
-    await _run_docker_checked(
-        "run", "--rm",
-        "--mount",
-        f"type=volume,source={volume_ref},target=/work,volume-subpath=system",
-        "--mount",
-        f"type=bind,source={_SUPERVISOR_JS_HOST},target=/src/supervisor.js,readonly",
-        _NODE_IMAGE,
-        "sh", "-c", shell_wrapped,
-        timeout=600,
-    )
-    log.info(
-        "docker install_supervisor: volume=%s agent=%s done (pointed at %s)",
-        volume_ref, agent_type, v_name,
-    )
+# ``install_supervisor`` was deleted in Phase E of
+# docs/runtime-image-unification.md. Sandbox containers now boot from the
+# agent-sdk Docker image whose ``/opt/agent-sdk/runtime/`` is bind-mounted
+# read-only via ``create_sandbox`` below, so no per-volume install runs.
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +166,18 @@ async def _ensure_subpath_dir(volume_ref: str, subpath: str) -> None:
 
 
 _LABEL_KEY = "agent-sdk.sandbox-id"
+_ORIGIN_LABEL_KEY = "agent_sdk_origin"
+
+
+def _agent_sdk_origin() -> str:
+    """Read the AGENT_SDK_ORIGIN env once per call.
+
+    Test runs set ``AGENT_SDK_ORIGIN=test`` (via
+    ``scripts/launch_server_test.sh``) so cleanup tooling can find and
+    reap orphan containers without touching production traffic.
+    """
+    import os
+    return os.environ.get("AGENT_SDK_ORIGIN", "production")
 
 
 async def create_sandbox(
@@ -269,7 +187,7 @@ async def create_sandbox(
     agent_type: str = "claude",
     root: str | None = None,
     spawn_env: dict[str, str] | None = None,
-    dockerfile: str | None = None,  # accepted but ignored — Docker uses _NODE_IMAGE
+    dockerfile: str | None = None,  # accepted but ignored — Docker uses the runtime image baked from the repo's Dockerfile
     pre_start_commands: list[str] | None = None,
     port: int | None = None,  # accepted for parity with uniform API; always allocates
     sandbox_ref: str | None = None,
@@ -295,9 +213,37 @@ async def create_sandbox(
         port = await _find_free_port()
 
     env_prefix = _build_env_prefix(spawn_env)
-    acp_path = f"{_SUPERVISOR_IN}/node_modules/.bin/{bin_name}"
+
+    # Symmetric with daytona / modal: the sandbox container boots from the
+    # agent-sdk runtime image (built via the repo's Dockerfile, baked with
+    # /opt/agent-sdk/runtime/). No host bind-mount, so docker and daytona
+    # consume the same prebuilt artifact. Resolved via:
+    #   1. ``DOCKER_IMAGE`` env (per-provider override)
+    #   2. ``AGENT_SDK_IMAGE`` env (cross-provider override)
+    #   3. ``.runtime-image-tag`` file at repo root (committed pin from
+    #      scripts/release.sh)
+    runtime_image = (
+        os.environ.get("DOCKER_IMAGE")
+        or os.environ.get("AGENT_SDK_IMAGE")
+        or _read_runtime_image_tag()
+    )
+    if not runtime_image:
+        raise RuntimeError(
+            "Docker provider requires an agent-sdk runtime image. Set "
+            "DOCKER_IMAGE / AGENT_SDK_IMAGE or run scripts/release.sh "
+            "to pin .runtime-image-tag. To build a local-only image: "
+            "`docker build -t agent-sdk:local . && echo agent-sdk:local "
+            "> .runtime-image-tag`."
+        )
+
+    # Resolve the ACP bin via package.json#bin (the image flattens
+    # ``node_modules/.bin/`` symlinks on some build engines).
+    runtime_in_container = "/opt/agent-sdk/runtime"
+    supervisor_js_in = f"{runtime_in_container}/supervisor.js"
+    from ._shared import _runtime_acp_bin_relative
+    acp_path = f"{runtime_in_container}/{_runtime_acp_bin_relative(agent_type)}"
     supervisor_argv = build_supervisor_argv(
-        supervisor_js=f"{_SUPERVISOR_IN}/supervisor.js", acp_bin=acp_path,
+        supervisor_js=supervisor_js_in, acp_bin=acp_path,
         acp_launch_args=_acp_launch_args(agent_type),
         port=_SUPERVISOR_CONTAINER_PORT, root=agent_root,
     )
@@ -318,9 +264,6 @@ async def create_sandbox(
             "--mount",
             f"type=volume,source={volume_ref},target={_AGENT_HOME_IN},"
             f"volume-subpath={subpath}",
-            "--mount",
-            f"type=volume,source={volume_ref},target={_SUPERVISOR_IN},"
-            f"volume-subpath=system/supervisor",
         ]
         # Opt-in named shared mounts (one /mnt/<name> per entry). Same
         # name-sanitization as the daytona path — strip path separators so
@@ -338,9 +281,13 @@ async def create_sandbox(
             # Used by reconcile_on_startup() to cross-reference live containers
             # against DB sandbox rows after a server crash.
             c += ["--label", f"{_LABEL_KEY}={sandbox_ref}"]
+        # Origin label for cleanup tooling — same shape as daytona's
+        # ``agent_sdk_origin`` label so a single cleanup script can reap
+        # both providers' test orphans by filter.
+        c += ["--label", f"{_ORIGIN_LABEL_KEY}={_agent_sdk_origin()}"]
         c += [
             "--entrypoint", "sh",
-            _NODE_IMAGE,
+            runtime_image,
             "-c", shell_cmd,
         ]
         return c

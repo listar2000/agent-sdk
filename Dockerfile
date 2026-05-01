@@ -12,10 +12,26 @@ COPY pyproject.toml .
 COPY src/ src/
 COPY ui/ ui/
 
+# Runtime tag files are read by providers/_shared.py to resolve the
+# correct daytona snapshot / docker image at sandbox-creation time.
+# COPY with a glob so the build still works if either file is missing
+# (e.g. before scripts/release.sh has been run).
+COPY .runtime-image-tag* .runtime-snapshot-tag* ./
+
 RUN pip install --no-cache-dir .
 
-# Preinstall supervisor Node deps so first-session startup doesn't wait on npm.
-RUN cd src/supervisor && npm install --silent
+# Pre-install the supervisor's npm deps so first-session startup doesn't
+# wait on npm and the ACP bin symlinks resolve relative to this directory.
+RUN cd src/supervisor && npm install --omit=optional --silent
+
+# Symlink ``/opt/agent-sdk/runtime`` to the actual supervisor dir so
+# providers that hardcode the canonical runtime path (daytona/modal/docker
+# all reference ``/opt/agent-sdk/runtime`` inside the sandbox) still
+# resolve. Both paths point at the same files; ``_runtime_acp_bin``
+# resolves through ``package.json#bin`` so any ``.bin/`` symlink-flattening
+# during image-build doesn't break supervisor spawn.
+RUN mkdir -p /opt/agent-sdk && ln -s /app/src/supervisor /opt/agent-sdk/runtime
+ENV AGENT_SDK_RUNTIME_PATH=/opt/agent-sdk/runtime
 
 EXPOSE 7778
 

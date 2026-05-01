@@ -83,11 +83,10 @@ uvicorn src.api.server:app --port 7778 --reload
 
 ## API Structure
 
-See [`docs/api.md`](api.md) for the full endpoint reference and [`assets/rest-api.html`](../assets/rest-api.html) for a visual map. Three resource groups:
+See [`docs/api.md`](api.md) for the full endpoint reference and [`assets/rest-api.html`](../assets/rest-api.html) for a visual map. Two top-level resource groups:
 
-- **Volumes** (`/volumes/*`) — durable storage, with file ops backed by a short-lived utility sandbox.
-- **Sandboxes** (`/sandboxes/*`) — ephemeral compute. Every sandbox is `(volume_id, subpath)`-scoped at creation; the volume is mounted at `/home/daytona` with a read-only `shared/` subpath at `/mnt/shared`.
-- **Sessions** (`/sessions/*`) — conversation. Bind to a volume; `current_sandbox_id` is swapped as sandboxes come and go. Explicit sandbox control via `/sessions/{id}/{start,stop,reset}-sandbox`.
+- **Volumes** (`/volumes/*`) — durable storage, with file ops that operate directly on the provider's volume primitives (no sandbox required).
+- **Sessions** (`/sessions/*`) — conversation. Bind to a volume; the active compute lease is owned by the in-process `SessionPool` and the provider sandbox identity (`sandbox_ref`) lives in `sessions.sandbox_state` (JSONB). Hibernation via `/sessions/{id}/release`; cold-recovery is implicit on the next call. There is no separate `/sandboxes` resource — `GET /sessions/{id}/sandbox` returns the metadata.
 
 `POST /sessions` accepts an optional `volume_id`; if omitted, a per-provider default volume is created/reused. Eager by default; pass `"provision": false` for the lazy session-shell flow.
 
@@ -100,9 +99,10 @@ The server uses Postgres. Tables are created automatically on startup via
 Tables:
 - `agents` — agent configurations (id, name, config JSONB)
 - `volumes` — persistent storage records (id, name, provider, provider_ref, status)
-- `sandboxes` — ephemeral compute records (id, provider, sandbox_ref, status, volume_id, subpath)
-- `sessions` — session records (id, agent_id, volume_id, current_sandbox_id, inner_session_id, env, secrets, cwd, pre_start_commands)
+- `sessions` — session records (id, agent_id, volume_id, inner_session_id, env, secrets, cwd, pre_start_commands, sandbox_state JSONB)
 - `session_log` — event log (session_id, event_type, payload JSONB)
+
+There is no `sandboxes` table — sandbox identity (provider sandbox ref, listen port, snapshot path, recipe) is stored in `sessions.sandbox_state` JSONB and managed by the in-process `SessionPool`.
 
 ## Environment Variables
 
@@ -112,14 +112,25 @@ Tables:
 | `CLAUDE_CODE_OAUTH_TOKEN` | — | Preferred auth for Claude agents |
 | `ANTHROPIC_API_KEY` | — | Fallback auth for Claude agents |
 | `OPENAI_API_KEY` | — | Required for Codex agents |
-| `SANDBOX_IDLE_TIMEOUT` | `300` | Seconds before idle sessions are reaped |
-| `SANDBOX_REAPER_TICK` | `60` | Idle reaper scan interval in seconds |
-| `SSE_HEARTBEAT_INTERVAL` | `30` | SSE heartbeat interval in seconds |
+| `AGENT_SDK_REAPER_IDLE_S` | `180` | Seconds an active session can sit idle before the pool reaper hibernates it |
+| `AGENT_SDK_REAPER_INTERVAL_S` | `60` | Pool reaper scan interval in seconds |
+| `AGENT_SDK_ORIGIN` | `production` | Tag applied to provisioned daytona sandboxes (set to `test` by `scripts/launch_server_test.sh` so cleanup tooling can isolate test traffic) |
 
 ## Running Tests
 
 ```bash
-PYTHONPATH=src python -m pytest tests/ -v
+.venv/bin/python -m pytest tests/ -n auto
 ```
 
-Tests use mocked DB and sandbox providers — no Docker or Postgres needed.
+`-n auto` (pytest-xdist) is mandatory — sequential runs of the daytona/docker
+golden suites take 8–15 min and waste iteration time. It is fine even when
+filtering with `-k`; xdist negotiates worker count down to the number of
+selected items.
+
+For the golden tests that need a live server, launch via
+`scripts/launch_server_test.sh` (NOT `launch_server_local.sh` directly) — the
+test wrapper sets `AGENT_SDK_ORIGIN=test` so daytona sandboxes are labelled
+isolatable from production traffic.
+
+Unit tests (most of `tests/`) use mocked DB and provider modules — no Docker or
+Postgres needed.

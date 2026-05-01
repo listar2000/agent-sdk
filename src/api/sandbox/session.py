@@ -1,8 +1,8 @@
 """Abstract base class for SandboxSession — one per running compute.
 
 Concrete provider classes (DaytonaSandboxSession, DockerSandboxSession,
-…) implement the 5 lifecycle methods. Per
-``docs/ephemeral-sandbox-design.md`` §5.
+UnixLocalSandboxSession, ModalSandboxSession) implement the 5 lifecycle
+methods.
 
 Decision: ``stop()`` and ``shutdown()`` are split. ``stop()`` is the
 data-preserving operation (snapshot + pause compute). ``shutdown()`` is
@@ -134,23 +134,13 @@ class BaseSandboxSession(abc.ABC):
             sess.get("inner_session_id") or self._inner_session_id
         )
 
-        agent_type = self.state.recipe.agent_type
-        if agent_type not in volume.supervisor_agent_types:
-            from importlib import import_module
-            mod_name = {
-                "daytona": "api.providers.daytona",
-                "docker":  "api.providers.docker",
-                "local":   "api.providers.local",
-                "modal":   "api.providers.modal",
-            }.get(volume.provider)
-            if mod_name is None:
-                raise RuntimeError(
-                    f"no install_supervisor module for provider {volume.provider}"
-                )
-            provider_mod = import_module(mod_name)
-            await provider_mod.install_supervisor(volume.provider_ref, agent_type)
-            await _db.add_supervisor_agent_type(volume.id, agent_type)
-
+        # Phase E of docs/runtime-image-unification.md: the per-volume
+        # ``install_supervisor`` step is gone. The supervisor + ACP bins
+        # ship in the agent-sdk Docker image at ``/opt/agent-sdk/runtime/``,
+        # so each provider's ``create_sandbox`` resolves them from a fixed
+        # in-image path. ``volumes.supervisor_agent_types`` (the cache that
+        # used to gate this branch) is also removed; the column drop is
+        # the last commit of Phase E.
         return self._volume_ref
 
     async def _attach_acp(self) -> None:

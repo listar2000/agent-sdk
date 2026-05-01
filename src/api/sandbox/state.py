@@ -1,8 +1,8 @@
 """Pydantic models for ``sessions.sandbox_state`` JSONB.
 
 This is the single source of truth for "what compute should this session
-have, and what's it currently bound to". Per ``docs/ephemeral-sandbox-design.md``
-§4 — recipe lives on the session row, never on the compute itself, so
+have, and what's it currently bound to". See ``docs/session-runtime-refactor.md``
+— recipe lives on the session row, never on the compute itself, so
 recovery cannot lose it.
 
 Discriminated by ``type`` so the JSONB roundtrips through

@@ -298,21 +298,22 @@ class ApiClient:
         return data or []
 
     async def delete_session(self, session_id: str) -> None:
-        """``DELETE /sessions/{id}`` — release the pool lease, drop the
-        session + sandbox rows. Idempotent: missing session returns 204
-        rather than 404 so this is safe as a "make sure this is gone"
+        """``DELETE /sessions/{id}`` — release the pool lease and drop
+        the session row. Idempotent: missing session returns 204 rather
+        than 404 so this is safe as a "make sure this is gone"
         primitive.
 
-        The underlying daytona/docker/local sandbox is *paused*, not
-        destroyed — same semantics as ``DELETE /sandboxes/{id}``."""
+        The underlying daytona/docker/local/modal sandbox is *paused*,
+        not destroyed — label-based cleanup scripts reclaim the compute
+        later."""
         resp = await self._http.delete(f"/sessions/{session_id}")
         _raise_for_status(resp)
 
     async def create_agent(self, **body: Any) -> dict[str, Any]:
         """``POST /agents`` — register an agent without provisioning a
-        sandbox. Used when the caller wants the agent identity (model,
-        prompt, tools) but doesn't need compute yet (e.g. dry-run
-        validation, deferred provisioning)."""
+        sandbox. Useful for dry-run validation or staging an agent
+        identity (agent_type, model, mcp_servers, skills, mode,
+        thought_level) before paying provisioning cost."""
         return await self._json("POST", "/agents", json=body)
 
     async def resume_session(

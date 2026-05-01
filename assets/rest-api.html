@@ -221,350 +221,325 @@
 
   <!-- PAGE HEADER -->
   <div class="page-header">
-    <h1>AFE Agent SDK — REST API</h1>
-    <p class="subtitle">Endpoint surface after the session / volume / sandbox decoupling. Volumes become first-class; sandboxes become volume-aware ephemeral compute; sessions decouple from sandboxes and bind to a volume via their agent.</p>
+    <h1>Agent SDK — REST API</h1>
+    <p class="subtitle">Two top-level resources: <strong>Volumes</strong> (durable storage) and <strong>Sessions</strong> (conversation, with implicit sandbox lifecycle owned by the in-process SessionPool). There is no <code>/sandboxes</code> resource — sandbox identity lives in <code>sessions.sandbox_state</code> JSONB and is surfaced via <code>GET /sessions/{id}/sandbox</code>.</p>
     <div class="legend">
-      <span><span class="badge badge-new">NEW</span> added in this spec</span>
-      <span><span class="badge badge-updated">UPDATED</span> existing endpoint, changed contract</span>
-      <span><span class="method-badge method-sse">SSE</span> server-sent events stream</span>
+      <span><span class="method-badge method-get">GET</span> read</span>
+      <span><span class="method-badge method-post">POST</span> mutate</span>
+      <span><span class="method-badge method-delete">DELETE</span> remove</span>
+      <span><span class="method-badge method-sse">SSE</span> server-sent events</span>
     </div>
   </div>
 
   <!-- ═══════════════════════════════════════════════
-       SECTION 1: SCHEMA CHANGES AT A GLANCE
+       SECTION 1: SCHEMA AT A GLANCE
   ═══════════════════════════════════════════════ -->
   <div class="section">
     <div class="section-header">
-      <h2>Schema Changes</h2>
-      <p class="section-sub">What the API operates on. One new table, two updated tables.</p>
+      <h2>Schema</h2>
+      <p class="section-sub">Four tables. Sandbox identity is <strong>not</strong> a separate table — it lives in <code>sessions.sandbox_state</code> JSONB.</p>
     </div>
 
-    <!-- volumes (new) -->
+    <!-- agents -->
+    <div class="card">
+      <div class="card-header ch-blue">
+        <div class="table-name"><span class="dot dot-blue"></span>agents</div>
+        <div class="badges"></div>
+      </div>
+      <div class="card-body">
+        <div class="schema-row"><span class="schema-field">id</span><span class="schema-type">TEXT PK</span><span class="schema-desc">UUID</span></div>
+        <div class="schema-row"><span class="schema-field">name</span><span class="schema-type">TEXT</span><span class="schema-desc">user-chosen label</span></div>
+        <div class="schema-row"><span class="schema-field">config</span><span class="schema-type">JSONB</span><span class="schema-desc">pure identity: agent_type, model, mcp_servers, skills, mode, thought_level</span></div>
+      </div>
+    </div>
+
+    <!-- volumes -->
     <div class="card">
       <div class="card-header ch-green">
         <div class="table-name"><span class="dot dot-green"></span>volumes</div>
-        <div class="badges"><span class="badge badge-new">New</span></div>
+        <div class="badges"></div>
       </div>
       <div class="card-body">
-        <div class="schema-row is-new"><span class="schema-field">id</span><span class="schema-type">TEXT PK</span><span class="schema-desc">UUID</span></div>
-        <div class="schema-row is-new"><span class="schema-field">name</span><span class="schema-type">TEXT UNIQUE</span><span class="schema-desc">user-chosen, e.g. "my-project"</span></div>
-        <div class="schema-row is-new"><span class="schema-field">provider</span><span class="schema-type">TEXT</span><span class="schema-desc">"daytona" | "docker" | "local"</span></div>
-        <div class="schema-row is-new"><span class="schema-field">provider_ref</span><span class="schema-type">TEXT</span><span class="schema-desc">native id: Daytona volume id / Docker volume name / host path</span></div>
-        <div class="schema-row is-new"><span class="schema-field">status</span><span class="schema-type">TEXT</span><span class="schema-desc">"ready" | "error" | "deleting"</span></div>
-        <div class="schema-row is-new"><span class="schema-field">created_at</span><span class="schema-type">TIMESTAMPTZ</span><span class="schema-desc">default now()</span></div>
+        <div class="schema-row"><span class="schema-field">id</span><span class="schema-type">TEXT PK</span><span class="schema-desc">UUID</span></div>
+        <div class="schema-row"><span class="schema-field">name</span><span class="schema-type">TEXT UNIQUE</span><span class="schema-desc">user-chosen, e.g. "my-project"</span></div>
+        <div class="schema-row"><span class="schema-field">provider</span><span class="schema-type">TEXT</span><span class="schema-desc">"daytona" | "docker" | "local" | "modal"</span></div>
+        <div class="schema-row"><span class="schema-field">provider_ref</span><span class="schema-type">TEXT</span><span class="schema-desc">native id: Daytona volume id / Docker volume name / host path</span></div>
+        <div class="schema-row"><span class="schema-field">status</span><span class="schema-type">TEXT</span><span class="schema-desc">"ready" | "error" | "deleting"</span></div>
+        <div class="schema-row"><span class="schema-field">created_at</span><span class="schema-type">TIMESTAMPTZ</span><span class="schema-desc">default now()</span></div>
       </div>
     </div>
 
-    <!-- sessions (updated) -->
+    <!-- sessions -->
     <div class="card">
       <div class="card-header ch-orange">
         <div class="table-name"><span class="dot dot-orange"></span>sessions</div>
-        <div class="badges"><span class="badge badge-updated">Updated</span></div>
+        <div class="badges"></div>
       </div>
       <div class="card-body">
-        <div class="schema-row"><span class="schema-field">id</span><span class="schema-type">TEXT PK</span><span class="schema-desc">unchanged</span></div>
-        <div class="schema-row"><span class="schema-field">agent_id</span><span class="schema-type">TEXT FK</span><span class="schema-desc">unchanged</span></div>
-        <div class="schema-row is-new"><span class="schema-field">volume_id</span><span class="schema-type">TEXT FK NOT NULL</span><span class="schema-desc">→ volumes.id, ON DELETE RESTRICT (new)</span></div>
-        <div class="schema-row is-new"><span class="schema-field">current_sandbox_id</span><span class="schema-type">TEXT FK NULL</span><span class="schema-desc">renamed from sandbox_id; nullable, ON DELETE SET NULL (was CASCADE)</span></div>
-        <div class="schema-row"><span class="schema-field">inner_session_id</span><span class="schema-type">TEXT</span><span class="schema-desc">ACP session handle for CLI --resume</span></div>
-        <div class="schema-row is-new"><span class="schema-field">env</span><span class="schema-type">JSONB NOT NULL</span><span class="schema-desc">non-secret env, default {} (new)</span></div>
-        <div class="schema-row is-new"><span class="schema-field">secrets</span><span class="schema-type">JSONB NOT NULL</span><span class="schema-desc">plaintext for now, default {} (new)</span></div>
-        <div class="schema-row is-new"><span class="schema-field">cwd</span><span class="schema-type">TEXT NOT NULL</span><span class="schema-desc">default '/tmp'; per-conversation cwd (moved from agent.config) (new)</span></div>
-        <div class="schema-row is-new"><span class="schema-field">pre_start_commands</span><span class="schema-type">JSONB NOT NULL</span><span class="schema-desc">default []; replayed on Type 2 sandbox replacement (new 2026-04-26)</span></div>
+        <div class="schema-row"><span class="schema-field">id</span><span class="schema-type">TEXT PK</span><span class="schema-desc">UUID</span></div>
+        <div class="schema-row"><span class="schema-field">agent_id</span><span class="schema-type">TEXT FK</span><span class="schema-desc">→ agents.id, ON DELETE CASCADE</span></div>
+        <div class="schema-row"><span class="schema-field">volume_id</span><span class="schema-type">TEXT FK NOT NULL</span><span class="schema-desc">→ volumes.id, ON DELETE RESTRICT</span></div>
+        <div class="schema-row"><span class="schema-field">inner_session_id</span><span class="schema-type">TEXT</span><span class="schema-desc">ACP session handle for resume</span></div>
+        <div class="schema-row"><span class="schema-field">env</span><span class="schema-type">JSONB</span><span class="schema-desc">non-secret env, default {}</span></div>
+        <div class="schema-row"><span class="schema-field">secrets</span><span class="schema-type">JSONB</span><span class="schema-desc">stored plaintext (envelope encryption pending), default {}</span></div>
+        <div class="schema-row"><span class="schema-field">cwd</span><span class="schema-type">TEXT</span><span class="schema-desc">per-conversation cwd; default '/tmp'</span></div>
+        <div class="schema-row"><span class="schema-field">pre_start_commands</span><span class="schema-type">JSONB</span><span class="schema-desc">replayed on Type-2 sandbox replacement; default []</span></div>
+        <div class="schema-row is-new"><span class="schema-field">sandbox_state</span><span class="schema-type">JSONB</span><span class="schema-desc">discriminated union (daytona | docker | unix_local | modal | unknown) — sandbox_ref, listen_port, snapshot_path, snapshot_version, recipe</span></div>
       </div>
     </div>
 
-    <!-- sandboxes (updated) -->
+    <!-- session_log -->
     <div class="card">
-      <div class="card-header ch-cyan">
-        <div class="table-name"><span class="dot dot-cyan"></span>sandboxes</div>
-        <div class="badges"><span class="badge badge-updated">Updated</span></div>
+      <div class="card-header ch-pink">
+        <div class="table-name"><span class="dot dot-pink"></span>session_log</div>
+        <div class="badges"></div>
       </div>
       <div class="card-body">
-        <div class="schema-row"><span class="schema-field">id</span><span class="schema-type">TEXT PK</span><span class="schema-desc">unchanged</span></div>
-        <div class="schema-row"><span class="schema-field">provider</span><span class="schema-type">TEXT</span><span class="schema-desc">unchanged</span></div>
-        <div class="schema-row"><span class="schema-field">sandbox_ref</span><span class="schema-type">TEXT</span><span class="schema-desc">unchanged — native provider id</span></div>
-        <div class="schema-row"><span class="schema-field">status</span><span class="schema-type">TEXT</span><span class="schema-desc">unchanged</span></div>
-        <div class="schema-row is-new"><span class="schema-field">volume_id</span><span class="schema-type">TEXT FK NOT NULL</span><span class="schema-desc">→ volumes.id, ON DELETE RESTRICT (new)</span></div>
-        <div class="schema-row is-new"><span class="schema-field">subpath</span><span class="schema-type">TEXT NOT NULL</span><span class="schema-desc">mounted at /home/daytona (new)</span></div>
+        <div class="schema-row"><span class="schema-field">id</span><span class="schema-type">SERIAL PK</span><span class="schema-desc">monotonic event id</span></div>
+        <div class="schema-row"><span class="schema-field">session_id</span><span class="schema-type">TEXT FK</span><span class="schema-desc">→ sessions.id, ON DELETE CASCADE</span></div>
+        <div class="schema-row"><span class="schema-field">agent_id</span><span class="schema-type">TEXT FK</span><span class="schema-desc">→ agents.id, ON DELETE CASCADE</span></div>
+        <div class="schema-row"><span class="schema-field">event_type</span><span class="schema-type">TEXT</span><span class="schema-desc">user_message | assistant_message | reasoning | tool_call | tool_result | usage | turn_end | error</span></div>
+        <div class="schema-row"><span class="schema-field">payload</span><span class="schema-type">JSONB</span><span class="schema-desc">payload shape varies per event_type — every row carries prompt_id (= rpc_id)</span></div>
+        <div class="schema-row"><span class="schema-field">created_at</span><span class="schema-type">TIMESTAMPTZ</span><span class="schema-desc">default now()</span></div>
       </div>
     </div>
 
     <div class="relation-note">
-      <strong>Mental model:</strong> every sandbox is <code>(volume_id, subpath)</code>-scoped.
-      When a session runs, the sandbox uses <code>subpath = agents/&lt;agent_id&gt;/home</code> so all sessions of the same agent share HOME on the volume.
-      A second mount at <code>subpath = shared</code> is always added read-only to <code>/mnt/shared</code>.
+      <strong>Mental model:</strong> a session binds to a volume (durable). The active compute lease is owned in-process by the <code>SessionPool</code>; <code>sandbox_state.sandbox_ref</code> is the opaque provider sandbox identity persisted on the row so cold-recovery (server restart, replacement sandbox) can pick up where the previous lease left off. The recipe (dockerfile, shared_mounts, root, agent_type, pre_start_commands) lives on the session row, never on the compute itself, so deleting a sandbox can't lose it.
     </div>
   </div>
 
   <!-- ═══════════════════════════════════════════════
-       SECTION 2: VOLUMES API (NEW)
+       SECTION 2: VOLUMES API
   ═══════════════════════════════════════════════ -->
   <div class="section">
     <div class="section-header">
       <h2>Volumes</h2>
-      <p class="section-sub">Persistent storage, user-scoped. Fully new resource. Shape parallels Sandboxes.</p>
+      <p class="section-sub">Persistent storage. Created once, lives for months. Holds <code>~/.claude</code>, transcripts, workspace.</p>
     </div>
 
     <div class="card">
       <div class="card-header ch-green">
         <div class="table-name"><span class="dot dot-green"></span>/volumes</div>
-        <div class="badges"><span class="badge badge-new">New resource</span></div>
+        <div class="badges"></div>
       </div>
       <div class="card-body">
 
         <div class="endpoint-group-label">Resource lifecycle</div>
-        <div class="endpoint-row is-new">
+        <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/volumes</span>
           <span class="endpoint-desc">Create + wait until <code>status = "ready"</code>. Body <code>{name, provider}</code>.</span>
-          <span class="endpoint-tag tag-new">New</span>
         </div>
-        <div class="endpoint-row is-new">
+        <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/volumes</span>
           <span class="endpoint-desc">List — optional <code>?provider=daytona</code> filter.</span>
-          <span class="endpoint-tag tag-new">New</span>
         </div>
-        <div class="endpoint-row is-new">
+        <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/volumes/{id_or_name}</span>
           <span class="endpoint-desc">Inspect — full row plus resolved provider_ref.</span>
-          <span class="endpoint-tag tag-new">New</span>
         </div>
-        <div class="endpoint-row is-new">
+        <div class="endpoint-row">
           <span class="method-badge method-delete">DELETE</span>
           <span class="endpoint-path">/volumes/{id_or_name}?force=false</span>
           <span class="endpoint-desc">Delete — 409 if sessions reference it; <code>force=true</code> cascades.</span>
-          <span class="endpoint-tag tag-new">New</span>
-        </div>
-
-        <div class="endpoint-group-label">File operations (mirror /sandboxes/{id}/files/*)</div>
-        <div class="endpoint-row is-new">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/volumes/{id_or_name}/files/tree?path=shared/</span>
-          <span class="endpoint-desc">Browse the volume contents.</span>
-          <span class="endpoint-tag tag-new">New</span>
-        </div>
-        <div class="endpoint-row is-new">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/volumes/{id_or_name}/files/read?path=…</span>
-          <span class="endpoint-desc">Read any file on the volume (shared/, agents/, …).</span>
-          <span class="endpoint-tag tag-new">New</span>
-        </div>
-        <div class="endpoint-row is-new">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/volumes/{id_or_name}/files/edit</span>
-          <span class="endpoint-desc">Write — body <code>{path, content}</code>. Used to seed <code>shared/</code>.</span>
-          <span class="endpoint-tag tag-new">New</span>
-        </div>
-
-        <div class="relation-note">
-          File ops are backed internally by a short-lived utility sandbox with the volume mounted.
-          Caller sees a pure REST endpoint; no need to manage sandboxes to seed data.
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════════════════════════════════════════
-       SECTION 3: SANDBOXES API (UPDATED)
-  ═══════════════════════════════════════════════ -->
-  <div class="section">
-    <div class="section-header">
-      <h2>Sandboxes</h2>
-      <p class="section-sub">Stay public and CRUD-able. Every sandbox is now <code>(volume_id, subpath)</code>-scoped at creation.</p>
-    </div>
-
-    <div class="card">
-      <div class="card-header ch-cyan">
-        <div class="table-name"><span class="dot dot-cyan"></span>/sandboxes</div>
-        <div class="badges"><span class="badge badge-updated">Updated</span></div>
-      </div>
-      <div class="card-body">
-
-        <div class="endpoint-group-label">Resource lifecycle</div>
-        <div class="endpoint-row is-updated">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes</span>
-          <span class="endpoint-desc">Create + wait — body <code>{provider, volume_id, subpath, config, pre_start_commands, shared_mounts, …}</code>.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes</span>
-          <span class="endpoint-desc">List.</span>
-        </div>
-        <div class="endpoint-row is-updated">
-          <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{id}</span>
-          <span class="endpoint-desc">Inspect — now includes <code>volume_id</code> and <code>subpath</code>.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
-        </div>
-        <div class="endpoint-row is-updated">
-          <span class="method-badge method-delete">DELETE</span>
-          <span class="endpoint-path">/sandboxes/{id}</span>
-          <span class="endpoint-desc">Kill — <strong>sessions survive</strong> with <code>current_sandbox_id = NULL</code>.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{id}/stop</span>
-          <span class="endpoint-desc">Stop the underlying compute (volume preserved).</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{id}/start</span>
-          <span class="endpoint-desc">Start a stopped sandbox.</span>
         </div>
 
         <div class="endpoint-group-label">File operations</div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{id}/files/tree</span>
-          <span class="endpoint-desc">Browse the sandbox filesystem (sees the mounted subpath at /home/daytona).</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/tree?path=shared/</span>
+          <span class="endpoint-desc">Browse the volume contents.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{id}/files/read</span>
-          <span class="endpoint-desc">Read a file.</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{id}/files/edit</span>
-          <span class="endpoint-desc">Write a file (edit or create).</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{id}/files/upload</span>
-          <span class="endpoint-desc">Upload a file — body <code>{path, content: base64}</code>.</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{id}/files/delete</span>
-          <span class="endpoint-desc">Delete a file or directory — body <code>{path}</code>.</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sandboxes/{id}/files/rename</span>
-          <span class="endpoint-desc">Rename/move — body <code>{path, new_path}</code>.</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/read?path=…</span>
+          <span class="endpoint-desc">Read any file on the volume (shared/, agents/, …).</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sandboxes/{id}/files/download</span>
-          <span class="endpoint-desc">Download a file as raw bytes (forwards content-type + disposition).</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/exists?path=…</span>
+          <span class="endpoint-desc">Existence check.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/download?path=…</span>
+          <span class="endpoint-desc">Raw bytes (forwards content-disposition).</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/edit</span>
+          <span class="endpoint-desc">Overwrite (<code>{path, content}</code>) or search/replace (<code>{path, old_string, new_string, replace_all?}</code>).</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/upload</span>
+          <span class="endpoint-desc">Binary upload — body <code>{path, content (base64)}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/mkdir</span>
+          <span class="endpoint-desc">Create directory — body <code>{path}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/delete</span>
+          <span class="endpoint-desc">Delete file or directory — body <code>{path}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/volumes/{id_or_name}/files/rename</span>
+          <span class="endpoint-desc">Rename / move — body <code>{path, new_path, overwrite?}</code>; 409 with <code>{error: "exists"}</code> if <code>overwrite=false</code>.</span>
         </div>
 
         <div class="relation-note">
-          <strong>Invariant:</strong> every sandbox mounts exactly one volume at exactly one subpath at creation. For session-driven creation,
-          <code>subpath = agents/&lt;agent_id&gt;/home</code>. Plus the implicit <code>shared</code> read-only mount on the same volume at <code>/mnt/shared</code>.
-          Daytona does not allow hot-attach, so changing the volume mount means creating a new sandbox.
+          File ops talk directly to the provider's volume primitives — no live sandbox required to seed data.
         </div>
       </div>
     </div>
   </div>
 
   <!-- ═══════════════════════════════════════════════
-       SECTION 4: SESSIONS API (UPDATED + NEW)
+       SECTION 3: SESSIONS API
   ═══════════════════════════════════════════════ -->
   <div class="section">
     <div class="section-header">
       <h2>Sessions</h2>
-      <p class="section-sub">No longer bound to a sandbox. Binds to a volume (via its agent). Sandboxes are provisioned lazily and auto-replaced on failure.</p>
+      <p class="section-sub">Conversation state. Compute lease is implicit and owned by the in-process <code>SessionPool</code>.</p>
     </div>
 
     <div class="card">
       <div class="card-header ch-orange">
         <div class="table-name"><span class="dot dot-orange"></span>/sessions</div>
-        <div class="badges"><span class="badge badge-updated">Updated</span></div>
+        <div class="badges"></div>
       </div>
       <div class="card-body">
 
         <div class="endpoint-group-label">Resource lifecycle</div>
-        <div class="endpoint-row is-updated">
+        <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions</span>
-          <span class="endpoint-desc">Create — eager by default (provisions sandbox + connects ACP); pass <code>"provision": false</code> in body for lazy (session row only). Old <code>/sessions/quick</code> collapsed into this.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
+          <span class="endpoint-desc">Create — eager by default (provisions sandbox + ACP via <code>SessionPool.cold_create</code>); pass <code>"provision": false</code> for lazy.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/sessions</span>
-          <span class="endpoint-desc">List.</span>
+          <span class="endpoint-desc">List sessions currently leased by the pool.</span>
         </div>
-        <div class="endpoint-row is-updated">
+        <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/sessions/{id}</span>
-          <span class="endpoint-desc">Inspect — <code>current_sandbox_id</code> may be null between runs.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
+          <span class="endpoint-desc">Read the row — env, redacted secret keys, <code>sandbox_ref</code>, <code>pre_start_commands</code>.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/sessions/{id}/status</span>
-          <span class="endpoint-desc">Status.</span>
+          <span class="endpoint-desc">Runtime status — routes through the pool, brings the session up if hibernated.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
-          <span class="endpoint-path">/sessions/{id}/log</span>
-          <span class="endpoint-desc">Event log (paginated).</span>
+          <span class="endpoint-path">/sessions/{id}/sandbox</span>
+          <span class="endpoint-desc">Sandbox metadata — <code>{provider, sandbox_ref, status, root, url, marker_path}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{id}/log?limit=N</span>
+          <span class="endpoint-desc">Event log (oldest first). Each row carries <code>prompt_id</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/resume</span>
+          <span class="endpoint-desc">Idempotent pre-warm — body may PATCH <code>env</code> / <code>secrets</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/release</span>
+          <span class="endpoint-desc">Snapshot to volume + drop the pool's compute lease (idempotent hibernation).</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-delete">DELETE</span>
+          <span class="endpoint-path">/sessions/{id}</span>
+          <span class="endpoint-desc">Release lease + delete row. Returns 204 even when missing — safe as a "make sure it's gone" primitive.</span>
         </div>
 
         <div class="endpoint-group-label">Messaging / runtime</div>
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/sessions/{id}/message</span>
-          <span class="endpoint-desc">Send a prompt — lazily provisions a sandbox if needed.</span>
+          <span class="endpoint-desc">Fire-and-forget. Returns <code>{rpc_id, status}</code>; events flow into <code>session_log</code> + any <code>/events</code> subscribers.</span>
         </div>
         <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/{id}/resume</span>
-          <span class="endpoint-desc">Resume — works even after sandbox was killed (HOME persisted on volume).</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/{id}/cancel</span>
-          <span class="endpoint-desc">Cancel the in-flight run.</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/{id}/config</span>
-          <span class="endpoint-desc">Update session config (env, secrets, etc.).</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/{id}/sandbox/exec</span>
-          <span class="endpoint-desc">Exec a one-shot command in the session's current sandbox.</span>
+          <span class="method-badge method-sse">SSE</span>
+          <span class="endpoint-path">/sessions/{id}/message+stream</span>
+          <span class="endpoint-desc">Submit + stream the reply in a single round-trip. Same wire format as <code>/events</code>, scoped to one rpc_id.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-sse">SSE</span>
           <span class="endpoint-path">/sessions/{id}/events</span>
-          <span class="endpoint-desc">Server-sent events — tool calls, tokens, plus new <code>sandbox_reattach</code>.</span>
+          <span class="endpoint-desc">Multi-subscriber SSE — every event broadcast by the SandboxSession, plus heartbeat sentinels.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/cancel</span>
+          <span class="endpoint-desc">Best-effort <code>session/cancel</code> notification on the live ACP child.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/config</span>
+          <span class="endpoint-desc">Patch <code>model</code> / <code>mode</code> / <code>thought_level</code> — applied live AND persisted on <code>agents.config</code> for cold-recovery.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/acp/call</span>
+          <span class="endpoint-desc">Generic ACP passthrough — <code>{method, params, notify?}</code>. Server auto-injects the inner sessionId.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/sandbox/exec</span>
+          <span class="endpoint-desc">One-shot command in the session's sandbox. Auto-recovers if reaped.</span>
         </div>
 
-        <div class="endpoint-group-label">Sandbox control (new)</div>
-        <div class="endpoint-row is-new">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/{id}/start-sandbox</span>
-          <span class="endpoint-desc">Pre-warm — provision the sandbox eagerly to hide first-run latency.</span>
-          <span class="endpoint-tag tag-new">New</span>
+        <div class="endpoint-group-label">Session-scoped filesystem</div>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{id}/files/tree</span>
+          <span class="endpoint-desc">Recursive directory tree of the live sandbox.</span>
         </div>
-        <div class="endpoint-row is-new">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/{id}/stop-sandbox</span>
-          <span class="endpoint-desc">Kill current sandbox; next run() provisions lazily.</span>
-          <span class="endpoint-tag tag-new">New</span>
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{id}/files/read?path=…</span>
+          <span class="endpoint-desc">Read a file.</span>
         </div>
-        <div class="endpoint-row is-new">
+        <div class="endpoint-row">
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/sessions/{id}/files/download?path=…</span>
+          <span class="endpoint-desc">Raw bytes.</span>
+        </div>
+        <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/sessions/{id}/reset-sandbox</span>
-          <span class="endpoint-desc">Kill current + provision a fresh one immediately.</span>
-          <span class="endpoint-tag tag-new">New</span>
+          <span class="endpoint-path">/sessions/{id}/files/edit</span>
+          <span class="endpoint-desc">Edit / create — same body shape as the volume edit endpoint.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/files/upload</span>
+          <span class="endpoint-desc">Binary upload — <code>{path, content (base64)}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/files/delete</span>
+          <span class="endpoint-desc">Delete file / directory — <code>{path}</code>.</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="method-badge method-post">POST</span>
+          <span class="endpoint-path">/sessions/{id}/files/rename</span>
+          <span class="endpoint-desc">Rename / move — <code>{path, new_path}</code>.</span>
         </div>
 
         <div class="relation-note">
-          <strong>Lazy provisioning rule:</strong> session creation does not touch the provider. First <code>/message</code> or <code>/resume</code> probes the
-          provider state and picks: use-as-is → start-stopped → reprovision. The same <code>agents/&lt;agent_id&gt;/home</code> subpath means the CLI
-          finds its transcripts on disk and resumes via <code>--resume &lt;inner_session_id&gt;</code>.
+          <strong>Recovery:</strong> conversation endpoints (<code>/message</code>, <code>/message+stream</code>, <code>/events</code>, <code>/cancel</code>, <code>/config</code>, <code>/acp/call</code>, <code>/sandbox/exec</code>, <code>/files/*</code>) all route through <code>SessionPool.get_session(id)</code>. Cold-creates from <code>sandbox_state</code> if no lease exists, or returns the live one if it does. There is no separate Type-1 / Type-2 decision in the route handler — it's internal to <code>SandboxSession.start()</code>.
         </div>
       </div>
     </div>
@@ -588,7 +563,7 @@
         <div class="endpoint-row">
           <span class="method-badge method-post">POST</span>
           <span class="endpoint-path">/agents</span>
-          <span class="endpoint-desc">Create an agent definition.</span>
+          <span class="endpoint-desc">Register an agent definition (no compute provisioned). Rejects <code>cwd</code> / <code>env</code> / <code>dockerfile</code> / <code>shared_mounts</code> with 400 — those belong on session / sandbox.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
@@ -600,23 +575,21 @@
           <span class="endpoint-path">/agents/{id}</span>
           <span class="endpoint-desc">Inspect.</span>
         </div>
-        <div class="endpoint-row is-updated">
+        <div class="endpoint-row">
           <span class="method-badge method-delete">DELETE</span>
           <span class="endpoint-path">/agents/{id}</span>
-          <span class="endpoint-desc">Delete — additionally removes <code>agents/&lt;agent_id&gt;/</code> from every volume this agent used.</span>
-          <span class="endpoint-tag tag-updated">Updated</span>
+          <span class="endpoint-desc">Delete — cascades to sessions via FK.</span>
         </div>
       </div>
     </div>
   </div>
 
   <!-- ═══════════════════════════════════════════════
-       SECTION 6: HEALTH & ADMIN
+       SECTION 5: HEALTH & ADMIN
   ═══════════════════════════════════════════════ -->
   <div class="section">
     <div class="section-header">
       <h2>Health &amp; Admin</h2>
-      <p class="section-sub">Unchanged from current server.</p>
     </div>
 
     <div class="card">
@@ -628,39 +601,48 @@
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/health</span>
-          <span class="endpoint-desc">Liveness probe.</span>
+          <span class="endpoint-desc">Liveness — <code>{status, sessions, busy_sessions}</code>.</span>
         </div>
         <div class="endpoint-row">
           <span class="method-badge method-get">GET</span>
           <span class="endpoint-path">/admin/sessions</span>
-          <span class="endpoint-desc">All sessions (admin view).</span>
+          <span class="endpoint-desc">Pool snapshot for the dashboard — every active lease + every supervisor instance.</span>
         </div>
         <div class="endpoint-row">
-          <span class="method-badge method-post">POST</span>
-          <span class="endpoint-path">/admin/sessions/{id}/reap</span>
-          <span class="endpoint-desc">Force-reap a stuck session.</span>
+          <span class="method-badge method-get">GET</span>
+          <span class="endpoint-path">/ui</span>
+          <span class="endpoint-desc">Chat UI (also <code>/ui/dashboard</code>, <code>/ui/files</code>, <code>/ui/volumes</code>).</span>
         </div>
       </div>
     </div>
   </div>
 
   <!-- ═══════════════════════════════════════════════
-       SECTION 7: NEW SSE EVENTS
+       SECTION 6: SSE WIRE FORMAT
   ═══════════════════════════════════════════════ -->
   <div class="section">
     <div class="section-header">
-      <h2>New SSE Events</h2>
-      <p class="section-sub">Emitted on <code style="font-family:monospace;color:#fb923c;">/sessions/{id}/events</code> in addition to the existing events.</p>
+      <h2>SSE Wire Format</h2>
+      <p class="section-sub">Both <code>/events</code> and <code>/message+stream</code> emit the same shape.</p>
     </div>
 
     <div class="card">
       <div class="card-header ch-pink">
-        <div class="table-name"><span class="dot dot-pink"></span>events</div>
-        <div class="badges"><span class="badge badge-new">New</span></div>
+        <div class="table-name"><span class="dot dot-pink"></span>blocks</div>
+        <div class="badges"></div>
       </div>
       <div class="card-body">
-        <div class="event-row is-new">
-          sandbox_reattach <span class="event-detail"> — emitted before the first real event of a run when the session reprovisioned its sandbox transparently. Payload: <code>{old_sandbox_id, new_sandbox_id}</code>.</span>
+        <div class="event-row">
+          <code>event: rpc:&lt;rpc_id&gt;</code> <span class="event-detail">— per-prompt SSE block; the body is the raw ACP JSON-RPC frame (notification, terminal result, or error).</span>
+        </div>
+        <div class="event-row">
+          <code>: heartbeat</code> <span class="event-detail">— keep-alive comment lines emitted during idle so nginx / cloudflare / EventSource don't close the connection between prompts.</span>
+        </div>
+        <div class="event-row">
+          <code>data: &lt;json&gt;</code> <span class="event-detail">— untagged blocks for non-prompt events (setup chatter, server-emitted error frames). Less common.</span>
+        </div>
+        <div class="event-row">
+          <code>{"jsonrpc":"2.0","id":"&lt;rpc_id&gt;","result":{"stopReason":"end_turn|cancelled"}}</code> <span class="event-detail">— terminal frame for a prompt.</span>
         </div>
       </div>
     </div>

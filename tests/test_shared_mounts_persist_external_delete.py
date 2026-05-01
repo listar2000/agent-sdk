@@ -131,6 +131,24 @@ async def test_shared_mounts_persist_across_external_sandbox_delete():
         )
         print(f"   ✓ wrote + read back marker on /mnt/{mount_name}")
 
+        # Send one prompt so claude-agent-acp persists a conversation
+        # JSONL (and the supervisor.js writes a snapshot tarball at
+        # turn-end). Without this, cold-recovery in Phase 3 would call
+        # ACP ``session/load`` on a session_id that was never written to
+        # disk; claude-agent-acp returns -32603 ``Internal error`` and the
+        # follow-up message hangs the SSE stream. The contract is "turn
+        # completed → snapshot/JSONL persisted, recoverable"; this test's
+        # original Phase 1 (configure + sandbox_exec, no prompt) hit
+        # exactly that corner case.
+        warmup_reply = await asyncio.wait_for(
+            agent.arun("Reply with the single word READY and nothing else."),
+            timeout=120,
+        )
+        assert "ready" in warmup_reply.lower(), (
+            f"warmup prompt didn't get a normal reply: {warmup_reply!r}"
+        )
+        print("   ✓ warmup prompt completed (JSONL + snapshot persisted)")
+
         # ── Phase 2: external Daytona delete ───────────────────────────
         print(f"\n[phase 2] externally deleting daytona sandbox {sandbox_ref_1[:16]}...")
         await _external_delete_daytona(sandbox_ref_1)

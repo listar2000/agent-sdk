@@ -1,4 +1,9 @@
-"""REST API server — agent/sandbox/session orchestration layer.
+"""REST API server — agent / volume / session orchestration layer.
+
+Sandbox identity is implicit and owned in-process by the
+``api.sandbox.SessionPool`` (see docs/session-runtime-refactor.md).
+There is no ``/sandboxes`` resource; ``GET /sessions/{id}/sandbox``
+returns the metadata.
 
 Run: uvicorn src.api.server:app --port 7778
 """
@@ -32,7 +37,6 @@ from fastapi.responses import (
 
 from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .db import (
-    add_supervisor_agent_type,
     close_pool,
     count_sessions_by_volume,
     delete_agent,
@@ -129,7 +133,7 @@ async def lifespan(app):
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
 
     # SessionPool owns idle eviction now (per
-    # docs/ephemeral-sandbox-design.md §6).
+    # docs/session-runtime-refactor.md).
     from api.sandbox import start_reaper, shutdown_pool
     await start_reaper()
 
@@ -1552,7 +1556,7 @@ _BG_TASKS: set[asyncio.Task] = set()
 async def session_events(session_id: str):
     """SSE stream for a session. Multi-subscriber: many concurrent
     /events connections to the same session each receive a copy of every
-    event (per ``docs/ephemeral-sandbox-design.md`` §15.1).
+    event.
 
     Subscribes via ``SandboxSession.subscribe()`` which:
       * yields the per-session replay buffer first (so a UI reconnecting

@@ -149,5 +149,31 @@ export DATABASE_URL="postgresql://postgres@localhost:${PG_PORT}/${PG_DB}"
 # end up with two different ``_pool`` globals.
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
+# Local provider's source-tree runtime path is <repo>/src/supervisor —
+# providers/_shared.py:_detect_runtime_path falls back to this when
+# /opt/agent-sdk/runtime/ isn't present (which is the source-tree case
+# when running uvicorn directly, not from inside the agent-sdk image).
+# Make sure the npm deps are populated so create_sandbox can resolve
+# the ACP bins via package.json#bin. Idempotent (~1-2s warm cache).
+if command -v npm >/dev/null 2>&1; then
+  echo "Ensuring src/supervisor npm deps are installed (source-tree fallback)..."
+  (cd "${REPO_ROOT}/src/supervisor" && npm install --omit=optional --silent) || {
+    echo "npm install failed; the local provider's create_sandbox will" >&2
+    echo "crash with 'ACP binary missing'. Install Node.js >=18 and rerun." >&2
+  }
+fi
+
+# Daytona / docker / modal providers auto-resolve the runtime image and
+# snapshot from .runtime-image-tag and .runtime-snapshot-tag (committed
+# by scripts/release.sh). If you're testing daytona/docker/modal locally
+# and haven't run release.sh yet, those providers will fail with a clear
+# error pointing at scripts/release.sh.
+if [[ -f "${REPO_ROOT}/.runtime-image-tag" ]]; then
+  echo "Runtime image: $(cat "${REPO_ROOT}/.runtime-image-tag")"
+fi
+if [[ -f "${REPO_ROOT}/.runtime-snapshot-tag" ]]; then
+  echo "Daytona snapshot: $(cat "${REPO_ROOT}/.runtime-snapshot-tag")"
+fi
+
 echo "Starting local server on http://localhost:7778 ..."
 exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port 7778

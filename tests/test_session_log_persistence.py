@@ -111,16 +111,31 @@ async def test_post_message_persists_session_log():
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
 
+    rows: list[dict] = []
+    rpc_id: str | None = None
     async with ApiClient(SERVER, timeout=120.0) as sdk:
-        sid = await _create_session(sdk)
-        sent = await sdk.send_message(sid, _TOOL_PROMPT)
-        rpc_id = sent["rpc_id"]
-        await _await_done(sdk, sid, rpc_id)
-        # Background persister runs slightly behind the SSE stream; give
-        # it a beat to flush turn_end before we read the log.
-        await asyncio.sleep(2.0)
+        sid: str | None = None
+        try:
+            sid = await _create_session(sdk)
+            sent = await sdk.send_message(sid, _TOOL_PROMPT)
+            rpc_id = sent["rpc_id"]
+            await _await_done(sdk, sid, rpc_id)
+            # Background persister runs slightly behind the SSE stream; give
+            # it a beat to flush turn_end before we read the log.
+            await asyncio.sleep(2.0)
 
-        rows = await sdk.get_session_log(sid, limit=200)
+            rows = await sdk.get_session_log(sid, limit=200)
+        finally:
+            # Always tear down the session so the local supervisor process
+            # exits and (on daytona/docker/modal) the underlying sandbox is
+            # released. Without this, repeated test runs accumulate live
+            # supervisors and — on daytona — burn through the account's disk
+            # quota. delete_session is idempotent (204 even when missing).
+            if sid:
+                try:
+                    await sdk.delete_session(sid)
+                except Exception as exc:
+                    print(f"cleanup delete_session({sid}) raised: {exc}")
 
     types = _count_types(rows)
     missing = _REQUIRED_TYPES - types.keys()
@@ -141,13 +156,22 @@ async def test_post_message_stream_persists_session_log():
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
 
+    rows: list[dict] = []
     async with ApiClient(SERVER, timeout=120.0) as sdk:
-        sid = await _create_session(sdk)
-        await _drain_message_stream(sdk, sid, _TOOL_PROMPT)
-        # See above — give the BG persister a moment to flush turn_end.
-        await asyncio.sleep(2.0)
+        sid: str | None = None
+        try:
+            sid = await _create_session(sdk)
+            await _drain_message_stream(sdk, sid, _TOOL_PROMPT)
+            # See above — give the BG persister a moment to flush turn_end.
+            await asyncio.sleep(2.0)
 
-        rows = await sdk.get_session_log(sid, limit=200)
+            rows = await sdk.get_session_log(sid, limit=200)
+        finally:
+            if sid:
+                try:
+                    await sdk.delete_session(sid)
+                except Exception as exc:
+                    print(f"cleanup delete_session({sid}) raised: {exc}")
 
     types = _count_types(rows)
     missing = _REQUIRED_TYPES - types.keys()

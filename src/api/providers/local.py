@@ -28,15 +28,18 @@ from ._shared import (
     _get_sandbox_env_vars,
     _port_lock,
     _freed_ports,
+    _runtime_acp_bin,
+    _runtime_supervisor_js,
     _safe_path,
     _wait_for_health,
 )
 
 log = logging.getLogger(__name__)
 
-# Repo root:  providers/ → api/ → src/ → repo
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_SUPERVISOR_JS_SRC = _REPO_ROOT / "src" / "supervisor" / "supervisor.js"
+# ``_REPO_ROOT`` and ``_SUPERVISOR_JS_SRC`` were deleted in Phase E of
+# docs/runtime-image-unification.md — they were used only by the deleted
+# install_supervisor function. ``_runtime_supervisor_js()`` /
+# ``_detect_runtime_path()`` (in providers/_shared.py) are the new resolvers.
 
 
 def _vol_root() -> Path:
@@ -107,119 +110,11 @@ async def delete_volume(ref: str) -> None:
     log.info("local volume deleted: %s", ref)
 
 
-# ---------------------------------------------------------------------------
-# Supervisor install
-# ---------------------------------------------------------------------------
-
-async def install_supervisor(ref: str, agent_type: str) -> None:
-    """Install supervisor.js + npm deps atomically into ``<ref>/system/supervisor/``.
-
-    Populates a sibling staging dir (``system/supervisor.tmp.<uuid>``) first,
-    verifies the expected sentinel (``node_modules/.bin/<bin>`` for npm agents
-    or just ``supervisor.js`` otherwise), then atomically swaps it into place
-    with ``os.rename``. On any failure the staging dir is removed, leaving
-    the previous install (if any) untouched. This makes a half-finished
-    ``npm install`` — killed by a disk-full or SIGKILL — safe to retry
-    because a re-run starts from a fresh staging dir, not a partially
-    populated destination.
-
-    **Cumulative across agent_types.** When ``final_dir`` already has a
-    populated ``package.json`` / ``node_modules`` (a previous agent_type was
-    installed), the staging dir is seeded with that content and ``npm install
-    <new-spec>`` *adds* the new ACP binary alongside the existing one.
-    Without this, every new agent_type's ``npm init -y`` would fresh-init the
-    package.json and the atomic swap would wipe the prior agent_type's
-    binary — leaving ``volumes.supervisor_agent_types`` (cumulative) and the
-    on-disk ``node_modules`` (last-wins) out of sync. The cache hit on the
-    older agent_type's session would then skip reinstall and bomb with
-    "ACP binary missing".
-    """
-    final_dir = Path(ref) / "system" / "supervisor"
-    system_dir = final_dir.parent
-    await asyncio.to_thread(lambda: os.makedirs(system_dir, exist_ok=True))
-    staging = system_dir / f"supervisor.tmp.{uuid.uuid4().hex[:8]}"
-    await asyncio.to_thread(lambda: os.makedirs(staging, exist_ok=True))
-
-    def _promote() -> None:
-        """Atomically replace final_dir with staging. Caller ensures sentinel."""
-        if final_dir.exists():
-            # shutil.rmtree is not atomic but we've already verified staging
-            # is complete; a concurrent ensure would at worst re-install.
-            shutil.rmtree(final_dir)
-        os.rename(staging, final_dir)
-
-    try:
-        if agent_type not in _ACP_NPM_SPECS:
-            # Non-npm agents: copy supervisor.js into staging, verify, swap.
-            await asyncio.to_thread(shutil.copy, _SUPERVISOR_JS_SRC, staging / "supervisor.js")
-            if not (staging / "supervisor.js").exists():
-                raise RuntimeError(f"staging sentinel missing: {staging}/supervisor.js")
-            await asyncio.to_thread(_promote)
-            log.info("local supervisor installed (non-npm agent_type=%s) on %s", agent_type, ref)
-            return
-
-        npm = shutil.which("npm")
-        if not npm:
-            raise RuntimeError("npm not found; install Node.js >=18")
-
-        spec = _ACP_NPM_SPECS[agent_type]
-        existing_pkg = final_dir / "package.json"
-        seeded_from_existing = existing_pkg.exists()
-
-        def _seed_from_existing() -> None:
-            """Copy package.json / package-lock.json / node_modules from the
-            current install into staging so npm install merges rather than
-            replaces."""
-            shutil.copy(existing_pkg, staging / "package.json")
-            existing_lock = final_dir / "package-lock.json"
-            if existing_lock.exists():
-                shutil.copy(existing_lock, staging / "package-lock.json")
-            existing_modules = final_dir / "node_modules"
-            if existing_modules.exists():
-                shutil.copytree(
-                    existing_modules,
-                    staging / "node_modules",
-                    symlinks=True,
-                )
-
-        def _run_npm_init() -> None:
-            subprocess.run(
-                [npm, "init", "-y"],
-                cwd=str(staging),
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-
-        def _run_npm_install() -> None:
-            subprocess.run(
-                [npm, "install", "--omit=optional", spec],
-                cwd=str(staging),
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-
-        if seeded_from_existing:
-            await asyncio.to_thread(_seed_from_existing)
-        else:
-            await asyncio.to_thread(_run_npm_init)
-        await asyncio.to_thread(_run_npm_install)
-        await asyncio.to_thread(shutil.copy, _SUPERVISOR_JS_SRC, staging / "supervisor.js")
-
-        # Sentinel check: the per-agent ACP binary must exist in node_modules.
-        sentinel = staging / "node_modules" / ".bin" / _acp_bin_name(agent_type)
-        if not sentinel.exists():
-            raise RuntimeError(f"staging sentinel missing: {sentinel}")
-        if not (staging / "supervisor.js").exists():
-            raise RuntimeError(f"staging sentinel missing: {staging}/supervisor.js")
-
-        await asyncio.to_thread(_promote)
-        log.info("local supervisor installed on volume %s for agent_type=%s", ref, agent_type)
-    except BaseException:
-        # Best-effort clean up the staging dir; don't mask the original error.
-        await asyncio.to_thread(lambda: shutil.rmtree(staging, ignore_errors=True))
-        raise
+# ``install_supervisor`` was deleted in Phase E of
+# docs/runtime-image-unification.md. The supervisor + ACP bins now ship in
+# the agent-sdk Docker image at ``/opt/agent-sdk/runtime/`` (or in
+# ``<repo>/src/supervisor`` for source-tree dev) and ``create_sandbox``
+# resolves them via ``_runtime_supervisor_js()`` / ``_runtime_acp_bin()``.
 
 
 # ---------------------------------------------------------------------------
@@ -257,23 +152,26 @@ async def create_sandbox(
     vol = Path(volume_ref)
     sub = (subpath or "").lstrip("/")
     home_dir = vol / sub
-    sup_dir = vol / "system" / "supervisor"
-    supervisor_js = sup_dir / "supervisor.js"
 
+    # Phase E of docs/runtime-image-unification.md: the supervisor + ACP bins
+    # come from the image runtime path (``/opt/agent-sdk/runtime/`` baked
+    # into the agent-sdk Docker image; falls back to ``<repo>/src/supervisor``
+    # for source-tree dev). No per-volume install.
+    bin_name = _acp_bin_name(agent_type)
+    supervisor_js = Path(_runtime_supervisor_js())
     if not supervisor_js.exists():
         raise RuntimeError(
-            f"supervisor.js missing at {supervisor_js}; call install_supervisor first"
+            f"runtime supervisor.js missing at {supervisor_js}. "
+            f"Set AGENT_SDK_RUNTIME_PATH or run "
+            f"`npm --prefix src/supervisor install`."
         )
-
-    # Resolve the ACP binary: volume install for npm agents, PATH for others.
-    bin_name = _acp_bin_name(agent_type)
     if agent_type in _ACP_NPM_SPECS:
-        acp_bin = sup_dir / "node_modules" / ".bin" / bin_name
-        if not acp_bin.exists():
+        acp_bin_str = _runtime_acp_bin(agent_type)
+        if not Path(acp_bin_str).exists():
             raise RuntimeError(
-                f"ACP binary missing at {acp_bin}; call install_supervisor({agent_type!r}) first"
+                f"runtime ACP binary missing at {acp_bin_str}. "
+                f"Rebuild image or re-run npm install in src/supervisor."
             )
-        acp_bin_str = str(acp_bin)
     else:
         system_bin = shutil.which(bin_name)
         if not system_bin:

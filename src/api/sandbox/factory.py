@@ -3,7 +3,7 @@
 One dict, one method call. No "if provider == X" branches in shared code.
 
 Adding a new provider means: implement ``XxxSandboxSession`` and add one
-line here. Per docs/ephemeral-sandbox-design.md §11 (factory dispatch).
+line here.
 """
 from __future__ import annotations
 

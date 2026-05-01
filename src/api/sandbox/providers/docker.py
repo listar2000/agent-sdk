@@ -1,9 +1,8 @@
 """DockerSandboxSession — concrete SandboxSession for the docker provider.
 
 Wraps existing primitives in ``src/api/providers/docker.py`` into the
-five-method ``BaseSandboxSession`` contract. Per
-``docs/ephemeral-sandbox-design.md`` §11 — adding a provider is one
-file + one factory line.
+five-method ``BaseSandboxSession`` contract — adding a provider is one
+file + one factory line in ``api/sandbox/factory.py``.
 
 Docker is structurally simpler than daytona:
   * No S3-FUSE bridge — local volume mounts are POSIX

@@ -9,8 +9,7 @@ the next prompt POST to a dead supervisor URL.
 
 Replaces today's scattered liveness signals: ``state._reader_connected``,
 ``state._reader_alive``, ``_instance_process_alive``, ad-hoc
-``_wait_for_health`` calls. Per docs/ephemeral-sandbox-design.md §15.4
-and the bug-class table in §13 — the test 7 race becomes inexpressible
+``_wait_for_health`` calls. The test-7 race becomes inexpressible
 because there's only one variable to read or write.
 
 Single writer (the per-prompt SSE drain inside

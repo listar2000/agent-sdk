@@ -177,6 +177,189 @@ def _acp_launch_args(agent_type: str) -> list[str]:
     return list(_ACP_LAUNCH_ARGS.get(agent_type, []))
 
 
+# ---------------------------------------------------------------------------
+# Runtime path resolution
+#
+# The agent-sdk runtime (``supervisor.js`` + per-agent-type ACP binaries) is
+# baked into the Docker image at ``/opt/agent-sdk/runtime/`` (see ``Dockerfile``)
+# so providers no longer install it onto user volumes at runtime. ``Volumes``
+# carry only user data; the runtime is pinned to the agent-sdk version.
+#
+# When running the server from source (no image), the helper falls back to
+# ``<repo>/src/supervisor`` which the developer pre-populates with
+# ``npm --prefix src/supervisor install``. ``scripts/launch_server_local.sh``
+# does this automatically.
+#
+# Resolution order:
+#   1. ``$AGENT_SDK_RUNTIME_PATH`` set → use it as-is (no existence check;
+#      callers fail loudly with a clear error if the contents are wrong).
+#   2. ``/opt/agent-sdk/runtime`` exists on disk → we're in the image.
+#   3. ``<repo>/src/supervisor/node_modules/.bin/claude-agent-acp`` exists
+#      → we're running from source.
+#   4. Raise ``RuntimeError`` with the remediation command.
+# ---------------------------------------------------------------------------
+
+# Repo root: providers/ → api/ → src/ → repo (mirrors local.py:38)
+_REPO_ROOT_FROM_SHARED = os.path.realpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+)
+_IMAGE_RUNTIME_PATH = "/opt/agent-sdk/runtime"
+_SOURCE_RUNTIME_PATH = os.path.join(_REPO_ROOT_FROM_SHARED, "src", "supervisor")
+_SOURCE_RUNTIME_SENTINEL = os.path.join(
+    _SOURCE_RUNTIME_PATH, "node_modules", ".bin", "claude-agent-acp",
+)
+
+
+def _detect_runtime_path() -> str:
+    """Return the absolute path to the agent-sdk runtime directory.
+
+    The directory must contain ``supervisor.js`` and a ``node_modules/.bin/``
+    populated with every ACP binary in ``_ACP_NPM_SPECS``. Existence of those
+    contents is NOT validated here — callers (each provider's
+    ``create_sandbox``) raise with a precise file path when something is
+    missing, which is more actionable than a generic "runtime not found".
+
+    Pure: no I/O after the env-var fast path except up to two ``os.path.exists``
+    calls, both on local FS.
+    """
+    explicit = os.environ.get("AGENT_SDK_RUNTIME_PATH")
+    if explicit:
+        return explicit
+    if os.path.isdir(_IMAGE_RUNTIME_PATH):
+        return _IMAGE_RUNTIME_PATH
+    if os.path.exists(_SOURCE_RUNTIME_SENTINEL):
+        return _SOURCE_RUNTIME_PATH
+    raise RuntimeError(
+        f"agent-sdk runtime not found. Looked at "
+        f"$AGENT_SDK_RUNTIME_PATH (unset), {_IMAGE_RUNTIME_PATH} (missing), "
+        f"and source-tree fallback {_SOURCE_RUNTIME_PATH} (missing "
+        f"sentinel {_SOURCE_RUNTIME_SENTINEL}). "
+        f"Run `npm --prefix src/supervisor install` for source-tree dev "
+        f"or set AGENT_SDK_RUNTIME_PATH to a populated runtime directory."
+    )
+
+
+def _runtime_supervisor_js() -> str:
+    """Path to ``supervisor.js`` inside the resolved runtime directory."""
+    return os.path.join(_detect_runtime_path(), "supervisor.js")
+
+
+def _runtime_acp_bin_relative(agent_type: str) -> str:
+    """Path to the per-agent-type ACP binary RELATIVE to the runtime root.
+
+    Resolves through ``node_modules/<pkg>/package.json#bin`` rather than
+    through ``node_modules/.bin/<name>`` because Daytona's snapshot
+    image-build flattens symlinks under ``node_modules/.bin/`` to 0-byte
+    regular files (the underlying scripts stay intact). Going via
+    package.json gives us the real path either way.
+
+    Reads the SERVER's local runtime ``package.json`` to determine the
+    relative path. This is correct as long as the server's runtime layout
+    matches the sandbox's runtime layout — which it does, because both
+    come from the same Docker image (or both run from ``<repo>/src/supervisor``
+    in source-tree dev). The returned path is a relative POSIX path the
+    caller prepends to its own sandbox-side runtime root.
+
+    Only valid for agent_types in ``_ACP_NPM_SPECS``; non-npm agents
+    (``goose``, ``openhands``) resolve via PATH and should not call this
+    helper.
+    """
+    runtime = _detect_runtime_path()
+    bin_name = _acp_bin_name(agent_type)
+    spec = _ACP_NPM_SPECS[agent_type]
+    pkg_name = _spec_package_name(spec)
+    pkg_dir = os.path.join(runtime, "node_modules", pkg_name)
+    pkg_json_path = os.path.join(pkg_dir, "package.json")
+    if not os.path.exists(pkg_json_path):
+        # Fall back to the legacy .bin/<name> path so callers' existence
+        # checks raise a useful error rather than a confusing
+        # FileNotFoundError from the package.json read.
+        return os.path.join("node_modules", ".bin", bin_name)
+    import json
+    with open(pkg_json_path) as f:
+        pkg = json.load(f)
+    bin_field = pkg.get("bin")
+    if isinstance(bin_field, str):
+        rel = bin_field
+    elif isinstance(bin_field, dict):
+        rel = bin_field.get(bin_name)
+        if rel is None:
+            if len(bin_field) == 1:
+                rel = next(iter(bin_field.values()))
+            else:
+                raise RuntimeError(
+                    f"runtime ACP package {pkg_name!r} has bin entries "
+                    f"{list(bin_field)} but none matches {bin_name!r}"
+                )
+    else:
+        raise RuntimeError(
+            f"runtime ACP package {pkg_name!r} has no bin field in package.json"
+        )
+    return os.path.join("node_modules", pkg_name, rel)
+
+
+def _runtime_acp_bin(agent_type: str) -> str:
+    """Absolute path to the per-agent-type ACP binary on the SERVER's
+    filesystem (i.e. resolved against the server-host's runtime path).
+    Used by the local provider where server == sandbox host."""
+    return os.path.join(_detect_runtime_path(), _runtime_acp_bin_relative(agent_type))
+
+
+def _spec_package_name(spec: str) -> str:
+    """Strip the ``@<version>`` suffix from an npm spec, preserving any
+    leading ``@scope/``. E.g.::
+
+        @agentclientprotocol/claude-agent-acp@^0.27.0 → @agentclientprotocol/claude-agent-acp
+        opencode-ai@^1.4.3                            → opencode-ai
+    """
+    # Find the LAST ``@`` whose position is > 0 (so the leading ``@`` of a
+    # scoped package isn't mistaken for the version separator).
+    if "@" not in spec[1:]:
+        return spec
+    at_idx = spec.rfind("@")
+    if at_idx <= 0:
+        return spec
+    return spec[:at_idx]
+
+
+# ``_use_image_runtime()`` was deleted in Phase E of
+# docs/runtime-image-unification.md. The image-runtime path is now
+# unconditional (the only path); ``AGENT_SDK_USE_IMAGE_RUNTIME=0`` is no
+# longer honoured.
+
+
+def _read_runtime_image_tag() -> str | None:
+    """Read ``.runtime-image-tag`` from the repo root.
+
+    Written by ``scripts/release.sh`` after each successful image build.
+    Used by the daytona / docker / modal providers as the default container
+    image when no per-environment ``*_IMAGE`` env var is set. Returns
+    ``None`` if the file is absent or empty (typical for fresh dev
+    checkouts that haven't released yet).
+    """
+    return _read_repo_tag(".runtime-image-tag")
+
+
+def _read_runtime_snapshot_tag() -> str | None:
+    """Read ``.runtime-snapshot-tag`` from the repo root.
+
+    Written by ``scripts/release.sh`` after a successful Daytona snapshot
+    register. Lets ``provision_daytona_sandbox`` default ``DAYTONA_SNAPSHOT``
+    without requiring per-environment env-var setup, and lets launch
+    scripts pick up a known-good snapshot for free.
+    """
+    return _read_repo_tag(".runtime-snapshot-tag")
+
+
+def _read_repo_tag(filename: str) -> str | None:
+    path = os.path.join(_REPO_ROOT_FROM_SHARED, filename)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        tag = f.read().strip()
+    return tag or None
+
+
 def build_supervisor_argv(
     *,
     supervisor_js: str,
@@ -420,9 +603,11 @@ def _build_volume_mounts(
     if not subpath:
         # Utility sandbox: whole-volume mount so we can inspect/create any dir.
         return [VolumeMount(volume_id=volume_id, mount_path="/v")]
+    # Phase E of docs/runtime-image-unification.md: the supervisor lives
+    # in the image at /opt/agent-sdk/runtime, never on the volume. Volume
+    # is data-only — only /vol is mounted (plus any opt-in shared mounts).
     mounts = [
         VolumeMount(volume_id=volume_id, mount_path="/vol", subpath=subpath),
-        VolumeMount(volume_id=volume_id, mount_path="/opt/supervisor", subpath="system/supervisor"),
     ]
     for name in (shared_mounts or []):
         # Defense-in-depth: the agent-config API accepts arbitrary strings,

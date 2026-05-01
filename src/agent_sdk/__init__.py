@@ -1,6 +1,13 @@
 """Generic async agent client SDK.
 
 Works with any server implementing the agent orchestration REST API.
+
+Two entry points:
+  * ``Agent`` — user persona, single-session UX (``arun``, ``astream``,
+    ``send``, ``events``, ``cancel``, ``configure``).
+  * ``ApiClient`` — operator persona, flat one-method-per-route wrapper
+    over the REST surface. Use from services that manage other people's
+    sessions.
 """
 
 __version__ = "0.5.0"

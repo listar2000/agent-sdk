@@ -88,56 +88,115 @@ async def test_delete_volume_tolerates_missing(tmp_path, monkeypatch):
     await local.delete_volume(missing)
 
 
+# ``test_install_supervisor_populates_volume`` and
+# ``test_install_supervisor_is_cumulative_across_agent_types`` were deleted
+# in Phase E of docs/runtime-image-unification.md. The supervisor + ACP bins
+# now ship in the image at ``/opt/agent-sdk/runtime/``; no per-volume install
+# happens, so there's nothing to populate or to stay cumulative.
+
+
 # ---------------------------------------------------------------------------
-# Supervisor install
+# Phase B: image-runtime feature flag
+#
+# These tests pin the parity-first behavior of ``AGENT_SDK_USE_IMAGE_RUNTIME``:
+# when the flag is set, ``create_sandbox`` resolves supervisor.js + ACP bin
+# from the runtime path; when unset, it uses the legacy volume-side install.
+# Both paths must remain functional through Phase D; Phase E deletes the
+# legacy branch and these tests collapse to a single happy-path check.
+#
+# The tests intercept ``subprocess.Popen`` so the supervisor never actually
+# spawns — we just want to confirm the argv carries the right paths.
 # ---------------------------------------------------------------------------
 
+
+class _CapturingPopen:
+    """Stand-in for ``subprocess.Popen`` that records argv and pretends to
+    be a live process. ``create_sandbox`` polls /v1/health afterwards; we
+    short-circuit by returning a process whose ``poll()`` claims it died,
+    so create_sandbox raises during the health check — but argv has already
+    been captured by then, which is what we're asserting on."""
+
+    captured: list[list[str]] = []
+
+    def __init__(self, args, **kwargs):
+        type(self).captured.append(list(args))
+        # Simulate immediate exit so the surrounding wait-for-health loop
+        # doesn't hang indefinitely. The test catches the resulting raise.
+        self.returncode = 1
+        self._stderr_data = b"capturing-popen: simulated exit\n"
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    @property
+    def stderr(self):
+        class _F:
+            def read(_self):
+                return b"capturing-popen: simulated exit\n"
+        return _F()
+
+
 @pytest.mark.asyncio
-async def test_install_supervisor_populates_volume(tmp_path, monkeypatch):
+async def test_create_sandbox_uses_image_runtime_when_flag_set(
+    tmp_path, monkeypatch,
+):
+    """With ``AGENT_SDK_USE_IMAGE_RUNTIME=1`` and ``AGENT_SDK_RUNTIME_PATH``
+    pointed at a populated runtime dir, ``create_sandbox`` spawns the
+    supervisor with the runtime-path values, NOT the volume-side path."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    monkeypatch.setenv("AGENT_SDK_USE_IMAGE_RUNTIME", "1")
+
+    # Stub a runtime dir with the sentinels create_sandbox checks for.
+    runtime_dir = tmp_path / "runtime"
+    bin_dir = runtime_dir / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    (runtime_dir / "supervisor.js").write_text("// stub\n")
+    claude_bin = bin_dir / "claude-agent-acp"
+    claude_bin.write_text("#!/bin/sh\nexit 0\n")
+    claude_bin.chmod(0o755)
+    monkeypatch.setenv("AGENT_SDK_RUNTIME_PATH", str(runtime_dir))
+
     from api.providers import local
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    # NOTE: NO install_supervisor call — that's the whole point of this path.
 
-    await local.install_supervisor(ref, "claude")
+    # Patch Popen ONLY around create_sandbox so install_supervisor (not
+    # called here, but kept symmetric with the by_default test) and any
+    # other subprocess.run users in the call chain still see real Popen.
+    _CapturingPopen.captured.clear()
+    monkeypatch.setattr(local.subprocess, "Popen", _CapturingPopen)
 
-    sup = Path(ref) / "system" / "supervisor"
-    assert (sup / "supervisor.js").is_file()
-    assert (sup / "package.json").is_file()
-    assert (sup / "node_modules").is_dir()
-    # ACP binary is the whole point of the install — must be executable.
-    acp_bin = sup / "node_modules" / ".bin" / "claude-agent-acp"
-    assert acp_bin.exists()
+    with pytest.raises(Exception):  # _CapturingPopen exits immediately → health check fails
+        await local.create_sandbox(
+            volume_ref=ref, subpath="agents/a1/home", agent_type="claude",
+        )
 
-
-@pytest.mark.asyncio
-async def test_install_supervisor_is_cumulative_across_agent_types(tmp_path, monkeypatch):
-    """Installing two agent_types on the same volume must leave BOTH binaries
-    in node_modules/.bin. Regression guard for the bug where each install ran
-    ``npm init -y`` in a fresh staging dir and the atomic swap wiped the
-    previous agent_type's deps. The DB cache ``volumes.supervisor_agent_types``
-    is cumulative; the on-disk install must match, otherwise a session for
-    the older agent_type hits the cache, skips reinstall, and bombs with
-    "ACP binary missing"."""
-    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
-
-    name = _vol_name()
-    ref = await local.create_volume(name)
-
-    await local.install_supervisor(ref, "claude")
-    await local.install_supervisor(ref, "codex")
-
-    sup = Path(ref) / "system" / "supervisor"
-    claude_bin = sup / "node_modules" / ".bin" / "claude-agent-acp"
-    codex_bin = sup / "node_modules" / ".bin" / "codex-acp"
-    assert claude_bin.exists(), (
-        f"claude-agent-acp wiped by codex install — install_supervisor is "
-        f"not cumulative. node_modules/.bin contents: "
-        f"{sorted(p.name for p in (sup / 'node_modules' / '.bin').iterdir())}"
+    assert _CapturingPopen.captured, "supervisor was not spawned"
+    argv = _CapturingPopen.captured[0]
+    assert str(runtime_dir / "supervisor.js") in argv, (
+        f"supervisor argv did not include image-runtime supervisor.js: {argv}"
     )
-    assert codex_bin.exists()
+    assert str(claude_bin) in argv, (
+        f"supervisor argv did not include image-runtime claude bin: {argv}"
+    )
+    # And confirm the legacy volume-side path is NOT in argv.
+    legacy_sup = Path(ref) / "system" / "supervisor" / "supervisor.js"
+    assert str(legacy_sup) not in argv, (
+        f"argv unexpectedly contains the legacy volume path: {argv}"
+    )
+
+
+# test_create_sandbox_uses_volume_runtime_by_default was deleted in Phase E
+# of docs/runtime-image-unification.md — the legacy volume-install path
+# is gone, so there's no flag-off behavior to pin.
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +215,9 @@ async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
-    await local.install_supervisor(ref, "claude")
+    # Phase E: no install_supervisor — supervisor.js + ACP bins live in the
+    # image runtime path. ``_detect_runtime_path()`` falls back to
+    # ``<repo>/src/supervisor`` when the image path is absent (CI / dev).
 
     inst = await local.create_sandbox(
         volume_ref=ref,
@@ -206,7 +267,7 @@ async def test_ensure_supervisor_url_returns_same_url(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
-    await local.install_supervisor(ref, "claude")
+    # Phase E: supervisor lives in the image runtime path, no per-volume install.
 
     inst = await local.create_sandbox(
         volume_ref=ref, subpath="agents/e/home", agent_type="claude",
