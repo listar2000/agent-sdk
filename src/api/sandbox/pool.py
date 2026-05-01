@@ -17,10 +17,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from typing import Any
+
+from api import db
 
 from .session import BaseSandboxSession
-from .state import SandboxState, deserialize, serialize
+from .state import Recipe, SandboxState, deserialize, serialize, state_for_provider
 
 log = logging.getLogger(__name__)
 
@@ -29,15 +30,6 @@ log = logging.getLogger(__name__)
 # the appropriate concrete SandboxSession subclass. Phase 2 exposes a
 # default implementation in factory.py keyed on state.type.
 SessionFactory = Callable[[str, SandboxState], BaseSandboxSession]
-
-
-# Type for the function that loads sandbox_state JSONB for a session_id.
-# Real impl reads from sessions.sandbox_state. Single-process
-# serialization uses the per-session asyncio lock below; multi-process
-# would need a single transaction wrapping the whole load→start→save
-# sequence (see db_bindings.py module docstring). Tests can pass a mock.
-LoadState = Callable[[str], "asyncio.Future[dict[str, Any] | None]"]
-SaveState = Callable[[str, dict[str, Any]], "asyncio.Future[None]"]
 
 
 class SessionPool:
@@ -54,16 +46,8 @@ class SessionPool:
     ``SandboxSession.start()``.
     """
 
-    def __init__(
-        self,
-        *,
-        factory: SessionFactory,
-        load_state: LoadState,
-        save_state: SaveState,
-    ) -> None:
+    def __init__(self, *, factory: SessionFactory) -> None:
         self._factory = factory
-        self._load_state = load_state
-        self._save_state = save_state
         self._active: dict[str, BaseSandboxSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -73,9 +57,20 @@ class SessionPool:
             lock = self._locks.setdefault(session_id, asyncio.Lock())
         return lock
 
-    async def get_session(self, session_id: str) -> BaseSandboxSession:
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        initial_state: SandboxState | None = None,
+    ) -> BaseSandboxSession:
         """Returns a known-alive SandboxSession. The single recovery
         entry point. Per docs §6.
+
+        ``initial_state`` is the explicit input channel for cold-create:
+        callers that just inserted a session row pass the recipe directly
+        instead of pre-writing the ``sandbox_state`` column. For recovery
+        (server restart, hibernated session resume) ``initial_state``
+        stays ``None`` and the column is the source of truth.
 
         Holds ``_locks[session_id]`` for the entire decide-and-start
         sequence so concurrent callers can't double-provision.
@@ -96,15 +91,39 @@ class SessionPool:
                 asyncio.create_task(_safe_shutdown(cached))
                 self._active.pop(session_id, None)
 
-            payload = await self._load_state(session_id)
-            state = deserialize(payload)
+            if initial_state is not None:
+                state: SandboxState = initial_state
+            else:
+                state = deserialize(await db.read_sandbox_state(session_id))
             session = self._factory(session_id, state)
             log.info("[pool.get_session] session=%s creating new state.type=%s sandbox_ref=%s",
                      session_id, getattr(state, "type", "?"), getattr(state, "sandbox_ref", None))
             await session.start()
-            await self._save_state(session_id, serialize(session.state))
+            await db.write_sandbox_state(session_id, serialize(session.state))
             self._active[session_id] = session
             return session
+
+    async def cold_create(
+        self,
+        session_id: str,
+        *,
+        provider: str,
+        recipe: Recipe,
+    ) -> BaseSandboxSession:
+        """Cold-start a session for which the row was just inserted.
+
+        Constructs the per-provider initial SandboxState from ``recipe``
+        and delegates to ``get_session`` so the same lock + cache logic
+        runs. For the recovery path (server restart, hibernated session
+        resume) call ``get_session`` directly — that reads state from
+        the DB.
+
+        Raises ``ValueError`` for an unknown provider name (caller should
+        map to HTTP 400). Any provider-side provisioning failure
+        propagates from ``get_session`` for the caller to translate.
+        """
+        initial_state = state_for_provider(provider, recipe)
+        return await self.get_session(session_id, initial_state=initial_state)
 
     async def release(self, session_id: str) -> None:
         """Hibernate: snapshot + drop compute. Idempotent.
@@ -118,7 +137,7 @@ class SessionPool:
             try:
                 try:
                     await session.stop()
-                    await self._save_state(session_id, serialize(session.state))
+                    await db.write_sandbox_state(session_id, serialize(session.state))
                 except Exception:
                     log.exception(
                         "session.stop() failed for %s; proceeding with shutdown",

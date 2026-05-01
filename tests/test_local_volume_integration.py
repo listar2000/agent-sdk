@@ -111,6 +111,35 @@ async def test_install_supervisor_populates_volume(tmp_path, monkeypatch):
     assert acp_bin.exists()
 
 
+@pytest.mark.asyncio
+async def test_install_supervisor_is_cumulative_across_agent_types(tmp_path, monkeypatch):
+    """Installing two agent_types on the same volume must leave BOTH binaries
+    in node_modules/.bin. Regression guard for the bug where each install ran
+    ``npm init -y`` in a fresh staging dir and the atomic swap wiped the
+    previous agent_type's deps. The DB cache ``volumes.supervisor_agent_types``
+    is cumulative; the on-disk install must match, otherwise a session for
+    the older agent_type hits the cache, skips reinstall, and bombs with
+    "ACP binary missing"."""
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
+    from api.providers import local
+
+    name = _vol_name()
+    ref = await local.create_volume(name)
+
+    await local.install_supervisor(ref, "claude")
+    await local.install_supervisor(ref, "codex")
+
+    sup = Path(ref) / "system" / "supervisor"
+    claude_bin = sup / "node_modules" / ".bin" / "claude-agent-acp"
+    codex_bin = sup / "node_modules" / ".bin" / "codex-acp"
+    assert claude_bin.exists(), (
+        f"claude-agent-acp wiped by codex install — install_supervisor is "
+        f"not cumulative. node_modules/.bin contents: "
+        f"{sorted(p.name for p in (sup / 'node_modules' / '.bin').iterdir())}"
+    )
+    assert codex_bin.exists()
+
+
 # ---------------------------------------------------------------------------
 # Sandbox lifecycle
 # ---------------------------------------------------------------------------
@@ -137,11 +166,11 @@ async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
 
     try:
         assert inst.url.startswith("http://127.0.0.1:")
-        assert inst.sandbox_id is not None
-        # sandbox_id is a stable provider ref (``local-<uuid12>``) so the
+        assert inst.sandbox_ref is not None
+        # sandbox_ref is a stable provider ref (``local-<uuid12>``) so the
         # same sandbox can survive an in-place restart with a fresh PID;
         # the _PROCESSES registry is keyed by that ref.
-        sandbox_ref = inst.sandbox_id
+        sandbox_ref = inst.sandbox_ref
         assert sandbox_ref in local._PROCESSES
 
         # Per-sandbox HOME exists on the volume.
@@ -152,7 +181,7 @@ async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
 
         # Status reports running.
-        status = await local.get_sandbox_status(inst.sandbox_id)
+        status = await local.get_sandbox_status(inst.sandbox_ref)
         assert status == "running"
     finally:
         await local.destroy_sandbox(inst)

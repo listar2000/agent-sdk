@@ -1,4 +1,4 @@
-"""Live end-to-end test on real Daytona, exercised through the SDK (ServerClient).
+"""Live end-to-end test on real Daytona, exercised through the SDK (ApiClient).
 
 Skipped unless DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN + TEST_DATABASE_URL
 are all set. Models a realistic agent-setup workflow:
@@ -41,20 +41,20 @@ pytestmark = pytest.mark.skipif(
 if _DB:
     os.environ["DATABASE_URL"] = _DB
 
-from agent_sdk.server_client import ServerClient  # noqa: E402
+from agent_sdk.api_client import ApiClient  # noqa: E402
 from api import server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
 async def sdk(clean_db):
-    """ServerClient bound to the in-process app via ASGITransport."""
+    """ApiClient bound to the in-process app via ASGITransport."""
     transport = httpx.ASGITransport(app=srv.app)
     http = httpx.AsyncClient(
         transport=transport,
         base_url="http://test",
         timeout=httpx.Timeout(300.0, read=None),
     )
-    sc = ServerClient(base_url="http://test", http_client=http)
+    sc = ApiClient(base_url="http://test", http_client=http)
     try:
         yield sc
     finally:
@@ -75,9 +75,9 @@ CLAUDE_MD_BODY = "You are a hive agent. Be helpful and concise.\n"
 
 
 @pytest.mark.asyncio
-async def test_live_daytona_realistic_workflow_via_sdk(sdk: ServerClient):
+async def test_live_daytona_realistic_workflow_via_sdk(sdk: ApiClient):
     """Realistic pre_start_commands workflow on a real Daytona sandbox,
-    driven entirely through ``ServerClient`` (the SDK that end users call)."""
+    driven entirely through ``ApiClient`` (the SDK that end users call)."""
     cmds = [
         # 1. Real package install. npm is on the base image (the supervisor
         # itself runs on node). cowsay is tiny and has a deterministic --version.
@@ -132,15 +132,12 @@ async def test_live_daytona_realistic_workflow_via_sdk(sdk: ServerClient):
         # collapsed. The pool path is "release the lease, then prompt
         # again" — the next get_session takes the cold-create branch
         # because the released SandboxSession's compute is gone.
-        # /release is exposed on the SDK; /message we drive directly via
-        # the underlying http client because we're not consuming the SSE
-        # body here, just triggering a cold-create.
-        rel = await sdk._http.post(f"/sessions/{sid}/release", timeout=120)
-        assert rel.status_code == 200, f"release failed: {rel.status_code} {rel.text}"
-        r = await sdk._http.post(
-            f"/sessions/{sid}/message", json={"message": "ping"}, timeout=300,
-        )
-        assert r.status_code == 200, f"message failed: {r.status_code} {r.text}"
+        await sdk.release_session(sid)
+        # send_message is fire-and-forget — it returns the rpc_id immediately
+        # and the cold-recovery proceeds on the server. We don't need to
+        # consume the SSE stream here; the file-read assertions below act
+        # as the synchronization point (they wait on the new sandbox).
+        await sdk.send_message(sid, "ping")
 
         # CLAUDE.md still correct on the new sandbox (via SDK).
         f2 = await sdk.session_file_read(sid, "CLAUDE.md")

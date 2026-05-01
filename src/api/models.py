@@ -34,10 +34,14 @@ class AgentConfig:
     """
     agent_type: str = "claude"
     model: str | None = None
-    prompt: str | None = None
-    tools: list[str] | None = None
     mcp_servers: dict | None = None
     skills: list | dict | None = None  # npx skills sources
+    # ACP dynamic config that gets re-applied on every fresh attach so
+    # cold-recovery (Type-2) doesn't silently revert a caller's
+    # set_mode / set_thought_level. Keep model on its own field above
+    # for back-compat (it predates this group).
+    mode: str | None = None              # "default" | "plan" | "bypassPermissions" | "acceptEdits" | ...
+    thought_level: str | None = None     # "low" | "medium" | "high" — Claude's "thinking" config_id
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}

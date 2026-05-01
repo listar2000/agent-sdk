@@ -261,7 +261,7 @@
       <a href="#config-files">Config files</a>
       <a href="#cleanup">Cleanup</a>
       <a href="#errors">Error handling</a>
-      <a href="#server-client">ServerClient</a>
+      <a href="#server-client">ApiClient</a>
       <a href="#pre-start">pre_start_commands</a>
       <a href="#full-example">Full example</a>
     </nav>
@@ -274,11 +274,11 @@
         <strong>Two clients, two personas.</strong>
         <ul>
           <li><code>agent_sdk.Agent</code> — <strong>user</strong>. Owns one session. Streams events, sends messages, resumes, exposes <code>agent.sandbox</code>.</li>
-          <li><code>agent_sdk.ServerClient</code> — <strong>operator</strong>. Stateless REST wrapper. Manages volumes, sessions, files for other people's sessions. Use it for schedulers, admin tools, hive workspace bootstraps.</li>
+          <li><code>agent_sdk.ApiClient</code> — <strong>operator</strong>. Stateless REST wrapper. Manages volumes, sessions, files for other people's sessions. Use it for schedulers, admin tools, hive workspace bootstraps.</li>
         </ul>
-        Pick by persona, not feature: if your code <em>is</em> the user, use <code>Agent</code>; if your code is acting <em>on behalf of</em> users, use <code>ServerClient</code>.
+        Pick by persona, not feature: if your code <em>is</em> the user, use <code>Agent</code>; if your code is acting <em>on behalf of</em> users, use <code>ApiClient</code>.
         <br><br>
-        <em>(There's also a small <code>agent_sdk.Client</code> with a volumes-only API — vestigial, predates <code>ServerClient</code>. Use <code>ServerClient</code> for new code.)</em>
+        <em>(There's also a small <code>agent_sdk.Client</code> with a volumes-only API — vestigial, predates <code>ApiClient</code>. Use <code>ApiClient</code> for new code.)</em>
       </div>
     </div>
   </div>
@@ -716,18 +716,18 @@ results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*
     </div>
   </div>
 
-  <!-- ── ServerClient ── -->
+  <!-- ── ApiClient ── -->
   <div class="section" id="server-client">
     <div class="section-header">
-      <h2><span class="section-icon" style="background:rgba(168,85,247,0.15);color:#c084fc">🖥</span>ServerClient <span class="pill pill-purple" style="vertical-align:middle">operator</span></h2>
+      <h2><span class="section-icon" style="background:rgba(168,85,247,0.15);color:#c084fc">🖥</span>ApiClient <span class="pill pill-purple" style="vertical-align:middle">operator</span></h2>
       <p class="section-sub">Stateless wrapper over every REST route. Use this for schedulers, admin tools, hive workspace bootstraps — anything that creates and manages other people's sessions.</p>
     </div>
 
     <div class="card">
       <div class="card-label">Basic usage</div>
-      <pre><code><span class="kw">from</span> <span class="nb">agent_sdk</span> <span class="kw">import</span> ServerClient
+      <pre><code><span class="kw">from</span> <span class="nb">agent_sdk</span> <span class="kw">import</span> ApiClient
 
-<span class="kw">async with</span> <span class="fn">ServerClient</span>(<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> sc:
+<span class="kw">async with</span> <span class="fn">ApiClient</span>(<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> sc:
     session = <span class="kw">await</span> sc.<span class="fn">create_session</span>(
         provider=<span class="st">"local"</span>, model=<span class="st">"haiku"</span>,
         name=<span class="st">"worker"</span>, agent_type=<span class="st">"claude"</span>,
@@ -776,7 +776,7 @@ results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*
     </div>
 
     <div class="callout callout-blue">
-      <strong>Stateless w.r.t. resources.</strong> One <code>ServerClient</code> instance is safe across thousands of concurrent operations against unrelated sessions. The only state it owns is one <code>httpx.AsyncClient</code> connection pool plus the bearer header.
+      <strong>Stateless w.r.t. resources.</strong> One <code>ApiClient</code> instance is safe across thousands of concurrent operations against unrelated sessions. The only state it owns is one <code>httpx.AsyncClient</code> connection pool plus the bearer header.
     </div>
   </div>
 
@@ -817,8 +817,8 @@ results = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(*
     </div>
 
     <div class="card">
-      <div class="card-label">via ServerClient — operator persona</div>
-      <pre><code><span class="kw">async with</span> <span class="fn">ServerClient</span>(<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> sc:
+      <div class="card-label">via ApiClient — operator persona</div>
+      <pre><code><span class="kw">async with</span> <span class="fn">ApiClient</span>(<span class="st">"http://localhost:7778"</span>) <span class="kw">as</span> sc:
     session = <span class="kw">await</span> sc.<span class="fn">create_session</span>(
         provider=<span class="st">"daytona"</span>,
         name=<span class="st">"deploy-bot"</span>, agent_type=<span class="st">"claude"</span>,

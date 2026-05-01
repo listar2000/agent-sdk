@@ -94,6 +94,31 @@ _ADAPTER: TypeAdapter[SandboxState] = TypeAdapter(SandboxState)
 _KNOWN_TYPES = {"daytona", "docker", "unix_local", "local", "modal", "unknown"}
 
 
+# Maps API-level provider names (the ``provider`` field on POST /sessions
+# and POST /sandboxes) to their concrete SandboxState class. ``"local"``
+# is an accepted alias for ``"unix_local"``.
+_PROVIDER_STATE_CLASS: dict[str, type[_BaseSandboxState]] = {
+    "daytona": DaytonaSandboxState,
+    "docker": DockerSandboxState,
+    "local": UnixLocalSandboxState,
+    "unix_local": UnixLocalSandboxState,
+    "modal": ModalSandboxState,
+}
+
+
+def state_for_provider(provider: str, recipe: Recipe) -> SandboxState:
+    """Construct the per-provider initial SandboxState for a fresh cold-create.
+
+    ``provider`` is the API-level provider name (matches the ``provider``
+    field on POST /sessions and POST /sandboxes). Raises ``ValueError``
+    for an unknown name — caller should map that to HTTP 400.
+    """
+    cls = _PROVIDER_STATE_CLASS.get(provider)
+    if cls is None:
+        raise ValueError(f"unsupported provider: {provider!r}")
+    return cls(recipe=recipe)
+
+
 def deserialize(payload: dict[str, Any] | None) -> SandboxState:
     """JSONB blob → typed state. NULL, missing ``type``, or an
     unrecognised ``type`` value all collapse to UnknownSandboxState — be

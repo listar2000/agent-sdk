@@ -34,7 +34,10 @@ from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .db import (
     add_supervisor_agent_type,
     close_pool,
+    count_sessions_by_volume,
     delete_agent,
+    delete_session,
+    delete_sessions_by_volume,
     delete_volume,
     get_agent,
     get_db,
@@ -47,11 +50,13 @@ from .db import (
     list_agents,
     list_volumes,
     log_event,
+    read_sandbox_state,
     update_session_env,
     update_session_secrets,
     upsert_agent,
     upsert_session,
     upsert_volume,
+    write_sandbox_state,
 )
 from .models import (
     EVT_ASSISTANT_MESSAGE,
@@ -307,11 +312,11 @@ async def _build_pre_start_commands(
 
 _CONFIG_KEYS = (
     "model",
-    "prompt",
-    "tools",
     "mcp_servers",
     "skills",
     "agent_type",
+    "mode",
+    "thought_level",
 )
 
 # Keys that were once inside AgentConfig but now live on session / sandbox
@@ -624,23 +629,16 @@ async def get_volume_route(id_or_name: str):
 async def delete_volume_route(id_or_name: str, force: bool = False):
     vol = await _resolve_volume(id_or_name)
 
-    async with get_db() as conn:
-        cur = await conn.execute(
-            "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (vol.id,)
+    session_count = await count_sessions_by_volume(vol.id)
+    if session_count > 0 and not force:
+        raise HTTPException(
+            409,
+            f"Volume has {session_count} session(s). "
+            f"Use ?force=true to cascade.",
         )
-        session_count = (await cur.fetchone())["n"]
-
-        if session_count > 0 and not force:
-            raise HTTPException(
-                409,
-                f"Volume has {session_count} session(s). "
-                f"Use ?force=true to cascade.",
-            )
-        if force and session_count > 0:
-            # FK RESTRICT on volume blocks the final delete otherwise.
-            await conn.execute(
-                "DELETE FROM sessions WHERE volume_id = %s", (vol.id,),
-            )
+    if force and session_count > 0:
+        # FK RESTRICT on volume blocks the final delete otherwise.
+        await delete_sessions_by_volume(vol.id)
 
     try:
         # daytona.delete_volume is aliased to delete_daytona_volume; the
@@ -1240,22 +1238,20 @@ async def _sessions_create_eager(data: dict) -> dict:
     supervisor, runs ACP ``session/new``, persists ``inner_session_id``
     on the session row).
     """
-    from psycopg.types.json import Json
-
-    from api.sandbox import (
-        DaytonaSandboxState,
-        DockerSandboxState,
-        ModalSandboxState,
-        Recipe,
-        UnixLocalSandboxState,
-        get_pool,
-        serialize,
-    )
+    from api.sandbox import Recipe, get_pool, state_for_provider
 
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
     provider = data.get("provider", "local")
+    # Validate provider before any DB writes so a typo doesn't leave an
+    # orphan agent row behind. ``state_for_provider`` is the single source
+    # of truth for which provider names cold_create accepts.
+    try:
+        state_for_provider(provider, Recipe())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), provider)
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
@@ -1273,6 +1269,13 @@ async def _sessions_create_eager(data: dict) -> dict:
     await upsert_agent(AgentRecord(id=agent_id, name=data.get("name"), config=config))
 
     user_pre_start = list(data.get("pre_start_commands") or [])
+    # Merge skill-install commands ahead of user commands, so skills land
+    # before any user setup that depends on them. For ``local`` the merge
+    # function installs skills on the host directly and returns the
+    # user_pre_start unchanged (local sandboxes share HOME with the server).
+    merged_pre_start = await _build_pre_start_commands(
+        config, provider, user_pre_start,
+    ) or []
 
     # Default cwd matches the per-provider HOME the first sandbox boots into,
     # so session/new and every later session/load share the JSONL hash key.
@@ -1283,23 +1286,16 @@ async def _sessions_create_eager(data: dict) -> dict:
             else default_cwd_for_provider(provider)
         )
 
-    state_cls = {
-        "daytona": DaytonaSandboxState,
-        "docker": DockerSandboxState,
-        "local": UnixLocalSandboxState,
-        "unix_local": UnixLocalSandboxState,
-        "modal": ModalSandboxState,
-    }.get(provider)
-    if state_cls is None:
-        await delete_agent(agent_id)
-        raise HTTPException(400, f"unsupported provider: {provider!r}")
-    initial_state = state_cls(recipe=Recipe(
+    # Recipe carries the MERGED list (skills + user) so Type-2 recovery
+    # re-runs both — the pool reads recipe.pre_start_commands directly,
+    # it does not re-derive skills from agents.config.skills.
+    recipe = Recipe(
         agent_type=agent_type,
         dockerfile=dockerfile,
         shared_mounts=list(shared_mounts) if shared_mounts else [],
         root=root,
-        pre_start_commands=user_pre_start,
-    ))
+        pre_start_commands=merged_pre_start,
+    )
 
     session_id = str(uuid.uuid4())
     await upsert_session(
@@ -1307,26 +1303,22 @@ async def _sessions_create_eager(data: dict) -> dict:
         volume_id=volume_record.id,
         env=body_env or {}, secrets=body_secrets or {},
         cwd=cwd,
-        pre_start_commands=user_pre_start,
+        # Mirror the recipe so the column matches what's persisted on the
+        # session row's sandbox_state JSONB. Pool reads from JSONB; this
+        # column is consumed by /sessions/{id} (GET) introspection.
+        pre_start_commands=merged_pre_start,
     )
-    # Pre-populate sandbox_state so pool.get_session knows the recipe on
-    # first call. The pool will overwrite this with the full state after
-    # cold-create (sandbox_ref, listen_port, snapshot_path).
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
-            (Json(serialize(initial_state)), session_id),
-        )
-
     pool = get_pool()
     try:
-        pool_session = await pool.get_session(session_id)
+        pool_session = await pool.cold_create(
+            session_id, provider=provider, recipe=recipe,
+        )
     except HTTPException:
         await delete_agent(agent_id)
         raise
     except Exception as e:
         await delete_agent(agent_id)
-        log.error("sessions_create_eager: pool.get_session failed (provider=%s): %s",
+        log.error("sessions_create_eager: pool.cold_create failed (provider=%s): %s",
                   provider, e, exc_info=True)
         if "circuit breaker" in str(e).lower():
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
@@ -1372,11 +1364,19 @@ async def _forward_session_config(
     config_data: dict | None = None,
 ) -> None:
     """Apply caller-provided ``model`` / ``mode`` / ``thought_level`` to a
-    pool session via ACP ``set_*``. Best-effort: a transient ACP failure
-    logs and continues. Fields are looked up first in ``data`` (top-level
-    body — what the SDK sends), then in ``config_data`` (nested body —
-    what ``_merge_top_level_config`` may have promoted ``model`` into)."""
+    pool session via ACP ``set_*`` AND persist them on ``agents.config``
+    so cold-recovery (Type-2) replays them via ``_attach_acp``.
+
+    Without persistence, a mid-flight ``set_mode("plan")`` would land
+    on the current ACP session but a sandbox restart would silently
+    revert to default. Same bug class the model field already fixed.
+
+    Best-effort: a transient ACP failure logs and continues. Fields are
+    looked up first in ``data`` (top-level body — what the SDK sends),
+    then in ``config_data`` (nested body — what ``_merge_top_level_config``
+    may have promoted ``model`` into)."""
     cfg = config_data or {}
+    applied: dict[str, str] = {}
     for key, method in _SESSION_CONFIG_FIELDS:
         val = data.get(key)
         if val is None:
@@ -1385,9 +1385,30 @@ async def _forward_session_config(
             continue
         try:
             await getattr(pool_session, method)(val)
+            applied[key] = val
         except Exception as e:
             log.warning("forward %s(%r) to session %s failed: %s",
                         method, val, pool_session.session_id, e)
+    # Persist to agents.config so the next cold-recovery replays them.
+    # Skip if the ACP push failed for everything (don't promise persistence
+    # we don't have). model already lives on AgentConfig.model; mode +
+    # thought_level land on the new fields added for this purpose.
+    if applied and pool_session._agent_id:
+        try:
+            agent = await get_agent(pool_session._agent_id)
+            if agent and agent.config:
+                changed = False
+                for key, val in applied.items():
+                    if getattr(agent.config, key, None) != val:
+                        setattr(agent.config, key, val)
+                        changed = True
+                if changed:
+                    await upsert_agent(agent)
+        except Exception:
+            log.exception(
+                "persist session config to agents.config failed for %s",
+                pool_session.session_id,
+            )
 
 
 async def _persist_user_message(session, message: str, rpc_id: str) -> None:
@@ -1719,12 +1740,11 @@ async def release_session_route(session_id: str):
     The next pool-mediated prompt restores from this snapshot.
     """
     from api.sandbox import deserialize, get_pool
-    from api.sandbox.db_bindings import load_sandbox_state
 
     pool = get_pool()
     await pool.release(session_id)
 
-    payload = await load_sandbox_state(session_id)
+    payload = await read_sandbox_state(session_id)
     state = deserialize(payload)
     return {
         "lifecycle": "hibernated",
@@ -1754,19 +1774,69 @@ async def delete_session_route(session_id: str):
     # Drop the session row. ``ON DELETE CASCADE`` on session_log handles
     # the log rows; ``sandbox_state`` JSONB lives on the sessions row
     # itself so it goes with the row.
-    async with get_db() as conn:
-        await conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+    await delete_session(session_id)
 
 
 @app.post("/sessions/{session_id}/config")
 async def session_set_config(session_id: str, request: Request):
-    """Set mode/model/thought_level for a session via the SessionPool."""
+    """Set mode/model/thought_level for a session via the SessionPool.
+
+    These three are the persisted, replayed-on-recovery knobs (see
+    ``_attach_acp``). Anything else ACP exposes — new ``configId``s
+    Claude grows, vendor-specific extensions — should go through
+    ``POST /sessions/{id}/acp/call`` so we don't grow a new typed
+    field per knob.
+    """
     data = await _json_body(request)
     from api.sandbox import get_pool
 
     pool_session = await get_pool().get_session(session_id)
     await _forward_session_config(pool_session, data)
     return {"status": "ok"}
+
+
+@app.post("/sessions/{session_id}/acp/call")
+async def session_acp_call(session_id: str, request: Request):
+    """Generic passthrough to the session's ACP supervisor.
+
+    Body: ``{"method": "session/...", "params": {...}, "notify": false}``.
+    Auto-injects the inner ``sessionId`` into ``params`` so callers
+    don't need to track it. ``notify=true`` sends as a JSON-RPC
+    notification (no response, no rpc_id) — required for
+    ``session/cancel`` and other handlers ACP routes via
+    ``notificationHandler``.
+
+    Used for anything the typed wrappers don't cover: Claude's
+    ever-growing ``configOptions`` set, vendor-specific extensions,
+    debugging, etc. NOT a replacement for the persisted config knobs
+    (model / mode / thought_level) — those go through
+    ``POST /sessions/{id}/config`` so cold-recovery replays them.
+    Anything called here is transient — survives only the current
+    ACP session, lost on the next restart.
+    """
+    data = await _json_body(request)
+    method = data.get("method")
+    if not method or not isinstance(method, str):
+        raise HTTPException(400, "method (str) required")
+    params = data.get("params") or {}
+    notify = bool(data.get("notify"))
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+    if pool_session._supervisor_url is None or pool_session._acp_session_id is None:
+        raise HTTPException(503, "session has no live ACP supervisor")
+    from api.acp_client import AcpClient
+    client = AcpClient(pool_session._supervisor_url)
+    if pool_session._inner_session_id is not None:
+        client._inner_session_ids[pool_session._acp_session_id] = (
+            pool_session._inner_session_id
+        )
+    try:
+        result = await client.call(
+            pool_session._acp_session_id, method, params, notify=notify,
+        )
+    finally:
+        await client.aclose()
+    return {"result": result}
 
 
 # ---------------------------------------------------------------------------

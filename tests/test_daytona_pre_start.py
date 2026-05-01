@@ -130,7 +130,7 @@ async def test_pre_start_exit_zero_no_raise(caplog):
         )
 
     assert inst is not None
-    assert inst.sandbox_id == "fake-sandbox-abc123"
+    assert inst.sandbox_ref == "fake-sandbox-abc123"
     assert any("pre-start" in r.message for r in caplog.records if r.levelno == logging.INFO), (
         f"Expected pre-start INFO log; records: {[r.message for r in caplog.records]}"
     )

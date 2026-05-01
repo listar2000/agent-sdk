@@ -510,12 +510,12 @@ Multiple concurrent `events()` contexts are allowed; each gets a fan-out copy. O
 
 ## Server-side client (operator persona)
 
-`agent_sdk.ServerClient` is a thin async wrapper over every REST route on this server. Use it from services that create, destroy, and introspect OTHER people's sessions — e.g. hive's workspace-agent bootstrap, `scripts/bench_recovery.py`, admin tooling. `Agent` stays the right choice when your code IS the user talking to its own session; `ServerClient` is the right choice when your code is the operator.
+`agent_sdk.ApiClient` is a thin async wrapper over every REST route on this server. Use it from services that create, destroy, and introspect OTHER people's sessions — e.g. hive's workspace-agent bootstrap, `scripts/bench_recovery.py`, admin tooling. `Agent` stays the right choice when your code IS the user talking to its own session; `ApiClient` is the right choice when your code is the operator.
 
 ```python
-from agent_sdk import ServerClient
+from agent_sdk import ApiClient
 
-async with ServerClient(
+async with ApiClient(
     base_url="https://agent-sdk.example.com",
     token="optional-admin-bearer",
 ) as sc:
@@ -530,7 +530,7 @@ async with ServerClient(
 - **Stateful only for transport.** The instance holds one `httpx.AsyncClient` (connection pool + bearer header). No locks, no retries, no idempotency keys.
 - **Flat surface, one method per endpoint.** No sub-namespaces. The method name mirrors the REST path; the body is pass-through. Adding a new route = adding one method.
 - **Shared error mapping with `Agent`.** HTTP ≥400 responses raise `httpx.HTTPStatusError` with the server's `{"error": ...}` body attached — same as the user-facing `Agent` class.
-- **Dependency-injection hook.** `ServerClient(base_url, http_client=...)` accepts a pre-built `httpx.AsyncClient` so callers with custom proxies, mock transports, or test harnesses don't have to subclass.
+- **Dependency-injection hook.** `ApiClient(base_url, http_client=...)` accepts a pre-built `httpx.AsyncClient` so callers with custom proxies, mock transports, or test harnesses don't have to subclass.
 
 ### Method list
 
@@ -567,4 +567,4 @@ Grouped by resource. Bodies are documented under the corresponding REST endpoint
 | | `session_file_rename(id, path, new_path)` | `POST /sessions/{id}/files/rename` |
 | | `session_file_download(id, path)` | `GET /sessions/{id}/files/download` |
 
-`ServerClient` is intentionally focused on the session/volume lifecycle — agents and standalone sandboxes are not in its method surface. Hit the corresponding REST endpoints (`/agents`, `/sandboxes`) directly via `httpx` if you need them. `delete_session` raises rather than silently no-oping because the route is not yet implemented; replace its body with a real call once the server adds `DELETE /sessions/{id}`.
+`ApiClient` is intentionally focused on the session/volume lifecycle — agents and standalone sandboxes are not in its method surface. Hit the corresponding REST endpoints (`/agents`, `/sandboxes`) directly via `httpx` if you need them. `delete_session` raises rather than silently no-oping because the route is not yet implemented; replace its body with a real call once the server adds `DELETE /sessions/{id}`.

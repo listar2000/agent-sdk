@@ -1,7 +1,7 @@
-"""Process-singleton SessionPool wired to DB bindings + factory.
+"""Process-singleton SessionPool wired to the factory.
 
-Exposed via ``get_pool()``. Phase 2 sub-task 3 lands this; sub-task 4
-redirects the existing recovery functions in server.py to use it.
+Exposed via ``get_pool()``. The pool reads/writes ``sessions.sandbox_state``
+through ``api.db`` directly — no DI port between them.
 """
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import asyncio
 import logging
 import os
 
-from .db_bindings import load_sandbox_state, save_sandbox_state
 from .factory import make_session
 from .pool import SessionPool
 
@@ -29,11 +28,7 @@ _REAPER_IDLE_S = float(os.environ.get("AGENT_SDK_REAPER_IDLE_S", "180"))  # 3 mi
 def get_pool() -> SessionPool:
     global _pool
     if _pool is None:
-        _pool = SessionPool(
-            factory=make_session,
-            load_state=load_sandbox_state,
-            save_state=save_sandbox_state,
-        )
+        _pool = SessionPool(factory=make_session)
     return _pool
 
 

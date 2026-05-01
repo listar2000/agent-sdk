@@ -157,9 +157,16 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     # Hard error during reattach — propagate, don't silently recreate.
                     raise
 
+        # ``_bootstrap_session`` (in ``BaseSandboxSession``) ran from
+        # ``start()`` before this method was called and unconditionally
+        # set ``_volume_ref`` from the session's volume row. Assert the
+        # invariant so a future refactor that decouples the two methods
+        # fails loudly here instead of falling through to a phantom
+        # ``_ensure_volume_supervisor`` (which never existed on this class).
+        assert self._volume_ref is not None, (
+            "_bootstrap_session must run before _resolve_or_create_sandbox"
+        )
         volume_ref = self._volume_ref
-        if volume_ref is None:
-            volume_ref = await self._ensure_volume_supervisor(dt_provider)
 
         # Cold create. create_sandbox passes the session volume/subpath so
         # /opt/supervisor is mounted for start_supervisor_in_sandbox().

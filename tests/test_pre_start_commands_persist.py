@@ -42,18 +42,18 @@ async def client(clean_db):
 
 @pytest_asyncio.fixture
 async def sdk(clean_db):
-    """ServerClient bound to the in-process app via ASGITransport.
+    """ApiClient bound to the in-process app via ASGITransport.
 
     Verifies the SDK wrapper, not just the raw HTTP API."""
     import httpx
-    from agent_sdk.server_client import ServerClient
+    from agent_sdk.api_client import ApiClient
 
     transport = ASGITransport(app=srv.app)
     http = httpx.AsyncClient(
         transport=transport, base_url="http://test",
         timeout=httpx.Timeout(30.0, read=None),
     )
-    sc = ServerClient(base_url="http://test", http_client=http)
+    sc = ApiClient(base_url="http://test", http_client=http)
     try:
         yield sc
     finally:
@@ -92,8 +92,8 @@ async def test_pre_start_commands_stored_on_lazy_session(client):
 
 @pytest.mark.asyncio
 async def test_pre_start_commands_round_trip_via_sdk(sdk):
-    """``ServerClient.create_session(pre_start_commands=...)`` persists, and
-    ``ServerClient.get_session(...)`` reads them back. Verifies the SDK
+    """``ApiClient.create_session(pre_start_commands=...)`` persists, and
+    ``ApiClient.get_session(...)`` reads them back. Verifies the SDK
     forwards the field correctly through both directions."""
     from api.models import AgentConfig, AgentRecord, VolumeRecord
 

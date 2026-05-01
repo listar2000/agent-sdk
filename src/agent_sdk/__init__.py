@@ -16,7 +16,7 @@ from .errors import (
     PromptError, StreamError,
 )
 from .persist import SessionRecord, SqliteSessionDriver
-from .server_client import ServerClient
+from .api_client import ApiClient
 
 __all__ = [
     "__version__",
@@ -30,5 +30,5 @@ __all__ = [
     "SandboxError", "VolumeFileExistsError", "AgentBusyError", "AgentTimeoutError", "PromptError", "StreamError",
     "SessionRecord",
     "SqliteSessionDriver",
-    "ServerClient",
+    "ApiClient",
 ]

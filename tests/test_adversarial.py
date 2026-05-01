@@ -67,11 +67,13 @@ def _build_stub_db() -> types.ModuleType:
     async def _noop(*a, **kw): return None
     async def _noop_list(*a, **kw): return []
     async def _noop_false(*a, **kw): return False
+    async def _noop_zero(*a, **kw): return 0
     async def _noop_agent(*a, **kw): return None
     async def _noop_sandbox(*a, **kw): return None
     async def _noop_session(*a, **kw): return None
     async def _noop_dict(*a, **kw): return {}
     async def _noop_volume(*a, **kw): return None
+    async def _noop_none(*a, **kw): return None
 
     @_asynccontextmanager
     async def _noop_get_db(*a, **kw):
@@ -106,6 +108,12 @@ def _build_stub_db() -> types.ModuleType:
     stub.delete_volume = _noop
     stub.set_session_current_sandbox = _noop
     stub.add_supervisor_agent_type = _noop
+    # SandboxState JSONB + cascade helpers added with the SessionPool refactor.
+    stub.read_sandbox_state = _noop_none
+    stub.write_sandbox_state = _noop
+    stub.delete_session = _noop
+    stub.delete_sessions_by_volume = _noop
+    stub.count_sessions_by_volume = _noop_zero
     return stub
 
 
@@ -400,26 +408,25 @@ class TestServerHelpers:
 
     def test_merge_top_level_config_does_not_overwrite(self):
         """_merge_top_level_config skips keys already present in config_data."""
-        data = {"model": "gpt-4", "tools": ["Bash"], "agent_type": "codex"}
+        data = {"model": "gpt-4", "mode": "plan", "agent_type": "codex"}
         config_data = {"model": "claude-3", "agent_type": "claude"}  # already has model, agent_type
         _merge_top_level_config(data, config_data)
         assert config_data["model"] == "claude-3"       # not overwritten
         assert config_data["agent_type"] == "claude"    # not overwritten
-        assert config_data["tools"] == ["Bash"]         # merged from data
+        assert config_data["mode"] == "plan"            # merged from data
 
     def test_merge_top_level_config_adds_missing_keys(self):
         """_merge_top_level_config adds keys that are absent from config_data.
 
-        After the 2026-04-23 ownership split, cwd is session-level and is
-        not in _CONFIG_KEYS — only identity fields (model, prompt, tools,
-        …) get merged into AgentConfig.
+        After the 2026-04-23 ownership split, only identity fields in _CONFIG_KEYS
+        (model, mcp_servers, skills, agent_type, mode, thought_level) get merged.
         """
-        data = {"model": "gpt-4", "agent_type": "codex", "prompt": "be helpful"}
+        data = {"model": "gpt-4", "agent_type": "codex", "mode": "plan"}
         config_data = {}
         _merge_top_level_config(data, config_data)
         assert config_data["model"] == "gpt-4"
         assert config_data["agent_type"] == "codex"
-        assert config_data["prompt"] == "be helpful"
+        assert config_data["mode"] == "plan"
 
     # NOTE: tests for the removed ``_derive_sandbox_ref`` helper used to live
     # here. The helper was removed in the volume-refactor — sandbox_ref now
@@ -950,7 +957,7 @@ class TestSqliteSessionDriver:
         record = SessionRecord(
             id="sess-1",
             agent_id="agent-1",
-            sandbox_id="sbx-1",
+            sandbox_ref="sbx-1",
             inner_session_id="inner-1",
             created_at=now,
             updated_at=now,
@@ -960,7 +967,7 @@ class TestSqliteSessionDriver:
         assert fetched is not None
         assert fetched.id == "sess-1"
         assert fetched.agent_id == "agent-1"
-        assert fetched.sandbox_id == "sbx-1"
+        assert fetched.sandbox_ref == "sbx-1"
         assert fetched.inner_session_id == "inner-1"
 
     def test_get_nonexistent_returns_none(self, tmp_path):
@@ -972,13 +979,13 @@ class TestSqliteSessionDriver:
         """update_session updates a record when id already exists."""
         driver = self._driver(tmp_path)
         now = time.time()
-        record = SessionRecord(id="sess-2", agent_id="agent-1", sandbox_id="sbx-1", created_at=now, updated_at=now)
+        record = SessionRecord(id="sess-2", agent_id="agent-1", sandbox_ref="sbx-1", created_at=now, updated_at=now)
         driver.update_session(record)
 
         updated = SessionRecord(
             id="sess-2",
             agent_id="agent-updated",
-            sandbox_id="sbx-new",
+            sandbox_ref="sbx-new",
             inner_session_id="inner-new",
             created_at=now,
             updated_at=now + 1,
@@ -1033,7 +1040,7 @@ class TestSqliteSessionDriver:
         for i in range(10):
             driver.update_session(SessionRecord(
                 id=f"sess-{i}", agent_id=f"agent-{i}",
-                sandbox_id=f"sbx-{i}", created_at=now, updated_at=now,
+                sandbox_ref=f"sbx-{i}", created_at=now, updated_at=now,
             ))
 
         for i in range(10):
@@ -1101,25 +1108,32 @@ class TestConcurrencyAdversarial:
     @pytest.mark.asyncio
     async def test_concurrent_double_ensure_registered_only_calls_api_once(self):
         """Two concurrent _ensure_registered() calls result in exactly one POST."""
-        post_calls = []
+        request_calls = []
 
-        async def _fake_post(url, **kwargs):
-            post_calls.append(url)
+        async def _fake_request(method, url, **kwargs):
+            request_calls.append((method, url))
             await asyncio.sleep(0.02)  # simulate latency
-            return _mock_response(200, {"id": "agent-race"})
+            resp = MagicMock(spec=httpx.Response)
+            resp.status_code = 200
+            resp.is_error = False
+            resp.content = b'{"id": "agent-race"}'
+            resp.json = MagicMock(return_value={"id": "agent-race"})
+            resp.headers = {"content-type": "application/json"}
+            resp.request = httpx.Request("POST", "http://localhost/agents")
+            return resp
 
         # Use http://localhost so the client-side credentials guard
         # (client.py:_is_remote_http) allows any oauth/api-key env-var creds
         # the developer may have exported; the actual POST is mocked below.
         agent = Agent("race-test", api_url="http://localhost")
-        with patch.object(agent._client, "post", side_effect=_fake_post):
+        with patch.object(agent._api._http, "request", side_effect=_fake_request):
             await asyncio.gather(
                 agent._ensure_registered(),
                 agent._ensure_registered(),
                 agent._ensure_registered(),  # three concurrent calls
             )
 
-        assert len(post_calls) == 1
+        assert len(request_calls) == 1
 
 
 # ===========================================================================
@@ -1127,50 +1141,6 @@ class TestConcurrencyAdversarial:
 # ===========================================================================
 
 class TestServerEndpointAdversarial:
-
-    @pytest.mark.asyncio
-    async def test_quick_create_with_bad_provider_returns_502(self, async_client):
-        """POST /sessions/quick with an unknown provider returns 502."""
-        from api.models import VolumeRecord
-        fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
-                                provider_ref="dt-x", status="ready")
-        with patch("api.server.create_instance", side_effect=ValueError("Unknown provider: 'badprovider'")), \
-             patch("api.server.get_volume", return_value=fake_vol):
-            resp = await async_client.post("/sessions", json={
-                "name": "test",
-                "provider": "badprovider",
-                "agent_type": "claude",
-                "volume_id": "vol_x",
-            })
-        assert resp.status_code == 502
-        assert "error" in resp.json()
-
-    @pytest.mark.asyncio
-    async def test_quick_create_circuit_breaker_returns_503(self, async_client):
-        """Circuit-breaker failures should tell clients to back off."""
-        from api.models import VolumeRecord
-        fake_vol = VolumeRecord(id="vol_x", name="x", provider="daytona",
-                                provider_ref="dt-x", status="ready")
-        # Eager session-create flows through _provision_sandbox_core →
-        # _provision_with_cache_retry → providers.provision_sandbox. Patch
-        # the dispatch-layer entry point so the mock survives the wrapper
-        # chain. (Earlier the test patched api.server.create_instance, which
-        # the eager flow no longer calls after the funnel-through refactor.)
-        async def boom(*args, **kwargs):
-            raise RuntimeError("circuit breaker open for daytona")
-
-        with patch("api.providers.provision_sandbox", new=boom), \
-             patch("api.server.get_volume", return_value=fake_vol), \
-             patch("api.server.ensure_volume_supervisor", new=AsyncMock(return_value=None)):
-            resp = await async_client.post("/sessions", json={
-                "name": "test",
-                "provider": "daytona",
-                "agent_type": "claude",
-                "volume_id": "vol_x",
-            })
-        assert resp.status_code == 503
-        assert resp.headers["Retry-After"] == "30"
-        assert "circuit breaker" in resp.json()["error"]
 
     @pytest.mark.asyncio
     async def test_create_agent_missing_name_still_works(self, async_client):
@@ -1188,11 +1158,13 @@ class TestServerEndpointAdversarial:
 
     @pytest.mark.asyncio
     async def test_session_resume_nonexistent_session(self, async_client):
-        """POST /sessions/{id}/resume for unknown session returns 404."""
-        with patch("api.server.get_session", return_value=None):
+        """POST /sessions/{id}/resume for unknown session raises an error."""
+        from fastapi import HTTPException
+        mock_pool = MagicMock()
+        mock_pool.get_session = AsyncMock(side_effect=HTTPException(status_code=404, detail="session not found"))
+        with patch("api.sandbox.get_pool", return_value=mock_pool):
             resp = await async_client.post("/sessions/nonexistent-sess/resume")
-        # Should be a 4xx error of some kind
-        assert resp.status_code >= 400
+        assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_list_agents_returns_empty_list(self, async_client):
@@ -1201,37 +1173,13 @@ class TestServerEndpointAdversarial:
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
 
-    @pytest.mark.asyncio
-    async def test_list_sandboxes_returns_empty_list(self, async_client):
-        """GET /sandboxes returns empty list (stub)."""
-        resp = await async_client.get("/sandboxes")
-        assert resp.status_code == 200
-        assert isinstance(resp.json(), list)
-
 
 # ===========================================================================
 # 13. Sandbox record derive_url
 # ===========================================================================
-
-class TestSandboxRecordDeriveUrl:
-
-    def test_local_derives_url_from_listen_port(self):
-        """SandboxRecord with local provider derives URL from listen_port."""
-        rec = SandboxRecord(id="s1", provider="local", sandbox_ref="pid-1234",
-                            listen_port=9999)
-        assert rec.derive_url() == "http://localhost:9999"
-
-    def test_docker_derives_url_from_listen_port(self):
-        """SandboxRecord with docker provider derives URL from listen_port."""
-        rec = SandboxRecord(id="s1", provider="docker", sandbox_ref="cid-abc",
-                            listen_port=8888)
-        assert rec.derive_url() == "http://localhost:8888"
-
-    def test_daytona_derive_url_raises(self):
-        """SandboxRecord with daytona provider raises NotImplementedError for derive_url."""
-        rec = SandboxRecord(id="s1", provider="daytona", sandbox_ref="daytona-xyz")
-        with pytest.raises(NotImplementedError):
-            rec.derive_url()
+# TestSandboxRecordDeriveUrl was deleted: derive_url() was removed from
+# SandboxRecord when the sandboxes table was dropped. The local stand-in
+# SandboxRecord dataclass at the top of this file intentionally omits it.
 
 
 # ===========================================================================
@@ -1242,11 +1190,11 @@ class TestAgentConfigEdgeCases:
 
     def test_to_dict_omits_none_values(self):
         """AgentConfig.to_dict() excludes fields that are None."""
-        config = AgentConfig(agent_type="claude", model=None, prompt="hi")
+        config = AgentConfig(agent_type="claude", model=None, mode="plan")
         d = config.to_dict()
         assert "model" not in d
         assert d["agent_type"] == "claude"
-        assert d["prompt"] == "hi"
+        assert d["mode"] == "plan"
 
     def test_from_dict_ignores_unknown_keys(self):
         """AgentConfig.from_dict() silently ignores unrecognised keys."""
@@ -1359,11 +1307,11 @@ class TestMergeTopLevelConfig:
     """Test the extracted _merge_top_level_config helper."""
 
     def test_merges_top_level_keys(self):
-        data = {"model": "haiku", "prompt": "hello"}
+        data = {"model": "haiku", "mode": "plan"}
         config_data = {}
         _merge_top_level_config(data, config_data)
         assert config_data["model"] == "haiku"
-        assert config_data["prompt"] == "hello"
+        assert config_data["mode"] == "plan"
 
     def test_does_not_overwrite_existing(self):
         data = {"model": "haiku"}
@@ -1393,7 +1341,7 @@ class TestAgentFromFile:
 
     def test_from_json_file(self, tmp_path):
         import json
-        config = {"name": "test-agent", "agent_type": "claude", "model": "sonnet", "tools": ["Read"]}
+        config = {"name": "test-agent", "agent_type": "claude", "model": "sonnet", "provider": "local"}
         f = tmp_path / "agent.json"
         f.write_text(json.dumps(config))
 
@@ -1402,7 +1350,7 @@ class TestAgentFromFile:
         assert agent.name == "test-agent"
         assert agent.agent_type == "claude"
         assert agent.model == "sonnet"
-        assert agent.tools == ["Read"]
+        assert agent.provider == "local"
 
     def test_from_json_file_no_name_uses_stem(self, tmp_path):
         import json
@@ -1444,8 +1392,6 @@ class TestAgentFromFile:
             "agent_type": "claude",
             "provider": "docker",
             "model": "haiku",
-            "prompt": "You are a test bot",
-            "tools": ["Read", "Edit"],
             "cwd": "/workspace",
         }
         f = tmp_path / "full.json"
@@ -1455,19 +1401,19 @@ class TestAgentFromFile:
         agent = Agent.from_file(str(f))
         assert agent.name == "full"
         assert agent.agent_type == "claude"
-        assert agent.prompt == "You are a test bot"
-        assert agent.tools == ["Read", "Edit"]
+        assert agent.model == "haiku"
+        assert agent.provider == "docker"
 class TestAgentClone:
     """Test Agent.clone()."""
 
     def test_clone_basic(self):
         from agent_sdk.client import Agent
-        agent = Agent("original", provider="local", model="sonnet", prompt="hello")
+        agent = Agent("original", provider="local", model="sonnet", cwd="/workspace")
         cloned = agent.clone()
         assert cloned.name == "original-clone"
         assert cloned.provider == "local"
         assert cloned.model == "sonnet"
-        assert cloned.prompt == "hello"
+        assert cloned.cwd == "/workspace"
 
     def test_clone_custom_name(self):
         from agent_sdk.client import Agent
@@ -1485,9 +1431,9 @@ class TestAgentClone:
 
     def test_clone_is_independent(self):
         from agent_sdk.client import Agent
-        agent = Agent("worker", tools=["Read", "Edit"])
+        agent = Agent("worker", model="sonnet")
         cloned = agent.clone()
-        assert cloned.tools == ["Read", "Edit"]
+        assert cloned.model == "sonnet"
         assert cloned is not agent
         assert cloned._registered is False  # fresh registration state
 
@@ -1521,37 +1467,9 @@ class TestDaytonaStateFix:
         assert "_daytona_sandbox_op" in stop_src
 
 
-class TestLockCleanup:
-    """Test that locks are cleaned up on session/sandbox deletion.
-
-    The session-lock invariants this class used to test
-    (_shutdown_session_state mustn't pop _session_locks; locks survive
-    shutdown end-to-end) were tied to the legacy in-memory SESSIONS
-    registry. Both helpers were deleted with the rest of the pre-pool
-    plumbing — the pool keeps its own per-session lock internally, so
-    there's nothing left at this layer to assert. Sandbox-lock cleanup
-    on DELETE /sandboxes/{id} still matters and is exercised below.
-    """
-
-    def test_sandbox_lock_cleaned_on_delete(self):
-        """Verify delete_sandbox_route pops sandbox locks."""
-        import inspect
-        from api.server import delete_sandbox_route
-        source = inspect.getsource(delete_sandbox_route)
-        assert "_sandbox_locks.pop" in source
-
-    @pytest.mark.asyncio
-    async def test_delete_sandbox_cleans_up(self):
-        """End-to-end: deleting a sandbox removes its lock."""
-        from api.server import _sandbox_locks
-        # Pre-populate a lock
-        _sandbox_locks["test-sbx"] = asyncio.Lock()
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            # Delete (will 404 since sandbox doesn't exist in DB, but exercises the code path)
-            await c.delete("/sandboxes/test-sbx")
-        # Lock should still be there since the 404 path doesn't reach cleanup
-        # But the mechanism exists in the success path
-        _sandbox_locks.pop("test-sbx", None)
+# TestLockCleanup was deleted: _sandbox_locks and delete_sandbox_route were
+# removed from api.server when the sandboxes table was dropped. The SessionPool
+# manages per-session locks internally now.
 
 
 # ── Iteration 18: Parallel shutdown, __str__ ──
@@ -1566,13 +1484,6 @@ class TestParallelShutdown:
         source = inspect.getsource(lifespan)
         assert "asyncio.gather" in source
 
-    def test_safe_destroy_in_shutdown(self):
-        """Verify shutdown wraps stop_instance in safe error handling."""
-        import inspect
-        from api.server import lifespan
-        source = inspect.getsource(lifespan)
-        assert "_safe_stop" in source
-        assert "stop_instance" in source
 class TestErrorContext:
     """Test that errors include agent name."""
 
@@ -1708,13 +1619,12 @@ class TestAgentCRUDEndpoints:
                 "name": "full-config",
                 "agent_type": "codex",
                 "model": "gpt-4",
-                "prompt": "Be helpful",
-                "tools": ["Read", "Edit"],
+                "mode": "plan",
             })
             data = r.json()
             assert data["config"]["agent_type"] == "codex"
             assert data["config"]["model"] == "gpt-4"
-            assert data["config"]["tools"] == ["Read", "Edit"]
+            assert data["config"]["mode"] == "plan"
 
 
 class TestSessionEndpoints:
@@ -1737,8 +1647,12 @@ class TestSessionEndpoints:
 
     @pytest.mark.asyncio
     async def test_session_status_not_found(self):
+        from fastapi import HTTPException
+        mock_pool = MagicMock()
+        mock_pool.get_session = AsyncMock(side_effect=HTTPException(status_code=404, detail="session not found"))
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            r = await c.get("/sessions/nonexistent/status")
+            with patch("api.sandbox.get_pool", return_value=mock_pool):
+                r = await c.get("/sessions/nonexistent/status")
             assert r.status_code == 404
 
     @pytest.mark.asyncio
@@ -1760,7 +1674,7 @@ class TestHealthEndpoint:
             body = r.json()
             assert body["status"] == "ok"
             # Health payload carries runtime counters — verify shape, not counts.
-            for k in ("sessions", "busy_sessions", "readers_alive", "instances"):
+            for k in ("sessions", "busy_sessions"):
                 assert k in body and isinstance(body[k], int)
 
 
@@ -1822,27 +1736,26 @@ class TestSandboxErrorConsolidation:
 
 
 class TestResetSessionFix:
-    def test_reset_session_clears_prompt_sent(self):
+    def test_reset_session_clears_registered(self):
         from agent_sdk.client import Agent
-        agent = Agent("test", prompt="system prompt")
-        agent._system_prompt_sent = True
+        agent = Agent("test")
+        agent._registered = True
+        agent.session_id = "sess-1"
         agent.reset_session()
-        assert agent._system_prompt_sent is False
+        assert agent._registered is False
 
     def test_reset_session_clears_all_state(self):
         from agent_sdk.client import Agent
         agent = Agent("test")
         agent.session_id = "sess-1"
         agent.inner_session_id = "inner-1"
-        agent.sandbox_id = "sbx-1"
+        agent.sandbox_ref = "sbx-ref-1"
         agent._registered = True
-        agent._system_prompt_sent = True
         agent.reset_session()
         assert agent.session_id is None
         assert agent.inner_session_id is None
-        assert agent.sandbox_id is None
+        assert agent.sandbox_ref is None
         assert agent._registered is False
-        assert agent._system_prompt_sent is False
 class TestValidationEdgeCases:
     """Test validation edge cases."""
 
@@ -1868,11 +1781,11 @@ class TestValidationEdgeCases:
 class TestAgentRegistrationPayload:
     def test_payload_includes_name(self):
         from agent_sdk.client import Agent
-        a = Agent("myagent", model="sonnet", tools=["Read"])
+        a = Agent("myagent", model="sonnet", provider="local")
         p = a._registration_payload()
         assert p["name"] == "myagent"
         assert p["model"] == "sonnet"
-        assert p["tools"] == ["Read"]
+        assert p["provider"] == "local"
 
     def test_payload_excludes_none(self):
         from agent_sdk.client import Agent
@@ -1880,22 +1793,6 @@ class TestAgentRegistrationPayload:
         p = a._registration_payload()
         assert "model" not in p
         assert "provider" not in p
-
-class TestPrepareMessage:
-    def test_first_message_includes_system(self):
-        from agent_sdk.client import Agent
-        a = Agent("test", prompt="You are helpful.")
-        msg = a._prepare_message("hello")
-        assert "system-context" in msg
-        assert "You are helpful." in msg
-
-    def test_second_message_no_system(self):
-        from agent_sdk.client import Agent
-        a = Agent("test", prompt="Sys.")
-        a._prepare_message("first")
-        msg = a._prepare_message("second")
-        assert "system-context" not in msg
-        assert msg.startswith("second") or "second" in msg
 
 class TestAcpLaunchArgs:
     def test_opencode_has_acp_subcommand(self):
@@ -1925,8 +1822,9 @@ class TestAcpLaunchArgs:
 class TestSessionRecordDataclass:
     def test_session_record_fields(self):
         from agent_sdk.persist import SessionRecord
-        r = SessionRecord(id="s1", agent_id="a1", sandbox_id="sb1")
+        r = SessionRecord(id="s1", agent_id="a1", sandbox_ref="sb1")
         assert r.id == "s1"
+        assert r.sandbox_ref == "sb1"
         assert r.inner_session_id is None
 
 

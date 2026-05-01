@@ -8,16 +8,27 @@ event yielded by ``SandboxSession.execute_prompt``.
 These tests fire a real prompt that triggers a tool call and assert that
 ``GET /sessions/{id}/log`` returns rows for the event types the dashboard
 and SDK depend on. Run against the live test server (``scripts/launch_server_test.sh``).
+
+Driven through ``agent_sdk.ApiClient`` rather than raw httpx — the wire
+contract is pinned independently in ``test_api_client.py`` and the server
+route tests, so behaviour-level integration tests like this one ride on
+the SDK to avoid hand-rolling SSE framing.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import os
+import sys
 import time
 
 import httpx
 import pytest
+
+_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from agent_sdk import ApiClient  # noqa: E402
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 
@@ -36,60 +47,45 @@ async def _server_up() -> bool:
         return False
 
 
-async def _create_session(c: httpx.AsyncClient) -> str:
+async def _create_session(sdk: ApiClient) -> str:
     # Pin haiku to keep these tests under sonnet's exhausted weekly
     # quota when other suites have run on the same OAuth token recently.
-    r = await c.post(f"{SERVER}/sessions", json={
-        "provider": "local", "agent_type": "claude", "config": {},
-        "model": "haiku",
-    })
-    r.raise_for_status()
-    return r.json()["session_id"]
+    created = await sdk.create_session(
+        provider="local", agent_type="claude", config={}, model="haiku",
+    )
+    return created["session_id"]
 
 
-async def _await_done_via_events(
-    c: httpx.AsyncClient, sid: str, rpc_id: str, timeout: float = 90.0
-) -> None:
-    """Drain GET /events until the done envelope for ``rpc_id`` arrives."""
+async def _await_done(sdk: ApiClient, sid: str, rpc_id: str, timeout: float = 90.0) -> None:
+    """Drain /events until the done envelope for ``rpc_id`` arrives."""
     deadline = time.time() + timeout
-    async with c.stream(
-        "GET", f"{SERVER}/sessions/{sid}/events",
-        headers={"Accept": "text/event-stream"},
-    ) as resp:
-        resp.raise_for_status()
-        buf = ""
-        async for chunk in resp.aiter_text():
-            buf += chunk
-            while "\n\n" in buf:
-                block, buf = buf.split("\n\n", 1)
-                if rpc_id in block and ('"stopReason"' in block
-                                         or '"type":"done"' in block):
-                    return
-            if time.time() > deadline:
-                raise TimeoutError(f"timeout after {timeout}s")
+    buf = b""
+    async for chunk in sdk.stream_events(sid):
+        buf += chunk
+        while b"\n\n" in buf:
+            block, buf = buf.split(b"\n\n", 1)
+            text = block.decode("utf-8", errors="replace")
+            if rpc_id in text and ('"stopReason"' in text or '"type":"done"' in text):
+                return
+        if time.time() > deadline:
+            raise TimeoutError(f"timeout after {timeout}s")
 
 
 async def _drain_message_stream(
-    c: httpx.AsyncClient, sid: str, message: str, timeout: float = 90.0
+    sdk: ApiClient, sid: str, message: str, timeout: float = 90.0,
 ) -> None:
     """POST /message+stream and drain until done."""
     deadline = time.time() + timeout
-    async with c.stream(
-        "POST", f"{SERVER}/sessions/{sid}/message+stream",
-        json={"message": message},
-        headers={"Accept": "text/event-stream"},
-        timeout=timeout + 5,
-    ) as resp:
-        resp.raise_for_status()
-        buf = ""
-        async for chunk in resp.aiter_text():
-            buf += chunk
-            while "\n\n" in buf:
-                block, buf = buf.split("\n\n", 1)
-                if '"stopReason"' in block or '"type":"done"' in block:
-                    return
-            if time.time() > deadline:
-                raise TimeoutError(f"timeout after {timeout}s")
+    buf = b""
+    async for chunk in sdk.send_message_stream(sid, message):
+        buf += chunk
+        while b"\n\n" in buf:
+            block, buf = buf.split(b"\n\n", 1)
+            text = block.decode("utf-8", errors="replace")
+            if '"stopReason"' in text or '"type":"done"' in text:
+                return
+        if time.time() > deadline:
+            raise TimeoutError(f"timeout after {timeout}s")
 
 
 def _count_types(rows: list[dict]) -> dict[str, int]:
@@ -115,21 +111,16 @@ async def test_post_message_persists_session_log():
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
 
-    async with httpx.AsyncClient(timeout=120) as c:
-        sid = await _create_session(c)
-        r = await c.post(
-            f"{SERVER}/sessions/{sid}/message", json={"message": _TOOL_PROMPT},
-        )
-        r.raise_for_status()
-        rpc_id = r.json()["rpc_id"]
-        await _await_done_via_events(c, sid, rpc_id)
+    async with ApiClient(SERVER, timeout=120.0) as sdk:
+        sid = await _create_session(sdk)
+        sent = await sdk.send_message(sid, _TOOL_PROMPT)
+        rpc_id = sent["rpc_id"]
+        await _await_done(sdk, sid, rpc_id)
         # Background persister runs slightly behind the SSE stream; give
         # it a beat to flush turn_end before we read the log.
         await asyncio.sleep(2.0)
 
-        r = await c.get(f"{SERVER}/sessions/{sid}/log?limit=200")
-        r.raise_for_status()
-        rows = r.json()
+        rows = await sdk.get_session_log(sid, limit=200)
 
     types = _count_types(rows)
     missing = _REQUIRED_TYPES - types.keys()
@@ -150,15 +141,13 @@ async def test_post_message_stream_persists_session_log():
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
 
-    async with httpx.AsyncClient(timeout=120) as c:
-        sid = await _create_session(c)
-        await _drain_message_stream(c, sid, _TOOL_PROMPT)
+    async with ApiClient(SERVER, timeout=120.0) as sdk:
+        sid = await _create_session(sdk)
+        await _drain_message_stream(sdk, sid, _TOOL_PROMPT)
         # See above — give the BG persister a moment to flush turn_end.
         await asyncio.sleep(2.0)
 
-        r = await c.get(f"{SERVER}/sessions/{sid}/log?limit=200")
-        r.raise_for_status()
-        rows = r.json()
+        rows = await sdk.get_session_log(sid, limit=200)
 
     types = _count_types(rows)
     missing = _REQUIRED_TYPES - types.keys()

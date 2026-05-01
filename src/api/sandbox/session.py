@@ -186,25 +186,38 @@ class BaseSandboxSession(abc.ABC):
             self._inner_session_id = client.get_inner_session_id(
                 self._acp_session_id
             )
-            # Re-apply the persisted model selection. Read fresh from DB
+            # Re-apply persisted ACP dynamic config. Read fresh from DB
             # rather than caching on the session object — POST /config
-            # writes to agents.config so a mid-flight model change there
-            # also propagates on the next attach.
+            # writes to agents.config so a mid-flight change there also
+            # propagates on the next attach. Each set_* is bounded best-
+            # effort: a transient failure on one shouldn't block the
+            # others (e.g. supervisor accepts model but rejects an
+            # unknown thought_level — keep the model change).
             if self._agent_id and self._inner_session_id:
                 try:
                     agent = await _db.get_agent(self._agent_id)
-                    model = (
-                        agent.config.model
-                        if agent and agent.config else None
-                    )
-                    if model:
-                        await client.set_model(self._acp_session_id, model)
+                    cfg = agent.config if agent else None
                 except Exception:
-                    import logging
-                    logging.getLogger(__name__).exception(
-                        "set_model replay failed for session %s",
-                        self.session_id,
-                    )
+                    cfg = None
+                replay = []
+                if cfg:
+                    if cfg.model:
+                        replay.append(("model", client.set_model, cfg.model))
+                    if cfg.mode:
+                        replay.append(("mode", client.set_mode, cfg.mode))
+                    if cfg.thought_level:
+                        replay.append(("thought_level",
+                                       client.set_thought_level,
+                                       cfg.thought_level))
+                for name, fn, val in replay:
+                    try:
+                        await fn(self._acp_session_id, val)
+                    except Exception:
+                        import logging
+                        logging.getLogger(__name__).exception(
+                            "set_%s replay failed for session %s",
+                            name, self.session_id,
+                        )
         finally:
             await client.aclose()
 
@@ -218,11 +231,9 @@ class BaseSandboxSession(abc.ABC):
         # real probe if the session sits idle past the freshness window.
         self.liveness.observe_chunk()
         if self._inner_session_id:
-            async with _db.get_db() as conn:
-                await conn.execute(
-                    "UPDATE sessions SET inner_session_id = %s WHERE id = %s",
-                    (self._inner_session_id, self.session_id),
-                )
+            await _db.update_session_inner_session_id(
+                self.session_id, self._inner_session_id,
+            )
 
     @property
     def supervisor_url(self) -> str | None:

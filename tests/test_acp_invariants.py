@@ -76,6 +76,7 @@ import pytest
 import pytest_asyncio
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from agent_sdk import ApiClient
 from agent_sdk.client import Agent
 
 BASE_URL = os.environ.get("ACP_TEST_URL", "http://localhost:7778")
@@ -238,31 +239,27 @@ async def capture_envelopes(
       (timestamp_from_start, event:rpc:<tag> or None, payload_dict).
     """
     t_start = time.monotonic()
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=None) as client:
-        async with client.stream(
-            "GET",
-            f"/sessions/{session_id}/events",
-            headers={"Accept": "text/event-stream"},
-        ) as resp:
-            buf = ""
-            async for chunk in resp.aiter_text():
-                if stop.is_set():
-                    return
-                buf += chunk
-                while "\n\n" in buf:
-                    block, buf = buf.split("\n\n", 1)
-                    tag, payload = parse_tagged_block(block)
-                    if payload is None:
-                        continue
-                    envelopes.append((time.monotonic() - t_start, tag, payload))
+    async with ApiClient(BASE_URL, timeout=30.0) as sdk:
+        buf = b""
+        async for chunk in sdk.stream_events(session_id):
+            if stop.is_set():
+                return
+            buf += chunk
+            while b"\n\n" in buf:
+                raw, buf = buf.split(b"\n\n", 1)
+                block = raw.decode("utf-8", errors="replace")
+                tag, payload = parse_tagged_block(block)
+                if payload is None:
+                    continue
+                envelopes.append((time.monotonic() - t_start, tag, payload))
 
 
 async def drain_inflight(session_id: str, timeout: float = 180.0) -> bool:
     """Poll GET /sessions/{id}/status until inflight_count reaches zero."""
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=30.0) as client:
+    async with ApiClient(BASE_URL, timeout=30.0) as sdk:
         for _ in range(int(timeout * 2)):
             try:
-                info = (await client.get(f"/sessions/{session_id}/status")).json()
+                info = await sdk.get_session_status(session_id)
                 if info.get("inflight_count", 0) == 0:
                     return True
             except Exception:

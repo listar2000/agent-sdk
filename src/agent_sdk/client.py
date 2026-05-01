@@ -6,6 +6,15 @@ Architecture note: The ACP protocol uses StreamableHTTP — the POST sends
 the JSON-RPC request but the response may arrive either in the POST body
 OR via the SSE stream. On Daytona, long-running POST requests are killed
 by the proxy, so the SSE stream is the reliable channel for results.
+
+Layering: ``Agent`` is the high-level UX wrapper. It holds an
+``ApiClient`` for all wire-level HTTP and adds:
+  * stateful session/sandbox tracking + persistence (sqlite)
+  * registration semantics (eager/resume/agent-only)
+  * system-prompt prepend on first message
+  * sync run() wrapper around the async core
+  * ``Sandbox`` helper for direct exec/file ops
+  * typed ``Event`` production from raw SSE bytes
 """
 
 import asyncio
@@ -26,6 +35,7 @@ from urllib.parse import urlparse
 import httpx
 
 from api.sse import iter_sse_blocks, parse_acp_event
+from agent_sdk.api_client import ApiClient, _raise_for_status
 from agent_sdk.errors import (
     AgentConnectionError, AgentNotRegisteredError, AgentBusyError,
     AgentTimeoutError, StreamError, PromptError,
@@ -104,27 +114,6 @@ class UsageStats:
             self.total_cost_usd += cost
 
 
-def _raise_for_status(resp) -> None:
-    """Like resp.raise_for_status() but includes server error message."""
-    status = getattr(resp, 'status_code', None)
-    if not isinstance(status, int) or status < 400:
-        return
-    detail = ""
-    try:
-        body = resp.json()
-        detail = body.get("error", body.get("detail", ""))
-    except Exception:
-        detail = getattr(resp, 'text', '')[:200]
-    msg = f"HTTP {resp.status_code}"
-    if detail:
-        msg += f": {detail}"
-    raise httpx.HTTPStatusError(
-        msg,
-        request=getattr(resp, 'request', httpx.Request("POST", "/")),
-        response=resp,
-    )
-
-
 class Sandbox:
     """Direct access to an agent's sandbox environment.
 
@@ -138,12 +127,9 @@ class Sandbox:
     async def exec(self, command: str, *, timeout: int = 30) -> dict:
         """Run a command in the sandbox. Returns {stdout, stderr, exit_code, stdout_truncated, timed_out}."""
         await self._agent._ensure_registered()
-        resp = await self._agent._client.post(
-            f"/sessions/{self._agent.session_id}/sandbox/exec",
-            json={"command": command, "timeout": timeout},
+        return await self._agent._api.session_sandbox_exec(
+            self._agent.session_id, command, timeout=timeout,
         )
-        _raise_for_status(resp)
-        return resp.json()
 
     async def read_file(self, path: str, *, timeout: int = 30) -> str:
         """Read a text file from the sandbox."""
@@ -191,8 +177,8 @@ class Agent:
     # api_key, secrets) live on differently-named private attrs and are handled
     # explicitly below.
     _CLONABLE_FIELDS = (
-        "agent_type", "provider", "model", "cwd", "root", "prompt",
-        "tools", "mcp_servers", "skills", "dockerfile",
+        "agent_type", "provider", "model", "cwd", "root",
+        "mcp_servers", "skills", "dockerfile",
         "volume_id", "pre_start_commands", "shared_mounts",
     )
 
@@ -204,9 +190,7 @@ class Agent:
         model: str | None = None,
         cwd: str | None = None,
         root: str | None = None,
-        prompt: str | None = None,
         api_url: str | None = None,
-        tools: list[str] | None = None,
         mcp_servers: dict[str, dict] | None = None,  # name -> config dict
         skills: list[str] | dict[str, dict] | None = None,  # npx skills sources
         db: str | None = None,
@@ -228,8 +212,6 @@ class Agent:
         self.model = model
         self.cwd = cwd
         self.root = root
-        self.prompt = prompt
-        self.tools = tools
         self.mcp_servers = mcp_servers
         self.skills = skills
         self.id: str | None = None  # set after registration (agent_id)
@@ -259,11 +241,21 @@ class Agent:
                 "use https:// or a localhost URL"
             )
 
-        self._client = httpx.AsyncClient(base_url=self._api_url, timeout=httpx.Timeout(30.0, read=120.0))
+        # Layered: Agent owns identity + state; ApiClient owns the wire.
+        # We pass our own httpx client so the read timeout (120s) covers
+        # the plain-POST paths Agent uses; ApiClient's per-call methods
+        # that need other timeouts (resume_session = 180s, release =
+        # 10s) override per-call via httpx.Timeout in their kwargs.
+        self._api = ApiClient(
+            self._api_url,
+            http_client=httpx.AsyncClient(
+                base_url=self._api_url,
+                timeout=httpx.Timeout(30.0, read=120.0),
+            ),
+        )
         self._registered = False
         self._register_lock = asyncio.Lock()
         self._prompt_lock = asyncio.Lock()
-        self._system_prompt_sent = False
         self.usage = UsageStats()
         self.sandbox = Sandbox(self)
 
@@ -352,29 +344,31 @@ class Agent:
             if self.session_id is not None and self.sandbox_ref is None and self.provider is None:
                 # Resume by session_id alone. Ship credentials so the respawned
                 # supervisor runs under the caller's Claude token, not the server's.
-                resume_body: dict[str, Any] = {}
                 secrets = self._secrets_payload()
+                resume_kwargs: dict[str, Any] = {}
                 if secrets:
-                    resume_body["secrets"] = secrets
-                resp = await self._client.post(
-                    f"/sessions/{self.session_id}/resume",
-                    json=resume_body or None,
-                    timeout=httpx.Timeout(30.0, read=180.0),
-                )
-                _raise_for_status(resp)
-                data = resp.json()
+                    resume_kwargs["secrets"] = secrets
+                data = await self._api.resume_session(self.session_id, **resume_kwargs)
                 self.sandbox_ref = data.get("sandbox_ref") or self.sandbox_ref
                 self.inner_session_id = data.get("inner_session_id")
                 self.id = data.get("agent_id") or self.name
             elif self.provider is not None:
-                # All-in-one via POST /sessions (eager by default)
+                # All-in-one via POST /sessions (eager by default).
+                # Retry on 5xx — ApiClient doesn't retry, so we wrap.
+                payload = self._registration_payload()
+                data: dict[str, Any] | None = None
+                last_err: Exception | None = None
                 for attempt in range(3):
-                    resp = await self._client.post("/sessions", json=self._registration_payload())
-                    if resp.status_code < 500 or attempt == 2:
+                    try:
+                        data = await self._api.create_session(**payload)
                         break
-                    await asyncio.sleep(2 ** attempt)
-                _raise_for_status(resp)
-                data = resp.json()
+                    except httpx.HTTPStatusError as e:
+                        last_err = e
+                        if e.response.status_code < 500 or attempt == 2:
+                            raise
+                        await asyncio.sleep(2 ** attempt)
+                if data is None:  # pragma: no cover — loop above either returns data or raises
+                    raise last_err or RuntimeError("create_session returned no data")
                 self.id = data.get("agent_id", self.name)
                 self.sandbox_ref = data.get("sandbox_ref")
                 self.inner_session_id = data.get("inner_session_id")
@@ -382,9 +376,7 @@ class Agent:
                     self.session_id = data.get("session_id") or str(uuid.uuid4())
             else:
                 # Plain agent registration (no sandbox)
-                resp = await self._client.post("/agents", json=self._registration_payload())
-                _raise_for_status(resp)
-                data = resp.json()
+                data = await self._api.create_agent(**self._registration_payload())
                 self.id = data.get("id", self.name)
                 if self.session_id is None:
                     self.session_id = str(uuid.uuid4())
@@ -405,26 +397,13 @@ class Agent:
                 except Exception as e:
                     log.warning("session persist failed: %s", e)
 
-    def _prepare_message(self, message: str) -> str:
-        """Prepend system prompt on first message. Must be called under _prompt_lock."""
-        if self.prompt and not self._system_prompt_sent:
-            self._system_prompt_sent = True
-            message = (
-                f"<system-context role='system'>\n{self.prompt}\n</system-context>\n\n"
-                f"{message}"
-            )
-        return message
-
     async def _post_message(self, message: str, *, interrupt: bool = False) -> str:
         """POST a prompt to /message. Returns rpc_id. Raises PromptError on HTTP error."""
         await self._ensure_registered()
-        body = {"message": self._prepare_message(message), "interrupt": interrupt}
-        resp = await self._client.post(
-            f"/sessions/{self.session_id}/message",
-            json=body,
+        data = await self._api.send_message(
+            self.session_id, message, interrupt=interrupt,
         )
-        _raise_for_status(resp)
-        return resp.json().get("rpc_id")
+        return data.get("rpc_id")
 
     async def send(self, message: str, *, interrupt: bool = False) -> str:
         """Submit a message without waiting for the response.
@@ -439,8 +418,14 @@ class Agent:
 
     @asynccontextmanager
     async def _open_sse(self):
-        """Open SSE GET /events on the existing client. Yields the response object."""
-        async with self._client.stream(
+        """Open SSE GET /events on the underlying httpx client. Yields the
+        response object so iter_sse_blocks can consume it directly.
+
+        Reaches into ``self._api._http`` for the raw stream context
+        manager — SSE parsing has cancellation semantics tied to the
+        response, and ApiClient's bytes-yielding ``stream_events`` would
+        lose that. Documented escape hatch."""
+        async with self._api._http.stream(
             "GET",
             f"/sessions/{self.session_id}/events",
             headers={"Accept": "text/event-stream"},
@@ -495,10 +480,13 @@ class Agent:
         connection loss.
         """
         await self._ensure_registered()
-        body = {"message": self._prepare_message(message), "interrupt": interrupt}
+        body = {"message": message, "interrupt": interrupt}
         try:
             async with self._prompt_lock:
-                async with self._client.stream(
+                # Same escape-hatch reasoning as _open_sse: iter_sse_blocks
+                # needs the raw response object, and the per-prompt SSE
+                # cancellation must be tied to the context manager.
+                async with self._api._http.stream(
                     "POST",
                     f"/sessions/{self.session_id}/message+stream",
                     json=body,
@@ -542,7 +530,13 @@ class Agent:
 
     def _reset_async_state(self) -> None:
         """Recreate event-loop-bound objects for a fresh asyncio.run() call."""
-        self._client = httpx.AsyncClient(base_url=self._api_url, timeout=httpx.Timeout(30.0, read=120.0))
+        self._api = ApiClient(
+            self._api_url,
+            http_client=httpx.AsyncClient(
+                base_url=self._api_url,
+                timeout=httpx.Timeout(30.0, read=120.0),
+            ),
+        )
         self._register_lock = asyncio.Lock()
         self._prompt_lock = asyncio.Lock()
 
@@ -553,7 +547,7 @@ class Agent:
             try:
                 return await coro_factory()
             finally:
-                await self._client.aclose()
+                await self._api.close()
         return asyncio.run(_run())
 
     def run(self, message: str, timeout: float | None = None, *, interrupt: bool = False) -> str:
@@ -570,16 +564,12 @@ class Agent:
     async def configure(self, **kwargs) -> None:
         """Set session config dynamically. Accepts: mode, model, thought_level."""
         await self._ensure_registered()
-        resp = await self._client.post(f"/sessions/{self.session_id}/config", json=kwargs)
-        _raise_for_status(resp)
+        await self._api.set_session_config(self.session_id, **kwargs)
 
     async def cancel(self) -> None:
         """Cancel the currently running prompt (best-effort)."""
         await self._ensure_registered()
-        resp = await self._client.post(
-            f"/sessions/{self.session_id}/cancel",
-        )
-        _raise_for_status(resp)
+        await self._api.cancel_session(self.session_id)
 
     def reset_session(self) -> None:
         """Clear session state so the agent re-registers on next call."""
@@ -587,7 +577,6 @@ class Agent:
         self.inner_session_id = None
         self.sandbox_ref = None
         self._registered = False
-        self._system_prompt_sent = False
 
     # ── Lifecycle ──
 
@@ -598,14 +587,11 @@ class Agent:
             # frees compute immediately and writes a fresh snapshot — the
             # next prompt resumes from disk instead of a stale memory state.
             try:
-                await self._client.post(
-                    f"/sessions/{self.session_id}/release",
-                    timeout=httpx.Timeout(5.0, read=10.0),
-                )
+                await self._api.release_session(self.session_id)
             except Exception as exc:
                 log.debug("aclose: release session %s failed (ignored): %s", self.session_id, exc)
             self._registered = False
-        await self._client.aclose()
+        await self._api.close()
 
     async def __aenter__(self):
         return self

@@ -39,6 +39,8 @@ from agent_sdk.errors import PromptError, StreamError
 class _FakeSseResponse:
     """Simulates an httpx streaming response that yields SSE text chunks."""
 
+    status_code = 200
+
     def __init__(self, chunks: list[str]):
         self._chunks = chunks
 
@@ -91,7 +93,7 @@ def _patched_agent(session_id: str = "sess-test") -> tuple[Agent, str]:
 
 @asynccontextmanager
 async def _mock_client(agent: Agent, blocks: list[str], rpc_id: str):
-    """Patch agent._client so GET /events yields the given blocks and POST returns rpc_id."""
+    """Patch agent._api._http so GET /events yields the given blocks and POST returns rpc_id."""
     sse_response = _FakeSseResponse([_make_sse_stream(blocks)])
 
     @asynccontextmanager
@@ -102,8 +104,8 @@ async def _mock_client(agent: Agent, blocks: list[str], rpc_id: str):
     mock_post_resp.raise_for_status = MagicMock()
     mock_post_resp.json = MagicMock(return_value={"rpc_id": rpc_id, "status": "ok"})
 
-    with patch.object(agent._client, "stream", _mock_stream), \
-         patch.object(agent._client, "post", AsyncMock(return_value=mock_post_resp)):
+    with patch.object(agent._api._http, "stream", _mock_stream), \
+         patch.object(agent._api._http, "post", AsyncMock(return_value=mock_post_resp)):
         yield
 
 
@@ -420,6 +422,8 @@ class TestSseReadTimeout:
         """
 
         class _TimeoutSseResponse:
+            status_code = 200
+
             async def aiter_text(self):
                 yield "event: rpc:rpc-t\ndata: " + json.dumps({
                     "method": "session/update",
@@ -439,8 +443,8 @@ class TestSseReadTimeout:
         mock_post_resp.raise_for_status = MagicMock()
         mock_post_resp.json = MagicMock(return_value={"rpc_id": rpc_id, "status": "ok"})
 
-        with patch.object(agent._client, "stream", _mock_stream), \
-             patch.object(agent._client, "post", AsyncMock(return_value=mock_post_resp)):
+        with patch.object(agent._api._http, "stream", _mock_stream), \
+             patch.object(agent._api._http, "post", AsyncMock(return_value=mock_post_resp)):
             with pytest.raises(StreamError, match="Connection lost"):
                 async for _ in agent.astream("timeout test"):
                     pass
@@ -450,6 +454,8 @@ class TestSseReadTimeout:
         """StreamError message contains the agent name for debugging."""
 
         class _TimeoutResponse:
+            status_code = 200
+
             async def aiter_text(self):
                 raise httpx.ReadTimeout("mock timeout")
                 yield  # noqa: unreachable — makes this an async generator
@@ -466,8 +472,8 @@ class TestSseReadTimeout:
         mock_post_resp.raise_for_status = MagicMock()
         mock_post_resp.json = MagicMock(return_value={"rpc_id": rpc_id, "status": "ok"})
 
-        with patch.object(agent._client, "stream", _mock_stream), \
-             patch.object(agent._client, "post", AsyncMock(return_value=mock_post_resp)):
+        with patch.object(agent._api._http, "stream", _mock_stream), \
+             patch.object(agent._api._http, "post", AsyncMock(return_value=mock_post_resp)):
             with pytest.raises(StreamError) as exc_info:
                 async for _ in agent.astream("timeout"):
                     pass
@@ -499,7 +505,7 @@ class TestEventsContextManager:
         async def _mock_stream(*args, **kwargs):
             yield _FakeSseResponse([_make_sse_stream(blocks)])
 
-        with patch.object(agent._client, "stream", _mock_stream):
+        with patch.object(agent._api._http, "stream", _mock_stream):
             events = []
             try:
                 async with agent.events() as event_iter:
@@ -529,7 +535,7 @@ class TestEventsContextManager:
         async def _mock_stream(*args, **kwargs):
             yield _FakeSseResponse([_make_sse_stream(blocks)])
 
-        with patch.object(agent._client, "stream", _mock_stream):
+        with patch.object(agent._api._http, "stream", _mock_stream):
             events = []
             async with agent.events() as event_iter:
                 async for ev in event_iter:
@@ -555,7 +561,7 @@ class TestEventsContextManager:
         async def _mock_stream(*args, **kwargs):
             yield _TimeoutEventsResponse()
 
-        with patch.object(agent._client, "stream", _mock_stream):
+        with patch.object(agent._api._http, "stream", _mock_stream):
             with pytest.raises(StreamError):
                 async with agent.events() as event_iter:
                     async for _ in event_iter:
@@ -588,7 +594,7 @@ class TestEnsureRegisteredRetry:
             resp.is_error = status_code >= 400
             return resp
 
-        async def _mock_post(url, *args, **kwargs):
+        async def _mock_request(method, url, *args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count < 3:
@@ -598,7 +604,7 @@ class TestEnsureRegisteredRetry:
                 "sandbox_id": "sbx-1", "inner_session_id": "inner-1",
             })
 
-        with patch.object(agent._client, "post", side_effect=_mock_post), \
+        with patch.object(agent._api._http, "request", side_effect=_mock_request), \
              patch("asyncio.sleep", AsyncMock()):  # skip actual sleep in retry
             await agent._ensure_registered()
 
@@ -617,10 +623,10 @@ class TestEnsureRegisteredRetry:
             resp.json = MagicMock(return_value={"error": "server error"})
             return resp
 
-        async def _mock_post(url, *args, **kwargs):
+        async def _mock_request(method, url, *args, **kwargs):
             return _make_500()
 
-        with patch.object(agent._client, "post", side_effect=_mock_post), \
+        with patch.object(agent._api._http, "request", side_effect=_mock_request), \
              patch("asyncio.sleep", AsyncMock()):
             with pytest.raises(Exception):
                 await agent._ensure_registered()
@@ -632,8 +638,8 @@ class TestEnsureRegisteredRetry:
 
         post_calls = []
 
-        async def _mock_post(url, *args, **kwargs):
-            post_calls.append(url)
+        async def _mock_request(method, url, *args, **kwargs):
+            post_calls.append((method, url))
             resp = MagicMock()
             resp.status_code = 200
             resp.is_error = False
@@ -644,7 +650,7 @@ class TestEnsureRegisteredRetry:
             resp.raise_for_status = MagicMock()
             return resp
 
-        with patch.object(agent._client, "post", side_effect=_mock_post):
+        with patch.object(agent._api._http, "request", side_effect=_mock_request):
             # Fire 10 concurrent _ensure_registered calls
             await asyncio.gather(*[agent._ensure_registered() for _ in range(10)])
 
@@ -731,18 +737,21 @@ class TestEnsureRegisteredResumePath:
         mock_resp.json = MagicMock(return_value={
             "session_id": "existing-session",
             "agent_id": "agent-abc",
-            "sandbox_id": "sbx-123",
+            "sandbox_ref": "sbx-123",
             "inner_session_id": "inner-abc",
             "status": "resumed",
         })
 
-        with patch.object(agent._client, "post", AsyncMock(return_value=mock_resp)) as mock_post:
+        with patch.object(agent._api._http, "request", AsyncMock(return_value=mock_resp)) as mock_request:
             await agent._ensure_registered()
 
-        call_args = mock_post.call_args
-        assert "resume" in call_args.args[0] or "resume" in str(call_args)
+        # ``ApiClient`` issues every call through ``self._http.request(method, path, ...)``;
+        # resume_session goes to ``POST /sessions/{id}/resume``.
+        call_args = mock_request.call_args
+        assert call_args.args[0] == "POST"
+        assert "resume" in call_args.args[1]
         assert agent._registered
-        assert agent.sandbox_id == "sbx-123"
+        assert agent.sandbox_ref == "sbx-123"
         assert agent.inner_session_id == "inner-abc"
 
     @pytest.mark.asyncio
@@ -764,7 +773,7 @@ class TestEnsureRegisteredResumePath:
         mock_resp.raise_for_status = _raise_for_status
         mock_resp.json = MagicMock(return_value={"error": "session not found"})
 
-        with patch.object(agent._client, "post", AsyncMock(return_value=mock_resp)):
+        with patch.object(agent._api._http, "request", AsyncMock(return_value=mock_resp)):
             with pytest.raises(httpx.HTTPStatusError):
                 await agent._ensure_registered()
 

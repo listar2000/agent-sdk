@@ -30,7 +30,7 @@ def _raise_for_status(resp: httpx.Response) -> None:
     """Raise ``httpx.HTTPStatusError`` with the server's error body attached.
 
     Matches ``agent_sdk.client._raise_for_status`` semantics so errors look
-    the same to callers that mix Agent and ServerClient.
+    the same to callers that mix Agent and ApiClient.
     """
     if resp.status_code < 400:
         return
@@ -53,12 +53,12 @@ def _raise_for_status(resp: httpx.Response) -> None:
     raise httpx.HTTPStatusError(msg, request=resp.request, response=resp)
 
 
-class ServerClient:
+class ApiClient:
     """Thin async wrapper over the agent-sdk REST API.
 
     Usage::
 
-        async with ServerClient("https://agent-sdk.example.com", token="...") as sc:
+        async with ApiClient("https://agent-sdk.example.com", token="...") as sc:
             s = await sc.create_session(provider="daytona", model="claude-sonnet-4-6")
             await sc.send_message(s["session_id"], "hello")
 
@@ -101,7 +101,7 @@ class ServerClient:
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def __aenter__(self) -> "ServerClient":
+    async def __aenter__(self) -> "ApiClient":
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
@@ -308,6 +308,40 @@ class ServerClient:
         resp = await self._http.delete(f"/sessions/{session_id}")
         _raise_for_status(resp)
 
+    async def create_agent(self, **body: Any) -> dict[str, Any]:
+        """``POST /agents`` — register an agent without provisioning a
+        sandbox. Used when the caller wants the agent identity (model,
+        prompt, tools) but doesn't need compute yet (e.g. dry-run
+        validation, deferred provisioning)."""
+        return await self._json("POST", "/agents", json=body)
+
+    async def resume_session(
+        self, session_id: str, **body: Any,
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/resume`` — bring a hibernated session
+        back to life on its existing volume.
+
+        Cold-recovery on Daytona involves several control-plane calls
+        and routinely exceeds 30s under load. We override the per-call
+        read timeout to 180s so the response actually arrives instead
+        of timing out client-side.
+        """
+        return await self._json(
+            "POST", f"/sessions/{session_id}/resume",
+            json=body or None,
+            timeout=httpx.Timeout(30.0, read=180.0),
+        )
+
+    async def release_session(self, session_id: str) -> dict[str, Any]:
+        """``POST /sessions/{id}/release`` — snapshot to volume + drop
+        the pool's compute lease. The next prompt cold-recovers from
+        the snapshot. Idempotent — releasing an already-released
+        session is a no-op."""
+        return await self._json(
+            "POST", f"/sessions/{session_id}/release",
+            timeout=httpx.Timeout(5.0, read=10.0),
+        )
+
     # ------------------------------------------------------------------
     # Sessions — runtime
     # ------------------------------------------------------------------
@@ -339,9 +373,49 @@ class ServerClient:
     async def set_session_config(
         self, session_id: str, **config: Any
     ) -> dict[str, Any]:
-        """``POST /sessions/{id}/config`` — patch runtime fields."""
+        """``POST /sessions/{id}/config`` — patch the THREE persisted-and-
+        replayed-on-recovery knobs: ``model``, ``mode``, ``thought_level``.
+
+        These survive cold-recovery (``_attach_acp`` re-applies them from
+        ``agents.config`` after every fresh ACP attach). For any other
+        ACP knob — new ``configId``s Claude grows, vendor extensions,
+        debugging — use :meth:`acp_call` instead so we don't grow a
+        new typed wrapper per knob.
+        """
         return await self._json(
             "POST", f"/sessions/{session_id}/config", json=config,
+        )
+
+    async def acp_call(
+        self,
+        session_id: str,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        notify: bool = False,
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/acp/call`` — generic passthrough to ACP.
+
+        Body: ``{"method": "...", "params": {...}, "notify": false}``.
+        Server auto-injects the inner ``sessionId`` into ``params`` so
+        the caller doesn't need to track it.
+
+        Use for anything the typed wrappers don't cover — Claude's
+        ever-growing ``configOptions``, vendor extensions, debugging,
+        future ACP methods. **Transient** — survives only the current
+        ACP session, lost on the next sandbox restart. For anything
+        that must replay on cold-recovery, persist via
+        :meth:`set_session_config` (model/mode/thought_level) or by
+        baking it into the recipe at create time.
+
+        Returns ``{"result": <ACP result dict>}``. ``notify=True`` for
+        JSON-RPC notifications (e.g. ``session/cancel``) — no response.
+        """
+        body: dict[str, Any] = {"method": method, "params": params or {}}
+        if notify:
+            body["notify"] = True
+        return await self._json(
+            "POST", f"/sessions/{session_id}/acp/call", json=body,
         )
 
     async def session_sandbox_exec(

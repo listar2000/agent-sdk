@@ -618,13 +618,7 @@ async def reconcile_on_startup() -> None:
     # Source of truth for "live sandboxes": the SessionPool's
     # ``sandbox_state.sandbox_ref`` JSONB on each sessions row.
     try:
-        async with dbmod.get_db() as conn:
-            rows = await (await conn.execute(
-                "SELECT DISTINCT sandbox_state->>'sandbox_ref' AS sid"
-                " FROM sessions"
-                " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
-            )).fetchall()
-        live_refs = {r["sid"] for r in rows}
+        live_refs = await dbmod.live_sandbox_refs()
     except Exception as e:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return

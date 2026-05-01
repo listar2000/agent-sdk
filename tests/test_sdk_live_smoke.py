@@ -1,6 +1,6 @@
-"""Live SDK + ServerClient smoke test.
+"""Live SDK + ApiClient smoke test.
 
-Exercises every public method on ``agent_sdk.ServerClient`` and the most
+Exercises every public method on ``agent_sdk.ApiClient`` and the most
 common ``agent_sdk.Agent`` flows against the running test server. Skipped
 when no server is reachable on localhost:7778.
 
@@ -21,7 +21,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from agent_sdk import ServerClient
+from agent_sdk import ApiClient
 from agent_sdk.client import Agent
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
@@ -42,12 +42,12 @@ async def _server_up() -> bool:
 async def sc():
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
-    async with ServerClient(SERVER) as client:
+    async with ApiClient(SERVER) as client:
         yield client
 
 
 # ---------------------------------------------------------------------------
-# ServerClient — volume CRUD + file ops
+# ApiClient — volume CRUD + file ops
 # ---------------------------------------------------------------------------
 
 
@@ -114,7 +114,7 @@ async def test_serverclient_volume_lifecycle(sc):
 
 
 # ---------------------------------------------------------------------------
-# ServerClient — session lifecycle + log + file ops + exec + cancel
+# ApiClient — session lifecycle + log + file ops + exec + cancel
 # ---------------------------------------------------------------------------
 
 

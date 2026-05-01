@@ -1,7 +1,6 @@
 """Ephemeral SandboxSession + per-provider concrete classes.
 
-Per ``docs/ephemeral-sandbox-design.md``. This module ships the
-classes; **wiring into the server's recovery path is a separate PR**.
+Per ``docs/ephemeral-sandbox-design.md``.
 
 What's here:
   * ``BaseSandboxSession`` — abstract: start / running / execute_prompt
@@ -15,15 +14,9 @@ What's here:
   * ``BaseSandboxState`` + per-provider state subclasses — Pydantic
     discriminated union backing ``sessions.sandbox_state`` JSONB.
   * ``make_session`` factory — discriminates by ``state.type``.
-
-What's NOT here yet (intentionally — follow-up PR):
-  * ``SessionPool`` / runtime singleton
-  * DB bindings (``load_sandbox_state`` / ``save_sandbox_state``)
-  * Cutover from ``_ensure_*`` recovery in ``server.py`` to the pool
-
-The classes can be exercised in isolation by tests (state round-trip,
-factory dispatch, liveness state machine) so they're not dead code —
-they just don't run on the request path yet.
+  * ``SessionPool`` + ``get_pool()`` runtime singleton — at-most-one
+    active SandboxSession per session_id; reads/writes
+    ``sessions.sandbox_state`` directly via ``api.db``.
 """
 from .factory import make_session, register
 from .liveness import Liveness, LivenessState
@@ -40,6 +33,7 @@ from .state import (
     UnknownSandboxState,
     deserialize,
     serialize,
+    state_for_provider,
 )
 
 __all__ = [
@@ -61,4 +55,5 @@ __all__ = [
     "serialize",
     "shutdown_pool",
     "start_reaper",
+    "state_for_provider",
 ]

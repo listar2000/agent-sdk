@@ -253,33 +253,72 @@ class AcpClient:
         resp.raise_for_status()
         self._inner_session_ids.pop(session_id, None)
 
-    async def set_mode(self, session_id: str, mode: str) -> None:
-        """Set the agent session mode (e.g. 'plan', 'bypassPermissions')."""
+    async def call(
+        self,
+        session_id: str,
+        method: str,
+        params: dict | None = None,
+        *,
+        notify: bool = False,
+    ) -> dict:
+        """Generic passthrough: call ANY ACP method on the inner session.
+
+        Auto-injects ``sessionId`` (the ACP inner sid) into ``params`` so
+        callers don't need to manage it. Any other field — ``modeId``,
+        ``configId``+``value``, future args — passes through unchanged.
+
+        ``notify=True`` sends as a JSON-RPC notification (no response,
+        no rpc_id) — required for ``session/cancel`` and any other
+        method ACP dispatches via ``notificationHandler`` rather than
+        the request handler. The method-name-vs-camelCase fallback
+        loop in ``set_mode`` is the caller's responsibility now: if
+        ACP grows aliases (set_mode vs setMode), pick one and stick
+        with it, or call twice catching errors.
+
+        Returns the result dict (empty on notifications). Raises on
+        ACP-side errors so callers see the failure instead of silently
+        swallowing.
+        """
         inner_sid = self.get_inner_session_id(session_id)
         if not inner_sid:
-            return
+            return {}
+        merged = {"sessionId": inner_sid, **(params or {})}
+        if notify:
+            await self._notify(session_id, method, merged)
+            return {}
+        return await self._send_rpc(session_id, method, merged) or {}
+
+    # Targeted convenience wrappers — small, used by Agent + the persisted
+    # replay path on cold-recovery. Anything not on this list, callers
+    # should reach for ``call()`` instead of asking us to add a wrapper.
+
+    async def set_mode(self, session_id: str, mode: str) -> None:
+        """Set the agent session mode (e.g. 'plan', 'bypassPermissions').
+
+        Tries snake_case then camelCase — ACP servers are inconsistent
+        about which they implement. Either-works is more reliable than
+        making the caller pick.
+        """
         for method in ("session/set_mode", "session/setMode"):
             try:
-                await self._send_rpc(session_id, method,
-                                     {"sessionId": inner_sid, "modeId": mode})
+                await self.call(session_id, method, {"modeId": mode})
                 return
             except Exception:
                 continue
 
-    async def _set_config_option(self, session_id: str, config_id: str, value: object) -> None:
-        inner_sid = self.get_inner_session_id(session_id)
-        if not inner_sid:
-            return
-        await self._send_rpc(session_id, "session/set_config_option",
-                             {"sessionId": inner_sid, "configId": config_id, "value": value})
-
     async def set_model(self, session_id: str, model: str) -> None:
         """Change the agent model mid-session."""
-        await self._set_config_option(session_id, "model", model)
+        await self.call(
+            session_id, "session/set_config_option",
+            {"configId": "model", "value": model},
+        )
 
     async def set_thought_level(self, session_id: str, level: str) -> None:
         """Set thinking depth ('high', 'medium', 'low')."""
-        await self._set_config_option(session_id, "thinking", level)
+        await self.call(
+            session_id, "session/set_config_option",
+            {"configId": "thinking", "value": level},
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()

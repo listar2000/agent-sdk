@@ -122,6 +122,17 @@ async def install_supervisor(ref: str, agent_type: str) -> None:
     ``npm install`` — killed by a disk-full or SIGKILL — safe to retry
     because a re-run starts from a fresh staging dir, not a partially
     populated destination.
+
+    **Cumulative across agent_types.** When ``final_dir`` already has a
+    populated ``package.json`` / ``node_modules`` (a previous agent_type was
+    installed), the staging dir is seeded with that content and ``npm install
+    <new-spec>`` *adds* the new ACP binary alongside the existing one.
+    Without this, every new agent_type's ``npm init -y`` would fresh-init the
+    package.json and the atomic swap would wipe the prior agent_type's
+    binary — leaving ``volumes.supervisor_agent_types`` (cumulative) and the
+    on-disk ``node_modules`` (last-wins) out of sync. The cache hit on the
+    older agent_type's session would then skip reinstall and bomb with
+    "ACP binary missing".
     """
     final_dir = Path(ref) / "system" / "supervisor"
     system_dir = final_dir.parent
@@ -152,6 +163,24 @@ async def install_supervisor(ref: str, agent_type: str) -> None:
             raise RuntimeError("npm not found; install Node.js >=18")
 
         spec = _ACP_NPM_SPECS[agent_type]
+        existing_pkg = final_dir / "package.json"
+        seeded_from_existing = existing_pkg.exists()
+
+        def _seed_from_existing() -> None:
+            """Copy package.json / package-lock.json / node_modules from the
+            current install into staging so npm install merges rather than
+            replaces."""
+            shutil.copy(existing_pkg, staging / "package.json")
+            existing_lock = final_dir / "package-lock.json"
+            if existing_lock.exists():
+                shutil.copy(existing_lock, staging / "package-lock.json")
+            existing_modules = final_dir / "node_modules"
+            if existing_modules.exists():
+                shutil.copytree(
+                    existing_modules,
+                    staging / "node_modules",
+                    symlinks=True,
+                )
 
         def _run_npm_init() -> None:
             subprocess.run(
@@ -171,7 +200,10 @@ async def install_supervisor(ref: str, agent_type: str) -> None:
                 stderr=subprocess.PIPE,
             )
 
-        await asyncio.to_thread(_run_npm_init)
+        if seeded_from_existing:
+            await asyncio.to_thread(_seed_from_existing)
+        else:
+            await asyncio.to_thread(_run_npm_init)
         await asyncio.to_thread(_run_npm_install)
         await asyncio.to_thread(shutil.copy, _SUPERVISOR_JS_SRC, staging / "supervisor.js")
 

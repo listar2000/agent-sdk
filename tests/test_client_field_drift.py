@@ -9,7 +9,7 @@ audit so the same class of bug can't regress silently:
   body instead of swallowing it into a bare ``HTTPStatusError: 400``.
 
 (Volume forward-compat tests were dropped when the legacy ``Client``
-class was removed; ``ServerClient`` returns raw dicts and is naturally
+class was removed; ``ApiClient`` returns raw dicts and is naturally
 forward-compatible with new server fields.)
 """
 from __future__ import annotations

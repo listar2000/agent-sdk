@@ -53,6 +53,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 load_dotenv(os.path.expanduser("~/.env"), override=False)
 
+from agent_sdk import ApiClient  # noqa: E402
 from api.sse import extract_sse_tag, parse_acp_event  # noqa: E402
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
@@ -110,10 +111,11 @@ def _require_provider(provider: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# HTTP helpers (driven through agent_sdk.ApiClient — wire contract is
+# pinned in test_api_client.py + server route tests)
 # ---------------------------------------------------------------------------
 
-async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
+async def _quick_session(sdk: ApiClient, provider: str) -> dict:
     # Pin haiku for the recovery suite — sonnet's per-key weekly quota
     # trips before this suite finishes when other suites have run on
     # the same OAuth token recently. Haiku is on a separate quota
@@ -127,9 +129,7 @@ async def _quick_session(client: httpx.AsyncClient, provider: str) -> dict:
     }
     if OAUTH_TOKEN:
         body["secrets"] = {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN}
-    resp = await client.post(f"{SERVER}/sessions", json=body, timeout=180)
-    assert resp.status_code == 200, f"quick session failed ({provider}): {resp.text}"
-    sess = resp.json()
+    sess = await sdk.create_session(**body)
     # Register for autouse-fixture teardown so the daytona/docker/local
     # sandbox provisioned by this session is destroyed even if the test
     # body raises. Defence-in-depth alongside the ``agent_sdk_origin``
@@ -176,59 +176,70 @@ def _auto_destroy_test_sandboxes():
                 pass
 
 
-async def _get_sandbox(client: httpx.AsyncClient, session_id: str) -> dict:
+async def _get_sandbox(sdk: ApiClient, session_id: str) -> dict:
     """Read sandbox metadata via the session-scoped route — single
     round-trip, no sandboxes-table dependency. Returns the same shape
     as the legacy ``GET /sandboxes/{id}`` (provider, sandbox_ref,
     status, root, url, marker_path) so the ``_external_*`` helpers
     don't need to change."""
-    sb = await client.get(f"{SERVER}/sessions/{session_id}/sandbox", timeout=10)
-    return sb.json()
+    return await sdk.get_session_sandbox(session_id)
 
 
-async def _send_message(client: httpx.AsyncClient, session_id: str, message: str) -> str:
-    resp = await client.post(
-        f"{SERVER}/sessions/{session_id}/message",
-        json={"message": message},
-        timeout=30,
-    )
-    assert resp.status_code == 200, f"message post failed: {resp.text}"
-    return resp.json()["rpc_id"]
+async def _send_message(sdk: ApiClient, session_id: str, message: str) -> str:
+    resp = await sdk.send_message(session_id, message)
+    return resp["rpc_id"]
 
 
-async def _collect_reply(client: httpx.AsyncClient, session_id: str, rpc_id: str) -> str:
+async def _collect_reply(sdk: ApiClient, session_id: str, rpc_id: str) -> str:
     """Stream /events until stopReason arrives for rpc_id; return full text."""
     parts: list[str] = []
     deadline = time.time() + PROMPT_TIMEOUT
-    async with client.stream(
-        "GET", f"{SERVER}/sessions/{session_id}/events",
-        timeout=PROMPT_TIMEOUT + 10,
-    ) as stream:
-        buf = ""
-        async for chunk in stream.aiter_text():
-            buf += chunk
-            while "\n\n" in buf:
-                block, buf = buf.split("\n\n", 1)
-                tag = extract_sse_tag(block)
-                if tag != rpc_id:
-                    continue
-                evt = parse_acp_event(block, rpc_id)
-                if evt is None:
-                    continue
-                if evt["type"] == "text":
-                    parts.append(evt["text"])
-                elif evt["type"] == "done":
-                    return "".join(parts)
-                elif evt["type"] == "error":
-                    raise RuntimeError(f"agent error: {evt['text']}")
-            if time.time() > deadline:
-                raise TimeoutError(f"no reply within {PROMPT_TIMEOUT}s for rpc {rpc_id}")
+    buf = b""
+    async for chunk in sdk.stream_events(session_id):
+        buf += chunk
+        while b"\n\n" in buf:
+            raw, buf = buf.split(b"\n\n", 1)
+            block = raw.decode("utf-8", errors="replace")
+            tag = extract_sse_tag(block)
+            if tag != rpc_id:
+                continue
+            evt = parse_acp_event(block, rpc_id)
+            if evt is None:
+                continue
+            if evt["type"] == "text":
+                parts.append(evt["text"])
+            elif evt["type"] == "done":
+                return "".join(parts)
+            elif evt["type"] == "error":
+                raise RuntimeError(f"agent error: {evt['text']}")
+        if time.time() > deadline:
+            raise TimeoutError(f"no reply within {PROMPT_TIMEOUT}s for rpc {rpc_id}")
     return "".join(parts)
 
 
-async def _ask(client: httpx.AsyncClient, session_id: str, message: str) -> str:
-    rpc_id = await _send_message(client, session_id, message)
-    return await _collect_reply(client, session_id, rpc_id)
+async def _ask(sdk: ApiClient, session_id: str, message: str) -> str:
+    rpc_id = await _send_message(sdk, session_id, message)
+    return await _collect_reply(sdk, session_id, rpc_id)
+
+
+async def _admin_session_row(sdk: ApiClient, session_id: str) -> dict | None:
+    """Read the in-memory session row from /admin/sessions.
+
+    Goes through ``sdk._http`` because /admin/sessions is an operator
+    debug route, not part of ApiClient's first-class surface.
+    """
+    resp = await sdk._http.get("/admin/sessions", timeout=10)
+    resp.raise_for_status()
+    admin = resp.json()
+    return next(
+        (s for s in admin.get("sessions", []) if s["session_id"] == session_id),
+        None,
+    )
+
+
+async def _admin_inner_sid(sdk: ApiClient, session_id: str) -> str | None:
+    row = await _admin_session_row(sdk, session_id)
+    return row.get("inner_session_id") if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -426,21 +437,21 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider):
     """Stop sandbox externally → server restarts it → same sandbox_ref, sandbox responds."""
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
         # Baseline: verify sandbox is live and record sandbox_ref from the API
         reply1 = await _ask(
-            client, session_id,
+            sdk, session_id,
             "Please run the shell command `hostname` and reply with a single line "
             "formatted as `HOSTNAME=<value>` so I can parse it.",
         )
         hostname_before = _extract_kv(reply1, "HOSTNAME")
         print(f"[test:{provider}] before stop — reply: {reply1[:200]!r}, hostname: {hostname_before}")
 
-        sandbox_before = await _get_sandbox(client, session_id)
+        sandbox_before = await _get_sandbox(sdk, session_id)
         sandbox_ref_before = sandbox_before.get("sandbox_ref") or sandbox_before.get("provider_ref", "")
         assert sandbox_ref_before, f"could not get sandbox_ref: {sandbox_before}"
         print(f"[test:{provider}] sandbox_ref before stop: {sandbox_ref_before[:20]}")
@@ -451,14 +462,14 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider):
 
         # Followup — server must restart the SAME sandbox (not provision a new one)
         reply2 = await _ask(
-            client, session_id,
+            sdk, session_id,
             "Please run the shell command `hostname` again and reply with a single line "
             "formatted as `HOSTNAME=<value>`.",
         )
         hostname_after = _extract_kv(reply2, "HOSTNAME")
         print(f"[test:{provider}] after restart — reply: {reply2[:200]!r}, hostname: {hostname_after}")
 
-        sandbox_after = await _get_sandbox(client, session_id)
+        sandbox_after = await _get_sandbox(sdk, session_id)
         sandbox_ref_after = sandbox_after.get("sandbox_ref") or sandbox_after.get("provider_ref", "")
         print(f"[test:{provider}] sandbox_ref after restart: {sandbox_ref_after[:20]}")
 
@@ -475,19 +486,19 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider):
 # Tests: delete recovery + volume persistence
 # ---------------------------------------------------------------------------
 
-async def _write_marker_and_read(client, session_id, marker):
+async def _write_marker_and_read(sdk, session_id, marker):
     """Turn-1: have the agent write marker and echo content back so
     stdout is non-empty (pure tool-use turns return no SSE text)."""
     return await _ask(
-        client, session_id,
+        sdk, session_id,
         f"Please run this shell pipeline and tell me the output:\n"
         f"  echo 'volume-test' > ~/{marker} && cat ~/{marker}",
     )
 
 
-async def _read_marker(client, session_id, marker):
+async def _read_marker(sdk, session_id, marker):
     return await _ask(
-        client, session_id,
+        sdk, session_id,
         f"Please run this shell command and tell me the output:\n"
         f"  cat ~/{marker} || echo NOT_FOUND",
     )
@@ -503,25 +514,24 @@ async def test_server_delete_persists_workspace(provider):
     _require_provider(provider)
     marker = "server-delete-marker.txt"
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        reply1 = await _write_marker_and_read(client, session_id, marker)
+        reply1 = await _write_marker_and_read(sdk, session_id, marker)
         assert "volume-test" in reply1, f"marker setup failed: {reply1}"
 
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         sandbox_ref_before = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
         # POST /sessions/{id}/release is the server-API-driven equivalent
         # of the legacy DELETE /sandboxes/{id}: snapshot to volume +
         # drop the pool's compute lease. Next prompt cold-recovers,
         # which is what "delete the sandbox" meant operationally.
-        r = await client.post(f"{SERVER}/sessions/{session_id}/release", timeout=60)
-        assert r.status_code in (200, 204), f"POST /release failed: {r.text}"
+        await sdk.release_session(session_id)
         await asyncio.sleep(3)
 
-        reply2 = await _read_marker(client, session_id, marker)
+        reply2 = await _read_marker(sdk, session_id, marker)
         print(f"[test:{provider}] after server-delete reply: {reply2[:400]!r}")
         assert "NOT_FOUND" not in reply2, (
             f"marker file lost after server DELETE — cold snapshot didn't run before "
@@ -535,7 +545,7 @@ async def test_server_delete_persists_workspace(provider):
         # (new ref). The contract this test pins is volume persistence —
         # the sandbox-ref-changed assertion was an implementation detail
         # of the legacy DELETE /sandboxes/{id} that always destroyed.
-        await _get_sandbox(client, session_id)  # smoke-check the route
+        await _get_sandbox(sdk, session_id)  # smoke-check the route
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
@@ -554,22 +564,22 @@ async def test_external_delete_preserves_agent_memory(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner={inner_before}")
 
-        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
         assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         await _external_delete(sandbox)
         await asyncio.sleep(3)
 
         # agent_memory preserved → session/load succeeds → inner_sid
         # unchanged across the delete.
-        inner_after = await _inner_sid_in_memory(client, session_id)
+        inner_after = await _admin_inner_sid(sdk, session_id)
         assert inner_after == inner_before, (
             f"agent_memory not preserved across external delete — session/load "
             f"didn't restore: {inner_before!r} → {inner_after!r}"
@@ -583,10 +593,6 @@ async def test_external_delete_preserves_agent_memory(provider):
 # Neutral ticket-ID framing avoids Claude's "secret code = social engineering"
 # guardrail. The agent will freely echo/recall TKT-<digits> tokens.
 
-async def _inner_sid_in_memory(client: httpx.AsyncClient, session_id: str) -> str | None:
-    admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
-    row = next((s for s in admin.get("sessions", []) if s["session_id"] == session_id), None)
-    return row.get("inner_session_id") if row else None
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
@@ -603,24 +609,24 @@ async def test_session_resume_after_stop(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
-        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
         assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
         # Stop sandbox externally
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         await _external_stop(sandbox)
         await asyncio.sleep(3)
 
         # Turn 2: open a FRESH httpx connection (simulates UI reconnect)
-        async with httpx.AsyncClient() as client2:
-            reply2 = await _ask(client2, session_id, "Reply with a single short word.")
-            inner_after = await _inner_sid_in_memory(client2, session_id)
+        async with ApiClient(SERVER) as sdk2:
+            reply2 = await _ask(sdk2, session_id, "Reply with a single short word.")
+            inner_after = await _admin_inner_sid(sdk2, session_id)
 
         assert reply2.strip(), f"turn 2 empty after stop+resume: {reply2!r}"
         assert inner_after == inner_before, (
@@ -642,22 +648,22 @@ async def test_session_resume_after_delete(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
-        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
         assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         await _external_delete(sandbox)
         await asyncio.sleep(3)
 
-        async with httpx.AsyncClient() as client2:
-            reply2 = await _ask(client2, session_id, "Reply with a single short word.")
-            inner_after = await _inner_sid_in_memory(client2, session_id)
+        async with ApiClient(SERVER) as sdk2:
+            reply2 = await _ask(sdk2, session_id, "Reply with a single short word.")
+            inner_after = await _admin_inner_sid(sdk2, session_id)
 
         assert reply2.strip(), f"turn 2 empty after delete+resume: {reply2!r}"
         assert inner_after == inner_before, (
@@ -703,8 +709,8 @@ async def test_session_survives_midstream_sandbox_stop(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
@@ -715,7 +721,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
         # own reply was persisted and restored, not just echoed from the
         # user-turn line of the JSONL.
         reply1 = await _ask(
-            client, session_id,
+            sdk, session_id,
             "Please compute 317 * 419 (use `echo $((317*419))` in a shell if "
             "it helps). Reply on a single line as `PRODUCT=<value>` so I can "
             "parse it.",
@@ -727,7 +733,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
         )
 
         # External stop — the exact UI scenario the user reproduced manually.
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         print(f"[test:{provider}] stopping sandbox {sandbox.get('sandbox_ref', '?')[:20]} externally")
         await _external_stop(sandbox)
 
@@ -743,11 +749,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
         # GET /sessions/{id} (DB) — the buggy SSE-reader recovery path mutates
         # state.inner_session_id in memory but doesn't upsert_session, so the
         # DB stays stale and the DB-backed check would silently pass.
-        admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
-        in_mem = next(
-            (s for s in admin.get("sessions", []) if s["session_id"] == session_id),
-            None,
-        )
+        in_mem = await _admin_session_row(sdk, session_id)
         assert in_mem is not None, f"session {session_id[:8]} missing from in-memory SESSIONS"
         inner_sid_after = in_mem.get("inner_session_id")
         print(f"[test:{provider}] in-memory inner_sid after recovery: {inner_sid_after}")
@@ -762,7 +764,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
         # turn to have landed on disk AND session/load to have actually
         # resumed it after recovery.
         reply2 = await _ask(
-            client, session_id,
+            sdk, session_id,
             "What was the product you computed earlier in this conversation? "
             "Reply with just the number.",
         )
@@ -806,24 +808,24 @@ async def test_message_immediately_after_stop(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
 
         # Turn 1 — confirm the agent is live.
-        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
         assert reply1.strip(), f"turn 1 empty reply: {reply1!r}"
         print(f"[test:{provider}] turn1 ok")
 
         # External stop — NO sleep. This is the race we're after.
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         await _external_stop(sandbox)
         print(f"[test:{provider}] sandbox stopped; immediately sending turn 2")
 
         # Turn 2 — the server must recover and deliver a reply.
-        reply2 = await _ask(client, session_id, "Reply with a single short word.")
+        reply2 = await _ask(sdk, session_id, "Reply with a single short word.")
         print(f"[test:{provider}] turn2 reply len: {len(reply2)}")
         assert reply2.strip(), (
             f"turn 2 lost: server accepted the prompt but no reply came back "
@@ -835,11 +837,7 @@ async def test_message_immediately_after_stop(provider):
         # changed, the server did session/new (new conversation) instead
         # of session/load. Read from /admin/sessions (in-memory) — the
         # buggy path updates state.inner_session_id without upsert_session.
-        admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
-        in_mem = next(
-            (s for s in admin.get("sessions", []) if s["session_id"] == session_id),
-            None,
-        )
+        in_mem = await _admin_session_row(sdk, session_id)
         assert in_mem is not None, f"session missing from /admin/sessions"
         assert in_mem.get("inner_session_id") == inner_sid_before, (
             f"inner_session_id changed across recovery — server silently "
@@ -868,17 +866,17 @@ async def test_message_after_stop_with_delay(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
 
-        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
         assert reply1.strip(), f"turn 1 empty: {reply1!r}"
         print(f"[test:{provider}] turn1 ok")
 
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         await _external_stop(sandbox)
         # Give the server's SSE reader time to observe the upstream
         # disconnect and tear down. This is the state the UI is in when
@@ -886,18 +884,14 @@ async def test_message_after_stop_with_delay(provider):
         await asyncio.sleep(4)
         print(f"[test:{provider}] stopped + waited 4s; sending turn 2")
 
-        reply2 = await _ask(client, session_id, "Reply with a single short word.")
+        reply2 = await _ask(sdk, session_id, "Reply with a single short word.")
         print(f"[test:{provider}] turn2 reply len: {len(reply2)}")
         assert reply2.strip(), (
             f"turn 2 lost after 4s stop-delay: server did not recover "
             f"the dead sandbox before dispatching the prompt: {reply2!r}"
         )
 
-        admin = (await client.get(f"{SERVER}/admin/sessions", timeout=10)).json()
-        in_mem = next(
-            (s for s in admin.get("sessions", []) if s["session_id"] == session_id),
-            None,
-        )
+        in_mem = await _admin_session_row(sdk, session_id)
         assert in_mem is not None, f"session missing from /admin/sessions"
         assert in_mem.get("inner_session_id") == inner_sid_before, (
             f"inner_session_id changed across recovery — server silently "
@@ -922,8 +916,8 @@ class _PersistentSse:
     repro.
     """
 
-    def __init__(self, client: httpx.AsyncClient, session_id: str) -> None:
-        self._client = client
+    def __init__(self, sdk: ApiClient, session_id: str) -> None:
+        self._sdk = sdk
         self._session_id = session_id
         self._queues: dict[str, asyncio.Queue] = {}
         self._alive = True
@@ -954,32 +948,31 @@ class _PersistentSse:
         attempt = 0
         while self._alive:
             try:
-                async with self._client.stream(
-                    "GET",
-                    f"{SERVER}/sessions/{self._session_id}/events",
-                    timeout=None,
-                    headers={"Accept": "text/event-stream"},
-                ) as stream:
-                    if stream.status_code != 200:
-                        raise RuntimeError(f"/events HTTP {stream.status_code}")
-                    attempt = 0
-                    self._reconnected.set()
-                    buf = ""
-                    async for chunk in stream.aiter_text():
-                        if not self._alive:
-                            return
-                        buf += chunk
-                        while "\n\n" in buf:
-                            block, buf = buf.split("\n\n", 1)
-                            tag = extract_sse_tag(block)
-                            if tag is None:
-                                continue
-                            evt = parse_acp_event(block, tag)
-                            if evt is None:
-                                continue
-                            await self._queues.setdefault(
-                                tag, asyncio.Queue()
-                            ).put(evt)
+                buf = b""
+                # Mark "stream open" on the first chunk we receive — that's
+                # equivalent to seeing the response status_code on the
+                # underlying httpx stream.
+                first = True
+                async for chunk in self._sdk.stream_events(self._session_id):
+                    if not self._alive:
+                        return
+                    if first:
+                        attempt = 0
+                        self._reconnected.set()
+                        first = False
+                    buf += chunk
+                    while b"\n\n" in buf:
+                        raw, buf = buf.split(b"\n\n", 1)
+                        block = raw.decode("utf-8", errors="replace")
+                        tag = extract_sse_tag(block)
+                        if tag is None:
+                            continue
+                        evt = parse_acp_event(block, tag)
+                        if evt is None:
+                            continue
+                        await self._queues.setdefault(
+                            tag, asyncio.Queue()
+                        ).put(evt)
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -993,7 +986,7 @@ class _PersistentSse:
 
 
 async def _ask_on_stream(
-    client: httpx.AsyncClient, session_id: str, stream: _PersistentSse,
+    sdk: ApiClient, session_id: str, stream: _PersistentSse,
     message: str,
 ) -> str:
     """POST /message then drain the rpc's events off the persistent stream.
@@ -1001,7 +994,7 @@ async def _ask_on_stream(
     Unlike `_ask`, this does NOT open a new /events connection — it uses
     the already-open one, matching the UI flow.
     """
-    rpc_id = await _send_message(client, session_id, message)
+    rpc_id = await _send_message(sdk, session_id, message)
     q = stream.get_queue(rpc_id)
     parts: list[str] = []
     deadline = time.time() + PROMPT_TIMEOUT
@@ -1037,29 +1030,29 @@ async def test_persistent_sse_stop_then_message(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        async with _PersistentSse(client, session_id) as sse:
+        async with _PersistentSse(sdk, session_id) as sse:
             ticket = "TKT-55501"
             reply1 = await _ask_on_stream(
-                client, session_id, sse,
+                sdk, session_id, sse,
                 f"I'm tracking work under ticket ID {ticket}. Please acknowledge by "
                 f"echoing the ticket ID back to me so I know you have it.",
             )
             assert ticket in reply1, f"turn 1 didn't echo ticket: {reply1!r}"
             print(f"[test:{provider}] turn1 ok (persistent SSE held open)")
 
-            sandbox = await _get_sandbox(client, session_id)
+            sandbox = await _get_sandbox(sdk, session_id)
             await _external_stop(sandbox)
             await asyncio.sleep(4)
             print(f"[test:{provider}] stopped + waited 4s; sending turn 2 "
                   f"on the SAME persistent /events stream")
 
             reply2 = await _ask_on_stream(
-                client, session_id, sse,
+                sdk, session_id, sse,
                 "What was the ticket ID I mentioned earlier in this conversation? "
                 "Reply with only the ticket ID.",
             )
@@ -1098,24 +1091,24 @@ async def test_persistent_sse_external_delete_then_message(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        async with _PersistentSse(client, session_id) as sse:
+        async with _PersistentSse(sdk, session_id) as sse:
             reply1 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
             # Out-of-band delete — server finds out via SSE disconnect.
-            sandbox = await _get_sandbox(client, session_id)
+            sandbox = await _get_sandbox(sdk, session_id)
             await _external_delete(sandbox)
             await asyncio.sleep(4)
 
             reply2 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply2.strip(), (
                 f"turn 2 lost on persistent SSE after external delete+delay: "
@@ -1146,15 +1139,15 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
 
-        async with _PersistentSse(client, session_id) as sse:
+        async with _PersistentSse(sdk, session_id) as sse:
             reply1 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
@@ -1162,15 +1155,14 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
             # /sandboxes/{id}: snapshot + drop the pool lease so the
             # next prompt cold-recovers (the "delete sandbox" semantics
             # the UI exercised).
-            r = await client.post(f"{SERVER}/sessions/{session_id}/release", timeout=30)
-            assert r.status_code in (200, 204), f"release failed: {r.text}"
+            await sdk.release_session(session_id)
 
             # Wait — the UI's SSE stream may observe stream-end here; the
             # _PersistentSse helper reconnects automatically.
             await asyncio.sleep(4)
 
             reply2 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply2.strip(), (
                 f"turn 2 lost on persistent SSE after delete+delay: the "
@@ -1205,18 +1197,18 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        async with _PersistentSse(client, session_id) as sse:
+        async with _PersistentSse(sdk, session_id) as sse:
             reply1 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
-            sandbox = await _get_sandbox(client, session_id)
+            sandbox = await _get_sandbox(sdk, session_id)
             await _kill_supervisor_in_sandbox(sandbox)
             # Give the server's SSE reader time to observe the upstream
             # disconnect and flip into recovery. No sandbox-delete event
@@ -1225,7 +1217,7 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
             await asyncio.sleep(6)
 
             reply2 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply2.strip(), (
                 f"turn 2 lost on persistent SSE after supervisor kill: the "
@@ -1264,18 +1256,18 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        async with _PersistentSse(client, session_id) as sse:
+        async with _PersistentSse(sdk, session_id) as sse:
             reply1 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
-            sandbox = await _get_sandbox(client, session_id)
+            sandbox = await _get_sandbox(sdk, session_id)
             await _kill_supervisor_in_sandbox(sandbox)
             # NO sleep — fire the message while the server still thinks
             # the cached supervisor URL is alive. This is the exact race
@@ -1284,7 +1276,7 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
             # reader observed the upstream disconnect.
 
             reply2 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply2.strip(), (
                 f"turn 2 lost on persistent SSE after supervisor kill (no delay): "
@@ -1338,18 +1330,18 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
     """
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        async with _PersistentSse(client, session_id) as sse:
+        async with _PersistentSse(sdk, session_id) as sse:
             reply1 = await _ask_on_stream(
-                client, session_id, sse, "Reply with a single short word.",
+                sdk, session_id, sse, "Reply with a single short word.",
             )
             assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
-            sandbox = await _get_sandbox(client, session_id)
+            sandbox = await _get_sandbox(sdk, session_id)
             await _kill_supervisor_in_sandbox(sandbox)
             # Let the server's upstream SSE reader observe the death and
             # kick the UI subscriber (the persistent stream will see a
@@ -1360,10 +1352,10 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
         # We're now in the UI's "stream closed, EventSource retry timer
         # running" state. The follow-up POSTs land in this gap.
         rpc2 = await _send_message(
-            client, session_id, "Reply with a single short word.",
+            sdk, session_id, "Reply with a single short word.",
         )
         rpc3 = await _send_message(
-            client, session_id, "Reply with a single short word.",
+            sdk, session_id, "Reply with a single short word.",
         )
 
         # Give the server scheduler enough time to dispatch both turns'
@@ -1376,7 +1368,7 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
         # event onto this subscriber; _collect_reply_on_stream drains until
         # both rpc ids have landed their stopReason.
         collected: dict[str, str] = {}
-        async with _PersistentSse(client, session_id) as sse2:
+        async with _PersistentSse(sdk, session_id) as sse2:
             deadline = time.time() + 60
             wanted = {rpc2, rpc3}
             while wanted and time.time() < deadline:
@@ -1427,17 +1419,17 @@ async def test_session_survives_supervisor_dir_wiped_from_volume():
     provider = "local"
     _require_provider(provider)
 
-    async with httpx.AsyncClient() as client:
-        sess = await _quick_session(client, provider)
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
-        reply1 = await _ask(client, session_id, "Reply with a single short word.")
+        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
         assert reply1.strip(), f"turn 1 empty: {reply1!r}"
 
         # Destroy the current sandbox so the next /message goes through
         # _provision_new. We need that path to hit ``create_sandbox``.
-        sandbox = await _get_sandbox(client, session_id)
+        sandbox = await _get_sandbox(sdk, session_id)
         await _external_delete(sandbox)
         await asyncio.sleep(2)
 
@@ -1452,7 +1444,7 @@ async def test_session_survives_supervisor_dir_wiped_from_volume():
         # Next turn: _provision_new → ensure_volume_supervisor (cache hit,
         # skip install) → create_sandbox raises RuntimeError (supervisor.js
         # missing). Server's retry path clears the cache + reinstalls + retries.
-        reply2 = await _ask(client, session_id, "Reply with a single short word.")
+        reply2 = await _ask(sdk, session_id, "Reply with a single short word.")
         assert reply2.strip(), (
             f"server did not recover from stale supervisor cache — "
             f"the retry path in _provision_new should clear the cache and "

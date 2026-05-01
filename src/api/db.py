@@ -695,6 +695,65 @@ async def get_session_secrets(session_id: str) -> dict[str, str]:
     return row["secrets"] or {}
 
 
+async def read_sandbox_state(session_id: str) -> dict | None:
+    """Read ``sessions.sandbox_state`` JSONB. None if the row is missing."""
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT sandbox_state FROM sessions WHERE id = %s", (session_id,)
+        )).fetchone()
+    return None if row is None else row["sandbox_state"]
+
+
+async def write_sandbox_state(session_id: str, payload: dict) -> None:
+    """Sole writer of ``sessions.sandbox_state``. Pool calls this after
+    ``session.start()`` and ``session.stop()`` to checkpoint."""
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
+            (Json(payload), session_id),
+        )
+
+
+async def update_session_inner_session_id(session_id: str, inner_session_id: str) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET inner_session_id = %s WHERE id = %s",
+            (inner_session_id, session_id),
+        )
+
+
+async def delete_session(session_id: str) -> None:
+    async with get_db() as conn:
+        await conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+
+
+async def count_sessions_by_volume(volume_id: str) -> int:
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (volume_id,)
+        )).fetchone()
+    return int(row["n"])
+
+
+async def delete_sessions_by_volume(volume_id: str) -> None:
+    async with get_db() as conn:
+        await conn.execute(
+            "DELETE FROM sessions WHERE volume_id = %s", (volume_id,),
+        )
+
+
+async def live_sandbox_refs() -> set[str]:
+    """Distinct ``sandbox_state.sandbox_ref`` values across all sessions.
+    Used by provider reconcilers to identify orphaned compute."""
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT DISTINCT sandbox_state->>'sandbox_ref' AS sid"
+            " FROM sessions"
+            " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
+        )).fetchall()
+    return {r["sid"] for r in rows}
+
+
 # get_any_session_for_sandbox removed: it walked sessions.current_sandbox_id
 # (gone with the sandboxes table) and was only used by the legacy back-compat
 # spawn_env-reconstruction path that the SessionPool replaced.

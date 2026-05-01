@@ -120,7 +120,7 @@ async def test_ensure_supervisor_url_unknown_provider():
     from api.providers import ProviderInstance
 
     fake_inst = ProviderInstance(
-        provider=_BOGUS, url="", root="/x", sandbox_id="x",
+        provider=_BOGUS, url="", root="/x", sandbox_ref="x",
     )
     with pytest.raises((ValueError, RuntimeError, KeyError)) as excinfo:
         await providers.ensure_supervisor_url(_BOGUS, fake_inst)

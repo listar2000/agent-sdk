@@ -1,4 +1,4 @@
-"""Unit tests for ``agent_sdk.ServerClient``.
+"""Unit tests for ``agent_sdk.ApiClient``.
 
 Uses ``httpx.MockTransport`` — no real server, no DB, no provider.
 Asserts each method sends the right HTTP verb + path + body to the
@@ -25,7 +25,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from agent_sdk import VolumeFileExistsError  # noqa: E402
-from agent_sdk.server_client import ServerClient  # noqa: E402
+from agent_sdk.api_client import ApiClient  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -65,15 +65,15 @@ class _Recorder:
         return self.requests[-1]
 
 
-def _make_client(recorder: _Recorder) -> ServerClient:
-    """Build a ServerClient whose transport is the recorder."""
+def _make_client(recorder: _Recorder) -> ApiClient:
+    """Build a ApiClient whose transport is the recorder."""
     http = httpx.AsyncClient(
         base_url="http://test",
         headers={"Accept": "application/json", "Authorization": "Bearer testtoken"},
         transport=httpx.MockTransport(recorder),
         timeout=httpx.Timeout(5.0, read=None),
     )
-    return ServerClient("http://test", http_client=http)
+    return ApiClient("http://test", http_client=http)
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +437,7 @@ async def test_stream_events_yields_raw_bytes():
         transport=httpx.MockTransport(handler),
         timeout=httpx.Timeout(5.0, read=None),
     )
-    async with ServerClient("http://test", http_client=http) as sc:
+    async with ApiClient("http://test", http_client=http) as sc:
         chunks = []
         async for chunk in sc.stream_events("s1"):
             chunks.append(chunk)
@@ -474,6 +474,6 @@ async def test_token_attached_as_bearer_header():
         transport=httpx.MockTransport(rec),
         timeout=httpx.Timeout(5.0, read=None),
     )
-    async with ServerClient("http://test", http_client=http) as sc:
+    async with ApiClient("http://test", http_client=http) as sc:
         await sc.list_sessions()
     assert rec.last.headers.get("authorization") == "Bearer s3cret"
