@@ -272,7 +272,7 @@ async def create_sandbox(
     dockerfile: str | None = None,  # accepted but ignored — Docker uses _NODE_IMAGE
     pre_start_commands: list[str] | None = None,
     port: int | None = None,  # accepted for parity with uniform API; always allocates
-    sandbox_id: str | None = None,
+    sandbox_ref: str | None = None,
     shared_mounts: list[str] | None = None,
     **_kw,
 ) -> ProviderInstance:
@@ -281,7 +281,7 @@ async def create_sandbox(
     Returns a ``ProviderInstance`` with ``container_id`` set; supervisor is
     already started (``ensure_supervisor_url`` will be a no-op).
 
-    If ``sandbox_id`` is provided it is attached as the
+    If `sandbox_ref` is provided it is attached as the
     ``agent-sdk.sandbox-id`` label so ``reconcile_on_startup`` can
     cross-reference this container with the DB after a server crash.
     """
@@ -334,10 +334,10 @@ async def create_sandbox(
                 f"type=volume,source={volume_ref},target=/mnt/{clean},"
                 f"volume-subpath=shared/{clean}",
             ]
-        if sandbox_id:
+        if sandbox_ref:
             # Used by reconcile_on_startup() to cross-reference live containers
             # against DB sandbox rows after a server crash.
-            c += ["--label", f"{_LABEL_KEY}={sandbox_id}"]
+            c += ["--label", f"{_LABEL_KEY}={sandbox_ref}"]
         c += [
             "--entrypoint", "sh",
             _NODE_IMAGE,
@@ -401,7 +401,7 @@ async def create_sandbox(
             provider="docker",
             url=url,
             root=agent_root,
-            sandbox_id=container_id,
+            sandbox_ref=container_id,
             container_id=container_id,
             port=port,
         )
@@ -448,7 +448,7 @@ async def start_sandbox(ref: str) -> None:
 
 async def stop_sandbox(inst: ProviderInstance) -> None:
     """Stop the container (container row remains, can be started again)."""
-    cid = inst.container_id or inst.sandbox_id
+    cid = inst.container_id or inst.sandbox_ref
     if not cid:
         return
     rc, _out, err = await _run_docker("stop", cid, timeout=30)
@@ -464,7 +464,7 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
 
 async def destroy_sandbox(inst: ProviderInstance) -> None:
     """Force-remove the container and recycle its host port."""
-    cid = inst.container_id or inst.sandbox_id
+    cid = inst.container_id or inst.sandbox_ref
     if not cid:
         return
     rc, _out, err = await _run_docker("rm", "-f", cid, timeout=30)
@@ -497,7 +497,7 @@ async def ensure_supervisor_url(
 # ---------------------------------------------------------------------------
 
 async def reconcile_on_startup() -> None:
-    """Force-remove orphan containers labeled with a stale sandbox_id.
+    """Force-remove orphan containers labeled with a stale sandbox_ref.
 
     For each container labeled ``agent-sdk.sandbox-id=<id>``:
       * No DB row, or row marked ``deleted`` → ``docker rm -f`` (orphan).
@@ -506,7 +506,7 @@ async def reconcile_on_startup() -> None:
         start``; removing the container would erase state the user is
         about to resume.
       * Live rows: leave alone. The SessionPool resolves compute on
-        demand via ``state.sandbox_id``; there's no per-process
+        demand via ``state.sandbox_ref``; there's no per-process
         ``_INSTANCES`` cache to repopulate anymore.
 
     Failures on individual containers are logged but never raised so a
@@ -531,11 +531,22 @@ async def reconcile_on_startup() -> None:
         log.warning("docker reconcile: ps failed: %s", e)
         return
 
-    # Reconcile only does orphan cleanup now: any container labeled with
-    # an unknown / deleted sandbox_id gets force-removed. The legacy
-    # "rebuild _INSTANCES entry for survivors" branch is gone — the
-    # SessionPool resolves compute through ``state.sandbox_id`` on each
-    # ``pool.get_session`` call, no per-process cache to repopulate.
+    # Reconcile only does orphan cleanup now: any container whose labeled
+    # sandbox-id (= the docker container id) doesn't appear in any live
+    # session's ``sandbox_state.sandbox_ref`` gets force-removed. The
+    # SessionPool's sandbox_state JSONB on ``sessions`` is the single
+    # source of truth for "what sandboxes belong to live sessions."
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT DISTINCT sandbox_state->>'sandbox_ref' AS sid"
+                " FROM sessions"
+                " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
+            )).fetchall()
+        live_refs = {r["sid"] for r in rows}
+    except Exception as e:
+        log.warning("docker reconcile: live-session query failed: %s", e)
+        return
     for line in out.decode(errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -543,23 +554,19 @@ async def reconcile_on_startup() -> None:
         parts = line.split(None, 2)
         if len(parts) < 3:
             continue
-        container_id, state, sandbox_id = parts[0], parts[1].lower(), parts[2]
-        try:
-            sb = await dbmod.get_sandbox(sandbox_id)
-        except Exception as e:
-            log.warning("docker reconcile: get_sandbox(%s) failed: %s", sandbox_id, e)
-            continue
-        # "stopped" rows are NOT orphans — they're resumable pairs (DB
-        # row + exited container waiting for docker start). Only deleted
-        # rows (or none) qualify the container as an orphan.
+        container_id, state, sandbox_ref_label = parts[0], parts[1].lower(), parts[2]
+        # "stopped" containers are NOT orphans if a live session still
+        # references them — they're resumable. The label may be the
+        # legacy sb_<hex> PK (pre-d5) or the container_id (post-d5);
+        # check both.
         is_orphan = (
-            sb is None
-            or getattr(sb, "status", None) == "deleted"
+            sandbox_ref_label not in live_refs
+            and container_id not in live_refs
         )
         if is_orphan:
             log.info(
-                "docker reconcile: removing orphan %s (sandbox_id=%s state=%s)",
-                container_id[:12], sandbox_id, state,
+                "docker reconcile: removing orphan %s (sandbox_ref=%s state=%s)",
+                container_id[:12], sandbox_ref_label, state,
             )
             try:
                 await _run_docker("rm", "-f", container_id, timeout=30)

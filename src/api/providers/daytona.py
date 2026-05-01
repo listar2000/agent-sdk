@@ -340,7 +340,7 @@ async def provision_daytona_sandbox(
     or start a supervisor (those are handled by ensure_volume_supervisor and
     ensure_supervisor_url respectively).
 
-    Returns a ProviderInstance with sandbox_id but no usable supervisor URL.
+    Returns a ProviderInstance with sandbox_ref but no usable supervisor URL.
     Supervisors are started per-session via start_supervisor_in_sandbox().
     The supervisor binary + ACP package are expected to already be installed on
     the volume at system/supervisor/ (mounted at /opt/supervisor).
@@ -426,7 +426,7 @@ async def provision_daytona_sandbox(
             provider="daytona",
             url="",  # no supervisor URL yet
             root=root,
-            sandbox_id=sandbox.id,
+            sandbox_ref=sandbox.id,
         )
     except BaseException:
         try:
@@ -489,30 +489,30 @@ async def restart_daytona_supervisor(
         provider="daytona",
         url=url,
         root=root,
-        sandbox_id=sandbox.id,
+        sandbox_ref=sandbox.id,
     )
 
 
 async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
     """Shared logic for destroy/stop Daytona sandbox."""
-    if not instance.sandbox_id:
+    if not instance.sandbox_ref:
         return
     try:
         daytona = _get_daytona_client()
     except (ImportError, RuntimeError) as e:
-        log.warning("cannot %s daytona sandbox %s: %s", op, instance.sandbox_id, e)
+        log.warning("cannot %s daytona sandbox %s: %s", op, instance.sandbox_ref, e)
         return
 
     loop = asyncio.get_running_loop()
     try:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(instance.sandbox_id))
+        sandbox = await loop.run_in_executor(None, lambda: daytona.get(instance.sandbox_ref))
         if op == "delete":
             await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
         else:
             await loop.run_in_executor(None, sandbox.stop)
-        log.info("daytona sandbox %sd: %s", op, instance.sandbox_id)
+        log.info("daytona sandbox %sd: %s", op, instance.sandbox_ref)
     except Exception as e:
-        log.warning("failed to %s daytona sandbox %s: %s", op, instance.sandbox_id, e)
+        log.warning("failed to %s daytona sandbox %s: %s", op, instance.sandbox_ref, e)
 
 
 async def destroy_daytona(instance: ProviderInstance) -> None:
@@ -834,7 +834,7 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     loop = asyncio.get_running_loop()
     try:
         sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_id)
+            None, lambda: daytona_client.get(inst.sandbox_ref)
         )
     except Exception as e:
         # Daytona raises a plain Exception with "not found" in the message when
@@ -843,7 +843,7 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
         if "not found" in str(e).lower():
             from ._shared import SandboxMissingError
             raise SandboxMissingError(
-                f"Daytona sandbox {inst.sandbox_id} not found (deleted externally)"
+                f"Daytona sandbox {inst.sandbox_ref} not found (deleted externally)"
             ) from e
         raise
     # If the sandbox was stopped externally (e.g. daytona.stop()), start it
@@ -851,10 +851,10 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     raw_state = sandbox.state
     state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
     if state_str != "started":
-        log.info("ensure_supervisor_url: sandbox %s is %s; starting", inst.sandbox_id[:16], state_str)
+        log.info("ensure_supervisor_url: sandbox %s is %s; starting", inst.sandbox_ref[:16], state_str)
         await loop.run_in_executor(None, sandbox.start)
-        await _wait_for_daytona_sandbox_ready(daytona_client, inst.sandbox_id)
-        sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(inst.sandbox_id))
+        await _wait_for_daytona_sandbox_ready(daytona_client, inst.sandbox_ref)
+        sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(inst.sandbox_ref))
     # The agent's HOME is /home/daytona — a local ext4 dir the supervisor
     # creates and populates from the volume snapshot on boot. supervisor.js
     # sets HOME=root when spawning the ACP child so Claude Code's session
@@ -1018,7 +1018,7 @@ async def create_sandbox(
     root: str | None = None,
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
-    sandbox_id: str | None = None,  # accepted for parity; unused here
+    sandbox_ref: str | None = None,  # accepted for parity; unused here
     shared_mounts: list[str] | None = None,
 ) -> ProviderInstance:
     """Uniform ``create_sandbox`` for the Daytona provider.
@@ -1028,7 +1028,7 @@ async def create_sandbox(
     shared mounts) but does NOT start a supervisor; the caller must run
     ``ensure_supervisor_url`` before talking to the supervisor.
 
-    ``spawn_env`` / ``port`` / ``sandbox_id`` are accepted for parity with
+    ``spawn_env`` / ``port`` / `sandbox_ref` are accepted for parity with
     docker/local but are unused here — the supervisor is started later with
     its own env + port, and Daytona doesn't take a name on create.
     """
@@ -1210,14 +1210,14 @@ async def volume_download(ref: str, path: str) -> bytes:
         raise ValueError("volume_download: path required")
     target = "/v/" + rel
     inst = await _get_or_create_utility(ref)
-    if not inst.sandbox_id:
-        raise RuntimeError("volume_download: utility sandbox_id missing")
+    if not inst.sandbox_ref:
+        raise RuntimeError("volume_download: utility sandbox_ref missing")
 
     loop = asyncio.get_running_loop()
     daytona_client = _get_daytona_client()
     try:
         sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_id)
+            None, lambda: daytona_client.get(inst.sandbox_ref)
         )
     except Exception as e:
         raise RuntimeError(f"volume_download: get sandbox failed: {e}") from e
@@ -1242,13 +1242,13 @@ async def _conditional_upload_if_absent(ref: str, abs_path: str, content: bytes)
     Raises RuntimeError on transport/protocol failures.
     """
     inst = await _get_or_create_utility(ref)
-    if not inst.sandbox_id:
-        raise RuntimeError("conditional upload: utility sandbox_id missing")
+    if not inst.sandbox_ref:
+        raise RuntimeError("conditional upload: utility sandbox_ref missing")
     loop = asyncio.get_running_loop()
     daytona_client = _get_daytona_client()
     try:
         sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_id)
+            None, lambda: daytona_client.get(inst.sandbox_ref)
         )
     except Exception as e:
         raise RuntimeError(f"conditional upload: get sandbox failed: {e}") from e

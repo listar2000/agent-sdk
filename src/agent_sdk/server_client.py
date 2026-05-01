@@ -263,7 +263,7 @@ class ServerClient:
         Eager by default (``provision: true``) — provisions a sandbox
         and connects ACP before returning. Pass ``provision: false`` in
         the body to get a session shell without a sandbox; pass
-        ``sandbox_id`` to reuse an existing sandbox.
+        `sandbox_ref` to reuse an existing sandbox.
         """
         return await self._json("POST", "/sessions", json=body)
 

@@ -75,37 +75,8 @@ class AgentRecord:
     config: AgentConfig = field(default_factory=AgentConfig)
 
 
-@dataclass
-class SandboxRecord:
-    id: str
-    provider: Provider
-    sandbox_ref: str
-    status: SandboxStatus = "stopped"
-    root: str = "/tmp"
-    volume_id: str | None = None
-    subpath: str | None = None
-    # Host-side port the supervisor listens on. Populated for docker/local;
-    # always NULL for Daytona (URL comes from the SDK-signed preview API).
-    listen_port: int | None = None
-    # Provisioning-time identity — frozen for the sandbox's lifetime. A
-    # sandbox replacement (e.g. daytona unrecoverable error) reads these
-    # from the row to rebuild an equivalent instance, so editing the agent
-    # afterwards doesn't change how an existing sandbox is restarted.
-    dockerfile: str | None = None
-    shared_mounts: list[str] = field(default_factory=list)
-
-    def derive_url(self) -> str:
-        """Reconstruct the supervisor URL from the DB row.
-
-        Used on cold-start when the in-memory ``_INSTANCES`` cache is empty.
-        Requires ``listen_port`` to be set (docker/local). Daytona has no
-        port-based URL; callers must consult the provider's SDK instead.
-        """
-        if self.listen_port is not None:
-            return f"http://localhost:{self.listen_port}"
-        raise NotImplementedError(
-            f"URL derivation for provider '{self.provider}' requires external resolver"
-        )
+# SandboxRecord removed: the sandboxes table is gone. Sandbox identity
+# lives in ``sessions.sandbox_state`` JSONB owned by the SessionPool.
 
 
 @dataclass
@@ -304,7 +275,6 @@ class LogEntry:
     id: int
     session_id: str
     agent_id: str
-    sandbox_id: str
     event_type: str      # "user_message" | "assistant_message" | "tool_call" | "tool_result" | "usage" | "error"
     payload: dict        # JSON, structure varies by event_type
     created_at: float

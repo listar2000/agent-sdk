@@ -211,7 +211,7 @@ class Agent:
         skills: list[str] | dict[str, dict] | None = None,  # npx skills sources
         db: str | None = None,
         session_id: str | None = None,
-        sandbox_id: str | None = None,
+        sandbox_ref: str | None = None,
         dockerfile: str | None = None,
         oauth_token: str | None = None,
         api_key: str | None = None,
@@ -233,7 +233,7 @@ class Agent:
         self.mcp_servers = mcp_servers
         self.skills = skills
         self.id: str | None = None  # set after registration (agent_id)
-        self.sandbox_id: str | None = sandbox_id
+        self.sandbox_ref: str | None = sandbox_ref
         self.dockerfile = dockerfile
         self.session_id: str | None = session_id
         self.inner_session_id: str | None = None  # internal — set by server responses
@@ -349,7 +349,7 @@ class Agent:
             if self._registered:
                 return
 
-            if self.session_id is not None and self.sandbox_id is None and self.provider is None:
+            if self.session_id is not None and self.sandbox_ref is None and self.provider is None:
                 # Resume by session_id alone. Ship credentials so the respawned
                 # supervisor runs under the caller's Claude token, not the server's.
                 resume_body: dict[str, Any] = {}
@@ -363,7 +363,7 @@ class Agent:
                 )
                 _raise_for_status(resp)
                 data = resp.json()
-                self.sandbox_id = data.get("sandbox_id") or self.sandbox_id
+                self.sandbox_ref = data.get("sandbox_ref") or self.sandbox_ref
                 self.inner_session_id = data.get("inner_session_id")
                 self.id = data.get("agent_id") or self.name
             elif self.provider is not None:
@@ -376,7 +376,7 @@ class Agent:
                 _raise_for_status(resp)
                 data = resp.json()
                 self.id = data.get("agent_id", self.name)
-                self.sandbox_id = data.get("sandbox_id")
+                self.sandbox_ref = data.get("sandbox_ref")
                 self.inner_session_id = data.get("inner_session_id")
                 if self.session_id is None:
                     self.session_id = data.get("session_id") or str(uuid.uuid4())
@@ -397,7 +397,7 @@ class Agent:
                     self._persist.update_session(SessionRecord(
                         id=self.session_id,
                         agent_id=self.id or self.name,
-                        sandbox_id=self.sandbox_id,
+                        sandbox_ref=self.sandbox_ref,
                         inner_session_id=self.inner_session_id,
                         created_at=now,
                         updated_at=now,
@@ -585,7 +585,7 @@ class Agent:
         """Clear session state so the agent re-registers on next call."""
         self.session_id = None
         self.inner_session_id = None
-        self.sandbox_id = None
+        self.sandbox_ref = None
         self._registered = False
         self._system_prompt_sent = False
 

@@ -235,7 +235,7 @@ class BaseSandboxSession(abc.ABC):
     @abc.abstractmethod
     async def start(self) -> None:
         """Bring compute up; restore from ``state.snapshot_path`` if set;
-        attach ACP. Mutates ``state`` in place (e.g. fills ``sandbox_id``
+        attach ACP. Mutates ``state`` in place (e.g. fills `sandbox_ref`
         on cold-create). Idempotent if already started.
 
         Provider-internal decision tree (not exposed):

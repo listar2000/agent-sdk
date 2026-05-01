@@ -326,13 +326,13 @@ async def create_sandbox(
     dockerfile: str | None = None,  # ignored — Modal uses _get_image()
     pre_start_commands: list[str] | None = None,
     port: int | None = None,  # accepted for parity; Modal picks its own via tunnel
-    sandbox_id: str | None = None,
+    sandbox_ref: str | None = None,
     shared_mounts: list[str] | None = None,
     **_kw,
 ) -> ProviderInstance:
     """Create a Modal sandbox with the volume mounted and supervisor running.
 
-    Returns a ``ProviderInstance`` with ``sandbox_id`` set to Modal's
+    Returns a ``ProviderInstance`` with ``sandbox_ref`` set to Modal's
     ``object_id`` and ``url`` set to the HTTPS tunnel URL. Supervisor is
     already started — ``ensure_supervisor_url`` is a no-op.
     """
@@ -378,9 +378,9 @@ async def create_sandbox(
     )
 
     try:
-        if sandbox_id:
+        if sandbox_ref:
             # Tags persist on the Modal side and drive reconcile_on_startup.
-            await asyncio.to_thread(sb.set_tags, {_TAG_KEY: sandbox_id})
+            await asyncio.to_thread(sb.set_tags, {_TAG_KEY: sandbox_ref})
 
         # Fetch the HTTPS tunnel URL. ``timeout`` here is the time Modal will
         # spend waiting for the tunnel to become ready.
@@ -419,7 +419,7 @@ async def create_sandbox(
             provider="modal",
             url=url,
             root=agent_root,
-            sandbox_id=sb.object_id,
+            sandbox_ref=sb.object_id,
             container_id=sb.object_id,
         )
     except BaseException:
@@ -501,7 +501,7 @@ async def start_sandbox(ref: str) -> None:
 
 async def stop_sandbox(inst: ProviderInstance) -> None:
     """Terminate the sandbox. Modal has no pause — this is destructive."""
-    sid = inst.sandbox_id or inst.container_id
+    sid = inst.sandbox_ref or inst.container_id
     if not sid:
         return
     try:
@@ -519,7 +519,7 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
 async def destroy_sandbox(inst: ProviderInstance) -> None:
     """Destroy the sandbox. Same as ``stop_sandbox`` — Modal has no two-tier."""
     await stop_sandbox(inst)
-    inst.sandbox_id = None
+    inst.sandbox_ref = None
     inst.container_id = None
 
 
@@ -547,7 +547,7 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     ``_exec_subprocess`` helper: stdout/stderr capped at 1 MiB each, a
     timeout yields ``ExecResult(timed_out=True)``.
     """
-    sid = inst.sandbox_id or inst.container_id
+    sid = inst.sandbox_ref or inst.container_id
     if not sid:
         raise RuntimeError("modal exec: no sandbox id on instance")
     sb = await _lookup_sandbox(sid)
@@ -583,7 +583,7 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
 # ---------------------------------------------------------------------------
 
 async def reconcile_on_startup() -> None:
-    """Terminate Modal sandboxes whose DB sandbox_id is gone or deleted.
+    """Terminate Modal sandboxes whose sandbox_ref is no longer in any live session or deleted.
 
     Iterates every sandbox under our app carrying the
     ``agent-sdk.sandbox-id`` tag. Untagged sandboxes are left alone
@@ -615,26 +615,41 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: list failed: %s", e)
         return
 
+    # Source of truth for "live sandboxes": the SessionPool's
+    # ``sandbox_state.sandbox_ref`` JSONB on each sessions row.
+    try:
+        async with dbmod.get_db() as conn:
+            rows = await (await conn.execute(
+                "SELECT DISTINCT sandbox_state->>'sandbox_ref' AS sid"
+                " FROM sessions"
+                " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
+            )).fetchall()
+        live_refs = {r["sid"] for r in rows}
+    except Exception as e:
+        log.warning("modal reconcile: live-session query failed: %s", e)
+        return
+
     for sb in sandboxes:
         try:
             tags = await asyncio.to_thread(sb.get_tags)
         except Exception as e:
             log.warning("modal reconcile: get_tags %s: %s", sb.object_id, e)
             continue
-        sandbox_id = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
-        if not sandbox_id:
+        sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
+        if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
             continue
-        try:
-            row = await dbmod.get_sandbox(sandbox_id)
-        except Exception as e:
-            log.warning("modal reconcile: get_sandbox(%s): %s", sandbox_id, e)
-            continue
-        is_orphan = row is None or getattr(row, "status", None) == "deleted"
+        # Modal tags also carry the modal sandbox object_id; the pool stores
+        # whatever was passed to create_sandbox as state.sandbox_ref. Check
+        # both forms so a label-rename doesn't strand live sandboxes.
+        is_orphan = (
+            sandbox_ref_tag not in live_refs
+            and sb.object_id not in live_refs
+        )
         if is_orphan:
             log.info(
-                "modal reconcile: terminating orphan %s (sandbox_id=%s)",
-                sb.object_id, sandbox_id,
+                "modal reconcile: terminating orphan %s (sandbox_ref=%s)",
+                sb.object_id, sandbox_ref_tag,
             )
             try:
                 await asyncio.to_thread(sb.terminate)

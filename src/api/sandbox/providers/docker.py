@@ -60,27 +60,27 @@ class DockerSandboxSession(BaseSandboxSession):
         # If state has a container id, try to keep it (test invariant:
         # external stop must restart same container, not provision new).
         instance = None
-        if self.state.sandbox_id:
+        if self.state.sandbox_ref:
             try:
-                status = await dk_provider.get_sandbox_status(self.state.sandbox_id)
+                status = await dk_provider.get_sandbox_status(self.state.sandbox_ref)
                 from api.providers import ProviderInstance
                 if status == "running":
                     instance = ProviderInstance(
                         provider="docker",
                         url=f"http://127.0.0.1:{self.state.listen_port}",
                         root=self.state.recipe.root or "/home/agent",
-                        sandbox_id=self.state.sandbox_id,
+                        sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
                 elif status == "stopped":
                     # Container exists but stopped (`docker stop` w/o --rm).
                     # `docker start` revives it on the same image+volume.
-                    await dk_provider.start_sandbox(self.state.sandbox_id)
+                    await dk_provider.start_sandbox(self.state.sandbox_ref)
                     instance = ProviderInstance(
                         provider="docker",
                         url=f"http://127.0.0.1:{self.state.listen_port}",
                         root=self.state.recipe.root or "/home/agent",
-                        sandbox_id=self.state.sandbox_id,
+                        sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
                 # missing/error → fall through to create.
@@ -97,10 +97,10 @@ class DockerSandboxSession(BaseSandboxSession):
                 pre_start_commands=self.state.recipe.pre_start_commands or None,
                 shared_mounts=self.state.recipe.shared_mounts or None,
             )
-            self.state.sandbox_id = instance.sandbox_id
+            self.state.sandbox_ref = instance.sandbox_ref
             self.state.listen_port = instance.port
 
-        self._container_id = instance.sandbox_id
+        self._container_id = instance.sandbox_ref
         self._supervisor_url = instance.url
 
         ok = await _wait_for_health(instance.url, max_retries=10, interval=0.3)
@@ -246,13 +246,13 @@ class DockerSandboxSession(BaseSandboxSession):
             await dk_provider.stop_sandbox(ProviderInstance(
                 provider="docker", url=self._supervisor_url or "",
                 root=self.state.recipe.root or "/home/agent",
-                sandbox_id=self.state.sandbox_id or "",
+                sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
         except Exception:
             log.exception("docker.stop_sandbox failed for session %s", self.session_id)
         # Container is gone; clear sandbox_id so next start cold-creates.
-        self.state.sandbox_id = None
+        self.state.sandbox_ref = None
         self.state.listen_port = None
 
     # ------------------------------------------------------------------ #

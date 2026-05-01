@@ -35,18 +35,18 @@ from api.sandbox import (
 class TestSandboxStateRoundTrip:
     def test_daytona_serialize_then_deserialize(self):
         s = DaytonaSandboxState(
-            sandbox_id="daytona-abc",
+            sandbox_ref="daytona-abc",
             listen_port=9100,
             recipe=Recipe(agent_type="claude", root="/home/daytona"),
         )
         round_tripped = deserialize(serialize(s))
         assert isinstance(round_tripped, DaytonaSandboxState)
-        assert round_tripped.sandbox_id == "daytona-abc"
+        assert round_tripped.sandbox_ref == "daytona-abc"
         assert round_tripped.recipe.agent_type == "claude"
 
     def test_docker_serialize_then_deserialize(self):
         s = DockerSandboxState(
-            sandbox_id="container-xyz",
+            sandbox_ref="container-xyz",
             listen_port=2497,
             recipe=Recipe(agent_type="codex", root="/home/agent",
                           shared_mounts=["/srv:/srv:ro"]),

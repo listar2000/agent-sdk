@@ -204,12 +204,12 @@ async def create_sandbox(
     root: str | None = None,
     dockerfile: str | None = None,  # accepted for parity; no effect on local
     pre_start_commands: list[str] | None = None,  # accepted for parity
-    sandbox_id: str | None = None,  # accepted for parity; local has no labels
+    sandbox_ref: str | None = None,  # accepted for parity; local has no labels
     **_: object,
 ) -> ProviderInstance:
     """Launch a supervisor subprocess rooted at ``<vol>/<subpath>``.
 
-    Returns a ProviderInstance whose ``sandbox_id`` is the stringified pid
+    Returns a ProviderInstance whose ``sandbox_ref`` is the stringified pid
     of the supervisor process; the live ``Popen`` is also kept in
     ``_PROCESSES`` for later status/destroy lookups by pid.
     """
@@ -359,7 +359,7 @@ async def create_sandbox(
         provider="local",
         url=url,
         root=str(home_dir),
-        sandbox_id=ref,
+        sandbox_ref=ref,
         port=port,
         process=proc,
     )
@@ -396,7 +396,7 @@ def _resolve_proc_and_ref(inst: ProviderInstance) -> tuple[subprocess.Popen | No
     across rebinds), then falls back to the _PROCESSES registry by
     sandbox_ref. Either or both may be None — caller decides what to do.
     """
-    ref = getattr(inst, "sandbox_id", None) if hasattr(inst, "sandbox_id") else None
+    ref = getattr(inst, "sandbox_ref", None) if hasattr(inst, "sandbox_ref") else None
     proc: subprocess.Popen | None = None
     if hasattr(inst, "process") and inst.process is not None and isinstance(inst.process, subprocess.Popen):
         proc = inst.process
@@ -498,7 +498,7 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
 
 async def destroy_sandbox(inst: ProviderInstance) -> None:
     """Terminate the supervisor subprocess and wipe all cached state for
-    this ref — sandbox_id, Popen, and spawn args. Subsequent
+    this ref — sandbox_ref, Popen, and spawn args. Subsequent
     get_sandbox_status(ref) returns 'missing'."""
     proc, ref = _resolve_proc_and_ref(inst)
 

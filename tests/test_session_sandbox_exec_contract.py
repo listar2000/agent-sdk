@@ -20,7 +20,6 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from api import providers, server as srv  # noqa: E402
-from api.models import SandboxRecord  # noqa: E402
 
 
 class _FakeProc:

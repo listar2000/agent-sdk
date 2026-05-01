@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from psycopg_pool import AsyncConnectionPool
 
-from .models import AgentConfig, AgentRecord, LogEntry, SandboxRecord, VolumeRecord
+from .models import AgentConfig, AgentRecord, LogEntry, VolumeRecord
 
 log = logging.getLogger(__name__)
 
@@ -26,18 +26,20 @@ _PG_SCHEMA = [
         name    TEXT,
         config  JSONB
     )""",
-    """CREATE TABLE IF NOT EXISTS sandboxes (
-        id              TEXT PRIMARY KEY,
-        provider        TEXT NOT NULL,
-        sandbox_ref     TEXT NOT NULL,
-        status          TEXT DEFAULT 'stopped',
-        root            TEXT NOT NULL DEFAULT '/tmp',
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    """CREATE TABLE IF NOT EXISTS volumes (
+        id            TEXT PRIMARY KEY,
+        name          TEXT NOT NULL UNIQUE,
+        provider      TEXT NOT NULL,
+        provider_ref  TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'ready',
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
+    # No sandboxes table — provider sandbox identity lives in
+    # ``sessions.sandbox_state`` JSONB (single source of truth, owned by
+    # SessionPool).
     """CREATE TABLE IF NOT EXISTS sessions (
         id                  TEXT PRIMARY KEY,
         agent_id            TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-        sandbox_id          TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
         inner_session_id    TEXT,
         env                 JSONB NOT NULL DEFAULT '{}'::jsonb,
         secrets             JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -47,23 +49,11 @@ _PG_SCHEMA = [
         id          SERIAL PRIMARY KEY,
         session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
         agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-        sandbox_id  TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
         event_type  TEXT NOT NULL,
         payload     JSONB NOT NULL,
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
-    """CREATE TABLE IF NOT EXISTS volumes (
-        id            TEXT PRIMARY KEY,
-        name          TEXT NOT NULL UNIQUE,
-        provider      TEXT NOT NULL,
-        provider_ref  TEXT NOT NULL,
-        status        TEXT NOT NULL DEFAULT 'ready',
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-    )""",
     "CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id)",
-    # Note: idx_sessions_sandbox was removed here; after the 2026-04-21 migration
-    # that renames sandbox_id -> current_sandbox_id, the index is managed in
-    # _MIGRATIONS as idx_sessions_current_sandbox.
     "CREATE INDEX IF NOT EXISTS idx_session_log_session ON session_log(session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_agent ON session_log(agent_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_volumes_name ON volumes(name)",
@@ -384,6 +374,33 @@ _MIGRATIONS = [
            s.current_sandbox_id, s.agent_id, s.pre_start_commands, s.volume_id
        )
        WHERE s.sandbox_state IS NULL""",
+    # 2026-04-30: drop the sandboxes table + all its mirrors. The pool's
+    # ``sessions.sandbox_state`` JSONB has been the runtime source of
+    # truth since the d4 PR; this migration removes the trigger machinery
+    # that overwrote it, the parallel ``sandboxes`` table, the
+    # ``current_sandbox_id`` FK column, and the ``session_log.sandbox_id``
+    # FK column (write-only, zero readers).
+    "DROP TRIGGER IF EXISTS _sandbox_state_sandboxes_sync ON sandboxes",
+    "DROP TRIGGER IF EXISTS _sandbox_state_sessions_sync ON sessions",
+    "DROP FUNCTION IF EXISTS _sync_sandbox_state_from_sandboxes() CASCADE",
+    "DROP FUNCTION IF EXISTS _sync_sandbox_state_from_sessions() CASCADE",
+    "DROP FUNCTION IF EXISTS _compute_sandbox_state(TEXT, TEXT, JSONB, TEXT) CASCADE",
+    # Drop FK columns before the table they reference.
+    "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_current_sandbox_id_fkey",
+    "ALTER TABLE sessions DROP COLUMN IF EXISTS current_sandbox_id",
+    "ALTER TABLE session_log DROP CONSTRAINT IF EXISTS session_log_sandbox_id_fkey",
+    "ALTER TABLE session_log DROP COLUMN IF EXISTS sandbox_id",
+    # Drop the now-orphaned table.
+    "DROP TABLE IF EXISTS sandboxes",
+    # 2026-04-30 (post-d5 rename): rename sandbox_state JSONB key
+    # ``sandbox_id`` → ``sandbox_ref``. The field always held the
+    # provider's opaque reference (e.g. Daytona sandbox UUID, docker
+    # container id, "local-<hex>"), never a DB row PK; the new name
+    # reflects that. Idempotent: only rows that still have the old key
+    # get rewritten, and the rewrite drops the old key in the same step.
+    """UPDATE sessions
+       SET sandbox_state = jsonb_set(sandbox_state - 'sandbox_id', '{sandbox_ref}', sandbox_state->'sandbox_id')
+       WHERE sandbox_state ? 'sandbox_id'""",
 ]
 
 
@@ -498,56 +515,10 @@ async def delete_agent(agent_id: str) -> None:
 # Sandbox CRUD
 # ---------------------------------------------------------------------------
 
-async def upsert_sandbox(sandbox: SandboxRecord) -> None:
-    async with get_db() as conn:
-        await conn.execute(
-            "INSERT INTO sandboxes"
-            " (id, provider, sandbox_ref, status, root, volume_id, subpath,"
-            "  listen_port, dockerfile, shared_mounts)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
-            " ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,"
-            " sandbox_ref=EXCLUDED.sandbox_ref, status=EXCLUDED.status,"
-            " root=EXCLUDED.root, volume_id=EXCLUDED.volume_id,"
-            " subpath=EXCLUDED.subpath, listen_port=EXCLUDED.listen_port,"
-            " dockerfile=EXCLUDED.dockerfile, shared_mounts=EXCLUDED.shared_mounts",
-            (sandbox.id, sandbox.provider, sandbox.sandbox_ref, sandbox.status,
-             sandbox.root, sandbox.volume_id, sandbox.subpath, sandbox.listen_port,
-             sandbox.dockerfile, Json(list(sandbox.shared_mounts or []))),
-        )
-
-
-def _row_to_sandbox(row: dict) -> SandboxRecord:
-    return SandboxRecord(
-        id=row["id"], provider=row["provider"],
-        sandbox_ref=row["sandbox_ref"], status=row["status"],
-        root=row.get("root", "/tmp"),
-        volume_id=row.get("volume_id"),
-        subpath=row.get("subpath"),
-        listen_port=row.get("listen_port"),
-        dockerfile=row.get("dockerfile"),
-        shared_mounts=list(row.get("shared_mounts") or []),
-    )
-
-
-async def get_sandbox(sandbox_id: str) -> SandboxRecord | None:
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT * FROM sandboxes WHERE id = %s", (sandbox_id,)
-        )).fetchone()
-    if row is None:
-        return None
-    return _row_to_sandbox(row)
-
-
-async def list_sandboxes() -> list[SandboxRecord]:
-    async with get_db() as conn:
-        rows = await (await conn.execute("SELECT * FROM sandboxes")).fetchall()
-    return [_row_to_sandbox(r) for r in rows]
-
-
-async def delete_sandbox(sandbox_id: str) -> None:
-    async with get_db() as conn:
-        await conn.execute("DELETE FROM sandboxes WHERE id = %s", (sandbox_id,))
+# Sandbox CRUD removed: the sandboxes table is gone (see migration in
+# _MIGRATIONS that drops it). Pool's sandbox_state JSONB on the sessions
+# row is the single source of truth; provider sandbox refs live there
+# directly.
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +597,7 @@ async def add_supervisor_agent_type(volume_id: str, agent_type: str) -> None:
 # Session CRUD
 # ---------------------------------------------------------------------------
 
-async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
+async def upsert_session(session_id: str, agent_id: str,
                          inner_session_id: str | None,
                          volume_id: str | None = None,
                          env: dict[str, str] | None = None,
@@ -638,14 +609,10 @@ async def upsert_session(session_id: str, agent_id: str, sandbox_id: str | None,
     PATCH-like semantics: ``env=None`` / ``secrets=None`` / ``cwd=None``
     means don't touch the stored column on update. Pass ``{}`` / ``""``
     to explicitly wipe.
-
-    ``sandbox_id`` maps to the ``current_sandbox_id`` column (may be None
-    if no sandbox is currently attached).
     """
-    cols = ["id", "agent_id", "current_sandbox_id", "inner_session_id"]
-    vals: list = [session_id, agent_id, sandbox_id, inner_session_id]
+    cols = ["id", "agent_id", "inner_session_id"]
+    vals: list = [session_id, agent_id, inner_session_id]
     update_parts = [
-        "current_sandbox_id=EXCLUDED.current_sandbox_id",
         "inner_session_id=EXCLUDED.inner_session_id",
     ]
     # (column_name, raw_value, value_transform) — included only when raw is not None
@@ -691,14 +658,6 @@ async def update_session_secrets(session_id: str, secrets: dict[str, str]) -> No
         )
 
 
-async def set_session_current_sandbox(session_id: str, sandbox_id: str | None) -> None:
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET current_sandbox_id = %s WHERE id = %s",
-            (sandbox_id, session_id),
-        )
-
-
 async def get_session(session_id: str) -> dict | None:
     async with get_db() as conn:
         row = await (await conn.execute(
@@ -736,22 +695,9 @@ async def get_session_secrets(session_id: str) -> dict[str, str]:
     return row["secrets"] or {}
 
 
-async def get_any_session_for_sandbox(sandbox_id: str) -> dict | None:
-    """Return one (most-recently updated) session row on this sandbox, or None.
-
-    Used to reconstruct spawn_env when restarting a sandbox without a specific
-    session_id in hand. All sessions on a sandbox share the same supervisor
-    process and thus the same spawn env.
-    """
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT * FROM sessions WHERE current_sandbox_id = %s"
-            " ORDER BY created_at DESC, id DESC LIMIT 1",
-            (sandbox_id,),
-        )).fetchone()
-    if row is None:
-        return None
-    return dict(row)
+# get_any_session_for_sandbox removed: it walked sessions.current_sandbox_id
+# (gone with the sandboxes table) and was only used by the legacy back-compat
+# spawn_env-reconstruction path that the SessionPool replaced.
 
 
 # ---------------------------------------------------------------------------
@@ -760,24 +706,24 @@ async def get_any_session_for_sandbox(sandbox_id: str) -> dict | None:
 
 def _row_to_log_entry(r: dict) -> LogEntry:
     return LogEntry(id=r["id"], session_id=r["session_id"], agent_id=r["agent_id"],
-                    sandbox_id=r["sandbox_id"], event_type=r["event_type"],
+                    event_type=r["event_type"],
                     payload=r["payload"], created_at=r["created_at"].timestamp())
 
 
-async def log_event(*, session_id: str, agent_id: str, sandbox_id: str | None,
+async def log_event(*, session_id: str, agent_id: str,
                     event_type: str, payload: dict) -> None:
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO session_log (session_id, agent_id, sandbox_id, event_type, payload)"
-            " VALUES (%s, %s, %s, %s, %s)",
-            (session_id, agent_id, sandbox_id, event_type, Json(payload)),
+            "INSERT INTO session_log (session_id, agent_id, event_type, payload)"
+            " VALUES (%s, %s, %s, %s)",
+            (session_id, agent_id, event_type, Json(payload)),
         )
 
 
 async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
     async with get_db() as conn:
         rows = await (await conn.execute(
-            "SELECT id, session_id, agent_id, sandbox_id, event_type, payload, created_at"
+            "SELECT id, session_id, agent_id, event_type, payload, created_at"
             " FROM session_log WHERE session_id = %s ORDER BY created_at ASC LIMIT %s",
             (session_id, limit),
         )).fetchall()

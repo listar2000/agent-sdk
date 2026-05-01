@@ -16,7 +16,7 @@ from typing import Protocol
 class SessionRecord:
     id: str
     agent_id: str
-    sandbox_id: str | None = None
+    sandbox_ref: str | None = None
     inner_session_id: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -38,7 +38,7 @@ class SqliteSessionDriver:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions ("
-            "id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, sandbox_id TEXT,"
+            "id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, sandbox_ref TEXT,"
             " inner_session_id TEXT,"
             " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
         )
@@ -47,6 +47,13 @@ class SqliteSessionDriver:
             self._conn.execute("ALTER TABLE sessions ADD COLUMN inner_session_id TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        # Migrate existing databases that still have the old sandbox_id column.
+        # SQLite's ALTER TABLE RENAME COLUMN is supported >=3.25; fall back to
+        # add-new-column-and-copy if RENAME fails.
+        try:
+            self._conn.execute("ALTER TABLE sessions RENAME COLUMN sandbox_id TO sandbox_ref")
+        except sqlite3.OperationalError:
+            pass  # Already renamed, or fresh DB.
         self._conn.commit()
 
     def get_session(self, id: str) -> SessionRecord | None:
@@ -56,7 +63,7 @@ class SqliteSessionDriver:
             return None
         return SessionRecord(
             id=row["id"], agent_id=row["agent_id"],
-            sandbox_id=row["sandbox_id"],
+            sandbox_ref=row["sandbox_ref"],
             inner_session_id=row["inner_session_id"],
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
@@ -64,13 +71,13 @@ class SqliteSessionDriver:
     def update_session(self, session: SessionRecord) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sessions (id, agent_id, sandbox_id, inner_session_id, created_at, updated_at)"
+                "INSERT INTO sessions (id, agent_id, sandbox_ref, inner_session_id, created_at, updated_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET"
-                " agent_id=excluded.agent_id, sandbox_id=excluded.sandbox_id,"
+                " agent_id=excluded.agent_id, sandbox_ref=excluded.sandbox_ref,"
                 " inner_session_id=excluded.inner_session_id,"
                 " updated_at=excluded.updated_at",
-                (session.id, session.agent_id, session.sandbox_id, session.inner_session_id,
+                (session.id, session.agent_id, session.sandbox_ref, session.inner_session_id,
                  session.created_at, session.updated_at),
             )
             self._conn.commit()

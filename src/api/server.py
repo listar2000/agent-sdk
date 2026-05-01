@@ -35,11 +35,9 @@ from .db import (
     add_supervisor_agent_type,
     close_pool,
     delete_agent,
-    delete_sandbox,
     delete_volume,
     get_agent,
     get_db,
-    get_sandbox,
     get_session,
     get_session_log,
     get_volume,
@@ -47,14 +45,11 @@ from .db import (
     init_db,
     init_pool,
     list_agents,
-    list_sandboxes,
     list_volumes,
     log_event,
     update_session_env,
     update_session_secrets,
-    set_session_current_sandbox,
     upsert_agent,
-    upsert_sandbox,
     upsert_session,
     upsert_volume,
 )
@@ -68,7 +63,6 @@ from .models import (
     EVT_USER_MESSAGE,
     AgentConfig,
     AgentRecord,
-    SandboxRecord,
     VolumeRecord,
 )
 from . import providers as _providers_mod
@@ -118,7 +112,7 @@ async def lifespan(app):
     await init_pool()
 
     # Startup reconciliation: kill orphan containers labeled with a
-    # sandbox_id whose DB row is gone or marked deleted. Per-provider in
+    # sandbox_ref whose DB row is gone or marked deleted. Per-provider in
     # parallel so a slow provider doesn't serialise boot. In practice
     # only Docker does real work; daytona/local/modal are no-ops today.
     async def _safe_reconcile(prov: str) -> None:
@@ -203,13 +197,6 @@ async def _require_agent(agent_id: str) -> AgentRecord:
     rec = await get_agent(agent_id)
     if rec is None:
         raise HTTPException(404, "agent not found")
-    return rec
-
-
-async def _require_sandbox(sandbox_id: str) -> SandboxRecord:
-    rec = await get_sandbox(sandbox_id)
-    if rec is None:
-        raise HTTPException(404, "sandbox not found")
     return rec
 
 
@@ -642,28 +629,18 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
             "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (vol.id,)
         )
         session_count = (await cur.fetchone())["n"]
-        cur = await conn.execute(
-            "SELECT count(*) AS n FROM sandboxes WHERE volume_id = %s", (vol.id,)
-        )
-        sandbox_count = (await cur.fetchone())["n"]
 
-        if (session_count > 0 or sandbox_count > 0) and not force:
+        if session_count > 0 and not force:
             raise HTTPException(
                 409,
-                f"Volume has {session_count} session(s) and {sandbox_count} "
-                f"sandbox(es). Use ?force=true to cascade.",
+                f"Volume has {session_count} session(s). "
+                f"Use ?force=true to cascade.",
             )
-        if force:
-            # Sessions first (sandbox FK is SET NULL), then sandboxes —
+        if force and session_count > 0:
             # FK RESTRICT on volume blocks the final delete otherwise.
-            if session_count > 0:
-                await conn.execute(
-                    "DELETE FROM sessions WHERE volume_id = %s", (vol.id,),
-                )
-            if sandbox_count > 0:
-                await conn.execute(
-                    "DELETE FROM sandboxes WHERE volume_id = %s", (vol.id,),
-                )
+            await conn.execute(
+                "DELETE FROM sessions WHERE volume_id = %s", (vol.id,),
+            )
 
     try:
         # daytona.delete_volume is aliased to delete_daytona_volume; the
@@ -909,75 +886,10 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
         raise _volume_fs_err("Rename", vol.provider, e)
 
 
-# ---------------------------------------------------------------------------
-# Sandbox CRUD
-# ---------------------------------------------------------------------------
-
-
-@app.get("/sandboxes")
-async def list_sandboxes_route():
-    sandboxes = await list_sandboxes()
-    return [
-        {
-            "id": s.id,
-            "provider": s.provider,
-            "sandbox_ref": s.sandbox_ref,
-            "status": s.status,
-            "root": s.root,
-        }
-        for s in sandboxes
-    ]
-
-
-@app.get("/sandboxes/{sandbox_id}")
-async def get_sandbox_route(sandbox_id: str):
-    record = await _require_sandbox(sandbox_id)
-    result = {
-        "id": record.id,
-        "provider": record.provider,
-        "sandbox_ref": record.sandbox_ref,
-        "status": record.status,
-        "root": record.root,
-    }
-    if record.provider in PORT_BASED_PROVIDERS:
-        try:
-            result["url"] = record.derive_url()
-        except Exception:
-            pass
-    # Local provider exposes the alive-marker path so an external "delete"
-    # simulation can remove just the marker without disturbing home —
-    # preserves the volume-persistence test invariants. PID isn't surfaced
-    # anymore (was tied to the legacy ``_INSTANCES`` cache); test helpers
-    # discover the supervisor by its listening port instead.
-    if record.provider == "local":
-        from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
-        args = _LOCAL_SPAWN_ARGS.get(record.sandbox_ref)
-        if args and args.get("marker_path"):
-            result["marker_path"] = args["marker_path"]
-    return result
-
-
-@app.delete("/sandboxes/{sandbox_id}")
-async def delete_sandbox_route(sandbox_id: str):
-    record = await _require_sandbox(sandbox_id)
-
-    # Every sandbox is now pool-owned (the legacy POST /sandboxes route
-    # that created stand-alone sandboxes is gone). Release through the
-    # pool so SandboxSession.stop() snapshots + tears down the compute,
-    # then drop the sandbox row. Match the pool by ``sandbox_ref`` (the
-    # provider UUID stored in ``state.sandbox_id``), not by the DB row
-    # PK we got from the URL.
-    try:
-        from api.sandbox import get_pool
-        pool = get_pool()
-        pool_session = pool.find_by_sandbox_id(record.sandbox_ref)
-        if pool_session is not None:
-            await pool.release(pool_session.session_id)
-    except Exception as e:
-        log.warning("DELETE /sandboxes %s: pool.release failed: %s", sandbox_id, e)
-
-    await delete_sandbox(sandbox_id)
-    return {"status": "deleted"}
+# Sandbox CRUD routes removed: the standalone ``sandboxes`` table is gone;
+# session-scoped routes (``GET /sessions/{id}/sandbox``,
+# ``DELETE /sessions/{id}``) replace them. Reverse lookups by sandbox_ref
+# go through ``SessionPool.find_by_sandbox_ref``.
 
 
 # ---------------------------------------------------------------------------
@@ -1001,8 +913,7 @@ async def admin_list_sessions():
             {
                 "session_id": sid,
                 "agent_id": sess._agent_id,
-                "current_sandbox_id": getattr(sess.state, "sandbox_id", None),
-                "sandbox_ref": getattr(sess.state, "sandbox_id", None),
+                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
                 "inner_session_id": sess._inner_session_id,
                 # "active subscriber" is the closest pool-level proxy for
                 # the dashboard's "running" badge — there's no per-prompt
@@ -1018,7 +929,7 @@ async def admin_list_sessions():
         ],
         "instances": [
             {
-                "sandbox_id": getattr(sess.state, "sandbox_id", None),
+                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
                 "provider": getattr(sess.state, "type", "unknown"),
                 "url": sess.supervisor_url,
                 "port": getattr(sess.state, "listen_port", None),
@@ -1051,7 +962,7 @@ async def list_sessions_route():
         out.append({
             "session_id": s.session_id,
             "agent_id": s._agent_id,  # noqa: SLF001
-            "current_sandbox_id": getattr(s.state, "sandbox_id", None),
+            "sandbox_ref": getattr(s.state, "sandbox_ref", None),
             "idle_seconds": round(now - last, 1) if last else None,
             "shutdown_requested": False,
         })
@@ -1069,11 +980,12 @@ async def get_session_route(session_id: str):
     rec = await _require_session_row(session_id)
     env = rec.get("env") or {}
     secrets = rec.get("secrets") or {}
+    sb_state = rec.get("sandbox_state") or {}
     return {
         "session_id": rec.get("id"),
         "agent_id": rec.get("agent_id"),
         "volume_id": rec.get("volume_id"),
-        "current_sandbox_id": rec.get("current_sandbox_id"),
+        "sandbox_ref": sb_state.get("sandbox_ref") if isinstance(sb_state, dict) else None,
         "inner_session_id": rec.get("inner_session_id"),
         "env": env,
         "secrets": {"keys": sorted(secrets.keys())},
@@ -1100,7 +1012,7 @@ async def session_status(session_id: str):
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
-        "current_sandbox_id": getattr(state, "sandbox_id", None),
+        "sandbox_ref": getattr(state, "sandbox_ref", None),
         "inner_session_id": pool_session._inner_session_id,
         "agent_busy": False,
         "active_rpc_id": None,
@@ -1137,7 +1049,7 @@ async def session_sandbox_info(session_id: str):
     provider = getattr(state, "type", "unknown")
     if provider == "unix_local":
         provider = "local"
-    sandbox_ref = getattr(state, "sandbox_id", None)
+    sandbox_ref = getattr(state, "sandbox_ref", None)
     result: dict = {
         "session_id": session_id,
         "provider": provider,
@@ -1219,15 +1131,11 @@ async def session_resume(session_id: str, request: Request):
 
     pool = get_pool()
     pool_session = await pool.get_session(session_id)
-    sandbox_id = getattr(pool_session.state, "sandbox_id", None)
+    sandbox_ref = getattr(pool_session.state, "sandbox_ref", None)
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
-        # Dual-key for back-compat: ``sandbox_id`` is the REST/client
-        # convention; ``current_sandbox_id`` matches the DB column +
-        # /sessions/{id} GET response shape.
-        "sandbox_id": sandbox_id,
-        "current_sandbox_id": sandbox_id,
+        "sandbox_ref": sandbox_ref,
         "inner_session_id": pool_session._inner_session_id,
         "status": "resumed",
     }
@@ -1239,9 +1147,9 @@ async def sessions_create(request: Request):
 
     Body:
       - ``provision`` (bool, default ``true``): when ``false``, skip sandbox
-        provisioning and return a session shell with ``current_sandbox_id =
-        null``. The sandbox materialises on the first downstream call that
-        needs one (``/sessions/{id}/start-sandbox`` or ``/message``).
+        provisioning and return a session shell with `sandbox_ref = null`.
+        The sandbox materialises on the first downstream call that needs
+        one (``/sessions/{id}/resume`` or ``/message``).
       - Every other field (``volume_id``, ``agent_id``, ``provider``,
         ``config``, ``env``, ``secrets``, ``cwd``, ``root``, ``dockerfile``,
         ``shared_mounts``) — see the dispatched-to helper for details.
@@ -1302,7 +1210,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
     session_id = str(uuid.uuid4())
     lazy_user_pre_start = data.get("pre_start_commands") or []
     await upsert_session(
-        session_id, agent_id, sandbox_id=None, inner_session_id=None,
+        session_id, agent_id, inner_session_id=None,
         volume_id=volume_record.id,
         env=body_env or {}, secrets=body_secrets or {},
         cwd=cwd,
@@ -1313,7 +1221,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
         "id": session_id,
         "agent_id": agent_id,
         "volume_id": volume_record.id,
-        "current_sandbox_id": None,
+        "sandbox_ref": None,
         "connected": False,
     }
 
@@ -1321,9 +1229,10 @@ async def _sessions_create_lazy(data: dict) -> dict:
 async def _sessions_create_eager(data: dict) -> dict:
     """Create agent + provision compute via SessionPool + attach ACP in one call.
 
-    Returns ``{agent_id, sandbox_id, current_sandbox_id, session_id, id,
-    inner_session_id, volume_id, connected: true}`` — ready to POST
-    /message against immediately.
+    Returns ``{agent_id, sandbox_ref, session_id, id, inner_session_id,
+    volume_id, connected: true}`` — ready to POST /message against
+    immediately. `sandbox_ref` is the provider sandbox ref (an opaque
+    string), not the legacy ``sb_<hex>`` synthesized PK.
 
     Implementation: writes the agent + session rows + initial
     ``sandbox_state`` JSONB, then calls ``pool.get_session(session_id)``
@@ -1394,16 +1303,15 @@ async def _sessions_create_eager(data: dict) -> dict:
 
     session_id = str(uuid.uuid4())
     await upsert_session(
-        session_id, agent_id, sandbox_id=None, inner_session_id=None,
+        session_id, agent_id, inner_session_id=None,
         volume_id=volume_record.id,
         env=body_env or {}, secrets=body_secrets or {},
         cwd=cwd,
         pre_start_commands=user_pre_start,
     )
     # Pre-populate sandbox_state so pool.get_session knows the recipe on
-    # first call. The dual-write trigger fires on UPDATE OF
-    # current_sandbox_id/agent_id/pre_start_commands/volume_id (NOT on
-    # sandbox_state itself), so this UPDATE doesn't get clobbered.
+    # first call. The pool will overwrite this with the full state after
+    # cold-create (sandbox_ref, listen_port, snapshot_path).
     async with get_db() as conn:
         await conn.execute(
             "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
@@ -1424,24 +1332,11 @@ async def _sessions_create_eager(data: dict) -> dict:
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         raise HTTPException(502, f"Provider '{provider}' failed: {e}")
 
-    # Back-compat shim: GET /sandboxes/{id} + DELETE /sandboxes/{id}
-    # (used by recovery test cleanup) still read the sandboxes table,
-    # which the pool's sandbox_state JSONB doesn't populate. Mirror the
-    # row here. Drop once those callers move to session-scoped routes.
-    provider_ref = getattr(pool_session.state, "sandbox_id", None)
-    sandbox_row_id = f"sb_{uuid.uuid4().hex[:12]}"
-    if provider_ref:
-        await upsert_sandbox(SandboxRecord(
-            id=sandbox_row_id, provider=provider, sandbox_ref=provider_ref,
-            status="running",
-            root=(pool_session.state.recipe.root or "/tmp"),
-            volume_id=volume_record.id,
-            subpath=pool_session._subpath or f"agents/{agent_id}",
-            listen_port=getattr(pool_session.state, "listen_port", None),
-            dockerfile=dockerfile,
-            shared_mounts=list(shared_mounts) if shared_mounts else [],
-        ))
-        await set_session_current_sandbox(session_id, sandbox_row_id)
+    # The pool's ``sandbox_state.sandbox_ref`` IS the sandbox identity now —
+    # opaque provider ref (e.g. "abc-uuid" for Daytona, "local-abc12" for
+    # unix_local). No separate ``sb_<hex>`` PK, no sandboxes-table row,
+    # no dual-write trigger to mirror state into a parallel table.
+    provider_ref = getattr(pool_session.state, "sandbox_ref", None)
 
     # Forward model/mode/thought_level so callers don't have to follow
     # POST /sessions with a separate POST /config. Read both top-level
@@ -1451,8 +1346,11 @@ async def _sessions_create_eager(data: dict) -> dict:
 
     return {
         "agent_id": agent_id,
-        "sandbox_id": sandbox_row_id if provider_ref else None,
-        "current_sandbox_id": sandbox_row_id if provider_ref else None,
+        # `sandbox_ref` is the provider sandbox ref now, not the legacy
+        # synthesized ``sb_<hex>`` PK. SDK uses it as an opaque string
+        # identifier for resume/persistence — the change in meaning is
+        # transparent to callers that only check non-None / equality.
+        "sandbox_ref": provider_ref,
         "session_id": session_id,
         "id": session_id,
         "volume_id": volume_record.id,
@@ -1492,25 +1390,6 @@ async def _forward_session_config(
                         method, val, pool_session.session_id, e)
 
 
-async def _resolve_log_sandbox_id(session) -> str | None:
-    """Resolve the ``sandboxes.id`` row PK for this pool session, suitable
-    for ``session_log.sandbox_id`` (FK → ``sandboxes(id)``).
-
-    The pool tracks the *provider* sandbox ref in ``state.sandbox_id``
-    (e.g. ``local-<uuid12>``), not the DB row PK (``sb_<hex>``). The
-    session row's ``current_sandbox_id`` is the right value here, written
-    by the back-compat shim in ``_sessions_create_eager`` and refreshed
-    by the pool-managed reset path.
-
-    Returns ``None`` if no sandbox row is currently linked — callers pass
-    that through unchanged; ``session_log.sandbox_id`` is nullable.
-    """
-    sess = await get_session(session.session_id)
-    if sess is None:
-        return None
-    return sess.get("current_sandbox_id")
-
-
 async def _persist_user_message(session, message: str, rpc_id: str) -> None:
     """Write the EVT_USER_MESSAGE row for a freshly-submitted prompt.
 
@@ -1522,7 +1401,6 @@ async def _persist_user_message(session, message: str, rpc_id: str) -> None:
         await log_event(
             session_id=session.session_id,
             agent_id=session._agent_id or "",
-            sandbox_id=await _resolve_log_sandbox_id(session),
             event_type=EVT_USER_MESSAGE,
             payload={"text": redact_secrets(message), "prompt_id": rpc_id},
         )
@@ -1557,7 +1435,6 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
     by turn. Failure of a single write is non-fatal — we log and keep
     draining so a transient DB hiccup doesn't drop the rest of the turn.
     """
-    sandbox_id = await _resolve_log_sandbox_id(session)
     agent_id = session._agent_id or ""
 
     async def _write(event: dict) -> None:
@@ -1574,7 +1451,7 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
         try:
             await log_event(
                 session_id=session.session_id,
-                agent_id=agent_id, sandbox_id=sandbox_id,
+                agent_id=agent_id,
                 event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
                 payload=payload,
             )
@@ -1632,7 +1509,7 @@ async def _log_session_acquire_error(session_id: str, rpc_id: str,
     """
     try:
         await log_event(
-            session_id=session_id, agent_id="", sandbox_id=None,
+            session_id=session_id, agent_id="",
             event_type=EVT_ERROR,
             payload={
                 "prompt_id": rpc_id,
@@ -1874,21 +1751,11 @@ async def delete_session_route(session_id: str):
     except Exception as e:
         log.warning("DELETE /sessions/%s: pool.release failed: %s",
                     session_id, e)
-    # Drop the session row + any sandbox row currently linked to it via
-    # the back-compat shim. ``ON DELETE CASCADE`` on session_log handles
-    # that side; ``current_sandbox_id`` is FK with ``ON DELETE SET NULL``
-    # but we want to clean the row up entirely, so target it explicitly.
-    sess = await get_session(session_id)
-    if sess is not None:
-        sb_id = sess.get("current_sandbox_id")
-        if sb_id:
-            try:
-                await delete_sandbox(sb_id)
-            except Exception as e:
-                log.warning("DELETE /sessions/%s: delete_sandbox(%s) failed: %s",
-                            session_id, sb_id, e)
-        async with get_db() as conn:
-            await conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+    # Drop the session row. ``ON DELETE CASCADE`` on session_log handles
+    # the log rows; ``sandbox_state`` JSONB lives on the sessions row
+    # itself so it goes with the row.
+    async with get_db() as conn:
+        await conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
 
 
 @app.post("/sessions/{session_id}/config")

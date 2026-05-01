@@ -5,9 +5,9 @@ five-method ``BaseSandboxSession`` contract. Per
 ``docs/ephemeral-sandbox-design.md`` §5.
 
 Lifecycle decisions live inside ``start()``:
-  * ``state.sandbox_id`` set, sandbox alive on Daytona  → reattach (cheapest)
-  * ``state.sandbox_id`` set, sandbox stopped/paused    → ``daytona.start()`` (resume)
-  * ``state.sandbox_id`` missing or sandbox not found   → fresh ``daytona.create()``
+  * ``state.sandbox_ref`` set, sandbox alive on Daytona  → reattach (cheapest)
+  * ``state.sandbox_ref`` set, sandbox stopped/paused    → ``daytona.start()`` (resume)
+  * ``state.sandbox_ref`` missing or sandbox not found   → fresh ``daytona.create()``
 
 No "Type 1 vs Type 2" branching outside this class — recovery just calls
 ``start()``; the class picks the cheapest path internally.
@@ -79,7 +79,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # Resolve the daytona sandbox handle: reattach, restart, or create.
         sandbox = await self._resolve_or_create_sandbox(dt_provider)
         self._daytona_sandbox = sandbox
-        self.state.sandbox_id = sandbox.id
+        self.state.sandbox_ref = sandbox.id
 
         # Bring the supervisor up. ``start_supervisor_in_sandbox`` is
         # idempotent (skips re-spawning when one is already healthy on
@@ -121,14 +121,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
     async def _resolve_or_create_sandbox(self, dt_provider) -> Any:
         """The internal Type-1-vs-Type-2 decision tree, hidden from callers."""
-        if self.state.sandbox_id:
+        if self.state.sandbox_ref:
             try:
                 # Try reattach + resume from pause if needed. The existing
                 # restart_daytona_supervisor handles "stopping/starting"
                 # transitional states via _wait_for_stable_daytona_state
                 # internally, so it's safe under load.
                 instance = await dt_provider.restart_daytona_supervisor(
-                    self.state.sandbox_id,
+                    self.state.sandbox_ref,
                     agent_type=self.state.recipe.agent_type,
                     root=self.state.recipe.root or "/home/daytona",
                     spawn_env=self._spawn_env,
@@ -141,7 +141,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
                 loop = asyncio.get_running_loop()
                 sandbox = await loop.run_in_executor(
-                    None, lambda: client.get(self.state.sandbox_id)
+                    None, lambda: client.get(self.state.sandbox_ref)
                 )
                 self._supervisor_url = instance.url
                 return sandbox
@@ -150,9 +150,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 if "not found" in msg or "404" in msg:
                     log.info(
                         "DaytonaSandboxSession: sandbox %s not found, will create fresh",
-                        (self.state.sandbox_id or "")[:16],
+                        (self.state.sandbox_ref or "")[:16],
                     )
-                    self.state.sandbox_id = None
+                    self.state.sandbox_ref = None
                 else:
                     # Hard error during reattach — propagate, don't silently recreate.
                     raise
@@ -176,7 +176,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         import os as _os
         client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
         loop = asyncio.get_running_loop()
-        sandbox = await loop.run_in_executor(None, lambda: client.get(instance.sandbox_id))
+        sandbox = await loop.run_in_executor(None, lambda: client.get(instance.sandbox_ref))
         return sandbox
 
     # ------------------------------------------------------------------ #
@@ -387,7 +387,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             await dt_provider.stop_daytona(ProviderInstance(
                 provider="daytona", url=self._supervisor_url or "",
                 root=self.state.recipe.root or "/home/daytona",
-                sandbox_id=self.state.sandbox_id or "",
+                sandbox_ref=self.state.sandbox_ref or "",
             ))
         except Exception:
             log.exception("daytona.stop failed for session %s", self.session_id)
