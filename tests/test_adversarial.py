@@ -294,7 +294,7 @@ def _make_agent_record(agent_type: str = "claude") -> AgentRecord:
     )
 
 
-def _make_sandbox_record(provider: str = "local", ref: str = "9999") -> SandboxRecord:
+def _make_sandbox_record(provider: str = "unix_local", ref: str = "9999") -> SandboxRecord:
     return SandboxRecord(id=str(uuid.uuid4()), provider=provider, sandbox_ref=ref, status="running")
 
 
@@ -575,7 +575,7 @@ class TestMcpDictConversion:
 class TestProviderConstants:
     def test_port_based_providers(self):
         from api.providers import PORT_BASED_PROVIDERS
-        assert "local" in PORT_BASED_PROVIDERS
+        assert "unix_local" in PORT_BASED_PROVIDERS
         assert "docker" in PORT_BASED_PROVIDERS
         assert "daytona" not in PORT_BASED_PROVIDERS
 
@@ -802,7 +802,7 @@ class TestProviderHelpers:
 
     def test_port_based_providers_set(self):
         """PORT_BASED_PROVIDERS is a frozenset containing 'local' and 'docker'."""
-        assert "local" in PORT_BASED_PROVIDERS
+        assert "unix_local" in PORT_BASED_PROVIDERS
         assert "docker" in PORT_BASED_PROVIDERS
         assert "daytona" not in PORT_BASED_PROVIDERS
 
@@ -811,7 +811,7 @@ class TestProviderHelpers:
         from api.acp_client import _mcp_dict_to_acp_array as _fn
         mcp = {
             "my-tool": {
-                "type": "local",
+                "type": "unix_local",
                 "command": "mytool",
                 "args": ["--flag"],
                 "env": {"MY_KEY": "val"},
@@ -1341,7 +1341,7 @@ class TestAgentFromFile:
 
     def test_from_json_file(self, tmp_path):
         import json
-        config = {"name": "test-agent", "agent_type": "claude", "model": "sonnet", "provider": "local"}
+        config = {"name": "test-agent", "agent_type": "claude", "model": "sonnet", "provider": "unix_local"}
         f = tmp_path / "agent.json"
         f.write_text(json.dumps(config))
 
@@ -1350,7 +1350,7 @@ class TestAgentFromFile:
         assert agent.name == "test-agent"
         assert agent.agent_type == "claude"
         assert agent.model == "sonnet"
-        assert agent.provider == "local"
+        assert agent.provider == "unix_local"
 
     def test_from_json_file_no_name_uses_stem(self, tmp_path):
         import json
@@ -1369,8 +1369,8 @@ class TestAgentFromFile:
         f.write_text(json.dumps(config))
 
         from agent_sdk.client import Agent
-        agent = Agent.from_file(str(f), provider="local")
-        assert agent.provider == "local"
+        agent = Agent.from_file(str(f), provider="unix_local")
+        assert agent.provider == "unix_local"
 
     def test_from_file_nonexistent_raises(self):
         from agent_sdk.client import Agent
@@ -1408,10 +1408,10 @@ class TestAgentClone:
 
     def test_clone_basic(self):
         from agent_sdk.client import Agent
-        agent = Agent("original", provider="local", model="sonnet", cwd="/workspace")
+        agent = Agent("original", provider="unix_local", model="sonnet", cwd="/workspace")
         cloned = agent.clone()
         assert cloned.name == "original-clone"
-        assert cloned.provider == "local"
+        assert cloned.provider == "unix_local"
         assert cloned.model == "sonnet"
         assert cloned.cwd == "/workspace"
 
@@ -1423,7 +1423,7 @@ class TestAgentClone:
 
     def test_clone_with_overrides(self):
         from agent_sdk.client import Agent
-        agent = Agent("worker", model="sonnet", provider="local")
+        agent = Agent("worker", model="sonnet", provider="unix_local")
         cloned = agent.clone(model="haiku", provider="docker")
         assert cloned.model == "haiku"
         assert cloned.provider == "docker"
@@ -1781,11 +1781,11 @@ class TestValidationEdgeCases:
 class TestAgentRegistrationPayload:
     def test_payload_includes_name(self):
         from agent_sdk.client import Agent
-        a = Agent("myagent", model="sonnet", provider="local")
+        a = Agent("myagent", model="sonnet", provider="unix_local")
         p = a._registration_payload()
         assert p["name"] == "myagent"
         assert p["model"] == "sonnet"
-        assert p["provider"] == "local"
+        assert p["provider"] == "unix_local"
 
     def test_payload_excludes_none(self):
         from agent_sdk.client import Agent

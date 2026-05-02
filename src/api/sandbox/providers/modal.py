@@ -48,14 +48,22 @@ class ModalSandboxSession(BaseSandboxSession):
             try:
                 status = await md_provider.get_sandbox_status(self.state.sandbox_ref)
                 if status == "running":
-                    from api.providers import ProviderInstance
-                    instance = ProviderInstance(
-                        provider="modal",
-                        url=f"http://{self.state.sandbox_ref}.modal.host:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/v",
-                        sandbox_ref=self.state.sandbox_ref,
-                        port=self.state.listen_port,
+                    # Fetch the REAL HTTPS tunnel URL — Modal allocates it at
+                    # sandbox-create time and it is NOT derivable from
+                    # sandbox_ref. The previous code constructed
+                    # "http://<ref>.modal.host:<port>" which never routes.
+                    url = await md_provider.resolve_supervisor_url(
+                        self.state.sandbox_ref
                     )
+                    if url:
+                        from api.providers import ProviderInstance
+                        instance = ProviderInstance(
+                            provider="modal",
+                            url=url,
+                            root=self.state.recipe.root or "/v",
+                            sandbox_ref=self.state.sandbox_ref,
+                            port=self.state.listen_port,
+                        )
             except Exception:
                 pass
 

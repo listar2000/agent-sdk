@@ -44,7 +44,7 @@ def _parse_args() -> tuple[int, str]:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     n_runs = int(args[0]) if args else 3
-    provider = "local"
+    provider = "unix_local"
     for f in flags:
         if f.startswith("--provider="):
             provider = f.split("=", 1)[1]
@@ -116,7 +116,7 @@ async def _ask(client: httpx.AsyncClient, session_id: str, msg: str) -> tuple[st
 
 
 async def _kill_sandbox(provider: str, sandbox_ref: str) -> None:
-    if provider == "local":
+    if provider == "unix_local":
         try:
             os.kill(int(sandbox_ref), 9)
         except (ValueError, ProcessLookupError):

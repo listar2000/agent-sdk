@@ -578,7 +578,7 @@ class TestEnsureRegisteredRetry:
     @pytest.mark.asyncio
     async def test_retries_on_500_and_succeeds_on_third_attempt(self):
         """provider registration retries up to 3 times on 500, succeeds eventually."""
-        agent = Agent("retry-agent", provider="local")
+        agent = Agent("retry-agent", provider="unix_local")
 
         call_count = 0
 
@@ -614,7 +614,7 @@ class TestEnsureRegisteredRetry:
     @pytest.mark.asyncio
     async def test_three_500s_raises_after_max_retries(self):
         """provider registration raises after 3 consecutive 500 errors."""
-        agent = Agent("fail-agent", provider="local")
+        agent = Agent("fail-agent", provider="unix_local")
 
         def _make_500():
             resp = MagicMock()
@@ -634,7 +634,7 @@ class TestEnsureRegisteredRetry:
     @pytest.mark.asyncio
     async def test_concurrent_ensure_registered_only_calls_post_once(self):
         """Concurrent _ensure_registered calls register exactly once (lock protection)."""
-        agent = Agent("concurrent-reg-agent", provider="local")
+        agent = Agent("concurrent-reg-agent", provider="unix_local")
 
         post_calls = []
 

@@ -220,7 +220,7 @@ def main() -> None:
         help="agent_sdk_origin label to match (default: $AGENT_SDK_ORIGIN or 'test')",
     )
     p.add_argument(
-        "--provider", choices=("daytona", "docker", "local", "all"),
+        "--provider", choices=("daytona", "docker", "unix_local", "all"),
         default="all",
         help="restrict to one provider (default: all)",
     )
@@ -236,7 +236,7 @@ def main() -> None:
         total += _reap_daytona(args.origin, dry_run=dry)
     if args.provider in ("docker", "all"):
         total += _reap_docker(args.origin, dry_run=dry)
-    if args.provider in ("local", "all"):
+    if args.provider in ("unix_local", "all"):
         total += _reap_local(dry_run=dry)
 
     if dry:

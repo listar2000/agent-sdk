@@ -126,7 +126,7 @@ class _SpawnRecorder:
         # assertion — different callers use different shapes.
         self.calls.append({"args": args, "kwargs": dict(kwargs)})
         return ProviderInstance(
-            provider=kwargs.get("provider") or (args[0] if args else "local"),
+            provider=kwargs.get("provider") or (args[0] if args else "unix_local"),
             url="http://127.0.0.1:54321",
             root=kwargs.get("root") or "/tmp/fake",
             sandbox_id="99999",
@@ -196,7 +196,7 @@ def _agent_with(transport_client: AsyncClient, **kwargs) -> Agent:
 
 @pytest.mark.asyncio
 async def test_sdk_creates_default_volume_when_none_specified(asgi_server):
-    """``Agent("x", provider="local")`` — no ``volume_id`` in the SDK
+    """``Agent("x", provider="unix_local")`` — no ``volume_id`` in the SDK
     payload — must produce a running sandbox.  The server auto-creates
     ``default-local`` and attaches.
 
@@ -207,7 +207,7 @@ async def test_sdk_creates_default_volume_when_none_specified(asgi_server):
     patches = [
         patch("api.server.create_instance",
               new=AsyncMock(return_value=ProviderInstance(
-                  provider="local", url="http://127.0.0.1:54321",
+                  provider="unix_local", url="http://127.0.0.1:54321",
                   root="/tmp/fake", sandbox_id="77777", port=54321))),
         patch("api.server.ensure_volume_supervisor",
               new=AsyncMock(return_value=None)),
@@ -221,7 +221,7 @@ async def test_sdk_creates_default_volume_when_none_specified(asgi_server):
     for p in patches:
         p.start()
     try:
-        agent = _agent_with(asgi_server, name="no-vol", provider="local")
+        agent = _agent_with(asgi_server, name="no-vol", provider="unix_local")
         # ``send`` registers and queues a message, returning the rpc_id.
         rpc_id = await agent.send("ping")
         assert rpc_id, "expected rpc_id from send()"
@@ -231,7 +231,7 @@ async def test_sdk_creates_default_volume_when_none_specified(asgi_server):
         # The DB volume row exists and is the default-local.
         vol = await dbmod.get_volume_by_name("default-local")
         assert vol is not None, "server must auto-create default-local volume"
-        assert vol.provider == "local"
+        assert vol.provider == "unix_local"
 
         # The session row points at that volume.
         sess = await dbmod.get_session(agent.session_id)
@@ -270,7 +270,7 @@ async def test_sdk_oauth_token_flows_into_spawn_env(asgi_server):
         p.start()
     try:
         agent = _agent_with(
-            asgi_server, name="authy", provider="local",
+            asgi_server, name="authy", provider="unix_local",
             oauth_token="secret-oauth-xyz",
         )
         await agent.send("hi")
@@ -308,7 +308,7 @@ async def test_sdk_api_key_flows_into_spawn_env(asgi_server):
         p.start()
     try:
         agent = _agent_with(
-            asgi_server, name="keyed", provider="local", api_key="sk-ant-xyz",
+            asgi_server, name="keyed", provider="unix_local", api_key="sk-ant-xyz",
         )
         await agent.send("hi")
         env = recorder.spawn_envs[0]
@@ -335,7 +335,7 @@ async def test_sdk_second_message_reuses_session_state(asgi_server):
     patches = [
         patch("api.server.create_instance",
               new=AsyncMock(return_value=ProviderInstance(
-                  provider="local", url="http://127.0.0.1:54321",
+                  provider="unix_local", url="http://127.0.0.1:54321",
                   root="/tmp/fake", sandbox_id="88888", port=54321))),
         patch("api.server.ensure_volume_supervisor",
               new=AsyncMock(return_value=None)),
@@ -349,7 +349,7 @@ async def test_sdk_second_message_reuses_session_state(asgi_server):
     for p in patches:
         p.start()
     try:
-        agent = _agent_with(asgi_server, name="reuser", provider="local")
+        agent = _agent_with(asgi_server, name="reuser", provider="unix_local")
 
         await agent.send("first")
         after_first = _FakeAcpClient.construct_count
@@ -400,7 +400,7 @@ async def test_sdk_send_returns_rpc_id_and_records_user_message(asgi_server):
     patches = [
         patch("api.server.create_instance",
               new=AsyncMock(return_value=ProviderInstance(
-                  provider="local", url="http://127.0.0.1:54321",
+                  provider="unix_local", url="http://127.0.0.1:54321",
                   root="/tmp/fake", sandbox_id="sse1", port=54321))),
         patch("api.server.ensure_volume_supervisor",
               new=AsyncMock(return_value=None)),
@@ -418,7 +418,7 @@ async def test_sdk_send_returns_rpc_id_and_records_user_message(asgi_server):
     for p in patches:
         p.start()
     try:
-        agent = _agent_with(asgi_server, name="streamer", provider="local")
+        agent = _agent_with(asgi_server, name="streamer", provider="unix_local")
         rpc_id = await agent.send("please echo")
         assert rpc_id, "send() must return a server-issued rpc_id"
 

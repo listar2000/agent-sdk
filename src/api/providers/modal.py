@@ -76,10 +76,14 @@ _RUNTIME_IN = "/opt/agent-sdk/runtime"
 # encrypted HTTPS tunnel whose URL is fetched from ``sb.tunnels()``.
 _SUPERVISOR_CONTAINER_PORT = 9100
 
-# Default sandbox lifetime (24 h — Modal's hard cap). Idle behaviour is
-# driven by supervisor traffic (HTTP health checks and ACP requests count as
-# activity).
-_SANDBOX_TIMEOUT_SEC = 24 * 3600
+# Sandbox lifetime caps. We lean on Modal's native ``idle_timeout`` to reap
+# quiet sandboxes (3 minutes of no traffic → terminate); the orphan reaper
+# (``reconcile_on_startup``) is the safety net for anything that escapes
+# both. Hard ceiling is 1 h so a forgotten sandbox can't outlive the natural
+# session window. Both supervisor heartbeats and ACP requests count as
+# activity for ``idle_timeout``.
+_SANDBOX_TIMEOUT_SEC = 3600
+_SANDBOX_IDLE_TIMEOUT_SEC = 180
 
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
@@ -129,16 +133,54 @@ async def _get_app():
 async def _get_image():
     """Return the shared sandbox Image (memoized).
 
-    Phase E of docs/runtime-image-unification.md: built from the repo's
-    root ``Dockerfile`` so the agent-sdk runtime
-    (``/opt/agent-sdk/runtime/{supervisor.js,node_modules}``) is baked in
-    and the sandbox does NOT need a per-volume install.
+    Two paths in priority order:
+
+    1. **Pre-built snapshot** (``.modal-snapshot-tag`` at the repo root).
+       Built by ``scripts/release_modal_snapshot.py``. Cold-create from
+       a snapshot is ~2 s vs ~85 s from a fresh ``Image.from_dockerfile``
+       — the snapshot image is already materialised on Modal's storage,
+       so ``Sandbox.create`` skips the remote build + first-pull steps.
+       Same architectural pattern as Daytona's
+       ``.runtime-snapshot-tag``.
+
+    2. **Dockerfile fallback** (``Dockerfile`` at the repo root). Used
+       on first boot before a snapshot has been generated, or when the
+       persisted snapshot id can't be looked up (e.g. transient Modal
+       error). Slow but always works as long as the Dockerfile is
+       valid.
+
+    Phase E of docs/runtime-image-unification.md is preserved: the
+    agent-sdk runtime (``/opt/agent-sdk/runtime/{supervisor.js,node_modules}``)
+    is baked into the image, so the sandbox does NOT need a per-volume
+    install regardless of which path we take here.
     """
     global _image
     if _image is not None:
         return _image
     modal, _ = _require_modal()
     repo_root = Path(__file__).resolve().parent.parent.parent.parent
+
+    snapshot_tag = repo_root / ".modal-snapshot-tag"
+    if snapshot_tag.exists():
+        snap_id = snapshot_tag.read_text().strip()
+        if snap_id:
+            try:
+                _image = await asyncio.to_thread(
+                    modal.Image.from_id, snap_id,
+                )
+                log.info(
+                    "modal: using pre-built filesystem snapshot %s "
+                    "(cold-create ~2s; rebuild via scripts/release_modal_snapshot.py)",
+                    snap_id,
+                )
+                return _image
+            except Exception as e:
+                log.warning(
+                    "modal: snapshot %s lookup failed (%s); falling back to "
+                    "Image.from_dockerfile (slower cold-create)",
+                    snap_id, e,
+                )
+
     dockerfile_path = repo_root / "Dockerfile"
     if not dockerfile_path.exists():
         raise RuntimeError(
@@ -314,6 +356,7 @@ async def create_sandbox(
             image=image,
             volumes={_VOLUME_MOUNT: vol},
             timeout=_SANDBOX_TIMEOUT_SEC,
+            idle_timeout=_SANDBOX_IDLE_TIMEOUT_SEC,
             encrypted_ports=[_SUPERVISOR_CONTAINER_PORT],
         )
     )
@@ -477,6 +520,32 @@ async def ensure_supervisor_url(
     return inst.url
 
 
+async def resolve_supervisor_url(sandbox_ref: str) -> str | None:
+    """Fetch the live HTTPS tunnel URL for an existing Modal sandbox.
+
+    The tunnel URL is allocated by Modal at sandbox-create time and is NOT
+    derivable from ``sandbox_ref`` alone. Recovery paths that try to reuse
+    a still-running sandbox MUST call this to get the real URL — anything
+    constructed by string templating ``sandbox_ref + ".modal.host"`` will
+    NOT route to the supervisor.
+
+    Returns ``None`` if the sandbox is missing or doesn't expose the
+    supervisor port. Caller can fall back to ``create_sandbox``.
+    """
+    try:
+        sb = await _lookup_sandbox(sandbox_ref)
+    except SandboxMissingError:
+        return None
+    try:
+        tunnels = await asyncio.to_thread(sb.tunnels, 60)
+    except Exception as e:
+        log.warning("modal resolve_supervisor_url: tunnels(%s) failed: %s",
+                    sandbox_ref, e)
+        return None
+    tun = tunnels.get(_SUPERVISOR_CONTAINER_PORT)
+    return tun.url if tun else None
+
+
 # ---------------------------------------------------------------------------
 # Exec helper (used by the package-level ``exec_in_instance`` dispatch)
 # ---------------------------------------------------------------------------
@@ -611,6 +680,9 @@ async def _run_volume_shell(
     """
     modal, _ = _require_modal()
     app = await _get_app()
+    # Same image as the main sandbox — Modal content-hashes the Dockerfile,
+    # so subsequent uses pull from cache. Using one image everywhere matches
+    # Daytona's "one snapshot for all" model.
     image = await _get_image()
     if vol is None:
         vol = await _get_volume(ref)

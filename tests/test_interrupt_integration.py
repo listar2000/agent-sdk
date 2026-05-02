@@ -58,7 +58,7 @@ class TestInterruptIntegration:
         """Sanity check: a single prompt round-trips correctly."""
         agent = Agent(
             "test-basic",
-            provider="local",
+            provider="unix_local",
             model=MODEL,
             cwd="/tmp",
             api_url=API_URL,
@@ -80,7 +80,7 @@ class TestInterruptIntegration:
         """
         agent = Agent(
             "test-interrupt",
-            provider="local",
+            provider="unix_local",
             model=MODEL,
             cwd="/tmp",
             api_url=API_URL,
@@ -154,7 +154,7 @@ class TestInterruptIntegration:
         """interrupt=True on an idle agent just submits normally (no cancel)."""
         agent = Agent(
             "test-int-idle",
-            provider="local",
+            provider="unix_local",
             model=MODEL,
             cwd="/tmp",
             api_url=API_URL,
@@ -193,7 +193,7 @@ class TestInterruptIntegration:
         """
         agent = Agent(
             "test-queue",
-            provider="local",
+            provider="unix_local",
             model=MODEL,
             cwd="/tmp",
             api_url=API_URL,
@@ -296,7 +296,7 @@ class TestGeminiIntegration:
         agent = Agent(
             "test-gemini",
             agent_type="gemini",
-            provider="local",
+            provider="unix_local",
             cwd="/tmp",
             api_url=API_URL,
         )
@@ -313,7 +313,7 @@ class TestGeminiIntegration:
         agent = Agent(
             "test-gemini-stream",
             agent_type="gemini",
-            provider="local",
+            provider="unix_local",
             cwd="/tmp",
             api_url=API_URL,
         )
@@ -336,7 +336,7 @@ class TestGeminiIntegration:
         agent = Agent(
             "test-gemini-int",
             agent_type="gemini",
-            provider="local",
+            provider="unix_local",
             cwd="/tmp",
             api_url=API_URL,
         )
@@ -404,7 +404,7 @@ class TestOpenCodeIntegration:
         agent = Agent(
             "test-opencode",
             agent_type="opencode",
-            provider="local",
+            provider="unix_local",
             cwd="/tmp",
             api_url=API_URL,
         )
@@ -421,7 +421,7 @@ class TestOpenCodeIntegration:
         agent = Agent(
             "test-opencode-stream",
             agent_type="opencode",
-            provider="local",
+            provider="unix_local",
             cwd="/tmp",
             api_url=API_URL,
         )
@@ -454,7 +454,7 @@ class TestClineIntegration:
         agent = Agent(
             "test-cline",
             agent_type="cline",
-            provider="local",
+            provider="unix_local",
             cwd="/tmp",
             api_url=API_URL,
         )
@@ -471,7 +471,7 @@ class TestClineIntegration:
         agent = Agent(
             "test-cline-stream",
             agent_type="cline",
-            provider="local",
+            provider="unix_local",
             cwd="/tmp",
             api_url=API_URL,
         )
@@ -603,7 +603,7 @@ class TestSSELogParity:
     async def test_simple_prompt_parity(self):
         """Simple text response: SSE events match session log."""
         agent = Agent(
-            "parity-simple", provider="local",
+            "parity-simple", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -635,7 +635,7 @@ class TestSSELogParity:
     async def test_tool_use_parity(self):
         """Tool call + result: SSE events match session log."""
         agent = Agent(
-            "parity-tool", provider="local",
+            "parity-tool", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -667,7 +667,7 @@ class TestSSELogParity:
     async def test_interrupt_parity(self):
         """Interrupted prompt: both turns logged with correct stop_reasons."""
         agent = Agent(
-            "parity-int", provider="local",
+            "parity-int", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -727,7 +727,7 @@ class TestSSELogParity:
     async def test_queued_prompts_parity(self):
         """Multiple queued prompts: all user_messages and turn_ends logged."""
         agent = Agent(
-            "parity-queue", provider="local",
+            "parity-queue", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -787,7 +787,7 @@ class TestSSELogParity:
     async def test_multi_tool_parity(self):
         """Multiple tool calls in one turn: all logged in order."""
         agent = Agent(
-            "parity-multitool", provider="local",
+            "parity-multitool", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -833,7 +833,7 @@ class TestSSELogParity:
     async def test_interrupt_mid_tool_parity(self):
         """Interrupt while a tool (Bash sleep) is running."""
         agent = Agent(
-            "parity-midtool", provider="local",
+            "parity-midtool", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -891,7 +891,7 @@ class TestSSELogParity:
         Expected order: A(cancelled) -> B -> C (queue preserved).
         """
         agent = Agent(
-            "parity-qi", provider="local",
+            "parity-qi", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -956,7 +956,7 @@ class TestSSELogParity:
     async def test_reasoning_only_parity(self):
         """Prompt that triggers reasoning but minimal output: reasoning logged."""
         agent = Agent(
-            "parity-reason", provider="local",
+            "parity-reason", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:

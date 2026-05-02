@@ -34,7 +34,7 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # than "restart supervisor inside an existing sandbox" (daytona's model).
 # local/docker reach the supervisor on localhost:<port>; modal reaches it via
 # an HTTPS tunnel; all three are recreated from scratch on miss.
-PORT_BASED_PROVIDERS = frozenset({"local", "docker", "modal"})
+PORT_BASED_PROVIDERS = frozenset({"unix_local", "docker", "modal"})
 
 # Auth/credential env vars that the server MUST NOT leak into sandboxes via
 # its own environment. When a sandbox spawns a supervisor, any of these keys
@@ -136,7 +136,7 @@ class VolumeFileExistsError(FileExistsError):
 @dataclass
 class ProviderInstance:
     """A running ACP supervisor instance."""
-    provider: "Provider"       # "local" | "docker" | "daytona" | "modal"
+    provider: "Provider"       # "unix_local" | "docker" | "daytona" | "modal"
     url: str                   # http:// base URL
     root: str = "/tmp"         # filesystem root for the sandbox
     sandbox_ref: str | None = None  # provider's opaque ref (Daytona id, docker container id, local "local-<hex>")

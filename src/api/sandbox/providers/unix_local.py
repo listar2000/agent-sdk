@@ -26,7 +26,7 @@ _SSE_READ_TIMEOUT_S = 60.0
 class UnixLocalSandboxSession(BaseSandboxSession):
     """One running local supervisor.js + ACP child subprocess."""
 
-    volume_provider = "local"
+    volume_provider = "unix_local"
     state: UnixLocalSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -53,7 +53,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                 from api.providers import ProviderInstance
                 if status == "running":
                     instance = ProviderInstance(
-                        provider="local",
+                        provider="unix_local",
                         url=f"http://127.0.0.1:{self.state.listen_port}",
                         root=self.state.recipe.root or "/tmp",
                         sandbox_ref=self.state.sandbox_ref,
@@ -66,7 +66,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     # sandbox identity survives external stops.
                     await lc_provider.start_sandbox(self.state.sandbox_ref)
                     instance = ProviderInstance(
-                        provider="local",
+                        provider="unix_local",
                         url=f"http://127.0.0.1:{self.state.listen_port}",
                         root=self.state.recipe.root or "/tmp",
                         sandbox_ref=self.state.sandbox_ref,
@@ -221,7 +221,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         from api.providers import ProviderInstance
         try:
             await lc_provider.stop_sandbox(ProviderInstance(
-                provider="local", url=self._supervisor_url or "",
+                provider="unix_local", url=self._supervisor_url or "",
                 root=self.state.recipe.root or "/tmp",
                 sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,

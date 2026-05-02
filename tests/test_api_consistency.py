@@ -138,7 +138,7 @@ async def test_post_sessions_lazy_missing_volume_id_uses_default(client):
     with patch("api.providers.local.create_volume",
                new=AsyncMock(return_value="/tmp/default-local-sess")):
         r = await client.post("/sessions",
-                              json={"provider": "local", "provision": False})
+                              json={"provider": "unix_local", "provision": False})
     assert r.status_code == 200, r.text
     assert r.json().get("volume_id")
 
@@ -151,7 +151,7 @@ async def test_post_sessions_eager_missing_volume_id_uses_default(client):
 
     async def fake_create_instance(*a, **kw):
         return ProviderInstance(
-            provider="local", url="http://127.0.0.1:9999",
+            provider="unix_local", url="http://127.0.0.1:9999",
             root="/tmp", sandbox_id="pid-12345", port=9999,
         )
 
@@ -164,7 +164,7 @@ async def test_post_sessions_eager_missing_volume_id_uses_default(client):
          patch("api.server.AcpClient"), \
          patch("api.server._start_session_tasks"):
         r = await client.post("/sessions",
-                              json={"name": "t", "provider": "local"})
+                              json={"name": "t", "provider": "unix_local"})
     # Success path (200) — or a clean 5xx if the mocked flow hits an
     # unpatched branch. The point: NOT 400 "volume_id is required".
     assert r.status_code != 400, f"should not reject missing volume_id: {r.text}"

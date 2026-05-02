@@ -190,6 +190,24 @@ class SessionPool:
                 return sess
         return None
 
+    def find_by_agent_id(self, agent_id: str) -> list[BaseSandboxSession]:
+        """All currently-active sessions belonging to ``agent_id``.
+
+        Reads ``sess._agent_id`` which is populated during
+        ``_bootstrap_session`` (i.e. set for every session in ``_active``
+        — entries here have already gone through ``start()``).
+
+        Used by the multi-session create path to enforce the Daytona
+        constraint "at most one live sibling per agent on Daytona": the
+        S3-FUSE mount of a fresh sandbox doesn't see writes that haven't
+        been flushed by an existing sibling's mount. Caller can decide
+        whether to 409 or evict the existing sibling first.
+        """
+        return [
+            sess for sess in self._active.values()
+            if getattr(sess, "_agent_id", None) == agent_id
+        ]
+
     async def shutdown_all(self, *, per_session_timeout_s: float = 10.0) -> None:
         """Stop the world: snapshot + shutdown every active session.
 
