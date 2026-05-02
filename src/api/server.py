@@ -918,7 +918,7 @@ async def admin_list_sessions():
                 "session_id": sid,
                 "agent_id": sess._agent_id,
                 "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
-                "inner_session_id": sess._inner_session_id,
+                "inner_session_id": sess.inner_session_id,
                 # "active subscriber" is the closest pool-level proxy for
                 # the dashboard's "running" badge — there's no per-prompt
                 # busy flag in the pool (per-prompt SSE replaces it).
@@ -1017,7 +1017,7 @@ async def session_status(session_id: str):
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
         "sandbox_ref": getattr(state, "sandbox_ref", None),
-        "inner_session_id": pool_session._inner_session_id,
+        "inner_session_id": pool_session.inner_session_id,
         "agent_busy": False,
         "active_rpc_id": None,
         "pending_count": 0,
@@ -1138,7 +1138,7 @@ async def session_resume(session_id: str, request: Request):
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
         "sandbox_ref": sandbox_ref,
-        "inner_session_id": pool_session._inner_session_id,
+        "inner_session_id": pool_session.inner_session_id,
         "status": "resumed",
     }
 
@@ -1406,7 +1406,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         "session_id": session_id,
         "id": session_id,
         "volume_id": volume_record.id,
-        "inner_session_id": pool_session._inner_session_id,
+        "inner_session_id": pool_session.inner_session_id,
         "connected": True,
     }
 
@@ -1926,20 +1926,10 @@ async def session_acp_call(session_id: str, request: Request):
     notify = bool(data.get("notify"))
     from api.sandbox import get_pool
     pool_session = await get_pool().get_session(session_id)
-    if pool_session._supervisor_url is None or pool_session._acp_session_id is None:
-        raise HTTPException(503, "session has no live ACP supervisor")
-    from api.acp_client import AcpClient
-    client = AcpClient(pool_session._supervisor_url)
-    if pool_session._inner_session_id is not None:
-        client._inner_session_ids[pool_session._acp_session_id] = (
-            pool_session._inner_session_id
-        )
     try:
-        result = await client.call(
-            pool_session._acp_session_id, method, params, notify=notify,
-        )
-    finally:
-        await client.aclose()
+        result = await pool_session.acp_call(method, params, notify=notify)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
     return {"result": result}
 
 

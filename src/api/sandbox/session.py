@@ -231,6 +231,45 @@ class BaseSandboxSession(abc.ABC):
         before start or after shutdown. Used by file-browse endpoints."""
         return self._supervisor_url
 
+    @property
+    def acp_session_id(self) -> str | None:
+        """Public read of the ACP session id minted on first attach."""
+        return self._acp_session_id
+
+    @property
+    def inner_session_id(self) -> str | None:
+        """Public read of the agent-native inner session id (used for
+        ``session/load`` on cold-recovery)."""
+        return self._inner_session_id
+
+    async def acp_call(
+        self, method: str, params: dict | None = None, *, notify: bool = False,
+    ) -> Any:
+        """Forward a JSON-RPC call to this session's ACP supervisor.
+
+        Encapsulates ``AcpClient`` construction + the inner-session-id
+        cache prime that callers used to do by hand. Auto-injects the
+        inner ``sessionId`` into ``params`` so callers don't have to
+        track it. ``notify=True`` sends as a JSON-RPC notification (no
+        response).
+
+        Raises ``RuntimeError`` if the session has no live supervisor or
+        no attached ACP session — the route handler maps that to 503.
+        """
+        if self._supervisor_url is None or self._acp_session_id is None:
+            raise RuntimeError("session has no live ACP supervisor")
+        from api.acp_client import AcpClient
+
+        client = AcpClient(self._supervisor_url)
+        if self._inner_session_id is not None:
+            client._inner_session_ids[self._acp_session_id] = self._inner_session_id
+        try:
+            return await client.call(
+                self._acp_session_id, method, params or {}, notify=notify,
+            )
+        finally:
+            await client.aclose()
+
     # --- Lifecycle methods (concrete subclasses override) ---
 
     @abc.abstractmethod
