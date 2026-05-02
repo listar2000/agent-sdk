@@ -268,7 +268,7 @@ async def create_sandbox(
     marker_dir = vol / "system" / "sandboxes"
     marker_path = marker_dir / f"{ref}.alive"
     await asyncio.to_thread(lambda: os.makedirs(marker_dir, exist_ok=True))
-    await asyncio.to_thread(lambda: marker_path.write_text("alive"))
+    await asyncio.to_thread(lambda: marker_path.write_text(str(proc.pid)))
 
     async with _PROCESSES_LOCK:
         _PROCESSES[ref] = proc
@@ -676,3 +676,66 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
         os.replace(src, dst)
 
     await asyncio.to_thread(_rename)
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation — kill orphan supervisor PIDs on startup
+# ---------------------------------------------------------------------------
+
+async def reconcile_on_startup() -> None:
+    """Kill leaked supervisor PIDs and remove their alive markers.
+
+    Walks ``<vol_root>/*/system/sandboxes/*.alive``. Each marker stores
+    the supervisor PID (legacy ``"alive"`` markers parse to no PID and
+    are unlinked without a kill). If the ref is in a live session we
+    leave it. Otherwise we SIGKILL the PID (when alive) and unlink the
+    marker.
+
+    Failures are logged and swallowed.
+    """
+    import glob
+    import signal
+
+    try:
+        from .. import db as dbmod
+    except Exception as e:
+        log.warning("unix_local reconcile: cannot import api.db: %s", e)
+        return
+
+    try:
+        live_refs = await dbmod.live_sandbox_refs()
+    except Exception as e:
+        log.warning("unix_local reconcile: live-session query failed: %s", e)
+        return
+
+    pattern = str(_vol_root() / "*" / "system" / "sandboxes" / "*.alive")
+    markers = await asyncio.to_thread(lambda: glob.glob(pattern))
+
+    for m in markers:
+        try:
+            ref = os.path.basename(m)[: -len(".alive")]
+            if ref in live_refs:
+                continue
+            try:
+                content = await asyncio.to_thread(lambda p=m: open(p).read().strip())
+            except Exception:
+                content = ""
+            pid: int | None = None
+            try:
+                pid = int(content) if content else None
+            except ValueError:
+                pid = None
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    log.info("unix_local reconcile: killed orphan pid=%d ref=%s", pid, ref)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    log.warning("unix_local reconcile: kill pid=%d failed: %s", pid, e)
+            try:
+                await asyncio.to_thread(os.remove, m)
+            except FileNotFoundError:
+                pass
+        except Exception as e:
+            log.warning("unix_local reconcile: marker %s: %s", m, e)
