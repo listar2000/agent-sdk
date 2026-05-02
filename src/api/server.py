@@ -1061,7 +1061,7 @@ async def session_sandbox_info(session_id: str):
     if url:
         result["url"] = url
     if provider == "unix_local" and sandbox_ref:
-        from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
+        from .providers.unix_local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
         args = _LOCAL_SPAWN_ARGS.get(sandbox_ref)
         if args and args.get("marker_path"):
             result["marker_path"] = args["marker_path"]

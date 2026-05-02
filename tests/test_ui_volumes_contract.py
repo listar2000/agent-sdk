@@ -50,9 +50,9 @@ async def test_list_volumes_shape(client):
 @pytest.mark.asyncio
 async def test_tree_is_newline_string(client):
     """UI parses tree as newline-separated string; dirs end with '/', files don't."""
-    with patch("api.providers.local.create_volume",
+    with patch("api.providers.unix_local.create_volume",
                new=AsyncMock(return_value="local-ui-tree")), \
-         patch("api.providers.local.volume_tree",
+         patch("api.providers.unix_local.volume_tree",
                new=AsyncMock(return_value="a.txt\nsub/\nsub/b.txt")):
         r = await client.post("/volumes", json={"name": "ui-tree-vol", "provider": "unix_local"})
         assert r.status_code == 200
@@ -71,9 +71,9 @@ async def test_tree_is_newline_string(client):
 @pytest.mark.asyncio
 async def test_file_read_content_or_content_base64(client):
     """UI reads either {content} (text) or {content_base64} (binary)."""
-    with patch("api.providers.local.create_volume",
+    with patch("api.providers.unix_local.create_volume",
                new=AsyncMock(return_value="local-ui-read")), \
-         patch("api.providers.local.volume_read",
+         patch("api.providers.unix_local.volume_read",
                new=AsyncMock(return_value=b"hello\nworld")):
         r = await client.post("/volumes", json={"name": "ui-read-vol", "provider": "unix_local"})
         assert r.status_code == 200

@@ -38,7 +38,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         if self._supervisor_url is not None and await self.running():
             return
 
-        from api.providers import local as lc_provider
+        from api.providers import unix_local as lc_provider
         from api.providers._shared import _wait_for_health
 
         volume_ref = await self._bootstrap_session()
@@ -217,7 +217,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             except Exception:
                 log.exception("snapshot request failed for session %s", self.session_id)
 
-        from api.providers import local as lc_provider
+        from api.providers import unix_local as lc_provider
         from api.providers import ProviderInstance
         try:
             await lc_provider.stop_sandbox(ProviderInstance(

@@ -135,7 +135,7 @@ async def test_post_sessions_lazy_missing_volume_id_uses_default(client):
     """Missing volume_id on lazy session → server uses default-{provider}.
     Backward-compat for zero-config SDK callers."""
     from unittest.mock import patch, AsyncMock
-    with patch("api.providers.local.create_volume",
+    with patch("api.providers.unix_local.create_volume",
                new=AsyncMock(return_value="/tmp/default-local-sess")):
         r = await client.post("/sessions",
                               json={"provider": "unix_local", "provision": False})
@@ -155,7 +155,7 @@ async def test_post_sessions_eager_missing_volume_id_uses_default(client):
             root="/tmp", sandbox_id="pid-12345", port=9999,
         )
 
-    with patch("api.providers.local.create_volume",
+    with patch("api.providers.unix_local.create_volume",
                new=AsyncMock(return_value="/tmp/default-local-quick")), \
          patch("api.server.ensure_volume_supervisor",
                new=AsyncMock(return_value=None)), \

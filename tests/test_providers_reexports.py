@@ -3,7 +3,7 @@
 Motivation (the bug this catches)
 --------------------------------
 Cycle-9 simplification dropped ``_ACP_BIN_NAMES`` from
-``api.providers.__init__.py`` even though ``api.providers.local`` imports it
+``api.providers.__init__.py`` even though ``api.providers.unix_local`` imports it
 as::
 
     from ._shared import _ACP_BIN_NAMES
@@ -134,14 +134,14 @@ def test_every_cross_module_import_from_api_providers_is_reexported():
 
 @pytest.mark.timeout(10)
 def test_every_cross_module_import_from_api_providers_submodules_is_real():
-    """Sub-module imports (e.g. ``from api.providers.local import ...``) must
+    """Sub-module imports (e.g. ``from api.providers.unix_local import ...``) must
     also resolve.  Parallel to the package-level test above — guards against
     renames that miss a single caller."""
     targets = {
         "api.providers._shared",
         "api.providers.daytona",
         "api.providers.docker",
-        "api.providers.local",
+        "api.providers.unix_local",
     }
     names_by_mod = _collect_imports(_SRC_DIR, targets)
 
