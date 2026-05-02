@@ -229,6 +229,45 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
+# ---------------------------------------------------------------------------
+# Volume adapter dispatch — per-provider ``BaseVolumeAdapter`` instances.
+# Replaces the ``__getattr__`` magic dispatch for per-volume file ops.
+# Lifecycle ops (create_volume / delete_volume) stay on the legacy dispatch.
+# ---------------------------------------------------------------------------
+
+from ._volume import BaseVolumeAdapter  # noqa: E402
+
+_VOLUME_ADAPTERS: dict[str, type[BaseVolumeAdapter]] = {}
+
+
+def _register_volume_adapters() -> None:
+    """Lazy-load each provider's volume adapter class. Same lazy pattern
+    as ``api.sandbox.factory._register_default_providers`` — first call
+    populates the table; subsequent calls are no-ops."""
+    if _VOLUME_ADAPTERS:
+        return
+    from .daytona.volumes import DaytonaVolumeAdapter
+    _VOLUME_ADAPTERS["daytona"] = DaytonaVolumeAdapter
+
+
+def get_volume_adapter(provider: str, provider_ref: str) -> BaseVolumeAdapter:
+    """Construct a per-volume adapter bound to ``provider_ref``.
+
+    Raises ``ValueError`` for unknown providers (same shape as
+    ``_dispatch_mod``). During Phase 2 rollout, only providers with a
+    registered adapter are wired here; others still go through the
+    legacy ``_providers_mod.volume_*`` dispatch.
+    """
+    _register_volume_adapters()
+    cls = _VOLUME_ADAPTERS.get(provider)
+    if cls is None:
+        raise ValueError(
+            f"no volume adapter registered for provider {provider!r}; "
+            f"available: {sorted(_VOLUME_ADAPTERS)}"
+        )
+    return cls(provider_ref)
+
+
 async def reconcile_sandboxes(provider: str) -> None:
     """Reconcile in-process sandbox state with live provider state on startup.
 
