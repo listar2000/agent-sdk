@@ -1005,7 +1005,7 @@ async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
     dropping the cache entry, so callers don't see a single stale-cache
     hit bubble up as a 500.
     """
-    from .. import providers as _prov  # local import for cycle
+    from ... import providers as _prov  # local import for cycle
     inst = await _get_or_create_utility(ref)
     try:
         return await _prov.exec_in_instance(inst, cmd, timeout=timeout)
@@ -1307,7 +1307,7 @@ async def reconcile_on_startup() -> None:
     Failures are logged and swallowed.
     """
     try:
-        from .. import db as dbmod
+        from ... import db as dbmod
     except Exception as e:
         log.warning("daytona reconcile: cannot import api.db: %s", e)
         return

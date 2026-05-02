@@ -126,7 +126,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("UnixLocalSandboxSession.execute_prompt called before start()")
 
-        from .daytona import _parse_sse_block
+        from api.providers.daytona.session import _parse_sse_block
 
         if rpc_id is None:
             rpc_id = str(uuid4())

@@ -462,7 +462,7 @@ async def reconcile_on_startup() -> None:
     # Local imports to avoid a hard cycle: docker.py is imported at module
     # init but api.db is initialized later in the lifespan.
     try:
-        from .. import db as dbmod
+        from ... import db as dbmod
     except Exception as e:
         log.warning("docker reconcile: cannot import api.db: %s", e)
         return

@@ -158,7 +158,9 @@ async def _get_image():
     if _image is not None:
         return _image
     modal, _ = _require_modal()
-    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    # repo root is 5 levels up from src/api/providers/modal/__init__.py
+    # (modal/ → providers/ → api/ → src/ → repo)
+    repo_root = Path(__file__).resolve().parents[4]
 
     snapshot_tag = repo_root / ".modal-snapshot-tag"
     if snapshot_tag.exists():
@@ -603,7 +605,7 @@ async def reconcile_on_startup() -> None:
     Failures on individual sandboxes are logged but never raised.
     """
     try:
-        from .. import db as dbmod
+        from ... import db as dbmod
     except Exception as e:
         log.warning("modal reconcile: cannot import api.db: %s", e)
         return

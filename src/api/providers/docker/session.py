@@ -149,7 +149,7 @@ class DockerSandboxSession(BaseSandboxSession):
         # SSE pipe is identical to daytona's — supervisor.js exposes the
         # same /v1/acp/{id} endpoint regardless of which container it
         # runs in. Reuse the daytona module's parser.
-        from .daytona import _parse_sse_block
+        from api.providers.daytona.session import _parse_sse_block
         import asyncio
 
         if rpc_id is None:
