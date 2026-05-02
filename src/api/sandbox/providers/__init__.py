@@ -7,7 +7,7 @@ One class per provider, each wrapping the existing primitives in
 Phase 2 sub-task 2 starts with daytona because it's the most complex;
 docker/local/modal follow.
 """
-from .daytona import DaytonaSandboxSession
+from api.providers.daytona.session import DaytonaSandboxSession
 from .docker import DockerSandboxSession
 from .modal import ModalSandboxSession
 from .unix_local import UnixLocalSandboxSession

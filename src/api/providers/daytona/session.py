@@ -1,7 +1,7 @@
 """DaytonaSandboxSession — concrete SandboxSession for the daytona provider.
 
-Wraps existing primitives in ``src/api/providers/daytona.py`` into the
-five-method ``BaseSandboxSession`` contract.
+Wraps existing primitives in ``src/api/providers/daytona/__init__.py``
+into the five-method ``BaseSandboxSession`` contract.
 
 Lifecycle decisions live inside ``start()``:
   * ``state.sandbox_ref`` set, sandbox alive on Daytona  → reattach (cheapest)
@@ -23,8 +23,8 @@ from uuid import uuid4
 
 import httpx
 
-from ..session import BaseSandboxSession
-from ..state import DaytonaSandboxState, SandboxState
+from api.sandbox.session import BaseSandboxSession
+from api.sandbox.state import DaytonaSandboxState, SandboxState
 
 log = logging.getLogger(__name__)
 

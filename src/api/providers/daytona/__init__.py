@@ -1,4 +1,13 @@
-"""Daytona provider — create/destroy/exec in Daytona sandboxes."""
+"""Daytona provider — create/destroy/exec in Daytona sandboxes.
+
+Package layout:
+- ``__init__.py`` (this file) — volume + sandbox primitives (functional,
+  stateless). Loaded by ``api.providers.__init__``'s dispatch table.
+- ``session.py`` — ``DaytonaSandboxSession``, the per-session lifecycle
+  class. Loaded directly via ``from api.providers.daytona.session
+  import DaytonaSandboxSession`` (avoids a circular import with
+  ``api.sandbox.session`` which session.py depends on).
+"""
 
 import asyncio
 import logging
@@ -9,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import NamedTuple
 
-from .. import load_dotenv
+from ... import load_dotenv
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +53,7 @@ def _run_sandbox_exec(sandbox, cmd: str, timeout: int = 120) -> "_ExecResult":
 
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
-from ._shared import (
+from .._shared import (
     _acp_bin_name,
     _acp_launch_args,
     _ACP_NPM_SPECS,

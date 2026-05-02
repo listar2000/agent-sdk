@@ -25,6 +25,7 @@ from .state import (
 # the DaytonaSandboxSession constructor — so an unwired provider doesn't
 # 500 the server.
 _REGISTRY: dict[str, Callable[[str, SandboxState], BaseSandboxSession]] = {}
+_REGISTRY_INITIALIZED = False
 
 
 def register(type_value: str, factory: Callable[[str, SandboxState], BaseSandboxSession]) -> None:
@@ -44,6 +45,10 @@ def make_session(session_id: str, state: SandboxState) -> BaseSandboxSession:
     Raises KeyError for an unregistered ``state.type`` — caller should
     pre-register all providers it intends to use.
     """
+    global _REGISTRY_INITIALIZED
+    if not _REGISTRY_INITIALIZED:
+        _register_default_providers()
+        _REGISTRY_INITIALIZED = True
     type_value = getattr(state, "type", "unknown")
     factory = _REGISTRY.get(type_value)
     if factory is None:
@@ -70,14 +75,15 @@ def _adapt(cls):
 
 
 def _register_default_providers() -> None:
-    """Eagerly register all available concrete SandboxSession classes.
+    """Register all available concrete SandboxSession classes.
 
-    Called from ``src/api/sandbox/__init__.py`` at import time so the
-    registry is ready before any caller invokes ``make_session``. Lazy
-    imports inside this function so module load doesn't pull in heavy
-    provider SDKs unless they're actually present.
+    Called lazily on the first ``make_session`` invocation so module-load
+    cycles (provider session.py needs ``BaseSandboxSession`` from
+    ``api.sandbox.session``, which imports this factory) are avoided.
+    Tests that need a registered provider before constructing a state
+    can call ``make_session`` once with any state to trigger registration.
     """
-    from .providers.daytona import DaytonaSandboxSession
+    from api.providers.daytona.session import DaytonaSandboxSession
     from .providers.docker import DockerSandboxSession
     from .providers.modal import ModalSandboxSession
     from .providers.unix_local import UnixLocalSandboxSession
@@ -86,7 +92,3 @@ def _register_default_providers() -> None:
     register("modal", _adapt(ModalSandboxSession))
     register("unix_local", _adapt(UnixLocalSandboxSession))
     register("unknown", _adapt(DaytonaSandboxSession))  # default-to-daytona
-
-
-# Eager registration at import time.
-_register_default_providers()

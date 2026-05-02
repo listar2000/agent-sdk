@@ -69,7 +69,7 @@ class TestSandboxStateRoundTrip:
 
 class TestFactoryDispatch:
     def test_each_state_type_maps_to_its_concrete_class(self):
-        from api.sandbox.providers.daytona import DaytonaSandboxSession
+        from api.providers.daytona.session import DaytonaSandboxSession
         from api.sandbox.providers.docker import DockerSandboxSession
         from api.sandbox.providers.modal import ModalSandboxSession
         from api.sandbox.providers.unix_local import UnixLocalSandboxSession

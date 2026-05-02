@@ -41,7 +41,7 @@ async def test_local_create_sandbox_rollback_uses_thread():
     (integration runs of the local provider cover the behavior).
     """
     import inspect
-    from api.providers import local as lp
+    from api.providers import unix_local as lp
 
     src = inspect.getsource(lp.create_sandbox)
     # The rollback paths must NOT call _kill_proc synchronously — that
