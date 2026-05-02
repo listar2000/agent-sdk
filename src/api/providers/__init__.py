@@ -213,10 +213,11 @@ _DISPATCH_FNS = frozenset({
     "create_volume", "delete_volume", "get_sandbox_status",
     "start_sandbox", "destroy_sandbox", "stop_sandbox",
     "ensure_supervisor_url",
-    # ``install_supervisor`` was deleted in Phase E of
-    # the runtime-image-unification refactor — the runtime ships in the image.
-    "volume_tree", "volume_read", "volume_download", "volume_exists", "volume_write",
-    "volume_upload", "volume_mkdir", "volume_delete", "volume_rename",
+    # Per-volume file ops (volume_tree / volume_read / volume_download /
+    # volume_exists / volume_write / volume_upload / volume_mkdir /
+    # volume_delete / volume_rename) used to live here too. Phase 2
+    # migrated them to ``BaseVolumeAdapter`` — callers go through
+    # ``get_volume_adapter(provider, ref)`` for a typed interface.
 })
 
 

@@ -80,6 +80,7 @@ from .providers import (
     ProviderInstance,
     VolumeFileExistsError,
     default_cwd_for_provider,
+    get_volume_adapter,
 )
 from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_secrets
@@ -729,9 +730,10 @@ def _volume_fs_err(op: str, vol_provider: str, exc: Exception) -> HTTPException:
 @app.get("/volumes/{id_or_name}/files/tree")
 async def volume_files_tree(id_or_name: str, path: str = ""):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(path)
     try:
-        tree = await _providers_mod.volume_tree(vol.provider, vol.provider_ref, rel)
+        tree = await adapter.tree(rel)
     except Exception as e:
         raise _volume_fs_err("Tree", vol.provider, e)
     return {"tree": tree}
@@ -740,9 +742,10 @@ async def volume_files_tree(id_or_name: str, path: str = ""):
 @app.get("/volumes/{id_or_name}/files/read")
 async def volume_files_read(id_or_name: str, path: str):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(path)
     try:
-        data = await _providers_mod.volume_read(vol.provider, vol.provider_ref, rel)
+        data = await adapter.read(rel)
     except Exception as e:
         raise _volume_fs_err("Read", vol.provider, e)
     # v1 response contract: text content.
@@ -756,9 +759,10 @@ async def volume_files_read(id_or_name: str, path: str):
 async def volume_files_download(id_or_name: str, path: str):
     """Download a volume file as raw bytes."""
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(path)
     try:
-        data = await _providers_mod.volume_download(vol.provider, vol.provider_ref, rel)
+        data = await adapter.download(rel)
     except Exception as e:
         raise _volume_fs_err("Download", vol.provider, e)
 
@@ -773,9 +777,10 @@ async def volume_files_download(id_or_name: str, path: str):
 @app.get("/volumes/{id_or_name}/files/exists")
 async def volume_files_exists(id_or_name: str, path: str):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(path)
     try:
-        exists = await _providers_mod.volume_exists(vol.provider, vol.provider_ref, rel)
+        exists = await adapter.exists(rel)
     except Exception as e:
         raise _volume_fs_err("Exists", vol.provider, e)
     return {"exists": exists}
@@ -784,6 +789,7 @@ async def volume_files_exists(id_or_name: str, path: str):
 @app.post("/volumes/{id_or_name}/files/edit", status_code=204)
 async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(body.path)
 
     # Validate the two shapes are not mixed.
@@ -800,19 +806,14 @@ async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
 
     try:
         if body.content is not None:
-            # Overwrite mode — single provider call.
-            await _providers_mod.volume_write(
-                vol.provider, vol.provider_ref, rel, body.content.encode(),
-            )
+            await adapter.write(rel, body.content.encode())
             return
         # Search/replace at the volume layer (no sandbox required):
         # read → str.replace → write. Same semantics as the
         # supervisor's session-scoped /files/edit, but driven directly
         # against the provider's volume primitives so callers don't
         # need a live sandbox to edit files on the volume.
-        existing = (
-            await _providers_mod.volume_read(vol.provider, vol.provider_ref, rel)
-        ).decode("utf-8", errors="replace")
+        existing = (await adapter.read(rel)).decode("utf-8", errors="replace")
         old = body.old_string or ""
         new = body.new_string or ""
         if not body.replace_all:
@@ -828,9 +829,7 @@ async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
             updated = existing.replace(old, new, 1)
         else:
             updated = existing.replace(old, new)
-        await _providers_mod.volume_write(
-            vol.provider, vol.provider_ref, rel, updated.encode(),
-        )
+        await adapter.write(rel, updated.encode())
     except HTTPException:
         raise
     except Exception as e:
@@ -840,13 +839,14 @@ async def volume_files_edit(id_or_name: str, body: _VolumeEditBody):
 @app.post("/volumes/{id_or_name}/files/upload", status_code=204)
 async def volume_files_upload(id_or_name: str, body: _VolumeUploadBody):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(body.path)
     try:
         payload = base64.b64decode(body.content, validate=True)
     except Exception as e:
         raise HTTPException(400, f"invalid base64 content: {e}")
     try:
-        await _providers_mod.volume_upload(vol.provider, vol.provider_ref, rel, payload)
+        await adapter.upload(rel, payload)
     except Exception as e:
         raise _volume_fs_err("Upload", vol.provider, e)
 
@@ -854,9 +854,10 @@ async def volume_files_upload(id_or_name: str, body: _VolumeUploadBody):
 @app.post("/volumes/{id_or_name}/files/mkdir", status_code=204)
 async def volume_files_mkdir(id_or_name: str, body: _VolumePathBody):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(body.path)
     try:
-        await _providers_mod.volume_mkdir(vol.provider, vol.provider_ref, rel)
+        await adapter.mkdir(rel)
     except Exception as e:
         raise _volume_fs_err("Mkdir", vol.provider, e)
 
@@ -864,9 +865,10 @@ async def volume_files_mkdir(id_or_name: str, body: _VolumePathBody):
 @app.post("/volumes/{id_or_name}/files/delete", status_code=204)
 async def volume_files_delete(id_or_name: str, body: _VolumePathBody):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(body.path)
     try:
-        await _providers_mod.volume_delete(vol.provider, vol.provider_ref, rel)
+        await adapter.delete(rel)
     except Exception as e:
         raise _volume_fs_err("Delete", vol.provider, e)
 
@@ -874,11 +876,11 @@ async def volume_files_delete(id_or_name: str, body: _VolumePathBody):
 @app.post("/volumes/{id_or_name}/files/rename", status_code=204)
 async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
     vol = await _resolve_volume(id_or_name)
+    adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     src = _safe_path(body.path)
     dst = _safe_path(body.new_path)
     try:
-        kwargs = {} if body.overwrite else {"overwrite": False}
-        await _providers_mod.volume_rename(vol.provider, vol.provider_ref, src, dst, **kwargs)
+        await adapter.rename(src, dst, overwrite=body.overwrite)
     except VolumeFileExistsError:
         return JSONResponse(
             {"error": "exists", "path": body.new_path},
