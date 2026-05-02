@@ -71,7 +71,7 @@ def test_build_volume_mounts_omits_supervisor_mount(monkeypatch, _stub_volume_mo
 
 
 # ``test_build_volume_mounts_flag_off_includes_supervisor_mount`` was deleted
-# in Phase E of docs/runtime-image-unification.md — there is no flag-off
+# in the runtime-image-unification refactor — there is no flag-off
 # path anymore.
 
 
@@ -157,7 +157,7 @@ async def test_provision_flag_on_without_image_or_snapshot_raises(monkeypatch):
 
 
 # ``test_provision_flag_off_defaults_to_hive_large_snapshot`` was deleted
-# in Phase E of docs/runtime-image-unification.md — the legacy hive-large
+# in the runtime-image-unification refactor — the legacy hive-large
 # default no longer exists, so there's no behavior to pin.
 
 
@@ -170,7 +170,7 @@ async def test_provision_flag_on_without_image_or_snapshot_raises(monkeypatch):
 async def test_start_supervisor_uses_image_runtime_paths(monkeypatch):
     """``start_supervisor_in_sandbox`` resolves the supervisor + ACP bin
     from the image-runtime path (``/opt/agent-sdk/runtime/``) — Phase E
-    of docs/runtime-image-unification.md collapsed the flag-conditional
+    of the runtime-image-unification refactor collapsed the flag-conditional
     branches into this unconditional path."""
     # Capture every shell command the supervisor-start path runs in the
     # sandbox so we can assert which paths got referenced.

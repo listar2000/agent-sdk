@@ -1,6 +1,6 @@
 """SessionPool — the entire recovery surface, in one method.
 
-See ``docs/session-runtime-refactor.md``. Replaced the legacy
+See ````. Replaced the legacy
 recovery chain (``_ensure_sandbox_alive`` / ``_type1_recover`` /
 ``_type2_recover`` / ``_rebind_state``) plus the in-memory
 ``_INSTANCES`` and ``SESSIONS`` registries plus the ``_session_locks``

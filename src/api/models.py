@@ -3,7 +3,7 @@
 Sandbox identity is not modelled here — it lives in ``sessions.sandbox_state``
 JSONB and is owned by ``api.sandbox.SessionPool`` (see
 ``api.sandbox.state.SandboxState`` for the discriminated union, and
-docs/session-runtime-refactor.md for the model)."""
+ for the model)."""
 
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ class VolumeRecord:
     provider_ref: str
     status: str = "ready"
     # ``supervisor_agent_types`` field deleted in Phase E of
-    # docs/runtime-image-unification.md. The DB column stays (now unused)
+    # the runtime-image-unification refactor. The DB column stays (now unused)
     # until the column-drop migration ships.
 
 
@@ -109,7 +109,7 @@ class SessionState:
 
     Vestigial: the runtime is now ``api.sandbox.SessionPool`` +
     ``api.sandbox.session.BaseSandboxSession`` (see
-    docs/session-runtime-refactor.md). This dataclass survives only for
+    ). This dataclass survives only for
     response-shape back-compat fields the dashboard reads
     (``agent_busy``, ``active_rpc_id``, ``pending_count``) — which are
     constants in current responses. Do not wire new code to it."""

@@ -73,8 +73,9 @@ AGENT_TYPES = frozenset({CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPE
 UNIX_LOCAL = "unix_local"
 DOCKER = "docker"
 DAYTONA = "daytona"
+MODAL = "modal"
 
-PROVIDERS = frozenset({UNIX_LOCAL, DOCKER, DAYTONA})
+PROVIDERS = frozenset({UNIX_LOCAL, DOCKER, DAYTONA, MODAL})
 
 
 def _is_remote_http(api_url: str) -> bool:

@@ -323,7 +323,7 @@ def _spec_package_name(spec: str) -> str:
 
 
 # ``_use_image_runtime()`` was deleted in Phase E of
-# docs/runtime-image-unification.md. The image-runtime path is now
+# the runtime-image-unification refactor. The image-runtime path is now
 # unconditional (the only path); ``AGENT_SDK_USE_IMAGE_RUNTIME=0`` is no
 # longer honoured.
 
@@ -603,7 +603,7 @@ def _build_volume_mounts(
     if not subpath:
         # Utility sandbox: whole-volume mount so we can inspect/create any dir.
         return [VolumeMount(volume_id=volume_id, mount_path="/v")]
-    # Phase E of docs/runtime-image-unification.md: the supervisor lives
+    # the runtime-image-unification refactor: the supervisor lives
     # in the image at /opt/agent-sdk/runtime, never on the volume. Volume
     # is data-only — only /vol is mounted (plus any opt-in shared mounts).
     mounts = [

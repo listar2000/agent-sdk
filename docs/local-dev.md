@@ -2,135 +2,103 @@
 
 ## Prerequisites
 
-- Docker and Docker Compose
+- Docker + Compose
 - Python 3.11+
-- A `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` for running Claude agents
+- `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`
 
-## Quick Start
-
-### 1. Create `.env` file
+## Quick start
 
 ```bash
-echo "CLAUDE_CODE_OAUTH_TOKEN=..." > .env   # preferred
-# echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env  # fallback
-```
-
-### 2. Start the server
-
-```bash
+echo "CLAUDE_CODE_OAUTH_TOKEN=..." > .env   # or ANTHROPIC_API_KEY=sk-ant-...
 docker compose up --build -d
+curl http://localhost:7778/health           # → {"status":"ok"}
 ```
 
-This starts:
-- **Postgres** on port 5433 (host) / 5432 (internal)
-- **API server** on port 7778
-
-The server auto-creates all database tables on startup (`CREATE TABLE IF NOT EXISTS`).
-
-### 3. Verify
+Postgres binds to `5433` on the host; the API to `7778`. `init_db()`
+runs `CREATE TABLE IF NOT EXISTS` + idempotent migrations on startup.
 
 ```bash
-curl http://localhost:7778/health
-# {"status":"ok"}
+docker compose down        # keep data
+docker compose down -v     # drop the database volume
 ```
 
-### 4. Run an agent
+## Run an agent
 
 ```python
 from agent_sdk import Agent
 
-agent = Agent(
-    "my-agent",
-    provider="local",
-    api_url="http://localhost:7778",
-)
+agent = Agent("my-agent", provider="local", api_url="http://localhost:7778")
 print(agent.run("What OS are you running on?"))
-```
-
-### 5. Stop
-
-```bash
-docker compose down        # stop, keep data
-docker compose down -v     # stop, delete database
 ```
 
 ## Helper scripts
 
-`scripts/launch_server_docker.sh` and `scripts/launch_server_local.sh` bootstrap everything (venv, Postgres, uvicorn):
+- `scripts/launch_server_docker.sh` — Postgres via `docker compose`, server on `:7778`.
+- `scripts/launch_server_local.sh` — project-local conda Postgres (no Docker), server on `:7778`.
 
-- `launch_server_docker.sh` — Postgres via `docker compose`, server on `:7778`.
-- `launch_server_local.sh` — project-local conda-installed Postgres (no Docker needed), server on `:7778`.
+Both load `.env` (repo) and `~/.env` before starting.
 
-Both load env vars from `.env` (repo-local) or `~/.env` before starting.
-
-## Without Docker or the helper scripts
+## Without the helpers
 
 ```bash
-# Start Postgres separately
 docker run -d --name agent-sdk-db \
-  -e POSTGRES_DB=agent_sdk_server \
-  -e POSTGRES_USER=postgres \
-  -e POSTGRES_PASSWORD=postgres \
-  -p 5433:5432 \
-  postgres:16-alpine
+  -e POSTGRES_DB=agent_sdk_server -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -p 5433:5432 postgres:16-alpine
 
-# Run the server
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/agent_sdk_server
-export CLAUDE_CODE_OAUTH_TOKEN=...   # or ANTHROPIC_API_KEY=sk-ant-...
+export CLAUDE_CODE_OAUTH_TOKEN=...
 pip install -e .
 uvicorn src.api.server:app --port 7778 --reload
 ```
 
-## API Structure
+## API surface
 
-See [`docs/api.md`](api.md) for the full endpoint reference and [`assets/rest-api.html`](../assets/rest-api.html) for a visual map. Two top-level resource groups:
+See [`docs/api.md`](api.md) and [`assets/rest-api.html`](../assets/rest-api.html). Two top-level resources:
 
-- **Volumes** (`/volumes/*`) — durable storage, with file ops that operate directly on the provider's volume primitives (no sandbox required).
-- **Sessions** (`/sessions/*`) — conversation. Bind to a volume; the active compute lease is owned by the in-process `SessionPool` and the provider sandbox identity (`sandbox_ref`) lives in `sessions.sandbox_state` (JSONB). Hibernation via `/sessions/{id}/release`; cold-recovery is implicit on the next call. There is no separate `/sandboxes` resource — `GET /sessions/{id}/sandbox` returns the metadata.
+- **Volumes** (`/volumes/*`) — durable storage; file ops run directly against the provider primitives, no sandbox needed.
+- **Sessions** (`/sessions/*`) — conversation, bound to a volume. Compute lease owned by the in-process `SessionPool`; sandbox identity lives in `sessions.sandbox_state` JSONB. Hibernate via `POST /sessions/{id}/release`; cold-recovery is implicit on the next call. `GET /sessions/{id}/sandbox` returns sandbox metadata (no `/sandboxes` resource).
 
-`POST /sessions` accepts an optional `volume_id`; if omitted, a per-provider default volume is created/reused. Eager by default; pass `"provision": false` for the lazy session-shell flow.
+`POST /sessions` accepts an optional `volume_id` (a default `default-{provider}` volume is created/reused if omitted). Eager by default; `"provision": false` for the lazy session-shell flow.
 
 ## Database
 
-The server uses Postgres. Tables are created automatically on startup via
-`CREATE TABLE IF NOT EXISTS`. Idempotent migrations in `src/api/db.py`
-(`_MIGRATIONS`) also run on startup to upgrade existing databases safely.
+Postgres. Tables created on startup via `CREATE TABLE IF NOT EXISTS`;
+idempotent migrations in `src/api/db.py::_MIGRATIONS` run on the same path.
 
-Tables:
-- `agents` — agent configurations (id, name, config JSONB)
-- `volumes` — persistent storage records (id, name, provider, provider_ref, status)
-- `sessions` — session records (id, agent_id, volume_id, inner_session_id, env, secrets, cwd, pre_start_commands, sandbox_state JSONB)
-- `session_log` — event log (session_id, event_type, payload JSONB)
+| Table | Purpose |
+|---|---|
+| `agents` | agent configs (id, name, config JSONB) |
+| `volumes` | persistent storage records (id, name, provider, provider_ref, status) |
+| `sessions` | session records (incl. `inner_session_id`, `env`, `secrets`, `cwd`, `pre_start_commands`, `sandbox_state` JSONB) |
+| `session_log` | event log (session_id, event_type, payload JSONB) |
 
-There is no `sandboxes` table — sandbox identity (provider sandbox ref, listen port, snapshot path, recipe) is stored in `sessions.sandbox_state` JSONB and managed by the in-process `SessionPool`.
+No `sandboxes` table — sandbox identity (`sandbox_ref`, listen port,
+snapshot path, recipe) is in `sessions.sandbox_state` JSONB, owned by
+the in-process `SessionPool`.
 
-## Environment Variables
+## Environment variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | `postgresql://localhost:5432/agent_sdk_server` | Postgres connection string |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | Preferred auth for Claude agents |
-| `ANTHROPIC_API_KEY` | — | Fallback auth for Claude agents |
-| `OPENAI_API_KEY` | — | Required for Codex agents |
-| `AGENT_SDK_REAPER_IDLE_S` | `180` | Seconds an active session can sit idle before the pool reaper hibernates it |
-| `AGENT_SDK_REAPER_INTERVAL_S` | `60` | Pool reaper scan interval in seconds |
-| `AGENT_SDK_ORIGIN` | `production` | Tag applied to provisioned daytona sandboxes (set to `test` by `scripts/launch_server_test.sh` so cleanup tooling can isolate test traffic) |
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://localhost:5432/agent_sdk_server` | Postgres conn string |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Preferred Claude auth |
+| `ANTHROPIC_API_KEY` | — | Fallback Claude auth |
+| `OPENAI_API_KEY` | — | Required for Codex |
+| `AGENT_SDK_REAPER_IDLE_S` | `180` | Idle window before pool hibernates a session |
+| `AGENT_SDK_REAPER_INTERVAL_S` | `60` | Pool reaper scan interval |
+| `AGENT_SDK_ORIGIN` | `production` | Daytona sandbox label (`scripts/launch_server_test.sh` sets `test`) |
 
-## Running Tests
+## Tests
 
 ```bash
 .venv/bin/python -m pytest tests/ -n auto
 ```
 
-`-n auto` (pytest-xdist) is mandatory — sequential runs of the daytona/docker
-golden suites take 8–15 min and waste iteration time. It is fine even when
-filtering with `-k`; xdist negotiates worker count down to the number of
-selected items.
+`-n auto` is mandatory (sequential daytona/docker takes 8–15 min). Fine
+with `-k` filters; xdist negotiates worker count down.
 
-For the golden tests that need a live server, launch via
-`scripts/launch_server_test.sh` (NOT `launch_server_local.sh` directly) — the
-test wrapper sets `AGENT_SDK_ORIGIN=test` so daytona sandboxes are labelled
-isolatable from production traffic.
+For golden tests that need a live server, use `scripts/launch_server_test.sh`
+(NOT `launch_server_local.sh` directly) — it sets `AGENT_SDK_ORIGIN=test`
+so daytona sandboxes are isolatable from production.
 
-Unit tests (most of `tests/`) use mocked DB and provider modules — no Docker or
-Postgres needed.
+Most unit tests use mocked DB / providers — no Docker or Postgres required.

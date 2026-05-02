@@ -136,5 +136,5 @@ async def test_docker_create_sandbox_raises_without_runtime_image(monkeypatch):
 
 
 # ``test_docker_create_sandbox_image_runtime_flag_off`` was deleted in
-# Phase E of docs/runtime-image-unification.md — the flag-off path no
+# the runtime-image-unification refactor — the flag-off path no
 # longer exists, so there's nothing to pin.

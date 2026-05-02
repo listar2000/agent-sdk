@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reclaim disk by deleting ``system/supervisor/`` from existing volumes.
 
-After the runtime-image unification (docs/runtime-image-unification.md), the
+After the runtime-image-unification refactor, the
 agent-sdk runtime is baked into the Docker image and providers no longer
 read from each volume's ``system/supervisor/`` directory. The dead
 directories are not a correctness problem — new code never touches them —

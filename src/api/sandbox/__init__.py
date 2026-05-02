@@ -1,6 +1,6 @@
 """Ephemeral SandboxSession + per-provider concrete classes.
 
-See ``docs/session-runtime-refactor.md``.
+See ````.
 
 What's here:
   * ``BaseSandboxSession`` — abstract: start / running / execute_prompt

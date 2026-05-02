@@ -1,6 +1,6 @@
 """Unit tests for the runtime-path resolution helper.
 
-Pins the contract documented in ``docs/runtime-image-unification.md`` §2.2:
+Pins the contract documented in ``the runtime-image-unification refactor`` §2.2:
 ``$AGENT_SDK_RUNTIME_PATH`` wins, then ``/opt/agent-sdk/runtime`` (image
 path), then ``<repo>/src/supervisor`` (source-tree fallback). When none of
 those resolves, a ``RuntimeError`` with the remediation command is raised.

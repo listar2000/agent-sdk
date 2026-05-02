@@ -1,7 +1,7 @@
 """REST API server — agent / volume / session orchestration layer.
 
 Sandbox identity is implicit and owned in-process by the
-``api.sandbox.SessionPool`` (see docs/session-runtime-refactor.md).
+``api.sandbox.SessionPool``
 There is no ``/sandboxes`` resource; ``GET /sessions/{id}/sandbox``
 returns the metadata.
 
@@ -133,7 +133,7 @@ async def lifespan(app):
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "unix_local", "modal")])
 
     # SessionPool owns idle eviction now (per
-    # docs/session-runtime-refactor.md).
+    # ).
     from api.sandbox import start_reaper, shutdown_pool
     await start_reaper()
 

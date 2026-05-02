@@ -507,25 +507,18 @@
             </div>
             <div class="field is-new">
               <div class="field-badges"></div>
-              <span class="field-name">supervisor_agent_types</span>
-              <span class="field-type">JSONB</span>
-              <span class="field-desc">cache of which agent_types have supervisor installed (skip redundant installs)</span>
-            </div>
-            <div class="field is-new">
-              <div class="field-badges"></div>
               <span class="field-name">created_at</span>
               <span class="field-type">TIMESTAMPTZ</span>
               <span class="field-desc">default now()</span>
             </div>
-            <div class="relation-note">Durable storage, independent of any sandbox. Lifecycle via <code style="font-family:monospace;color:#fb923c;">/volumes</code> CRUD.</div>
+            <div class="relation-note">Durable storage, independent of any sandbox. Lifecycle via <code style="font-family:monospace;color:#fb923c;">/volumes</code> CRUD. Volumes hold user data only — the supervisor + ACP bins ship in the agent-sdk image at <code style="font-family:monospace;color:#fb923c;">/opt/agent-sdk/runtime/</code>.</div>
             <div class="relation-note" style="margin-top:6px;">On-volume layout:<br>
-              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">system/supervisor/</code> — shared supervisor.js + node_modules (installed once per agent_type, read-only to sandboxes)<br>
               &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">agents/&lt;agent_id&gt;/</code> — per-agent slice: <code style="font-family:monospace;color:#fb923c;">snapshot.tar</code> (HOME contents, refreshed each turn-end) + <code style="font-family:monospace;color:#fb923c;">logs/</code><br>
               &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">shared/&lt;name&gt;/</code> — opt-in shared folder, mounted at <code style="font-family:monospace;color:#fb923c;">/mnt/&lt;name&gt;</code> for agents that list it in <code style="font-family:monospace;color:#fb923c;">config.shared_mounts</code></div>
           </div>
         </div>
 
-        <!-- sandbox_state JSONB on sessions (replaces the old sandboxes table) -->
+        <!-- sandbox_state JSONB on sessions -->
         <div class="card">
           <div class="card-header ch-cyan">
             <div class="table-name">
@@ -614,7 +607,7 @@
               <div class="field-badges"></div>
               <span class="field-name">sandbox_state</span>
               <span class="field-type">JSONB</span>
-              <span class="field-desc">discriminated union (daytona | docker | unix_local | modal | unknown). Holds <code style="font-family:monospace;color:#fb923c;">sandbox_ref</code>, <code style="font-family:monospace;color:#fb923c;">listen_port</code>, <code style="font-family:monospace;color:#fb923c;">snapshot_path</code>, <code style="font-family:monospace;color:#fb923c;">snapshot_version</code>, and the provisioning <code style="font-family:monospace;color:#fb923c;">recipe</code>. Replaces the old <code style="font-family:monospace;color:#fb923c;">current_sandbox_id</code> FK.</span>
+              <span class="field-desc">discriminated union (daytona | docker | unix_local | modal | unknown). Holds <code style="font-family:monospace;color:#fb923c;">sandbox_ref</code>, <code style="font-family:monospace;color:#fb923c;">listen_port</code>, <code style="font-family:monospace;color:#fb923c;">snapshot_path</code>, <code style="font-family:monospace;color:#fb923c;">snapshot_version</code>, and the provisioning <code style="font-family:monospace;color:#fb923c;">recipe</code>.</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -644,7 +637,7 @@
               <div class="field-badges"><span class="badge-field-new">new</span></div>
               <span class="field-name">pre_start_commands</span>
               <span class="field-type">JSONB NOT NULL</span>
-              <span class="field-desc">default []. Caller-supplied shell commands run inside the sandbox before the supervisor starts. Persisted so they re-run on Type 2 recovery (replacement sandbox). Skill-install commands are merged separately at run time. Added 2026-04-26.</span>
+              <span class="field-desc">default []. Caller-supplied shell commands run inside the sandbox before the supervisor starts. Persisted so they re-run on Type 2 recovery (replacement sandbox). Skill-install commands are merged separately at run time.</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>
@@ -840,7 +833,6 @@
             <div class="relation-note">Stored as JSON in agents.config column. Pure agent identity — cloneable, no per-invocation state. <code style="font-family:monospace;color:#fb923c;">mode</code> + <code style="font-family:monospace;color:#fb923c;">thought_level</code> are persisted here so cold-recovery (Type-2) replays them via <code style="font-family:monospace;color:#fb923c;">_attach_acp</code>.</div>
             <div class="relation-note" style="margin-top:6px;">
               <strong>Not on AgentConfig:</strong><br>
-              &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">prompt</code> + <code style="font-family:monospace;color:#fb923c;">tools</code> → removed; provider CLIs handle them directly via mode / built-in defaults<br>
               &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">cwd</code> → <code style="font-family:monospace;color:#fb923c;">sessions.cwd</code> (JSONL-hash key; per-conversation)<br>
               &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">dockerfile</code> + <code style="font-family:monospace;color:#fb923c;">shared_mounts</code> + <code style="font-family:monospace;color:#fb923c;">root</code> + <code style="font-family:monospace;color:#fb923c;">pre_start_commands</code> → <code style="font-family:monospace;color:#fb923c;">sandbox_state.recipe</code> (frozen at provision time)<br>
               &nbsp;&nbsp;<code style="font-family:monospace;color:#fb923c;">env</code> → <code style="font-family:monospace;color:#fb923c;">sessions.env</code> / <code style="font-family:monospace;color:#fb923c;">sessions.secrets</code>
@@ -962,7 +954,7 @@
               <div class="field-badges"></div>
               <span class="field-name">sandbox_id</span>
               <span class="field-type">str</span>
-              <span class="field-desc">vestigial — runtime is now SessionPool / SandboxSession (see docs/session-runtime-refactor.md). This dataclass survives only for response-shape back-compat.</span>
+              <span class="field-desc">opaque sandbox ref returned in API responses. The runtime is owned by <code style="font-family:monospace;color:#fb923c;">SessionPool</code> / <code style="font-family:monospace;color:#fb923c;">SandboxSession</code>.</span>
             </div>
             <div class="field">
               <div class="field-badges"></div>

@@ -90,7 +90,7 @@ async def test_delete_volume_tolerates_missing(tmp_path, monkeypatch):
 
 # ``test_install_supervisor_populates_volume`` and
 # ``test_install_supervisor_is_cumulative_across_agent_types`` were deleted
-# in Phase E of docs/runtime-image-unification.md. The supervisor + ACP bins
+# in the runtime-image-unification refactor. The supervisor + ACP bins
 # now ship in the image at ``/opt/agent-sdk/runtime/``; no per-volume install
 # happens, so there's nothing to populate or to stay cumulative.
 
@@ -195,7 +195,7 @@ async def test_create_sandbox_uses_image_runtime_when_flag_set(
 
 
 # test_create_sandbox_uses_volume_runtime_by_default was deleted in Phase E
-# of docs/runtime-image-unification.md — the legacy volume-install path
+# of the runtime-image-unification refactor — the legacy volume-install path
 # is gone, so there's no flag-off behavior to pin.
 
 

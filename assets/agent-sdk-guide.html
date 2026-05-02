@@ -276,8 +276,6 @@
           <li><code>agent_sdk.ApiClient</code> — <strong>operator</strong>. Stateless REST wrapper. Manages volumes, sessions, files for other people's sessions. Use it for schedulers, admin tools, hive workspace bootstraps.</li>
         </ul>
         Pick by persona, not feature: if your code <em>is</em> the user, use <code>Agent</code>; if your code is acting <em>on behalf of</em> users, use <code>ApiClient</code>.
-        <br><br>
-        <em>(There's also a small <code>agent_sdk.Client</code> with a volumes-only API — vestigial, predates <code>ApiClient</code>. Use <code>ApiClient</code> for new code.)</em>
       </div>
     </div>
   </div>
@@ -399,7 +397,7 @@ text = agent.<span class="fn">run</span>(<span class="st">"Say hi"</span>, timeo
 <span class="kw">await</span> agent.<span class="fn">send</span>(<span class="st">"Cancel and do this instead."</span>, interrupt=<span class="nm">True</span>)</code></pre>
     </div>
     <div class="callout callout-blue">
-      Interrupt is purely client-side: <code>cancel()</code> first, then submit. The server has no per-session prompt queue — see <code>docs/acp-boundary-problem.md</code>.
+      Interrupt is purely client-side: <code>cancel()</code> first, then submit. The server has no per-session prompt queue — at most one <code>session/prompt</code> runs against the ACP child at a time per session.
     </div>
 
     <div class="card">

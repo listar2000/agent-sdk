@@ -401,7 +401,7 @@ _MIGRATIONS = [
     """UPDATE sessions
        SET sandbox_state = jsonb_set(sandbox_state - 'sandbox_id', '{sandbox_ref}', sandbox_state->'sandbox_id')
        WHERE sandbox_state ? 'sandbox_id'""",
-    # Phase E of docs/runtime-image-unification.md: supervisor + ACP bins
+    # the runtime-image-unification refactor: supervisor + ACP bins
     # now ship in the agent-sdk Docker image at /opt/agent-sdk/runtime/.
     # The per-volume install-cache column is no longer read or written.
     # Forward-only drop — irreversible, but safe because every code path
@@ -605,7 +605,7 @@ async def delete_volume(volume_id: str) -> None:
 
 
 # add_supervisor_agent_type was deleted in Phase E of
-# docs/runtime-image-unification.md — the supervisor_agent_types cache
+# the runtime-image-unification refactor — the supervisor_agent_types cache
 # is no longer used. The DB column survives until the column-drop migration.
 
 

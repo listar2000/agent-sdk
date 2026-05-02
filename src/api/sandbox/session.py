@@ -134,7 +134,7 @@ class BaseSandboxSession(abc.ABC):
             sess.get("inner_session_id") or self._inner_session_id
         )
 
-        # Phase E of docs/runtime-image-unification.md: the per-volume
+        # the runtime-image-unification refactor: the per-volume
         # ``install_supervisor`` step is gone. The supervisor + ACP bins
         # ship in the agent-sdk Docker image at ``/opt/agent-sdk/runtime/``,
         # so each provider's ``create_sandbox`` resolves them from a fixed

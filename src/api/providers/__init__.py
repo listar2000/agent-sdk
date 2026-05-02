@@ -213,7 +213,7 @@ _DISPATCH_FNS = frozenset({
     "start_sandbox", "destroy_sandbox", "stop_sandbox",
     "ensure_supervisor_url",
     # ``install_supervisor`` was deleted in Phase E of
-    # docs/runtime-image-unification.md — the runtime ships in the image.
+    # the runtime-image-unification refactor — the runtime ships in the image.
     "volume_tree", "volume_read", "volume_download", "volume_exists", "volume_write",
     "volume_upload", "volume_mkdir", "volume_delete", "volume_rename",
 })

@@ -106,7 +106,7 @@ def _provision_ctx(sandbox):
     """Context manager stack for provision_daytona_sandbox unit tests.
 
     These are pre_start-failure tests, not runtime-image tests. Phase E
-    of docs/runtime-image-unification.md removed the legacy node:22-slim
+    of the runtime-image-unification refactor removed the legacy node:22-slim
     fallback, so we set ``DAYTONA_IMAGE`` to satisfy the now-required
     image arg. ``DAYTONA_SNAPSHOT=0`` keeps us off the snapshot branch
     so the test still exercises the image path.

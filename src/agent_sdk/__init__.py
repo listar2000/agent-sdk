@@ -15,7 +15,7 @@ __version__ = "0.5.0"
 from .client import (
     Agent, Event, Sandbox, Session, UsageStats,
     CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE, AGENT_TYPES,
-    UNIX_LOCAL, DOCKER, DAYTONA, PROVIDERS,
+    UNIX_LOCAL, DOCKER, DAYTONA, MODAL, PROVIDERS,
 )
 from .errors import (
     AgentSDKError, AgentConnectionError, AgentNotRegisteredError,
@@ -33,7 +33,7 @@ __all__ = [
     "Session",
     "UsageStats",
     "CLAUDE", "CODEX", "OPENCODE", "GEMINI", "CLINE", "DEEPAGENTS", "OPENHANDS", "GOOSE", "AGENT_TYPES",
-    "UNIX_LOCAL", "DOCKER", "DAYTONA", "PROVIDERS",
+    "UNIX_LOCAL", "DOCKER", "DAYTONA", "MODAL", "PROVIDERS",
     "AgentSDKError", "AgentConnectionError", "AgentNotRegisteredError",
     "SandboxError", "VolumeFileExistsError", "AgentBusyError", "AgentTimeoutError", "PromptError", "StreamError",
     "SessionRecord",

@@ -1,17 +1,19 @@
 """E2E: sandbox stop/delete recovery and session resume.
 
-All tests require a live server on localhost:7778. Five test groups
-(10 parametrized over local/docker/daytona + 1 local-only = 11 tests
-total; see tests/README.md for per-test invariants):
+All tests require a live server on localhost:7778. 15 tests, most
+parameterized over ``{daytona, docker, unix_local, modal}`` (a few omit
+a provider where the failure mode doesn't apply). See tests/README.md
+for per-test invariants. Five thematic groups:
 
   1. stop — external sandbox stop → server restarts same sandbox →
             same ``sandbox_ref``, files at /tmp survive.
 
-  2. delete — external sandbox delete → server provisions new sandbox
+  2. delete — external sandbox delete (or server-driven
+              ``DELETE /sessions/{id}``) → server provisions new sandbox
               on same volume → different ``sandbox_ref``, files in the
               VOLUME working dir survive.
 
-  3. resume — session persists across ensure_session_live re-entrancy,
+  3. resume — session persists across pool-mediated reattach,
               including a midstream variant that exercises the
               SSE-reader's own recovery path.
 
@@ -21,16 +23,14 @@ total; see tests/README.md for per-test invariants):
               retrying), and persistent-SSE (UI holds /events open
               across turns).
 
-  5. persistent-SSE + delete — two variants matching real UI flow:
-              server-side DELETE /sandboxes/{id} vs out-of-band delete
-              (daytona dashboard / docker rm / kill -9).
-
-  6. stale-cache — local-only: wipe system/supervisor/ on disk while
-              the DB cache claims it's installed; server must detect
-              on next provision and self-heal.
+  5. persistent-SSE + delete — variants matching real UI flow:
+              server-side ``DELETE /sessions/{id}`` vs out-of-band
+              delete (daytona dashboard / docker rm / kill -9), plus
+              supervisor-killed-in-place and reconnect-gap replay.
 
 Skipped when the provider is unavailable (no docker daemon, no
-DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN, or no server on localhost:7778).
+DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN, no modal profile, or no
+server on localhost:7778).
 """
 from __future__ import annotations
 
@@ -165,7 +165,7 @@ def _auto_destroy_test_sandboxes():
     Errors are swallowed (best-effort cleanup) and the underlying daytona
     sandbox still has the ``agent_sdk_origin`` label as a backup so a
     crashed-mid-cleanup orphan can be picked up by
-    ``scripts/cleanup_daytona_orphans.py``.
+    ``scripts/cleanup_orphans.py``.
     """
     _CREATED_SESSIONS.clear()
     yield
@@ -1523,7 +1523,7 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
 
 
 # ``test_session_survives_supervisor_dir_wiped_from_volume`` was deleted in
-# Phase E of docs/runtime-image-unification.md. The test exercised the
+# the runtime-image-unification refactor. The test exercised the
 # ``volumes.supervisor_agent_types`` cache-vs-disk-drift recovery path; that
 # path no longer exists because the supervisor + ACP bins now ship in the
 # image (``/opt/agent-sdk/runtime/``) instead of being installed onto each

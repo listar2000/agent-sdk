@@ -1,52 +1,40 @@
 # Testing
 
-Always run `pytest` with `-n auto` (pytest-xdist) so the full suite runs across
-all available workers. Sequential runs of the daytona/docker golden suites take
-8–15+ minutes and waste an enormous amount of iteration time. Example:
+Run pytest with `-n auto` (pytest-xdist). Sequential daytona/docker
+goldens are 8–15+ min; xdist parallel is mandatory. `-n auto` is fine
+with `-k` filters — xdist negotiates worker count down.
 
     .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto
 
-`-n auto` is fine even when filtering with `-k` — pytest-xdist negotiates worker
-count down to the number of selected items.
-
-Launch the dev server for the golden tests with `scripts/launch_server_test.sh`
-(NOT `launch_server_local.sh` directly). The test wrapper sets
-`AGENT_SDK_ORIGIN=test` so daytona sandboxes get labelled `agent_sdk_origin=test`
-and stay isolatable from real production traffic — `cleanup_daytona_orphans.py`
-greps that label.
+For the golden suite, launch the dev server with
+`scripts/launch_server_test.sh` (NOT `launch_server_local.sh` directly).
+The wrapper sets `AGENT_SDK_ORIGIN=test`, so daytona sandboxes carry
+`agent_sdk_origin=test` and `cleanup_orphans.py` can isolate them from
+production.
 
 ## Sandbox cleanup across test runs
 
-Tests that create real sandboxes (live daytona / docker / local provider)
-are wrapped by an autouse `_auto_cleanup_live_sessions` fixture in
+Tests that create real sandboxes (daytona / docker / local) are wrapped
+by an autouse `_auto_cleanup_live_sessions` fixture in
 `tests/conftest.py`. It tracks every session created via `Agent` or
 `ApiClient.create_session` and fires `DELETE /sessions/{id}` at teardown
-even on test failure — so the session row + pool lease are always dropped.
+even on test failure.
 
-For paused-not-deleted residue (daytona pauses on release; docker stops
-on release; both leak across runs), use the unified cleanup script:
+For paused-on-release residue (daytona pauses; docker stops):
 
-    # Dry run — see what'd be reaped:
-    python scripts/cleanup_orphans.py
-
-    # Reap everything labelled agent_sdk_origin=test:
-    python scripts/cleanup_orphans.py --yes
-
-    # Or one provider at a time:
+    python scripts/cleanup_orphans.py                       # dry run
+    python scripts/cleanup_orphans.py --yes                 # reap origin=test
     python scripts/cleanup_orphans.py --provider daytona --yes
     python scripts/cleanup_orphans.py --provider docker --yes
-    python scripts/cleanup_orphans.py --provider unix_local --yes  # kills orphan supervisor.js whose ppid==1
+    python scripts/cleanup_orphans.py --provider unix_local --yes   # orphan supervisor.js, ppid==1
 
-CI can opt into automatic post-session cleanup with
-`AGENT_SDK_TEST_AUTO_CLEANUP=1` (off by default for local dev to avoid
-churn on every unit-test run).
+CI opt-in for auto post-session cleanup: `AGENT_SDK_TEST_AUTO_CLEANUP=1`.
+Off by default to avoid churn on local unit-test runs.
 
-## Daytona-specific notes
+## Daytona quota errors
 
-The daytona golden suite runs cleanly under `-n auto` as of #42 (POST /message
-no longer blocks on cold-recovery; transition-aware probe handles
-`starting`/`stopping`/etc. without spurious teardowns). If it suddenly starts
-failing with `Total disk limit exceeded. Maximum allowed: 2000GiB`, that's
-NOT a code regression — it's orphaned sandboxes from a previous failed run
-accumulating on the Daytona side. Run `cleanup_orphans.py --provider daytona
---yes` (filter defaults to the `test` origin, so production is safe).
+If the daytona golden suite fails with `Total disk limit exceeded.
+Maximum allowed: 2000GiB`, that's orphaned sandboxes from a prior
+failed run, NOT a code regression. Run
+`cleanup_orphans.py --provider daytona --yes` (defaults to the `test`
+origin; production is safe).

@@ -61,7 +61,7 @@ from ._shared import (
     normalize_find_output,
 )
 
-# Phase E of docs/runtime-image-unification.md: ``_SUPERVISOR_DIR``,
+# the runtime-image-unification refactor: ``_SUPERVISOR_DIR``,
 # ``_SUPERVISOR_REMOTE_DIR``, and ``_SUPERVISOR_VOLUME_DIR`` were deleted
 # along with the install/cache helpers that used them. The supervisor now
 # lives at ``/opt/agent-sdk/runtime/`` inside the daytona sandbox image.
@@ -180,7 +180,7 @@ async def start_supervisor_in_sandbox(
         )
         return url
 
-    # Phase E of docs/runtime-image-unification.md: the daytona sandbox boots
+    # the runtime-image-unification refactor: the daytona sandbox boots
     # from an image whose ``/opt/agent-sdk/runtime/`` already contains
     # supervisor.js + every ACP bin. No volume-side cache check, no
     # deps.tar.gz extract, no legacy /tmp install — all gone with the image.
@@ -251,7 +251,7 @@ async def start_supervisor_in_sandbox(
 
 
 # ``_resolve_legacy_volume_supervisor`` was deleted in Phase E of
-# docs/runtime-image-unification.md — all its volume-cache + tar-extract +
+# the runtime-image-unification refactor — all its volume-cache + tar-extract +
 # legacy-fallback work is obsolete now that the runtime is in the image.
 
 
@@ -301,7 +301,7 @@ async def provision_daytona_sandbox(
     loop = asyncio.get_running_loop()
     daytona = Daytona(DaytonaConfig(api_key=api_key))
 
-    # Phase E of docs/runtime-image-unification.md: the runtime is baked
+    # the runtime-image-unification refactor: the runtime is baked
     # into the agent-sdk Docker image. Provisioning needs either a
     # snapshot (faster cold-start, registered by ``scripts/release.sh``
     # via Daytona's ``Image.from_dockerfile``) or an image reference. The
@@ -848,7 +848,7 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
 
 
 # ``install_supervisor`` was deleted in Phase E of
-# docs/runtime-image-unification.md. The daytona sandbox now boots from an
+# the runtime-image-unification refactor. The daytona sandbox now boots from an
 # image whose /opt/agent-sdk/runtime/ contains supervisor.js + every ACP
 # bin; ``provision_daytona_sandbox`` reads ``DAYTONA_IMAGE`` /
 # ``.runtime-image-tag`` for that image.

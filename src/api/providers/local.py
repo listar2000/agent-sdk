@@ -37,7 +37,7 @@ from ._shared import (
 log = logging.getLogger(__name__)
 
 # ``_REPO_ROOT`` and ``_SUPERVISOR_JS_SRC`` were deleted in Phase E of
-# docs/runtime-image-unification.md — they were used only by the deleted
+# the runtime-image-unification refactor — they were used only by the deleted
 # install_supervisor function. ``_runtime_supervisor_js()`` /
 # ``_detect_runtime_path()`` (in providers/_shared.py) are the new resolvers.
 
@@ -111,7 +111,7 @@ async def delete_volume(ref: str) -> None:
 
 
 # ``install_supervisor`` was deleted in Phase E of
-# docs/runtime-image-unification.md. The supervisor + ACP bins now ship in
+# the runtime-image-unification refactor. The supervisor + ACP bins now ship in
 # the agent-sdk Docker image at ``/opt/agent-sdk/runtime/`` (or in
 # ``<repo>/src/supervisor`` for source-tree dev) and ``create_sandbox``
 # resolves them via ``_runtime_supervisor_js()`` / ``_runtime_acp_bin()``.
@@ -153,7 +153,7 @@ async def create_sandbox(
     sub = (subpath or "").lstrip("/")
     home_dir = vol / sub
 
-    # Phase E of docs/runtime-image-unification.md: the supervisor + ACP bins
+    # the runtime-image-unification refactor: the supervisor + ACP bins
     # come from the image runtime path (``/opt/agent-sdk/runtime/`` baked
     # into the agent-sdk Docker image; falls back to ``<repo>/src/supervisor``
     # for source-tree dev). No per-volume install.
