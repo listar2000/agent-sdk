@@ -36,7 +36,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ._shared import (
+from .._shared import (
     ExecResult,
     ProviderInstance,
     SandboxMissingError,
@@ -158,7 +158,9 @@ async def _get_image():
     if _image is not None:
         return _image
     modal, _ = _require_modal()
-    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    # repo root is 5 levels up from src/api/providers/modal/__init__.py
+    # (modal/ → providers/ → api/ → src/ → repo)
+    repo_root = Path(__file__).resolve().parents[4]
 
     snapshot_tag = repo_root / ".modal-snapshot-tag"
     if snapshot_tag.exists():
@@ -328,7 +330,7 @@ async def create_sandbox(
     env_prefix = _build_env_prefix(spawn_env)
     # Resolve the ACP bin via package.json#bin (daytona/modal flatten the
     # ``node_modules/.bin/`` symlinks during image-build).
-    from ._shared import _runtime_acp_bin_relative
+    from .._shared import _runtime_acp_bin_relative
     sup_dir_in = _RUNTIME_IN
     acp_path = f"{sup_dir_in}/{_runtime_acp_bin_relative(agent_type)}"
     supervisor_argv = build_supervisor_argv(
@@ -603,7 +605,7 @@ async def reconcile_on_startup() -> None:
     Failures on individual sandboxes are logged but never raised.
     """
     try:
-        from .. import db as dbmod
+        from ... import db as dbmod
     except Exception as e:
         log.warning("modal reconcile: cannot import api.db: %s", e)
         return

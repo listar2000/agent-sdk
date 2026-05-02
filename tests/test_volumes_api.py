@@ -349,7 +349,7 @@ async def test_volume_files_upload_mkdir_delete_rename_dispatch(client):
     async def fake_delete(ref, path):
         calls.append(("delete", ref, (path,)))
 
-    async def fake_rename(ref, path, new_path):
+    async def fake_rename(ref, path, new_path, *, overwrite=True):
         calls.append(("rename", ref, (path, new_path)))
 
     with patch("api.providers.daytona.volume_upload", new=AsyncMock(side_effect=fake_upload)), \

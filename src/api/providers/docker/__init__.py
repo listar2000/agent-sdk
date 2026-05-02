@@ -25,7 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ._shared import (
+from .._shared import (
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_NPM_SPECS,
@@ -240,7 +240,7 @@ async def create_sandbox(
     # ``node_modules/.bin/`` symlinks on some build engines).
     runtime_in_container = "/opt/agent-sdk/runtime"
     supervisor_js_in = f"{runtime_in_container}/supervisor.js"
-    from ._shared import _runtime_acp_bin_relative
+    from .._shared import _runtime_acp_bin_relative
     acp_path = f"{runtime_in_container}/{_runtime_acp_bin_relative(agent_type)}"
     supervisor_argv = build_supervisor_argv(
         supervisor_js=supervisor_js_in, acp_bin=acp_path,
@@ -462,7 +462,7 @@ async def reconcile_on_startup() -> None:
     # Local imports to avoid a hard cycle: docker.py is imported at module
     # init but api.db is initialized later in the lifespan.
     try:
-        from .. import db as dbmod
+        from ... import db as dbmod
     except Exception as e:
         log.warning("docker reconcile: cannot import api.db: %s", e)
         return

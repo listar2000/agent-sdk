@@ -1,4 +1,13 @@
-"""Daytona provider — create/destroy/exec in Daytona sandboxes."""
+"""Daytona provider — create/destroy/exec in Daytona sandboxes.
+
+Package layout:
+- ``__init__.py`` (this file) — volume + sandbox primitives (functional,
+  stateless). Loaded by ``api.providers.__init__``'s dispatch table.
+- ``session.py`` — ``DaytonaSandboxSession``, the per-session lifecycle
+  class. Loaded directly via ``from api.providers.daytona.session
+  import DaytonaSandboxSession`` (avoids a circular import with
+  ``api.sandbox.session`` which session.py depends on).
+"""
 
 import asyncio
 import logging
@@ -9,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import NamedTuple
 
-from .. import load_dotenv
+from ... import load_dotenv
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +53,7 @@ def _run_sandbox_exec(sandbox, cmd: str, timeout: int = 120) -> "_ExecResult":
 
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
-from ._shared import (
+from .._shared import (
     _acp_bin_name,
     _acp_launch_args,
     _ACP_NPM_SPECS,
@@ -187,7 +196,7 @@ async def start_supervisor_in_sandbox(
     # The bin path is resolved via ``package.json#bin`` (not
     # ``node_modules/.bin/``) because daytona's image-build flattens
     # symlinks; the underlying scripts survive but the symlinks don't.
-    from ._shared import _runtime_acp_bin_relative
+    from .._shared import _runtime_acp_bin_relative
     sup_dir = "/opt/agent-sdk/runtime"
     acp_bin = f"{sup_dir}/{_runtime_acp_bin_relative(agent_type)}"
     log.info(
@@ -823,7 +832,7 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
         # the sandbox has been deleted out-of-band. Surface this as a typed
         # error so the server can re-provision on the same volume.
         if "not found" in str(e).lower():
-            from ._shared import SandboxMissingError
+            from .._shared import SandboxMissingError
             raise SandboxMissingError(
                 f"Daytona sandbox {inst.sandbox_ref} not found (deleted externally)"
             ) from e
@@ -996,7 +1005,7 @@ async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
     dropping the cache entry, so callers don't see a single stale-cache
     hit bubble up as a 500.
     """
-    from .. import providers as _prov  # local import for cycle
+    from ... import providers as _prov  # local import for cycle
     inst = await _get_or_create_utility(ref)
     try:
         return await _prov.exec_in_instance(inst, cmd, timeout=timeout)
@@ -1298,7 +1307,7 @@ async def reconcile_on_startup() -> None:
     Failures are logged and swallowed.
     """
     try:
-        from .. import db as dbmod
+        from ... import db as dbmod
     except Exception as e:
         log.warning("daytona reconcile: cannot import api.db: %s", e)
         return

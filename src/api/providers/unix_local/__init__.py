@@ -16,7 +16,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from ._shared import (
+from .._shared import (
     AUTH_KEYS,
     ProviderInstance,
     VolumeFileExistsError,
@@ -697,7 +697,7 @@ async def reconcile_on_startup() -> None:
     import signal
 
     try:
-        from .. import db as dbmod
+        from ... import db as dbmod
     except Exception as e:
         log.warning("unix_local reconcile: cannot import api.db: %s", e)
         return

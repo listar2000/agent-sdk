@@ -15,8 +15,8 @@ from uuid import uuid4
 
 import httpx
 
-from ..session import BaseSandboxSession
-from ..state import SandboxState, UnixLocalSandboxState
+from api.sandbox.session import BaseSandboxSession
+from api.sandbox.state import SandboxState, UnixLocalSandboxState
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         if self._supervisor_url is not None and await self.running():
             return
 
-        from api.providers import local as lc_provider
+        from api.providers import unix_local as lc_provider
         from api.providers._shared import _wait_for_health
 
         volume_ref = await self._bootstrap_session()
@@ -126,7 +126,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("UnixLocalSandboxSession.execute_prompt called before start()")
 
-        from .daytona import _parse_sse_block
+        from api.providers.daytona.session import _parse_sse_block
 
         if rpc_id is None:
             rpc_id = str(uuid4())
@@ -217,7 +217,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             except Exception:
                 log.exception("snapshot request failed for session %s", self.session_id)
 
-        from api.providers import local as lc_provider
+        from api.providers import unix_local as lc_provider
         from api.providers import ProviderInstance
         try:
             await lc_provider.stop_sandbox(ProviderInstance(

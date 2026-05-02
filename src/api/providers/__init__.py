@@ -1,10 +1,11 @@
-"""ACP supervisor provider management — local, docker, daytona.
+"""ACP supervisor provider management — daytona, docker, unix_local, modal.
 
 This package splits provider-specific code into sub-modules:
-  - daytona.py   — Daytona sandbox management
-  - docker.py    — Docker container management
-  - local.py     — Local subprocess management
-  - _shared.py   — Shared types, constants, helpers
+  - daytona.py     — Daytona sandbox management
+  - docker.py      — Docker container management
+  - unix_local.py  — Host-subprocess management
+  - modal.py       — Modal sandbox management
+  - _shared.py     — Shared types, constants, helpers
 
 providers/__init__.py:
   - Re-exports the ``_shared`` and ``.daytona`` symbols that server.py
@@ -64,13 +65,13 @@ from .daytona import (
 # Provider module dispatch table
 from . import daytona as _daytona_mod
 from . import docker as _docker_mod
-from . import local as _local_mod
+from . import unix_local as _unix_local_mod
 from . import modal as _modal_mod
 
 _PROVIDER_MODS = {
     "daytona": _daytona_mod,
     "docker": _docker_mod,
-    "unix_local": _local_mod,
+    "unix_local": _unix_local_mod,
     "modal": _modal_mod,
 }
 
@@ -212,10 +213,11 @@ _DISPATCH_FNS = frozenset({
     "create_volume", "delete_volume", "get_sandbox_status",
     "start_sandbox", "destroy_sandbox", "stop_sandbox",
     "ensure_supervisor_url",
-    # ``install_supervisor`` was deleted in Phase E of
-    # the runtime-image-unification refactor — the runtime ships in the image.
-    "volume_tree", "volume_read", "volume_download", "volume_exists", "volume_write",
-    "volume_upload", "volume_mkdir", "volume_delete", "volume_rename",
+    # Per-volume file ops (volume_tree / volume_read / volume_download /
+    # volume_exists / volume_write / volume_upload / volume_mkdir /
+    # volume_delete / volume_rename) used to live here too. Phase 2
+    # migrated them to ``BaseVolumeAdapter`` — callers go through
+    # ``get_volume_adapter(provider, ref)`` for a typed interface.
 })
 
 
@@ -226,6 +228,51 @@ def __getattr__(name: str):
         _dispatch.__name__ = name
         return _dispatch
     raise AttributeError(name)
+
+
+# ---------------------------------------------------------------------------
+# Volume adapter dispatch — per-provider ``BaseVolumeAdapter`` instances.
+# Replaces the ``__getattr__`` magic dispatch for per-volume file ops.
+# Lifecycle ops (create_volume / delete_volume) stay on the legacy dispatch.
+# ---------------------------------------------------------------------------
+
+from ._volume import BaseVolumeAdapter  # noqa: E402
+
+_VOLUME_ADAPTERS: dict[str, type[BaseVolumeAdapter]] = {}
+
+
+def _register_volume_adapters() -> None:
+    """Lazy-load each provider's volume adapter class. Same lazy pattern
+    as ``api.sandbox.factory._register_default_providers`` — first call
+    populates the table; subsequent calls are no-ops."""
+    if _VOLUME_ADAPTERS:
+        return
+    from .daytona.volumes import DaytonaVolumeAdapter
+    from .docker.volumes import DockerVolumeAdapter
+    from .modal.volumes import ModalVolumeAdapter
+    from .unix_local.volumes import UnixLocalVolumeAdapter
+    _VOLUME_ADAPTERS["daytona"] = DaytonaVolumeAdapter
+    _VOLUME_ADAPTERS["docker"] = DockerVolumeAdapter
+    _VOLUME_ADAPTERS["modal"] = ModalVolumeAdapter
+    _VOLUME_ADAPTERS["unix_local"] = UnixLocalVolumeAdapter
+
+
+def get_volume_adapter(provider: str, provider_ref: str) -> BaseVolumeAdapter:
+    """Construct a per-volume adapter bound to ``provider_ref``.
+
+    Raises ``ValueError`` for unknown providers (same shape as
+    ``_dispatch_mod``). During Phase 2 rollout, only providers with a
+    registered adapter are wired here; others still go through the
+    legacy ``_providers_mod.volume_*`` dispatch.
+    """
+    _register_volume_adapters()
+    cls = _VOLUME_ADAPTERS.get(provider)
+    if cls is None:
+        raise ValueError(
+            f"no volume adapter registered for provider {provider!r}; "
+            f"available: {sorted(_VOLUME_ADAPTERS)}"
+        )
+    return cls(provider_ref)
 
 
 async def reconcile_sandboxes(provider: str) -> None:

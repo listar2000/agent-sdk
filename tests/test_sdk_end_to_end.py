@@ -114,7 +114,7 @@ class _SpawnRecorder:
 
     Attached via ``patch.object`` so we can reuse the same recorder across
     multiple patches — a test might mock both ``server.create_instance``
-    (universal dispatch) and ``providers.local.create_sandbox``
+    (universal dispatch) and ``providers.unix_local.create_sandbox``
     (provider-specific) and expect to see the single call show up exactly
     once.
     """
@@ -215,7 +215,7 @@ async def test_sdk_creates_default_volume_when_none_specified(asgi_server):
         patch("api.server._start_session_tasks", lambda state: None),
         # Don't actually mkdir the local default-volume — let the DB row
         # be created but short-circuit the filesystem op.
-        patch("api.providers.local.create_volume",
+        patch("api.providers.unix_local.create_volume",
               new=AsyncMock(return_value="/tmp/default-local")),
     ]
     for p in patches:
@@ -263,7 +263,7 @@ async def test_sdk_oauth_token_flows_into_spawn_env(asgi_server):
               new=AsyncMock(return_value=None)),
         patch("api.server.AcpClient", _FakeAcpClient),
         patch("api.server._start_session_tasks", lambda state: None),
-        patch("api.providers.local.create_volume",
+        patch("api.providers.unix_local.create_volume",
               new=AsyncMock(return_value="/tmp/default-local")),
     ]
     for p in patches:
@@ -301,7 +301,7 @@ async def test_sdk_api_key_flows_into_spawn_env(asgi_server):
               new=AsyncMock(return_value=None)),
         patch("api.server.AcpClient", _FakeAcpClient),
         patch("api.server._start_session_tasks", lambda state: None),
-        patch("api.providers.local.create_volume",
+        patch("api.providers.unix_local.create_volume",
               new=AsyncMock(return_value="/tmp/default-local")),
     ]
     for p in patches:
@@ -343,7 +343,7 @@ async def test_sdk_second_message_reuses_session_state(asgi_server):
               new=AsyncMock(return_value=True)),
         patch("api.server.AcpClient", _FakeAcpClient),
         patch("api.server._start_session_tasks", lambda state: None),
-        patch("api.providers.local.create_volume",
+        patch("api.providers.unix_local.create_volume",
               new=AsyncMock(return_value="/tmp/default-local")),
     ]
     for p in patches:
@@ -405,7 +405,7 @@ async def test_sdk_send_returns_rpc_id_and_records_user_message(asgi_server):
         patch("api.server.ensure_volume_supervisor",
               new=AsyncMock(return_value=None)),
         patch("api.server.AcpClient", _FakeAcpClient),
-        patch("api.providers.local.create_volume",
+        patch("api.providers.unix_local.create_volume",
               new=AsyncMock(return_value="/tmp/default-local")),
         patch("api.server._execute_one_prompt", new=fake_execute_one_prompt),
         # Start only the scheduler (which drains pending_prompts through

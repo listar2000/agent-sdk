@@ -73,70 +73,38 @@ async def test_volume_crud_roundtrip():
 
 
 @pytest.mark.asyncio
-async def test_sessions_has_volume_id_and_current_sandbox_id():
+async def test_sessions_has_volume_id_and_sandbox_state():
+    """Sessions row schema: volume_id (NOT NULL) and sandbox_state JSONB.
+    The legacy current_sandbox_id FK + standalone sandboxes table were
+    dropped; sandbox identity now lives in sessions.sandbox_state JSONB."""
     await dbmod.init_pool()
     try:
         async with dbmod.get_db() as conn:
             rows = await (await conn.execute(
                 "SELECT column_name, is_nullable FROM information_schema.columns "
-                "WHERE table_name='sessions' AND column_name IN ('volume_id', 'current_sandbox_id', 'sandbox_id')"
+                "WHERE table_name='sessions' "
+                "AND column_name IN ('volume_id', 'sandbox_state', 'current_sandbox_id', 'sandbox_id')"
             )).fetchall()
         cols = {r["column_name"]: r["is_nullable"] for r in rows}
         assert "volume_id" in cols
-        assert "current_sandbox_id" in cols
-        assert "sandbox_id" not in cols, "old sandbox_id column should be renamed"
-        assert cols["current_sandbox_id"] == "YES", "current_sandbox_id must be nullable"
+        assert "sandbox_state" in cols
+        assert "current_sandbox_id" not in cols, "current_sandbox_id was dropped"
+        assert "sandbox_id" not in cols, "sandbox_id was dropped"
+        assert cols["volume_id"] == "NO", "sessions.volume_id must be NOT NULL"
     finally:
         await dbmod.close_pool()
 
 
 @pytest.mark.asyncio
-async def test_sandboxes_has_volume_id_and_subpath():
+async def test_sandboxes_table_was_dropped():
+    """The sandboxes table was removed; sandbox identity moved into
+    sessions.sandbox_state JSONB owned by the in-process SessionPool."""
     await dbmod.init_pool()
     try:
         async with dbmod.get_db() as conn:
-            rows = await (await conn.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='sandboxes' AND column_name IN ('volume_id', 'subpath')"
-            )).fetchall()
-        names = {r["column_name"] for r in rows}
-        assert names == {"volume_id", "subpath"}
-    finally:
-        await dbmod.close_pool()
-
-
-@pytest.mark.asyncio
-async def test_sandbox_record_roundtrip_with_volume():
-    from api.models import SandboxRecord, VolumeRecord
-    await dbmod.init_pool()
-    try:
-        await dbmod.upsert_volume(VolumeRecord(id="vol_x", name="x", provider="daytona", provider_ref="dt-x"))
-        sb = SandboxRecord(id="sb_x", provider="daytona", sandbox_ref="dt-sb",
-                           status="running", root="/home/daytona",
-                           volume_id="vol_x", subpath="agents/a1/home")
-        await dbmod.upsert_sandbox(sb)
-        got = await dbmod.get_sandbox("sb_x")
-        assert got.volume_id == "vol_x"
-        assert got.subpath == "agents/a1/home"
-    finally:
-        await dbmod.close_pool()
-
-
-@pytest.mark.asyncio
-async def test_volume_id_is_not_null_after_backfill():
-    """After all migrations run, sessions.volume_id and sandboxes.volume_id are NOT NULL."""
-    await dbmod.init_pool()
-    try:
-        async with dbmod.get_db() as conn:
-            rows = await (await conn.execute(
-                "SELECT table_name, column_name, is_nullable "
-                "FROM information_schema.columns "
-                "WHERE (table_name='sessions' AND column_name='volume_id') "
-                "   OR (table_name='sandboxes' AND column_name IN ('volume_id', 'subpath'))"
-            )).fetchall()
-        state = {(r["table_name"], r["column_name"]): r["is_nullable"] for r in rows}
-        assert state.get(("sessions", "volume_id")) == "NO", f"sessions.volume_id should be NOT NULL: {state}"
-        assert state.get(("sandboxes", "volume_id")) == "NO", f"sandboxes.volume_id should be NOT NULL: {state}"
-        assert state.get(("sandboxes", "subpath")) == "NO", f"sandboxes.subpath should be NOT NULL: {state}"
+            row = await (await conn.execute(
+                "SELECT to_regclass('public.sandboxes') AS t"
+            )).fetchone()
+        assert row["t"] is None, "sandboxes table should not exist"
     finally:
         await dbmod.close_pool()
