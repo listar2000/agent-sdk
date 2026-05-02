@@ -574,6 +574,7 @@ class Agent:
         "agent_type", "provider", "model", "cwd", "root",
         "mcp_servers", "skills", "dockerfile",
         "volume_id", "pre_start_commands", "shared_mounts",
+        "resources",
     )
 
     def __init__(
@@ -597,6 +598,7 @@ class Agent:
         pre_start_commands: list[str] | None = None,
         shared_mounts: list[str] | None = None,
         secrets: dict[str, str] | None = None,
+        resources: dict[str, Any] | None = None,
     ):
         self.name = name
         self.agent_type = agent_type
@@ -613,6 +615,7 @@ class Agent:
         self.volume_id = volume_id
         self.pre_start_commands = pre_start_commands
         self.shared_mounts = shared_mounts
+        self.resources = resources
         self._user_secrets: dict[str, str] = dict(secrets) if secrets else {}
         self._persist: SqliteSessionDriver | None = SqliteSessionDriver(db) if db else None
 

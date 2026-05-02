@@ -1282,6 +1282,7 @@ async def _sessions_create_eager(data: dict) -> dict:
     on the session row).
     """
     from api.sandbox import Recipe, get_pool, state_for_provider
+    from api.sandbox.state import Resources, validate_resources_for_provider
 
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
@@ -1306,6 +1307,12 @@ async def _sessions_create_eager(data: dict) -> dict:
     shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
     config_data.pop("dockerfile_content", None)
     config_data.pop("dockerfile", None)
+    resources_data = data.get("resources") or config_data.pop("resources", None)
+    try:
+        resources = Resources(**resources_data) if resources_data else None
+        validate_resources_for_provider(provider, resources)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     # Mirror the lazy path's agent_id reuse: when the caller passes an
     # existing agent_id, this is "create another session under the same
@@ -1353,6 +1360,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         shared_mounts=list(shared_mounts) if shared_mounts else [],
         root=root,
         pre_start_commands=merged_pre_start,
+        resources=resources,
     )
 
     session_id = str(uuid.uuid4())

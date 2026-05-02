@@ -176,6 +176,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             pre_start_commands=self.state.recipe.pre_start_commands or None,
             root=self.state.recipe.root or "/home/daytona",
             shared_mounts=self.state.recipe.shared_mounts or None,
+            resources=self.state.recipe.resources,
         )
         from daytona_sdk import Daytona, DaytonaConfig
         import os as _os

@@ -15,6 +15,87 @@ from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, Field, TypeAdapter
 
 
+class Resources(BaseModel):
+    """Per-session compute request. Each provider applies the subset it
+    supports and silently ignores the rest — see ``providers/<P>/__init__.py``
+    for the per-provider mapping.
+
+    ``gpu`` follows Modal's convention: ``"TYPE"`` (count=1), ``"TYPE:COUNT"``,
+    or a bare integer string for count-only. Type-aware providers (modal)
+    require a type and silently skip count-only requests; count-aware
+    providers (daytona, docker) extract the count and ignore the type.
+    ``disk_gib`` is only honoured by daytona.
+    """
+
+    cpu: float | None = None
+    memory_mib: int | None = None
+    gpu: str | None = None
+    disk_gib: int | None = None
+
+
+def parse_gpu(s: str | None) -> tuple[str | None, int | None]:
+    """Parse a Modal-style gpu string into ``(type, count)``.
+
+    Returns ``(None, None)`` for empty input. ``"T4:2"`` → ``("T4", 2)``;
+    ``"T4"`` → ``("T4", 1)``; ``"2"`` → ``(None, 2)``.
+    """
+    if not s:
+        return None, None
+    if ":" in s:
+        t, c = s.split(":", 1)
+        return (t.upper() if t else None), int(c)
+    if s.isdigit():
+        return None, int(s)
+    return s.upper(), 1
+
+
+def validate_resources_for_provider(provider: str, req: Resources | None) -> None:
+    """Reject resources requests with fields the provider can't honour.
+
+    Per-provider support matrix:
+      * unix_local: rejects any non-None ``resources`` (subprocess on host —
+        no isolation primitive).
+      * daytona: rejects ``gpu`` with a type component (daytona accepts
+        count only).
+      * modal: rejects ``disk_gib`` (no per-sandbox storage knob) and
+        count-only ``gpu`` (modal requires a type).
+      * docker: rejects ``gpu`` with a type component and ``disk_gib``.
+
+    Raises ``ValueError`` with a human-readable message; callers should
+    convert to HTTP 400.
+    """
+    if req is None:
+        return
+    if provider == "unix_local":
+        raise ValueError(
+            "unix_local does not support per-session resources "
+            "(it runs as a host subprocess with no isolation primitive)"
+        )
+    gpu_type, gpu_count = parse_gpu(req.gpu)
+    if provider == "daytona":
+        if gpu_type is not None:
+            raise ValueError(
+                f"daytona does not support gpu type selection (got {req.gpu!r}); "
+                "use a count-only string like \"1\" or \"2\""
+            )
+    elif provider == "modal":
+        if req.disk_gib is not None:
+            raise ValueError("modal does not support disk_gib (no per-sandbox storage knob)")
+        if gpu_type is None and gpu_count is not None:
+            raise ValueError(
+                f"modal requires a gpu type (got count-only {req.gpu!r}); "
+                "use \"T4\", \"A100:2\", etc."
+            )
+    elif provider == "docker":
+        if gpu_type is not None:
+            raise ValueError(
+                f"docker does not support gpu type selection (got {req.gpu!r}); "
+                "use a count-only string like \"1\" or \"2\""
+            )
+        if req.disk_gib is not None:
+            raise ValueError("docker does not support disk_gib (no per-container storage quota)")
+
+
 class Recipe(BaseModel):
     """The provisioning identity of a session — what to spin up.
 
@@ -28,6 +109,7 @@ class Recipe(BaseModel):
     root: str | None = None
     agent_type: str = "claude"
     pre_start_commands: list[str] = Field(default_factory=list)
+    resources: Resources | None = None
 
 
 class _BaseSandboxState(BaseModel):
