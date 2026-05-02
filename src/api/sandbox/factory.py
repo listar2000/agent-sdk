@@ -84,9 +84,9 @@ def _register_default_providers() -> None:
     can call ``make_session`` once with any state to trigger registration.
     """
     from api.providers.daytona.session import DaytonaSandboxSession
-    from .providers.docker import DockerSandboxSession
-    from .providers.modal import ModalSandboxSession
-    from .providers.unix_local import UnixLocalSandboxSession
+    from api.providers.docker.session import DockerSandboxSession
+    from api.providers.modal.session import ModalSandboxSession
+    from api.providers.unix_local.session import UnixLocalSandboxSession
     register("daytona", _adapt(DaytonaSandboxSession))
     register("docker", _adapt(DockerSandboxSession))
     register("modal", _adapt(ModalSandboxSession))

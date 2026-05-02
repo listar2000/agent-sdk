@@ -36,7 +36,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ._shared import (
+from .._shared import (
     ExecResult,
     ProviderInstance,
     SandboxMissingError,

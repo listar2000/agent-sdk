@@ -14,8 +14,8 @@ from uuid import uuid4
 
 import httpx
 
-from ..session import BaseSandboxSession
-from ..state import ModalSandboxState, SandboxState
+from api.sandbox.session import BaseSandboxSession
+from api.sandbox.state import ModalSandboxState, SandboxState
 
 log = logging.getLogger(__name__)
 

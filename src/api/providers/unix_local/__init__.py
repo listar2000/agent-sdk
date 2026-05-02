@@ -16,7 +16,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from ._shared import (
+from .._shared import (
     AUTH_KEYS,
     ProviderInstance,
     VolumeFileExistsError,

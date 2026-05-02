@@ -25,7 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ._shared import (
+from .._shared import (
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_NPM_SPECS,
