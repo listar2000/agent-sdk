@@ -51,7 +51,7 @@ def _fake_response(status_code: int = 200, json_body: dict | None = None) -> htt
 def test_registration_payload_puts_oauth_token_in_secrets():
     """OAuth token must ride through ``payload["secrets"]``, not as a
     top-level key.  The server only reads credentials from ``secrets``."""
-    a = Agent("x", provider="local", api_url="http://localhost:7778",
+    a = Agent("x", provider="unix_local", api_url="http://localhost:7778",
               oauth_token="secret-oauth-123")
     p = _payload(a)
     assert "secrets" in p, "no secrets key on payload"
@@ -64,7 +64,7 @@ def test_registration_payload_puts_oauth_token_in_secrets():
 @pytest.mark.timeout(5)
 def test_registration_payload_puts_api_key_in_secrets():
     """Same contract for ``api_key``."""
-    a = Agent("x", provider="local", api_url="http://localhost:7778",
+    a = Agent("x", provider="unix_local", api_url="http://localhost:7778",
               api_key="sk-ant-secret")
     p = _payload(a)
     assert p["secrets"].get("ANTHROPIC_API_KEY") == "sk-ant-secret"
@@ -123,7 +123,7 @@ async def test_resume_by_session_id_puts_credentials_in_secrets(monkeypatch):
 
 @pytest.mark.timeout(5)
 def test_registration_payload_accepts_both_credentials():
-    a = Agent("x", provider="local", api_url="http://localhost:7778",
+    a = Agent("x", provider="unix_local", api_url="http://localhost:7778",
               oauth_token="tok", api_key="sk")
     p = _payload(a)
     assert p["secrets"] == {
@@ -140,7 +140,7 @@ def test_registration_payload_omits_secrets_when_no_credentials(monkeypatch):
     # Make sure inherited env-vars don't pollute the assertion.
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    a = Agent("x", provider="local", api_url="http://localhost:7778")
+    a = Agent("x", provider="unix_local", api_url="http://localhost:7778")
     p = _payload(a)
     assert "secrets" not in p
 
@@ -154,13 +154,13 @@ def test_registration_payload_omits_volume_id_by_default(monkeypatch):
     """When the caller doesn't specify a volume, the SDK must NOT invent
     one — the server auto-creates/looks up ``default-<provider>``.
 
-    This was the root cause of ``Agent("x", provider="local")`` returning
+    This was the root cause of ``Agent("x", provider="unix_local")`` returning
     400 from ``/sessions/quick``: the SDK sent no volume_id, and at the
     time the server hadn't yet implemented ``_resolve_or_default_volume``.
     """
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    a = Agent("x", provider="local", api_url="http://localhost:7778")
+    a = Agent("x", provider="unix_local", api_url="http://localhost:7778")
     p = _payload(a)
     assert "volume_id" not in p
 
@@ -175,7 +175,7 @@ def test_registration_payload_serializes_via_standard_json(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     a = Agent(
         "x",
-        provider="local",
+        provider="unix_local",
         api_url="http://localhost:7778",
         oauth_token="t",
         model="claude-sonnet-4-5",
@@ -202,7 +202,7 @@ def test_registration_payload_serializes_via_standard_json(monkeypatch):
 def test_registration_payload_always_has_name_and_agent_type(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    a = Agent("worker-42", provider="local", api_url="http://localhost:7778")
+    a = Agent("worker-42", provider="unix_local", api_url="http://localhost:7778")
     p = _payload(a)
     assert p["name"] == "worker-42"
     assert p["agent_type"] == "claude"
@@ -212,7 +212,7 @@ def test_registration_payload_always_has_name_and_agent_type(monkeypatch):
 def test_registration_payload_forwards_provider(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    for provider in ("local", "docker", "daytona"):
+    for provider in ("unix_local", "docker", "daytona"):
         a = Agent("x", provider=provider, api_url="http://localhost:7778")
         p = _payload(a)
         assert p.get("provider") == provider
@@ -228,7 +228,7 @@ def test_registration_payload_drops_none_keys(monkeypatch):
     """
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    a = Agent("x", provider="local", api_url="http://localhost:7778")
+    a = Agent("x", provider="unix_local", api_url="http://localhost:7778")
     p = _payload(a)
     for k in ("model", "prompt", "tools", "mcp_servers", "skills"):
         assert k not in p, f"{k!r} should be omitted when not set"

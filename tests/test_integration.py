@@ -41,7 +41,7 @@ skip_if_no_server = pytest.mark.skipif(
 @pytest.mark.asyncio
 async def test_basic_arun():
     """Agent can complete a simple prompt end-to-end."""
-    agent = Agent("test-basic", provider="local", api_url=BASE_URL, model="haiku")
+    agent = Agent("test-basic", provider="unix_local", api_url=BASE_URL, model="haiku")
     resp = await asyncio.wait_for(
         agent.arun("Reply with exactly: HELLO_WORLD"),
         timeout=60,
@@ -57,7 +57,7 @@ async def test_session_resume_recalls_context():
     import random
     num = random.randint(100, 999)  # 3-digit to avoid false positives
 
-    agent = Agent("test-resume", provider="local", api_url=BASE_URL, model="haiku")
+    agent = Agent("test-resume", provider="unix_local", api_url=BASE_URL, model="haiku")
     resp1 = await asyncio.wait_for(
         agent.arun(f'Remember this number: {num}. Say only "OK {num}."'),
         timeout=90,
@@ -79,7 +79,7 @@ async def test_session_resume_recalls_context():
 @pytest.mark.asyncio
 async def test_astream_yields_text_and_done():
     """astream yields at least one text event and a done event."""
-    agent = Agent("test-events", provider="local", api_url=BASE_URL, model="haiku")
+    agent = Agent("test-events", provider="unix_local", api_url=BASE_URL, model="haiku")
     events = []
 
     async def _collect():
@@ -186,7 +186,7 @@ async def _run_scenario(steps: list, agent_name: str):
     """Shared harness: spawn an Agent, run a sequence of send/wait steps,
     capture all /events envelopes, return (rpc_ids, envelopes).
     """
-    agent = Agent(agent_name, provider="local", api_url=BASE_URL, model="haiku")
+    agent = Agent(agent_name, provider="unix_local", api_url=BASE_URL, model="haiku")
     await agent._ensure_registered()
     session_id = agent.session_id
 

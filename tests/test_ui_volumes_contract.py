@@ -54,7 +54,7 @@ async def test_tree_is_newline_string(client):
                new=AsyncMock(return_value="local-ui-tree")), \
          patch("api.providers.local.volume_tree",
                new=AsyncMock(return_value="a.txt\nsub/\nsub/b.txt")):
-        r = await client.post("/volumes", json={"name": "ui-tree-vol", "provider": "local"})
+        r = await client.post("/volumes", json={"name": "ui-tree-vol", "provider": "unix_local"})
         assert r.status_code == 200
         r = await client.get("/volumes/ui-tree-vol/files/tree")
     assert r.status_code == 200
@@ -75,7 +75,7 @@ async def test_file_read_content_or_content_base64(client):
                new=AsyncMock(return_value="local-ui-read")), \
          patch("api.providers.local.volume_read",
                new=AsyncMock(return_value=b"hello\nworld")):
-        r = await client.post("/volumes", json={"name": "ui-read-vol", "provider": "local"})
+        r = await client.post("/volumes", json={"name": "ui-read-vol", "provider": "unix_local"})
         assert r.status_code == 200
         r = await client.get("/volumes/ui-read-vol/files/read", params={"path": "a.txt"})
     assert r.status_code == 200

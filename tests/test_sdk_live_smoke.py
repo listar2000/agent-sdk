@@ -58,11 +58,11 @@ async def test_serverclient_volume_lifecycle(sc):
     name = f"smoke-{uuid.uuid4().hex[:8]}"
 
     # create + dedup-by-name
-    vol = await sc.create_volume(name=name, provider="local")
+    vol = await sc.create_volume(name=name, provider="unix_local")
     assert vol["id"] and vol["name"] == name
 
     # list / get
-    listed = await sc.list_volumes(provider="local")
+    listed = await sc.list_volumes(provider="unix_local")
     assert any(v["name"] == name for v in listed), listed
     fetched = await sc.get_volume(vol["id"])
     assert fetched["id"] == vol["id"]
@@ -143,7 +143,7 @@ async def test_serverclient_session_lifecycle(sc):
     sandbox_exec → set_config → cancel → delete. Pinned to haiku so the
     one prompt we send doesn't burn the sonnet quota."""
     sess = await sc.create_session(
-        provider="local", agent_type="claude", model="haiku",
+        provider="unix_local", agent_type="claude", model="haiku",
     )
     sid = sess.get("session_id") or sess["id"]
 
@@ -180,7 +180,7 @@ async def test_serverclient_session_lifecycle(sc):
         # sandbox info via the session-scoped route
         sb = await sc.get_session_sandbox(sid)
         assert sb["session_id"] == sid
-        assert sb["provider"] == "local"
+        assert sb["provider"] == "unix_local"
         assert sb["sandbox_ref"], sb
         assert sb["status"] == "running"
         assert sb.get("url", "").startswith("http://"), sb
@@ -214,7 +214,7 @@ async def test_agent_run_streams_done():
         pytest.skip(f"no server at {SERVER}")
     agent = Agent(
         f"smoke-{uuid.uuid4().hex[:8]}",
-        provider="local", api_url=SERVER, model="haiku",
+        provider="unix_local", api_url=SERVER, model="haiku",
     )
     try:
         text = await asyncio.wait_for(
@@ -233,7 +233,7 @@ async def test_agent_astream_yields_typed_dicts():
         pytest.skip(f"no server at {SERVER}")
     agent = Agent(
         f"smoke-ev-{uuid.uuid4().hex[:8]}",
-        provider="local", api_url=SERVER, model="haiku",
+        provider="unix_local", api_url=SERVER, model="haiku",
     )
     seen_types: set[str] = set()
     try:
@@ -266,7 +266,7 @@ async def test_agent_sandbox_helpers_round_trip():
         pytest.skip(f"no server at {SERVER}")
     agent = Agent(
         f"smoke-sb-{uuid.uuid4().hex[:8]}",
-        provider="local", api_url=SERVER, model="haiku",
+        provider="unix_local", api_url=SERVER, model="haiku",
     )
     try:
         # _ensure_registered is private; trigger it via any public call.

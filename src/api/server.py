@@ -130,7 +130,7 @@ async def lifespan(app):
         except Exception as e:
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
-    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "local", "modal")])
+    await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "unix_local", "modal")])
 
     # SessionPool owns idle eviction now (per
     # docs/session-runtime-refactor.md).
@@ -293,13 +293,13 @@ async def _build_pre_start_commands(
 
     Concatenates skill-install commands (from ``config.skills``) with
     caller-supplied ``user_cmds``, preserving order so skills land first.
-    For the ``local`` provider we install skills on the host and return
-    ``None`` — the local sandbox shares HOME with the server, so skill
+    For the ``unix_local`` provider we install skills on the host and return
+    ``None`` — the unix_local sandbox shares HOME with the server, so skill
     install runs once on the host and user commands there would execute
     with server privileges (deliberately unsupported).
     """
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
-    if provider == "local":
+    if provider == "unix_local":
         if skill_cmds:
             try:
                 await _install_skills_locally(config.skills)
@@ -1045,12 +1045,10 @@ async def session_sandbox_info(session_id: str):
     from api.sandbox import get_pool
     pool_session = await get_pool().get_session(session_id)
     state = pool_session.state
-    # Pool's state.type for unix is ``unix_local``; the legacy
-    # ``/sandboxes/{id}`` route returned ``local`` and downstream
-    # tooling (test helpers, dashboard) keys on that. Normalise.
+    # Provider name is the canonical ``state.type`` discriminator —
+    # ``"unix_local"`` for the unix subprocess provider; no legacy
+    # ``"local"`` alias.
     provider = getattr(state, "type", "unknown")
-    if provider == "unix_local":
-        provider = "local"
     sandbox_ref = getattr(state, "sandbox_ref", None)
     result: dict = {
         "session_id": session_id,
@@ -1062,7 +1060,7 @@ async def session_sandbox_info(session_id: str):
     url = pool_session.supervisor_url
     if url:
         result["url"] = url
-    if provider == "local" and sandbox_ref:
+    if provider == "unix_local" and sandbox_ref:
         from .providers.local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
         args = _LOCAL_SPAWN_ARGS.get(sandbox_ref)
         if args and args.get("marker_path"):
@@ -1143,6 +1141,44 @@ async def session_resume(session_id: str, request: Request):
     }
 
 
+def _reject_daytona_sibling_when_active(agent_id: str | None, provider: str) -> None:
+    """Daytona-specific multi-session guard.
+
+    On Daytona, a Volume is mounted into each Sandbox via S3-FUSE. Each
+    mount has its own page cache, so writes from sibling A's mount are
+    not visible in sibling B's mount until A has flushed to S3 AND B
+    has invalidated its cache (neither happens automatically between
+    prompts). Multi-session on Daytona therefore needs a separate
+    architectural fix (one shared sandbox, multi-supervisor) before it
+    can be safe.
+
+    For now, fail-fast: if the caller is creating a sibling under an
+    existing ``agent_id`` and there's already a live SandboxSession for
+    that agent on Daytona, 409. Single-session-per-agent on Daytona
+    (and unlimited siblings on docker/local/modal) keeps working.
+
+    No-op for non-Daytona providers and for first-session creates
+    (``agent_id`` is None).
+    """
+    from api.sandbox import get_pool
+
+    if provider != "daytona" or not agent_id:
+        return
+    live = get_pool().find_by_agent_id(agent_id)
+    if live:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Daytona supports one live session per agent today. "
+                "Release the existing session "
+                f"({live[0].session_id}) via DELETE /sessions/{{id}} or "
+                "POST /sessions/{id}/release before creating a sibling. "
+                "(Multi-session on Daytona requires a shared-sandbox + "
+                "multi-supervisor architecture; not yet shipped.)"
+            ),
+        )
+
+
 @app.post("/sessions")
 async def sessions_create(request: Request):
     """Create a session. Eager by default (provision sandbox + connect).
@@ -1176,7 +1212,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
-    default_provider = data.get("provider") or data.get("config", {}).get("provider") or "local"
+    default_provider = data.get("provider") or data.get("config", {}).get("provider") or "unix_local"
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), default_provider)
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
@@ -1188,6 +1224,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
     agent_id = data.get("agent_id")
     if agent_id:
         await _require_agent(agent_id)
+        _reject_daytona_sibling_when_active(agent_id, default_provider)
     else:
         agent_id = str(uuid.uuid4())
         await upsert_agent(AgentRecord(
@@ -1200,11 +1237,11 @@ async def _sessions_create_lazy(data: dict) -> dict:
     # Pull session cwd out of the body; agent config is pure identity now.
     # The default matches the per-provider home_dir that the FIRST sandbox
     # provision will spawn with, so session/new and every later session/load
-    # use the same path (the JSONL hash key). For local, this is the
+    # use the same path (the JSONL hash key). For unix_local, this is the
     # per-agent volume subpath; for docker/daytona, a fixed mount point.
     default_cwd = (
         str(Path(volume_record.provider_ref) / f"agents/{agent_id}")
-        if default_provider == "local"
+        if default_provider == "unix_local"
         else default_cwd_for_provider(default_provider)
     )
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
@@ -1247,7 +1284,7 @@ async def _sessions_create_eager(data: dict) -> dict:
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
-    provider = data.get("provider", "local")
+    provider = data.get("provider", "unix_local")
     # Validate provider before any DB writes so a typo doesn't leave an
     # orphan agent row behind. ``state_for_provider`` is the single source
     # of truth for which provider names cold_create accepts.
@@ -1268,15 +1305,30 @@ async def _sessions_create_eager(data: dict) -> dict:
     config_data.pop("dockerfile_content", None)
     config_data.pop("dockerfile", None)
 
-    agent_id = str(uuid.uuid4())
-    config = AgentConfig.from_dict({**config_data, "agent_type": agent_type})
-    await upsert_agent(AgentRecord(id=agent_id, name=data.get("name"), config=config))
+    # Mirror the lazy path's agent_id reuse: when the caller passes an
+    # existing agent_id, this is "create another session under the same
+    # agent" (multi-session SDK). Validate and reuse; otherwise mint a
+    # fresh agent. Track which branch we took so the rollback path below
+    # only deletes agents we created here.
+    requested_agent_id = data.get("agent_id")
+    if requested_agent_id:
+        await _require_agent(requested_agent_id)
+        _reject_daytona_sibling_when_active(requested_agent_id, provider)
+        agent_id = requested_agent_id
+        config = AgentConfig.from_dict({**config_data, "agent_type": agent_type})
+        agent_was_created_here = False
+    else:
+        agent_id = str(uuid.uuid4())
+        config = AgentConfig.from_dict({**config_data, "agent_type": agent_type})
+        await upsert_agent(AgentRecord(id=agent_id, name=data.get("name"), config=config))
+        agent_was_created_here = True
 
     user_pre_start = list(data.get("pre_start_commands") or [])
     # Merge skill-install commands ahead of user commands, so skills land
-    # before any user setup that depends on them. For ``local`` the merge
-    # function installs skills on the host directly and returns the
-    # user_pre_start unchanged (local sandboxes share HOME with the server).
+    # before any user setup that depends on them. For ``unix_local`` the
+    # merge function installs skills on the host directly and returns the
+    # user_pre_start unchanged (unix_local sandboxes share HOME with the
+    # server).
     merged_pre_start = await _build_pre_start_commands(
         config, provider, user_pre_start,
     ) or []
@@ -1286,7 +1338,7 @@ async def _sessions_create_eager(data: dict) -> dict:
     if cwd is None:
         cwd = (
             str(Path(volume_record.provider_ref) / f"agents/{agent_id}")
-            if provider == "local"
+            if provider == "unix_local"
             else default_cwd_for_provider(provider)
         )
 
@@ -1318,10 +1370,12 @@ async def _sessions_create_eager(data: dict) -> dict:
             session_id, provider=provider, recipe=recipe,
         )
     except HTTPException:
-        await delete_agent(agent_id)
+        if agent_was_created_here:
+            await delete_agent(agent_id)
         raise
     except Exception as e:
-        await delete_agent(agent_id)
+        if agent_was_created_here:
+            await delete_agent(agent_id)
         log.error("sessions_create_eager: pool.cold_create failed (provider=%s): %s",
                   provider, e, exc_info=True)
         if "circuit breaker" in str(e).lower():
@@ -1788,6 +1842,10 @@ async def delete_session_route(session_id: str):
         if payload is not None:
             state = deserialize(payload)
             sandbox_ref = getattr(state, "sandbox_ref", None)
+            # ``state.type`` is the Pydantic discriminator
+            # (``"unix_local"`` / ``"docker"`` / ``"daytona"`` /
+            # ``"modal"``) — same key space as ``_PROVIDER_MODS``,
+            # so this is a direct lookup.
             provider_type = getattr(state, "type", None)
     except Exception as e:
         log.warning("DELETE /sessions/%s: read state failed: %s",

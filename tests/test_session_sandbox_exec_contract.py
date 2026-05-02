@@ -99,7 +99,7 @@ async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
 async def test_exec_in_instance_local_runs_with_instance_root(monkeypatch, tmp_path):
     """Local direct exec must run in the sandbox root, not the API process cwd."""
     instance = providers.ProviderInstance(
-        provider="local", url="", root=str(tmp_path), sandbox_ref="local-ref",
+        provider="unix_local", url="", root=str(tmp_path), sandbox_ref="local-ref",
     )
     captured: dict = {}
 

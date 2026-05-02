@@ -70,13 +70,16 @@ from . import modal as _modal_mod
 _PROVIDER_MODS = {
     "daytona": _daytona_mod,
     "docker": _docker_mod,
-    "local": _local_mod,
+    "unix_local": _local_mod,
     "modal": _modal_mod,
 }
 
 
 def _dispatch_mod(provider: str):
     """Look up a provider module or raise with a clear error.
+
+    The unix subprocess provider is canonically ``"unix_local"``; the
+    legacy ``"local"`` spelling is no longer accepted anywhere.
 
     Avoids bare ``KeyError('foobar')`` from ``_PROVIDER_MODS[provider]`` in
     a long stack trace — the server's exception handler turns this into a
@@ -146,7 +149,7 @@ async def destroy_instance(instance: ProviderInstance) -> None:
 
 async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
     """Run a shell command in the sandbox environment."""
-    if instance.provider == "local":
+    if instance.provider == "unix_local":
         proc = await asyncio.create_subprocess_shell(
             cmd,
             cwd=instance.root,

@@ -35,7 +35,7 @@ on release; both leak across runs), use the unified cleanup script:
     # Or one provider at a time:
     python scripts/cleanup_orphans.py --provider daytona --yes
     python scripts/cleanup_orphans.py --provider docker --yes
-    python scripts/cleanup_orphans.py --provider local --yes  # kills orphan supervisor.js whose ppid==1
+    python scripts/cleanup_orphans.py --provider unix_local --yes  # kills orphan supervisor.js whose ppid==1
 
 CI can opt into automatic post-session cleanup with
 `AGENT_SDK_TEST_AUTO_CLEANUP=1` (off by default for local dev to avoid

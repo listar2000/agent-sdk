@@ -286,7 +286,7 @@ async def create_sandbox(
     log.info("local sandbox started (ref=%s, pid=%d, port=%d, home=%s)",
              ref, proc.pid, port, home_dir)
     return ProviderInstance(
-        provider="local",
+        provider="unix_local",
         url=url,
         root=str(home_dir),
         sandbox_ref=ref,

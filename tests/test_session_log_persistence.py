@@ -51,7 +51,7 @@ async def _create_session(sdk: ApiClient) -> str:
     # Pin haiku to keep these tests under sonnet's exhausted weekly
     # quota when other suites have run on the same OAuth token recently.
     created = await sdk.create_session(
-        provider="local", agent_type="claude", config={}, model="haiku",
+        provider="unix_local", agent_type="claude", config={}, model="haiku",
     )
     return created["session_id"]
 

@@ -236,7 +236,7 @@ async def _try_create_agent(agent_type: str, name: str) -> Agent | None:
         secrets["OPENAI_API_KEY"] = key
     try:
         agent = Agent(
-            name, provider="local", api_url=BASE_URL, agent_type=agent_type,
+            name, provider="unix_local", api_url=BASE_URL, agent_type=agent_type,
             secrets=secrets or None,
         )
         await asyncio.wait_for(agent._ensure_registered(), timeout=20.0)

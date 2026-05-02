@@ -130,7 +130,7 @@ async def test_ensure_supervisor_url_unknown_provider():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("provider", ["local", "docker", "daytona"])
+@pytest.mark.parametrize("provider", ["unix_local", "docker", "daytona"])
 def test_registered_providers_are_dispatchable(provider):
     """_dispatch_mod returns a module for each known provider."""
     # Not all providers publish _dispatch_mod symbol; use the public path.
@@ -160,7 +160,7 @@ async def test_unknown_provider_message_mentions_valid_providers():
         msg = str(exc).lower()
         # The improved message includes 'valid:' followed by the allowlist.
         if "valid" in msg:
-            for p in ("local", "docker", "daytona"):
+            for p in ("unix_local", "docker", "daytona"):
                 assert p in msg, (
                     f"message lists valid providers but omits {p!r}: {exc!r}"
                 )

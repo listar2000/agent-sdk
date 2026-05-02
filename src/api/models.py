@@ -17,8 +17,8 @@ from typing import Any, Literal
 # ── Closed enums (Literal aliases) ──
 # Provider names and sandbox statuses are closed sets — narrowing them
 # lets type-checkers catch the silent-drop bug class (e.g. a dict literal
-# that maps "daytona"+"docker" but forgets "local"+"modal").
-Provider = Literal["local", "docker", "daytona", "modal"]
+# that maps "daytona"+"docker" but forgets "unix_local"+"modal").
+Provider = Literal["unix_local", "docker", "daytona", "modal"]
 SandboxStatus = Literal["running", "stopped", "error", "creating", "missing"]
 
 

@@ -307,7 +307,7 @@ async def _external_stop(sandbox: dict) -> None:
             ["docker", "stop", ref], capture_output=True, timeout=30
         ))
 
-    elif provider == "local":
+    elif provider == "unix_local":
         pid = await loop.run_in_executor(None, _local_supervisor_pid, sandbox)
         if pid is not None:
             try:
@@ -348,7 +348,7 @@ async def _kill_supervisor_in_sandbox(sandbox: dict) -> None:
             ),
         )
 
-    elif provider == "local":
+    elif provider == "unix_local":
         # Local has no separate "supervisor inside sandbox" — the supervisor
         # IS the sandbox process. Same kill path as _external_stop.
         pid = await loop.run_in_executor(None, _local_supervisor_pid, sandbox)
@@ -411,7 +411,7 @@ async def _external_delete(sandbox: dict) -> None:
             ["docker", "rm", "-f", ref], capture_output=True, timeout=30
         ))
 
-    elif provider == "local":
+    elif provider == "unix_local":
         # "delete" = kill the supervisor AND remove the sandbox-alive marker
         # file. HOME stays intact (that's the volume data the test expects
         # to persist across delete). The marker is the signal local's
@@ -452,7 +452,7 @@ def _extract_kv(text: str, key: str) -> str | None:
 # so recovery always yields a fresh Modal object_id — the stable-ref invariant
 # simply doesn't apply. Session continuity is covered by
 # ``test_session_resume_after_stop[modal]`` instead.
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
 @pytest.mark.asyncio
 async def test_stop_sandbox_same_sandbox_after_restart(provider):
     """Stop sandbox externally → server restarts it → same sandbox_ref, sandbox responds."""
@@ -525,7 +525,7 @@ async def _read_marker(sdk, session_id, marker):
     )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_server_delete_persists_workspace(provider):
     """Server-mediated DELETE triggers a cold snapshot (filesystem_cache)
@@ -569,7 +569,7 @@ async def test_server_delete_persists_workspace(provider):
         await _get_sandbox(sdk, session_id)  # smoke-check the route
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
 @pytest.mark.asyncio
 async def test_delete_session_destroys_sandbox(provider):
     """``DELETE /sessions/{id}`` must destroy the underlying sandbox, not
@@ -650,7 +650,7 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
             except (json.JSONDecodeError, KeyError, IndexError):
                 last_state = "?"
 
-        elif provider == "local":
+        elif provider == "unix_local":
             # Local "delete" = supervisor process gone AND the sandbox
             # marker file gone. Both are observable without server help:
             # the supervisor PID was on the sandbox row; the marker path
@@ -673,7 +673,7 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
     )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_external_delete_preserves_agent_memory(provider):
     """Out-of-band delete (daytona dashboard / docker rm) bypasses the
@@ -720,7 +720,7 @@ async def test_external_delete_preserves_agent_memory(provider):
 
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_session_resume_after_stop(provider):
     """Full session resume: stop sandbox between turns, reconnect, session is
@@ -760,7 +760,7 @@ async def test_session_resume_after_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_session_resume_after_delete(provider):
     """Delete sandbox between turns → NEW sandbox provisioned → session/load
@@ -802,7 +802,7 @@ async def test_session_resume_after_delete(provider):
 # Test: midstream sandbox stop (UI-flow reproduction)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_session_survives_midstream_sandbox_stop(provider):
     """SSE upstream death triggers sandbox recovery — MUST resume, not reset.
@@ -905,7 +905,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_message_immediately_after_stop(provider):
     """Turn 1 → stop sandbox → turn 2 with NO sleep. Reproduces the race
@@ -971,7 +971,7 @@ async def test_message_immediately_after_stop(provider):
         )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_message_after_stop_with_delay(provider):
     """Turn 1 → stop sandbox → wait ~4s → turn 2. User-reported repro.
@@ -1136,7 +1136,7 @@ async def _ask_on_stream(
             raise RuntimeError(f"agent error: {evt['text']}")
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_stop_then_message(provider):
     """UI-shape repro: one persistent /events connection spans turn1 →
@@ -1189,7 +1189,7 @@ async def test_persistent_sse_stop_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 @pytest.mark.timeout(240)
 async def test_persistent_sse_external_delete_then_message(provider):
@@ -1242,7 +1242,7 @@ async def test_persistent_sse_external_delete_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_delete_sandbox_then_message(provider):
     """UI repro for the `DELETE /sandboxes/{id}` + persistent /events flow.
@@ -1296,7 +1296,7 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_supervisor_killed_then_message(provider):
     """Prod UI repro: supervisor process dies, sandbox stays alive.
@@ -1352,7 +1352,7 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
             )
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_persistent_sse_supervisor_killed_immediate_message(provider):
     """Prod UI race: kill supervisor, then POST /message BEFORE the server
@@ -1411,7 +1411,7 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
 
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "local", "modal"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
 async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
     """End-to-end wiring for the UI reconnect-gap bug.

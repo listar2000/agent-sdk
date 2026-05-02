@@ -407,6 +407,15 @@ _MIGRATIONS = [
     # Forward-only drop — irreversible, but safe because every code path
     # that referenced the column was deleted in the same release.
     "ALTER TABLE volumes DROP COLUMN IF EXISTS supervisor_agent_types",
+    # 2026-05-01: rename the unix-subprocess provider canonically to
+    # ``unix_local`` everywhere. The legacy ``"local"`` value is no
+    # longer accepted by the code (no aliasing layer); migrate any
+    # existing rows in place. Idempotent — second run finds nothing
+    # to update.
+    "UPDATE volumes SET provider = 'unix_local' WHERE provider = 'local'",
+    """UPDATE sessions
+       SET sandbox_state = jsonb_set(sandbox_state, '{type}', '"unix_local"'::jsonb)
+       WHERE sandbox_state->>'type' = 'local'""",
 ]
 
 

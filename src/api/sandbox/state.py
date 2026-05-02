@@ -65,7 +65,7 @@ class DockerSandboxState(_BaseSandboxState):
 
 
 class UnixLocalSandboxState(_BaseSandboxState):
-    type: Literal["unix_local", "local"] = "unix_local"
+    type: Literal["unix_local"] = "unix_local"
     sandbox_ref: str | None = None  # pid as string
     listen_port: int | None = None
 
@@ -91,16 +91,14 @@ SandboxState = Annotated[
 _ADAPTER: TypeAdapter[SandboxState] = TypeAdapter(SandboxState)
 
 
-_KNOWN_TYPES = {"daytona", "docker", "unix_local", "local", "modal", "unknown"}
+_KNOWN_TYPES = {"daytona", "docker", "unix_local", "modal", "unknown"}
 
 
 # Maps API-level provider names (the ``provider`` field on POST /sessions
-# and POST /sandboxes) to their concrete SandboxState class. ``"local"``
-# is an accepted alias for ``"unix_local"``.
+# and POST /sandboxes) to their concrete SandboxState class.
 _PROVIDER_STATE_CLASS: dict[str, type[_BaseSandboxState]] = {
     "daytona": DaytonaSandboxState,
     "docker": DockerSandboxState,
-    "local": UnixLocalSandboxState,
     "unix_local": UnixLocalSandboxState,
     "modal": ModalSandboxState,
 }
@@ -126,9 +124,6 @@ def deserialize(payload: dict[str, Any] | None) -> SandboxState:
     server."""
     if payload is None:
         return UnknownSandboxState()
-    # Tolerate legacy "local" alias by routing to unix_local.
-    if payload.get("type") == "local":
-        payload = {**payload, "type": "unix_local"}
     # Tolerate legacy "sandbox_id" key — pre-d5 JSONB blobs used that
     # name; the field was renamed to "sandbox_ref" to better reflect
     # its meaning (opaque provider reference, not a DB row PK).

@@ -12,7 +12,7 @@ from it. Idempotent: running it twice is a no-op the second time. Dry-run
 by default; pass ``--yes`` to actually delete.
 
 Provider scopes:
-  --provider local    walks ~/.agent-sdk/volumes/*/system/ on the host
+  --provider unix_local    walks ~/.agent-sdk/volumes/*/system/ on the host
   --provider docker   spawns a short-lived container per volume to rm -rf
   --provider daytona  spawns a short-lived sandbox per volume
   --provider modal    runs an exec against each modal volume
@@ -167,7 +167,7 @@ async def _cleanup_daytona(yes: bool) -> int:
 
 async def _amain(args: argparse.Namespace) -> int:
     total = 0
-    if args.provider in ("local", "all"):
+    if args.provider in ("unix_local", "all"):
         total += await _cleanup_local(args.yes)
     if args.provider in ("daytona", "all"):
         total += await _cleanup_daytona(args.yes)
@@ -182,7 +182,7 @@ async def _amain(args: argparse.Namespace) -> int:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--provider", choices=("local", "docker", "daytona", "modal", "all"),
+    p.add_argument("--provider", choices=("unix_local", "docker", "daytona", "modal", "all"),
                    default="all")
     p.add_argument("--yes", action="store_true", help="actually delete (default: dry-run)")
     args = p.parse_args()
