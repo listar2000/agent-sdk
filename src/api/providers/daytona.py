@@ -1282,3 +1282,53 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
         if "__RENAME_NOT_VISIBLE__" in (res.stdout or ""):
             raise RuntimeError("volume_rename postcondition failed: destination not visible")
         raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation — delete orphaned daytona sandboxes on startup
+# ---------------------------------------------------------------------------
+
+async def reconcile_on_startup() -> None:
+    """Delete daytona sandboxes whose id is not in any live session row.
+
+    Lists by ``agent_sdk_origin=<AGENT_SDK_ORIGIN>`` so dev/test/prod
+    deploys sharing one daytona account never cross-reap. Mirrors what
+    ``scripts/cleanup_orphans.py`` does, automated at boot.
+
+    Failures are logged and swallowed.
+    """
+    try:
+        from .. import db as dbmod
+    except Exception as e:
+        log.warning("daytona reconcile: cannot import api.db: %s", e)
+        return
+
+    try:
+        daytona = _get_daytona_client()
+    except Exception as e:
+        log.warning("daytona reconcile: client unavailable: %s", e)
+        return
+
+    labels = _sandbox_labels()
+    try:
+        page = await asyncio.to_thread(lambda: daytona.list(labels=labels))
+        items = list(getattr(page, "items", None) or page)
+    except Exception as e:
+        log.warning("daytona reconcile: list failed: %s", e)
+        return
+
+    try:
+        live_refs = await dbmod.live_sandbox_refs()
+    except Exception as e:
+        log.warning("daytona reconcile: live-session query failed: %s", e)
+        return
+
+    for sb in items:
+        sid = getattr(sb, "id", None)
+        if not sid or sid in live_refs:
+            continue
+        log.info("daytona reconcile: deleting orphan %s", sid[:16])
+        try:
+            await asyncio.to_thread(lambda s=sb: daytona.delete(s))
+        except Exception as e:
+            log.warning("daytona reconcile: delete %s: %s", sid[:16], e)
