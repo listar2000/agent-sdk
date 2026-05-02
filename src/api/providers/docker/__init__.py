@@ -240,7 +240,7 @@ async def create_sandbox(
     # ``node_modules/.bin/`` symlinks on some build engines).
     runtime_in_container = "/opt/agent-sdk/runtime"
     supervisor_js_in = f"{runtime_in_container}/supervisor.js"
-    from ._shared import _runtime_acp_bin_relative
+    from .._shared import _runtime_acp_bin_relative
     acp_path = f"{runtime_in_container}/{_runtime_acp_bin_relative(agent_type)}"
     supervisor_argv = build_supervisor_argv(
         supervisor_js=supervisor_js_in, acp_bin=acp_path,

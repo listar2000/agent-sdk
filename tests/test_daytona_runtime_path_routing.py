@@ -112,6 +112,11 @@ async def test_provision_flag_on_with_daytona_image_uses_image_path(monkeypatch)
     monkeypatch.setenv("DAYTONA_API_KEY", "fake")
     monkeypatch.delenv("DAYTONA_SNAPSHOT", raising=False)
 
+    # The repo ships ``.runtime-snapshot-tag`` so a fresh checkout
+    # provisions from the prebuilt snapshot by default. Force it off
+    # here to exercise the image path explicitly.
+    monkeypatch.setattr(dprov, "_read_runtime_snapshot_tag", lambda: None)
+
     calls: list = []
     _patch_daytona_sdk(monkeypatch, calls=calls)
 
@@ -139,9 +144,11 @@ async def test_provision_flag_on_without_image_or_snapshot_raises(monkeypatch):
     monkeypatch.delenv("DAYTONA_SNAPSHOT", raising=False)
     monkeypatch.setenv("DAYTONA_API_KEY", "fake")
 
-    # Force _read_runtime_image_tag to return None (simulates fresh checkout
-    # before scripts/release.sh has run).
+    # Force _read_runtime_image_tag AND _read_runtime_snapshot_tag to
+    # return None (simulates a fresh checkout before scripts/release.sh
+    # has run — both files would be absent).
     monkeypatch.setattr(dprov, "_read_runtime_image_tag", lambda: None)
+    monkeypatch.setattr(dprov, "_read_runtime_snapshot_tag", lambda: None)
 
     calls: list = []
     _patch_daytona_sdk(monkeypatch, calls=calls)

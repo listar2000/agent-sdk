@@ -196,7 +196,7 @@ async def start_supervisor_in_sandbox(
     # The bin path is resolved via ``package.json#bin`` (not
     # ``node_modules/.bin/``) because daytona's image-build flattens
     # symlinks; the underlying scripts survive but the symlinks don't.
-    from ._shared import _runtime_acp_bin_relative
+    from .._shared import _runtime_acp_bin_relative
     sup_dir = "/opt/agent-sdk/runtime"
     acp_bin = f"{sup_dir}/{_runtime_acp_bin_relative(agent_type)}"
     log.info(
@@ -832,7 +832,7 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
         # the sandbox has been deleted out-of-band. Surface this as a typed
         # error so the server can re-provision on the same volume.
         if "not found" in str(e).lower():
-            from ._shared import SandboxMissingError
+            from .._shared import SandboxMissingError
             raise SandboxMissingError(
                 f"Daytona sandbox {inst.sandbox_ref} not found (deleted externally)"
             ) from e

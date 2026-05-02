@@ -328,7 +328,7 @@ async def create_sandbox(
     env_prefix = _build_env_prefix(spawn_env)
     # Resolve the ACP bin via package.json#bin (daytona/modal flatten the
     # ``node_modules/.bin/`` symlinks during image-build).
-    from ._shared import _runtime_acp_bin_relative
+    from .._shared import _runtime_acp_bin_relative
     sup_dir_in = _RUNTIME_IN
     acp_path = f"{sup_dir_in}/{_runtime_acp_bin_relative(agent_type)}"
     supervisor_argv = build_supervisor_argv(
