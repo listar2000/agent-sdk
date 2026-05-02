@@ -247,7 +247,13 @@ def _register_volume_adapters() -> None:
     if _VOLUME_ADAPTERS:
         return
     from .daytona.volumes import DaytonaVolumeAdapter
+    from .docker.volumes import DockerVolumeAdapter
+    from .modal.volumes import ModalVolumeAdapter
+    from .unix_local.volumes import UnixLocalVolumeAdapter
     _VOLUME_ADAPTERS["daytona"] = DaytonaVolumeAdapter
+    _VOLUME_ADAPTERS["docker"] = DockerVolumeAdapter
+    _VOLUME_ADAPTERS["modal"] = ModalVolumeAdapter
+    _VOLUME_ADAPTERS["unix_local"] = UnixLocalVolumeAdapter
 
 
 def get_volume_adapter(provider: str, provider_ref: str) -> BaseVolumeAdapter:
