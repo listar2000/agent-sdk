@@ -1,8 +1,10 @@
-"""Unit tests for the new ``api.sandbox`` classes — verify they're
-import-clean and the basic state machine + factory dispatch work.
+"""Unit tests for ``api.sandbox`` state, factory dispatch, and Liveness.
 
-The classes are NOT yet wired into the server's recovery path; these
-tests exercise them in isolation so they're not dead code.
+Fast feedback for the bits the live golden suite exercises end-to-end:
+Pydantic round-trip of the discriminated SandboxState union, factory
+dispatch from state to concrete SandboxSession class, and the Liveness
+state machine (including ``force_probe`` for the external-supervisor-kill
+race characterized in the recovery tests).
 """
 import asyncio
 import os
