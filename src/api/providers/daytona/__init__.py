@@ -1149,6 +1149,31 @@ async def _upload_overwrite(ref: str, abs_path: str, content: bytes) -> None:
         raise RuntimeError(f"upload overwrite failed: {e}") from e
 
 
+async def _move_overwrite(ref: str, src_abs: str, dst_abs: str) -> None:
+    """Move ``src_abs`` to ``dst_abs`` through Daytona's filesystem API."""
+    inst = await _get_or_create_utility(ref)
+    if not inst.sandbox_ref:
+        raise RuntimeError("move overwrite: utility sandbox_ref missing")
+    loop = asyncio.get_running_loop()
+    daytona_client = _get_daytona_client()
+    try:
+        sandbox = await loop.run_in_executor(
+            None, lambda: daytona_client.get(inst.sandbox_ref)
+        )
+    except Exception as e:
+        raise RuntimeError(f"move overwrite: get sandbox failed: {e}") from e
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: sandbox.fs.move_files(src_abs, dst_abs),
+        )
+    except Exception as e:
+        msg = str(e)
+        if "not found" in msg.lower() or "404" in msg:
+            raise FileNotFoundError(f"{src_abs} not found on volume {ref}") from e
+        raise RuntimeError(f"move overwrite failed: {msg}") from e
+
+
 async def _daytona_supports_conditional_create(ref: str) -> bool:
     """Detect once per volume whether toolbox upload honors If-None-Match: *."""
     mode = (os.environ.get("DAYTONA_CONDITIONAL_CREATE_MODE", "auto") or "auto").strip().lower()
@@ -1283,9 +1308,9 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
         f"echo __RENAME_NOT_VISIBLE__; exit 98"
     )
     if overwrite:
-        # Daytona volumes are object-store backed. POSIX `mv` on the mounted
-        # view can fail or report success without durable movement, so use the
-        # provider file API for the data transfer and delete the source after.
+        # Daytona volumes are object-store backed. Use Daytona's filesystem move
+        # endpoint so creation and source removal happen in the provider layer,
+        # not through the eventually-consistent mounted /v view.
         res = await _run_in_utility_sandbox(
             ref,
             (
@@ -1300,9 +1325,7 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
             if "__UNSUPPORTED_DIR__" in (res.stdout or ""):
                 raise NotImplementedError("overwrite rename for directories is not supported")
             raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")
-        src_bytes = await volume_download(ref, src_rel)
-        await _upload_overwrite(ref, dst, src_bytes)
-        await volume_delete(ref, src_rel)
+        await _move_overwrite(ref, src, dst)
         verify = await _run_in_utility_sandbox(ref, settle_check)
         if verify.exit_code != 0:
             raise RuntimeError("volume_rename postcondition failed: destination not visible")
