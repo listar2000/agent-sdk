@@ -9,11 +9,16 @@ Phase 4 of the volumes-on-docker-local plan.
 from __future__ import annotations
 
 import asyncio
+import glob
+import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
+import time
 import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .._shared import (
@@ -36,11 +41,6 @@ from .._shared import (
 
 log = logging.getLogger(__name__)
 
-# ``_REPO_ROOT`` and ``_SUPERVISOR_JS_SRC`` were deleted in Phase E of
-# the runtime-image-unification refactor — they were used only by the deleted
-# install_supervisor function. ``_runtime_supervisor_js()`` /
-# ``_detect_runtime_path()`` (in providers/_shared.py) are the new resolvers.
-
 
 def _vol_root() -> Path:
     raw = os.environ.get("AGENT_SDK_LOCAL_VOL_ROOT")
@@ -49,21 +49,68 @@ def _vol_root() -> Path:
     return (Path.home() / ".agent-sdk" / "volumes").resolve()
 
 
-# Registry of sandbox subprocesses keyed by sandbox_ref (a stable UUID
-# we assign at create time). Keying on a stable ref (not the PID, which
-# changes across respawn) is what lets a local sandbox survive an external
-# SIGKILL as a logical entity: the ref stays in sandboxes.sandbox_ref and
-# start_sandbox(ref) respawns a new supervisor under the same ref with a
-# new PID. Matches Daytona's model (daytona.stop preserves sandbox.id;
-# daytona.start revives at the same id).
+# Source of truth: ``<vol_root>/<volume>/system/sandboxes/<ref>.json`` carries
+# the PID + spawn plan for one supervisor. Mirrors how docker uses the daemon's
+# container record, daytona/modal use their control planes — destroy/stop/
+# start/status all read from disk, never from in-memory dicts that vanish on
+# restart. ``_PROCESSES`` is a current-lifetime cache for ``proc.wait()``
+# zombie reaping only; nothing load-bearing reads it.
+
+@dataclass
+class _SandboxRecord:
+    ref: str
+    pid: int
+    port: int
+    node: str
+    supervisor_js: str
+    acp_bin: str
+    extra: list[str] = field(default_factory=list)
+    effective_root: str = "/tmp"
+    base_env: dict[str, str] = field(default_factory=dict)
+
+
+def _load_record(ref: str) -> tuple[Path | None, _SandboxRecord | None]:
+    """Sync — callers wrap in ``asyncio.to_thread`` to avoid blocking the loop."""
+    matches = glob.glob(str(_vol_root() / "*" / "system" / "sandboxes" / f"{ref}.json"))
+    if not matches:
+        return None, None
+    marker = Path(matches[0])
+    try:
+        return marker, _SandboxRecord(**json.loads(marker.read_text()))
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        return marker, None
+
+
+def _write_record(marker: Path, record: _SandboxRecord) -> None:
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_suffix(marker.suffix + ".tmp")
+    tmp.write_text(json.dumps(asdict(record)))
+    os.replace(tmp, marker)
+
+
+def _kill_pid(pid: int) -> None:
+    """SIGTERM, poll up to 5s, SIGKILL fallback."""
+    if pid <= 0:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 _PROCESSES: dict[str, subprocess.Popen] = {}
 _PROCESSES_LOCK = asyncio.Lock()
-
-# Spawn plan cached per ref so start_sandbox can recreate a supervisor
-# with the same HOME / volume / port / etc. after the process dies.
-# Cleared on destroy_sandbox (and when home_dir vanishes, signalling
-# "delete" semantics — see get_sandbox_status).
-_SPAWN_ARGS: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -260,28 +307,19 @@ async def create_sandbox(
     # Stable ref that outlives the PID — what sandboxes.sandbox_ref stores.
     ref = f"local-{uuid.uuid4().hex[:12]}"
 
-    # Write a sandbox-alive marker OUTSIDE the home dir so an external
-    # "delete" operation can remove it without disturbing the volume data
-    # we actually want to persist. Located alongside home at:
-    #   <volume>/system/sandboxes/<ref>.alive
-    # Server's get_sandbox_status checks existence of this file.
-    marker_dir = vol / "system" / "sandboxes"
-    marker_path = marker_dir / f"{ref}.alive"
-    await asyncio.to_thread(lambda: os.makedirs(marker_dir, exist_ok=True))
-    await asyncio.to_thread(lambda: marker_path.write_text(str(proc.pid)))
+    # Persist the full record at <volume>/system/sandboxes/<ref>.json — the
+    # source of truth that destroy/stop/start/status/reconcile all read.
+    record = _SandboxRecord(
+        ref=ref, pid=proc.pid, port=port, node=node,
+        supervisor_js=str(supervisor_js), acp_bin=acp_bin_str,
+        extra=list(extra), effective_root=effective_root,
+        base_env=dict(base_env),
+    )
+    marker_path = vol / "system" / "sandboxes" / f"{ref}.json"
+    await asyncio.to_thread(_write_record, marker_path, record)
 
     async with _PROCESSES_LOCK:
         _PROCESSES[ref] = proc
-        _SPAWN_ARGS[ref] = {
-            "node": node,
-            "supervisor_js": str(supervisor_js),
-            "acp_bin_str": acp_bin_str,
-            "extra": list(extra),
-            "effective_root": effective_root,
-            "port": port,
-            "base_env": dict(base_env),
-            "marker_path": str(marker_path),
-        }
 
     log.info("local sandbox started (ref=%s, pid=%d, port=%d, home=%s)",
              ref, proc.pid, port, home_dir)
@@ -295,159 +333,93 @@ async def create_sandbox(
     )
 
 
-def _kill_proc(proc: subprocess.Popen) -> None:
-    """Best-effort terminate → kill."""
-    if proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-    except ProcessLookupError:
-        pass
-
-
-def _lookup_proc(ref: str) -> subprocess.Popen | None:
-    return _PROCESSES.get(ref)
-
-
-def _resolve_proc_and_ref(inst: ProviderInstance) -> tuple[subprocess.Popen | None, str | None]:
-    """Find the live Popen + sandbox ref for this provider instance.
-
-    Tries ``inst.process`` first (Type 1 in-place restart preserves it
-    across rebinds), then falls back to the _PROCESSES registry by
-    sandbox_ref. Either or both may be None — caller decides what to do.
-    """
-    ref = getattr(inst, "sandbox_ref", None) if hasattr(inst, "sandbox_ref") else None
-    proc: subprocess.Popen | None = None
-    if hasattr(inst, "process") and inst.process is not None and isinstance(inst.process, subprocess.Popen):
-        proc = inst.process
-    if proc is None and ref:
-        proc = _PROCESSES.get(ref)
-    return proc, ref
-
-
 async def get_sandbox_status(ref: str) -> str:
-    """Return running / stopped / missing / error.
-
-    ``missing`` → no spawn plan cached for this ref, OR the home dir we'd
-    respawn into is gone. Either way the sandbox is unrevivable and the
-    caller should provision a fresh one.
-
-    ``stopped`` → spawn plan cached, home intact, but Popen is dead (or
-    absent). start_sandbox(ref) can restart in place at the same ref.
-
-    ``running`` → Popen is alive.
-    """
-    args = _SPAWN_ARGS.get(ref)
-    if args is None:
+    """``missing`` (no marker) | ``stopped`` (marker, dead PID) | ``running``."""
+    marker, record = await asyncio.to_thread(_load_record, ref)
+    if marker is None:
         return "missing"
-    # The alive marker (at system/sandboxes/<ref>.alive) is the external
-    # "this sandbox still logically exists" signal. External delete wipes
-    # just this file, leaving HOME intact so the volume-persistence tests
-    # can still read their marker files.
-    marker = args.get("marker_path")
-    if marker and not os.path.exists(marker):
-        return "missing"
-
-    proc = _lookup_proc(ref)
-    if proc is None:
+    if record is None or record.pid <= 0:
         return "stopped"
-    rc = proc.poll()
-    if rc is None:
-        return "running"
-    # Process exited. With spawn plan + marker intact, we can revive.
-    return "stopped"
+    try:
+        os.kill(record.pid, 0)  # signal-only, returns instantly — safe inline
+    except ProcessLookupError:
+        return "stopped"
+    except PermissionError:
+        pass  # exists but not ours — alive enough
+    return "running"
 
 
 async def start_sandbox(ref: str) -> None:
-    """Respawn a supervisor for ``ref`` using the cached spawn plan.
+    """Respawn the supervisor for ``ref`` from the persisted spawn plan."""
+    marker, record = await asyncio.to_thread(_load_record, ref)
+    if record is None:
+        raise RuntimeError(f"start_sandbox: no marker for ref {ref}")
 
-    Called by ensure_sandbox when get_sandbox_status returned "stopped".
-    Replaces the stale Popen at the same ref + port, so sandbox_ref stays
-    stable across external kill events (mirroring Daytona's stop/start
-    contract).
-    """
-    args = _SPAWN_ARGS.get(ref)
-    if args is None:
-        raise RuntimeError(f"start_sandbox: no spawn plan for ref {ref}")
-
-    # Drop any stale Popen for this ref before respawn.
     async with _PROCESSES_LOCK:
         existing = _PROCESSES.pop(ref, None)
     if existing is not None:
-        await asyncio.to_thread(_kill_proc, existing)
+        await asyncio.to_thread(_kill_pid, existing.pid)
 
     proc = await asyncio.to_thread(
         subprocess.Popen,
         [
-            args["node"], args["supervisor_js"],
-            "--host", "127.0.0.1",
-            "--port", str(args["port"]),
-            "--acp", args["acp_bin_str"],
-            *args["extra"],
-            "--root", args["effective_root"],
+            record.node, record.supervisor_js,
+            "--host", "127.0.0.1", "--port", str(record.port),
+            "--acp", record.acp_bin, *record.extra,
+            "--root", record.effective_root,
         ],
-        env=args["base_env"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        env=record.base_env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
 
-    url = f"http://127.0.0.1:{args['port']}"
-    healthy = await _wait_for_health(url)
-    if not healthy:
-        await asyncio.to_thread(_kill_proc, proc)
-        raise RuntimeError(
-            f"local supervisor failed to become healthy on port {args['port']} (ref={ref})"
-        )
+    url = f"http://127.0.0.1:{record.port}"
+    if not await _wait_for_health(url):
+        await asyncio.to_thread(_kill_pid, proc.pid)
+        raise RuntimeError(f"local supervisor failed to become healthy on port {record.port} (ref={ref})")
+
+    record.pid = proc.pid
+    await asyncio.to_thread(_write_record, marker, record)
     async with _PROCESSES_LOCK:
         _PROCESSES[ref] = proc
-    log.info("local sandbox respawned (ref=%s, pid=%d, port=%d)",
-             ref, proc.pid, args["port"])
+    log.info("local sandbox respawned (ref=%s, pid=%d, port=%d)", ref, proc.pid, record.port)
+
+
+async def _kill_and_reap(ref: str, record: _SandboxRecord | None) -> None:
+    """Kill PID via marker; reap Popen if we still own it (current lifetime)."""
+    if record is not None:
+        await asyncio.to_thread(_kill_pid, record.pid)
+    async with _PROCESSES_LOCK:
+        proc = _PROCESSES.pop(ref, None)
+    if proc is not None:
+        try:
+            await asyncio.to_thread(proc.wait, 2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 async def stop_sandbox(inst: ProviderInstance) -> None:
-    """Kill the supervisor but keep spawn args cached so start_sandbox(ref)
-    can revive it at the same ref. Mirrors Daytona stop semantics."""
-    proc, ref = _resolve_proc_and_ref(inst)
-    if proc is not None:
-        await asyncio.to_thread(_kill_proc, proc)
-    if ref:
-        async with _PROCESSES_LOCK:
-            _PROCESSES.pop(ref, None)
-    # NOTE: _SPAWN_ARGS[ref] INTENTIONALLY retained so start_sandbox can revive.
+    """Kill the supervisor; keep the marker so ``start_sandbox(ref)`` can revive."""
+    ref = getattr(inst, "sandbox_ref", None)
+    if not ref:
+        return
+    _, record = await asyncio.to_thread(_load_record, ref)
+    await _kill_and_reap(ref, record)
 
 
 async def destroy_sandbox(inst: ProviderInstance) -> None:
-    """Terminate the supervisor subprocess and wipe all cached state for
-    this ref — sandbox_ref, Popen, and spawn args. Subsequent
-    get_sandbox_status(ref) returns 'missing'."""
-    proc, ref = _resolve_proc_and_ref(inst)
-
-    if proc is not None:
-        await asyncio.to_thread(_kill_proc, proc)
-
-    if ref:
-        async with _PROCESSES_LOCK:
-            _PROCESSES.pop(ref, None)
-            args = _SPAWN_ARGS.pop(ref, None)
-        marker = args.get("marker_path") if args else None
-        if marker:
-            try:
-                os.remove(marker)
-            except FileNotFoundError:
-                pass
-
-    port = getattr(inst, "port", None)
-    if port is not None:
+    """Kill the supervisor and remove its marker — terminal delete."""
+    ref = getattr(inst, "sandbox_ref", None)
+    if not ref:
+        return
+    marker, record = await asyncio.to_thread(_load_record, ref)
+    await _kill_and_reap(ref, record)
+    if marker is not None:
+        try:
+            await asyncio.to_thread(os.remove, marker)
+        except FileNotFoundError:
+            pass
+    port = getattr(inst, "port", None) or (record.port if record else None)
+    if port:
         async with _port_lock:
             _freed_ports.append(port)
         try:
@@ -683,19 +655,17 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
 # ---------------------------------------------------------------------------
 
 async def reconcile_on_startup() -> None:
-    """Kill leaked supervisor PIDs and remove their alive markers.
+    """Kill orphan supervisors and unlink their markers on server boot.
 
-    Walks ``<vol_root>/*/system/sandboxes/*.alive``. Each marker stores
-    the supervisor PID (legacy ``"alive"`` markers parse to no PID and
-    are unlinked without a kill). If the ref is in a live session we
-    leave it. Otherwise we SIGKILL the PID (when alive) and unlink the
-    marker.
+    A marker whose ref isn't in any live session row is an orphan: its
+    DELETE never landed (server crashed, test crashed, etc.). Kill the
+    PID and unlink the marker. Markers from active sessions are left
+    alone.
 
-    Failures are logged and swallowed.
+    Globs both new ``<ref>.json`` records and legacy ``<ref>.alive`` PID
+    files; the latter format predates this refactor and gets cleaned up
+    here on first boot after upgrade.
     """
-    import glob
-    import signal
-
     try:
         from ... import db as dbmod
     except Exception as e:
@@ -708,34 +678,47 @@ async def reconcile_on_startup() -> None:
         log.warning("unix_local reconcile: live-session query failed: %s", e)
         return
 
-    pattern = str(_vol_root() / "*" / "system" / "sandboxes" / "*.alive")
-    markers = await asyncio.to_thread(lambda: glob.glob(pattern))
-
-    for m in markers:
-        try:
-            ref = os.path.basename(m)[: -len(".alive")]
-            if ref in live_refs:
+    def _scan_orphans() -> list[tuple[str, int | None]]:
+        """Sync helper: enumerate orphan (path, pid) pairs without touching them."""
+        sandbox_dir = _vol_root() / "*" / "system" / "sandboxes"
+        paths = (
+            glob.glob(str(sandbox_dir / "*.json"))
+            + glob.glob(str(sandbox_dir / "*.alive"))
+        )
+        orphans: list[tuple[str, int | None]] = []
+        for m in paths:
+            path = Path(m)
+            if path.stem in live_refs:
                 continue
             try:
-                content = await asyncio.to_thread(lambda p=m: open(p).read().strip())
+                text = path.read_text().strip()
             except Exception:
-                content = ""
+                text = ""
             pid: int | None = None
-            try:
-                pid = int(content) if content else None
-            except ValueError:
-                pid = None
-            if pid is not None:
+            if path.suffix == ".json":
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                    log.info("unix_local reconcile: killed orphan pid=%d ref=%s", pid, ref)
-                except ProcessLookupError:
-                    pass
-                except Exception as e:
-                    log.warning("unix_local reconcile: kill pid=%d failed: %s", pid, e)
+                    pid = int(json.loads(text).get("pid", 0)) or None
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pid = None
+            elif text:
+                try:
+                    pid = int(text)
+                except ValueError:
+                    pid = None
+            orphans.append((m, pid))
+        return orphans
+
+    orphans = await asyncio.to_thread(_scan_orphans)
+    for path, pid in orphans:
+        if pid:
             try:
-                await asyncio.to_thread(os.remove, m)
-            except FileNotFoundError:
+                await asyncio.to_thread(os.kill, pid, signal.SIGKILL)
+                log.info("unix_local reconcile: killed orphan pid=%d ref=%s", pid, Path(path).stem)
+            except ProcessLookupError:
                 pass
-        except Exception as e:
-            log.warning("unix_local reconcile: marker %s: %s", m, e)
+            except Exception as e:
+                log.warning("unix_local reconcile: kill pid=%d failed: %s", pid, e)
+        try:
+            await asyncio.to_thread(os.remove, path)
+        except FileNotFoundError:
+            pass
