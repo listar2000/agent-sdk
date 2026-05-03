@@ -40,12 +40,46 @@ async def test_volume_mkdir_uses_mkdir_p(monkeypatch):
 async def test_volume_delete_missing_maps_to_filenotfound(monkeypatch):
     from api.providers import daytona
 
-    async def fake_run(_ref: str, _cmd: str, timeout: int = 30):
-        return SimpleNamespace(stdout="__MISSING__", stderr="", exit_code=2)
+    class FakeFs:
+        def delete_file(self, _path: str, recursive: bool = False) -> None:
+            raise Exception("404 not found")
 
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
+    class FakeSandbox:
+        fs = FakeFs()
+
+    async def fake_get_utility(_ref: str):
+        return SimpleNamespace(sandbox_ref="sandbox-ref")
+
+    monkeypatch.setattr(daytona, "_get_or_create_utility", fake_get_utility)
+    monkeypatch.setattr(daytona, "_get_daytona_client", lambda: SimpleNamespace(get=lambda _ref: FakeSandbox()))
+
     with pytest.raises(FileNotFoundError):
         await daytona.volume_delete("vol-ref", "shared/missing.txt")
+
+
+@pytest.mark.asyncio
+async def test_volume_delete_uses_provider_file_api(monkeypatch):
+    from api.providers import daytona
+
+    captured: dict[str, object] = {}
+
+    class FakeFs:
+        def delete_file(self, path: str, recursive: bool = False) -> None:
+            captured["path"] = path
+            captured["recursive"] = recursive
+
+    class FakeSandbox:
+        fs = FakeFs()
+
+    async def fake_get_utility(_ref: str):
+        return SimpleNamespace(sandbox_ref="sandbox-ref")
+
+    monkeypatch.setattr(daytona, "_get_or_create_utility", fake_get_utility)
+    monkeypatch.setattr(daytona, "_get_daytona_client", lambda: SimpleNamespace(get=lambda _ref: FakeSandbox()))
+
+    await daytona.volume_delete("vol-ref", "shared/docs/a.txt")
+
+    assert captured == {"path": "/v/shared/docs/a.txt", "recursive": True}
 
 
 @pytest.mark.asyncio
