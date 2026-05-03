@@ -1413,45 +1413,30 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @pytest.mark.asyncio
-async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
-    """End-to-end wiring for the UI reconnect-gap bug.
+async def test_ui_reconnect_gap_persists_replies_to_session_log(provider):
+    """End-to-end wiring: prompts submitted while no /events subscriber is
+    attached must still land in ``session_log`` so a reconnecting UI can
+    cold-load them via ``GET /sessions/{id}/log``.
 
-    The companion unit test ``test_dispatch_with_no_subscribers_buffers_
-    for_next_subscribe`` pins the ``SessionState.dispatch`` →
-    ``subscribe_session`` mechanism directly. This integration test
-    pins the full wiring — a regression in ``_broadcast_one_block``,
-    the scheduler's dispatch routing, or the /events subscribe path
-    would silently pass the unit test while breaking the UI.
-
-    Exact UI sequence reproduced here (the user's prod trace):
-        check again the host            <- prior turns work
-          Same hostname: 5f349b61-...
-        Stream error: stream closed. Reconnecting...
-        what abotu now?                 <- msg1 during gap (no reply)
-          Queued for agent
-        Reconnected to session 96f90144.
-        now?                            <- msg2 after reconnect (no reply)
-          Queued for agent
-        hi                              <- msg3 after reconnect (no reply)
+    History recovery is now the /log endpoint's job, not a per-session
+    replay buffer on /events. (Earlier the server kept a bounded replay
+    buffer that seeded each new subscriber; that double-delivered every
+    event a cold-loading UI just fetched from /log, so the buffer was
+    removed.) /events is live-only; durable history lives in
+    ``session_log`` which is persisted in-line by ``_persist_prompt_events``
+    regardless of subscriber state.
 
     Flow in-order:
       1. Open persistent /events (UI's EventSource on page load).
       2. Turn 1 via POST /message over the persistent stream — succeeds.
-      3. Kill supervisor process inside the sandbox (the prod 502 /
-         daytona-proxy-dead / supervisor-OOM trigger).
-      4. Exit the ``_PersistentSse`` context — cleanly tears down the
-         reader with no auto-reconnect. This is the "EventSource retry
-         timer still running, no subscriber on the server" state.
+      3. Kill supervisor inside the sandbox (the prod 502 / OOM trigger).
+      4. Exit the persistent-SSE context — no subscribers attached.
       5. POST msg2 and msg3 during the gap.
-      6. Open a fresh /events (EventSource finally reconnects).
-      7. Assert both follow-ups get replies — on unfixed baseline both
-         time out with ``TimeoutError`` because their events were
-         dispatched to empty subscriber lists and dropped.
-
-    Subscriber-buffer behavior is provider-agnostic. Docker variant
-    relies on ``pkill supervisor.js`` taking down PID 1 (container
-    exits) — same UI-visible "stream closed" trigger; the test pins
-    the server-side buffer regardless of how the supervisor went away.
+      6. Wait for the server scheduler to drive both turns; with no
+         subscriber the events are still persisted to ``session_log``.
+      7. GET /sessions/{id}/log and assert both rpc ids landed
+         ``user_message`` + ``turn_end`` rows. Replays the cold-load
+         path the UI takes on EventSource reconnect.
     """
     _require_provider(provider)
 
@@ -1469,13 +1454,10 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
             sandbox = await _get_sandbox(sdk, session_id)
             await _kill_supervisor_in_sandbox(sandbox)
             # Let the server's upstream SSE reader observe the death and
-            # kick the UI subscriber (the persistent stream will see a
-            # stream close here).
+            # kick the UI subscriber.
             await asyncio.sleep(3)
 
-        # __aexit__ above killed the reader so no auto-reconnect fires.
-        # We're now in the UI's "stream closed, EventSource retry timer
-        # running" state. The follow-up POSTs land in this gap.
+        # No subscribers attached. The follow-up POSTs land in this gap.
         rpc2 = await _send_message(
             sdk, session_id, "Reply with a single short word.",
         )
@@ -1483,42 +1465,32 @@ async def test_ui_reconnect_gap_loses_replies_and_blocks_followups(provider):
             sdk, session_id, "Reply with a single short word.",
         )
 
-        # Give the server scheduler enough time to dispatch both turns'
-        # events into what are currently empty subscriber lists.
-        await asyncio.sleep(8)
+        # Wait for the scheduler to drive both turns to completion. The
+        # /log endpoint reads ``session_log`` rows that
+        # ``_persist_prompt_events`` writes inline as ACP events arrive,
+        # independent of any subscriber.
+        deadline = time.time() + 90
+        seen_done: set[str] = set()
+        while seen_done < {rpc2, rpc3} and time.time() < deadline:
+            await asyncio.sleep(2)
+            async with httpx.AsyncClient(timeout=10) as http:
+                resp = await http.get(
+                    f"{SERVER}/sessions/{session_id}/log",
+                    params={"limit": 500},
+                )
+            resp.raise_for_status()
+            for entry in resp.json():
+                pid = (entry.get("payload") or {}).get("prompt_id")
+                if pid in (rpc2, rpc3) and entry["event_type"] == "turn_end":
+                    seen_done.add(pid)
 
-        # UI's EventSource finally reconnects — open ONE persistent /events
-        # (matching the UI's single EventSource) and look for both replies.
-        # With the fix, the pending-broadcast buffer replays every missed
-        # event onto this subscriber; _collect_reply_on_stream drains until
-        # both rpc ids have landed their stopReason.
-        collected: dict[str, str] = {}
-        async with _PersistentSse(sdk, session_id) as sse2:
-            deadline = time.time() + 60
-            wanted = {rpc2, rpc3}
-            while wanted and time.time() < deadline:
-                for rpc in list(wanted):
-                    q = sse2.get_queue(rpc)
-                    try:
-                        evt = await asyncio.wait_for(
-                            q.get(), timeout=max(1.0, deadline - time.time()),
-                        )
-                    except asyncio.TimeoutError:
-                        continue
-                    if evt["type"] == "done":
-                        collected[rpc] = "<done>"
-                        wanted.discard(rpc)
-                    elif evt["type"] == "error":
-                        collected[rpc] = f"<error: {evt.get('text')!r}>"
-                        wanted.discard(rpc)
-
-        timed_out = [rpc for rpc in (rpc2, rpc3) if rpc not in collected]
-        assert not timed_out, (
-            f"{len(timed_out)}/2 follow-up messages never reached the "
-            f"reconnected /events stream. Events dispatched during the UI's "
-            f"EventSource retry gap were dropped because no subscriber was "
-            f"listening and the server has no replay for them. "
-            f"Missing rpc_ids = {timed_out}; collected = {list(collected)}"
+        missing = [rpc for rpc in (rpc2, rpc3) if rpc not in seen_done]
+        assert not missing, (
+            f"{len(missing)}/2 follow-up messages never landed a turn_end "
+            f"row in session_log. Events submitted during a no-subscriber "
+            f"gap must still persist so /log can serve them on UI "
+            f"reconnect. Missing rpc_ids = {missing}; "
+            f"seen_done = {sorted(seen_done)}"
         )
 
 

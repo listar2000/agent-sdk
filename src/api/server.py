@@ -1719,11 +1719,17 @@ async def session_events(session_id: str):
     /events connections to the same session each receive a copy of every
     event.
 
+    Live-only: subscribers receive events broadcast after they register.
+    Historical events live in ``session_log`` and are served by
+    ``GET /sessions/{id}/log``; clients that need both history and live
+    updates load /log on mount, then open /events for the tail. (Earlier
+    versions seeded a per-session replay buffer onto new subscribers; that
+    double-delivered every event a cold-loading UI just fetched from
+    /log. Recovery from a mid-turn SSE drop now goes via re-fetching
+    /log rather than server-side replay.)
+
     Subscribes via ``SandboxSession.subscribe()`` which:
-      * yields the per-session replay buffer first (so a UI reconnecting
-        after a transient disconnect doesn't miss events that fired
-        during the gap)
-      * then streams live broadcasts from ``execute_prompt``
+      * streams live broadcasts from ``execute_prompt``
       * yields the ``_HEARTBEAT`` sentinel during idle so intermediaries
         (nginx / cloudflare / browser EventSource) don't close the
         connection between prompts.
