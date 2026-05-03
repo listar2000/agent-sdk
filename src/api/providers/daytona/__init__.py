@@ -1124,6 +1124,31 @@ async def _conditional_upload_if_absent(ref: str, abs_path: str, content: bytes)
         raise RuntimeError(f"conditional upload failed: {e}") from e
 
 
+async def _upload_overwrite(ref: str, abs_path: str, content: bytes) -> None:
+    """Upload bytes to ``abs_path``, replacing any existing file."""
+    inst = await _get_or_create_utility(ref)
+    if not inst.sandbox_ref:
+        raise RuntimeError("upload overwrite: utility sandbox_ref missing")
+    loop = asyncio.get_running_loop()
+    daytona_client = _get_daytona_client()
+    try:
+        sandbox = await loop.run_in_executor(
+            None, lambda: daytona_client.get(inst.sandbox_ref)
+        )
+    except Exception as e:
+        raise RuntimeError(f"upload overwrite: get sandbox failed: {e}") from e
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
+                path=abs_path,
+                file=content,
+            ),
+        )
+    except Exception as e:
+        raise RuntimeError(f"upload overwrite failed: {e}") from e
+
+
 async def _daytona_supports_conditional_create(ref: str) -> bool:
     """Detect once per volume whether toolbox upload honors If-None-Match: *."""
     mode = (os.environ.get("DAYTONA_CONDITIONAL_CREATE_MODE", "auto") or "auto").strip().lower()
@@ -1232,7 +1257,9 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
     src = "/v/" + src_rel
     dst = "/v/" + dst_rel
     dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
-    # mountpoint-backed volumes can lag after rename/link+unlink. Do not report
+    if src_rel == dst_rel:
+        return
+    # mountpoint-backed volumes can lag after copy/delete. Do not report
     # success until dst is visible and src is gone in the utility sandbox view.
     settle_check = (
         f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
@@ -1242,19 +1269,9 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
         f"echo __RENAME_NOT_VISIBLE__; exit 98"
     )
     if overwrite:
-        cmd = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} && "
-            f"mv -- {shlex.quote(src)} {shlex.quote(dst)} && "
-            f"{settle_check}"
-        )
-    else:
-        # Daytona volumes are object-store backed; hardlinks are not reliable.
-        # Require a real create-if-absent primitive instead of race-prone emulation.
-        if not await _daytona_supports_conditional_create(ref):
-            raise NotImplementedError(
-                "atomic no-overwrite rename is not supported on this Daytona volume backend"
-            )
+        # Daytona volumes are object-store backed. POSIX `mv` on the mounted
+        # view can fail or report success without durable movement, so use the
+        # provider file API for the data transfer and delete the source after.
         res = await _run_in_utility_sandbox(
             ref,
             (
@@ -1267,30 +1284,47 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
             if "__MISSING__" in (res.stdout or ""):
                 raise FileNotFoundError(f"{path} not found on volume {ref}")
             if "__UNSUPPORTED_DIR__" in (res.stdout or ""):
-                raise NotImplementedError("atomic no-overwrite directory rename is not supported")
+                raise NotImplementedError("overwrite rename for directories is not supported")
             raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")
         src_bytes = await volume_download(ref, src_rel)
-        outcome = await _conditional_upload_if_absent(ref, dst, src_bytes)
-        if outcome == "exists":
-            raise VolumeFileExistsError(new_path)
-        if outcome != "created":
-            raise RuntimeError("volume_rename failed: conditional destination claim returned unknown result")
+        await _upload_overwrite(ref, dst, src_bytes)
         await volume_delete(ref, src_rel)
         verify = await _run_in_utility_sandbox(ref, settle_check)
         if verify.exit_code != 0:
             raise RuntimeError("volume_rename postcondition failed: destination not visible")
         return
-    res = await _run_in_utility_sandbox(ref, cmd)
+
+    # Daytona volumes are object-store backed; hardlinks are not reliable.
+    # Require a real create-if-absent primitive instead of race-prone emulation.
+    if not await _daytona_supports_conditional_create(ref):
+        raise NotImplementedError(
+            "atomic no-overwrite rename is not supported on this Daytona volume backend"
+        )
+    res = await _run_in_utility_sandbox(
+        ref,
+        (
+            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
+            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi"
+        ),
+    )
     if res.exit_code != 0:
         if "__MISSING__" in (res.stdout or ""):
             raise FileNotFoundError(f"{path} not found on volume {ref}")
-        if "__EXISTS__" in (res.stdout or ""):
-            raise VolumeFileExistsError(new_path)
         if "__UNSUPPORTED_DIR__" in (res.stdout or ""):
             raise NotImplementedError("atomic no-overwrite directory rename is not supported")
-        if "__RENAME_NOT_VISIBLE__" in (res.stdout or ""):
-            raise RuntimeError("volume_rename postcondition failed: destination not visible")
         raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")
+    src_bytes = await volume_download(ref, src_rel)
+    outcome = await _conditional_upload_if_absent(ref, dst, src_bytes)
+    if outcome == "exists":
+        raise VolumeFileExistsError(new_path)
+    if outcome != "created":
+        raise RuntimeError("volume_rename failed: conditional destination claim returned unknown result")
+    await volume_delete(ref, src_rel)
+    verify = await _run_in_utility_sandbox(ref, settle_check)
+    if verify.exit_code != 0:
+        raise RuntimeError("volume_rename postcondition failed: destination not visible")
+    return
 
 
 # ---------------------------------------------------------------------------
