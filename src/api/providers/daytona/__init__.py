@@ -1237,15 +1237,29 @@ async def volume_delete(ref: str, path: str) -> None:
     if not rel:
         raise ValueError("volume_delete: path required")
     target = "/v/" + rel
-    cmd = (
-        f"if [ ! -e {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"rm -rf -- {shlex.quote(target)}"
-    )
-    res = await _run_in_utility_sandbox(ref, cmd)
-    if res.exit_code != 0:
-        if "__MISSING__" in (res.stdout or ""):
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(f"volume_delete failed: {res.stderr[:400]}")
+    inst = await _get_or_create_utility(ref)
+    if not inst.sandbox_ref:
+        raise RuntimeError("volume_delete: utility sandbox_ref missing")
+
+    loop = asyncio.get_running_loop()
+    daytona_client = _get_daytona_client()
+    try:
+        sandbox = await loop.run_in_executor(
+            None, lambda: daytona_client.get(inst.sandbox_ref)
+        )
+    except Exception as e:
+        raise RuntimeError(f"volume_delete: get sandbox failed: {e}") from e
+
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: sandbox.fs.delete_file(target, recursive=True),
+        )
+    except Exception as e:
+        msg = str(e)
+        if "not found" in msg.lower() or "404" in msg:
+            raise FileNotFoundError(f"{path} not found on volume {ref}") from e
+        raise RuntimeError(f"volume_delete failed: {msg}") from e
 
 
 async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
