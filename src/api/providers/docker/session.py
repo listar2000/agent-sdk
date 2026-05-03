@@ -202,7 +202,7 @@ class DockerSandboxSession(BaseSandboxSession):
                                 continue
                             self._broadcast((rpc_id, block))
                             yield event
-                            if event.get("type") == "done":
+                            if event.get("type") in ("done", "error"):
                                 return
                 finally:
                     if not send_task.done():
