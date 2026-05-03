@@ -47,3 +47,39 @@ def redact_secrets(text: str) -> str:
     if _REDACT_HOME and _HOME in result:
         result = result.replace(_HOME, "/home/[USER]")
     return result
+
+
+# Matches `echo <blob>` where the blob is 40+ bytes of base64-style alphabet.
+# Targets the canonical pre_start_commands shape callers use to deliver a
+# config payload to the sandbox without exposing it on the command line:
+#
+#   mkdir -p ... && echo <base64-of-config-with-token> | base64 -d > /path
+#
+# The regex-based ``redact_secrets`` above can't see inside the base64 wrap,
+# so a UUID-shaped agent token nested in a JSON config is invisible to it.
+# Stripping the entire blob is the only sound redaction at this layer.
+_BASE64_ECHO_RE = re.compile(r"(echo\s+)([A-Za-z0-9+/=_-]{40,})")
+
+
+def redact_pre_start_commands(cmds: list[str]) -> list[str]:
+    """Redact sensitive payloads embedded in shell-string pre_start_commands
+    before returning them to API clients.
+
+    Two passes per command:
+      1. Strip ``echo <blob>`` base64 payloads (delivers tokens to the
+         sandbox via ``echo <b64> | base64 -d > /path/file.json``).
+      2. Apply the standard ``redact_secrets`` regex set so any inline
+         secret literals in install URLs, env-var assignments, etc. that
+         match a known format are also redacted.
+
+    Returns a new list — input is not mutated.
+    """
+    out: list[str] = []
+    for cmd in cmds or []:
+        if not isinstance(cmd, str):
+            out.append(cmd)
+            continue
+        cmd = _BASE64_ECHO_RE.sub(r"\1[REDACTED]", cmd)
+        cmd = redact_secrets(cmd)
+        out.append(cmd)
+    return out

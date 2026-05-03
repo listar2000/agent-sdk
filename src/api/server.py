@@ -83,7 +83,7 @@ from .providers import (
     get_volume_adapter,
 )
 from .providers._shared import _safe_path as _shared_safe_path
-from .redact import redact_secrets
+from .redact import redact_pre_start_commands, redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -980,6 +980,13 @@ async def get_session_route(session_id: str):
     ``env`` is returned in full (non-sensitive). ``secrets`` is returned as
     ``{"keys": [...]}`` (names only) so callers can confirm what's stored
     without leaking values. Values are never serialized to clients.
+
+    ``pre_start_commands`` are run through ``redact_pre_start_commands``
+    because callers commonly embed config payloads via
+    ``echo <base64-blob> | base64 -d > /path/file.json``, and the inner
+    blob can contain credentials (e.g. hivespace's per-agent JSON cfg
+    holds the agent's token). Stripping the blob keeps the field useful
+    for "is this set / how many" debugging without leaking content.
     """
     rec = await _require_session_row(session_id)
     env = rec.get("env") or {}
@@ -993,7 +1000,7 @@ async def get_session_route(session_id: str):
         "inner_session_id": rec.get("inner_session_id"),
         "env": env,
         "secrets": {"keys": sorted(secrets.keys())},
-        "pre_start_commands": rec.get("pre_start_commands") or [],
+        "pre_start_commands": redact_pre_start_commands(rec.get("pre_start_commands") or []),
     }
 
 
