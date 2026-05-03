@@ -657,59 +657,36 @@ async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool =
 async def reconcile_on_startup() -> None:
     """Kill orphan supervisors and unlink their markers on server boot.
 
-    A marker whose ref isn't in any live session row is an orphan: its
-    DELETE never landed (server crashed, test crashed, etc.). Kill the
-    PID and unlink the marker. Markers from active sessions are left
-    alone.
-
-    Globs both new ``<ref>.json`` records and legacy ``<ref>.alive`` PID
-    files; the latter format predates this refactor and gets cleaned up
-    here on first boot after upgrade.
+    A marker whose ref isn't in any live session row is an orphan — its
+    DELETE never landed. Kill the PID, unlink the marker. Markers from
+    active sessions are left alone.
     """
     try:
         from ... import db as dbmod
     except Exception as e:
         log.warning("unix_local reconcile: cannot import api.db: %s", e)
         return
-
     try:
         live_refs = await dbmod.live_sandbox_refs()
     except Exception as e:
         log.warning("unix_local reconcile: live-session query failed: %s", e)
         return
 
-    def _scan_orphans() -> list[tuple[str, int | None]]:
-        """Sync helper: enumerate orphan (path, pid) pairs without touching them."""
-        sandbox_dir = _vol_root() / "*" / "system" / "sandboxes"
-        paths = (
-            glob.glob(str(sandbox_dir / "*.json"))
-            + glob.glob(str(sandbox_dir / "*.alive"))
-        )
-        orphans: list[tuple[str, int | None]] = []
-        for m in paths:
+    def _scan() -> list[tuple[str, int | None]]:
+        pattern = str(_vol_root() / "*" / "system" / "sandboxes" / "*.json")
+        out: list[tuple[str, int | None]] = []
+        for m in glob.glob(pattern):
             path = Path(m)
             if path.stem in live_refs:
                 continue
             try:
-                text = path.read_text().strip()
-            except Exception:
-                text = ""
-            pid: int | None = None
-            if path.suffix == ".json":
-                try:
-                    pid = int(json.loads(text).get("pid", 0)) or None
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    pid = None
-            elif text:
-                try:
-                    pid = int(text)
-                except ValueError:
-                    pid = None
-            orphans.append((m, pid))
-        return orphans
+                pid = int(json.loads(path.read_text()).get("pid", 0)) or None
+            except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+                pid = None
+            out.append((m, pid))
+        return out
 
-    orphans = await asyncio.to_thread(_scan_orphans)
-    for path, pid in orphans:
+    for path, pid in await asyncio.to_thread(_scan):
         if pid:
             try:
                 await asyncio.to_thread(os.kill, pid, signal.SIGKILL)
