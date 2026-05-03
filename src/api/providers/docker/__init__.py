@@ -24,6 +24,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from .._shared import (
     ProviderInstance,
@@ -180,6 +181,27 @@ def _agent_sdk_origin() -> str:
     return os.environ.get("AGENT_SDK_ORIGIN", "production")
 
 
+def _docker_resource_flags(req: Any) -> list[str]:
+    """Map our ``Resources`` to ``docker run`` flags.
+
+    Docker accepts ``--cpus``, ``--memory`` (suffix ``m``=MiB), and
+    ``--gpus device=N`` (count only, no per-container type selection).
+    ``gpu_type`` and ``disk_gib`` are silently dropped.
+    """
+    if req is None:
+        return []
+    from api.sandbox.state import parse_gpu
+    flags: list[str] = []
+    if req.cpu is not None:
+        flags += ["--cpus", str(req.cpu)]
+    if req.memory_mib is not None:
+        flags += ["--memory", f"{int(req.memory_mib)}m"]
+    _, gpu_count = parse_gpu(req.gpu)
+    if gpu_count is not None and gpu_count > 0:
+        flags += ["--gpus", str(gpu_count)]
+    return flags
+
+
 async def create_sandbox(
     *,
     volume_ref: str,
@@ -192,6 +214,7 @@ async def create_sandbox(
     port: int | None = None,  # accepted for parity with uniform API; always allocates
     sandbox_ref: str | None = None,
     shared_mounts: list[str] | None = None,
+    resources: Any = None,
     **_kw,
 ) -> ProviderInstance:
     """Create a Docker container with three volume-subpath mounts + supervisor.
@@ -285,6 +308,7 @@ async def create_sandbox(
         # ``agent_sdk_origin`` label so a single cleanup script can reap
         # both providers' test orphans by filter.
         c += ["--label", f"{_ORIGIN_LABEL_KEY}={_agent_sdk_origin()}"]
+        c += _docker_resource_flags(resources)
         c += [
             "--entrypoint", "sh",
             runtime_image,
@@ -552,7 +576,17 @@ async def volume_tree(ref: str, path: str) -> str:
     """
     rel = _safe_rel(path)
     target = f"/v/{rel}" if rel else "/v"
-    shell = f"find {shlex.quote(target)} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
+    # busybox find (alpine) lacks -printf, so emit "<type> <relpath>" via
+    # three -type passes. Output stays sorted/normalized in
+    # ``normalize_find_output``. cd into target so paths are emitted relative.
+    qt = shlex.quote(target)
+    shell = (
+        f"cd {qt} 2>/dev/null && ("
+        "find . -mindepth 1 -type l -exec sh -c 'printf \"l %s\\n\" \"${0#./}\"' {} \\; ; "
+        "find . -mindepth 1 -type d -exec sh -c 'printf \"d %s\\n\" \"${0#./}\"' {} \\; ; "
+        "find . -mindepth 1 -type f -exec sh -c 'printf \"f %s\\n\" \"${0#./}\"' {} \\;"
+        ") 2>/dev/null"
+    )
     rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
     if rc != 0:
         raise RuntimeError(

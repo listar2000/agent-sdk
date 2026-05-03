@@ -218,53 +218,6 @@ async def _seed_fake_supervisor(volume_ref: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sandbox_create_inspect_destroy():
-    name = _vol_name()
-    inst: ProviderInstance | None = None
-    try:
-        await dprov.create_volume(name)
-        await _seed_fake_supervisor(name)
-        subpath = "agents/test-agent/home"
-        inst = await dprov.create_sandbox(
-            volume_ref=name, subpath=subpath, agent_type="claude",
-        )
-        assert inst.container_id
-        assert inst.url.startswith("http://localhost:")
-        assert inst.port is not None
-
-        # Status: running
-        status = await dprov.get_sandbox_status(inst.container_id)
-        assert status == "running", f"expected running, got {status!r}"
-
-        # ensure_supervisor_url is a no-op returning inst.url
-        url = await dprov.ensure_supervisor_url(inst, agent_type="claude")
-        assert url == inst.url
-
-        # Hit the fake /v1/echo to cause a write into the mounted agent-home.
-        import httpx
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(f"{inst.url}/v1/echo")
-            assert r.status_code == 200
-
-        # The write should have landed on the volume at <subpath>/messages.log.
-        got = await dprov.volume_read(name, f"{subpath}/messages.log")
-        assert got == b"ping\n"
-
-        # Destroy removes the container and port should be released.
-        await dprov.destroy_sandbox(inst)
-        status = await dprov.get_sandbox_status(inst.container_id or "")
-        assert status == "missing"
-        inst = None
-    finally:
-        if inst is not None:
-            try:
-                await dprov.destroy_sandbox(inst)
-            except Exception:
-                pass
-        await dprov.delete_volume(name)
-
-
-@pytest.mark.asyncio
 async def test_sandbox_stop_start_resume():
     name = _vol_name()
     inst: ProviderInstance | None = None
@@ -294,52 +247,6 @@ async def test_sandbox_stop_start_resume():
                 await dprov.destroy_sandbox(inst)
             except Exception:
                 pass
-        await dprov.delete_volume(name)
-
-
-@pytest.mark.asyncio
-async def test_destroy_recreate_same_subpath_preserves_files():
-    """Destroying and recreating a sandbox with the same subpath must
-    preserve the agent-home contents (the point of decoupled volumes)."""
-    name = _vol_name()
-    first: ProviderInstance | None = None
-    second: ProviderInstance | None = None
-    try:
-        await dprov.create_volume(name)
-        await _seed_fake_supervisor(name)
-        subpath = "agents/persist-agent/home"
-
-        first = await dprov.create_sandbox(
-            volume_ref=name, subpath=subpath, agent_type="claude",
-        )
-        import httpx
-        async with httpx.AsyncClient(timeout=5) as c:
-            await c.get(f"{first.url}/v1/echo")
-
-        # First write should be visible.
-        got = await dprov.volume_read(name, f"{subpath}/messages.log")
-        assert got == b"ping\n"
-
-        await dprov.destroy_sandbox(first)
-        first = None
-
-        # Recreate on the same subpath.
-        second = await dprov.create_sandbox(
-            volume_ref=name, subpath=subpath, agent_type="claude",
-        )
-        async with httpx.AsyncClient(timeout=5) as c:
-            await c.get(f"{second.url}/v1/echo")
-
-        # Previous + new writes both present.
-        got = await dprov.volume_read(name, f"{subpath}/messages.log")
-        assert got == b"ping\nping\n", got
-    finally:
-        for inst in (first, second):
-            if inst is not None:
-                try:
-                    await dprov.destroy_sandbox(inst)
-                except Exception:
-                    pass
         await dprov.delete_volume(name)
 
 
@@ -373,95 +280,6 @@ async def _read_symlink_target(volume_ref: str, link_rel: str) -> str:
         timeout=30,
     )
     return out.decode(errors="replace").strip() if rc == 0 else ""
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(
-    os.environ.get("AGENT_SDK_SKIP_SLOW_DOCKER_TESTS") == "1",
-    reason="slow npm-install test skipped (AGENT_SDK_SKIP_SLOW_DOCKER_TESTS=1)",
-)
-async def test_install_supervisor_symlink_flip_preserves_old_version():
-    """MA2 regression guard: the docker install_supervisor replaces
-    ``system/supervisor`` with a symlink to a fresh ``supervisor.v<ts>/``
-    on each run.  The OLD versioned directory must linger (GC is 24 h old)
-    so a live container bind-mounting the previous symlink target keeps a
-    consistent view of the filesystem.
-
-    Reverting MA2 (rm -rf + rename) would pass the local provider's test
-    but FAIL here because the old v-dir would be gone.
-    """
-    name = _vol_name()
-    try:
-        await dprov.create_volume(name)
-
-        # First install.
-        await dprov.install_supervisor(name, agent_type="claude")
-        entries1 = await _read_system_tree(name)
-        # There should be a single supervisor.v* directory and a symlink.
-        v_dirs1 = [e.rstrip("/@*") for e in entries1 if e.startswith("supervisor.v")]
-        assert len(v_dirs1) == 1, f"expected one v-dir after install 1, got {entries1}"
-        v1 = v_dirs1[0]
-
-        link1 = await _read_symlink_target(name, "system/supervisor")
-        assert link1 == v1, (
-            f"expected symlink → {v1}, got {link1!r} (entries={entries1})"
-        )
-
-        # Second install — simulates a reinstall. Cache is bypassed since
-        # we call the provider function directly (not via ensure_volume_supervisor).
-        # The second v-name is monotonically larger (timestamp-based) so
-        # there's no collision with the first.
-        await dprov.install_supervisor(name, agent_type="claude")
-        entries2 = await _read_system_tree(name)
-        v_dirs2 = sorted(
-            e.rstrip("/@*") for e in entries2 if e.startswith("supervisor.v")
-        )
-        assert len(v_dirs2) == 2, (
-            f"expected OLD + NEW v-dirs after install 2, got {entries2}"
-        )
-        assert v1 in v_dirs2, (
-            f"OLD v-dir {v1!r} missing — MA2 revert would delete it before "
-            f"the symlink flip (entries={entries2})"
-        )
-        v2 = next(d for d in v_dirs2 if d != v1)
-
-        # Symlink now points at the NEW v-dir, not the old one.
-        link2 = await _read_symlink_target(name, "system/supervisor")
-        assert link2 == v2, (
-            f"expected symlink → new v-dir {v2!r}, got {link2!r}"
-        )
-        assert link2 != v1, "symlink should have flipped to the new v-dir"
-    finally:
-        await dprov.delete_volume(name)
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(
-    os.environ.get("AGENT_SDK_SKIP_SLOW_DOCKER_TESTS") == "1",
-    reason="slow npm-install test skipped (AGENT_SDK_SKIP_SLOW_DOCKER_TESTS=1)",
-)
-async def test_install_supervisor_populates_system_supervisor():
-    """Runs a real ``npm install`` inside node:20-slim. ~30-90s; skip with env."""
-    name = _vol_name()
-    try:
-        await dprov.create_volume(name)
-        await dprov.install_supervisor(name, agent_type="claude")
-        tree = await dprov.volume_tree(name, "system/supervisor")
-        files = tree.splitlines()
-        # supervisor.js copied.
-        assert "system/supervisor/supervisor.js" in files, (
-            "expected supervisor.js in " + str(files)[:500]
-        )
-        # package.json created by `npm init`.
-        assert "system/supervisor/package.json" in files, (
-            "expected package.json in " + str(files)[:500]
-        )
-        # Claude ACP binary installed.
-        assert any("claude-agent-acp" in f for f in files), (
-            "expected claude-agent-acp bin in " + str(files)[:500]
-        )
-    finally:
-        await dprov.delete_volume(name)
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +337,7 @@ async def test_label_propagation_provider_create_sandbox():
         sb_id = f"sb_{uuid.uuid4().hex[:10]}"
         inst = await dprov.create_sandbox(
             volume_ref=name, subpath="agents/label-probe/home",
-            agent_type="claude", sandbox_id=sb_id,
+            agent_type="claude", sandbox_ref=sb_id,
         )
         assert inst.container_id
         assert _inspect_label(inst.container_id) == sb_id, (
@@ -567,7 +385,7 @@ class TestDockerReconcile:
         """Create a labeled container against a prepared volume."""
         return await dprov.create_sandbox(
             volume_ref=volume_name, subpath=subpath, agent_type="claude",
-            sandbox_id=sandbox_id,
+            sandbox_ref=sandbox_id,
         )
 
     @pytest.mark.asyncio

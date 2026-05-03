@@ -477,7 +477,11 @@ async def _wait_for_health(url: str, max_retries: int = 150, interval: float = 0
 # Port allocator
 # ---------------------------------------------------------------------------
 
-_next_local_port = 2469
+# ``_freed_ports`` was a recycle pool when ports came from a per-process
+# monotonic counter. It's now vestigial — the OS allocator never re-issues
+# the same ephemeral port back-to-back, so recycling has no value. Kept as
+# a still-existing-but-unread list so existing call sites that append on
+# error paths don't need rewiring; entries are never consumed.
 _freed_ports: list[int] = []
 _port_lock = asyncio.Lock()
 
@@ -495,49 +499,27 @@ async def _recycle_port(instance) -> None:
         _freed_ports.append(port)
 
 
-def _port_is_bindable(port: int) -> bool:
-    """Return True if ``port`` is currently free to bind on 127.0.0.1.
-
-    Rejects port 0 even though ``bind(("127.0.0.1", 0))`` technically
-    succeeds — that's OS-assigned allocation, not "this port is free," and
-    callers treat the return value as the port they'll listen on. Letting
-    0 through here meant a spurious 0 entry in ``_freed_ports`` would get
-    recycled and crash supervisor startup with "health check failed on
-    port 0".
-    """
-    if port <= 0:
-        return False
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("127.0.0.1", port))
-        except OSError:
-            return False
-    return True
-
-
 async def _find_free_port() -> int:
     """Allocate a host port that is currently free at the OS level.
 
-    Keeps the monotonic counter + freed-port recycling for backward compat,
-    but each candidate is verified by a bind-and-close probe before return.
-    If no candidate binds cleanly within a bounded loop, falls through to
-    ``bind(0)`` and lets the OS pick.
+    Always asks the OS via ``bind(("127.0.0.1", 0))`` rather than walking
+    a process-local counter. The monotonic-counter approach was unsafe
+    under pytest-xdist: each worker is its own Python process, so two
+    workers would both pick e.g. ``2469``, both bind-probe successfully
+    (the probe doesn't reserve), and both try to bind for real — one
+    won, the other got "address already in use". The OS allocator hands
+    out ports from the ephemeral range (32768+) and won't double-issue
+    across processes.
+
+    There's a tiny TOCTOU window between this function's
+    ``getsockname()`` and the caller's actual ``bind`` (since we close
+    the socket before returning), but two callers in the same process
+    are serialised by ``_port_lock`` and across processes the kernel
+    won't hand out the same ephemeral twice in close succession.
+    Callers that hit a "port in use" race retry once in
+    ``docker.create_sandbox``.
     """
-    global _next_local_port
     async with _port_lock:
-        # Try up to N candidates (recycled + counter) before falling back
-        # to OS-assigned. Bounded so we can't spin forever.
-        for _ in range(64):
-            if _freed_ports:
-                candidate = _freed_ports.pop()
-            else:
-                candidate = _next_local_port
-                _next_local_port += 1
-            if _port_is_bindable(candidate):
-                return candidate
-            # Port in use at OS level — drop it, try another.
-        # Fallback: let the OS pick any free port.
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 0))

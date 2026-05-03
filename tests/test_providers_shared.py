@@ -41,40 +41,23 @@ def _bind_port(port: int):
 
 @pytest.mark.asyncio
 async def test_find_free_port_skips_occupied_port():
-    """A port occupied via bind+listen must never be returned by the
-    allocator, even if the monotonic counter would otherwise pick it."""
+    """A port occupied at the OS level must never be returned by the
+    allocator. The implementation now uses ``bind(("127.0.0.1", 0))``
+    which delegates to the kernel — it won't hand out a port that's
+    already bound by another socket.
+    """
     from api.providers import _shared as sh
 
-    # Snap the counter forward so the NEXT candidate is a port we choose
-    # and occupy.  Binding 0 lets the OS pick a free port; we then
-    # occupy it explicitly AND rewind the counter to it.
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    probe.bind(("127.0.0.1", 0))
-    occupied = probe.getsockname()[1]
-    probe.listen(1)
-
-    try:
-        # Force the allocator to see ``occupied`` as the next counter value.
-        async with sh._port_lock:
-            prev_next = sh._next_local_port
-            sh._next_local_port = occupied
-            # Clear any freed cache for a deterministic test.
-            sh._freed_ports.clear()
-        try:
-            # First call: occupied port is bindable=False → skipped.
+    # Hold a port via bind+listen, then call the allocator. The kernel
+    # picks an ephemeral; verify it's never the held port across many
+    # calls.
+    with _bind_port(0) as held:
+        held_port = held.getsockname()[1]
+        for _ in range(8):
             port = await sh._find_free_port()
-            assert port != occupied, (
-                f"_find_free_port returned occupied port {occupied}"
+            assert port != held_port, (
+                f"allocator returned occupied port {held_port}"
             )
-            # The allocator should still be returning a usable port.
-            with _bind_port(port):
-                pass  # if the port were taken, this would raise
-        finally:
-            async with sh._port_lock:
-                sh._next_local_port = prev_next
-    finally:
-        probe.close()
 
 
 @pytest.mark.asyncio
@@ -96,67 +79,35 @@ async def test_find_free_port_loop_never_returns_bound_port():
 
 
 @pytest.mark.asyncio
-async def test_find_free_port_os_fallback_when_counter_exhausted():
-    """If every counter candidate is occupied for the entire bounded
-    loop, the allocator falls through to ``bind(0)`` and returns an
-    OS-assigned free port."""
+async def test_find_free_port_returns_bindable_ports():
+    """Every port the allocator returns must be bindable at OS level.
+
+    The implementation just delegates to ``bind(("127.0.0.1", 0))``, so
+    the kernel guarantees an unused ephemeral. This test pins that
+    contract — a future change that introduces caching or recycling
+    must keep it true.
+    """
     from api.providers import _shared as sh
 
-    # Bind a contiguous range of ports so the counter lands on occupied
-    # candidates for every iteration.  The implementation loops 64
-    # candidates before the fallback; binding ~12 consecutive ports is
-    # enough because the OS-assigned fallback is the failsafe path.
-    occupied_socks: list[socket.socket] = []
-    base = 0
-    try:
-        # Find a free starting point.
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.bind(("127.0.0.1", 0))
-        base = probe.getsockname()[1]
-        probe.close()
-
-        # Hold a generous contiguous block.
-        for i in range(16):
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(("127.0.0.1", base + i))
-                s.listen(1)
-                occupied_socks.append(s)
-            except OSError:
-                # Someone else took it — irrelevant for the test.
-                s.close()
-
-        # Rewind counter to the base of the occupied block and clear
-        # the freed cache so the allocator must chew through our block.
-        async with sh._port_lock:
-            prev_next = sh._next_local_port
-            sh._freed_ports.clear()
-            sh._next_local_port = base
-
+    seen: set[int] = set()
+    for _ in range(16):
+        port = await sh._find_free_port()
+        assert port > 0
+        # Verify bindable. We have to close the allocator's socket
+        # (it already did), so we can rebind here.
+        test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            port = await sh._find_free_port()
-            # Whatever port we got, it must actually be bindable.
-            assert port > 0
-            occupied_ports = {s.getsockname()[1] for s in occupied_socks}
-            assert port not in occupied_ports, (
-                f"allocator returned an occupied port {port} (held block: "
-                f"{sorted(occupied_ports)})"
-            )
-            # Sanity: the port must be bindable right now (closing the
-            # allocator's probe socket already released it back to the OS).
-            test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                test.bind(("127.0.0.1", port))
-            finally:
-                test.close()
+            test.bind(("127.0.0.1", port))
         finally:
-            async with sh._port_lock:
-                sh._next_local_port = prev_next
-    finally:
-        for s in occupied_socks:
-            s.close()
+            test.close()
+        # The allocator should not double-issue within a single test
+        # process even though we don't reserve.
+        seen.add(port)
+    assert len(seen) >= 8, (
+        f"expected mostly-unique ports across 16 calls, got {len(seen)} "
+        "distinct values — kernel may be re-issuing aggressively"
+    )
 
 
 # ---------------------------------------------------------------------------

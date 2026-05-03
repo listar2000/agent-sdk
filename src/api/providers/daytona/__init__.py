@@ -16,7 +16,7 @@ import shlex
 import time
 import uuid
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from ... import load_dotenv
 
@@ -102,6 +102,26 @@ _LABEL_ORIGIN = "agent_sdk_origin"
 
 def _sandbox_labels() -> dict[str, str]:
     return {_LABEL_ORIGIN: os.environ.get("AGENT_SDK_ORIGIN", "production")}
+
+
+def _to_daytona_resources(req: Any) -> Any:
+    """Map our ``Resources`` to daytona-sdk ``Resources`` (image path only).
+
+    daytona's ``Resources`` is ``cpu``/``memory`` (GiB) /``disk`` (GiB) /``gpu``
+    (count). The ``gpu_type`` half of our request is silently dropped — daytona
+    has no API for it. Returns ``None`` for an empty/all-None request so the
+    SDK uses defaults.
+    """
+    if req is None:
+        return None
+    from api.sandbox.state import parse_gpu
+    from daytona_sdk import Resources as _DR
+    _, gpu_count = parse_gpu(req.gpu)
+    cpu = int(req.cpu) if req.cpu is not None else None
+    memory_gib = (req.memory_mib + 1023) // 1024 if req.memory_mib is not None else None
+    if cpu is None and memory_gib is None and req.disk_gib is None and gpu_count is None:
+        return None
+    return _DR(cpu=cpu, memory=memory_gib, disk=req.disk_gib, gpu=gpu_count)
 
 
 def _get_daytona_client():
@@ -284,6 +304,7 @@ async def provision_daytona_sandbox(
     volume_id: str | None = None,
     subpath: str | None = None,
     shared_mounts: list[str] | None = None,
+    resources: Any = None,
 ) -> ProviderInstance:
     """Create a Daytona sandbox with 3 volume mounts, but do NOT install deps
     or start a supervisor (those are handled by ensure_volume_supervisor and
@@ -328,6 +349,17 @@ async def provision_daytona_sandbox(
     )
     use_snapshot = dockerfile is None and snapshot.lower() not in {"", "0", "false", "image"}
 
+    # Daytona snapshots bake resources in at snapshot-creation time;
+    # CreateSandboxFromSnapshotParams has no ``resources`` field. When the
+    # caller wants per-session resources, fall back to the image path so
+    # the request is honoured (slower cold-create, ~30s vs ~2s).
+    if use_snapshot and resources is not None:
+        log.info(
+            "daytona: resources requested (%s); falling back from snapshot %s "
+            "to image path", resources, snapshot,
+        )
+        use_snapshot = False
+
     if dockerfile is not None:
         if not Path(dockerfile).exists():
             raise FileNotFoundError(f"Dockerfile not found: {dockerfile}")
@@ -365,6 +397,7 @@ async def provision_daytona_sandbox(
             CreateSandboxFromImageParams(
                 image=image, auto_stop_interval=0, env_vars=env_vars,
                 volumes=volumes, labels=labels,
+                resources=_to_daytona_resources(resources),
             ), timeout=create_timeout,
         ))
 
@@ -875,6 +908,7 @@ async def create_sandbox(
     pre_start_commands: list[str] | None = None,
     sandbox_ref: str | None = None,  # accepted for parity; unused here
     shared_mounts: list[str] | None = None,
+    resources: Any = None,
 ) -> ProviderInstance:
     """Uniform ``create_sandbox`` for the Daytona provider.
 
@@ -900,6 +934,7 @@ async def create_sandbox(
         volume_id=volume_ref,
         subpath=subpath,
         shared_mounts=shared_mounts,
+        resources=resources,
     )
 
 

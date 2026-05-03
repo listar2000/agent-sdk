@@ -93,6 +93,27 @@ _TAG_KEY = "agent-sdk.sandbox-id"
 _APP_NAME = "agent-sdk"
 
 
+def _to_modal_resources(req: Any) -> dict[str, Any]:
+    """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
+
+    Modal accepts ``cpu`` (float), ``memory`` (int MiB), and ``gpu`` (str:
+    ``"TYPE"`` or ``"TYPE:COUNT"``). A count-only gpu request (no type) is
+    silently dropped — Modal requires a type. ``disk_gib`` is ignored.
+    """
+    if req is None:
+        return {}
+    from api.sandbox.state import parse_gpu
+    out: dict[str, Any] = {}
+    if req.cpu is not None:
+        out["cpu"] = float(req.cpu)
+    if req.memory_mib is not None:
+        out["memory"] = int(req.memory_mib)
+    gpu_type, gpu_count = parse_gpu(req.gpu)
+    if gpu_type is not None:
+        out["gpu"] = f"{gpu_type}:{gpu_count}" if (gpu_count or 1) > 1 else gpu_type
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Lazy Modal SDK handles
 # ---------------------------------------------------------------------------
@@ -309,6 +330,7 @@ async def create_sandbox(
     port: int | None = None,  # accepted for parity; Modal picks its own via tunnel
     sandbox_ref: str | None = None,
     shared_mounts: list[str] | None = None,
+    resources: Any = None,
     **_kw,
 ) -> ProviderInstance:
     """Create a Modal sandbox with the volume mounted and supervisor running.
@@ -348,9 +370,10 @@ async def create_sandbox(
     )
 
     log.info(
-        "modal create_sandbox: volume=%s subpath=%s agent=%s",
-        volume_ref, subpath, agent_type,
+        "modal create_sandbox: volume=%s subpath=%s agent=%s resources=%s",
+        volume_ref, subpath, agent_type, resources,
     )
+    res_kw = _to_modal_resources(resources)
     sb = await asyncio.to_thread(
         lambda: modal.Sandbox.create(
             "bash", "-c", entrypoint,
@@ -360,6 +383,7 @@ async def create_sandbox(
             timeout=_SANDBOX_TIMEOUT_SEC,
             idle_timeout=_SANDBOX_IDLE_TIMEOUT_SEC,
             encrypted_ports=[_SUPERVISOR_CONTAINER_PORT],
+            **res_kw,
         )
     )
 

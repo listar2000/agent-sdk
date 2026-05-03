@@ -43,7 +43,7 @@ def _vol_name() -> str:
 @pytest.mark.asyncio
 async def test_create_volume_makes_dirs_and_returns_path(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -56,7 +56,7 @@ async def test_create_volume_makes_dirs_and_returns_path(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_create_volume_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref1 = await local.create_volume(name)
@@ -68,7 +68,7 @@ async def test_create_volume_is_idempotent(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_delete_volume_removes_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -81,7 +81,7 @@ async def test_delete_volume_removes_dir(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_delete_volume_tolerates_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     missing = str(tmp_path / "never-existed")
     # Must not raise.
@@ -162,7 +162,7 @@ async def test_create_sandbox_uses_image_runtime_when_flag_set(
     claude_bin.chmod(0o755)
     monkeypatch.setenv("AGENT_SDK_RUNTIME_PATH", str(runtime_dir))
 
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -211,7 +211,7 @@ async def _fetch_health(url: str) -> httpx.Response:
 @pytest.mark.asyncio
 async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -263,7 +263,7 @@ async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_ensure_supervisor_url_returns_same_url(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -286,7 +286,7 @@ async def test_ensure_supervisor_url_returns_same_url(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_read_write_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -299,7 +299,7 @@ async def test_volume_read_write_roundtrip(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_tree_lists_entries(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -316,7 +316,7 @@ async def test_volume_tree_lists_entries(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_mkdir_upload_rename_delete(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -346,7 +346,8 @@ async def test_volume_mkdir_upload_rename_delete(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_rename_no_overwrite_success_and_collision(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import VolumeFileExistsError, local
+    from api.providers import VolumeFileExistsError
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -366,7 +367,8 @@ async def test_volume_rename_no_overwrite_success_and_collision(tmp_path, monkey
 @pytest.mark.asyncio
 async def test_concurrent_volume_rename_no_overwrite_one_wins(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import VolumeFileExistsError, local
+    from api.providers import VolumeFileExistsError
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -395,7 +397,7 @@ async def test_concurrent_volume_rename_no_overwrite_one_wins(tmp_path, monkeypa
 @pytest.mark.asyncio
 async def test_volume_exists(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -410,7 +412,7 @@ async def test_volume_read_rejects_symlink_escape(tmp_path, monkeypatch):
     """A symlink inside the volume pointing to /etc/passwd must not be
     readable via volume_read — realpath containment check rejects it."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -426,7 +428,7 @@ async def test_volume_read_rejects_symlink_escape(tmp_path, monkeypatch):
 async def test_volume_write_rejects_symlink_escape(tmp_path, monkeypatch):
     """Writing through a symlink that points outside the volume is rejected."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -447,7 +449,7 @@ async def test_volume_write_rejects_symlink_escape(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_read_rejects_dotdot(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -468,7 +470,7 @@ async def test_volume_read_rejects_dotdot(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_read_missing_file_raises_filenotfound(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -482,7 +484,7 @@ async def test_volume_read_missing_volume_root_raises(tmp_path, monkeypatch):
     """Reading from a volume ref that doesn't exist on disk raises a
     filesystem error — not a silent empty string."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     bogus = str(tmp_path / "no-such-volume-dir")
     # _safe_join resolves the realpath of <bogus>/<path>; since bogus doesn't
@@ -498,7 +500,7 @@ async def test_volume_read_on_directory_raises(tmp_path, monkeypatch):
     a regular file descriptor — opening a directory path that way yields
     EISDIR."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -512,7 +514,7 @@ async def test_volume_read_on_directory_raises(tmp_path, monkeypatch):
 async def test_volume_read_empty_path_raises(tmp_path, monkeypatch):
     """Reading with an empty path targets the volume root (a directory)."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)
@@ -528,7 +530,7 @@ async def test_volume_write_parent_path_through_file_fails(tmp_path, monkeypatch
     """Writing to a path whose parent is a regular file (not a directory)
     must fail — not silently corrupt the parent."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import local
+    from api.providers import unix_local as local
 
     name = _vol_name()
     ref = await local.create_volume(name)

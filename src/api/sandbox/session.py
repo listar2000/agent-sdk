@@ -62,6 +62,12 @@ class BaseSandboxSession(abc.ABC):
         self.session_id = session_id
         self.state = state
         self.liveness = Liveness(probe=self._liveness_probe)
+        # Serialises ``execute_prompt`` per session so concurrent POST
+        # /message calls run sequentially and ``session_log`` row order
+        # tracks SSE arrival order. ``interrupt=True`` cancels the active
+        # turn (so the lock releases promptly) but doesn't jump the
+        # queue — FIFO is preserved (test_queue_plus_interrupt_parity).
+        self._prompt_lock = asyncio.Lock()
         # Subscriber fan-out: persistent across many execute_prompt calls
         # so that GET /events can stay open across N prompts.
         self._subscribers: dict[str, asyncio.Queue[Any]] = {}
