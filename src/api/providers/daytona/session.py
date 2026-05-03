@@ -349,7 +349,19 @@ class DaytonaSandboxSession(BaseSandboxSession):
                             # correlate per-prompt streams.
                             self._broadcast((rpc_id, block))
                             yield event
-                            if event.get("type") == "done":
+                            # Both ``done`` (clean stopReason — end_turn /
+                            # cancelled / max_tokens / max_turn_requests) and
+                            # ``error`` (top-level JSON-RPC error envelope —
+                            # auth failure, internal error, process death)
+                            # signal that ACP is finished with this rpc_id and
+                            # will write nothing else for it. Stop iterating
+                            # so the SSE stream closes promptly. Tool failures
+                            # are ``session/update`` notifications and surface
+                            # as ``tool_result`` / ``update`` events — they
+                            # never become ``type=="error"``, so this check
+                            # cannot accidentally end a turn the LLM is still
+                            # recovering from.
+                            if event.get("type") in ("done", "error"):
                                 return
                 finally:
                     if not send_task.done():
