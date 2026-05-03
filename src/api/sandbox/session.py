@@ -18,8 +18,6 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from collections import deque
-
 from .liveness import Liveness
 from .state import SandboxState
 
@@ -34,11 +32,9 @@ _END = object()
 _HEARTBEAT = object()
 _HEARTBEAT_INTERVAL_S = 20.0
 
-# Bound on the per-session event replay buffer. Late subscribers (UI
-# reconnects after a "stream closed" hiccup) replay this buffer first,
-# then receive live broadcasts. A new POST /message that fires before
-# the reconnect lands here, so the user-visible "lost reply" disappears.
-_BUFFER_SIZE = 1024
+# Per-subscriber queue capacity. Slow subscribers drop events rather than
+# backpressuring the source supervisor stream.
+_QUEUE_MAXSIZE = 2048
 
 
 class BaseSandboxSession(abc.ABC):
@@ -69,12 +65,10 @@ class BaseSandboxSession(abc.ABC):
         # queue — FIFO is preserved (test_queue_plus_interrupt_parity).
         self._prompt_lock = asyncio.Lock()
         # Subscriber fan-out: persistent across many execute_prompt calls
-        # so that GET /events can stay open across N prompts.
+        # so that GET /events can stay open across N prompts. Subscribers
+        # only receive events broadcast AFTER they register — historical
+        # events live in ``session_log`` (GET /sessions/{id}/log).
         self._subscribers: dict[str, asyncio.Queue[Any]] = {}
-        # Bounded replay buffer of recent broadcasts so a UI that
-        # reconnects /events after a transient close still receives
-        # events posted during the gap. Bounded → memory bounded.
-        self._buffer: deque = deque(maxlen=_BUFFER_SIZE)
         # Set by concrete start(); used by file-proxy endpoints to talk
         # to the supervisor without going through ACP.
         self._supervisor_url: str | None = None
@@ -420,15 +414,7 @@ class BaseSandboxSession(abc.ABC):
         sid = str(uuid.uuid4())
         # Bounded queue: slow subscribers drop events rather than backpressuring
         # the source supervisor stream. Per docs §15.5 — keep today's behaviour.
-        q: asyncio.Queue[Any] = asyncio.Queue(maxsize=_BUFFER_SIZE * 2)
-        # Seed the queue with the buffer BEFORE registering so concurrent
-        # broadcasts don't double-deliver: items in the queue stay ordered
-        # (replay first, then live).
-        for event in list(self._buffer):
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                break
+        q: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._subscribers[sid] = q
         return sid, q
 
@@ -472,9 +458,14 @@ class BaseSandboxSession(abc.ABC):
             yield item
 
     def _broadcast(self, event: Any) -> None:
-        """Append to replay buffer + fan out to every active subscriber.
-        Slow subscribers whose queue is full silently drop this event."""
-        self._buffer.append(event)
+        """Fan out to every active subscriber. Slow subscribers whose
+        queue is full silently drop this event.
+
+        Live-only: events are not buffered for late subscribers. Callers
+        that need historical events read GET /sessions/{id}/log; that
+        endpoint is the source of truth for everything broadcast on this
+        session. Mixing the two would double-deliver every event a
+        cold-loading UI just fetched from /log."""
         for q in list(self._subscribers.values()):
             try:
                 q.put_nowait(event)

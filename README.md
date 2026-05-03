@@ -115,31 +115,6 @@ Session data lives on the volume, so the session survives sandbox death on every
 - [API reference](docs/api.md) — REST endpoints + `ApiClient` table
 - [Local dev](docs/local-dev.md) — Docker setup, env vars
 
-## Layout
-
-```
-src/
-  agent_sdk/         Python SDK
-    api_client.py      ApiClient (operator persona — flat, one method per route)
-    client.py          Agent (user persona — single-session UX)
-    errors.py
-    persist.py         SQLite session persistence
-  api/               Orchestration server
-    server.py          FastAPI endpoints
-    db.py              Postgres CRUD
-    models.py          AgentRecord, VolumeRecord, AgentConfig
-    acp_client.py      JSON-RPC ACP client (POST + SSE)
-    sse.py             SSE parsing
-    redact.py          Secret redaction
-    providers/         Volume backend per provider (local, docker, daytona, modal)
-    sandbox/           SessionPool + ephemeral SandboxSession
-      pool.py, session.py, state.py, factory.py, runtime.py, liveness.py
-      providers/         Per-provider SandboxSession
-  supervisor/        Node stdio ⇄ HTTP bridge
-tests/  examples/  docs/  assets/  ui/
-docker-compose.yml  Dockerfile
-```
-
 ## Tests
 
 ```bash

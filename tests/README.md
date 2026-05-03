@@ -103,17 +103,18 @@ covered by #11.
 Exercises `_execute_one_prompt`'s retry on
 `ConnectError`/`RemoteProtocolError`/`ReadError`.
 
-### 15. `test_ui_reconnect_gap_loses_replies_and_blocks_followups`
-The exact prod UI trace: supervisor dies → reader kicks the UI's
-`/events` → browser's EventSource retry timer is still running when
-the user types → POST lands with zero subscribers → events dispatched
-to empty lists → UI eventually reconnects but sees "Queued for agent"
-forever. Two POSTs in the gap, then a fresh `/events`; both must get a
-reply.
+### 15. `test_ui_reconnect_gap_persists_replies_to_session_log`
+Supervisor dies → /events subscribers are kicked → user sends two
+POSTs while no subscriber is attached → each turn must still land
+`user_message` + `turn_end` rows in `session_log`. /events is
+live-only; durable history lives in /log. The UI cold-loads /log on
+mount (and on reconnect) so the gap-submitted prompts surface there
+even though no subscriber saw them stream live.
 
-Pinned by `_pending_broadcasts` (bounded deque): events appended when
-no subscriber is attached, drained on the next `subscribe_session`.
-See the companion unit test in `test_async_correctness.py`.
+Earlier this test pinned a per-session in-memory replay buffer that
+re-delivered missed events through /events on reconnect; the buffer
+was removed because it double-delivered everything a cold-loading UI
+had just fetched from /log.
 
 ## Companion unit tests — `test_async_correctness.py`
 
@@ -142,7 +143,7 @@ If you touch:
 - `HOME` in the supervisor spawn_env
 - `sandbox_state.recipe` or `_build_volume_mounts`
 - Subscriber dispatch (`broadcast` / `dispatch` / `subscribe_session`)
-- `_pending_broadcasts` (#15)
+- session_log persistence in `_persist_prompt_events` (#15)
 - `_execute_one_prompt`'s error handling (#8, #14)
 
 Run against daytona (`DAYTONA_API_KEY` + `CLAUDE_CODE_OAUTH_TOKEN`) — its
