@@ -807,10 +807,13 @@ class TestSSELogParity:
                         if ev["type"] == "done":
                             return
 
+            # Force two distinct tool invocations by mixing tools — Claude
+            # collapses two echo args into one Bash call when the prompt
+            # only mentions Bash, but won't combine across tool kinds.
             await agent._post_message(
-                "Run TWO separate Bash commands, one after the other:\n"
-                "1. echo FIRST_TOOL\n"
-                "2. echo SECOND_TOOL\n"
+                "Do these two things, one at a time, using a tool for each:\n"
+                "1. Use Bash to run: echo FIRST_TOOL\n"
+                "2. Use the Read tool to read /etc/hostname\n"
                 "After both, say DONE."
             )
             await asyncio.wait_for(listen(), timeout=60)
