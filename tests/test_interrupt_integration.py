@@ -541,7 +541,13 @@ def _sse_to_canonical(events: list[dict]) -> list[dict]:
 
 
 def _log_to_canonical(log_entries: list[dict]) -> list[dict]:
-    """Convert session log entries to the same canonical form."""
+    """Convert session log entries to the same canonical form as SSE.
+
+    The persist path coalesces consecutive ``text`` / ``reasoning``
+    chunks into one row at write-time (see
+    ``_persist_prompt_events._flush_buffers``), so this is a 1:1
+    mapping with no further merging.
+    """
     out: list[dict] = []
     for entry in log_entries:
         et = entry["event_type"]

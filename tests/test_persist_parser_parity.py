@@ -131,3 +131,147 @@ def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
         f"_EVENT_TYPE_TO_LOG must map parser output {etype!r} to "
         f"{expected_log_type!r} so persist and SSE produce the same canonical log"
     )
+
+
+# ---------------------------------------------------------------------------
+# Persist coalescing — one row per logical block, not per ACP chunk.
+# Mirrors what the SDK's ``astream`` accumulates and what ``/events``
+# subscribers see after canonicalization.
+# ---------------------------------------------------------------------------
+
+class _FakeSession:
+    """Minimal stand-in: ``execute_prompt`` yields a fixed event list,
+    ``_broadcast`` is a no-op, agent_id/session_id are constants."""
+
+    def __init__(self, events: list[dict]) -> None:
+        self._events = events
+        self._agent_id = "agent-x"
+        self.session_id = "sess-x"
+
+    async def execute_prompt(self, message: str, *, rpc_id: str):
+        for e in self._events:
+            yield e
+
+    def _broadcast(self, _evt: dict) -> None:
+        pass
+
+
+def _capture_log_writes(monkeypatch) -> list[tuple[str, dict]]:
+    """Patch ``api.server.log_event`` to record (event_type, payload) tuples
+    instead of touching the DB. Returns the captured list."""
+    rows: list[tuple[str, dict]] = []
+
+    async def _fake_log_event(*, session_id, agent_id, event_type, payload):
+        rows.append((event_type, payload))
+
+    from api import server as srv
+    monkeypatch.setattr(srv, "log_event", _fake_log_event)
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_persist_coalesces_consecutive_reasoning_chunks(monkeypatch):
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "reasoning", "text": "step 1 "},
+        {"type": "reasoning", "text": "step 2 "},
+        {"type": "reasoning", "text": "step 3"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    from api.server import _persist_prompt_events
+    await _persist_prompt_events(sess, "hi", "rpc-1")
+
+    types = [r[0] for r in rows]
+    assert types == ["reasoning", "turn_end"], (
+        f"3 consecutive reasoning chunks must collapse to one row + turn_end; got {types}"
+    )
+    assert rows[0][1]["text"] == "step 1 step 2 step 3"
+
+
+@pytest.mark.asyncio
+async def test_persist_coalesces_consecutive_text_chunks(monkeypatch):
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "text", "text": "Hello "},
+        {"type": "text", "text": "world"},
+        {"type": "usage", "usage": {"in": 10, "out": 5}},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    from api.server import _persist_prompt_events
+    await _persist_prompt_events(sess, "hi", "rpc-1")
+
+    types = [r[0] for r in rows]
+    # ``usage`` is non-flushing — text chunks coalesce, usage writes
+    # mid-buffer, then ``done`` flushes the text and writes turn_end.
+    assert types == ["usage", "assistant_message", "turn_end"], (
+        f"text chunks must collapse around non-flushing usage; got {types}"
+    )
+    assert rows[1][1]["text"] == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_persist_usage_mid_reasoning_does_not_split_block(monkeypatch):
+    """Mirrors the ``test_simple_prompt_parity`` ACP order: reasoning
+    chunks, then usage_update, then assistant text, then done. Usage
+    must NOT flush the reasoning buffer — otherwise SSE and log
+    canonicalization disagree on event order.
+    """
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "reasoning", "text": "deliberating"},
+        {"type": "usage", "usage": {}},
+        {"type": "text", "text": "answer"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    from api.server import _persist_prompt_events
+    await _persist_prompt_events(sess, "hi", "rpc-1")
+
+    types = [r[0] for r in rows]
+    assert types == ["usage", "reasoning", "assistant_message", "turn_end"], (
+        f"reasoning must outlive a non-flushing usage row; got {types}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_flushes_on_type_change(monkeypatch):
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "reasoning", "text": "thinking"},
+        {"type": "text", "text": "answer"},
+        {"type": "reasoning", "text": "more"},
+        {"type": "text", "text": "final"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    from api.server import _persist_prompt_events
+    await _persist_prompt_events(sess, "hi", "rpc-1")
+
+    types = [r[0] for r in rows]
+    assert types == [
+        "reasoning", "assistant_message", "reasoning", "assistant_message", "turn_end",
+    ], f"interleaved blocks must each produce one row; got {types}"
+
+
+@pytest.mark.asyncio
+async def test_persist_flushes_before_tool(monkeypatch):
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "text", "text": "I will run "},
+        {"type": "text", "text": "this"},
+        {"type": "tool", "tool_name": "Bash", "args": {"cmd": "ls"}},
+        {"type": "tool_result", "tool_name": "Bash", "result": "x.txt"},
+        {"type": "text", "text": "Done."},
+        {"type": "usage", "usage": {}},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    from api.server import _persist_prompt_events
+    await _persist_prompt_events(sess, "hi", "rpc-1")
+
+    types = [r[0] for r in rows]
+    # Tool call flushes the leading text; tool result is a discrete row;
+    # trailing text + usage + done — usage doesn't flush, so the text
+    # block lands AFTER usage on its terminal-event flush (matches SSE
+    # canonical ordering).
+    assert types == [
+        "assistant_message", "tool_call", "tool_result",
+        "usage", "assistant_message", "turn_end",
+    ], f"tool calls flush text; usage does not; got {types}"
