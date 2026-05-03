@@ -417,38 +417,12 @@ class DaytonaSandboxSession(BaseSandboxSession):
 def _parse_sse_block(block: str, rpc_id: str) -> dict[str, Any] | None:
     """Parse one ``data: <json>\\n`` block into a structured event dict.
 
-    Filters by rpc_id — events for OTHER prompts (concurrent ACP traffic)
-    are skipped. Returns None on malformed blocks or non-event lines
-    (e.g. ``: heartbeat``).
+    Single source of truth: delegates to ``api.sse.parse_acp_event`` so
+    every consumer (SDK ``astream``, server ``_persist_prompt_events``,
+    /events SSE) sees the same event taxonomy. Returns ``None`` for
+    heartbeats, non-event meta updates (e.g. ``available_commands_update``),
+    empty-text chunks, or events whose JSON-RPC ``id`` doesn't match
+    ``rpc_id`` (concurrent ACP traffic on the same supervisor).
     """
-    data_lines = [
-        line[5:].lstrip() for line in block.splitlines()
-        if line.startswith("data:")
-    ]
-    if not data_lines:
-        return None
-    raw = "\n".join(data_lines)
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    # Match by rpc_id (id field on the JSON-RPC envelope).
-    if isinstance(payload, dict):
-        msg_id = payload.get("id")
-        if msg_id is not None and msg_id != rpc_id:
-            return None
-        if "result" in payload and isinstance(payload["result"], dict):
-            if "stopReason" in payload["result"]:
-                return {"type": "done", "stop_reason": payload["result"]["stopReason"]}
-        if "error" in payload:
-            return {"type": "error", "error": payload["error"]}
-        # session/update notifications carry the actual text/tool events.
-        if payload.get("method") == "session/update":
-            update = payload.get("params", {}).get("update", {})
-            update_type = update.get("sessionUpdate")
-            if update_type == "agent_message_chunk":
-                content = update.get("content", {})
-                if content.get("type") == "text":
-                    return {"type": "text", "text": content.get("text", "")}
-            return {"type": update_type or "unknown", "raw": update}
-    return None
+    from api.sse import parse_acp_event
+    return parse_acp_event(block, rpc_id)

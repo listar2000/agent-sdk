@@ -1498,18 +1498,16 @@ async def _persist_user_message(session, message: str, rpc_id: str) -> None:
                       session.session_id, rpc_id)
 
 
-# execute_prompt yields {type: ...} dicts; map their type strings to the
-# session_log EVT_ row schema the dashboard / SDK already understand. Any
-# type missing from this map is logged as-is (forward-compat with new
-# ACP update kinds).
+# execute_prompt yields events whose ``type`` matches what
+# ``api.sse.parse_acp_event`` emits — same taxonomy as the SDK
+# ``astream`` and the /events SSE consumers. Any type missing from
+# this map is logged as-is (forward-compat with new ACP update kinds).
 _EVENT_TYPE_TO_LOG = {
     "text": EVT_ASSISTANT_MESSAGE,
-    "agent_message_chunk": EVT_ASSISTANT_MESSAGE,
-    "thought_chunk": EVT_REASONING,
-    "tool_call": EVT_TOOL_CALL,
-    "tool_call_update": EVT_TOOL_RESULT,
-    "usage_update": EVT_USAGE,
-    "usage_updated": EVT_USAGE,
+    "reasoning": EVT_REASONING,
+    "tool": EVT_TOOL_CALL,
+    "tool_result": EVT_TOOL_RESULT,
+    "usage": EVT_USAGE,
     "error": EVT_ERROR,
     "done": "turn_end",
 }
