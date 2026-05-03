@@ -83,7 +83,7 @@ async def test_volume_delete_uses_provider_file_api(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_volume_rename_overwrite_uses_file_api_copy_delete(monkeypatch):
+async def test_volume_rename_overwrite_uses_provider_file_api_move(monkeypatch):
     from api.providers import daytona
 
     calls: list[str] = []
@@ -93,20 +93,12 @@ async def test_volume_rename_overwrite_uses_file_api_copy_delete(monkeypatch):
         calls.append(cmd)
         return SimpleNamespace(stdout="", stderr="", exit_code=0)
 
-    async def fake_download(_ref: str, _path: str) -> bytes:
-        return b"payload"
-
-    async def fake_upload(_ref: str, abs_path: str, content: bytes) -> None:
-        captured["abs_path"] = abs_path
-        captured["content"] = content
-
-    async def fake_delete(_ref: str, path: str) -> None:
-        captured["deleted"] = path
+    async def fake_move(_ref: str, src_abs: str, dst_abs: str) -> None:
+        captured["src_abs"] = src_abs
+        captured["dst_abs"] = dst_abs
 
     monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
-    monkeypatch.setattr(daytona, "volume_download", fake_download)
-    monkeypatch.setattr(daytona, "_upload_overwrite", fake_upload)
-    monkeypatch.setattr(daytona, "volume_delete", fake_delete)
+    monkeypatch.setattr(daytona, "_move_overwrite", fake_move)
     await daytona.volume_rename("vol-ref", "shared/a.txt", "shared/sub/b.txt")
 
     assert len(calls) == 2
@@ -115,9 +107,8 @@ async def test_volume_rename_overwrite_uses_file_api_copy_delete(monkeypatch):
     assert "mv --" not in cmd
     assert "/v/shared/a.txt" in cmd
     assert captured == {
-        "abs_path": "/v/shared/sub/b.txt",
-        "content": b"payload",
-        "deleted": "shared/a.txt",
+        "src_abs": "/v/shared/a.txt",
+        "dst_abs": "/v/shared/sub/b.txt",
     }
 
 
@@ -242,18 +233,10 @@ async def test_volume_rename_postcondition_failure_maps_to_runtime_error(monkeyp
             return SimpleNamespace(stdout="", stderr="", exit_code=0)
         return SimpleNamespace(stdout="__RENAME_NOT_VISIBLE__", stderr="", exit_code=98)
 
-    async def fake_download(_ref: str, _path: str) -> bytes:
-        return b"payload"
-
-    async def fake_upload(_ref: str, _abs_path: str, _content: bytes) -> None:
-        return None
-
-    async def fake_delete(_ref: str, _path: str) -> None:
+    async def fake_move(_ref: str, _src_abs: str, _dst_abs: str) -> None:
         return None
 
     monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
-    monkeypatch.setattr(daytona, "volume_download", fake_download)
-    monkeypatch.setattr(daytona, "_upload_overwrite", fake_upload)
-    monkeypatch.setattr(daytona, "volume_delete", fake_delete)
+    monkeypatch.setattr(daytona, "_move_overwrite", fake_move)
     with pytest.raises(RuntimeError, match="postcondition failed"):
         await daytona.volume_rename("vol-ref", "shared/a.txt", "shared/sub/b.txt")
