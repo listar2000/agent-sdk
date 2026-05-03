@@ -221,20 +221,19 @@ class DaytonaSandboxSession(BaseSandboxSession):
         if self._supervisor_url is None or self._daytona_sandbox is None:
             return False
 
+        from .._shared import _supervisor_health_status
+
         async def _probe_url() -> tuple[bool, int | None]:
-            """Returns (alive, status_code or None on connection error)."""
-            try:
-                async with httpx.AsyncClient(timeout=2.0) as client:
-                    resp = await client.get(f"{self._supervisor_url}/v1/health")
-                return resp.status_code == 200, resp.status_code
-            except Exception:
-                return False, None
+            return await _supervisor_health_status(self._supervisor_url)
 
         ok, status = await _probe_url()
         if ok:
             return True
-        # 4xx: supervisor is up but said no — don't retry, don't query state.
-        if status is not None and 400 <= status < 500:
+        # Supervisor reachable but verdict was "dead" (200 + acp_alive=false,
+        # or 4xx). Authoritative — don't retry, don't query control plane.
+        # Either case the caller cold-recovers. 5xx and connection errors
+        # fall through to layer-2 (control-plane state lookup + retry).
+        if status is not None and 200 <= status < 500:
             return False
 
         # Layer 2: consult sandbox state. Transitional → wait + retry.

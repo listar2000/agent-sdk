@@ -473,6 +473,45 @@ async def _wait_for_health(url: str, max_retries: int = 150, interval: float = 0
     return False
 
 
+async def _supervisor_health_status(
+    url: str, *, timeout: float = 2.0,
+) -> tuple[bool, int | None]:
+    """Probe ``GET {url}/v1/health`` and report whether the supervisor's
+    inner ACP child is alive — not just whether the supervisor itself is
+    reachable.
+
+    Returns ``(alive, status_code_or_None)``:
+      * ``(True, 200)``  — 200 with ``acp_alive`` true (or absent for older
+        supervisors that don't yet emit the field).
+      * ``(False, 200)`` — 200 with ``acp_alive: false``. This is the
+        "ghost supervisor" case: HTTP up, child dead, messages pile up
+        unread. Caller MUST treat as dead and cold-recover.
+      * ``(False, <status>)`` — any non-200 status.
+      * ``(False, None)`` — connection error / timeout.
+
+    The signature mirrors what daytona's two-layer probe needs (status
+    code distinguishes 4xx-stable from 5xx/connection layer-2 retry).
+    Other providers ignore the status code and just take the bool.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{url}/v1/health")
+    except Exception:
+        return False, None
+    if resp.status_code != 200:
+        return False, resp.status_code
+    # 200: trust the body's acp_alive verdict. Absent / non-bool → trust the
+    # 200 (legacy supervisor or malformed body — supervisor is reachable).
+    try:
+        body = resp.json()
+    except Exception:
+        return True, 200
+    acp_alive = body.get("acp_alive") if isinstance(body, dict) else None
+    if acp_alive is False:
+        return False, 200
+    return True, 200
+
+
 # ---------------------------------------------------------------------------
 # Port allocator
 # ---------------------------------------------------------------------------
