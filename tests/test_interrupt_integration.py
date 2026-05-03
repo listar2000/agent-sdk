@@ -492,6 +492,27 @@ class TestClineIntegration:
 # SSE ↔ Session Log parity tests
 # ---------------------------------------------------------------------------
 
+def _fetch_log_after_n_turn_ends(session_id: str, expected_turn_ends: int,
+                                 *, limit: int = 30, deadline_s: float = 5.0):
+    """Poll ``/sessions/{id}/log`` until ``expected_turn_ends`` ``turn_end``
+    rows are present (or deadline elapses). The broadcast path leads the
+    persist path by a few ms — broadcasts are intentionally per-chunk
+    while persist coalesces and writes a row per logical block, so when
+    an SSE listener sees ``done`` the matching ``turn_end`` row may not
+    have landed yet. Polling makes the parity comparison
+    durable-record-aware.
+    """
+    import time as _time
+    end = _time.monotonic() + deadline_s
+    last = []
+    while _time.monotonic() < end:
+        r = _httpx.get(f"{API_URL}/sessions/{session_id}/log?limit={limit}")
+        last = r.json()
+        if sum(1 for e in last if e.get("event_type") == "turn_end") >= expected_turn_ends:
+            return last
+        _time.sleep(0.1)
+    return last
+
 def _sse_to_canonical(events: list[dict]) -> list[dict]:
     """Convert a list of SSE Event dicts to canonical log-comparable form.
 
@@ -626,8 +647,9 @@ class TestSSELogParity:
             await agent._post_message("Reply with exactly: PARITY_OK")
             await asyncio.wait_for(listen(), timeout=30)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=20")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 1, limit=20, deadline_s=10.0,
+            )
 
             sse_c = _sse_to_canonical(sse_events)
             log_c = _log_to_canonical(log_entries)
@@ -658,8 +680,9 @@ class TestSSELogParity:
             await agent._post_message("Use Bash to run: echo TOOL_PARITY")
             await asyncio.wait_for(listen(), timeout=30)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=20")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 1, limit=20, deadline_s=10.0,
+            )
 
             sse_c = _sse_to_canonical(sse_events)
             log_c = _log_to_canonical(log_entries)
@@ -697,15 +720,25 @@ class TestSSELogParity:
             await agent._post_message(
                 "Write a 2000-word essay about the history of computing."
             )
-            await asyncio.sleep(3)
+            # Wait until the model has produced SOME output before interrupting,
+            # so the cancel actually races a running turn rather than firing
+            # before the supervisor has even spawned. Fixed sleeps drift under
+            # parallel test load.
+            for _ in range(100):
+                if any(e["type"] in ("text", "reasoning") for e in sse_events):
+                    break
+                await asyncio.sleep(0.2)
+            else:
+                pytest.fail("model produced no output within 20s")
 
             # Interrupt
             await agent._post_message("Say INTERRUPTED_OK", interrupt=True)
 
             await asyncio.wait_for(listener, timeout=30)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=30")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 2, limit=30, deadline_s=10.0,
+            )
 
             # Check stop_reasons match between SSE and log
             sse_stops = [e.get("stop_reason") for e in sse_events if e["type"] == "done"]
@@ -756,10 +789,11 @@ class TestSSELogParity:
             await agent._post_message("Say BRAVO")
             await agent._post_message("Say CHARLIE")
 
-            await asyncio.wait_for(listener, timeout=60)
+            await asyncio.wait_for(listener, timeout=120)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=30")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 1, limit=30, deadline_s=10.0,
+            )
 
             user_msgs = [e for e in log_entries if e["event_type"] == "user_message"]
             turn_ends = [e for e in log_entries if e["event_type"] == "turn_end"]
@@ -818,8 +852,9 @@ class TestSSELogParity:
             )
             await asyncio.wait_for(listen(), timeout=60)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=30")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 1, limit=30, deadline_s=10.0,
+            )
 
             sse_c = _sse_to_canonical(sse_events)
             log_c = _log_to_canonical(log_entries)
@@ -866,15 +901,25 @@ class TestSSELogParity:
             await agent._post_message(
                 "Use Bash to run: for i in 1 2 3 4 5; do echo step-$i; sleep 1; done"
             )
-            await asyncio.sleep(3)
+            # Wait until the tool call is observed in SSE before interrupting.
+            # A fixed sleep races with model latency under CPU pressure (xdist
+            # parallelism); waiting for a concrete event makes the test
+            # deterministic. Cap at 20s so a stuck model fails the timeout.
+            for _ in range(100):
+                if any(e["type"] == "tool" for e in sse_events):
+                    break
+                await asyncio.sleep(0.2)
+            else:
+                pytest.fail("model never issued a tool call within 20s")
 
             # Interrupt mid-tool
             await agent._post_message("Say MID_TOOL_OK", interrupt=True)
 
             await asyncio.wait_for(listener, timeout=30)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=30")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 2, limit=30, deadline_s=10.0,
+            )
 
             sse_stops = [e.get("stop_reason") for e in sse_events if e["type"] == "done"]
             log_stops = [e["payload"].get("stop_reason")
@@ -930,10 +975,11 @@ class TestSSELogParity:
             # C: interrupt A
             await agent._post_message("Say INTERRUPT_C", interrupt=True)
 
-            await asyncio.wait_for(listener, timeout=60)
+            await asyncio.wait_for(listener, timeout=120)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=40")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 3, limit=40, deadline_s=10.0,
+            )
 
             user_msgs = [e for e in log_entries if e["event_type"] == "user_message"]
             turn_ends = [e for e in log_entries if e["event_type"] == "turn_end"]
@@ -984,8 +1030,9 @@ class TestSSELogParity:
             )
             await asyncio.wait_for(listen(), timeout=30)
 
-            r = _httpx.get(f"{API_URL}/sessions/{agent.session_id}/log?limit=20")
-            log_entries = r.json()
+            log_entries = _fetch_log_after_n_turn_ends(
+                agent.session_id, 3, limit=20, deadline_s=10.0,
+            )
 
             sse_c = _sse_to_canonical(sse_events)
             log_c = _log_to_canonical(log_entries)

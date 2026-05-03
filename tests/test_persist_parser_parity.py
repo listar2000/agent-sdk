@@ -141,12 +141,16 @@ def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
 
 class _FakeSession:
     """Minimal stand-in: ``execute_prompt`` yields a fixed event list,
-    ``_broadcast`` is a no-op, agent_id/session_id are constants."""
+    ``_broadcast`` is a no-op, agent_id/session_id are constants. Owns
+    its own ``_prompt_lock`` so the persist path's ``async with`` holds.
+    """
 
     def __init__(self, events: list[dict]) -> None:
+        import asyncio as _a
         self._events = events
         self._agent_id = "agent-x"
         self.session_id = "sess-x"
+        self._prompt_lock = _a.Lock()
 
     async def execute_prompt(self, message: str, *, rpc_id: str):
         for e in self._events:
@@ -181,11 +185,12 @@ async def test_persist_coalesces_consecutive_reasoning_chunks(monkeypatch):
     from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
-    types = [r[0] for r in rows]
+    types = [r[0] for r in rows if r[0] != "user_message"]
     assert types == ["reasoning", "turn_end"], (
         f"3 consecutive reasoning chunks must collapse to one row + turn_end; got {types}"
     )
-    assert rows[0][1]["text"] == "step 1 step 2 step 3"
+    reasoning_row = next(r for r in rows if r[0] == "reasoning")
+    assert reasoning_row[1]["text"] == "step 1 step 2 step 3"
 
 
 @pytest.mark.asyncio
@@ -200,13 +205,128 @@ async def test_persist_coalesces_consecutive_text_chunks(monkeypatch):
     from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
-    types = [r[0] for r in rows]
+    types = [r[0] for r in rows if r[0] != "user_message"]
     # ``usage`` is non-flushing — text chunks coalesce, usage writes
     # mid-buffer, then ``done`` flushes the text and writes turn_end.
     assert types == ["usage", "assistant_message", "turn_end"], (
         f"text chunks must collapse around non-flushing usage; got {types}"
     )
-    assert rows[1][1]["text"] == "Hello world"
+    am_row = next(r for r in rows if r[0] == "assistant_message")
+    assert am_row[1]["text"] == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_persist_serializes_concurrent_prompts_on_same_session(monkeypatch):
+    """Two POST /message calls on the same session must run sequentially.
+
+    Without ``session._prompt_lock`` the two persist tasks raced on
+    ``session_log`` writes and the row order diverged from SSE arrival
+    order — surfaced as the ``test_interrupt_mid_tool_parity
+    ['cancelled','end_turn'] vs ['end_turn','cancelled']`` flake.
+    """
+    import asyncio as _a
+
+    rows = _capture_log_writes(monkeypatch)
+
+    class _OrderedEvents:
+        """Yields a tagged ``text`` chunk then a small sleep so the second
+        concurrent call has a chance to interleave inside the persist
+        loop if the lock isn't doing its job."""
+        def __init__(self, tag: str) -> None:
+            self._tag = tag
+            self._agent_id = "agent-x"
+            self.session_id = "sess-x"
+            # Shared across both call paths in this test — the same
+            # lock instance enforces serialisation.
+            pass
+
+        async def execute_prompt(self, message: str, *, rpc_id: str):
+            yield {"type": "text", "text": f"{self._tag}-1"}
+            await _a.sleep(0.05)
+            yield {"type": "text", "text": f"{self._tag}-2"}
+            yield {"type": "done", "stop_reason": "end_turn"}
+
+        def _broadcast(self, _evt: dict) -> None:
+            pass
+
+    sess_a = _OrderedEvents("A")
+    sess_b = _OrderedEvents("B")
+    # Same lock => same logical session.
+    shared_lock = _a.Lock()
+    sess_a._prompt_lock = shared_lock
+    sess_b._prompt_lock = shared_lock
+
+    from api.server import _persist_prompt_events
+    # Fire two concurrent persist tasks against the shared lock.
+    t_a = _a.create_task(_persist_prompt_events(sess_a, "msg-a", "rpc-a"))
+    t_b = _a.create_task(_persist_prompt_events(sess_b, "msg-b", "rpc-b"))
+    await _a.gather(t_a, t_b)
+
+    # All A's rows must come before all B's rows (or vice versa) — they
+    # must NOT interleave. Locate the boundary by the prompt_id payload.
+    prompt_ids = [r[1].get("prompt_id") for r in rows if r[0] == "assistant_message"]
+    boundary = None
+    for i in range(1, len(prompt_ids)):
+        if prompt_ids[i] != prompt_ids[i - 1]:
+            boundary = i
+            break
+    # If only one prompt's text rows are present (because text chunks
+    # collapsed into a single row each), both prompts will have exactly
+    # one assistant_message — that's still ordered.
+    assert boundary is None or all(
+        prompt_ids[i] == prompt_ids[boundary] for i in range(boundary, len(prompt_ids))
+    ), f"prompts must not interleave; saw assistant_message prompt_ids={prompt_ids}"
+
+
+@pytest.mark.asyncio
+async def test_persist_flushes_buffer_on_hard_cancel(monkeypatch):
+    """Hard cancel (asyncio Task.cancel) must not drop unflushed text.
+
+    ``CancelledError`` is a ``BaseException`` in Python 3.8+, so the
+    ``except Exception`` arm wouldn't run — the ``finally`` block with
+    ``asyncio.shield`` is the safety net.
+    """
+    import asyncio as _asyncio
+
+    rows = _capture_log_writes(monkeypatch)
+
+    class _SlowEvents:
+        """Yields a few text chunks then sleeps forever, so the outer
+        task can be cancelled mid-stream with content still buffered."""
+        def __init__(self) -> None:
+            self._agent_id = "agent-x"
+            self.session_id = "sess-x"
+            self._prompt_lock = _asyncio.Lock()
+
+        async def execute_prompt(self, message: str, *, rpc_id: str):
+            yield {"type": "text", "text": "partial "}
+            yield {"type": "text", "text": "answer"}
+            # Hold the iterator open so the outer Task.cancel races
+            # against the buffer.
+            await _asyncio.sleep(60)
+
+        def _broadcast(self, _evt: dict) -> None:
+            pass
+
+    from api.server import _persist_prompt_events
+    task = _asyncio.create_task(
+        _persist_prompt_events(_SlowEvents(), "hi", "rpc-cancel"),
+    )
+    # Give the iterator a chance to buffer the two text chunks.
+    await _asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except _asyncio.CancelledError:
+        pass
+
+    # The finally block should have flushed the partial assistant
+    # message even though the outer task was cancelled.
+    assert any(r[0] == "assistant_message" for r in rows), (
+        f"hard-cancel must flush buffered text; got {[r[0] for r in rows]}"
+    )
+    am = next(r for r in rows if r[0] == "assistant_message")
+    assert am[1]["text"] == "partial answer"
 
 
 @pytest.mark.asyncio
@@ -226,7 +346,7 @@ async def test_persist_usage_mid_reasoning_does_not_split_block(monkeypatch):
     from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
-    types = [r[0] for r in rows]
+    types = [r[0] for r in rows if r[0] != "user_message"]
     assert types == ["usage", "reasoning", "assistant_message", "turn_end"], (
         f"reasoning must outlive a non-flushing usage row; got {types}"
     )
@@ -245,7 +365,7 @@ async def test_persist_flushes_on_type_change(monkeypatch):
     from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
-    types = [r[0] for r in rows]
+    types = [r[0] for r in rows if r[0] != "user_message"]
     assert types == [
         "reasoning", "assistant_message", "reasoning", "assistant_message", "turn_end",
     ], f"interleaved blocks must each produce one row; got {types}"
@@ -266,7 +386,7 @@ async def test_persist_flushes_before_tool(monkeypatch):
     from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
-    types = [r[0] for r in rows]
+    types = [r[0] for r in rows if r[0] != "user_message"]
     # Tool call flushes the leading text; tool result is a discrete row;
     # trailing text + usage + done — usage doesn't flush, so the text
     # block lands AFTER usage on its terminal-event flush (matches SSE

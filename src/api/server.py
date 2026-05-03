@@ -1563,48 +1563,86 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
             await _write({"type": "reasoning", "text": "".join(think_buf)})
             think_buf.clear()
 
-    try:
-        async for event in session.execute_prompt(message, rpc_id=rpc_id):
-            if not isinstance(event, dict):
-                continue
-            t = event.get("type")
-            # Coalesce consecutive text/reasoning chunks; flush on
-            # type-change so order and adjacency are preserved.
-            if t == "text":
-                if think_buf:
+    # Per-session prompt serialisation: only one execute_prompt drives
+    # the supervisor at a time. Without this, two concurrent POST
+    # /message calls produce two parallel persist tasks racing on
+    # ``session_log`` writes and the row order diverges from SSE
+    # arrival order (the
+    # ``test_interrupt_mid_tool_parity ['cancelled','end_turn'] vs
+    # ['end_turn','cancelled']`` flake under -n auto). FIFO is
+    # preserved across queued prompts; ``interrupt=True`` cancels the
+    # active turn so the lock releases promptly without reordering.
+    #
+    # All cleanup paths (final flush on success, error-row write, hard-
+    # cancel buffer flush) MUST run while the lock is held — otherwise
+    # the next prompt's persist task can interleave its writes with
+    # this prompt's tail and the log row order de-syncs from SSE.
+    async with session._prompt_lock:
+        # Log the user_message INSIDE the lock so log row order tracks
+        # actual execution order. Writing it outside (as the SSE caller
+        # does, before spawning ``_drive``) lets queued prompts produce
+        # interleaved ``user_message_A, user_message_B, user_message_C,
+        # turn_end_A, ...`` — the test ``test_queued_prompts_parity``
+        # asserts user_message[i] < turn_end[i] which that ordering
+        # violates.
+        await _persist_user_message(session, message, rpc_id)
+        try:
+            async for event in session.execute_prompt(message, rpc_id=rpc_id):
+                if not isinstance(event, dict):
+                    continue
+                t = event.get("type")
+                # Coalesce consecutive text/reasoning chunks; flush on
+                # type-change so order and adjacency are preserved.
+                if t == "text":
+                    if think_buf:
+                        await _flush_buffers()
+                    text_buf.append(event.get("text", ""))
+                elif t == "reasoning":
+                    if text_buf:
+                        await _flush_buffers()
+                    think_buf.append(event.get("text", ""))
+                elif t == "usage":
+                    # Usage updates can fire mid-stream and don't break
+                    # the surrounding text/reasoning block — write usage
+                    # as a discrete row without flushing buffers, matching
+                    # the SSE canonicalization in ``_sse_to_canonical``.
+                    await _write(event)
+                else:
+                    # Tool/tool_result/done/error terminate the current
+                    # text/think block before writing themselves, so
+                    # order is stable across consumers.
                     await _flush_buffers()
-                text_buf.append(event.get("text", ""))
-            elif t == "reasoning":
-                if text_buf:
-                    await _flush_buffers()
-                think_buf.append(event.get("text", ""))
-            elif t == "usage":
-                # Usage updates can fire mid-stream and don't break the
-                # surrounding text/reasoning block — write usage as a
-                # discrete row without flushing buffers, matching the SSE
-                # canonicalization in test ``_sse_to_canonical``.
-                await _write(event)
-            else:
-                # Tool/tool_result/done/error terminate the current
-                # text/think block before writing themselves, so order is
-                # stable across consumers.
-                await _flush_buffers()
-                await _write(event)
-        # Stream ended without a terminal event (rare — usually ``done``
-        # closes it); flush anything still buffered.
-        await _flush_buffers()
-    except Exception as e:
-        log.exception("execute_prompt failed for session %s rpc=%s",
-                      session.session_id, rpc_id)
-        await _flush_buffers()
-        await _write({
-            "type": "error",
-            "message": str(e)[:500], "kind": type(e).__name__,
-        })
-        session._broadcast({
-            "type": "error", "rpc_id": rpc_id,
-            "error": {"message": str(e), "exception_type": type(e).__name__},
-        })
+                    await _write(event)
+            # Stream ended without a terminal event (rare — usually
+            # ``done`` closes it); flush anything still buffered.
+            await _flush_buffers()
+        except Exception as e:
+            log.exception("execute_prompt failed for session %s rpc=%s",
+                          session.session_id, rpc_id)
+            await _flush_buffers()
+            await _write({
+                "type": "error",
+                "message": str(e)[:500], "kind": type(e).__name__,
+            })
+            session._broadcast({
+                "type": "error", "rpc_id": rpc_id,
+                "error": {"message": str(e), "exception_type": type(e).__name__},
+            })
+        finally:
+            # Hard-cancel path: ``CancelledError`` is a ``BaseException``
+            # in Python 3.8+ and bypasses ``except Exception``. Without
+            # this finally an asyncio Task cancellation (server shutdown,
+            # session DELETE) drops the in-flight buffer. ``asyncio.shield``
+            # keeps the flush running even if the surrounding task is in
+            # a cancelling state.
+            if text_buf or think_buf:
+                try:
+                    await asyncio.shield(_flush_buffers())
+                except Exception:
+                    log.exception(
+                        "final flush failed for session %s rpc=%s — buffer lost",
+                        session.session_id, rpc_id,
+                    )
 
 
 @app.post("/sessions/{session_id}/message")
@@ -1787,7 +1825,11 @@ async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
         yield f"data: {json.dumps(err)}\n\n"
         return
 
-    await _persist_user_message(session, message, rpc_id)
+    # ``_persist_user_message`` was previously called HERE, but that
+    # races concurrent queued prompts: three POSTs land three
+    # user_message rows before any turn_end. ``_persist_prompt_events``
+    # now writes user_message inside its prompt_lock, so log row
+    # order matches actual execution order.
 
     # Eager registration so drive_task can start immediately — the
     # generator-form ``subscribe()`` defers queue registration to the
