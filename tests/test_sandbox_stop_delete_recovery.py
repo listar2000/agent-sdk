@@ -1501,3 +1501,145 @@ async def test_ui_reconnect_gap_persists_replies_to_session_log(provider):
 # image (``/opt/agent-sdk/runtime/``) instead of being installed onto each
 # volume's ``system/supervisor/`` dir. Wiping a non-existent volume
 # directory on a path the runtime never reads is a no-op.
+
+
+# ---------------------------------------------------------------------------
+# Silent-failure regression: data-research / Task Builder bug 2026-05-04
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.asyncio
+async def test_no_silent_failure_concurrent_stop_and_message(provider):
+    """Repro of the data-research / Task Builder silent-failure bug
+    (2026-05-04).
+
+    Production scenario:
+      * The hivespace UI keeps a long-lived ``GET /events`` SSE
+        connection open from chat-panel mount onwards.
+      * The user sits idle long enough for Daytona's idle reaper to
+        initiate auto-pause asynchronously.
+      * The user sends a message during the pause transition: the
+        supervisor URL still answers ``/v1/health`` 200 (proxy cache)
+        but ``/v1/acp/<inner_sid>`` returns ``400`` because the ACP
+        child was already torn down.
+      * The pool either (a) trusts the cached probe and forwards
+        directly to a dead supervisor, or (b) detects the stale state,
+        re-provisions a new session, and shuts the old one down. In
+        case (b), ``shutdown()`` calls ``_close_subscribers()`` which
+        sends ``_END`` to every queue — including the UI's persistent
+        /events subscriber — and the user's chat stream silently dies.
+      * Result: no reply, no error toast, just silence. User refreshes
+        the page (which re-establishes /events on the new session).
+
+    To reproduce we fire ``daytona.stop()`` (or the per-provider
+    equivalent) and ``POST /message`` concurrently while a persistent
+    /events stream is already open. The race is the same as prod's
+    auto-pause: pool sees a transitional state, re-provisions, the
+    fresh-session broadcasts must reach the existing subscriber.
+
+    Invariant: every accepted ``POST /message`` produces SOMETHING on
+    the live wire (text+done or error) within
+    ``silent_timeout_s`` for a UI that was already subscribed before
+    the message went out. Pure silence is the only failure mode.
+
+    Subscriber-handoff fix lives in ``api.sandbox.pool.SessionPool.
+    get_session`` — when the pool detects a stale entry it transfers
+    the prior session's ``_subscribers`` dict onto the replacement
+    session before kicking off ``shutdown()`` on the old one, so
+    ``_close_subscribers()`` doesn't tear down /events streams that
+    belong to the live session.
+
+    Modal is omitted: ``modal.terminate`` is destructive (no pause
+    state), so the in-place "stop while signed URL is still serving"
+    race the test pins doesn't apply — modal recovery goes through a
+    different SandboxMissingError path covered by
+    ``test_session_resume_after_delete[modal]``.
+    """
+    _require_provider(provider)
+
+    silent_timeout_s = 90.0
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        reply1 = await _ask(sdk, session_id, "Reply with a single short word.")
+        assert reply1.strip(), f"turn 1 empty reply: {reply1!r}"
+
+        sandbox = await _get_sandbox(sdk, session_id)
+
+        # Subscribe FIRST — matches the production UI flow (chat panel
+        # opens /events on mount, user sends messages later). Without
+        # subscribe-first ordering, broadcasts that fire before the
+        # subscriber attaches are lost as a matter of architectural
+        # contract (server.py:1773 — /events is live-only). The bug
+        # under test is "the persistent subscriber dies during recovery
+        # so it MISSES live broadcasts", not "the test forgot to
+        # subscribe in time".
+        async with _PersistentSse(sdk, session_id) as sse:
+            # Race: kick off the stop, then immediately submit turn 2.
+            stop_task = asyncio.create_task(_external_stop(sandbox))
+            try:
+                rpc2 = await _send_message(
+                    sdk, session_id, "Reply with a single short word.",
+                )
+            finally:
+                await stop_task
+            print(f"[test:{provider}] stop+turn2 raced; rpc2={rpc2}")
+
+            # _PersistentSse stores per-rpc events. We only need to know
+            # if SOMETHING terminal arrives for rpc2 within the budget.
+            q = sse.get_queue(rpc2)
+            terminal_kind: str | None = None
+            seen_text = False
+            deadline = time.time() + silent_timeout_s
+
+            while time.time() < deadline and terminal_kind is None:
+                try:
+                    evt = await asyncio.wait_for(
+                        q.get(), timeout=max(1.0, deadline - time.time()),
+                    )
+                except asyncio.TimeoutError:
+                    break
+                if evt["type"] == "text":
+                    seen_text = True
+                elif evt["type"] == "done":
+                    terminal_kind = "text+done" if seen_text else "done"
+                elif evt["type"] == "error":
+                    terminal_kind = "error"
+
+        if terminal_kind is None:
+            async with httpx.AsyncClient() as c:
+                resp = await c.get(
+                    f"{SERVER}/sessions/{session_id}/log?limit=200",
+                    timeout=10,
+                )
+            log_entries = resp.json() if resp.status_code == 200 else []
+            log_for_rpc2 = [
+                e for e in log_entries
+                if (e.get("payload") or {}).get("prompt_id") == rpc2
+            ]
+            assert log_for_rpc2, (
+                f"silent failure: turn 2 (rpc={rpc2}) produced NO event "
+                f"on /events within {silent_timeout_s}s AND no row in "
+                f"session_log. The server accepted POST /message and "
+                f"dropped the prompt on the floor — this is the data-"
+                f"research / Task Builder repro."
+            )
+            kinds = sorted({e["event_type"] for e in log_for_rpc2})
+            raise AssertionError(
+                f"broadcast leak: turn 2 (rpc={rpc2}) was processed by "
+                f"the server (session_log shows {kinds}) but NOTHING "
+                f"reached the persistent /events stream within "
+                f"{silent_timeout_s}s. Pool re-provisioned the session "
+                f"during the stop+message race and the prior session's "
+                f"shutdown() closed the UI's subscriber via "
+                f"_close_subscribers() — the recovery's broadcasts "
+                f"landed on the new session whose subscriber dict was "
+                f"empty. Fix: hand off subscribers from stale → fresh "
+                f"session in pool.get_session."
+            )
+
+        print(f"[test:{provider}] turn 2 terminal_kind={terminal_kind}")
+        assert terminal_kind in ("text+done", "done", "error"), terminal_kind

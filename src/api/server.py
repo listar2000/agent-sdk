@@ -1675,9 +1675,24 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
                 "type": "error",
                 "message": str(e)[:500], "kind": type(e).__name__,
             })
+            # Broadcast as a JSON-RPC error envelope so consumers that
+            # parse SSE blocks via ``parse_acp_event`` (UI, the test
+            # ``_PersistentSse`` reader, the SDK ``astream`` adapter)
+            # recognise it as an ``error`` frame and surface it. The
+            # ``rpc_id`` / ``type`` keys remain for the older dict-shape
+            # consumers in ``_execute_and_stream_sse`` that filter by
+            # rpc_id before yielding to SSE.
             session._broadcast({
                 "type": "error", "rpc_id": rpc_id,
-                "error": {"message": str(e), "exception_type": type(e).__name__},
+                "jsonrpc": "2.0", "id": rpc_id,
+                "error": {
+                    "code": -32603,
+                    "message": str(e),
+                    "data": {
+                        "kind": type(e).__name__,
+                        "exception_type": type(e).__name__,
+                    },
+                },
             })
         finally:
             # Hard-cancel path: ``CancelledError`` is a ``BaseException``
@@ -1798,13 +1813,22 @@ async def session_events(session_id: str):
             #   - (rpc_id, raw_block) tuple from execute_prompt — emit
             #     ``event: rpc:<id>\n<block>\n\n`` so test/UI can correlate
             #   - parsed event dict from non-prompt sources — emit as data:
+            #     (carry the rpc tag if the dict has one — error frames
+            #     broadcast from ``_persist_prompt_events`` failure paths
+            #     do; without the tag the UI's per-rpc dispatch drops
+            #     them and the user sees silence — the data-research
+            #     / Task Builder repro).
             if item is _HEARTBEAT:
                 yield ": heartbeat\n\n"
             elif isinstance(item, tuple) and len(item) == 2:
                 rpc_id, block = item
                 yield f"event: rpc:{rpc_id}\n{block}\n\n"
             else:
-                yield f"data: {json.dumps(item)}\n\n"
+                tag = item.get("rpc_id") if isinstance(item, dict) else None
+                if tag:
+                    yield f"event: rpc:{tag}\ndata: {json.dumps(item)}\n\n"
+                else:
+                    yield f"data: {json.dumps(item)}\n\n"
 
     return StreamingResponse(
         _gen(),
@@ -1940,7 +1964,13 @@ async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
             elif isinstance(item, dict):
                 if item.get("rpc_id") != rpc_id:
                     continue
-                yield f"data: {json.dumps(item)}\n\n"
+                # Carry the rpc tag so per-rpc consumers (UI, tests'
+                # _PersistentSse) can dispatch error broadcasts the same
+                # way they dispatch ACP frames. Without this the error
+                # is yielded as untagged ``data:`` and silently dropped
+                # by tag-filtering consumers — the production Task
+                # Builder silent-failure repro.
+                yield f"event: rpc:{rpc_id}\ndata: {json.dumps(item)}\n\n"
                 if item.get("type") == "error":
                     return
     finally:

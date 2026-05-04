@@ -77,6 +77,7 @@ class SessionPool:
         """
         async with self._lock(session_id):
             cached = self._active.get(session_id)
+            handed_off_subscribers: dict[str, asyncio.Queue] = {}
             if cached is not None:
                 # Force-probe so an externally-killed supervisor is detected
                 # immediately, even if the previous prompt's last chunk was
@@ -88,6 +89,18 @@ class SessionPool:
                 # Stale entry; tear down runtime in background. We don't
                 # snapshot here — compute is dead, can't snapshot reliably.
                 # The previous successful per-turn snapshot is the fallback.
+                #
+                # Transfer subscriber queues to the replacement session
+                # *before* shutdown so any /events SSE consumers attached
+                # to the stale session keep streaming across the recovery
+                # — without this hand-off, ``_close_subscribers`` in
+                # ``shutdown()`` puts ``_END`` on every queue and the
+                # user's chat connection dies mid-recovery (the data-
+                # research / Task Builder silent-failure repro). Clearing
+                # the dict on the cached session makes ``_close_subscribers``
+                # a no-op so subscribers see no spurious _END.
+                handed_off_subscribers = dict(cached._subscribers)
+                cached._subscribers.clear()
                 asyncio.create_task(_safe_shutdown(cached))
                 self._active.pop(session_id, None)
 
@@ -98,6 +111,13 @@ class SessionPool:
             session = self._factory(session_id, state)
             log.info("[pool.get_session] session=%s creating new state.type=%s sandbox_ref=%s",
                      session_id, getattr(state, "type", "?"), getattr(state, "sandbox_ref", None))
+            if handed_off_subscribers:
+                # Splice the prior session's subscribers onto the new one
+                # so its broadcasts (including any error frame from a
+                # ``execute_prompt`` failure) reach the existing /events
+                # consumers. Done before ``start()`` so the first chunk
+                # observed by the supervisor goes to the right queues.
+                session._subscribers.update(handed_off_subscribers)
             await session.start()
             await db.write_sandbox_state(session_id, serialize(session.state))
             self._active[session_id] = session

@@ -120,6 +120,7 @@ def _to_modal_resources(req: Any) -> dict[str, Any]:
 
 _app: Any | None = None
 _image: Any | None = None
+_volume_image: Any | None = None
 
 
 def _require_modal():
@@ -214,6 +215,21 @@ async def _get_image():
     return _image
 
 
+async def _get_volume_image():
+    """Return the tiny image used for one-off volume file operations.
+
+    Registering a volume should not force-build the full agent runtime image.
+    The main sandbox still uses ``_get_image()`` so agents get supervisor.js
+    and ACP bins baked in.
+    """
+    global _volume_image
+    if _volume_image is not None:
+        return _volume_image
+    modal, _ = _require_modal()
+    _volume_image = modal.Image.debian_slim()
+    return _volume_image
+
+
 async def _get_volume(ref: str):
     """Resolve a volume ``ref`` (the volume name) to a Modal ``Volume`` handle.
 
@@ -234,7 +250,7 @@ async def _get_volume(ref: str):
 # ---------------------------------------------------------------------------
 
 async def create_volume(name: str) -> str:
-    """Create a Modal v2 volume and pre-create the standard dir layout.
+    """Create or adopt a Modal v2 volume.
 
     Returns the volume name (the provider ref). v2 is required — v1 doesn't
     support the append semantics the agent filesystem needs.
@@ -246,15 +262,7 @@ async def create_volume(name: str) -> str:
         create_if_missing=True,
         version=api_pb2.VolumeFsVersion.VOLUME_FS_VERSION_V2,
     )
-    # Idempotent layout pre-create. Uses a short-lived sandbox (Modal's only
-    # way to exec against a volume) with the whole volume mounted at /v.
-    await _run_volume_shell(
-        name,
-        "mkdir -p /v/shared /v/system/supervisor /v/agents",
-        timeout=90,
-        vol=vol,
-    )
-    log.info("modal volume %s created with layout", name)
+    log.info("modal volume %s created or adopted", name)
     return name
 
 
@@ -706,10 +714,7 @@ async def _run_volume_shell(
     """
     modal, _ = _require_modal()
     app = await _get_app()
-    # Same image as the main sandbox — Modal content-hashes the Dockerfile,
-    # so subsequent uses pull from cache. Using one image everywhere matches
-    # Daytona's "one snapshot for all" model.
-    image = await _get_image()
+    image = await _get_volume_image()
     if vol is None:
         vol = await _get_volume(ref)
 
