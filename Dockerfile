@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm
 RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
 COPY pyproject.toml .
+COPY Dockerfile .
 COPY src/ src/
 COPY ui/ ui/
 
