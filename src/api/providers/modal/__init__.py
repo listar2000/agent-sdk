@@ -760,7 +760,11 @@ async def volume_tree(ref: str, path: str) -> str:
     """
     rel = _safe_rel(path)
     target = f"/v/{rel}" if rel else "/v"
-    shell = f"find {shlex.quote(target)} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
+    quoted_target = shlex.quote(target)
+    shell = (
+        f"if [ ! -e {quoted_target} ]; then exit 0; fi; "
+        f"find {quoted_target} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
+    )
     rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
     if rc != 0:
         raise RuntimeError(

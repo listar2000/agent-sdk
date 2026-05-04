@@ -163,6 +163,22 @@ async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
     assert await modal_provider.create_volume("modal-prod") == "modal-prod"
 
 
+@pytest.mark.asyncio
+async def test_modal_volume_tree_missing_path_returns_empty(monkeypatch):
+    from api.providers import modal as modal_provider
+
+    captured = {}
+
+    async def fake_run_volume_shell(ref, shell, *, timeout=60, vol=None):
+        captured["shell"] = shell
+        return 0, b"", b""
+
+    monkeypatch.setattr(modal_provider, "_run_volume_shell", fake_run_volume_shell)
+
+    assert await modal_provider.volume_tree("modal-prod", "shared/123") == ""
+    assert "if [ ! -e /v/shared/123 ]; then exit 0; fi;" in captured["shell"]
+
+
 def test_docker_resource_flags_translates():
     from api.providers.docker import _docker_resource_flags
     flags = _docker_resource_flags(Resources(cpu=2.0, memory_mib=4096, gpu="2"))
