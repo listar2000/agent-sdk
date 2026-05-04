@@ -196,6 +196,7 @@ class Session:
         session_id: str | None = None,
         sandbox_ref: str | None = None,
         lazy_provision: bool = False,
+        workspace: str | None = None,
     ):
         self._agent = agent
         self.session_id: str | None = session_id
@@ -225,6 +226,15 @@ class Session:
         # for backwards compatibility (callers expect
         # ``agent.sandbox_ref`` to be set after first registration).
         self._lazy_provision = lazy_provision
+        # Per-session workspace override. ``None`` = inherit from
+        # ``Agent.workspace`` (today's behavior). Set this to give one
+        # Agent multiple sessions, each on a different shared HOME —
+        # useful for "one user, several projects" patterns. NOTE:
+        # sessions of the same Agent on different workspaces no longer
+        # share Claude's JSONL history (different HOME = different
+        # ``~/.claude/projects/...``); that's by design — workspace IS
+        # the unit of shared state.
+        self.workspace: str | None = workspace
 
     # ── Registration ──
 
@@ -275,6 +285,13 @@ class Session:
                     payload = agent._registration_payload()
                     if agent.id is not None:
                         payload["agent_id"] = agent.id
+                    # Per-session workspace override wins over the agent's
+                    # value. Server stores whatever ``workspace`` ends up
+                    # in the body on the session row; ``None`` means
+                    # "drop the field" so the agent's value (if any)
+                    # propagates unchanged.
+                    if self.workspace is not None:
+                        payload["workspace"] = self.workspace
                     if self._lazy_provision:
                         # Server's POST /sessions routes by ``provision`` flag:
                         # eager (default) provisions sandbox + ACP attach
@@ -775,6 +792,7 @@ class Agent:
         self,
         *,
         sandbox_ref: str | None = None,
+        workspace: str | None = None,
     ) -> Session:
         """Create a new ``Session`` bound to this Agent.
 
@@ -782,7 +800,8 @@ class Agent:
         recipe, secrets) and — once registered — the same server-side
         ``agent_id``, which means it shares volume subpath
         ``agents/<agent_id>/`` and Claude's JSONL history with sibling
-        sessions of this Agent.
+        sessions of this Agent (when neither this session nor the
+        Agent override the HOME via ``workspace``).
 
         Provisioning is **lazy**: this returns immediately without any
         network call. On the first ``arun`` / ``astream`` / ``send`` the
@@ -795,10 +814,23 @@ class Agent:
         feature pending a shared-sandbox + multi-supervisor
         architecture).
 
+        ``workspace`` overrides the Agent's workspace for THIS session
+        only — useful when one Agent identity needs to switch HOME
+        between sessions (e.g. one user, several projects). When set,
+        HOME becomes ``workspaces/<workspace>/`` instead of either the
+        Agent's workspace path or ``agents/<agent_id>/``. Ignored on
+        daytona (the server returns 400 — same constraint as
+        ``Agent(workspace=...)``).
+
         For resuming an existing server-side session, use
         :meth:`session` instead.
         """
-        return Session(self, sandbox_ref=sandbox_ref, lazy_provision=True)
+        return Session(
+            self,
+            sandbox_ref=sandbox_ref,
+            lazy_provision=True,
+            workspace=workspace,
+        )
 
     def session(
         self,

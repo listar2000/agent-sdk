@@ -337,6 +337,50 @@ async def test_bootstrap_subpath_defaults_to_agent_when_workspace_unset(db_pool)
 
 @_db_required
 @pytest.mark.asyncio
+async def test_per_session_workspace_overrides_agent(client):
+    """``Session.workspace`` (set via ``agent.create_session(workspace=X)``)
+    must override the Agent's workspace for THAT session only. Same
+    agent_id on the wire; different workspace columns on the two
+    session rows.
+    """
+    from api import db as dbmod
+    from api.models import VolumeRecord
+
+    vol_id = _uniq("v-ws-override")
+    vol_name = _uniq("vws-override")
+    await dbmod.upsert_volume(VolumeRecord(
+        id=vol_id, name=vol_name,
+        provider="unix_local", provider_ref=f"/tmp/{vol_name}",
+    ))
+
+    inherit = (await client.post("/sessions", json={
+        "provider": "unix_local",
+        "volume_id": vol_id,
+        "provision": False,
+        "workspace": "agent-alpha",
+    })).json()
+
+    override = (await client.post("/sessions", json={
+        "provider": "unix_local",
+        "volume_id": vol_id,
+        "provision": False,
+        "agent_id": inherit["agent_id"],  # same Agent identity
+        "workspace": "session-beta",
+    })).json()
+
+    assert inherit["workspace"] == "agent-alpha"
+    assert override["workspace"] == "session-beta"
+    assert inherit["agent_id"] == override["agent_id"]
+    # Confirm storage matches the wire: each session row carries its own
+    # workspace, independent of the Agent's value.
+    s1 = await dbmod.get_session(inherit["id"])
+    s2 = await dbmod.get_session(override["id"])
+    assert s1["workspace"] == "agent-alpha"
+    assert s2["workspace"] == "session-beta"
+
+
+@_db_required
+@pytest.mark.asyncio
 async def test_two_agents_same_workspace_share_subpath(db_pool):
     """The whole point of the feature: two different agents that name the
     same workspace land on the same subpath, and therefore the same HOME
