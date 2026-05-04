@@ -31,6 +31,11 @@ def _raise_for_status(resp: httpx.Response) -> None:
 
     Matches ``agent_sdk.client._raise_for_status`` semantics so errors look
     the same to callers that mix Agent and ApiClient.
+
+    Safe on streaming responses: when the body hasn't been read yet (e.g.
+    ``client.stream("GET", ...)`` paths surface a ResponseNotRead on
+    ``.json()``/``.text``), we fall through to the bare status-line
+    error rather than crashing the caller with the cryptic stdlib message.
     """
     if resp.status_code < 400:
         return
@@ -45,8 +50,15 @@ def _raise_for_status(resp: httpx.Response) -> None:
             detail = detail.get("error", str(detail))
     except VolumeFileExistsError:
         raise
+    except httpx.ResponseNotRead:
+        # Streaming response — body isn't accessible without aread(); leave
+        # detail empty so the caller still gets the status code.
+        detail = ""
     except Exception:
-        detail = (resp.text or "")[:200]
+        try:
+            detail = (resp.text or "")[:200]
+        except httpx.ResponseNotRead:
+            detail = ""
     msg = f"HTTP {resp.status_code}"
     if detail:
         msg += f": {detail}"
