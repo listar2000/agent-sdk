@@ -196,6 +196,7 @@ class Session:
         session_id: str | None = None,
         sandbox_ref: str | None = None,
         lazy_provision: bool = False,
+        workspace: str | None = None,
     ):
         self._agent = agent
         self.session_id: str | None = session_id
@@ -225,6 +226,15 @@ class Session:
         # for backwards compatibility (callers expect
         # ``agent.sandbox_ref`` to be set after first registration).
         self._lazy_provision = lazy_provision
+        # Per-session workspace override. ``None`` = inherit from
+        # ``Agent.workspace`` (today's behavior). Set this to give one
+        # Agent multiple sessions, each on a different shared HOME —
+        # useful for "one user, several projects" patterns. NOTE:
+        # sessions of the same Agent on different workspaces no longer
+        # share Claude's JSONL history (different HOME = different
+        # ``~/.claude/projects/...``); that's by design — workspace IS
+        # the unit of shared state.
+        self.workspace: str | None = workspace
 
     # ── Registration ──
 
@@ -275,6 +285,13 @@ class Session:
                     payload = agent._registration_payload()
                     if agent.id is not None:
                         payload["agent_id"] = agent.id
+                    # Per-session workspace override wins over the agent's
+                    # value. Server stores whatever ``workspace`` ends up
+                    # in the body on the session row; ``None`` means
+                    # "drop the field" so the agent's value (if any)
+                    # propagates unchanged.
+                    if self.workspace is not None:
+                        payload["workspace"] = self.workspace
                     if self._lazy_provision:
                         # Server's POST /sessions routes by ``provision`` flag:
                         # eager (default) provisions sandbox + ACP attach
@@ -564,6 +581,14 @@ class Agent:
         s1 = agent.create_session()
         s2 = agent.create_session()
         await asyncio.gather(s1.arun("task A"), s2.arun("task B"))
+
+        # Multiple agents on the same shared HOME — pass the same workspace
+        # name. Each runs on its own sandbox; their HOME (``/home/agent``)
+        # is the same volume subpath ``workspaces/<name>/``. Not supported
+        # on daytona.
+        a = Agent("alice", provider="docker", workspace="team-alpha")
+        b = Agent("bob",   provider="docker", workspace="team-alpha")
+        await asyncio.gather(a.arun("write notes.md"), b.arun("read notes.md"))
     """
 
     # Constructor kwargs whose attribute name matches the kwarg name. Drives
@@ -574,7 +599,7 @@ class Agent:
         "agent_type", "provider", "model", "cwd", "root",
         "mcp_servers", "skills", "dockerfile",
         "volume_id", "pre_start_commands", "shared_mounts",
-        "resources",
+        "resources", "workspace",
     )
 
     def __init__(
@@ -599,6 +624,7 @@ class Agent:
         shared_mounts: list[str] | None = None,
         secrets: dict[str, str] | None = None,
         resources: dict[str, Any] | None = None,
+        workspace: str | None = None,
     ):
         self.name = name
         self.agent_type = agent_type
@@ -616,6 +642,14 @@ class Agent:
         self.pre_start_commands = pre_start_commands
         self.shared_mounts = shared_mounts
         self.resources = resources
+        # Shared HOME directory (subpath of the volume). When set, the
+        # session's HOME inside the sandbox becomes ``workspaces/<name>/``
+        # instead of ``agents/<agent_id>/`` — multiple agents (or sessions
+        # of different agents) can share state by passing the same name.
+        # Server normalizes the value (lowercase, ``[a-z0-9._-]``) and
+        # rejects daytona; the property below reads back the raw input,
+        # the canonical form lives on the session row.
+        self.workspace = workspace
         self._user_secrets: dict[str, str] = dict(secrets) if secrets else {}
         self._persist: SqliteSessionDriver | None = SqliteSessionDriver(db) if db else None
 
@@ -758,6 +792,7 @@ class Agent:
         self,
         *,
         sandbox_ref: str | None = None,
+        workspace: str | None = None,
     ) -> Session:
         """Create a new ``Session`` bound to this Agent.
 
@@ -765,7 +800,8 @@ class Agent:
         recipe, secrets) and — once registered — the same server-side
         ``agent_id``, which means it shares volume subpath
         ``agents/<agent_id>/`` and Claude's JSONL history with sibling
-        sessions of this Agent.
+        sessions of this Agent (when neither this session nor the
+        Agent override the HOME via ``workspace``).
 
         Provisioning is **lazy**: this returns immediately without any
         network call. On the first ``arun`` / ``astream`` / ``send`` the
@@ -778,10 +814,23 @@ class Agent:
         feature pending a shared-sandbox + multi-supervisor
         architecture).
 
+        ``workspace`` overrides the Agent's workspace for THIS session
+        only — useful when one Agent identity needs to switch HOME
+        between sessions (e.g. one user, several projects). When set,
+        HOME becomes ``workspaces/<workspace>/`` instead of either the
+        Agent's workspace path or ``agents/<agent_id>/``. Ignored on
+        daytona (the server returns 400 — same constraint as
+        ``Agent(workspace=...)``).
+
         For resuming an existing server-side session, use
         :meth:`session` instead.
         """
-        return Session(self, sandbox_ref=sandbox_ref, lazy_provision=True)
+        return Session(
+            self,
+            sandbox_ref=sandbox_ref,
+            lazy_provision=True,
+            workspace=workspace,
+        )
 
     def session(
         self,

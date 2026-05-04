@@ -118,13 +118,25 @@ class BaseSandboxSession(abc.ABC):
 
         self._volume_ref = volume.provider_ref
         self._agent_id = sess.get("agent_id")
-        # Subpath governs ACP HOME inside the sandbox. Use ``agents/<agent_id>``
-        # so multiple sessions of the same agent share Claude's
-        # ~/.claude/projects/... JSONL store — that's what makes session/load
-        # find the prior conversation. Per session_id would shard the JSONLs
-        # and break recovery (`Claude Code executable not found at .../cli.js`
-        # is the symptom: SDK ENOENT on the spawn cwd).
-        self._subpath = f"agents/{self._agent_id}" if self._agent_id else f"sessions/{self.session_id}"
+        # Subpath governs ACP HOME inside the sandbox. Three branches,
+        # mutually exclusive, in priority order:
+        #   1. ``workspaces/<name>`` — when the session was created with an
+        #      explicit workspace, multiple agents share this dir as HOME.
+        #      Server normalizes the name on insert, so we use it as-is.
+        #   2. ``agents/<agent_id>`` — the default. Multiple sessions of the
+        #      SAME agent share Claude's ~/.claude/projects/... JSONL store
+        #      via this dir; that's what makes session/load find prior
+        #      conversation. Per session_id would shard the JSONLs and
+        #      break recovery.
+        #   3. ``sessions/<id>`` — orphan fallback when an unregistered
+        #      session somehow has no agent_id.
+        ws = sess.get("workspace")
+        if ws:
+            self._subpath = f"workspaces/{ws}"
+        elif self._agent_id:
+            self._subpath = f"agents/{self._agent_id}"
+        else:
+            self._subpath = f"sessions/{self.session_id}"
         self._spawn_env = {
             **(sess.get("env") or {}),
             **(sess.get("secrets") or {}),

@@ -416,6 +416,14 @@ _MIGRATIONS = [
     """UPDATE sessions
        SET sandbox_state = jsonb_set(sandbox_state, '{type}', '"unix_local"'::jsonb)
        WHERE sandbox_state->>'type' = 'local'""",
+    # 2026-05-04: shared workspace. When set, overrides the per-agent
+    # ``agents/<agent_id>/`` HOME with ``workspaces/<name>/`` so multiple
+    # agents (or sessions of different agents) can share a single home dir
+    # on the same volume. NULL = today's behavior (per-agent home).
+    # Server-side normalization (``_normalize_workspace``) enforces the
+    # name shape before insert, so the column itself stores the canonical
+    # form already.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workspace TEXT",
 ]
 
 
@@ -619,12 +627,14 @@ async def upsert_session(session_id: str, agent_id: str,
                          env: dict[str, str] | None = None,
                          secrets: dict[str, str] | None = None,
                          cwd: str | None = None,
-                         pre_start_commands: list[str] | None = None) -> None:
+                         pre_start_commands: list[str] | None = None,
+                         workspace: str | None = None) -> None:
     """Upsert a session row.
 
-    PATCH-like semantics: ``env=None`` / ``secrets=None`` / ``cwd=None``
-    means don't touch the stored column on update. Pass ``{}`` / ``""``
-    to explicitly wipe.
+    PATCH-like semantics: ``env=None`` / ``secrets=None`` / ``cwd=None`` /
+    ``workspace=None`` means don't touch the stored column on update. Pass
+    ``{}`` / ``""`` to explicitly wipe. ``workspace`` should be the
+    already-normalized form — this writer doesn't validate.
     """
     cols = ["id", "agent_id", "inner_session_id"]
     vals: list = [session_id, agent_id, inner_session_id]
@@ -638,6 +648,7 @@ async def upsert_session(session_id: str, agent_id: str,
         ("secrets", secrets, Json),
         ("cwd", cwd, lambda v: v),
         ("pre_start_commands", pre_start_commands, Json),
+        ("workspace", workspace, lambda v: v),
     ]
     for col, raw, transform in optional:
         if raw is None:

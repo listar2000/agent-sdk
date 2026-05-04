@@ -53,7 +53,27 @@ rpc_id = await agent.send("cancel and do this", interrupt=True)
 
 `interrupt=True` is client-side: cancel the running prompt, wait for the terminal block, then submit. `send()` returns immediately. Default server is `http://localhost:7778`; override with `api_url=` or `AGENT_API_URL=`.
 
-Agent identity is pure: `agent_type`, `model`, `mcp_servers`, `skills`, `mode`, `thought_level`. Per-session knobs (`cwd`, `env`, `secrets`) and provisioning knobs (`dockerfile`, `shared_mounts`, `root`, `pre_start_commands`, `volume_id`) live on the session.
+Agent identity is pure: `agent_type`, `model`, `mcp_servers`, `skills`, `mode`, `thought_level`. Per-session knobs (`cwd`, `env`, `secrets`, `workspace`) and provisioning knobs (`dockerfile`, `shared_mounts`, `root`, `pre_start_commands`, `volume_id`) live on the session.
+
+## Shared workspace (multi-agent collaboration)
+
+Two or more agents (or sessions of different agents) can bind the same HOME directory by passing the same `workspace=` name. Each runs on its own sandbox; the volume's `workspaces/<name>/` subpath is mounted as `/home/agent` so they collaborate on one codebase, share files in real time, and see each other's writes via the kernel.
+
+```python
+a = Agent("alice", provider="docker", workspace="team-alpha")
+b = Agent("bob",   provider="docker", workspace="team-alpha")
+await asyncio.gather(a.arun("write notes.md"), b.arun("read notes.md"))
+```
+
+Override per-session (one Agent identity, multiple projects):
+
+```python
+agent = Agent("user", provider="docker", workspace="default-project")
+s1 = agent.create_session()                            # workspaces/default-project
+s2 = agent.create_session(workspace="other-project")   # workspaces/other-project
+```
+
+`workspace` is opt-in. When unset, HOME falls back to the per-agent `agents/<agent_id>/` (today's behavior). Names are normalized to `[a-z0-9][a-z0-9._-]{0,63}` server-side. Supported on `unix_local`, `docker`, and `modal`; rejected with HTTP 400 on `daytona` (S3-FUSE + tarball snapshots can't coordinate concurrent writers across two sandboxes).
 
 ## Per-request Claude credentials
 

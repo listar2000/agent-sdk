@@ -81,6 +81,7 @@ from .providers import (
     VolumeFileExistsError,
     default_cwd_for_provider,
     get_volume_adapter,
+    _normalize_workspace,
 )
 from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_pre_start_commands, redact_secrets
@@ -996,6 +997,7 @@ async def get_session_route(session_id: str):
         "session_id": rec.get("id"),
         "agent_id": rec.get("agent_id"),
         "volume_id": rec.get("volume_id"),
+        "workspace": rec.get("workspace"),
         "sandbox_ref": sb_state.get("sandbox_ref") if isinstance(sb_state, dict) else None,
         "inner_session_id": rec.get("inner_session_id"),
         "env": env,
@@ -1070,10 +1072,13 @@ async def session_sandbox_info(session_id: str):
     if url:
         result["url"] = url
     if provider == "unix_local" and sandbox_ref:
-        from .providers.unix_local import _SPAWN_ARGS as _LOCAL_SPAWN_ARGS
-        args = _LOCAL_SPAWN_ARGS.get(sandbox_ref)
-        if args and args.get("marker_path"):
-            result["marker_path"] = args["marker_path"]
+        # ``_SPAWN_ARGS`` was removed in the on-disk-marker refactor (PR #57);
+        # ``_load_record`` now resolves the marker path on the fly by globbing
+        # ``<vol_root>/*/system/sandboxes/<ref>.json``.
+        from .providers.unix_local import _load_record
+        marker, _rec = await asyncio.to_thread(_load_record, sandbox_ref)
+        if marker is not None:
+            result["marker_path"] = str(marker)
     return result
 
 
@@ -1150,6 +1155,34 @@ async def session_resume(session_id: str, request: Request):
     }
 
 
+def _extract_workspace(data: dict, provider: str) -> str | None:
+    """Read + normalize ``workspace`` from a session-create body.
+
+    Returns the canonical lowercased name, or ``None`` if unset/blank.
+    Raises ``HTTPException(400)`` on invalid name shape and
+    ``HTTPException(400)`` on daytona — daytona's S3-FUSE mounts can't
+    coordinate concurrent writes across two sandboxes (same constraint
+    that drives ``_reject_daytona_sibling_when_active``), and shared
+    workspaces hit that exact race even when the two sandboxes belong
+    to *different* agents. Lift the rejection once a multi-supervisor
+    architecture lands.
+    """
+    raw = data.get("workspace")
+    if raw is None or raw == "":
+        return None
+    if provider == "daytona":
+        raise HTTPException(
+            400,
+            "shared workspace is not supported on the daytona provider yet "
+            "(S3-FUSE caches don't coordinate cross-sandbox writes); use "
+            "docker, unix_local, or modal",
+        )
+    try:
+        return _normalize_workspace(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 def _reject_daytona_sibling_when_active(agent_id: str | None, provider: str) -> None:
     """Daytona-specific multi-session guard.
 
@@ -1222,6 +1255,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
     body_env, body_secrets = _pop_env_and_secrets(data)
 
     default_provider = data.get("provider") or data.get("config", {}).get("provider") or "unix_local"
+    workspace = _extract_workspace(data, default_provider)
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), default_provider)
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
@@ -1229,6 +1263,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
     config_data.pop("dockerfile_content", None)
     config_data.pop("shared_mounts", None)
     config_data.pop("root", None)
+    config_data.pop("workspace", None)
 
     agent_id = data.get("agent_id")
     if agent_id:
@@ -1247,12 +1282,13 @@ async def _sessions_create_lazy(data: dict) -> dict:
     # The default matches the per-provider home_dir that the FIRST sandbox
     # provision will spawn with, so session/new and every later session/load
     # use the same path (the JSONL hash key). For unix_local, this is the
-    # per-agent volume subpath; for docker/daytona, a fixed mount point.
-    default_cwd = (
-        str(Path(volume_record.provider_ref) / f"agents/{agent_id}")
-        if default_provider == "unix_local"
-        else default_cwd_for_provider(default_provider)
-    )
+    # per-agent volume subpath (or the workspace subpath when set); for
+    # docker/daytona, a fixed mount point.
+    if default_provider == "unix_local":
+        home_subpath = f"workspaces/{workspace}" if workspace else f"agents/{agent_id}"
+        default_cwd = str(Path(volume_record.provider_ref) / home_subpath)
+    else:
+        default_cwd = default_cwd_for_provider(default_provider)
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
     session_id = str(uuid.uuid4())
@@ -1263,12 +1299,14 @@ async def _sessions_create_lazy(data: dict) -> dict:
         env=body_env or {}, secrets=body_secrets or {},
         cwd=cwd,
         pre_start_commands=list(lazy_user_pre_start),
+        workspace=workspace,
     )
 
     return {
         "id": session_id,
         "agent_id": agent_id,
         "volume_id": volume_record.id,
+        "workspace": workspace,
         "sandbox_ref": None,
         "connected": False,
     }
@@ -1303,6 +1341,7 @@ async def _sessions_create_eager(data: dict) -> dict:
     except ValueError as e:
         raise HTTPException(400, str(e))
 
+    workspace = _extract_workspace(data, provider)
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), provider)
     agent_type = data.get("agent_type", "claude")
     config_data = data.get("config", {})
@@ -1314,6 +1353,7 @@ async def _sessions_create_eager(data: dict) -> dict:
     shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
     config_data.pop("dockerfile_content", None)
     config_data.pop("dockerfile", None)
+    config_data.pop("workspace", None)
     resources_data = data.get("resources") or config_data.pop("resources", None)
     try:
         resources = Resources(**resources_data) if resources_data else None
@@ -1351,12 +1391,14 @@ async def _sessions_create_eager(data: dict) -> dict:
 
     # Default cwd matches the per-provider HOME the first sandbox boots into,
     # so session/new and every later session/load share the JSONL hash key.
+    # When workspace is set, HOME is ``workspaces/<ws>`` instead of
+    # ``agents/<agent_id>`` — match that here so cwd lands in the right place.
     if cwd is None:
-        cwd = (
-            str(Path(volume_record.provider_ref) / f"agents/{agent_id}")
-            if provider == "unix_local"
-            else default_cwd_for_provider(provider)
-        )
+        if provider == "unix_local":
+            home_subpath = f"workspaces/{workspace}" if workspace else f"agents/{agent_id}"
+            cwd = str(Path(volume_record.provider_ref) / home_subpath)
+        else:
+            cwd = default_cwd_for_provider(provider)
 
     # Recipe carries the MERGED list (skills + user) so Type-2 recovery
     # re-runs both — the pool reads recipe.pre_start_commands directly,
@@ -1380,6 +1422,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         # session row's sandbox_state JSONB. Pool reads from JSONB; this
         # column is consumed by /sessions/{id} (GET) introspection.
         pre_start_commands=merged_pre_start,
+        workspace=workspace,
     )
     pool = get_pool()
     try:
@@ -1421,6 +1464,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         "session_id": session_id,
         "id": session_id,
         "volume_id": volume_record.id,
+        "workspace": workspace,
         "inner_session_id": pool_session.inner_session_id,
         "connected": True,
     }

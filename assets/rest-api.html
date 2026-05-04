@@ -283,6 +283,7 @@
         <div class="schema-row"><span class="schema-field">env</span><span class="schema-type">JSONB</span><span class="schema-desc">non-secret env, default {}</span></div>
         <div class="schema-row"><span class="schema-field">secrets</span><span class="schema-type">JSONB</span><span class="schema-desc">stored plaintext (envelope encryption pending), default {}</span></div>
         <div class="schema-row"><span class="schema-field">cwd</span><span class="schema-type">TEXT</span><span class="schema-desc">per-conversation cwd; default '/tmp'</span></div>
+        <div class="schema-row is-new"><span class="schema-field">workspace</span><span class="schema-type">TEXT</span><span class="schema-desc">opt-in shared HOME name; when set, HOME = &lt;volume&gt;/workspaces/&lt;workspace&gt;/, else agents/&lt;agent_id&gt;/. Normalized to [a-z0-9][a-z0-9._-]{0,63}. Rejected on daytona.</span></div>
         <div class="schema-row"><span class="schema-field">pre_start_commands</span><span class="schema-type">JSONB</span><span class="schema-desc">replayed on Type-2 sandbox replacement; default []</span></div>
         <div class="schema-row is-new"><span class="schema-field">sandbox_state</span><span class="schema-type">JSONB</span><span class="schema-desc">discriminated union (daytona | docker | unix_local | modal | unknown) — sandbox_ref, listen_port, snapshot_path, snapshot_version, recipe</span></div>
       </div>
