@@ -47,6 +47,7 @@ from ._shared import (
     _MAX_OUTPUT_BYTES,
     _truncate,
     _exec_subprocess,
+    _normalize_workspace,
 )
 
 # Re-export Daytona-specific symbols for server.py + tests.

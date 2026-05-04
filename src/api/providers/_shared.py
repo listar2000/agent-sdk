@@ -617,6 +617,37 @@ def _truncate(data: bytes, limit: int) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Workspace name normalizer
+# ---------------------------------------------------------------------------
+
+# Workspace names appear as directory names on real filesystems and as path
+# components in shell scripts (e.g. ``cd /home/agent``). Strict shape: lowercase
+# letters/digits/dot/underscore/dash, must start with alnum, max 64 chars. Fail
+# loud on bad input — silent munging (the ``shared_mounts`` style ``/`` → ``-``)
+# is fine for an opt-in mount but workspaces are a session-identity field, so a
+# typo should error rather than silently bind to the wrong dir.
+_WORKSPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _normalize_workspace(name: str) -> str:
+    """Normalize + validate a workspace name. Raises ``ValueError`` on
+    invalid input.
+
+    Trims surrounding whitespace and slashes, lowercases, then matches
+    ``[a-z0-9][a-z0-9._-]{0,63}``. Callers that need HTTP semantics
+    should translate the ``ValueError`` to 400.
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"workspace name must be a string, got {type(name).__name__}")
+    clean = name.strip().strip("/").lower()
+    if not _WORKSPACE_RE.match(clean):
+        raise ValueError(
+            f"invalid workspace name {name!r}: must match [a-z0-9][a-z0-9._-]{{0,63}}"
+        )
+    return clean
+
+
+# ---------------------------------------------------------------------------
 # Path sanitizer (shared across server + providers)
 # ---------------------------------------------------------------------------
 
