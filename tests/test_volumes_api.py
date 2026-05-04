@@ -38,6 +38,19 @@ async def test_post_volume_creates_row(client):
 
 
 @pytest.mark.asyncio
+async def test_post_modal_volume_registers_without_layout_sandbox(client):
+    with patch("api.providers.modal.create_volume",
+               new=AsyncMock(return_value="modal-volume-ref")) as create_mock:
+        r = await client.post("/volumes", json={"name": "modal-prod", "provider": "modal"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "modal-prod"
+    assert body["provider"] == "modal"
+    assert body["provider_ref"] == "modal-volume-ref"
+    create_mock.assert_awaited_once_with("modal-prod")
+
+
+@pytest.mark.asyncio
 async def test_get_and_list_volumes(client):
     with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-r1")):
