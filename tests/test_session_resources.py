@@ -138,6 +138,21 @@ def test_to_modal_resources_returns_empty_for_none():
     assert _to_modal_resources(None) == {}
 
 
+def test_modal_entrypoint_pins_pre_start_home():
+    from api.providers.modal import _build_entrypoint_cmd
+
+    entrypoint = _build_entrypoint_cmd(
+        subpath="agents/7",
+        supervisor_cmd="node supervisor.js",
+        shared_mounts=["42"],
+        pre_start_commands=["uv tool install hivespace"],
+    )
+
+    assert "export HOME=/home/agent && mkdir -p /home/agent && uv tool install hivespace" in entrypoint
+    assert "ln -s /v/agents/agents/7 /home/agent" in entrypoint
+    assert entrypoint.endswith("exec node supervisor.js")
+
+
 @pytest.mark.asyncio
 async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
     from api.providers import modal as modal_provider
@@ -161,6 +176,22 @@ async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
     monkeypatch.setattr(modal_provider, "_run_volume_shell", fail_run_volume_shell)
 
     assert await modal_provider.create_volume("modal-prod") == "modal-prod"
+
+
+@pytest.mark.asyncio
+async def test_modal_volume_tree_missing_path_returns_empty(monkeypatch):
+    from api.providers import modal as modal_provider
+
+    captured = {}
+
+    async def fake_run_volume_shell(ref, shell, *, timeout=60, vol=None):
+        captured["shell"] = shell
+        return 0, b"", b""
+
+    monkeypatch.setattr(modal_provider, "_run_volume_shell", fake_run_volume_shell)
+
+    assert await modal_provider.volume_tree("modal-prod", "shared/123") == ""
+    assert "if [ ! -e /v/shared/123 ]; then exit 0; fi;" in captured["shell"]
 
 
 def test_docker_resource_flags_translates():

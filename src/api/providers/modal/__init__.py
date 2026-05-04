@@ -321,7 +321,14 @@ def _build_entrypoint_cmd(
         lines.append(f"rm -rf /mnt/{clean}")
         lines.append(f"ln -s /v/shared/{clean} /mnt/{clean}")
     if pre_start_commands:
-        lines.extend(pre_start_commands)
+        for cmd in pre_start_commands:
+            # Match Daytona: pre-start installs/config must land in the
+            # same HOME the agent later uses, not the image user's default.
+            lines.append(
+                f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
+                f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
+                f"&& {cmd}"
+            )
     lines.append(f"exec {supervisor_cmd}")
     return "\n".join(lines)
 
@@ -760,7 +767,11 @@ async def volume_tree(ref: str, path: str) -> str:
     """
     rel = _safe_rel(path)
     target = f"/v/{rel}" if rel else "/v"
-    shell = f"find {shlex.quote(target)} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
+    quoted_target = shlex.quote(target)
+    shell = (
+        f"if [ ! -e {quoted_target} ]; then exit 0; fi; "
+        f"find {quoted_target} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
+    )
     rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
     if rc != 0:
         raise RuntimeError(
