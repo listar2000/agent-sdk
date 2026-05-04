@@ -138,6 +138,31 @@ def test_to_modal_resources_returns_empty_for_none():
     assert _to_modal_resources(None) == {}
 
 
+@pytest.mark.asyncio
+async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
+    from api.providers import modal as modal_provider
+
+    class FakeVolume:
+        @staticmethod
+        def from_name(name, *, create_if_missing, version):
+            assert name == "modal-prod"
+            assert create_if_missing is True
+            assert version == "v2"
+            return object()
+
+    class FakeApiPb2:
+        class VolumeFsVersion:
+            VOLUME_FS_VERSION_V2 = "v2"
+
+    async def fail_run_volume_shell(*args, **kwargs):
+        raise AssertionError("create_volume should not pre-create layout via sandbox")
+
+    monkeypatch.setattr(modal_provider, "_require_modal", lambda: (type("M", (), {"Volume": FakeVolume}), FakeApiPb2))
+    monkeypatch.setattr(modal_provider, "_run_volume_shell", fail_run_volume_shell)
+
+    assert await modal_provider.create_volume("modal-prod") == "modal-prod"
+
+
 def test_docker_resource_flags_translates():
     from api.providers.docker import _docker_resource_flags
     flags = _docker_resource_flags(Resources(cpu=2.0, memory_mib=4096, gpu="2"))
