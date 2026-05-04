@@ -321,7 +321,14 @@ def _build_entrypoint_cmd(
         lines.append(f"rm -rf /mnt/{clean}")
         lines.append(f"ln -s /v/shared/{clean} /mnt/{clean}")
     if pre_start_commands:
-        lines.extend(pre_start_commands)
+        for cmd in pre_start_commands:
+            # Match Daytona: pre-start installs/config must land in the
+            # same HOME the agent later uses, not the image user's default.
+            lines.append(
+                f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
+                f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
+                f"&& {cmd}"
+            )
     lines.append(f"exec {supervisor_cmd}")
     return "\n".join(lines)
 
