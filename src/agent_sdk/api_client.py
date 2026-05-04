@@ -289,7 +289,8 @@ class ApiClient:
     async def get_session_log(
         self, session_id: str, *, limit: int = 500
     ) -> list[dict[str, Any]]:
-        """``GET /sessions/{id}/log?limit=N``."""
+        """``GET /sessions/{id}/log?limit=N`` — returns the most recent N
+        events in chronological (ascending ``id``) order."""
         data = await self._json(
             "GET", f"/sessions/{session_id}/log", params={"limit": limit},
         )

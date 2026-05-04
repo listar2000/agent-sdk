@@ -797,16 +797,25 @@ async def log_event(*, session_id: str, agent_id: str,
 
 async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
     async with get_db() as conn:
+        # Return the *tail* N events (most recent) in chronological order.
+        # ORDER BY id (BIGSERIAL) — strictly monotonic by insertion order.
+        # ``ORDER BY created_at`` ties when two INSERTs land within the same
+        # microsecond (Postgres's ``now()`` resolves to transaction start
+        # time at us precision); the per-session prompt_lock makes writes
+        # sequential within a single prompt, but consecutive
+        # ``await log_event`` calls can still tie because each starts its
+        # own one-statement transaction.
+        #
+        # The inner ``ORDER BY id DESC LIMIT`` keeps the latest events when
+        # the session has more than ``limit`` rows; the outer ``ORDER BY id
+        # ASC`` restores chronological order so callers can replay them
+        # straight through. Sessions shorter than ``limit`` are unaffected.
         rows = await (await conn.execute(
             "SELECT id, session_id, agent_id, event_type, payload, created_at"
-            # ORDER BY id (BIGSERIAL) — strictly monotonic by insertion order.
-            # ``ORDER BY created_at`` ties when two INSERTs land within the
-            # same microsecond (Postgres's ``now()`` resolves to transaction
-            # start time at us precision); the per-session prompt_lock makes
-            # writes sequential within a single prompt, but consecutive
-            # ``await log_event`` calls can still tie because each starts
-            # its own one-statement transaction.
-            " FROM session_log WHERE session_id = %s ORDER BY id ASC LIMIT %s",
+            " FROM ("
+            "   SELECT id, session_id, agent_id, event_type, payload, created_at"
+            "   FROM session_log WHERE session_id = %s ORDER BY id DESC LIMIT %s"
+            " ) AS t ORDER BY id ASC",
             (session_id, limit),
         )).fetchall()
     return [_row_to_log_entry(r) for r in rows]
