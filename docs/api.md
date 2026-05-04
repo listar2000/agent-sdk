@@ -38,7 +38,7 @@ Config fields belong to one of three groups:
 | Field | Belongs on | Notes |
 |---|---|---|
 | `agent_type`, `model`, `mcp_servers`, `skills`, `mode`, `thought_level` | agent | Persisted on `agents.config`; replayed on cold-recovery. |
-| `cwd`, `env`, `secrets` | session | Per-conversation. `env`/`secrets` are PATCH-shaped (omitted=keep, `{}`=clear, `{...}`=replace). `cwd` keys the JSONL hash. |
+| `cwd`, `env`, `secrets`, `workspace` | session | Per-conversation. `env`/`secrets` are PATCH-shaped (omitted=keep, `{}`=clear, `{...}`=replace). `cwd` keys the JSONL hash. `workspace` overrides HOME — see below. |
 | `dockerfile`, `dockerfile_content`, `shared_mounts`, `root`, `pre_start_commands`, `volume_id` | sandbox | Frozen at provision time; survive replacement via the recipe on `sandbox_state`. |
 
 Fields can sit at the top level OR under `config`; top-level wins. `volume_id` is optional — when omitted, a `default-{provider}` volume is created/reused.
@@ -50,12 +50,22 @@ Fields can sit at the top level OR under `config`; top-level wins. `volume_id` i
   "agent_type": "claude",
   "model": "claude-sonnet-4-6",
   "cwd": "/tmp",
+  "workspace": "team-alpha",
   "mcp_servers": {"name": {"type": "local", "command": "...", "args": []}},
   "skills": ["rllm-org/hive#staging"],
   "shared_mounts": ["shared-data"],
   "pre_start_commands": ["uv tool install hive-evolve"]
 }
 ```
+
+#### `workspace` — shared HOME across agents
+
+When set, the session's HOME inside the sandbox becomes `<volume>/workspaces/<workspace>/` instead of the per-agent `<volume>/agents/<agent_id>/`. Two or more sessions (from any agents) on the same volume + same `workspace` value mount the same directory and see each other's writes via the kernel.
+
+- **Normalization**: server lowercases + trims, must match `[a-z0-9][a-z0-9._-]{0,63}`. Bad shape → HTTP 400.
+- **Provider support**: `unix_local`, `docker`, `modal`. Daytona returns HTTP 400 (S3-FUSE projection + `/vol/snapshot.tar` round-trip can't safely coordinate two writers).
+- **Storage**: top-level column `sessions.workspace TEXT NULL`. Surfaced in `GET /sessions/{id}` and the create-response.
+- **JSONL history**: workspace IS the unit of shared state — Claude's `~/.claude/projects/...` lives in HOME, so two sessions in the same workspace share JSONL history; two sessions in different workspaces don't.
 
 `pre_start_commands` run inside the sandbox before the supervisor starts (install CLIs, lay down config). `local` ignores them (no sandbox boundary). The effective list is `skills_install_commands + caller_pre_start_commands`, persisted on `sandbox_state.recipe.pre_start_commands`. They re-run on replacement (Type 2) recovery; not on same-VM restart (Type 1) — original side effects survive on disk.
 

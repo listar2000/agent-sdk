@@ -69,7 +69,7 @@ idempotent migrations in `src/api/db.py::_MIGRATIONS` run on the same path.
 |---|---|
 | `agents` | agent configs (id, name, config JSONB) |
 | `volumes` | persistent storage records (id, name, provider, provider_ref, status) |
-| `sessions` | session records (incl. `inner_session_id`, `env`, `secrets`, `cwd`, `pre_start_commands`, `sandbox_state` JSONB) |
+| `sessions` | session records (incl. `inner_session_id`, `env`, `secrets`, `cwd`, `workspace`, `pre_start_commands`, `sandbox_state` JSONB) |
 | `session_log` | event log (session_id, event_type, payload JSONB) |
 
 No `sandboxes` table — sandbox identity (`sandbox_ref`, listen port,
