@@ -334,12 +334,37 @@ async def create_sandbox(
 
 
 async def get_sandbox_status(ref: str) -> str:
-    """``missing`` (no marker) | ``stopped`` (marker, dead PID) | ``running``."""
+    """``missing`` (no marker) | ``stopped`` (marker, dead PID) | ``running``.
+
+    Detection strategy (in order):
+      1. If we own the Popen handle for this ref, ``proc.poll()`` is
+         authoritative — it distinguishes a live process from a zombie
+         the way ``os.kill(pid, 0)`` cannot. After an external SIGKILL,
+         the supervisor exits but lingers as a zombie until the parent
+         (this server) reaps it; ``os.kill(pid, 0)`` returns success on
+         zombies, which would falsely report "running" and trick the
+         caller into reusing a port with no live listener.
+      2. Otherwise (server restart, no Popen retained), fall back to
+         ``os.kill(pid, 0)`` to detect a missing PID. This path doesn't
+         see zombies, but it also can't — once the API server restarts
+         and re-parents to init, the kernel reaps the zombie itself.
+    """
     marker, record = await asyncio.to_thread(_load_record, ref)
     if marker is None:
         return "missing"
     if record is None or record.pid <= 0:
         return "stopped"
+    async with _PROCESSES_LOCK:
+        proc = _PROCESSES.get(ref)
+    if proc is not None:
+        rc = await asyncio.to_thread(proc.poll)
+        if rc is not None:
+            # Process has exited; reap to drop the zombie immediately so the
+            # caller's restart path doesn't have to fight a stale entry.
+            async with _PROCESSES_LOCK:
+                _PROCESSES.pop(ref, None)
+            return "stopped"
+        return "running"
     try:
         os.kill(record.pid, 0)  # signal-only, returns instantly — safe inline
     except ProcessLookupError:
