@@ -222,14 +222,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
         if self._supervisor_url is None or self._daytona_sandbox is None:
             return False
 
+        # Layer 1 uses the cached AcpClient's pooled httpx connection so
+        # we don't pay TLS handshake to the Daytona signed URL on every
+        # probe. PR #82 fixed this for the message proxy paths; same
+        # win applies to the probe.
+        client = self._get_acp_client()
+
         async def _probe_url() -> tuple[bool, int | None]:
-            """Returns (alive, status_code or None on connection error)."""
-            try:
-                async with httpx.AsyncClient(timeout=2.0) as client:
-                    resp = await client.get(f"{self._supervisor_url}/v1/health")
-                return resp.status_code == 200, resp.status_code
-            except Exception:
-                return False, None
+            return await client.health_probe()
 
         ok, status = await _probe_url()
         if ok:
@@ -264,11 +264,13 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
     async def _daytona_sandbox_state(self) -> str:
         """Fetch current Daytona sandbox state string. Empty on error
-        — caller treats unknown state as non-transitional."""
+        — caller treats unknown state as non-transitional. Uses the
+        process-shared Daytona SDK client (same singleton as PR #82's
+        ``_DAYTONA_CLIENT``) so we don't pay SDK init on every probe
+        layer-2 fallback."""
         try:
-            from daytona_sdk import Daytona, DaytonaConfig
-            import os as _os
-            client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
+            from . import _get_daytona_client
+            client = _get_daytona_client()
             loop = asyncio.get_running_loop()
             sb = await loop.run_in_executor(
                 None, lambda: client.get(self._daytona_sandbox.id),

@@ -140,12 +140,8 @@ class DockerSandboxSession(BaseSandboxSession):
     async def _liveness_probe(self) -> bool:
         if self._supervisor_url is None:
             return False
-        try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                resp = await client.get(f"{self._supervisor_url}/v1/health")
-                return resp.status_code == 200
-        except Exception:
-            return False
+        ok, _ = await self._get_acp_client().health_probe()
+        return ok
 
     # ------------------------------------------------------------------ #
     # execute_prompt: per-prompt supervisor SSE stream                    #
