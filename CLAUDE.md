@@ -23,11 +23,14 @@ even on test failure.
 
 For paused-on-release residue (daytona pauses; docker stops):
 
-    python scripts/cleanup_orphans.py                       # dry run
-    python scripts/cleanup_orphans.py --yes                 # reap origin=test
-    python scripts/cleanup_orphans.py --provider daytona --yes
-    python scripts/cleanup_orphans.py --provider docker --yes
-    python scripts/cleanup_orphans.py --provider unix_local --yes   # orphan supervisor.js, ppid==1
+    python scripts/cleanup_orphans.py                       # dry run, all providers
+    python scripts/cleanup_orphans.py --yes                 # reap origin=test across daytona + docker + unix_local
+    python scripts/cleanup_orphans.py --provider daytona --yes   # one provider only
+
+The script defaults to `--provider all` and `--origin $AGENT_SDK_ORIGIN`
+(falls back to `test`), so the no-flag invocation is the right one to run
+after a flaky golden suite. Each provider's section is skipped silently
+if its dep is missing (`DAYTONA_API_KEY` unset, `docker` not on PATH).
 
 CI opt-in for auto post-session cleanup: `AGENT_SDK_TEST_AUTO_CLEANUP=1`.
 Off by default to avoid churn on local unit-test runs.

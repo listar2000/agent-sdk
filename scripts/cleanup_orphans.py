@@ -19,16 +19,16 @@ This script handles both.
 
 Usage:
 
-    # Dry run — see what'd be reaped:
+    # Dry run across daytona + docker + unix_local (default --provider=all):
     python scripts/cleanup_orphans.py
 
-    # Actually reap:
+    # Actually reap (across all providers):
     python scripts/cleanup_orphans.py --yes
 
-    # Reap a specific provider only:
+    # One provider only:
     python scripts/cleanup_orphans.py --provider docker --yes
 
-    # Reap a different origin (e.g. a crashed prod server's orphans):
+    # Different origin (e.g. a crashed prod server's orphans):
     python scripts/cleanup_orphans.py --origin production --yes
 
 Environment:
