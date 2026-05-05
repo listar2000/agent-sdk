@@ -182,7 +182,7 @@ reuses it.
 
 ```sh
 # Server on localhost:7778; provider deps on PATH.
-scripts/launch_server_test.sh &     # sets AGENT_SDK_ORIGIN=test
+scripts/launch_server_test.sh &     # defaults AGENT_SDK_ORIGIN=test
 # Daytona: DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN
 # Modal:   `modal setup` + CLAUDE_CODE_OAUTH_TOKEN
 

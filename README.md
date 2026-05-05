@@ -13,7 +13,32 @@ curl http://localhost:7778/health               # → {"status":"ok",...}
 
 Postgres on `5433`, API on `7778`, chat UI at `http://localhost:7778/ui`. Stop with `docker compose down` (`-v` also drops the database volume).
 
-For a managed venv + Postgres, use `scripts/launch_server_docker.sh` (Docker Postgres) or `scripts/launch_server_local.sh` (project-local conda Postgres, no Docker). See [`docs/local-dev.md`](docs/local-dev.md).
+For a managed venv + Postgres, use `scripts/launch_server_docker.sh` (Docker Postgres) or `scripts/launch_server_test.sh` (project-local conda Postgres, no Docker). Both default `AGENT_SDK_ORIGIN=test` so daytona sandboxes are isolatable from production; both load `.env` (repo) and `~/.env` before starting.
+
+Without the helpers:
+
+```bash
+docker run -d --name agent-sdk-db \
+  -e POSTGRES_DB=agent_sdk_server -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -p 5433:5432 postgres:16-alpine
+
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/agent_sdk_server
+export CLAUDE_CODE_OAUTH_TOKEN=...
+pip install -e .
+uvicorn src.api.server:app --port 7778 --reload
+```
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://localhost:5432/agent_sdk_server` | Postgres conn string |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Preferred Claude auth |
+| `ANTHROPIC_API_KEY` | — | Fallback Claude auth |
+| `OPENAI_API_KEY` | — | Required for Codex |
+| `AGENT_SDK_REAPER_IDLE_S` | `180` | Idle window before pool hibernates a session |
+| `AGENT_SDK_REAPER_INTERVAL_S` | `60` | Pool reaper scan interval |
+| `AGENT_SDK_ORIGIN` | `production` (server code default); `test` when launched via `scripts/launch_server_test.sh` or `scripts/launch_server_docker.sh` | Daytona sandbox label — `cleanup_orphans.py` keys off this |
 
 ## Deploy to Railway
 
@@ -133,7 +158,6 @@ Session data lives on the volume, so the session survives sandbox death on every
 ## Docs
 
 - [API reference](docs/api.md) — REST endpoints + `ApiClient` table
-- [Local dev](docs/local-dev.md) — Docker setup, env vars
 
 ## Tests
 
@@ -143,4 +167,4 @@ Session data lives on the volume, so the session survives sandbox death on every
 
 `-n auto` is mandatory (sequential daytona/docker is 8–15 min). Fine with `-k` filters.
 
-For golden tests against a live server, use `scripts/launch_server_test.sh` (NOT `launch_server_local.sh` directly) — it sets `AGENT_SDK_ORIGIN=test` so daytona sandboxes are labelled isolatable from production.
+For golden tests against a live server, use `scripts/launch_server_test.sh` — it defaults `AGENT_SDK_ORIGIN=test` so daytona sandboxes are labelled isolatable from production.

@@ -6,6 +6,13 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv"
 VENV_PYTHON="${VENV_DIR}/bin/python"
 
+# Default to the test origin so forgotten flags can't pollute production.
+# Production deploys (Railway, etc.) set AGENT_SDK_ORIGIN=production explicitly
+# and don't go through this script. Override with
+# ``AGENT_SDK_ORIGIN=production scripts/launch_server_docker.sh`` if you really
+# need a production-tagged server locally.
+export AGENT_SDK_ORIGIN="${AGENT_SDK_ORIGIN:-test}"
+
 if command -v python3 >/dev/null 2>&1; then
     SYSTEM_PYTHON="python3"
 elif command -v python >/dev/null 2>&1; then
@@ -32,6 +39,10 @@ for env_file in "${REPO_ROOT}/.env" "${HOME}/.env"; do
         set +a
     fi
 done
+
+# Re-assert the test default in case .env unset it.
+export AGENT_SDK_ORIGIN="${AGENT_SDK_ORIGIN:-test}"
+echo "AGENT_SDK_ORIGIN=${AGENT_SDK_ORIGIN}"
 
 needs_install=0
 recreate_venv=0
@@ -93,7 +104,7 @@ fi
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/agent_sdk_server
 
 # Local provider's source-tree runtime path. See
-# scripts/launch_server_local.sh for the full rationale.
+# scripts/launch_server_test.sh for the full rationale.
 if command -v npm >/dev/null 2>&1; then
   echo "Ensuring src/supervisor npm deps are installed..."
   # Don't pass --omit=optional. opencode-ai's postinstall requires the

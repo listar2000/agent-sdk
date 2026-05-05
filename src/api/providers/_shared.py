@@ -187,7 +187,7 @@ def _acp_launch_args(agent_type: str) -> list[str]:
 #
 # When running the server from source (no image), the helper falls back to
 # ``<repo>/src/supervisor`` which the developer pre-populates with
-# ``npm --prefix src/supervisor install``. ``scripts/launch_server_local.sh``
+# ``npm --prefix src/supervisor install``. ``scripts/launch_server_test.sh``
 # does this automatically.
 #
 # Resolution order:

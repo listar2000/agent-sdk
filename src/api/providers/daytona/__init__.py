@@ -93,10 +93,11 @@ _SNAPSHOT_PATH = f"{_DAYTONA_VOLUME_MOUNT}/snapshot.tar"
 
 
 # Single label so test orphans can be identified and bulk-deleted via
-# ``daytona.list(labels={"agent_sdk_origin": "test"})``. Production
-# sandboxes default to ``"production"`` so the same query never touches
-# them. Set ``AGENT_SDK_ORIGIN=test`` in the test process before launching
-# the server.
+# ``daytona.list(labels={"agent_sdk_origin": "test"})``. All local-dev
+# launchers default ``AGENT_SDK_ORIGIN=test``; production deploys
+# (Railway via ``Dockerfile``) leave it unset and the env-default below
+# falls back to ``"production"``, so the test-origin query never touches
+# real production sandboxes.
 _LABEL_ORIGIN = "agent_sdk_origin"
 
 

@@ -6,9 +6,12 @@ at create time with one label:
 
     agent_sdk_origin = <AGENT_SDK_ORIGIN env, default "production">
 
-Run the test server with ``AGENT_SDK_ORIGIN=test`` so test sandboxes
-are tagged ``"test"``; production sandboxes default to ``"production"``
-and are not touched by the default filter.
+All local-dev launchers (``scripts/launch_server_test.sh``,
+``scripts/launch_server_docker.sh``, and ``docker compose up``) default
+``AGENT_SDK_ORIGIN=test`` so test sandboxes are tagged ``"test"``;
+production deploys (Railway via ``Dockerfile``) leave it unset and the
+server falls back to ``"production"``, so the default ``--origin test``
+filter never touches them.
 
 Usage:
 

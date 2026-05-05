@@ -28,6 +28,13 @@ services:
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-300}
       SANDBOX_REAPER_TICK: ${SANDBOX_REAPER_TICK:-60}
+      # Default to "test" so daytona sandboxes spawned from local
+      # ``docker compose up`` are isolatable from production via
+      # ``cleanup_orphans.py``. Railway production builds from Dockerfile
+      # (which doesn't set this), so the server falls back to its
+      # ``"production"`` code default in real deploys. Override with
+      # ``AGENT_SDK_ORIGIN=production docker compose up`` if needed.
+      AGENT_SDK_ORIGIN: ${AGENT_SDK_ORIGIN:-test}
     volumes:
       - claude_config:/root/.claude
     depends_on:

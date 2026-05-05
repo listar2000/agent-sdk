@@ -173,9 +173,11 @@ _ORIGIN_LABEL_KEY = "agent_sdk_origin"
 def _agent_sdk_origin() -> str:
     """Read the AGENT_SDK_ORIGIN env once per call.
 
-    Test runs set ``AGENT_SDK_ORIGIN=test`` (via
-    ``scripts/launch_server_test.sh``) so cleanup tooling can find and
-    reap orphan containers without touching production traffic.
+    All local-dev launchers (``scripts/launch_server_test.sh``,
+    ``scripts/launch_server_docker.sh``, ``docker compose up``) default
+    this to ``"test"`` so ``cleanup_orphans.py`` can reap orphan containers
+    without touching production traffic. Production deploys (Railway via
+    ``Dockerfile``) leave it unset and we fall back to ``"production"``.
     """
     import os
     return os.environ.get("AGENT_SDK_ORIGIN", "production")

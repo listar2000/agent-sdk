@@ -6,11 +6,12 @@ with `-k` filters — xdist negotiates worker count down.
 
     .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto
 
-For the golden suite, launch the dev server with
-`scripts/launch_server_test.sh` (NOT `launch_server_local.sh` directly).
-The wrapper sets `AGENT_SDK_ORIGIN=test`, so daytona sandboxes carry
-`agent_sdk_origin=test` and `cleanup_orphans.py` can isolate them from
-production.
+For local dev and the golden suite, launch the server with
+`scripts/launch_server_test.sh` — the only local launcher. It defaults
+`AGENT_SDK_ORIGIN=test` so daytona sandboxes carry `agent_sdk_origin=test`
+and `cleanup_orphans.py` can isolate them from production. Override with
+`AGENT_SDK_ORIGIN=production scripts/launch_server_test.sh` if you need a
+production-tagged server locally.
 
 ## Sandbox cleanup across test runs
 
