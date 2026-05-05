@@ -92,17 +92,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
         self._supervisor_url = url
         self.state.listen_port = _SUPERVISOR_PORT
 
-        # Verify the supervisor answers /v1/health before declaring
-        # ourselves started. Bounded short wait — start_supervisor already
-        # did its own readiness poll, this is just a sanity check.
-        ok = await _wait_for_health(url, max_retries=3, interval=0.5)
-        if not ok:
-            raise RuntimeError(
-                f"Supervisor not responding at {url} after start_supervisor_in_sandbox"
-            )
-
-        # Mark liveness alive — start_supervisor_in_sandbox just probed
-        # /v1/health successfully, so we have direct evidence.
+        # ``start_supervisor_in_sandbox`` returned only after its own
+        # ``_wait_for_health`` saw a 200 — the supervisor IS healthy as
+        # of microseconds ago. We used to do another 3-attempt poll here
+        # as a "sanity check" but it never caught anything that ``ACP
+        # attach`` (which fires next, also via HTTP to the same URL)
+        # wouldn't catch on the same round trip; it just added 100-500ms
+        # to every session_create. Trust the upstream signal and let ACP
+        # attach be the next probe.
         self.liveness.observe_chunk()
 
         # ACP attach happens on first execute_prompt; we pre-allocate the
@@ -132,11 +129,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     spawn_env=self._spawn_env,
                 )
                 # restart_daytona_supervisor returned an instance with .url
-                # set; we also need the daytona sandbox handle. Get it
-                # explicitly so subsequent stop()/exec() calls have it.
-                from daytona_sdk import Daytona, DaytonaConfig
-                import os as _os
-                client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
+                # set; we also need the daytona sandbox handle for later
+                # stop()/exec() calls. Use the cached process-shared
+                # client so we don't pay SDK init on every reattach.
+                client = dt_provider._get_daytona_client()
                 loop = asyncio.get_running_loop()
                 sandbox = await loop.run_in_executor(
                     None, lambda: client.get(self.state.sandbox_ref)
@@ -182,9 +178,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
             shared_mounts=self.state.recipe.shared_mounts or None,
             resources=self.state.recipe.resources,
         )
-        from daytona_sdk import Daytona, DaytonaConfig
-        import os as _os
-        client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
+        # Use the cached process-shared client (avoids 50-200ms of SDK
+        # init per session) and offload the sync .get() onto the
+        # executor so we don't block the loop.
+        client = dt_provider._get_daytona_client()
         loop = asyncio.get_running_loop()
         sandbox = await loop.run_in_executor(None, lambda: client.get(instance.sandbox_ref))
         return sandbox
@@ -423,6 +420,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         self._daytona_sandbox = None
         self._supervisor_url = None
         self._close_subscribers()
+        await self._aclose_acp_client()
 
 
 # ---------------------------------------------------------------------------

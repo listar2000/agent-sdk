@@ -125,13 +125,26 @@ def _to_daytona_resources(req: Any) -> Any:
     return _DR(cpu=cpu, memory=memory_gib, disk=req.disk_gib, gpu=gpu_count)
 
 
+_DAYTONA_CLIENT: "Any | None" = None
+
+
 def _get_daytona_client():
-    """Get a Daytona SDK client. Raises ImportError or RuntimeError on failure."""
+    """Get the process-shared Daytona SDK client. Constructed once and
+    cached. Raises ImportError or RuntimeError on first failure.
+
+    The Daytona SDK constructor performs config validation + SDK init
+    (~50-200ms wall) that has no per-call value. There were ~20 sites
+    in this module each constructing a fresh client per request — under
+    a 5-session bench that's 100+ unnecessary inits."""
+    global _DAYTONA_CLIENT
+    if _DAYTONA_CLIENT is not None:
+        return _DAYTONA_CLIENT
     from daytona_sdk import Daytona, DaytonaConfig
     api_key = os.environ.get("DAYTONA_API_KEY")
     if not api_key:
         raise RuntimeError("DAYTONA_API_KEY not set")
-    return Daytona(DaytonaConfig(api_key=api_key))
+    _DAYTONA_CLIENT = Daytona(DaytonaConfig(api_key=api_key))
+    return _DAYTONA_CLIENT
 
 
 async def start_supervisor_in_sandbox(
