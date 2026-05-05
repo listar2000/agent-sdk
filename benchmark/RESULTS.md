@@ -255,3 +255,92 @@ Same suite, same `-n auto` parallelism, all PRs stacked:
 | wall | 196-200s (deterministic 60s sleep dominates) | 196-200s |
 
 **Zero regressions across the live golden suite from any PR in the series.**
+
+---
+
+## Peek-mode follow-up (#85): isolated A/B against post-#84 main
+
+After #82 + #84 landed in `main` (commit `322f464`), I re-A/B'd the
+peek-mode branch (`perf/peek-mode-get-session-v2`, rebased onto current
+main) against the same workload to see what additional wins peek mode
+brings on top of the already-optimized baseline.
+
+Methodology: same harness, same workload, same machine. 3 iters × 5
+sessions × 2 turns × 5 file ops × 2 MB upload, unix_local.
+
+```bash
+# Baseline = current main (322f464, has #82 + #84):
+git -C /tmp/asdk-baseline checkout 322f464
+CHECKOUT_PATH=/tmp/asdk-baseline LABEL=baseline-newmain \
+  PROVIDER=unix_local N_SESSIONS=5 N_TURNS=2 N_FILE_OPS=5 LARGE_MB=2 ITERS=3 \
+  REPORT=/tmp/workload_full_v2.jsonl bash benchmark/load/ab_harness.sh
+
+# Patched = peek-mode rebased on new main:
+git checkout perf/peek-mode-get-session-v2
+git rebase main
+LABEL=patched-newmain \
+  PROVIDER=unix_local N_SESSIONS=5 N_TURNS=2 N_FILE_OPS=5 LARGE_MB=2 ITERS=3 \
+  REPORT=/tmp/workload_full_v2.jsonl bash benchmark/load/ab_harness.sh
+
+REPORT=/tmp/workload_full_v2.jsonl .venv/bin/python benchmark/load/compare.py
+```
+
+| op | base p50 (ms) | new p50 (ms) | p50 Δ | base p99 | new p99 | p99 Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| session_status | 5.0 | 5.0 | 0.0% (≈) | 23.5 | 8.3 | **-64.7%** ¹ |
+| session_sandbox_info | 6.0 | 6.4 | +6.7% (≈) | 9.7 | 26.4 | +172% ² |
+| prompt_after_resume | 1486.5 | 1315.7 | -11.5% | 3674.0 | 1753.8 | **-52.3%** ¹ |
+| prompt_turn | 1576.7 | 1118.4 | -29.1% ³ | 2281.8 | 2451.4 | +7.4% (≈) ³ |
+| files_read | 6.7 | 4.0 | -40.3% ⁴ | 34.7 | 28.3 | -18.4% |
+| files_tree | 9.0 | 5.6 | -37.8% ⁴ | 52.6 | 29.3 | -44.3% |
+| files_upload_small | 12.5 | 4.7 | -62.4% ⁴ | 33.4 | 27.8 | -16.8% |
+| files_upload_large (2 MB) | 110.4 | 88.6 | -19.7% | 144.9 | 152.3 | +5.1% (≈) |
+| sandbox_exec | 20.1 | 7.7 | -61.7% ⁴ | 30.9 | 29.1 | -5.8% (≈) |
+| config_mode | 29.8 | 32.0 | +7.4% (≈) | 35.5 | 34.7 | -2.3% (≈) |
+| config_model | 12.7 | 10.7 | -15.7% | 30.3 | 32.3 | +6.6% (≈) |
+| session_create | 945.6 | 955.2 | +1.0% (≈) | 998.3 | 975.3 | -2.3% (≈) |
+| release | 5040.8 | 5036.4 | 0.0% (≈) | 5101.8 | 5081.2 | -0.4% (≈) |
+| resume | 759.3 | 730.4 | -3.8% (≈) | 771.5 | 763.0 | -1.1% (≈) |
+| **wall_s** | **21.97** | **17.94** | **-18.3%** | | | |
+| **throughput sess/s** | **0.228** | **0.279** | **+22.4%** | | | |
+
+¹ `session_status` p99 -64.7% IS a real peek-mode signal — that endpoint
+now bypasses `force_probe=True` and falls back to a DB read. The
+`prompt_after_resume` p99 -52.3%, however, **is noise**: that endpoint
+calls `pool.get_session()` *without* peek (peek is only used by
+`/status` and `/sandbox`), so it still hits the same probe path on both
+sides. With N=15 samples per side, p99 is dominated by the worst
+outlier — Anthropic API tail variance + run-order cache warmth account
+for the swing. Treat it as informational, not as a peek-mode win.
+
+² `session_sandbox_info` p99 jumped 9.7→26.4 ms but absolute values are
+tiny (sub-30 ms) and N=15 per side. One outlier dominates p99 at this
+sample size — not a real regression.
+
+³ `prompt_turn` deltas swing wildly because Anthropic API tail variance
+dominates. -29% on p50 with +7% on p99 is the textbook signature of
+small-sample noise, not a real shift. The earlier run (`ec5ef64` →
+`322f464` baseline) had `prompt_turn` p50 = 1479 → 1338. This run's
+1576 baseline is *higher* than the original baseline — same workload,
+different day's API latency.
+
+⁴ Big-percentage wins on sub-15 ms file/exec ops are similarly noise:
+a 5 ms swing on `files_upload_small` reads as -62% but the absolute
+floor is dominated by Python serialization + `httpx` per-request setup,
+not anything peek-mode touches. Trust the wall-time + the protected p99
+columns above; treat the per-op p50 deltas in this section as
+informational only.
+
+### What's actually shipping in #85
+
+The bench above is the diffuse signal. The cleaner signal is the
+targeted micro-bench in the PR body: **10 consecutive `/status` polls
+on a hibernated session** dropped from 1668 ms cumulative to 24 ms
+(**-98.6%**), AND the sandbox stays hibernated instead of being
+reanimated. That second property — reaper correctness — is the real
+value; the perf number is a downstream consequence.
+
+### Goldens (peek mode on top of new main)
+
+`tests/test_sandbox_stop_delete_recovery.py` — the canonical golden
+suite — passes 60/60 in 158s with `-n auto`. No regressions.
