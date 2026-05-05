@@ -44,6 +44,7 @@ class ModalSandboxSession(BaseSandboxSession):
         volume_ref = await self._bootstrap_session()
 
         instance = None
+        reattached = False
         if self.state.sandbox_ref:
             try:
                 status = await md_provider.get_sandbox_status(self.state.sandbox_ref)
@@ -64,6 +65,7 @@ class ModalSandboxSession(BaseSandboxSession):
                             sandbox_ref=self.state.sandbox_ref,
                             port=self.state.listen_port,
                         )
+                        reattached = True
             except Exception:
                 pass
 
@@ -85,6 +87,11 @@ class ModalSandboxSession(BaseSandboxSession):
 
         ok = await _wait_for_health(instance.url, max_retries=15, interval=0.5)
         if not ok:
+            if reattached:
+                # Reattached to an existing modal sandbox but its supervisor
+                # is unreachable. Abandon the ref so the next get_session
+                # cold-creates fresh instead of looping on the wedged one.
+                self.state.sandbox_ref = None
             raise RuntimeError(
                 f"Modal supervisor not responding at {instance.url}"
             )
