@@ -11,6 +11,30 @@ import httpx
 log = logging.getLogger(__name__)
 
 
+def _normalize_acp_model(model: str) -> str:
+    """Map any Anthropic / hivespace-style model string to the three
+    aliases ACP's claude-agent-acp accepts: ``default``, ``opus``,
+    ``haiku``. Pass-through for already-normalised values; substring
+    match for full IDs (``claude-sonnet-4-6`` → ``default``,
+    ``claude-haiku-4-5-20251001`` → ``haiku``, ``claude-opus-4-6``
+    → ``opus``). Unknown strings fall back to ``default`` — same
+    safety the runtime uses when set_model is skipped entirely. ACP
+    rejects anything outside its three aliases with -32603, so
+    "unknown" is the only sensible default."""
+    if not model:
+        return "default"
+    s = model.strip().lower()
+    if s in ("default", "opus", "haiku"):
+        return s
+    if "sonnet" in s:
+        return "default"  # ACP's "default" slot points at the latest sonnet
+    if "opus" in s:
+        return "opus"
+    if "haiku" in s:
+        return "haiku"
+    return "default"
+
+
 def _mcp_dict_to_acp_array(mcp_servers: dict) -> list[dict]:
     """Convert {name: config} dict to ACP session/new array format.
 
@@ -326,10 +350,27 @@ class AcpClient:
                 continue
 
     async def set_model(self, session_id: str, model: str) -> None:
-        """Change the agent model mid-session."""
+        """Change the agent model mid-session.
+
+        Normalises full Anthropic API model IDs (e.g. ``claude-sonnet-4-6``,
+        ``claude-haiku-4-5-20251001``) down to the three aliases that
+        claude-agent-acp's ``getAvailableModels`` accepts under OAuth:
+        ``default``, ``opus``, ``haiku``. Without this, every set_model
+        call from a hivespace agent (whose ``agent.model`` column stores
+        the public-API ID) returns ``-32603 Invalid value for config
+        option model: ...`` and the user sees harmless-but-noisy ERROR
+        rows on every Type-2 cold-recovery and on every direct config
+        forward. See the data-research / Task Builder repro
+        (2026-05-04).
+
+        Substring match is sufficient: the public-API IDs always
+        embed exactly one of ``sonnet`` / ``opus`` / ``haiku``, and
+        ACP's ``default`` slot IS the latest sonnet so the mapping is
+        semantically correct.
+        """
         await self.call(
             session_id, "session/set_config_option",
-            {"configId": "model", "value": model},
+            {"configId": "model", "value": _normalize_acp_model(model)},
         )
 
     async def set_thought_level(self, session_id: str, level: str) -> None:

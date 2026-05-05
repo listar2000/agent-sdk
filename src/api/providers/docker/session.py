@@ -96,6 +96,7 @@ class DockerSandboxSession(BaseSandboxSession):
                 pre_start_commands=self.state.recipe.pre_start_commands or None,
                 shared_mounts=self.state.recipe.shared_mounts or None,
                 resources=self.state.recipe.resources,
+                sandbox_ref=self.session_id,
             )
             self.state.sandbox_ref = instance.sandbox_ref
             self.state.listen_port = instance.port
