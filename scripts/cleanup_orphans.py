@@ -5,9 +5,12 @@ Each provider tags sandboxes it provisions with one shared label:
 
     agent_sdk_origin = <AGENT_SDK_ORIGIN env, default "production">
 
-Test runs set ``AGENT_SDK_ORIGIN=test`` (via
-``scripts/launch_server_test.sh``) so test sandboxes are tagged ``"test"``
-and can be reaped without touching real production traffic.
+All local-dev launchers (``scripts/launch_server_test.sh``,
+``scripts/launch_server_docker.sh``, and ``docker compose up``) default
+``AGENT_SDK_ORIGIN=test`` so test sandboxes are tagged ``"test"`` and
+can be reaped without touching real production traffic. Production
+deploys (Railway via ``Dockerfile``) leave the env unset and the server
+falls back to ``"production"``.
 
 Daytona pauses-not-deletes on session release, so paused-but-not-deleted
 sandboxes pile up against the account's disk quota across CI runs. Docker
@@ -16,16 +19,16 @@ This script handles both.
 
 Usage:
 
-    # Dry run — see what'd be reaped:
+    # Dry run across daytona + docker + unix_local (default --provider=all):
     python scripts/cleanup_orphans.py
 
-    # Actually reap:
+    # Actually reap (across all providers):
     python scripts/cleanup_orphans.py --yes
 
-    # Reap a specific provider only:
+    # One provider only:
     python scripts/cleanup_orphans.py --provider docker --yes
 
-    # Reap a different origin (e.g. a crashed prod server's orphans):
+    # Different origin (e.g. a crashed prod server's orphans):
     python scripts/cleanup_orphans.py --origin production --yes
 
 Environment:

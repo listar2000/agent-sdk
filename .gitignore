@@ -9,7 +9,7 @@ build/
 node_modules/
 .claude/
 
-# Local Postgres for launch_server_local.sh
+# Local Postgres for launch_server_test.sh
 .postgres-env/
 .postgres-data/
 

@@ -6,11 +6,12 @@ with `-k` filters — xdist negotiates worker count down.
 
     .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto
 
-For the golden suite, launch the dev server with
-`scripts/launch_server_test.sh` (NOT `launch_server_local.sh` directly).
-The wrapper sets `AGENT_SDK_ORIGIN=test`, so daytona sandboxes carry
-`agent_sdk_origin=test` and `cleanup_orphans.py` can isolate them from
-production.
+For local dev and the golden suite, launch the server with
+`scripts/launch_server_test.sh` — the only local launcher. It defaults
+`AGENT_SDK_ORIGIN=test` so daytona sandboxes carry `agent_sdk_origin=test`
+and `cleanup_orphans.py` can isolate them from production. Override with
+`AGENT_SDK_ORIGIN=production scripts/launch_server_test.sh` if you need a
+production-tagged server locally.
 
 ## Sandbox cleanup across test runs
 
@@ -22,11 +23,14 @@ even on test failure.
 
 For paused-on-release residue (daytona pauses; docker stops):
 
-    python scripts/cleanup_orphans.py                       # dry run
-    python scripts/cleanup_orphans.py --yes                 # reap origin=test
-    python scripts/cleanup_orphans.py --provider daytona --yes
-    python scripts/cleanup_orphans.py --provider docker --yes
-    python scripts/cleanup_orphans.py --provider unix_local --yes   # orphan supervisor.js, ppid==1
+    python scripts/cleanup_orphans.py                       # dry run, all providers
+    python scripts/cleanup_orphans.py --yes                 # reap origin=test across daytona + docker + unix_local
+    python scripts/cleanup_orphans.py --provider daytona --yes   # one provider only
+
+The script defaults to `--provider all` and `--origin $AGENT_SDK_ORIGIN`
+(falls back to `test`), so the no-flag invocation is the right one to run
+after a flaky golden suite. Each provider's section is skipped silently
+if its dep is missing (`DAYTONA_API_KEY` unset, `docker` not on PATH).
 
 CI opt-in for auto post-session cleanup: `AGENT_SDK_TEST_AUTO_CLEANUP=1`.
 Off by default to avoid churn on local unit-test runs.
