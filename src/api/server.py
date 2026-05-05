@@ -22,6 +22,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from psycopg.types.json import Json
@@ -768,10 +769,16 @@ async def volume_files_download(id_or_name: str, path: str):
         raise _volume_fs_err("Download", vol.provider, e)
 
     filename = path.rsplit("/", 1)[-1] or "download"
+    ascii_filename = filename.encode("ascii", "ignore").decode() or "download"
     return Response(
         content=data,
         media_type="application/octet-stream",
-        headers={"content-disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "content-disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
     )
 
 

@@ -12,9 +12,10 @@ Replaces today's scattered liveness signals: ``state._reader_connected``,
 ``_wait_for_health`` calls. The test-7 race becomes inexpressible
 because there's only one variable to read or write.
 
-Single writer (the per-prompt SSE drain inside
-``SandboxSession.execute_prompt``). Multiple readers (``running()`` on
-the session, ``pool.get_session`` fast-path).
+Writers are successful supervisor interactions (prompt SSE chunks,
+health probes, and UI/API activity that proves the session is in use).
+Multiple readers (``running()`` on the session, ``pool.get_session``
+fast-path).
 """
 from __future__ import annotations
 
@@ -50,10 +51,21 @@ class Liveness:
         self._probe = probe
         self._unknown_after_idle_s = unknown_after_idle_s
 
-    # --- Writer side (called by the SSE drain) ---
+    # --- Writer side (called by successful session activity) ---
 
     def observe_chunk(self) -> None:
         self._state = "alive"
+        self._last_chunk_at = time.monotonic()
+
+    def observe_activity(self) -> None:
+        """Record non-prompt activity against an already-live session.
+
+        File browsing, status checks, and persistent /events heartbeats are
+        user activity just as much as prompt chunks. They should keep the
+        pool reaper from hibernating an actively viewed sandbox.
+        """
+        if self._state != "dead":
+            self._state = "alive"
         self._last_chunk_at = time.monotonic()
 
     def observe_error(self) -> None:

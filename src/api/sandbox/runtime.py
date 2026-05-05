@@ -23,6 +23,12 @@ _reaper_task: asyncio.Task | None = None
 # hibernation. Tunable via env so ops can dial it without a code change.
 _REAPER_INTERVAL_S = float(os.environ.get("AGENT_SDK_REAPER_INTERVAL_S", "60"))
 _REAPER_IDLE_S = float(os.environ.get("AGENT_SDK_REAPER_IDLE_S", "180"))  # 3 min
+_MODAL_REAPER_IDLE_S = float(
+    os.environ.get(
+        "AGENT_SDK_MODAL_REAPER_IDLE_S",
+        os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "1800"),
+    )
+)
 
 
 def get_pool() -> SessionPool:
@@ -52,7 +58,10 @@ async def _reaper_loop(pool: SessionPool) -> None:
         except asyncio.CancelledError:
             return
         try:
-            n = await pool.reap_idle(_REAPER_IDLE_S)
+            n = await pool.reap_idle(
+                _REAPER_IDLE_S,
+                provider_idle_s={"modal": _MODAL_REAPER_IDLE_S},
+            )
             if n:
                 log.info("reaper: hibernated %d idle session(s)", n)
         except Exception:

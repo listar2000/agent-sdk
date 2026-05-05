@@ -85,6 +85,7 @@ class SessionPool:
                 alive = await cached.running(force_probe=True)
                 log.info("[pool.get_session] session=%s cached=True alive=%s", session_id, alive)
                 if alive:
+                    cached.liveness.observe_activity()
                     return cached
                 # Stale entry; tear down runtime in background. We don't
                 # snapshot here — compute is dead, can't snapshot reliably.
@@ -171,19 +172,27 @@ class SessionPool:
         No I/O — just whether the pool currently holds a session."""
         return session_id in self._active
 
-    async def reap_idle(self, idle_s: float) -> int:
+    async def reap_idle(
+        self,
+        idle_s: float,
+        *,
+        provider_idle_s: dict[str, float] | None = None,
+    ) -> int:
         """Hibernate every active session whose last observed activity is
         older than ``idle_s``. Returns the count of sessions released.
 
-        Activity = last chunk observed by ``execute_prompt`` (tracked on
-        the session's ``Liveness._last_chunk_at``). Heartbeats from the
-        supervisor count as activity, so a session stays warm for the
-        duration of any in-flight prompt regardless of how long it runs.
+        Activity = the session's ``Liveness._last_chunk_at``. Prompt
+        chunks, successful health probes, file/status traffic, and live
+        /events subscribers all count as activity so an open UI does not
+        hibernate underneath the user.
         """
         import time as _time
         now = _time.monotonic()
         stale = []
         for sid, sess in list(self._active.items()):
+            if sess._subscribers:
+                sess.liveness.observe_activity()
+                continue
             last = sess.liveness._last_chunk_at
             if last is None:
                 # Never observed a chunk — likely a session that started
@@ -191,7 +200,9 @@ class SessionPool:
                 # by giving it the full idle window from now.
                 sess.liveness._last_chunk_at = now
                 continue
-            if (now - last) > idle_s:
+            provider = getattr(sess.state, "type", "")
+            limit = (provider_idle_s or {}).get(provider, idle_s)
+            if (now - last) > limit:
                 stale.append(sid)
         for sid in stale:
             try:

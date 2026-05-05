@@ -77,13 +77,16 @@ _RUNTIME_IN = "/opt/agent-sdk/runtime"
 _SUPERVISOR_CONTAINER_PORT = 9100
 
 # Sandbox lifetime caps. We lean on Modal's native ``idle_timeout`` to reap
-# quiet sandboxes (3 minutes of no traffic → terminate); the orphan reaper
+# quiet sandboxes (30 minutes of no traffic → terminate by default);
+# the orphan reaper
 # (``reconcile_on_startup``) is the safety net for anything that escapes
 # both. Hard ceiling is 1 h so a forgotten sandbox can't outlive the natural
-# session window. Both supervisor heartbeats and ACP requests count as
-# activity for ``idle_timeout``.
+# session window. HTTP traffic through the Modal tunnel counts as activity
+# for ``idle_timeout``.
 _SANDBOX_TIMEOUT_SEC = 3600
-_SANDBOX_IDLE_TIMEOUT_SEC = 180
+_SANDBOX_IDLE_TIMEOUT_SEC = int(float(
+    os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "1800")
+))
 
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
