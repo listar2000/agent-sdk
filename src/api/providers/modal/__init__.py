@@ -76,14 +76,11 @@ _RUNTIME_IN = "/opt/agent-sdk/runtime"
 # encrypted HTTPS tunnel whose URL is fetched from ``sb.tunnels()``.
 _SUPERVISOR_CONTAINER_PORT = 9100
 
-# Sandbox lifetime caps. We lean on Modal's native ``idle_timeout`` to reap
-# quiet sandboxes (3 minutes of no traffic → terminate); the orphan reaper
-# (``reconcile_on_startup``) is the safety net for anything that escapes
-# both. Hard ceiling is 1 h so a forgotten sandbox can't outlive the natural
-# session window. Both supervisor heartbeats and ACP requests count as
-# activity for ``idle_timeout``.
+# Sandbox lifetime cap. Match Daytona's provider-level idle behavior: no native
+# idle timeout is requested here; the agent-sdk session reaper owns hibernation.
+# Hard ceiling is 1 h so a forgotten sandbox can't outlive the natural session
+# window.
 _SANDBOX_TIMEOUT_SEC = 3600
-_SANDBOX_IDLE_TIMEOUT_SEC = 180
 
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
@@ -396,7 +393,6 @@ async def create_sandbox(
             image=image,
             volumes={_VOLUME_MOUNT: vol},
             timeout=_SANDBOX_TIMEOUT_SEC,
-            idle_timeout=_SANDBOX_IDLE_TIMEOUT_SEC,
             encrypted_ports=[_SUPERVISOR_CONTAINER_PORT],
             **res_kw,
         )
