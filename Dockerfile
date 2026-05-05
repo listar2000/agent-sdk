@@ -13,11 +13,11 @@ COPY Dockerfile .
 COPY src/ src/
 COPY ui/ ui/
 
-# Runtime tag files are read by providers/_shared.py to resolve the
-# correct daytona snapshot / docker image at sandbox-creation time.
+# Runtime tag files are read by providers to resolve the correct daytona
+# snapshot, docker image, and modal filesystem snapshot at sandbox-creation time.
 # COPY with a glob so the build still works if either file is missing
 # (e.g. before scripts/release.sh has been run).
-COPY .runtime-image-tag* .runtime-snapshot-tag* ./
+COPY .runtime-image-tag* .runtime-snapshot-tag* .modal-snapshot-tag* ./
 
 RUN pip install --no-cache-dir .
 
