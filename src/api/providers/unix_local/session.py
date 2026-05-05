@@ -44,6 +44,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         volume_ref = await self._bootstrap_session()
 
         instance = None
+        reattached = False
         # sandbox_id here is the local provider's stable ref (local-XXXX).
         # On second start() we try to restart the SAME sandbox in place so
         # the test_stop_sandbox_same_sandbox_after_restart invariant holds.
@@ -59,6 +60,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
+                    reattached = True
                 elif status == "stopped":
                     # Process died but spawn plan + alive marker intact;
                     # respawn at the same ref (same volume subpath, same
@@ -72,6 +74,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
+                    reattached = True
                 # status == "missing" → fall through to create.
             except Exception:
                 pass
@@ -93,6 +96,11 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         ok = await _wait_for_health(instance.url, max_retries=10, interval=0.3)
         if not ok:
+            if reattached:
+                # Reattached to an existing supervisor PID but it's
+                # unreachable. Abandon the ref so the next get_session
+                # cold-creates fresh instead of looping on the wedged one.
+                self.state.sandbox_ref = None
             raise RuntimeError(
                 f"Local supervisor not responding at {instance.url}"
             )

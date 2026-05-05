@@ -59,6 +59,7 @@ class DockerSandboxSession(BaseSandboxSession):
         # If state has a container id, try to keep it (test invariant:
         # external stop must restart same container, not provision new).
         instance = None
+        reattached = False
         if self.state.sandbox_ref:
             try:
                 status = await dk_provider.get_sandbox_status(self.state.sandbox_ref)
@@ -71,6 +72,7 @@ class DockerSandboxSession(BaseSandboxSession):
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
+                    reattached = True
                 elif status == "stopped":
                     # Container exists but stopped (`docker stop` w/o --rm).
                     # `docker start` revives it on the same image+volume.
@@ -82,6 +84,7 @@ class DockerSandboxSession(BaseSandboxSession):
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
+                    reattached = True
                 # missing/error → fall through to create.
             except Exception:
                 pass
@@ -106,6 +109,12 @@ class DockerSandboxSession(BaseSandboxSession):
 
         ok = await _wait_for_health(instance.url, max_retries=10, interval=0.3)
         if not ok:
+            if reattached:
+                # We reattached to an existing container but its supervisor
+                # is unreachable. Abandon the ref so the next get_session
+                # cold-creates a fresh container instead of looping on the
+                # same wedged one.
+                self.state.sandbox_ref = None
             raise RuntimeError(
                 f"Supervisor not responding at {instance.url} after create_sandbox"
             )

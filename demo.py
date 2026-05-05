@@ -49,7 +49,6 @@ async def main() -> int:
     async with dbmod.get_db() as conn:
         await conn.execute("DELETE FROM session_log")
         await conn.execute("DELETE FROM sessions")
-        await conn.execute("DELETE FROM sandboxes")
         await conn.execute("DELETE FROM volumes")
         await conn.execute("DELETE FROM agents")
 

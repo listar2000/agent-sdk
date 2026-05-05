@@ -269,9 +269,19 @@ def _normalize_skills(skills) -> list[str]:
 
 
 def _skills_install_commands(skills) -> list[str]:
-    """Return shell commands to install skills via ``npx skills add``."""
+    """Return shell commands to install skills via ``npx skills add``.
+
+    A source like ``owner/repo@skill-name`` is a single-skill filter. Pass
+    ``--all`` only when no ``@<skill>`` suffix is given, so the filter is
+    respected — otherwise ``--all`` overrides it and pulls every skill
+    from the repo (e.g. ``github/awesome-copilot`` ships hundreds).
+    """
     sources = _normalize_skills(skills)
-    return [f"npx -y skills add {shlex.quote(source)} --all -g" for source in sources]
+    cmds: list[str] = []
+    for source in sources:
+        flags = "-g" if "@" in source else "--all -g"
+        cmds.append(f"npx -y skills add {shlex.quote(source)} {flags}")
+    return cmds
 
 
 async def _install_skills_locally(skills) -> None:

@@ -163,7 +163,7 @@ async def asgi_server(monkeypatch, tmp_path):
     await dbmod.init_pool()
     try:
         async with dbmod.get_db() as conn:
-            for table in ("session_log", "sessions", "sandboxes", "volumes", "agents"):
+            for table in ("session_log", "sessions", "volumes", "agents"):
                 await conn.execute(f"DELETE FROM {table}")
         transport = ASGITransport(app=srv.app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:

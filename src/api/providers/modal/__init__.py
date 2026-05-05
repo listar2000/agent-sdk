@@ -77,15 +77,18 @@ _RUNTIME_IN = "/opt/agent-sdk/runtime"
 _SUPERVISOR_CONTAINER_PORT = 9100
 
 # Sandbox lifetime caps. We lean on Modal's native ``idle_timeout`` to reap
-# quiet sandboxes (30 minutes of no traffic → terminate by default);
-# the orphan reaper
-# (``reconcile_on_startup``) is the safety net for anything that escapes
-# both. Hard ceiling is 1 h so a forgotten sandbox can't outlive the natural
-# session window. HTTP traffic through the Modal tunnel counts as activity
-# for ``idle_timeout``.
+# quiet sandboxes; the orphan reaper (``reconcile_on_startup``) is the safety
+# net for anything that escapes both. Hard ceiling is 1 h so a forgotten
+# sandbox can't outlive the natural session window. HTTP traffic through the
+# Modal tunnel counts as activity for ``idle_timeout``.
+#
+# Keep the Modal-native idle window above the pool's Modal reaper window so
+# our ``stop()`` path can POST ``/v1/snapshot`` before Modal SIGTERMs the
+# supervisor. This avoids repeated cold starts while preserving graceful
+# hibernation for idle sessions.
 _SANDBOX_TIMEOUT_SEC = 3600
 _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
-    os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "1800")
+    os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "2100")
 ))
 
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
