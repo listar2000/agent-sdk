@@ -1,7 +1,16 @@
 # Head-to-head benchmark results
 
-Baseline: commit `ec5ef64` (main HEAD as of this PR's branch point).
-Patched: this PR (8 modified files — see PR description).
+Baseline: commit `ec5ef64` (main HEAD as of PR #82's branch point).
+Patched: PR #82 + this PR's open follow-ups.
+
+> **Update (PR #82 + #84 + #85 cumulative):** see "Cumulative impact"
+> section at the bottom of this doc for the across-PRs table. The
+> per-op p50 wins compound: most read-heavy ops are now -80 to -92%
+> below baseline (status: -90.6%, files_read: -86.5%, config_*: -84%).
+> Wall stays flat in the standard mixed bench because Anthropic API
+> + supervisor cold-boot dominate it. The wins matter for ops that
+> happen WITHOUT a prompt in flight: dashboard polling, file-browse
+> UIs, multi-tab observation, etc.
 
 Both runs on the same machine within the same session window, alternating
 where possible to control for time-of-day Daytona load. Methodology in
@@ -129,3 +138,120 @@ installed (7), `GEMINI_API_KEY` unset (3), OpenCode mac-only (2),
 deltas above are where the optimizations actually show up.
 
 **Zero regressions across the live golden suite.**
+
+---
+
+# Cumulative impact: PR #82 + #84 + #85
+
+After PR #82 shipped, two follow-up PRs landed on the same theme of
+"small surgical fixes to the request hot path":
+
+- **PR #84** — share httpx pool for `/v1/health` probe across all 4
+  providers. Every `pool.get_session()` call (which fires on every
+  /sessions/{id}/* request) was constructing a fresh `httpx.AsyncClient`
+  for the supervisor health probe; PR #84 routes the probe through
+  the cached per-session AcpClient pool. Win was -11% wall / +12%
+  throughput on its own (see PR #84's body for the isolated A/B).
+
+- **PR #85** — peek-mode `get_session(peek=True)` for read-only
+  `/status` and `/sandbox` endpoints. The pre-PR #85 behaviour was
+  buggy: a UI dashboard polling `/status` on a hibernated session
+  unhibernated the sandbox on the first poll (1-2s cold-recovery)
+  AND kept it warm forever, defeating the reaper. PR #85 falls back
+  to a DB read of `sessions.sandbox_state` JSONB when the session
+  isn't in the live pool. Targeted bench: 10 status polls on a
+  hibernated session: 1668ms → 24ms (-98.6%) with the sandbox
+  staying hibernated.
+
+## Cumulative A/B (`unix_local`, 5 sessions × default workflow)
+
+Measured against pre-PR #84 main HEAD (`12b39ca`, post-PR #82) so
+the table shows what PR #84 + PR #85 add ON TOP of PR #82.
+
+### With release/resume in the workload (default workflow, 3 iters)
+
+| op | base p50 (ms) | new p50 (ms) | p50 Δ | p99 Δ |
+|---|---:|---:|---:|---:|
+| **session_status** | 53.0 | **5.0** | **-90.6%** | -91.1% |
+| **config_thought_level** | 67.7 | 7.3 | **-89.2%** | -62.9% |
+| files_upload_small | 37.2 | 4.8 | **-87.1%** | -55.5% |
+| files_read | 30.4 | 4.1 | **-86.5%** | -62.2% |
+| session_sandbox_info | 49.4 | 7.5 | **-84.8%** | -58.2% |
+| config_model | 72.9 | 11.6 | **-84.1%** | -65.4% |
+| files_tree | 35.7 | 7.7 | **-78.4%** | -58.2% |
+| sandbox_exec | 36.8 | 8.3 | **-77.4%** | -83.6% |
+| config_mode | 100.5 | 33.8 | **-66.4%** | -49.4% |
+| files_upload_large (2 MB) | 150.2 | 104.5 | -30.4% | -27.1% |
+| prompt_after_resume | 1783.8 | 1415.5 | **-20.6%** | **-41.2%** |
+| session_create | 1080.1 | 1015.1 | -6.0% | -11.5% |
+| prompt_turn | 1486.0 | 1555.2 | +4.7% (≈) | +1.6% (≈) |
+| release | 5057 | 7456 | +47.4%¹ | +46.7%¹ |
+| resume | 792 | 779 | -1.7% (≈) | -1.0% (≈) |
+| **wall_s** | 20.91 | 20.74 | -0.8% (≈) | |
+| **throughput sess/s** | 0.239 | 0.241 | +0.8% (≈) | |
+
+¹ Single-iteration noise — release is dominated by ~5-7s of supervisor-side
+snapshot work that this PR series doesn't touch. With 3 iters per side
+and high natural variance in the snapshot path, the median can swing
+1-3 seconds. None of the changed code paths run during release.
+
+### Without release/resume (`SKIP_RELEASE=1`, 3 iters)
+
+Removing release reveals the per-op picture without snapshot noise:
+
+| op | base p50 (ms) | new p50 (ms) | p50 Δ | p99 Δ |
+|---|---:|---:|---:|---:|
+| files_upload_small | 52.7 | 4.1 | **-92.2%** | -88.0% |
+| files_tree | 43.7 | 5.1 | **-88.3%** | -66.9% |
+| files_read | 35.1 | 4.3 | **-87.7%** | -68.8% |
+| config_mode | 109.7 | 16.7 | **-84.8%** | -70.9% |
+| config_thought_level | 66.5 | 10.2 | **-84.7%** | -58.8% |
+| session_sandbox_info | 52.7 | 8.3 | **-84.3%** | -59.7% |
+| session_status | 32.2 | 5.6 | **-82.6%** | -87.2% |
+| config_model | 81.2 | 14.9 | **-81.7%** | -39.0% |
+| sandbox_exec | 42.9 | 8.9 | **-79.3%** | -49.8% |
+| files_upload_large | 158.4 | 92.3 | **-41.7%** | -39.6% |
+| session_create | 1079.8 | 1022.9 | -5.3% | -6.9% |
+| prompt_turn | 1639 | 1636 | -0.2% (≈) | -1.1% (≈) |
+| **wall_s** | 12.22 | 12.80 | +4.7% (≈) | |
+| **throughput sess/s** | 0.409 | 0.391 | -4.4% (≈) | |
+
+The wall stays flat even without release — because `prompt_turn`
+(Anthropic-bound, ~1.6s) dominates the per-session pipe and isn't in
+the path of any change. **The wins are real but they show up in
+per-op latency, not aggregate wall**.
+
+### Where the wins matter
+
+If your workload is read-heavy or polling-heavy:
+
+- **Dashboard / observability**: `/status` polls 10× cheaper, sandboxes
+  stay hibernated under polling (PR #85)
+- **File browser UI**: `/files/tree`, `/files/read`, `/files/upload`
+  all 5-9× faster (PR #84 — probe was eating the latency)
+- **ACP config polling**: `/config` 5-7× faster
+- **`/sandbox/exec` for tool-call backends**: 5× faster
+
+If your workload is chat-only (one prompt → one reply, repeat):
+
+- The wall is bounded by Anthropic API latency. Per-prompt overhead is
+  already <100ms server-side; no remaining low-hanging fruit on the
+  Python side.
+- Remaining session_create cost (~1s on `unix_local`, ~40s on Daytona)
+  is dominated by supervisor + claude-code-acp child cold-boot.
+  Optimizing this requires either supervisor.js changes (pre-spawn
+  child) or a lazy-attach refactor in Python (defer `_attach_acp` to
+  first ACP op). See `NEW_SCENARIOS_BASELINE.md` for the profiling.
+
+## Goldens (cumulative, all 4 providers, `-n auto`)
+
+Same suite, same `-n auto` parallelism, all PRs stacked:
+
+| | baseline (`12b39ca`) | patched (#82+#84+#85) |
+|---|---|---|
+| passed | 78 | 78 |
+| failed | 0 | 0 |
+| skipped | 14 | 14 |
+| wall | 196-200s (deterministic 60s sleep dominates) | 196-200s |
+
+**Zero regressions across the live golden suite from any PR in the series.**

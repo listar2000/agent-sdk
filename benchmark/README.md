@@ -98,6 +98,17 @@ SSE streaming, mostly waiting on remote HTTP), there's no need to
 switch. **Single-process loadgens are misleading here** because the
 client saturates first; this script intentionally uses N worker procs.
 
+### `scaling_curve.py`
+**Question:** at what concurrency does per-op latency start to degrade?
+Reveals contention points (DB pool, executor, shared httpx client) that
+single-N benches miss.
+
+**Run:** `LEVELS=1,5,10,20,40 PROVIDER=unix_local .venv/bin/python benchmark/load/scaling_curve.py`
+
+Hits a tiny workflow (create + 1 prompt + 3 file_tree calls + delete)
+at each level, prints a degradation table. Useful for identifying
+"the system is fine to N=20 but cliffs at N=40" type problems.
+
 ### `load_agent_sdk_unix.py`
 **Question:** end-to-end concurrent throughput of the agent-sdk server
 against the `unix_local` provider (no remote billing). Reads `N_SESSIONS`
@@ -132,8 +143,14 @@ per condition to read any A/B signal.
 **Question:** does an optimization actually improve a realistic mixed
 workload, end to end?
 
-**`workload_full.py`** runs one full session lifecycle that touches
-nearly every server code path:
+**`workload_full.py`** has two layers: top-level **scenario** + opt-in
+**per-session extras**. Designed so the default A/B numbers stay
+reproducible, while opt-ins exercise paths that aren't on the standard
+session lifecycle.
+
+### Default per-session workflow (`BENCH_SCENARIO=default`)
+
+Each of N sessions independently runs:
 - session create (eager, with config)
 - status / sandbox introspection
 - 3× ACP config calls (model / mode / thought_level)
@@ -142,9 +159,38 @@ nearly every server code path:
 - sandbox exec
 - optional release + resume + post-resume prompt
 
-Knobs: `PROVIDER`, `N_SESSIONS`, `N_TURNS`, `N_FILE_OPS`, `LARGE_MB`,
-`MODEL`, `SKIP_RELEASE`, `LABEL`. Appends a JSON summary line per run
-to `/tmp/workload_full.jsonl`.
+### Per-session opt-in extras (added to whatever scenario is running)
+
+Each is gated by an env var; default off so existing A/B comparisons
+stay valid:
+
+| env var | what it adds |
+|---|---|
+| `BENCH_SSE_SUBSCRIBER=1` | Open a parallel `GET /events` while running a prompt. Tests subscriber fan-out + heartbeats. Records `sse_subscriber_prompt` (wall ms) and `sse_subscriber_chunks` (count delivered to the parallel subscriber). |
+| `BENCH_CONCURRENT_PROMPTS=N` | Fire N prompts in parallel on the same session. Server's `_prompt_lock` serializes them. Records `concurrent_prompts_xN` (total wall) — meaningful test of the lock contention path. |
+| `BENCH_LONG_TURNS=N` | N additional simple turns to test JSONL growth + supervisor stability over a sustained chat. |
+| `BENCH_TOOL_HEAVY=1` | One prompt that forces the agent to run 3 Bash tool calls. Real production shape — not a single-Anthropic-roundtrip but a tool-call/tool-result loop. |
+| `BENCH_CANCEL=1` | Submit a prompt via `/message`, sleep 200ms, send `POST /cancel`. Tests cancellation propagation through ACP. |
+| `BENCH_INTERRUPT=1` | Submit a prompt, then submit another with `interrupt=true`. The "stop and resend" UI pattern. |
+
+### Top-level scenarios (`BENCH_SCENARIO=...`)
+
+Pick the shape of the load:
+
+| scenario | what each "session" does |
+|---|---|
+| `default` | Full per-session workflow above (longest, exercises most code paths) |
+| `bursty` | Minimal: create + 1 prompt + delete. Use with high N_SESSIONS to stress cold-create throughput |
+| `long_chat` | One session, N_TURNS turns (use N_TURNS=20+). Stresses JSONL growth + supervisor memory |
+| `mixed` | Per-session profile varies (default / bursty / long_chat / volume_direct cycling). Models real production where users do different things at the same time |
+| `volume_direct` | `/volumes/{id}/files/*` — non-session-scoped file ops. Different code path used by the Volume Inspector UI |
+| `multi_session_per_agent` | N sessions sharing one `agent_id` (`BENCH_MULTI_SESSION_PER_AGENT=N`). Tests sibling-session invariants. On Daytona, asserts the 409 sibling rejection contract |
+| `gigantic_files` | One session per worker. Phase 1 uploads a `BENCH_GIGANTIC_MB`-sized file (default 0 — must set), Phase 2 reads it back, Phase 3 downloads it raw, Phase 4 search-replace edits a same-size text file. **Each phase pairs with a concurrent `/files/tree` probe on a separate connection** — the probe's p99 directly measures whether the big op blocks the event loop for other requests (the actual b64 `to_thread` win). Records `gf_<phase>_ms` (big op wall) + `gf_probe_<phase>` (per-probe latency p50/p99). |
+| `stress` | Each of N sessions picks a profile (gigantic / tool_heavy / long_chat / files_only / bursty / volume_direct), all run in parallel. Production-shaped peak load — every workload type happening simultaneously. Per-op latencies under stress show isolation problems (e.g. file ops slow down when a gigantic upload is in flight on another session). Set N_SESSIONS to a multiple of 6 to get one of each. |
+
+Knobs (env vars): `PROVIDER`, `N_SESSIONS`, `N_TURNS`, `N_FILE_OPS`,
+`LARGE_MB`, `MODEL`, `SKIP_RELEASE`, `LABEL`, plus the BENCH_* knobs
+above. Appends a JSON summary line per run to `/tmp/workload_full.jsonl`.
 
 **`ab_harness.sh`** runs `workload_full.py` for ITERS iterations
 against a server source path of your choice (`CHECKOUT_PATH`).
