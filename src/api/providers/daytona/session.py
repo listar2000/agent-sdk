@@ -144,16 +144,20 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 self._supervisor_url = instance.url
                 return sandbox
             except Exception as e:
-                msg = str(e).lower()
-                if "not found" in msg or "404" in msg:
-                    log.info(
-                        "DaytonaSandboxSession: sandbox %s not found, will create fresh",
-                        (self.state.sandbox_ref or "")[:16],
-                    )
-                    self.state.sandbox_ref = None
-                else:
-                    # Hard error during reattach — propagate, don't silently recreate.
-                    raise
+                # Whether the sandbox is genuinely missing (404) or alive
+                # but unreachable for any other reason — Daytona 5xx,
+                # supervisor wedged, port held, disk full, OOM — the
+                # answer is the same: abandon the ref and cold-create
+                # a fresh sandbox. The previously-attempted sandbox
+                # stays labelled ``agent_sdk_origin`` in Daytona for
+                # ``cleanup_orphans.py`` to reap. Without this
+                # fall-through, a wedged sandbox locks the session
+                # forever — every retry hits the same dead reattach.
+                log.warning(
+                    "DaytonaSandboxSession: reattach to %s failed (%s); abandoning + cold-creating",
+                    (self.state.sandbox_ref or "")[:16], e,
+                )
+                self.state.sandbox_ref = None
 
         # ``_bootstrap_session`` (in ``BaseSandboxSession``) ran from
         # ``start()`` before this method was called and unconditionally
