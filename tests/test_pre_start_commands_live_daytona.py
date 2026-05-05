@@ -127,16 +127,45 @@ async def test_live_daytona_realistic_workflow_via_sdk(sdk: ApiClient):
 
         await asyncio.sleep(1.5)
 
-        # ── Phase 2: Type 2 recovery via /release + /message ──────────────
+        # ── Phase 2: Type 2 recovery via external sandbox delete ──────────
         # /reset-sandbox was removed when the deprecated routes were
-        # collapsed. The pool path is "release the lease, then prompt
-        # again" — the next get_session takes the cold-create branch
-        # because the released SandboxSession's compute is gone.
-        await sdk.release_session(sid)
-        # send_message is fire-and-forget — it returns the rpc_id immediately
-        # and the cold-recovery proceeds on the server. We don't need to
-        # consume the SSE stream here; the file-read assertions below act
-        # as the synchronization point (they wait on the new sandbox).
+        # collapsed (commit ce6e8c9). That commit migrated to
+        # /release + /message claiming equivalent Type 2 semantics, but
+        # they're not: /release pauses the daytona sandbox in place
+        # (state preserved, sandbox_ref kept on the session row), so the
+        # next get_session falls into restart_daytona_supervisor — which
+        # restarts the existing supervisor without re-running
+        # pre_start_commands. Real Type 2 requires the sandbox itself to
+        # be GONE, which forces _resolve_or_create_sandbox into the
+        # cold-create branch where pre_start_commands actually run.
+        # We trigger it by deleting the sandbox through the daytona SDK
+        # directly — same shape as any out-of-band delete (dashboard,
+        # quota cleanup, scripts/cleanup_orphans.py).
+        from agent_sdk.api_client import ApiClient as _AC  # type: ignore
+        sandbox_ref = (await sdk.get_session_sandbox(sid))["sandbox_ref"]
+        from daytona_sdk import Daytona, DaytonaConfig
+        _client = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
+        loop = asyncio.get_event_loop()
+        sb = await loop.run_in_executor(None, lambda: _client.get(sandbox_ref))
+        await loop.run_in_executor(None, lambda: _client.delete(sb))
+        # Daytona's delete is async on its end — poll until the sandbox
+        # is no longer findable, otherwise the next get_session can race
+        # the cleanup and either reattach to a half-dead sandbox or hit
+        # "An unexpected error occurred" from the create path. Bounded
+        # 10 s — same budget as test_sandbox_stop_delete_recovery's
+        # _external_delete helper.
+        deadline = loop.time() + 10.0
+        while loop.time() < deadline:
+            try:
+                await loop.run_in_executor(None, lambda: _client.get(sandbox_ref))
+                await asyncio.sleep(0.5)
+            except Exception:
+                break
+
+        # send_message triggers the cold-recovery: get_session sees the
+        # sandbox is gone (404 from restart_daytona_supervisor), clears
+        # sandbox_ref, and falls through to create_sandbox which runs
+        # pre_start_commands on the fresh sandbox.
         await sdk.send_message(sid, "ping")
 
         # CLAUDE.md still correct on the new sandbox (via SDK).
