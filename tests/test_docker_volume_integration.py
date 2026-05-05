@@ -400,8 +400,6 @@ class TestDockerReconcile:
 
         dbmod.init_db()
         await dbmod.init_pool()
-        async with dbmod.get_db() as conn:
-            await conn.execute("DELETE FROM sandboxes")
 
         vol_name = _vol_name()
         cid: str | None = None
@@ -456,7 +454,6 @@ class TestDockerReconcile:
         async with dbmod.get_db() as conn:
             await conn.execute("DELETE FROM session_log")
             await conn.execute("DELETE FROM sessions")
-            await conn.execute("DELETE FROM sandboxes")
             await conn.execute("DELETE FROM volumes")
 
         vol_name = _vol_name()
@@ -538,7 +535,6 @@ class TestDockerReconcile:
         async with dbmod.get_db() as conn:
             await conn.execute("DELETE FROM session_log")
             await conn.execute("DELETE FROM sessions")
-            await conn.execute("DELETE FROM sandboxes")
             await conn.execute("DELETE FROM volumes")
 
         vol_name = _vol_name()
@@ -613,7 +609,6 @@ class TestDockerReconcile:
         async with dbmod.get_db() as conn:
             await conn.execute("DELETE FROM session_log")
             await conn.execute("DELETE FROM sessions")
-            await conn.execute("DELETE FROM sandboxes")
             await conn.execute("DELETE FROM volumes")
 
         vol_name = _vol_name()

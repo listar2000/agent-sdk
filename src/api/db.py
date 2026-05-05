@@ -43,6 +43,9 @@ _PG_SCHEMA = [
         inner_session_id    TEXT,
         env                 JSONB NOT NULL DEFAULT '{}'::jsonb,
         secrets             JSONB NOT NULL DEFAULT '{}'::jsonb,
+        volume_id           TEXT NOT NULL REFERENCES volumes(id) ON DELETE RESTRICT,
+        cwd                 TEXT NOT NULL DEFAULT '/tmp',
+        pre_start_commands  JSONB NOT NULL DEFAULT '[]'::jsonb,
         created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     """CREATE TABLE IF NOT EXISTS session_log (
@@ -65,332 +68,44 @@ _PG_SCHEMA = [
 # fresh databases alike. Append new migrations to the bottom.
 # ---------------------------------------------------------------------------
 _MIGRATIONS = [
-    # 2026-04-12: drop unused sandboxes columns from earlier design
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS name",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS image",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS auto_stop_min",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS labels",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS env_vars",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS resources",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS agent_count",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS last_activity",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS error_message",
-    "ALTER TABLE sandboxes DROP COLUMN IF EXISTS updated_at",
-    # 2026-04-16: add root column for sandbox filesystem boundary
-    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS root TEXT NOT NULL DEFAULT '/tmp'",
-    # 2026-04-21: per-session env (identity, non-secret) and secrets.
-    # Secrets are plaintext JSONB for now — see SECRETS_PLAINTEXT tech-debt
-    # note in models.py. Phase 2 adds envelope encryption.
-    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS env JSONB NOT NULL DEFAULT '{}'::jsonb",
-    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS secrets JSONB NOT NULL DEFAULT '{}'::jsonb",
-    # 2026-04-21: decouple sessions from sandboxes; bind to volumes.
-    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS volume_id TEXT REFERENCES volumes(id) ON DELETE RESTRICT",
-    # Rename sandbox_id -> current_sandbox_id (idempotent: no-op if already done).
-    """DO $$ BEGIN
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sessions' AND column_name='sandbox_id')
-           AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sessions' AND column_name='current_sandbox_id') THEN
-            ALTER TABLE sessions RENAME COLUMN sandbox_id TO current_sandbox_id;
-        END IF;
-    END $$""",
-    # Drop the old index (created by _PG_SCHEMA on sandbox_id) and recreate on
-    # current_sandbox_id. DROP IF EXISTS is safe if it was never created.
-    "DROP INDEX IF EXISTS idx_sessions_sandbox",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_current_sandbox ON sessions(current_sandbox_id)",
-    "ALTER TABLE sessions ALTER COLUMN current_sandbox_id DROP NOT NULL",
-    # Drop any CASCADE FK on current_sandbox_id, replace with SET NULL.
-    "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_sandbox_id_fkey",
-    "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_current_sandbox_id_fkey",
-    """ALTER TABLE sessions ADD CONSTRAINT sessions_current_sandbox_id_fkey
-        FOREIGN KEY (current_sandbox_id) REFERENCES sandboxes(id) ON DELETE SET NULL""",
-    # session_log no longer lifecycle-coupled to sandbox.
-    "ALTER TABLE session_log ALTER COLUMN sandbox_id DROP NOT NULL",
-    "ALTER TABLE session_log DROP CONSTRAINT IF EXISTS session_log_sandbox_id_fkey",
-    """ALTER TABLE session_log ADD CONSTRAINT session_log_sandbox_id_fkey
-        FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE SET NULL""",
-    # 2026-04-21: sandboxes become volume-aware.
-    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS volume_id TEXT REFERENCES volumes(id) ON DELETE RESTRICT",
-    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS subpath  TEXT",
-    # 2026-04-21: backfill volume_id + subpath for pre-existing rows, then enforce NOT NULL.
-    # Create a "legacy" volume per distinct provider in the sandboxes table.
-    """DO $$
-    DECLARE p TEXT;
-    DECLARE legacy_id TEXT;
-    BEGIN
-        -- Providers from sandboxes
-        FOR p IN SELECT DISTINCT provider FROM sandboxes WHERE provider IS NOT NULL LOOP
-            legacy_id := 'vol_legacy_' || p;
-            INSERT INTO volumes (id, name, provider, provider_ref, status)
-            VALUES (legacy_id, 'legacy-' || p, p, 'legacy-backfill', 'ready')
-            ON CONFLICT (id) DO NOTHING;
-        END LOOP;
-        -- If there are no sandboxes but there are sessions with NULL volume_id,
-        -- ensure at least one legacy volume exists so the backfill has a target.
-        IF EXISTS (SELECT 1 FROM sessions WHERE volume_id IS NULL)
-           AND NOT EXISTS (SELECT 1 FROM volumes) THEN
-            INSERT INTO volumes (id, name, provider, provider_ref, status)
-            VALUES ('vol_legacy_daytona', 'legacy-daytona', 'daytona', 'legacy-backfill', 'ready')
-            ON CONFLICT (id) DO NOTHING;
-        END IF;
-    END $$""",
-    # Backfill sessions.volume_id from the matching legacy volume (by provider of current sandbox).
-    # If the session has no current sandbox, point at the first legacy volume.
-    """UPDATE sessions s SET volume_id = (
-        SELECT id FROM volumes
-        WHERE provider = COALESCE(
-            (SELECT provider FROM sandboxes WHERE id = s.current_sandbox_id),
-            (SELECT provider FROM volumes LIMIT 1)
-        ) LIMIT 1
-    ) WHERE s.volume_id IS NULL""",
-    # Backfill sandboxes.volume_id from the matching legacy volume.
-    """UPDATE sandboxes SET volume_id = (
-        SELECT id FROM volumes WHERE provider = sandboxes.provider LIMIT 1
-    ) WHERE volume_id IS NULL""",
-    # Backfill sandboxes.subpath with a placeholder for pre-existing rows.
-    "UPDATE sandboxes SET subpath = 'legacy' WHERE subpath IS NULL",
-    # Enforce NOT NULL now that backfill is done.
-    """DO $$ BEGIN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name='sessions' AND column_name='volume_id' AND is_nullable='YES'
-        ) THEN
-            ALTER TABLE sessions ALTER COLUMN volume_id SET NOT NULL;
-        END IF;
-    END $$""",
-    """DO $$ BEGIN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name='sandboxes' AND column_name='volume_id' AND is_nullable='YES'
-        ) THEN
-            ALTER TABLE sandboxes ALTER COLUMN volume_id SET NOT NULL;
-        END IF;
-    END $$""",
-    """DO $$ BEGIN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name='sandboxes' AND column_name='subpath' AND is_nullable='YES'
-        ) THEN
-            ALTER TABLE sandboxes ALTER COLUMN subpath SET NOT NULL;
-        END IF;
-    END $$""",
-    # 2026-04-22: cache which agent_types have their supervisor installed on each volume.
-    # Avoids a 30s utility-sandbox probe on every Daytona sandbox boot.
-    "ALTER TABLE volumes ADD COLUMN IF NOT EXISTS supervisor_agent_types JSONB NOT NULL DEFAULT '[]'::jsonb",
-    # 2026-04-22: split sandbox_ref vs. listen_port so docker/local can store
-    # both container_id / pid *and* the host port the supervisor is listening on.
-    # Daytona rows leave listen_port NULL (URL comes from the signed preview API).
-    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS listen_port INTEGER",
-    # 2026-04-23: config ownership split — cwd belongs to session (JSONL hash
-    # key, per-conversation), dockerfile + shared_mounts belong to sandbox
-    # (provisioning-time identity; must survive sandbox replacement). Agent is
-    # pure identity (agent_type, model, prompt, tools, mcp_servers, skills).
-    "ALTER TABLE sessions  ADD COLUMN IF NOT EXISTS cwd TEXT",
-    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS dockerfile TEXT",
-    "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS shared_mounts JSONB NOT NULL DEFAULT '[]'::jsonb",
-    # Backfill from agents.config before dropping those keys. Each session's
-    # cwd comes from its agent; each sandbox's dockerfile/shared_mounts come
-    # from the agent currently bound via sessions.current_sandbox_id.
-    """UPDATE sessions s SET cwd = COALESCE(
-        (SELECT a.config->>'cwd' FROM agents a WHERE a.id = s.agent_id),
-        '/tmp'
-    ) WHERE cwd IS NULL""",
-    """UPDATE sandboxes sb SET dockerfile = (
-        SELECT a.config->>'dockerfile' FROM agents a
-        JOIN sessions s ON s.agent_id = a.id
-        WHERE s.current_sandbox_id = sb.id
-        LIMIT 1
-    ) WHERE dockerfile IS NULL""",
-    """UPDATE sandboxes sb SET shared_mounts = COALESCE((
-        SELECT a.config->'shared_mounts' FROM agents a
-        JOIN sessions s ON s.agent_id = a.id
-        WHERE s.current_sandbox_id = sb.id
-          AND jsonb_typeof(a.config->'shared_mounts') = 'array'
-        LIMIT 1
-    ), '[]'::jsonb) WHERE shared_mounts = '[]'::jsonb""",
-    # Enforce NOT NULL on sessions.cwd now that backfill is done.
-    "ALTER TABLE sessions ALTER COLUMN cwd SET DEFAULT '/tmp'",
-    """DO $$ BEGIN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name='sessions' AND column_name='cwd' AND is_nullable='YES'
-        ) THEN
-            ALTER TABLE sessions ALTER COLUMN cwd SET NOT NULL;
-        END IF;
-    END $$""",
-    # Drop the moved keys from agents.config so server reads stop finding them.
-    "UPDATE agents SET config = config - 'cwd' - 'dockerfile' - 'shared_mounts' - 'env' WHERE config IS NOT NULL",
-    # 2026-04-23: the 2026-04-21 backfill (around line 125 above) inserts
-    # synthetic volumes with provider_ref='legacy-backfill' so pre-refactor
-    # sessions have SOMETHING to point at. That placeholder isn't a real
-    # provider-side volume, so daytona.create rejects every mount of it
-    # and the user sees 500 on /events. Redirect any session/sandbox that
-    # still points at a legacy stub to the provider's ``default-<provider>``
-    # volume (which has a real provider_ref), then delete the stub. If a
-    # default isn't present yet for that provider, leave the legacy row
-    # alone — the next caller that goes through _resolve_or_default_volume
-    # will create one and re-run of this migration on the next deploy will
-    # then repoint. Idempotent: the WHERE provider_ref='legacy-backfill'
-    # clause means re-running on already-healed rows is a no-op.
-    """DO $$
-    DECLARE legacy RECORD;
-    DECLARE default_id TEXT;
-    BEGIN
-        FOR legacy IN
-            SELECT id, provider FROM volumes WHERE provider_ref = 'legacy-backfill'
-        LOOP
-            SELECT id INTO default_id
-            FROM volumes
-            WHERE name = 'default-' || legacy.provider
-              AND provider_ref <> 'legacy-backfill'
-            LIMIT 1;
-            IF default_id IS NOT NULL THEN
-                UPDATE sessions  SET volume_id = default_id WHERE volume_id = legacy.id;
-                UPDATE sandboxes SET volume_id = default_id WHERE volume_id = legacy.id;
-                DELETE FROM volumes WHERE id = legacy.id;
-            END IF;
-        END LOOP;
-    END $$""",
-    # 2026-04-26: persist caller-supplied pre_start_commands on the session row
-    # so they can be re-run when a new sandbox is provisioned (Type 2 recovery).
-    # Only the raw user commands are stored; skill-install commands are re-merged
-    # from agent.config.skills at recovery time.
-    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pre_start_commands"
-    " JSONB NOT NULL DEFAULT '[]'::jsonb",
-    # 2026-04-30: shadow ``sandbox_state`` JSONB on the session row.
-    # Today the canonical sandbox identity lives in the ``sandboxes`` table
-    # and the session row holds ``current_sandbox_id`` as an FK. Recovery
-    # (``_ensure_sandbox_locked`` / ``_type1_recover`` / ``_type2_recover``)
-    # JOINs from sessions through sandboxes on every check.
-    #
-    # This column dual-writes the relevant fields so callers can read
-    # everything they need from the session row alone — foundation for a
-    # subsequent PR that drops the sandboxes table entirely. Writes still
-    # go to both via the trigger; reads stay through the legacy table for
-    # back-compat in this PR.
-    #
+    # 2026-05-04 squash: removed all migrations dated 2026-04-26 or earlier.
+    # The columns they added (env, secrets, volume_id, cwd, pre_start_commands)
+    # are now in the CREATE TABLE above, so fresh DBs get them via DDL; prod
+    # already ran the ALTERs months ago. Pre-squash legacy lived in the now-
+    # dropped ``sandboxes`` table, which built up ~50 ALTER/UPDATE statements
+    # that each failed harmlessly on every boot post-2026-04-30
+    # ``DROP TABLE sandboxes``. The terminal cleanup at the bottom is kept
+    # idempotent for any DB that somehow missed the original drop.
+
+    # 2026-04-30: ``sandbox_state`` JSONB on the session row is the canonical
+    # sandbox identity (the parallel ``sandboxes`` table is dropped below).
     # Shape (mirrored from a SandboxRecord row):
-    #   { "type": <provider>, "sandbox_id": <provider_ref>,
+    #   { "type": <provider>, "sandbox_ref": <provider_ref>,
     #     "listen_port": int|null, "snapshot_path": str|null,
     #     "snapshot_version": int,
     #     "recipe": {dockerfile, shared_mounts, root, agent_type, pre_start_commands} }
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_state JSONB",
-    # Drop any leftover triggers from prior experimental branches so this
-    # migration's _sandbox_state_* triggers are the only ones writing to
-    # ``sandbox_state``. Idempotent.
-    "DROP TRIGGER IF EXISTS _ephemeral_sandboxes_sync ON sandboxes",
+    # 2026-04-30: drop the ``sandboxes`` table + all its mirrors. The pool's
+    # ``sessions.sandbox_state`` JSONB is the runtime source of truth; the
+    # trigger machinery that used to mirror writes from the ``sandboxes``
+    # table into ``sandbox_state`` is gone. All idempotent — no-ops on fresh
+    # DBs, applies the drop on any DB that ran the pre-squash migrations.
+    "DROP TRIGGER IF EXISTS _sandbox_state_sessions_sync ON sessions",
     "DROP TRIGGER IF EXISTS _ephemeral_sessions_sync ON sessions",
+    "DROP FUNCTION IF EXISTS _sync_sandbox_state_from_sandboxes() CASCADE",
+    "DROP FUNCTION IF EXISTS _sync_sandbox_state_from_sessions() CASCADE",
+    "DROP FUNCTION IF EXISTS _compute_sandbox_state(TEXT, TEXT, JSONB, TEXT) CASCADE",
     "DROP FUNCTION IF EXISTS _ephemeral_sync_sandbox_state_from_sandboxes() CASCADE",
     "DROP FUNCTION IF EXISTS _ephemeral_sync_sandbox_state_from_sessions() CASCADE",
     "DROP FUNCTION IF EXISTS _ephemeral_compute_sandbox_state(TEXT, TEXT, JSONB, TEXT) CASCADE",
     "DROP FUNCTION IF EXISTS _ephemeral_compute_sandbox_state(TEXT, TEXT, JSONB) CASCADE",
-    """CREATE OR REPLACE FUNCTION _compute_sandbox_state(
-           sb_id TEXT, agent_id_in TEXT, pre_start_in JSONB, volume_id_in TEXT
-       ) RETURNS JSONB AS $$
-       DECLARE
-           sb RECORD;
-           agent_type TEXT;
-           volume_provider TEXT;
-       BEGIN
-           SELECT a.config->>'agent_type' INTO agent_type
-               FROM agents a WHERE a.id = agent_id_in;
-           SELECT v.provider INTO volume_provider
-               FROM volumes v WHERE v.id = volume_id_in;
-           IF sb_id IS NULL THEN
-               RETURN jsonb_build_object(
-                   'type',             COALESCE(volume_provider, 'unknown'),
-                   'sandbox_id',       NULL,
-                   'snapshot_path',    NULL,
-                   'snapshot_version', 0,
-                   'listen_port',      NULL,
-                   'recipe', jsonb_build_object(
-                       'dockerfile',          NULL,
-                       'shared_mounts',       '[]'::jsonb,
-                       'root',                NULL,
-                       'agent_type',          COALESCE(agent_type, 'claude'),
-                       'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
-                   )
-               );
-           END IF;
-           SELECT * INTO sb FROM sandboxes WHERE id = sb_id;
-           IF NOT FOUND THEN
-               RETURN jsonb_build_object(
-                   'type',             COALESCE(volume_provider, 'unknown'),
-                   'sandbox_id',       NULL,
-                   'snapshot_path',    NULL,
-                   'snapshot_version', 0,
-                   'listen_port',      NULL,
-                   'recipe', jsonb_build_object(
-                       'dockerfile',          NULL,
-                       'shared_mounts',       '[]'::jsonb,
-                       'root',                NULL,
-                       'agent_type',          COALESCE(agent_type, 'claude'),
-                       'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
-                   )
-               );
-           END IF;
-           RETURN jsonb_build_object(
-               'type',             sb.provider,
-               'sandbox_id',       sb.sandbox_ref,
-               'snapshot_path',    NULL,
-               'snapshot_version', 0,
-               'listen_port',      sb.listen_port,
-               'recipe', jsonb_build_object(
-                   'dockerfile',          sb.dockerfile,
-                   'shared_mounts',       COALESCE(sb.shared_mounts, '[]'::jsonb),
-                   'root',                sb.root,
-                   'agent_type',          COALESCE(agent_type, 'claude'),
-                   'pre_start_commands',  COALESCE(pre_start_in, '[]'::jsonb)
-               )
-           );
-       END $$ LANGUAGE plpgsql""",
-    """CREATE OR REPLACE FUNCTION _sync_sandbox_state_from_sandboxes()
-       RETURNS TRIGGER AS $$
-       BEGIN
-           UPDATE sessions s
-           SET sandbox_state = _compute_sandbox_state(
-               NEW.id, s.agent_id, s.pre_start_commands, s.volume_id
-           )
-           WHERE s.current_sandbox_id = NEW.id;
-           RETURN NEW;
-       END $$ LANGUAGE plpgsql""",
-    """CREATE OR REPLACE FUNCTION _sync_sandbox_state_from_sessions()
-       RETURNS TRIGGER AS $$
-       BEGIN
-           NEW.sandbox_state := _compute_sandbox_state(
-               NEW.current_sandbox_id, NEW.agent_id, NEW.pre_start_commands, NEW.volume_id
-           );
-           RETURN NEW;
-       END $$ LANGUAGE plpgsql""",
-    "DROP TRIGGER IF EXISTS _sandbox_state_sandboxes_sync ON sandboxes",
-    """CREATE TRIGGER _sandbox_state_sandboxes_sync
-       AFTER INSERT OR UPDATE ON sandboxes
-       FOR EACH ROW EXECUTE FUNCTION _sync_sandbox_state_from_sandboxes()""",
-    "DROP TRIGGER IF EXISTS _sandbox_state_sessions_sync ON sessions",
-    """CREATE TRIGGER _sandbox_state_sessions_sync
-       BEFORE INSERT OR UPDATE OF current_sandbox_id, agent_id, pre_start_commands, volume_id ON sessions
-       FOR EACH ROW EXECUTE FUNCTION _sync_sandbox_state_from_sessions()""",
-    # One-shot backfill so existing rows aren't NULL until next write.
-    """UPDATE sessions s
-       SET sandbox_state = _compute_sandbox_state(
-           s.current_sandbox_id, s.agent_id, s.pre_start_commands, s.volume_id
-       )
-       WHERE s.sandbox_state IS NULL""",
-    # 2026-04-30: drop the sandboxes table + all its mirrors. The pool's
-    # ``sessions.sandbox_state`` JSONB has been the runtime source of
-    # truth since the d4 PR; this migration removes the trigger machinery
-    # that overwrote it, the parallel ``sandboxes`` table, the
-    # ``current_sandbox_id`` FK column, and the ``session_log.sandbox_id``
-    # FK column (write-only, zero readers).
-    "DROP TRIGGER IF EXISTS _sandbox_state_sandboxes_sync ON sandboxes",
-    "DROP TRIGGER IF EXISTS _sandbox_state_sessions_sync ON sessions",
-    "DROP FUNCTION IF EXISTS _sync_sandbox_state_from_sandboxes() CASCADE",
-    "DROP FUNCTION IF EXISTS _sync_sandbox_state_from_sessions() CASCADE",
-    "DROP FUNCTION IF EXISTS _compute_sandbox_state(TEXT, TEXT, JSONB, TEXT) CASCADE",
-    # Drop FK columns before the table they reference.
+    "DROP INDEX IF EXISTS idx_sessions_sandbox",
+    "DROP INDEX IF EXISTS idx_sessions_current_sandbox",
+    "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_sandbox_id_fkey",
     "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_current_sandbox_id_fkey",
     "ALTER TABLE sessions DROP COLUMN IF EXISTS current_sandbox_id",
     "ALTER TABLE session_log DROP CONSTRAINT IF EXISTS session_log_sandbox_id_fkey",
     "ALTER TABLE session_log DROP COLUMN IF EXISTS sandbox_id",
-    # Drop the now-orphaned table.
     "DROP TABLE IF EXISTS sandboxes",
     # 2026-04-30 (post-d5 rename): rename sandbox_state JSONB key
     # ``sandbox_id`` → ``sandbox_ref``. The field always held the
