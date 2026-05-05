@@ -62,6 +62,7 @@ class SessionPool:
         session_id: str,
         *,
         initial_state: SandboxState | None = None,
+        peek: bool = False,
     ) -> BaseSandboxSession:
         """Returns a known-alive SandboxSession. The single recovery
         entry point. Per docs §6.
@@ -71,6 +72,14 @@ class SessionPool:
         instead of pre-writing the ``sandbox_state`` column. For recovery
         (server restart, hibernated session resume) ``initial_state``
         stays ``None`` and the column is the source of truth.
+
+        ``peek=True`` opts out of cold-recovery: if the session is in
+        the live cache, return it as usual; if not, raise ``KeyError``
+        instead of provisioning a fresh sandbox. Used by read-only
+        endpoints (``GET /sessions/{id}/status``, ``/sandbox``,
+        ``/admin/sessions``) so a UI status poll on a hibernated session
+        doesn't accidentally unhibernate it. Caller should fall back to
+        a DB read of the persisted ``sandbox_state`` JSONB.
 
         Holds ``_locks[session_id]`` for the entire decide-and-start
         sequence so concurrent callers can't double-provision.
@@ -83,10 +92,14 @@ class SessionPool:
                 # immediately, even if the previous prompt's last chunk was
                 # observed seconds ago (the test 7 race class).
                 alive = await cached.running(force_probe=True)
-                log.info("[pool.get_session] session=%s cached=True alive=%s", session_id, alive)
+                log.info("[pool.get_session] session=%s cached=True alive=%s peek=%s", session_id, alive, peek)
                 if alive:
                     cached.liveness.observe_activity()
                     return cached
+                # Not alive. In peek mode, don't tear down or replace —
+                # caller wants a snapshot of state, not a side-effect.
+                if peek:
+                    raise KeyError(f"session {session_id} not in live pool (peek=True)")
                 # Stale entry; tear down runtime in background. We don't
                 # snapshot here — compute is dead, can't snapshot reliably.
                 # The previous successful per-turn snapshot is the fallback.
@@ -104,6 +117,11 @@ class SessionPool:
                 cached._subscribers.clear()
                 asyncio.create_task(_safe_shutdown(cached))
                 self._active.pop(session_id, None)
+
+            if peek:
+                # No cached entry → don't cold-recover; caller will read
+                # from DB.
+                raise KeyError(f"session {session_id} not in live pool (peek=True)")
 
             if initial_state is not None:
                 state: SandboxState = initial_state

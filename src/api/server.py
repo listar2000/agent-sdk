@@ -1092,8 +1092,15 @@ async def get_session_route(session_id: str):
 
 @app.get("/sessions/{session_id}/status")
 async def session_status(session_id: str):
-    """Session runtime status including last activity. Routes through
-    SessionPool — brings the SandboxSession up if it's been reaped.
+    """Session runtime status. Read-only — does NOT cold-recover a
+    hibernated session. UI status polls would otherwise unhibernate the
+    sandbox on every poll, defeating the reaper.
+
+    Tries the pool's live cache first (peek mode). If not cached, falls
+    back to a DB read of ``sessions.sandbox_state`` JSONB plus the
+    ``sessions`` row. Live-only fields (``last_activity``, subscriber
+    count, ``has_client``, ``supervisor_url``) become None / 0 / False
+    when the session isn't live in the pool.
 
     Several response keys (``agent_busy`` / ``active_rpc_id`` /
     ``pending_count`` / ``rpc_subscriber_count`` / ``available_commands``)
@@ -1102,10 +1109,35 @@ async def session_status(session_id: str):
     shape back-compat with the dashboard."""
     from api.sandbox import get_pool
 
-    pool_session = await get_pool().get_session(session_id)
+    now = time.time()
+    try:
+        pool_session = await get_pool().get_session(session_id, peek=True)
+    except KeyError:
+        sess = await get_session(session_id)
+        if sess is None:
+            raise HTTPException(404, f"Session {session_id} not found")
+        sb_state = sess.get("sandbox_state") or {}
+        sandbox_ref = sb_state.get("sandbox_ref") if isinstance(sb_state, dict) else None
+        return {
+            "session_id": session_id,
+            "agent_id": sess.get("agent_id"),
+            "sandbox_ref": sandbox_ref,
+            "inner_session_id": sess.get("inner_session_id"),
+            "agent_busy": False,
+            "active_rpc_id": None,
+            "pending_count": 0,
+            "session_subscriber_count": 0,
+            "rpc_subscriber_count": 0,
+            "last_activity": None,
+            "idle_seconds": None,
+            "has_client": False,
+            "shutdown_requested": False,
+            "available_commands": [],
+            "supervisor_url": None,
+            "supervisor_port": sb_state.get("listen_port") if isinstance(sb_state, dict) else None,
+        }
     state = pool_session.state
     last_chunk = pool_session.liveness._last_chunk_at
-    now = time.time()
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
@@ -1128,17 +1160,40 @@ async def session_status(session_id: str):
 
 @app.get("/sessions/{session_id}/sandbox")
 async def session_sandbox_info(session_id: str):
-    """Sandbox metadata read straight from the SessionPool — no
-    sandboxes-table dependency.
+    """Sandbox metadata. Read-only — does NOT cold-recover a hibernated
+    session. Falls back to a DB read of ``sessions.sandbox_state`` JSONB
+    when the session isn't in the live pool.
 
     Returns the same shape as ``GET /sandboxes/{id}`` (provider,
     sandbox_ref, status, root, url for port-based providers,
     marker_path for local) so test helpers and admin UIs that need
     sandbox info can stay in session-id space and avoid the
-    sandbox-row-id round trip. Brings the SandboxSession up if it's
-    been hibernated."""
-    from api.sandbox import get_pool
-    pool_session = await get_pool().get_session(session_id)
+    sandbox-row-id round trip. ``url`` is omitted when the session
+    isn't live (no supervisor running)."""
+    from api.sandbox import deserialize, get_pool
+    try:
+        pool_session = await get_pool().get_session(session_id, peek=True)
+    except KeyError:
+        # Not in live pool — read from DB
+        sb_payload = await read_sandbox_state(session_id)
+        if sb_payload is None:
+            raise HTTPException(404, f"Session {session_id} not found")
+        state = deserialize(sb_payload)
+        provider = getattr(state, "type", "unknown")
+        sandbox_ref = getattr(state, "sandbox_ref", None)
+        result: dict = {
+            "session_id": session_id,
+            "provider": provider,
+            "sandbox_ref": sandbox_ref,
+            "status": "hibernated" if sandbox_ref else "missing",
+            "root": (state.recipe.root if state.recipe else None) or "/tmp",
+        }
+        if provider == "unix_local" and sandbox_ref:
+            from .providers.unix_local import _load_record
+            marker, _rec = await asyncio.to_thread(_load_record, sandbox_ref)
+            if marker is not None:
+                result["marker_path"] = str(marker)
+        return result
     state = pool_session.state
     # Provider name is the canonical ``state.type`` discriminator —
     # ``"unix_local"`` for the unix subprocess provider; no legacy
