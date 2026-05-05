@@ -83,6 +83,14 @@ class BaseSandboxSession(abc.ABC):
         self._acp_session_id: str | None = None
         self._acp_attached: bool = False
         self._supervisor_installed: bool = False
+        # Cached AcpClient bound to this session's supervisor URL. Constructed
+        # lazily on first use, reused across every acp_call / set_mode / etc.
+        # so we don't re-handshake TCP+TLS on every notification. Closed in
+        # shutdown(). The supervisor URL is set during start() and doesn't
+        # change for the session's lifetime, so caching by URL is safe.
+        from api.acp_client import AcpClient as _AcpClient  # type-only-ish
+        self._acp_client_cls = _AcpClient
+        self._acp_client: _AcpClient | None = None
 
     async def _bootstrap_session(self) -> str:
         """Idempotent: load the session row + volume from DB, install the
@@ -175,53 +183,49 @@ class BaseSandboxSession(abc.ABC):
             return
 
         from api import db as _db
-        from api.acp_client import AcpClient
 
-        client = AcpClient(self._supervisor_url)
-        try:
-            await client.attach(
-                self._acp_session_id,
-                self.state.recipe.agent_type,
-                cwd=self._cwd,
-                inner_session_id=self._inner_session_id,
-            )
-            self._inner_session_id = client.get_inner_session_id(
-                self._acp_session_id
-            )
-            # Re-apply persisted ACP dynamic config. Read fresh from DB
-            # rather than caching on the session object — POST /config
-            # writes to agents.config so a mid-flight change there also
-            # propagates on the next attach. Each set_* is bounded best-
-            # effort: a transient failure on one shouldn't block the
-            # others (e.g. supervisor accepts model but rejects an
-            # unknown thought_level — keep the model change).
-            if self._agent_id and self._inner_session_id:
+        client = self._get_acp_client()
+        await client.attach(
+            self._acp_session_id,
+            self.state.recipe.agent_type,
+            cwd=self._cwd,
+            inner_session_id=self._inner_session_id,
+        )
+        self._inner_session_id = client.get_inner_session_id(
+            self._acp_session_id
+        )
+        # Re-apply persisted ACP dynamic config. Read fresh from DB
+        # rather than caching on the session object — POST /config
+        # writes to agents.config so a mid-flight change there also
+        # propagates on the next attach. Each set_* is bounded best-
+        # effort: a transient failure on one shouldn't block the
+        # others (e.g. supervisor accepts model but rejects an
+        # unknown thought_level — keep the model change).
+        if self._agent_id and self._inner_session_id:
+            try:
+                agent = await _db.get_agent(self._agent_id)
+                cfg = agent.config if agent else None
+            except Exception:
+                cfg = None
+            replay = []
+            if cfg:
+                if cfg.model:
+                    replay.append(("model", client.set_model, cfg.model))
+                if cfg.mode:
+                    replay.append(("mode", client.set_mode, cfg.mode))
+                if cfg.thought_level:
+                    replay.append(("thought_level",
+                                   client.set_thought_level,
+                                   cfg.thought_level))
+            for name, fn, val in replay:
                 try:
-                    agent = await _db.get_agent(self._agent_id)
-                    cfg = agent.config if agent else None
+                    await fn(self._acp_session_id, val)
                 except Exception:
-                    cfg = None
-                replay = []
-                if cfg:
-                    if cfg.model:
-                        replay.append(("model", client.set_model, cfg.model))
-                    if cfg.mode:
-                        replay.append(("mode", client.set_mode, cfg.mode))
-                    if cfg.thought_level:
-                        replay.append(("thought_level",
-                                       client.set_thought_level,
-                                       cfg.thought_level))
-                for name, fn, val in replay:
-                    try:
-                        await fn(self._acp_session_id, val)
-                    except Exception:
-                        import logging
-                        logging.getLogger(__name__).exception(
-                            "set_%s replay failed for session %s",
-                            name, self.session_id,
-                        )
-        finally:
-            await client.aclose()
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "set_%s replay failed for session %s",
+                        name, self.session_id,
+                    )
 
         self._acp_attached = True
         # The ACP attach above is itself a successful round-trip to the
@@ -254,33 +258,74 @@ class BaseSandboxSession(abc.ABC):
         ``session/load`` on cold-recovery)."""
         return self._inner_session_id
 
+    def _get_acp_client(self) -> "AcpClient":  # noqa: F821
+        """Lazily construct and cache the AcpClient bound to this session's
+        supervisor URL. Reused across attach + every acp_call / set_*
+        invocation so we don't pay TCP+TLS handshake on every notification.
+        Closed in ``shutdown()``. Caller must ensure ``_supervisor_url``
+        is set before calling — used internally where that's already true.
+
+        If ``_supervisor_url`` has been re-bound (e.g. Daytona signed-URL
+        refresh on reattach in ``_resolve_or_create_sandbox``), the stale
+        cached client is dropped and a fresh one is built. We don't await
+        ``aclose`` here because this is a sync helper — the loose httpx
+        connections are closed by their finaliser; the next ``shutdown()``
+        is the durable cleanup boundary.
+        """
+        assert self._supervisor_url is not None, (
+            "_get_acp_client called before supervisor URL is set"
+        )
+        if self._acp_client is not None and self._acp_client.base_url != self._supervisor_url.rstrip("/"):
+            self._acp_client = None
+        if self._acp_client is None:
+            self._acp_client = self._acp_client_cls(self._supervisor_url)
+        # Mirror the inner session id mapping so methods that look it up
+        # (set_mode, set_model, call) work even if the cached client was
+        # constructed before the session was attached.
+        if (
+            self._acp_session_id is not None
+            and self._inner_session_id is not None
+        ):
+            self._acp_client._inner_session_ids[self._acp_session_id] = (
+                self._inner_session_id
+            )
+        return self._acp_client
+
+    async def _aclose_acp_client(self) -> None:
+        """Close the cached AcpClient if any. Safe to call multiple times.
+        Concrete shutdown() impls call this so the underlying httpx pool
+        gets cleaned up alongside subscribers."""
+        if self._acp_client is not None:
+            try:
+                await self._acp_client.aclose()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "AcpClient.aclose failed for session %s",
+                    self.session_id,
+                    exc_info=True,
+                )
+            self._acp_client = None
+
     async def acp_call(
         self, method: str, params: dict | None = None, *, notify: bool = False,
     ) -> Any:
         """Forward a JSON-RPC call to this session's ACP supervisor.
 
-        Encapsulates ``AcpClient`` construction + the inner-session-id
-        cache prime that callers used to do by hand. Auto-injects the
-        inner ``sessionId`` into ``params`` so callers don't have to
-        track it. ``notify=True`` sends as a JSON-RPC notification (no
-        response).
+        Reuses the cached ``AcpClient`` so repeated calls share the same
+        keep-alive connection to the supervisor. Auto-injects the inner
+        ``sessionId`` into ``params`` so callers don't have to track it.
+        ``notify=True`` sends as a JSON-RPC notification (no response).
 
         Raises ``RuntimeError`` if the session has no live supervisor or
         no attached ACP session — the route handler maps that to 503.
         """
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("session has no live ACP supervisor")
-        from api.acp_client import AcpClient
-
-        client = AcpClient(self._supervisor_url)
-        if self._inner_session_id is not None:
-            client._inner_session_ids[self._acp_session_id] = self._inner_session_id
-        try:
-            return await client.call(
-                self._acp_session_id, method, params or {}, notify=notify,
-            )
-        finally:
-            await client.aclose()
+        client = self._get_acp_client()
+        return await client.call(
+            self._acp_session_id, method, params or {}, notify=notify,
+        )
 
     # --- Lifecycle methods (concrete subclasses override) ---
 
@@ -371,24 +416,16 @@ class BaseSandboxSession(abc.ABC):
     # --- ACP config: forward set_mode / set_model / set_thought_level ---
 
     async def _acp_call(self, method_name: str, *args) -> None:
-        """Open an ``AcpClient`` against this session's supervisor and
-        invoke ``method_name(self._acp_session_id, *args)``. Used by
-        the wrapper methods below so each one stays a one-liner.
+        """Invoke ``method_name(self._acp_session_id, *args)`` via the
+        cached ``AcpClient``. Used by the wrapper methods below so each
+        one stays a one-liner.
 
         No-op (silently) if the session has no live supervisor URL or
         no attached ACP session — same shape as ``cancel_active_prompt``."""
         if self._supervisor_url is None or self._acp_session_id is None:
             return
-        from api.acp_client import AcpClient  # local import: avoid cycles
-        client = AcpClient(self._supervisor_url)
-        # AcpClient indexes inner_session_ids by acp_session_id internally;
-        # mirror what attach() did so set_mode() etc can resolve it.
-        if self._inner_session_id is not None:
-            client._inner_session_ids[self._acp_session_id] = self._inner_session_id
-        try:
-            await getattr(client, method_name)(self._acp_session_id, *args)
-        finally:
-            await client.aclose()
+        client = self._get_acp_client()
+        await getattr(client, method_name)(self._acp_session_id, *args)
 
     async def set_mode(self, mode: str) -> None:
         await self._acp_call("set_mode", mode)

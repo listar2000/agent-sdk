@@ -243,3 +243,4 @@ class UnixLocalSandboxSession(BaseSandboxSession):
     async def shutdown(self) -> None:
         self._supervisor_url = None
         self._close_subscribers()
+        await self._aclose_acp_client()

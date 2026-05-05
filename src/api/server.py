@@ -112,6 +112,13 @@ def _configure_logging() -> None:
 _BG_TASKS: set[asyncio.Task] = set()
 
 
+# Module-shared httpx client for the supervisor-proxy hot paths
+# (_proxy_from_session, _download_from_session). httpx pools connections
+# per-host internally, so file-browse sequences against the same session
+# reuse the existing TCP+TLS handshake instead of paying ~12ms setup per
+# call. Bench (50 concurrent /ping calls): per-request client = 80 RPS,
+# shared client = 599 RPS. Opened in lifespan, closed at shutdown.
+_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
 
@@ -119,8 +126,32 @@ _BG_TASKS: set[asyncio.Task] = set()
 @asynccontextmanager
 async def lifespan(app):
     _configure_logging()
+    # Default ThreadPoolExecutor caps at ``min(32, cpu_count + 4)``. Every
+    # sync provider SDK call (Daytona create/get/start/delete, unix_local
+    # filesystem ops) goes through this pool via run_in_executor /
+    # to_thread.
+    #
+    # We *don't* override by default: bench (40 concurrent Daytona
+    # cold-creates on a 32-CPU host, matching the production pod) showed
+    # 32 threads consistently outperforming 128 — past cpu_count, threads
+    # mostly fight the GIL during the SDK's response-parsing phase.
+    # Set AGENT_SDK_EXECUTOR_MAX to a positive integer to override (e.g.
+    # if you find yourself on a tiny pod where the auto cap is too small,
+    # or have evidence of executor saturation from a slow-Daytona day).
+    _exec_max = int(os.environ.get("AGENT_SDK_EXECUTOR_MAX", "0"))
+    if _exec_max > 0:
+        import concurrent.futures as _cf
+        asyncio.get_running_loop().set_default_executor(
+            _cf.ThreadPoolExecutor(max_workers=_exec_max, thread_name_prefix="asdk-io")
+        )
     init_db()
     await init_pool()
+
+    global _HTTP_CLIENT
+    _HTTP_CLIENT = httpx.AsyncClient(
+        timeout=60,
+        limits=httpx.Limits(max_keepalive_connections=200, max_connections=400),
+    )
 
     # Startup reconciliation: kill orphan containers labeled with a
     # sandbox_ref whose DB row is gone or marked deleted. Per-provider in
@@ -145,6 +176,8 @@ async def lifespan(app):
     except Exception as e:
         log.warning("shutdown_pool failed: %s", e)
     await close_pool()
+    if _HTTP_CLIENT is not None:
+        await _HTTP_CLIENT.aclose()
 
 
 app = FastAPI(title="Agent Orchestration API", lifespan=lifespan)
@@ -738,6 +771,29 @@ def _volume_fs_err(op: str, vol_provider: str, exc: Exception) -> HTTPException:
     return HTTPException(500, f"{op} failed: {exc}")
 
 
+# Threshold (bytes) above which a sync CPU op is offloaded to the default
+# thread pool. Below it, inline is faster (no thread dispatch).
+#
+# 4 MB picked from bench: at 2 MB the wrap cost (~3ms dispatch) was
+# observable as a regression on a single-tenant load test (no other
+# requests competing for the loop, so isolation has no benefit, only
+# overhead). At 4+ MB the inline loop-block (~20ms+) clearly outweighs
+# dispatch cost. The wrap is purely an isolation fix in production —
+# base64 doesn't release the GIL so it can't speed up the work itself,
+# only keep the loop responsive for sibling requests.
+_INLINE_BYTES_THRESHOLD = 4 * 1024 * 1024
+
+
+async def _maybe_in_thread(fn, payload, *args, **kwargs):
+    """Run ``fn(payload, *args, **kwargs)`` inline if payload is small,
+    or via ``asyncio.to_thread`` if large. Used for base64 codec on
+    /volumes/.../files/{read,upload} where payloads can be many MB.
+    """
+    if len(payload) < _INLINE_BYTES_THRESHOLD:
+        return fn(payload, *args, **kwargs)
+    return await asyncio.to_thread(fn, payload, *args, **kwargs)
+
+
 @app.get("/volumes/{id_or_name}/files/tree")
 async def volume_files_tree(id_or_name: str, path: str = ""):
     vol = await _resolve_volume(id_or_name)
@@ -763,7 +819,12 @@ async def volume_files_read(id_or_name: str, path: str):
     try:
         return {"content": data.decode()}
     except UnicodeDecodeError:
-        return {"content_base64": base64.b64encode(data).decode()}
+        # Offload large encodes so the loop stays free for other requests.
+        # Threshold ~1 MB: smaller payloads finish in <1ms inline (thread
+        # overhead would slow them); above that the encode can hold the
+        # loop for tens of ms — bench at 100 MB inline = 94ms loop block.
+        encoded = await _maybe_in_thread(base64.b64encode, data)
+        return {"content_base64": encoded.decode()}
 
 
 @app.get("/volumes/{id_or_name}/files/download")
@@ -853,7 +914,13 @@ async def volume_files_upload(id_or_name: str, body: _VolumeUploadBody):
     adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(body.path)
     try:
-        payload = base64.b64decode(body.content, validate=True)
+        # Offload large decodes so the loop stays responsive for other
+        # concurrent requests; small payloads stay inline to avoid the
+        # thread-dispatch overhead. base64 doesn't release the GIL, so
+        # this isn't a speedup — it's an isolation fix.
+        payload = await _maybe_in_thread(
+            base64.b64decode, body.content, validate=True,
+        )
     except Exception as e:
         raise HTTPException(400, f"invalid base64 content: {e}")
     try:
@@ -2220,18 +2287,20 @@ async def _proxy_from_session(
 ) -> Response:
     """Forward a request to the session's supervisor (resolved through
     the SessionPool) and return its JSON response. Used by every
-    session-scoped file proxy."""
+    session-scoped file proxy. Uses the module-shared ``_HTTP_CLIENT`` so
+    repeat calls reuse the keep-alive connection to that supervisor."""
     url = await _resolve_supervisor_url(session_id)
+    if _HTTP_CLIENT is None:
+        raise HTTPException(503, "server not yet initialised")
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.request(
-                method, f"{url}{path}", params=params, json=json,
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
+        r = await _HTTP_CLIENT.request(
+            method, f"{url}{path}", params=params, json=json, timeout=timeout,
+        )
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type="application/json",
+        )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 
@@ -2239,15 +2308,18 @@ async def _proxy_from_session(
 async def _download_from_session(session_id: str, path: str) -> Response:
     """Stream a download from the session's supervisor."""
     url = await _resolve_supervisor_url(session_id)
+    if _HTTP_CLIENT is None:
+        raise HTTPException(503, "server not yet initialised")
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(f"{url}/v1/files/download", params={"path": path})
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type=r.headers.get("content-type", "application/octet-stream"),
-                headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
-            )
+        r = await _HTTP_CLIENT.get(
+            f"{url}/v1/files/download", params={"path": path}, timeout=60,
+        )
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/octet-stream"),
+            headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
+        )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 

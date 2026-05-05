@@ -273,3 +273,4 @@ class DockerSandboxSession(BaseSandboxSession):
         self._container_id = None
         self._supervisor_url = None
         self._close_subscribers()
+        await self._aclose_acp_client()
