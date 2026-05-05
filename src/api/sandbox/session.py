@@ -428,6 +428,7 @@ class BaseSandboxSession(abc.ABC):
         # the source supervisor stream. Per docs §15.5 — keep today's behaviour.
         q: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._subscribers[sid] = q
+        self.liveness.observe_activity()
         return sid, q
 
     async def iterate_subscriber(
@@ -448,10 +449,12 @@ class BaseSandboxSession(abc.ABC):
                         q.get(), timeout=_HEARTBEAT_INTERVAL_S,
                     )
                 except asyncio.TimeoutError:
+                    self.liveness.observe_activity()
                     yield _HEARTBEAT
                     continue
                 if event is _END:
                     return
+                self.liveness.observe_activity()
                 yield event
         finally:
             self._subscribers.pop(sid, None)

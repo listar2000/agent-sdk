@@ -117,6 +117,12 @@ class TestLiveness:
         live.observe_error()
         assert live.state == "dead"
 
+    def test_observe_activity_does_not_revive_dead_session(self):
+        live = Liveness()
+        live.observe_error()
+        live.observe_activity()
+        assert live.state == "dead"
+
     @pytest.mark.asyncio
     async def test_is_alive_returns_true_when_recently_observed(self):
         live = Liveness()
@@ -164,3 +170,66 @@ class TestLiveness:
         live.observe_chunk()  # state = alive, no probe needed
         await live.is_alive(force_probe=True)
         assert probe_calls == [1], "force_probe should bypass the alive cache"
+
+
+# ---------------------------------------------------------------------------
+# pool.py — idle reaper provider thresholds
+# ---------------------------------------------------------------------------
+
+class _FakePoolSession:
+    def __init__(self, state):
+        self.state = state
+        self.liveness = Liveness()
+        self._subscribers = {}
+
+
+class TestSessionPoolReaper:
+    @pytest.mark.asyncio
+    async def test_reap_idle_uses_provider_specific_threshold(self, monkeypatch):
+        from api.sandbox.pool import SessionPool
+
+        pool = SessionPool(factory=lambda _sid, _state: None)
+        daytona = _FakePoolSession(DaytonaSandboxState(recipe=Recipe()))
+        modal = _FakePoolSession(ModalSandboxState(recipe=Recipe()))
+        for sess in (daytona, modal):
+            sess.liveness.observe_activity()
+            sess.liveness._last_chunk_at -= 10
+        pool._active = {"daytona": daytona, "modal": modal}
+
+        released = []
+
+        async def _release(session_id):
+            released.append(session_id)
+
+        monkeypatch.setattr(pool, "release", _release)
+
+        count = await pool.reap_idle(
+            5,
+            provider_idle_s={"modal": 60},
+        )
+
+        assert count == 1
+        assert released == ["daytona"]
+
+    @pytest.mark.asyncio
+    async def test_reap_idle_keeps_active_event_subscribers_warm(self, monkeypatch):
+        from api.sandbox.pool import SessionPool
+
+        pool = SessionPool(factory=lambda _sid, _state: None)
+        modal = _FakePoolSession(ModalSandboxState(recipe=Recipe()))
+        modal.liveness.observe_activity()
+        modal.liveness._last_chunk_at -= 10
+        modal._subscribers["ui"] = asyncio.Queue()
+        pool._active = {"modal": modal}
+
+        released = []
+
+        async def _release(session_id):
+            released.append(session_id)
+
+        monkeypatch.setattr(pool, "release", _release)
+
+        count = await pool.reap_idle(5)
+
+        assert count == 0
+        assert released == []

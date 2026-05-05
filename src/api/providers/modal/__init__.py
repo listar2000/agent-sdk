@@ -79,16 +79,17 @@ _SUPERVISOR_CONTAINER_PORT = 9100
 # Sandbox lifetime caps. We lean on Modal's native ``idle_timeout`` to reap
 # quiet sandboxes; the orphan reaper (``reconcile_on_startup``) is the safety
 # net for anything that escapes both. Hard ceiling is 1 h so a forgotten
-# sandbox can't outlive the natural session window. Both supervisor heartbeats
-# and ACP requests count as activity for ``idle_timeout``.
+# sandbox can't outlive the natural session window. HTTP traffic through the
+# Modal tunnel counts as activity for ``idle_timeout``.
 #
-# Idle window is set well above ``AGENT_SDK_REAPER_IDLE_S`` (default 180s) so
-# our pool reaper wins the hibernation race — otherwise Modal SIGTERMs the
-# supervisor before our ``stop()`` POSTs ``/v1/snapshot``, and the HTTP call
-# fails with ``RemoteProtocolError: Server disconnected without sending a
-# response`` against the now-shutting tunnel.
+# Keep the Modal-native idle window above the pool's Modal reaper window so
+# our ``stop()`` path can POST ``/v1/snapshot`` before Modal SIGTERMs the
+# supervisor. This avoids repeated cold starts while preserving graceful
+# hibernation for idle sessions.
 _SANDBOX_TIMEOUT_SEC = 3600
-_SANDBOX_IDLE_TIMEOUT_SEC = 300
+_SANDBOX_IDLE_TIMEOUT_SEC = int(float(
+    os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "2100")
+))
 
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
