@@ -54,7 +54,7 @@ async def test_get_image_prefers_committed_modal_snapshot(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_modal_runs_pre_start_before_supervisor_health(monkeypatch) -> None:
-    events: list[tuple[str, str]] = []
+    events: list[tuple[str, str, int | None]] = []
 
     class FakeTunnel:
         url = "https://example.modal.host"
@@ -68,14 +68,14 @@ async def test_modal_runs_pre_start_before_supervisor_health(monkeypatch) -> Non
             return {mprov._SUPERVISOR_CONTAINER_PORT: FakeTunnel()}
 
         def terminate(self):
-            events.append(("terminate", ""))
+            events.append(("terminate", "", None))
 
     fake_sb = FakeSandbox()
 
     class FakeSandboxFactory:
         @staticmethod
         def create(*args, **_kwargs):
-            events.append(("create", args[2]))
+            events.append(("create", args[2], None))
             return fake_sb
 
     async def fake_get_app():
@@ -88,11 +88,11 @@ async def test_modal_runs_pre_start_before_supervisor_health(monkeypatch) -> Non
         return SimpleNamespace()
 
     async def fake_exec(_sb, cmd: str, *, timeout: int):
-        events.append(("exec", cmd))
+        events.append(("exec", cmd, timeout))
         return 0, "", ""
 
     async def fake_wait(url: str, *, max_retries: int, interval: float):
-        events.append(("health", url))
+        events.append(("health", url, None))
         return True
 
     from api.providers import _shared as shared
@@ -113,10 +113,75 @@ async def test_modal_runs_pre_start_before_supervisor_health(monkeypatch) -> Non
     )
 
     assert result.sandbox_ref == "sb-test"
-    assert [name for name, _ in events] == ["create", "exec", "exec", "health"]
+    assert [name for name, _, _ in events] == ["create", "exec", "exec", "health"]
     entrypoint = events[0][1]
     assert "tail -f /dev/null" in entrypoint
     assert "echo setup" not in entrypoint
     assert "supervisor.js" not in entrypoint
+    assert "ln -s /v/agents/sessions/test /home/agent" not in entrypoint
+    assert "mkdir -p /home/agent" in entrypoint
     assert "echo setup" in events[1][1]
     assert "nohup" in events[2][1]
+    assert "--snapshot-path /v/agents/sessions/test/snapshot.tar" in events[2][1]
+
+
+@pytest.mark.asyncio
+async def test_modal_uses_daytona_style_pre_start_timeout_for_skills(monkeypatch) -> None:
+    exec_timeouts: list[int] = []
+
+    class FakeTunnel:
+        url = "https://example.modal.host"
+
+    class FakeSandbox:
+        object_id = "sb-test"
+        stdout = SimpleNamespace(read=lambda: "")
+        stderr = SimpleNamespace(read=lambda: "")
+
+        def tunnels(self, _timeout: int):
+            return {mprov._SUPERVISOR_CONTAINER_PORT: FakeTunnel()}
+
+        def terminate(self):
+            raise AssertionError("should not terminate")
+
+    class FakeSandboxFactory:
+        @staticmethod
+        def create(*_args, **_kwargs):
+            return FakeSandbox()
+
+    async def fake_exec(_sb, _cmd: str, *, timeout: int):
+        exec_timeouts.append(timeout)
+        return 0, "", ""
+
+    async def fake_get_app():
+        return SimpleNamespace(app_id="app-test")
+
+    async def fake_get_image():
+        return SimpleNamespace()
+
+    async def fake_get_volume(_ref: str):
+        return SimpleNamespace()
+
+    async def fake_wait(*_args, **_kwargs):
+        return True
+
+    from api.providers import _shared as shared
+
+    monkeypatch.setattr(shared, "_runtime_acp_bin_relative", lambda _agent_type: "node_modules/.bin/claude-agent-acp")
+    monkeypatch.setattr(mprov, "_require_modal", lambda: (SimpleNamespace(Sandbox=FakeSandboxFactory), SimpleNamespace()))
+    monkeypatch.setattr(mprov, "_get_app", fake_get_app)
+    monkeypatch.setattr(mprov, "_get_image", fake_get_image)
+    monkeypatch.setattr(mprov, "_get_volume", fake_get_volume)
+    monkeypatch.setattr(mprov, "_exec_modal_shell", fake_exec)
+    monkeypatch.setattr(mprov, "_wait_for_health", fake_wait)
+    monkeypatch.setattr(mprov, "_PRE_START_COMMAND_TIMEOUT_SEC", 120)
+
+    await mprov.create_sandbox(
+        volume_ref="vol-test",
+        subpath="sessions/test",
+        pre_start_commands=[
+            "npx -y skills add claude-office-skills/skills@html-slides -g",
+            "echo setup",
+        ],
+    )
+
+    assert exec_timeouts == [120, 120, 10]

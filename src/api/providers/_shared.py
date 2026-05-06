@@ -91,9 +91,9 @@ _SUPERVISOR_REMOTE_PORT = 9100
 _PROVIDER_VOLUME_HOME: dict[str, str] = {
     "daytona": "/home/daytona",
     "docker": "/home/agent",
-    # Modal mounts the whole volume at /v and the sandbox's pre-start shell
-    # symlinks /home/agent -> /v/agents/<subpath>, mirroring Docker's layout
-    # so downstream code can treat the two providers identically.
+    # Modal also keeps /home/agent local and restores/snapshots it through
+    # /v/agents/<subpath>/snapshot.tar, mirroring Daytona's hot-filesystem
+    # layout while preserving the Docker-shaped cwd.
     "modal": "/home/agent",
 }
 

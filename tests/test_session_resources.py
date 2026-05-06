@@ -138,19 +138,19 @@ def test_to_modal_resources_returns_empty_for_none():
     assert _to_modal_resources(None) == {}
 
 
-def test_modal_entrypoint_pins_pre_start_home():
+def test_modal_entrypoint_uses_local_home_with_snapshot_dir():
     from api.providers.modal import _build_entrypoint_cmd
 
     entrypoint = _build_entrypoint_cmd(
         subpath="agents/7",
-        supervisor_cmd="node supervisor.js",
         shared_mounts=["42"],
-        pre_start_commands=["uv tool install hivespace"],
     )
 
-    assert "export HOME=/home/agent && mkdir -p /home/agent && uv tool install hivespace" in entrypoint
-    assert "ln -s /v/agents/agents/7 /home/agent" in entrypoint
-    assert entrypoint.endswith("exec node supervisor.js")
+    assert "mkdir -p /v/agents/agents/7" in entrypoint
+    assert "mkdir -p /home/agent" in entrypoint
+    assert "ln -s /v/agents/agents/7 /home/agent" not in entrypoint
+    assert "ln -s /v/shared/42 /mnt/42" in entrypoint
+    assert entrypoint.endswith("exec tail -f /dev/null")
 
 
 @pytest.mark.asyncio

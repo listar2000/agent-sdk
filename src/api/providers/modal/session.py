@@ -32,7 +32,7 @@ class ModalSandboxSession(BaseSandboxSession):
         if not isinstance(state, ModalSandboxState):
             state = ModalSandboxState(recipe=state.recipe)
         super().__init__(session_id=session_id, state=state)
-        self._cwd = "/v"
+        self._cwd = "/home/agent"
 
     async def start(self) -> None:
         if self._supervisor_url is not None and await self.running():
@@ -61,7 +61,7 @@ class ModalSandboxSession(BaseSandboxSession):
                         instance = ProviderInstance(
                             provider="modal",
                             url=url,
-                            root=self.state.recipe.root or "/v",
+                            root=self.state.recipe.root or "/home/agent",
                             sandbox_ref=self.state.sandbox_ref,
                             port=self.state.listen_port,
                         )
@@ -191,11 +191,15 @@ class ModalSandboxSession(BaseSandboxSession):
             return
         if self._supervisor_url is not None:
             try:
+                from api.providers import modal as md_provider
+                snapshot_path = md_provider._snapshot_path_for_subpath(
+                    self._subpath or f"sessions/{self.session_id}"
+                )
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(f"{self._supervisor_url}/v1/snapshot",
-                                             json={"path": "/v/snapshot.tar"})
+                                             json={"path": snapshot_path})
                     if resp.status_code == 200:
-                        self.state.snapshot_path = "/v/snapshot.tar"
+                        self.state.snapshot_path = snapshot_path
                         self.state.snapshot_version += 1
             except Exception:
                 log.exception("snapshot request failed for session %s", self.session_id)
@@ -208,7 +212,7 @@ class ModalSandboxSession(BaseSandboxSession):
         try:
             await md_provider.stop_sandbox(ProviderInstance(
                 provider="modal", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/v",
+                root=self.state.recipe.root or "/home/agent",
                 sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))

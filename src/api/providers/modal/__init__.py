@@ -1,22 +1,20 @@
 """Modal provider — volume + sandbox management via ``modal`` SDK.
 
-Modal Volume v2 supports live-mount POSIX operations (append, rename, flock,
-chmod, symlinks, hardlinks, atomic replace) so we mount the volume directly as
-the agent HOME, mirroring docker.py rather than daytona.py's snapshot-tarball
-dance.
+Modal mirrors Daytona's hot-filesystem model: the agent HOME is a local
+sandbox directory and the mounted volume carries snapshot tarballs plus
+explicit shared mounts. This keeps startup-time package/skill installs off the
+volume-backed path while still preserving the agent filesystem across fresh
+sandboxes.
 
-Volume layout mirrors the Docker provider (subpaths inside a single volume):
+Volume layout inside the single Modal volume:
 
     /v/shared/                  — shared mounts (one per agent shared_mount)
-    /v/system/supervisor ->     — symlink to supervisor.v<ts>.<rand>/
-        supervisor.v*/          — versioned supervisor install (lazy)
-    /v/agents/<subpath>/        — per-session agent HOME
+    /v/agents/<subpath>/        — per-agent snapshot tarballs
 
 Modal volumes only support a single mount point per mount, so we mount the
-whole volume at ``/v`` and the sandbox's entrypoint shell symlinks:
+whole volume at ``/v`` and the sandbox's entrypoint shell creates:
 
-    /home/agent     -> /v/agents/<subpath>
-    /opt/supervisor -> /v/system/supervisor
+    /home/agent     — local hot HOME, restored from /v/agents/<subpath>/*.tar
     /mnt/<name>     -> /v/shared/<name>    (one per agent shared mount)
 
 Stop/start semantics: Modal has no Docker-style pause — ``terminate()`` is
@@ -302,7 +300,7 @@ def _build_entrypoint_cmd(
 ) -> str:
     """Compose the sandbox's PID-1 shell script.
 
-    Creates the agent HOME directory and Docker-shaped symlinks, then keeps
+    Creates a local agent HOME directory and shared-mount symlinks, then keeps
     the sandbox alive. Pre-start commands and supervisor launch run later via
     ``Sandbox.exec`` so health checks do not race setup work.
 
@@ -310,17 +308,15 @@ def _build_entrypoint_cmd(
     so no ``/opt/supervisor → /v/system/supervisor`` symlink is required.
     """
     safe_sub = subpath.strip("/")
-    agent_home_target = f"/v/agents/{safe_sub}"
+    snapshot_dir = f"/v/agents/{safe_sub}"
 
     lines = [
         "set -e",
-        f"mkdir -p {shlex.quote(agent_home_target)}",
-        # Ensure /home and /opt exist in the slim debian image.
-        "mkdir -p /home /opt",
-        # Clean + recreate the agent-home symlink so a restart can't end up
-        # with a dangling or wrong-target link.
-        f"rm -rf {_AGENT_HOME_IN}",
-        f"ln -s {shlex.quote(agent_home_target)} {_AGENT_HOME_IN}",
+        f"mkdir -p {shlex.quote(snapshot_dir)}",
+        # Keep HOME local like Daytona; the supervisor restores/snapshots it
+        # through /v/agents/<subpath>/snapshot.tar.
+        f"rm -rf {shlex.quote(_AGENT_HOME_IN)}",
+        f"mkdir -p {shlex.quote(_AGENT_HOME_IN)} /mnt",
     ]
     for name in (shared_mounts or []):
         clean = name.strip("/").replace("..", "").replace("/", "-")
@@ -333,14 +329,20 @@ def _build_entrypoint_cmd(
     return "\n".join(lines)
 
 
+def _snapshot_path_for_subpath(subpath: str) -> str:
+    return f"/v/agents/{subpath.strip('/')}/snapshot.tar"
+
+
 def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, str, str]:
     # Match ``exec_in_sandbox``: use ``sh -c`` — slim Modal images may not
     # ship ``bash``, and ``bash -lc`` can fail before any user command runs.
-    proc = sb.exec("sh", "-c", cmd)
+    # Match Daytona's control-plane timeout shape by passing the timeout to
+    # the exec call itself, not just to the client-side wait.
+    proc = sb.exec("sh", "-c", cmd, timeout=timeout)
     try:
-        rc = proc.wait(timeout=timeout)
-    except TypeError:
         rc = proc.wait()
+    except TypeError:
+        rc = proc.wait(timeout=timeout)
     return rc, proc.stdout.read() or "", proc.stderr.read() or ""
 
 
@@ -406,6 +408,7 @@ async def create_sandbox(
         acp_launch_args=_acp_launch_args(agent_type),
         port=_SUPERVISOR_CONTAINER_PORT,
         root=agent_root,
+        snapshot_path=_snapshot_path_for_subpath(subpath),
     )
     supervisor_cmd = f"env {env_prefix} {supervisor_argv}"
     entrypoint = _build_entrypoint_cmd(
