@@ -270,12 +270,12 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Skills provisioning (skills CLI)
+# Skills provisioning (npx skills)
 # ---------------------------------------------------------------------------
 
 
 def _normalize_skills(skills) -> list[str]:
-    """Normalize skills config into a list of source strings for ``skills add``.
+    """Normalize skills config into a list of source strings for ``npx skills add``.
 
     Accepts:
       - list[str]:  ["rllm-org/hive#staging", "vercel-labs/agent-skills"]
@@ -302,7 +302,7 @@ def _normalize_skills(skills) -> list[str]:
 
 
 def _skills_install_commands(skills) -> list[str]:
-    """Return shell commands to install skills via the baked ``skills`` CLI.
+    """Return shell commands to install skills via ``npx skills add``.
 
     A source like ``owner/repo@skill-name`` is a single-skill filter. Pass
     ``--all`` only when no ``@<skill>`` suffix is given, so the filter is
@@ -313,7 +313,7 @@ def _skills_install_commands(skills) -> list[str]:
     cmds: list[str] = []
     for source in sources:
         flags = "-g" if "@" in source else "--all -g"
-        cmds.append(f"skills add {shlex.quote(source)} {flags}")
+        cmds.append(f"npx -y skills add {shlex.quote(source)} {flags}")
     return cmds
 
 

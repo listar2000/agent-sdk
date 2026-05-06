@@ -424,7 +424,7 @@ async def provision_daytona_sandbox(
             for cmd in pre_start_commands:
                 log.info("provision pre-start: %s", cmd)
                 # Pin HOME to the daytona agent home so user commands
-                # (e.g. ``skills add ... -g``) write into the same
+                # (e.g. ``npx skills add ... -g``) write into the same
                 # ``$HOME/.claude/skills/`` directory the supervisor
                 # later spawns Claude under (cwd=/home/daytona). Without
                 # this the shell's default HOME is /root and skills end

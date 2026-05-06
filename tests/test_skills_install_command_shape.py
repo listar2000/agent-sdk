@@ -1,6 +1,6 @@
 """Unit tests for ``_skills_install_commands`` flag selection.
 
-The ``--all`` flag tells ``skills add`` to install every skill in a
+The ``--all`` flag tells ``npx skills add`` to install every skill in a
 repo. With a ``@<skill-name>`` suffix on the source, ``--all`` would
 override the filter and pull hundreds of unwanted skills (e.g.
 ``github/awesome-copilot`` ships azure/dotnet/gtm/arize bundles).
@@ -24,7 +24,6 @@ def test_single_skill_filter_is_respected():
         ["github/awesome-copilot@excalidraw-diagram-generator"]
     )
     assert len(cmds) == 1
-    assert cmds[0].startswith("skills add ")
     assert "github/awesome-copilot@excalidraw-diagram-generator" in cmds[0]
     assert "--all" not in cmds[0]
     assert cmds[0].endswith(" -g")

@@ -5,8 +5,8 @@ WORKDIR /app
 # Install Node.js (required for ACP supervisor)
 RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm git && rm -rf /var/lib/apt/lists/*
 
-# Install agent CLIs and the skills CLI used by pre-start provisioning.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai skills
+# Install agent CLIs
+RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
 COPY pyproject.toml .
 COPY Dockerfile .

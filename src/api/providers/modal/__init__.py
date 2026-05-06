@@ -1,20 +1,22 @@
 """Modal provider — volume + sandbox management via ``modal`` SDK.
 
-Modal mirrors Daytona's hot-filesystem model: the agent HOME is a local
-sandbox directory and the mounted volume carries snapshot tarballs plus
-explicit shared mounts. This keeps startup-time package/skill installs off the
-volume-backed path while still preserving the agent filesystem across fresh
-sandboxes.
+Modal Volume v2 supports live-mount POSIX operations (append, rename, flock,
+chmod, symlinks, hardlinks, atomic replace) so we mount the volume directly as
+the agent HOME, mirroring docker.py rather than daytona.py's snapshot-tarball
+dance.
 
-Volume layout inside the single Modal volume:
+Volume layout mirrors the Docker provider (subpaths inside a single volume):
 
     /v/shared/                  — shared mounts (one per agent shared_mount)
-    /v/agents/<subpath>/        — per-agent snapshot tarballs
+    /v/system/supervisor ->     — symlink to supervisor.v<ts>.<rand>/
+        supervisor.v*/          — versioned supervisor install (lazy)
+    /v/agents/<subpath>/        — per-session agent HOME
 
 Modal volumes only support a single mount point per mount, so we mount the
-whole volume at ``/v`` and the sandbox's entrypoint shell creates:
+whole volume at ``/v`` and the sandbox's entrypoint shell symlinks:
 
-    /home/agent     — local hot HOME, restored from /v/agents/<subpath>/*.tar
+    /home/agent     -> /v/agents/<subpath>
+    /opt/supervisor -> /v/system/supervisor
     /mnt/<name>     -> /v/shared/<name>    (one per agent shared mount)
 
 Stop/start semantics: Modal has no Docker-style pause — ``terminate()`` is
@@ -88,9 +90,7 @@ _SANDBOX_TIMEOUT_SEC = 3600
 _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
     os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "2100")
 ))
-_PRE_START_COMMAND_TIMEOUT_SEC = int(float(
-    os.environ.get("AGENT_SDK_MODAL_PRE_START_TIMEOUT_S", "120")
-))
+
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
 _TAG_KEY = "agent-sdk.sandbox-id"
@@ -294,28 +294,30 @@ async def delete_volume(ref: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_entrypoint_cmd(
-    *, subpath: str,
+    *, subpath: str, supervisor_cmd: str,
     shared_mounts: list[str] | None,
+    pre_start_commands: list[str] | None,
 ) -> str:
     """Compose the sandbox's PID-1 shell script.
 
-    Creates a local agent HOME directory and shared-mount symlinks, then keeps
-    the sandbox alive. Pre-start commands and supervisor launch run later via
-    ``Sandbox.exec`` so health checks do not race setup work.
+    Creates the agent HOME directory, puts Docker-shaped symlinks in place,
+    runs any pre-start commands, then execs the supervisor.
 
     Phase E: the supervisor is at ``/opt/agent-sdk/runtime`` (image-baked),
     so no ``/opt/supervisor → /v/system/supervisor`` symlink is required.
     """
     safe_sub = subpath.strip("/")
-    snapshot_dir = f"/v/agents/{safe_sub}"
+    agent_home_target = f"/v/agents/{safe_sub}"
 
     lines = [
         "set -e",
-        f"mkdir -p {shlex.quote(snapshot_dir)}",
-        # Keep HOME local like Daytona; the supervisor restores/snapshots it
-        # through /v/agents/<subpath>/snapshot.tar.
-        f"rm -rf {shlex.quote(_AGENT_HOME_IN)}",
-        f"mkdir -p {shlex.quote(_AGENT_HOME_IN)} /mnt",
+        f"mkdir -p {shlex.quote(agent_home_target)}",
+        # Ensure /home and /opt exist in the slim debian image.
+        "mkdir -p /home /opt",
+        # Clean + recreate the agent-home symlink so a restart can't end up
+        # with a dangling or wrong-target link.
+        f"rm -rf {_AGENT_HOME_IN}",
+        f"ln -s {shlex.quote(agent_home_target)} {_AGENT_HOME_IN}",
     ]
     for name in (shared_mounts or []):
         clean = name.strip("/").replace("..", "").replace("/", "-")
@@ -324,63 +326,17 @@ def _build_entrypoint_cmd(
         lines.append(f"mkdir -p /v/shared/{clean} /mnt")
         lines.append(f"rm -rf /mnt/{clean}")
         lines.append(f"ln -s /v/shared/{clean} /mnt/{clean}")
-    lines.append("exec tail -f /dev/null")
+    if pre_start_commands:
+        for cmd in pre_start_commands:
+            # Match Daytona: pre-start installs/config must land in the
+            # same HOME the agent later uses, not the image user's default.
+            lines.append(
+                f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
+                f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
+                f"&& {cmd}"
+            )
+    lines.append(f"exec {supervisor_cmd}")
     return "\n".join(lines)
-
-
-def _snapshot_path_for_subpath(subpath: str) -> str:
-    return f"/v/agents/{subpath.strip('/')}/snapshot.tar"
-
-
-def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, str, str]:
-    # Match ``exec_in_sandbox``: use ``sh -c`` — slim Modal images may not
-    # ship ``bash``, and ``bash -lc`` can fail before any user command runs.
-    # Match Daytona's control-plane timeout shape by passing the timeout to
-    # the exec call itself, not just to the client-side wait.
-    proc = sb.exec("sh", "-c", cmd, timeout=timeout)
-    try:
-        rc = proc.wait()
-    except TypeError:
-        rc = proc.wait(timeout=timeout)
-    return rc, proc.stdout.read() or "", proc.stderr.read() or ""
-
-
-def _pre_start_failure_message(
-    *, cmd: str, rc: int | None, out: str, err: str, timeout: int,
-) -> str:
-    snippet = (err or out or "")[-1000:].strip()
-    if not snippet:
-        snippet = "<no stdout/stderr captured>"
-    hint = ""
-    if rc == -1:
-        hint = (
-            "\nModal returned exit=-1, which usually means the exec hit its "
-            f"timeout/provider abort before the shell returned (timeout={timeout}s)."
-        )
-    return (
-        "pre_start_commands failed on Modal sandbox "
-        f"(exit={rc}, timeout={timeout}s): {cmd!r}"
-        f"{hint}\n{snippet}"
-    )
-
-
-async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | None, str, str]:
-    outer = timeout + 5
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_run_modal_exec_sync, sb, cmd, timeout),
-            timeout=outer,
-        )
-    except asyncio.TimeoutError as e:
-        preview = (cmd[:200] + "…") if len(cmd) > 200 else cmd
-        raise RuntimeError(
-            f"Modal exec timed out after {outer}s (inner wait={timeout}s): {preview!r}"
-        ) from e
-    except Exception as e:
-        preview = (cmd[:200] + "…") if len(cmd) > 200 else cmd
-        raise RuntimeError(
-            f"Modal exec failed for command {preview!r}: {e}"
-        ) from e
 
 
 async def create_sandbox(
@@ -426,12 +382,12 @@ async def create_sandbox(
         acp_launch_args=_acp_launch_args(agent_type),
         port=_SUPERVISOR_CONTAINER_PORT,
         root=agent_root,
-        snapshot_path=_snapshot_path_for_subpath(subpath),
     )
     supervisor_cmd = f"env {env_prefix} {supervisor_argv}"
     entrypoint = _build_entrypoint_cmd(
-        subpath=subpath,
+        subpath=subpath, supervisor_cmd=supervisor_cmd,
         shared_mounts=shared_mounts,
+        pre_start_commands=pre_start_commands,
     )
 
     log.info(
@@ -466,36 +422,6 @@ async def create_sandbox(
                 f"modal sandbox {sb.object_id}: no tunnel for port {_SUPERVISOR_CONTAINER_PORT}"
             )
         url = tun.url
-
-        # Match Daytona's sequencing: pre-start work completes before the
-        # supervisor is launched, so health checks only measure supervisor
-        # readiness rather than skill/config install time.
-        for cmd in pre_start_commands or []:
-            wrapped = (
-                f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
-                f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
-                f"&& {cmd}"
-            )
-            rc, out, err = await _exec_modal_shell(
-                sb, wrapped, timeout=_PRE_START_COMMAND_TIMEOUT_SEC,
-            )
-            if rc != 0:
-                raise RuntimeError(_pre_start_failure_message(
-                    cmd=cmd, rc=rc, out=out, err=err,
-                    timeout=_PRE_START_COMMAND_TIMEOUT_SEC,
-                ))
-
-        start_cmd = (
-            f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
-            f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
-            f"&& nohup {supervisor_cmd} > /tmp/agent-sdk-supervisor.log 2>&1 &"
-        )
-        rc, out, err = await _exec_modal_shell(sb, start_cmd, timeout=10)
-        if rc != 0:
-            snippet = (err or out or "")[-500:]
-            raise RuntimeError(
-                f"failed to start Modal supervisor (exit={rc}): {snippet}"
-            )
 
         # Health check against the supervisor over HTTPS.
         if not await _wait_for_health(url, max_retries=120, interval=1):
