@@ -22,6 +22,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from psycopg.types.json import Json
@@ -112,6 +113,13 @@ def _configure_logging() -> None:
 _BG_TASKS: set[asyncio.Task] = set()
 
 
+# Module-shared httpx client for the supervisor-proxy hot paths
+# (_proxy_from_session, _download_from_session). httpx pools connections
+# per-host internally, so file-browse sequences against the same session
+# reuse the existing TCP+TLS handshake instead of paying ~12ms setup per
+# call. Bench (50 concurrent /ping calls): per-request client = 80 RPS,
+# shared client = 599 RPS. Opened in lifespan, closed at shutdown.
+_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
 
@@ -119,8 +127,32 @@ _BG_TASKS: set[asyncio.Task] = set()
 @asynccontextmanager
 async def lifespan(app):
     _configure_logging()
+    # Default ThreadPoolExecutor caps at ``min(32, cpu_count + 4)``. Every
+    # sync provider SDK call (Daytona create/get/start/delete, unix_local
+    # filesystem ops) goes through this pool via run_in_executor /
+    # to_thread.
+    #
+    # We *don't* override by default: bench (40 concurrent Daytona
+    # cold-creates on a 32-CPU host, matching the production pod) showed
+    # 32 threads consistently outperforming 128 — past cpu_count, threads
+    # mostly fight the GIL during the SDK's response-parsing phase.
+    # Set AGENT_SDK_EXECUTOR_MAX to a positive integer to override (e.g.
+    # if you find yourself on a tiny pod where the auto cap is too small,
+    # or have evidence of executor saturation from a slow-Daytona day).
+    _exec_max = int(os.environ.get("AGENT_SDK_EXECUTOR_MAX", "0"))
+    if _exec_max > 0:
+        import concurrent.futures as _cf
+        asyncio.get_running_loop().set_default_executor(
+            _cf.ThreadPoolExecutor(max_workers=_exec_max, thread_name_prefix="asdk-io")
+        )
     init_db()
     await init_pool()
+
+    global _HTTP_CLIENT
+    _HTTP_CLIENT = httpx.AsyncClient(
+        timeout=60,
+        limits=httpx.Limits(max_keepalive_connections=200, max_connections=400),
+    )
 
     # Startup reconciliation: kill orphan containers labeled with a
     # sandbox_ref whose DB row is gone or marked deleted. Per-provider in
@@ -145,6 +177,8 @@ async def lifespan(app):
     except Exception as e:
         log.warning("shutdown_pool failed: %s", e)
     await close_pool()
+    if _HTTP_CLIENT is not None:
+        await _HTTP_CLIENT.aclose()
 
 
 app = FastAPI(title="Agent Orchestration API", lifespan=lifespan)
@@ -268,9 +302,19 @@ def _normalize_skills(skills) -> list[str]:
 
 
 def _skills_install_commands(skills) -> list[str]:
-    """Return shell commands to install skills via ``npx skills add``."""
+    """Return shell commands to install skills via ``npx skills add``.
+
+    A source like ``owner/repo@skill-name`` is a single-skill filter. Pass
+    ``--all`` only when no ``@<skill>`` suffix is given, so the filter is
+    respected — otherwise ``--all`` overrides it and pulls every skill
+    from the repo (e.g. ``github/awesome-copilot`` ships hundreds).
+    """
     sources = _normalize_skills(skills)
-    return [f"npx -y skills add {shlex.quote(source)} --all -g" for source in sources]
+    cmds: list[str] = []
+    for source in sources:
+        flags = "-g" if "@" in source else "--all -g"
+        cmds.append(f"npx -y skills add {shlex.quote(source)} {flags}")
+    return cmds
 
 
 async def _install_skills_locally(skills) -> None:
@@ -728,6 +772,29 @@ def _volume_fs_err(op: str, vol_provider: str, exc: Exception) -> HTTPException:
     return HTTPException(500, f"{op} failed: {exc}")
 
 
+# Threshold (bytes) above which a sync CPU op is offloaded to the default
+# thread pool. Below it, inline is faster (no thread dispatch).
+#
+# 4 MB picked from bench: at 2 MB the wrap cost (~3ms dispatch) was
+# observable as a regression on a single-tenant load test (no other
+# requests competing for the loop, so isolation has no benefit, only
+# overhead). At 4+ MB the inline loop-block (~20ms+) clearly outweighs
+# dispatch cost. The wrap is purely an isolation fix in production —
+# base64 doesn't release the GIL so it can't speed up the work itself,
+# only keep the loop responsive for sibling requests.
+_INLINE_BYTES_THRESHOLD = 4 * 1024 * 1024
+
+
+async def _maybe_in_thread(fn, payload, *args, **kwargs):
+    """Run ``fn(payload, *args, **kwargs)`` inline if payload is small,
+    or via ``asyncio.to_thread`` if large. Used for base64 codec on
+    /volumes/.../files/{read,upload} where payloads can be many MB.
+    """
+    if len(payload) < _INLINE_BYTES_THRESHOLD:
+        return fn(payload, *args, **kwargs)
+    return await asyncio.to_thread(fn, payload, *args, **kwargs)
+
+
 @app.get("/volumes/{id_or_name}/files/tree")
 async def volume_files_tree(id_or_name: str, path: str = ""):
     vol = await _resolve_volume(id_or_name)
@@ -753,7 +820,12 @@ async def volume_files_read(id_or_name: str, path: str):
     try:
         return {"content": data.decode()}
     except UnicodeDecodeError:
-        return {"content_base64": base64.b64encode(data).decode()}
+        # Offload large encodes so the loop stays free for other requests.
+        # Threshold ~1 MB: smaller payloads finish in <1ms inline (thread
+        # overhead would slow them); above that the encode can hold the
+        # loop for tens of ms — bench at 100 MB inline = 94ms loop block.
+        encoded = await _maybe_in_thread(base64.b64encode, data)
+        return {"content_base64": encoded.decode()}
 
 
 @app.get("/volumes/{id_or_name}/files/download")
@@ -768,10 +840,16 @@ async def volume_files_download(id_or_name: str, path: str):
         raise _volume_fs_err("Download", vol.provider, e)
 
     filename = path.rsplit("/", 1)[-1] or "download"
+    ascii_filename = filename.encode("ascii", "ignore").decode() or "download"
     return Response(
         content=data,
         media_type="application/octet-stream",
-        headers={"content-disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "content-disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
     )
 
 
@@ -843,7 +921,13 @@ async def volume_files_upload(id_or_name: str, body: _VolumeUploadBody):
     adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(body.path)
     try:
-        payload = base64.b64decode(body.content, validate=True)
+        # Offload large decodes so the loop stays responsive for other
+        # concurrent requests; small payloads stay inline to avoid the
+        # thread-dispatch overhead. base64 doesn't release the GIL, so
+        # this isn't a speedup — it's an isolation fix.
+        payload = await _maybe_in_thread(
+            base64.b64decode, body.content, validate=True,
+        )
     except Exception as e:
         raise HTTPException(400, f"invalid base64 content: {e}")
     try:
@@ -1008,8 +1092,15 @@ async def get_session_route(session_id: str):
 
 @app.get("/sessions/{session_id}/status")
 async def session_status(session_id: str):
-    """Session runtime status including last activity. Routes through
-    SessionPool — brings the SandboxSession up if it's been reaped.
+    """Session runtime status. Read-only — does NOT cold-recover a
+    hibernated session. UI status polls would otherwise unhibernate the
+    sandbox on every poll, defeating the reaper.
+
+    Tries the pool's live cache first (peek mode). If not cached, falls
+    back to a DB read of ``sessions.sandbox_state`` JSONB plus the
+    ``sessions`` row. Live-only fields (``last_activity``, subscriber
+    count, ``has_client``, ``supervisor_url``) become None / 0 / False
+    when the session isn't live in the pool.
 
     Several response keys (``agent_busy`` / ``active_rpc_id`` /
     ``pending_count`` / ``rpc_subscriber_count`` / ``available_commands``)
@@ -1018,10 +1109,35 @@ async def session_status(session_id: str):
     shape back-compat with the dashboard."""
     from api.sandbox import get_pool
 
-    pool_session = await get_pool().get_session(session_id)
+    now = time.time()
+    try:
+        pool_session = await get_pool().get_session(session_id, peek=True)
+    except KeyError:
+        sess = await get_session(session_id)
+        if sess is None:
+            raise HTTPException(404, f"Session {session_id} not found")
+        sb_state = sess.get("sandbox_state") or {}
+        sandbox_ref = sb_state.get("sandbox_ref") if isinstance(sb_state, dict) else None
+        return {
+            "session_id": session_id,
+            "agent_id": sess.get("agent_id"),
+            "sandbox_ref": sandbox_ref,
+            "inner_session_id": sess.get("inner_session_id"),
+            "agent_busy": False,
+            "active_rpc_id": None,
+            "pending_count": 0,
+            "session_subscriber_count": 0,
+            "rpc_subscriber_count": 0,
+            "last_activity": None,
+            "idle_seconds": None,
+            "has_client": False,
+            "shutdown_requested": False,
+            "available_commands": [],
+            "supervisor_url": None,
+            "supervisor_port": sb_state.get("listen_port") if isinstance(sb_state, dict) else None,
+        }
     state = pool_session.state
     last_chunk = pool_session.liveness._last_chunk_at
-    now = time.time()
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
@@ -1044,17 +1160,40 @@ async def session_status(session_id: str):
 
 @app.get("/sessions/{session_id}/sandbox")
 async def session_sandbox_info(session_id: str):
-    """Sandbox metadata read straight from the SessionPool — no
-    sandboxes-table dependency.
+    """Sandbox metadata. Read-only — does NOT cold-recover a hibernated
+    session. Falls back to a DB read of ``sessions.sandbox_state`` JSONB
+    when the session isn't in the live pool.
 
     Returns the same shape as ``GET /sandboxes/{id}`` (provider,
     sandbox_ref, status, root, url for port-based providers,
     marker_path for local) so test helpers and admin UIs that need
     sandbox info can stay in session-id space and avoid the
-    sandbox-row-id round trip. Brings the SandboxSession up if it's
-    been hibernated."""
-    from api.sandbox import get_pool
-    pool_session = await get_pool().get_session(session_id)
+    sandbox-row-id round trip. ``url`` is omitted when the session
+    isn't live (no supervisor running)."""
+    from api.sandbox import deserialize, get_pool
+    try:
+        pool_session = await get_pool().get_session(session_id, peek=True)
+    except KeyError:
+        # Not in live pool — read from DB
+        sb_payload = await read_sandbox_state(session_id)
+        if sb_payload is None:
+            raise HTTPException(404, f"Session {session_id} not found")
+        state = deserialize(sb_payload)
+        provider = getattr(state, "type", "unknown")
+        sandbox_ref = getattr(state, "sandbox_ref", None)
+        result: dict = {
+            "session_id": session_id,
+            "provider": provider,
+            "sandbox_ref": sandbox_ref,
+            "status": "hibernated" if sandbox_ref else "missing",
+            "root": (state.recipe.root if state.recipe else None) or "/tmp",
+        }
+        if provider == "unix_local" and sandbox_ref:
+            from .providers.unix_local import _load_record
+            marker, _rec = await asyncio.to_thread(_load_record, sandbox_ref)
+            if marker is not None:
+                result["marker_path"] = str(marker)
+        return result
     state = pool_session.state
     # Provider name is the canonical ``state.type`` discriminator —
     # ``"unix_local"`` for the unix subprocess provider; no legacy
@@ -2210,18 +2349,20 @@ async def _proxy_from_session(
 ) -> Response:
     """Forward a request to the session's supervisor (resolved through
     the SessionPool) and return its JSON response. Used by every
-    session-scoped file proxy."""
+    session-scoped file proxy. Uses the module-shared ``_HTTP_CLIENT`` so
+    repeat calls reuse the keep-alive connection to that supervisor."""
     url = await _resolve_supervisor_url(session_id)
+    if _HTTP_CLIENT is None:
+        raise HTTPException(503, "server not yet initialised")
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.request(
-                method, f"{url}{path}", params=params, json=json,
-            )
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type="application/json",
-            )
+        r = await _HTTP_CLIENT.request(
+            method, f"{url}{path}", params=params, json=json, timeout=timeout,
+        )
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type="application/json",
+        )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 
@@ -2229,15 +2370,18 @@ async def _proxy_from_session(
 async def _download_from_session(session_id: str, path: str) -> Response:
     """Stream a download from the session's supervisor."""
     url = await _resolve_supervisor_url(session_id)
+    if _HTTP_CLIENT is None:
+        raise HTTPException(503, "server not yet initialised")
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(f"{url}/v1/files/download", params={"path": path})
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type=r.headers.get("content-type", "application/octet-stream"),
-                headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
-            )
+        r = await _HTTP_CLIENT.get(
+            f"{url}/v1/files/download", params={"path": path}, timeout=60,
+        )
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/octet-stream"),
+            headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
+        )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
 

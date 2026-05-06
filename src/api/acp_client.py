@@ -94,6 +94,31 @@ class AcpClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def health_probe(self, timeout: float = 2.0) -> tuple[bool, int | None]:
+        """Liveness probe: GET /v1/health using the cached httpx pool.
+
+        Returns ``(alive, status_code or None)`` where ``alive`` is True
+        on 200, False otherwise. Connection errors return ``(False, None)``
+        so callers can distinguish "supervisor said no" from "couldn't
+        even reach it" (matters on Daytona where the layer-2 fallback
+        only kicks in on connection-level failure).
+
+        Per-call ``timeout`` overrides the cached client's read=None
+        default — the cached client is configured for long ACP streaming,
+        not short probes.
+
+        Replaces the per-call ``async with httpx.AsyncClient(timeout=2.0)``
+        each provider's ``_liveness_probe`` was doing — that constructed
+        a fresh httpx pool every probe (~3-5ms localhost, ~50-200ms
+        HTTPS to Daytona's signed URL). Reusing this client's keep-alive
+        pool drops the per-probe cost to a single round-trip.
+        """
+        try:
+            resp = await self._client.get("/v1/health", timeout=timeout)
+            return resp.status_code == 200, resp.status_code
+        except Exception:
+            return False, None
+
     async def _send_rpc(self, session_id: str, method: str, params: dict,
                          agent: str | None = None, rpc_id: str | None = None) -> dict:
         """Send a JSON-RPC 2.0 request to /v1/acp/{session_id}."""

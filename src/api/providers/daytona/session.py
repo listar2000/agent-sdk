@@ -92,17 +92,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
         self._supervisor_url = url
         self.state.listen_port = _SUPERVISOR_PORT
 
-        # Verify the supervisor answers /v1/health before declaring
-        # ourselves started. Bounded short wait — start_supervisor already
-        # did its own readiness poll, this is just a sanity check.
-        ok = await _wait_for_health(url, max_retries=3, interval=0.5)
-        if not ok:
-            raise RuntimeError(
-                f"Supervisor not responding at {url} after start_supervisor_in_sandbox"
-            )
-
-        # Mark liveness alive — start_supervisor_in_sandbox just probed
-        # /v1/health successfully, so we have direct evidence.
+        # ``start_supervisor_in_sandbox`` returned only after its own
+        # ``_wait_for_health`` saw a 200 — the supervisor IS healthy as
+        # of microseconds ago. We used to do another 3-attempt poll here
+        # as a "sanity check" but it never caught anything that ``ACP
+        # attach`` (which fires next, also via HTTP to the same URL)
+        # wouldn't catch on the same round trip; it just added 100-500ms
+        # to every session_create. Trust the upstream signal and let ACP
+        # attach be the next probe.
         self.liveness.observe_chunk()
 
         # ACP attach happens on first execute_prompt; we pre-allocate the
@@ -132,11 +129,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     spawn_env=self._spawn_env,
                 )
                 # restart_daytona_supervisor returned an instance with .url
-                # set; we also need the daytona sandbox handle. Get it
-                # explicitly so subsequent stop()/exec() calls have it.
-                from daytona_sdk import Daytona, DaytonaConfig
-                import os as _os
-                client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
+                # set; we also need the daytona sandbox handle for later
+                # stop()/exec() calls. Use the cached process-shared
+                # client so we don't pay SDK init on every reattach.
+                client = dt_provider._get_daytona_client()
                 loop = asyncio.get_running_loop()
                 sandbox = await loop.run_in_executor(
                     None, lambda: client.get(self.state.sandbox_ref)
@@ -144,16 +140,20 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 self._supervisor_url = instance.url
                 return sandbox
             except Exception as e:
-                msg = str(e).lower()
-                if "not found" in msg or "404" in msg:
-                    log.info(
-                        "DaytonaSandboxSession: sandbox %s not found, will create fresh",
-                        (self.state.sandbox_ref or "")[:16],
-                    )
-                    self.state.sandbox_ref = None
-                else:
-                    # Hard error during reattach — propagate, don't silently recreate.
-                    raise
+                # Whether the sandbox is genuinely missing (404) or alive
+                # but unreachable for any other reason — Daytona 5xx,
+                # supervisor wedged, port held, disk full, OOM — the
+                # answer is the same: abandon the ref and cold-create
+                # a fresh sandbox. The previously-attempted sandbox
+                # stays labelled ``agent_sdk_origin`` in Daytona for
+                # ``cleanup_orphans.py`` to reap. Without this
+                # fall-through, a wedged sandbox locks the session
+                # forever — every retry hits the same dead reattach.
+                log.warning(
+                    "DaytonaSandboxSession: reattach to %s failed (%s); abandoning + cold-creating",
+                    (self.state.sandbox_ref or "")[:16], e,
+                )
+                self.state.sandbox_ref = None
 
         # ``_bootstrap_session`` (in ``BaseSandboxSession``) ran from
         # ``start()`` before this method was called and unconditionally
@@ -178,9 +178,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
             shared_mounts=self.state.recipe.shared_mounts or None,
             resources=self.state.recipe.resources,
         )
-        from daytona_sdk import Daytona, DaytonaConfig
-        import os as _os
-        client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
+        # Use the cached process-shared client (avoids 50-200ms of SDK
+        # init per session) and offload the sync .get() onto the
+        # executor so we don't block the loop.
+        client = dt_provider._get_daytona_client()
         loop = asyncio.get_running_loop()
         sandbox = await loop.run_in_executor(None, lambda: client.get(instance.sandbox_ref))
         return sandbox
@@ -221,14 +222,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
         if self._supervisor_url is None or self._daytona_sandbox is None:
             return False
 
+        # Layer 1 uses the cached AcpClient's pooled httpx connection so
+        # we don't pay TLS handshake to the Daytona signed URL on every
+        # probe. PR #82 fixed this for the message proxy paths; same
+        # win applies to the probe.
+        client = self._get_acp_client()
+
         async def _probe_url() -> tuple[bool, int | None]:
-            """Returns (alive, status_code or None on connection error)."""
-            try:
-                async with httpx.AsyncClient(timeout=2.0) as client:
-                    resp = await client.get(f"{self._supervisor_url}/v1/health")
-                return resp.status_code == 200, resp.status_code
-            except Exception:
-                return False, None
+            return await client.health_probe()
 
         ok, status = await _probe_url()
         if ok:
@@ -263,11 +264,13 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
     async def _daytona_sandbox_state(self) -> str:
         """Fetch current Daytona sandbox state string. Empty on error
-        — caller treats unknown state as non-transitional."""
+        — caller treats unknown state as non-transitional. Uses the
+        process-shared Daytona SDK client (same singleton as PR #82's
+        ``_DAYTONA_CLIENT``) so we don't pay SDK init on every probe
+        layer-2 fallback."""
         try:
-            from daytona_sdk import Daytona, DaytonaConfig
-            import os as _os
-            client = Daytona(DaytonaConfig(api_key=_os.environ["DAYTONA_API_KEY"]))
+            from . import _get_daytona_client
+            client = _get_daytona_client()
             loop = asyncio.get_running_loop()
             sb = await loop.run_in_executor(
                 None, lambda: client.get(self._daytona_sandbox.id),
@@ -419,6 +422,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         self._daytona_sandbox = None
         self._supervisor_url = None
         self._close_subscribers()
+        await self._aclose_acp_client()
 
 
 # ---------------------------------------------------------------------------

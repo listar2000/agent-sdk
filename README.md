@@ -2,16 +2,12 @@
 
 Python SDK and orchestration server for running Claude Code, Codex, OpenCode, and other ACP-compatible agents in sandboxes (`unix_local`, `docker`, `daytona`, `modal`).
 
-## Run with Docker
+## Run
 
 ```bash
 echo "CLAUDE_CODE_OAUTH_TOKEN=..." > .env       # or ANTHROPIC_API_KEY=sk-ant-...
 echo "DAYTONA_API_KEY=dtn_..." >> .env          # optional, for cloud sandboxes
-docker compose up --build -d
-curl http://localhost:7778/health               # → {"status":"ok",...}
 ```
-
-Postgres on `5433`, API on `7778`, chat UI at `/ui`. `docker compose down -v` also drops the DB volume.
 
 For a managed venv + Postgres without compose, use `scripts/launch_server_docker.sh` (Docker Postgres) or `scripts/launch_server_test.sh` (project-local conda Postgres). All three local-dev paths default `AGENT_SDK_ORIGIN=test` so daytona sandboxes are isolatable from production; override with `AGENT_SDK_ORIGIN=production <launcher>`.
 
@@ -34,7 +30,7 @@ For a managed venv + Postgres without compose, use `scripts/launch_server_docker
 ```python
 from agent_sdk import Agent
 
-agent = Agent("worker", provider="local")
+agent = Agent("worker", provider="unix_local")
 response = await agent.arun("Create hello.py")
 
 async for ev in agent.astream("Analyze this codebase"):
@@ -44,7 +40,7 @@ await agent.arun("focus on X instead", interrupt=True)   # cancel + resubmit
 await agent.send("do this next")                          # fire-and-forget; pair with .events()
 ```
 
-`agent.run()` is the sync wrapper. Default server is `http://localhost:7778`; override via `api_url=` or `AGENT_API_URL=`.
+Default server is `http://localhost:7778`; override via `api_url=` or `AGENT_API_URL=`.
 
 Agent identity is pure: `agent_type`, `model`, `mcp_servers`, `skills`, `mode`, `thought_level`. Per-session knobs (`cwd`, `env`, `secrets`, `workspace`) and provisioning knobs (`dockerfile`, `shared_mounts`, `root`, `pre_start_commands`, `volume_id`) live on the session.
 
@@ -76,8 +72,6 @@ agent = Agent("worker", provider="daytona", oauth_token=user_oauth_token)
 # fallback: oauth_token= > CLAUDE_CODE_OAUTH_TOKEN env > api_key= > ANTHROPIC_API_KEY env
 ```
 
-Credentials travel in `secrets` on `POST /sessions` (redacted from read APIs), are applied as per-sandbox env, and the SDK refuses plaintext HTTP. When OAuth is supplied the server scrubs its own `ANTHROPIC_API_KEY` from that sandbox so there's no silent fallback.
-
 ## Architecture
 
 ```
@@ -96,18 +90,7 @@ Credentials travel in `secrets` on `POST /sessions` (redacted from read APIs), a
 - **Sessions** — conversation state, bound to an immutable `volume_id`. `SessionPool` owns the at-most-one warm `SandboxSession` per `session_id`; `release(sid)` snapshots and drops the lease.
 - **Supervisor** — `src/supervisor/supervisor.js` spawns the ACP binary and exposes it over `/v1/acp/{id}` POST+SSE. One per sandbox; runtime baked into the agent-sdk image at `/opt/agent-sdk/runtime/`.
 
-| Provider | Sandbox runs as | Survives stop? |
-|---|---|---|
-| `unix_local` | Host subprocess | No |
-| `docker` | Ephemeral container | No |
-| `daytona` | Daytona workspace | Yes (paused, FS preserved) |
-| `modal` | Modal sandbox | No (volume preserved) |
-
 Session data lives on the volume, so sessions survive sandbox death on every provider — the column above is sandbox-level only.
-
-## Database
-
-Postgres. `init_db()` runs `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER TABLE` migrations (`_MIGRATIONS` in `src/api/db.py`) on every startup. Tables: `agents`, `volumes`, `sessions`, `session_log`. New migrations must be `IF [NOT] EXISTS`-safe; append to the bottom.
 
 ## Tests
 

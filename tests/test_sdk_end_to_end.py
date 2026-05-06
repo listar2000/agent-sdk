@@ -1,20 +1,29 @@
 """End-to-end integration of ``agent_sdk.Agent`` against an in-process ASGI
-server, with only the lowest-level provider primitives mocked.
+server, with only the lowest-level provisioning step mocked.
 
 Why this file exists
 --------------------
 Every regression in the bullet list on the volume-refactor branch was
 invisible to existing unit tests because they mocked at the provider
-boundary (``provision_daytona_sandbox``, ``create_instance``, or even
-``AcpClient``).  Real SDK examples exercised a chain those mocks
-short-circuited.
+boundary and short-circuited the chain real SDK examples exercised.
 
 This file goes one level deeper: the SDK's ``Agent`` talks to the real
 server app through ASGI transport, the server reaches into the real
-provider dispatch, and only the subprocess / supervisor-start step is
-replaced with a cheap fake.  Result: if the SDK stops forwarding
-credentials, if the default volume logic breaks, or if the SessionState
-loses a field, this suite fires.
+SessionPool / provider dispatch, and only the actual sandbox
+provisioning is replaced with a fake. Result: if the SDK stops
+forwarding credentials, if the default volume logic breaks, or if the
+session row loses a field, this suite fires.
+
+History
+-------
+Originally written against the pre-SessionPool architecture
+(``api.server.SESSIONS`` dict + ``_start_session_tasks`` /
+``_scheduler_loop`` background tasks + module-global
+``api.server.create_instance``). All of that machinery was replaced by
+``api.sandbox.SessionPool`` and the per-provider concrete sandbox
+session classes; the file was rewritten 2026-05-04 to mock at the new
+boundary (``api.sandbox.runtime.get_pool``) and verify state via the
+persisted session row instead of intercepting inert function calls.
 """
 from __future__ import annotations
 
@@ -23,7 +32,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -43,150 +52,152 @@ if _DB and not os.environ.get("DATABASE_URL"):
 
 from api import db as dbmod  # noqa: E402
 from api import server as srv  # noqa: E402
-from api.providers import ProviderInstance  # noqa: E402
 from agent_sdk.client import Agent  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Fake AcpClient — minimum viable supervisor surface
+# Fake SandboxSession + SessionPool — minimum surface to satisfy the
+# server's ``/sessions`` and ``/sessions/{id}/message`` routes without
+# actually provisioning anything.
 # ---------------------------------------------------------------------------
 
-class _FakeAcpClient:
-    """Lightweight stand-in for ``api.acp_client.AcpClient``.
 
-    Unlike the real client, this one never opens an HTTP connection —
-    every ACP method is a local coroutine.  Enough surface to get the
-    server past ``_apply_config_and_initialize`` and through at least
-    one prompt round-trip.
+def _make_fake_session(session_id: str, sandbox_ref: str = "fake-ref-1") -> MagicMock:
+    """A fake SandboxSession that quacks enough for the server endpoints
+    we exercise here. Per-prompt SSE is faked by returning an empty async
+    generator from ``execute_prompt``.
+
+    Routes we care about read these attributes:
+      * ``state.sandbox_ref`` (POST /sessions response)
+      * ``inner_session_id`` (POST /sessions response)
+      * ``_supervisor_url`` (status / sandbox introspection)
+      * ``_acp_session_id`` / ``_inner_session_id`` (acp_call)
+      * ``_subscribers`` dict (admin / status)
+      * ``liveness._last_chunk_at`` (status / pool reaper)
     """
+    sess = MagicMock()
+    sess.session_id = session_id
+    sess.state = MagicMock(sandbox_ref=sandbox_ref)
+    sess.inner_session_id = f"inner-{session_id[:8]}"
+    sess._supervisor_url = "http://127.0.0.1:54321"
+    sess._acp_session_id = f"acp-{session_id[:8]}"
+    sess._inner_session_id = sess.inner_session_id
+    sess._subscribers = {}
+    sess._agent_id = None  # set by upsert
+    sess.supervisor_url = sess._supervisor_url
+    sess.liveness = MagicMock(_last_chunk_at=None)
 
-    construct_count = 0
-    seen_urls: list[str] = []
+    async def _empty_iter():
+        if False:
+            yield  # pragma: no cover
+    sess.execute_prompt = MagicMock(return_value=_empty_iter())
+    sess.cancel_active_prompt = AsyncMock(return_value=None)
+    sess.set_mode = AsyncMock(return_value=None)
+    sess.set_model = AsyncMock(return_value=None)
+    sess.set_thought_level = AsyncMock(return_value=None)
+    sess.acp_call = AsyncMock(return_value={})
 
-    def __init__(self, base_url: str):
-        _FakeAcpClient.construct_count += 1
-        _FakeAcpClient.seen_urls.append(base_url)
-        self.base_url = base_url.rstrip("/")
-        self._inner: dict[str, str] = {}
+    # Subscriber fan-out machinery used by ``_execute_and_stream_sse``:
+    # the route registers a subscriber and iterates it. The iterate path
+    # needs to terminate cleanly — yield nothing (empty generator).
+    import asyncio as _asyncio
 
-    async def initialize(self, session_id, agent, cwd="/tmp", mcp_servers=None):
-        self._inner[session_id] = f"inner-{uuid.uuid4().hex[:8]}"
-        return {"protocolVersion": 1}
+    def _register():
+        return ("sub-id", _asyncio.Queue())
 
-    async def handshake(self, session_id, agent):
-        return {"protocolVersion": 1}
+    async def _iterate(_sid, _q):
+        if False:
+            yield  # pragma: no cover
 
-    async def _send_rpc(self, session_id, method, params, agent=None, rpc_id=None):
-        return {}
+    sess.register_subscriber = MagicMock(side_effect=_register)
+    sess.iterate_subscriber = MagicMock(side_effect=_iterate)
 
-    async def prompt(self, session_id, message, rpc_id=None):
-        return rpc_id, type("R", (), {"stop_reason": "end_turn", "usage": {}})()
-
-    async def cancel_prompt(self, session_id):  # pragma: no cover
-        return None
-
-    def get_inner_session_id(self, session_id):
-        return self._inner.get(session_id)
-
-    def set_inner_session_id(self, session_id, inner_id):
-        self._inner[session_id] = inner_id
-
-    async def close_session(self, session_id):  # pragma: no cover
-        self._inner.pop(session_id, None)
-
-    async def aclose(self):  # pragma: no cover
-        return None
-
-    @classmethod
-    def reset(cls):
-        cls.construct_count = 0
-        cls.seen_urls = []
+    # Per-prompt lock used by ``_persist_prompt_events``.
+    sess._prompt_lock = _asyncio.Lock()
+    sess._broadcast = MagicMock()
+    return sess
 
 
-# ---------------------------------------------------------------------------
-# Helper: fake ProviderInstance factory that records the spawn_env it was
-# handed.  Used so tests can assert ``CLAUDE_CODE_OAUTH_TOKEN`` made it all
-# the way from the SDK caller to ``create_sandbox``'s env arg.
-# ---------------------------------------------------------------------------
-
-class _SpawnRecorder:
-    """Records every call to ``create_instance`` / ``create_sandbox``.
-
-    Attached via ``patch.object`` so we can reuse the same recorder across
-    multiple patches — a test might mock both ``server.create_instance``
-    (universal dispatch) and ``providers.unix_local.create_sandbox``
-    (provider-specific) and expect to see the single call show up exactly
-    once.
+def _make_fake_pool() -> tuple[MagicMock, list[MagicMock]]:
+    """Build a fake SessionPool that records every cold_create / get_session
+    call and hands back a fresh fake SandboxSession. Returns
+    ``(pool, sessions_list)`` so the test can assert how many were minted.
     """
-    def __init__(self):
-        self.calls: list[dict] = []
+    sessions: list[MagicMock] = []
 
-    async def __call__(self, *args, **kwargs):
-        # Normalize: record both positional and keyword args for later
-        # assertion — different callers use different shapes.
-        self.calls.append({"args": args, "kwargs": dict(kwargs)})
-        return ProviderInstance(
-            provider=kwargs.get("provider") or (args[0] if args else "unix_local"),
-            url="http://127.0.0.1:54321",
-            root=kwargs.get("root") or "/tmp/fake",
-            sandbox_id="99999",
-            port=54321,
-        )
+    async def _hydrate_agent_id(s):
+        """Real ``_bootstrap_session`` reads ``sessions.agent_id`` from
+        the DB and sets ``self._agent_id``; persistence paths
+        (``_persist_user_message``) need it for the session_log FK. The
+        fake skips bootstrap, so do the lookup here."""
+        try:
+            row = await dbmod.get_session(s.session_id)
+            if row:
+                s._agent_id = row.get("agent_id")
+        except Exception:
+            pass
 
-    @property
-    def spawn_envs(self) -> list[dict]:
-        """Extract the ``spawn_env`` dict from each recorded call."""
-        out = []
-        for c in self.calls:
-            kw = c["kwargs"]
-            if "spawn_env" in kw:
-                out.append(kw["spawn_env"] or {})
-        return out
+    async def _cold_create(session_id, *, provider, recipe):
+        s = _make_fake_session(session_id)
+        await _hydrate_agent_id(s)
+        sessions.append(s)
+        return s
+
+    async def _get_session(session_id, *, initial_state=None):
+        # If we already minted a fake for this id, return it (cache hit).
+        for s in sessions:
+            if s.session_id == session_id:
+                return s
+        s = _make_fake_session(session_id)
+        await _hydrate_agent_id(s)
+        sessions.append(s)
+        return s
+
+    pool = MagicMock()
+    pool.cold_create = AsyncMock(side_effect=_cold_create)
+    pool.get_session = AsyncMock(side_effect=_get_session)
+    pool.release = AsyncMock(return_value=None)
+    pool.find_by_agent_id = MagicMock(return_value=[])
+    pool._active = {}
+    return pool, sessions
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest_asyncio.fixture
 async def asgi_server(monkeypatch, tmp_path):
     """Yield a live ASGI transport + client pair, with DB wiped.
 
     Function-scoped to sidestep the session-scoped ``db_pool`` fixture's
-    event-loop issues with pytest-asyncio 1.x.  Also points the local
+    event-loop issues with pytest-asyncio 1.x. Also points the local
     volume root at a tmp dir so default-volume creation doesn't litter
     ``~/.agent-sdk/volumes/``.
     """
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path / "vols"))
-    _FakeAcpClient.reset()
     dbmod.init_db()
     await dbmod.init_pool()
     try:
         async with dbmod.get_db() as conn:
-            for table in ("session_log", "sessions", "sandboxes", "volumes", "agents"):
+            for table in ("session_log", "sessions", "volumes", "agents"):
                 await conn.execute(f"DELETE FROM {table}")
         transport = ASGITransport(app=srv.app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
             yield c
     finally:
-        srv.SESSIONS.clear()
-        srv._INSTANCES.clear()
         await dbmod.close_pool()
 
 
 def _agent_with(transport_client: AsyncClient, **kwargs) -> Agent:
     """Return an ``Agent`` whose internal httpx client is the ASGI-backed one.
 
-    We must swap ``agent._client`` in place *before* any registration
-    request, since ``Agent.__init__`` opens its own ``httpx.AsyncClient``
-    against ``api_url``.
-
     Use ``http://localhost`` as the nominal URL because ``Agent`` refuses
-    to send credentials to a non-https, non-localhost URL (the test-only
-    ``http://test`` host trips that guard).
+    to send credentials to a non-https, non-localhost URL.
     """
     a = Agent(api_url="http://localhost", **kwargs)
-    a._client = transport_client
+    a._api._http = transport_client
     return a
 
 
@@ -194,43 +205,36 @@ def _agent_with(transport_client: AsyncClient, **kwargs) -> Agent:
 # 1. Default volume auto-creation
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_sdk_creates_default_volume_when_none_specified(asgi_server):
     """``Agent("x", provider="unix_local")`` — no ``volume_id`` in the SDK
-    payload — must produce a running sandbox.  The server auto-creates
-    ``default-local`` and attaches.
+    payload — must produce a session with ``sandbox_ref`` set. The server
+    auto-creates ``default-unix_local`` and attaches via the SessionPool.
 
     Without the ``_resolve_or_default_volume`` fallback the request
-    returned 400 "volume_id required" and the SDK raised.  This test is
+    returned 400 "volume_id required" and the SDK raised. This test is
     the simplest regression guard: just send it, expect success.
     """
+    pool, sessions = _make_fake_pool()
     patches = [
-        patch("api.server.create_instance",
-              new=AsyncMock(return_value=ProviderInstance(
-                  provider="unix_local", url="http://127.0.0.1:54321",
-                  root="/tmp/fake", sandbox_id="77777", port=54321))),
-        patch("api.server.ensure_volume_supervisor",
-              new=AsyncMock(return_value=None)),
-        patch("api.server.AcpClient", _FakeAcpClient),
-        patch("api.server._start_session_tasks", lambda state: None),
-        # Don't actually mkdir the local default-volume — let the DB row
-        # be created but short-circuit the filesystem op.
+        patch("api.sandbox.runtime.get_pool", return_value=pool),
+        patch("api.sandbox.get_pool", return_value=pool),
         patch("api.providers.unix_local.create_volume",
-              new=AsyncMock(return_value="/tmp/default-local")),
+              new=AsyncMock(return_value=str(Path(os.environ.get("AGENT_SDK_LOCAL_VOL_ROOT", "/tmp")) / "default-unix_local"))),
     ]
     for p in patches:
         p.start()
     try:
         agent = _agent_with(asgi_server, name="no-vol", provider="unix_local")
-        # ``send`` registers and queues a message, returning the rpc_id.
         rpc_id = await agent.send("ping")
         assert rpc_id, "expected rpc_id from send()"
         assert agent.session_id, "agent should have a session_id after register"
-        assert agent.sandbox_id, "agent should have a sandbox_id after register"
+        assert agent.sandbox_ref, "agent should have a sandbox_ref after register"
 
-        # The DB volume row exists and is the default-local.
-        vol = await dbmod.get_volume_by_name("default-local")
-        assert vol is not None, "server must auto-create default-local volume"
+        # The DB volume row exists and is the default for unix_local.
+        vol = await dbmod.get_volume_by_name("default-unix_local")
+        assert vol is not None, "server must auto-create default-unix_local volume"
         assert vol.provider == "unix_local"
 
         # The session row points at that volume.
@@ -243,28 +247,28 @@ async def test_sdk_creates_default_volume_when_none_specified(asgi_server):
 
 
 # ---------------------------------------------------------------------------
-# 2. OAuth token → spawn_env
+# 2. OAuth token → secrets on the persisted session row → spawn_env
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_sdk_oauth_token_flows_into_spawn_env(asgi_server):
-    """An ``oauth_token="secret"`` passed to Agent must land inside the
-    supervisor spawn_env as ``CLAUDE_CODE_OAUTH_TOKEN``.
+    """``oauth_token="secret"`` passed to Agent must land in the session's
+    persisted ``secrets`` column as ``CLAUDE_CODE_OAUTH_TOKEN``. From there
+    ``BaseSandboxSession._bootstrap_session`` builds the supervisor's
+    ``spawn_env``.
 
     Previously the SDK sent ``oauth_token`` as a top-level field on the
-    registration payload and the server silently ignored it.  The fix is
-    to put it under ``secrets``; this test asserts the whole pipeline
-    actually carries the secret through to ``create_instance``.
+    registration payload and the server silently ignored it. The fix is
+    to put it under ``secrets``; this test asserts the SDK still routes
+    it through that channel and the server still persists it.
     """
-    recorder = _SpawnRecorder()
+    pool, sessions = _make_fake_pool()
     patches = [
-        patch("api.server.create_instance", new=recorder),
-        patch("api.server.ensure_volume_supervisor",
-              new=AsyncMock(return_value=None)),
-        patch("api.server.AcpClient", _FakeAcpClient),
-        patch("api.server._start_session_tasks", lambda state: None),
+        patch("api.sandbox.runtime.get_pool", return_value=pool),
+        patch("api.sandbox.get_pool", return_value=pool),
         patch("api.providers.unix_local.create_volume",
-              new=AsyncMock(return_value="/tmp/default-local")),
+              new=AsyncMock(return_value=str(Path(os.environ.get("AGENT_SDK_LOCAL_VOL_ROOT", "/tmp")) / "default-unix_local"))),
     ]
     for p in patches:
         p.start()
@@ -275,15 +279,12 @@ async def test_sdk_oauth_token_flows_into_spawn_env(asgi_server):
         )
         await agent.send("hi")
 
-        assert len(recorder.calls) == 1, (
-            f"expected exactly one create_instance call, got {len(recorder.calls)}"
-        )
-        spawn_envs = recorder.spawn_envs
-        assert spawn_envs, "no spawn_env captured from create_instance"
-        env = spawn_envs[0]
-        assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "secret-oauth-xyz", (
-            "CLAUDE_CODE_OAUTH_TOKEN missing from spawn_env; "
-            f"got keys: {sorted(env.keys())}. Regression: SDK stopped "
+        sess = await dbmod.get_session(agent.session_id)
+        assert sess is not None, "session row must exist"
+        secrets = sess.get("secrets") or {}
+        assert secrets.get("CLAUDE_CODE_OAUTH_TOKEN") == "secret-oauth-xyz", (
+            "CLAUDE_CODE_OAUTH_TOKEN missing from session.secrets; "
+            f"got keys: {sorted(secrets.keys())}. Regression: SDK stopped "
             "forwarding creds via the 'secrets' channel."
         )
     finally:
@@ -293,16 +294,13 @@ async def test_sdk_oauth_token_flows_into_spawn_env(asgi_server):
 
 @pytest.mark.asyncio
 async def test_sdk_api_key_flows_into_spawn_env(asgi_server):
-    """Same contract for ``api_key``."""
-    recorder = _SpawnRecorder()
+    """Same contract for ``api_key`` → ``ANTHROPIC_API_KEY``."""
+    pool, sessions = _make_fake_pool()
     patches = [
-        patch("api.server.create_instance", new=recorder),
-        patch("api.server.ensure_volume_supervisor",
-              new=AsyncMock(return_value=None)),
-        patch("api.server.AcpClient", _FakeAcpClient),
-        patch("api.server._start_session_tasks", lambda state: None),
+        patch("api.sandbox.runtime.get_pool", return_value=pool),
+        patch("api.sandbox.get_pool", return_value=pool),
         patch("api.providers.unix_local.create_volume",
-              new=AsyncMock(return_value="/tmp/default-local")),
+              new=AsyncMock(return_value=str(Path(os.environ.get("AGENT_SDK_LOCAL_VOL_ROOT", "/tmp")) / "default-unix_local"))),
     ]
     for p in patches:
         p.start()
@@ -311,40 +309,37 @@ async def test_sdk_api_key_flows_into_spawn_env(asgi_server):
             asgi_server, name="keyed", provider="unix_local", api_key="sk-ant-xyz",
         )
         await agent.send("hi")
-        env = recorder.spawn_envs[0]
-        assert env.get("ANTHROPIC_API_KEY") == "sk-ant-xyz"
+        sess = await dbmod.get_session(agent.session_id)
+        secrets = (sess or {}).get("secrets") or {}
+        assert secrets.get("ANTHROPIC_API_KEY") == "sk-ant-xyz", (
+            f"ANTHROPIC_API_KEY missing from session.secrets; got {sorted(secrets.keys())}"
+        )
     finally:
         for p in patches:
             p.stop()
 
 
 # ---------------------------------------------------------------------------
-# 3. Second message reuses SessionState (SDK-level)
+# 3. Second message reuses the SessionPool entry (no rebuild)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_sdk_second_message_reuses_session_state(asgi_server):
-    """``agent.send()`` called twice must not rebuild ``SessionState``.
+    """``agent.send()`` called twice must hit the SessionPool's cache the
+    second time — exactly one ``cold_create`` call across both sends.
 
-    Regression guard for the missing ``supervisor_url`` on the state
-    object produced by ``/sessions/quick``.  If reuse breaks, the second
-    send triggers a rebuild that runs ``session/load`` against a
-    freshly-created inner session and the supervisor 500s.  Here we
-    detect it cheaply by counting AcpClient constructions.
+    Regression guard for the recovery path: if the first POST /sessions
+    didn't persist enough state for ``get_session(id)`` to find a cached
+    entry, the second send would trigger a second cold_create on the
+    same session_id, which double-provisions the sandbox.
     """
+    pool, sessions = _make_fake_pool()
     patches = [
-        patch("api.server.create_instance",
-              new=AsyncMock(return_value=ProviderInstance(
-                  provider="unix_local", url="http://127.0.0.1:54321",
-                  root="/tmp/fake", sandbox_id="88888", port=54321))),
-        patch("api.server.ensure_volume_supervisor",
-              new=AsyncMock(return_value=None)),
-        patch("api.providers._wait_for_health",
-              new=AsyncMock(return_value=True)),
-        patch("api.server.AcpClient", _FakeAcpClient),
-        patch("api.server._start_session_tasks", lambda state: None),
+        patch("api.sandbox.runtime.get_pool", return_value=pool),
+        patch("api.sandbox.get_pool", return_value=pool),
         patch("api.providers.unix_local.create_volume",
-              new=AsyncMock(return_value="/tmp/default-local")),
+              new=AsyncMock(return_value=str(Path(os.environ.get("AGENT_SDK_LOCAL_VOL_ROOT", "/tmp")) / "default-unix_local"))),
     ]
     for p in patches:
         p.start()
@@ -352,18 +347,21 @@ async def test_sdk_second_message_reuses_session_state(asgi_server):
         agent = _agent_with(asgi_server, name="reuser", provider="unix_local")
 
         await agent.send("first")
-        after_first = _FakeAcpClient.construct_count
-        assert after_first == 1, (
-            f"expected 1 AcpClient constructor call after first send, "
-            f"got {after_first}"
+        # Give the fire-and-forget /message background drain a tick to
+        # invoke get_session for its execute_prompt path.
+        await asyncio.sleep(0.05)
+        cold_after_first = pool.cold_create.await_count
+        assert cold_after_first == 1, (
+            f"expected 1 cold_create after first send, got {cold_after_first}"
         )
 
         await agent.send("second")
-        after_second = _FakeAcpClient.construct_count
-        assert after_second == 1, (
-            f"second send() triggered an AcpClient rebuild "
-            f"(constructs={after_second}); SessionState.supervisor_url "
-            "must be populated by /sessions/quick so the reuse path hits."
+        await asyncio.sleep(0.05)
+        cold_after_second = pool.cold_create.await_count
+        assert cold_after_second == 1, (
+            f"second send() triggered a cold_create rebuild "
+            f"(cold_create awaits={cold_after_second}); the session row "
+            "from /sessions must let pool.get_session take the cache hit."
         )
     finally:
         for p in patches:
@@ -371,49 +369,34 @@ async def test_sdk_second_message_reuses_session_state(asgi_server):
 
 
 # ---------------------------------------------------------------------------
-# 4. Agent.arun() streams a reply through the full pipeline
+# 4. send() round-trip records the user_message in session_log
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_sdk_send_returns_rpc_id_and_records_user_message(asgi_server):
     """Covers the SDK → server ``/message`` round trip.
 
     ``agent.send()`` must return the ``rpc_id`` handed back by the server
-    and the server must have logged the user's prompt under that
-    rpc_id.  Exercising this end-to-end proves:
+    and the server must have logged the user's prompt under that rpc_id.
+    Exercising this end-to-end proves:
 
     * registration payload parses without a 400,
-    * ``ensure_session_live`` can reuse state from ``/sessions/quick``,
-    * ``/message`` accepts the body and enqueues a prompt.
+    * ``/sessions`` returns a session with the SDK's expected shape,
+    * ``/message`` accepts the body and persists ``user_message`` to
+      ``session_log`` under the returned rpc_id.
 
     We deliberately avoid the streaming ``/events`` endpoint — httpx's
     ASGITransport has known flakiness around StreamingResponse cleanup
-    (cancellation on teardown).  The prompt log is a more reliable
-    proxy for "the request reached the scheduler".
+    on cancellation. The session_log row is a more reliable proxy for
+    "the request reached the persistence layer".
     """
-    captured_prompts: list[tuple[str, str, str]] = []
-
-    async def fake_execute_one_prompt(state, rpc_id, message):
-        # Just record that the scheduler saw this prompt.
-        captured_prompts.append((state.session_id, rpc_id, message))
-
+    pool, sessions = _make_fake_pool()
     patches = [
-        patch("api.server.create_instance",
-              new=AsyncMock(return_value=ProviderInstance(
-                  provider="unix_local", url="http://127.0.0.1:54321",
-                  root="/tmp/fake", sandbox_id="sse1", port=54321))),
-        patch("api.server.ensure_volume_supervisor",
-              new=AsyncMock(return_value=None)),
-        patch("api.server.AcpClient", _FakeAcpClient),
+        patch("api.sandbox.runtime.get_pool", return_value=pool),
+        patch("api.sandbox.get_pool", return_value=pool),
         patch("api.providers.unix_local.create_volume",
-              new=AsyncMock(return_value="/tmp/default-local")),
-        patch("api.server._execute_one_prompt", new=fake_execute_one_prompt),
-        # Start only the scheduler (which drains pending_prompts through
-        # our fake _execute_one_prompt) — skip the upstream SSE reader.
-        patch("api.server._start_session_tasks",
-              lambda state: setattr(state, "_reader_alive", True) or
-              setattr(state, "_scheduler_task",
-                      asyncio.create_task(srv._scheduler_loop(state)))),
+              new=AsyncMock(return_value=str(Path(os.environ.get("AGENT_SDK_LOCAL_VOL_ROOT", "/tmp")) / "default-unix_local"))),
     ]
     for p in patches:
         p.start()
@@ -422,20 +405,24 @@ async def test_sdk_send_returns_rpc_id_and_records_user_message(asgi_server):
         rpc_id = await agent.send("please echo")
         assert rpc_id, "send() must return a server-issued rpc_id"
 
-        # Give the scheduler task a tick to consume the pending prompt.
+        # Background drain persists ``user_message`` then attempts
+        # execute_prompt (no-op via our fake). Wait briefly for the row.
         for _ in range(50):
-            if captured_prompts:
+            log_rows = await dbmod.get_session_log(agent.session_id, limit=10)
+            if any((r.payload or {}).get("prompt_id") == rpc_id for r in log_rows):
                 break
             await asyncio.sleep(0.05)
-        assert captured_prompts, (
-            "scheduler did not observe any prompt — either _submit_prompt "
-            "didn't wake the loop or the state's scheduler task was never "
-            "started"
-        )
-        seen_sid, seen_rpc, seen_msg = captured_prompts[-1]
-        assert seen_sid == agent.session_id
-        assert seen_rpc == rpc_id
-        assert "please echo" in seen_msg
+        else:
+            pytest.fail("user_message not logged under returned rpc_id")
+
+        log_rows = await dbmod.get_session_log(agent.session_id, limit=10)
+        user_rows = [
+            r for r in log_rows
+            if r.event_type == "user_message"
+            and (r.payload or {}).get("prompt_id") == rpc_id
+        ]
+        assert user_rows, "expected one user_message row carrying the rpc_id"
+        assert "please echo" in (user_rows[0].payload or {}).get("text", "")
     finally:
         for p in patches:
             p.stop()

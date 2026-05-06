@@ -66,6 +66,10 @@ def isolated_vol_root(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
     saved_procs = dict(lp._PROCESSES)
     lp._PROCESSES.clear()
+    # Redirect the global ref→record index away from $HOME so the test
+    # doesn't read or scribble on the developer's real
+    # ``~/.agent-sdk/sandbox-markers/``.
+    monkeypatch.setattr(lp, "_index_dir", lambda: tmp_path / "_index")
     try:
         yield tmp_path
     finally:
@@ -109,6 +113,65 @@ async def test_destroy_kills_orphan_pid_when_in_memory_state_lost(
         assert _wait_for_exit(proc), (
             f"orphan pid {proc.pid} survived destroy — DELETE silently "
             f"dropped the session row but left the supervisor running"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_destroy_finds_marker_outside_vol_root_via_global_index(
+    isolated_vol_root, tmp_path,
+):
+    """Volume sits OUTSIDE the active ``AGENT_SDK_LOCAL_VOL_ROOT`` —
+    e.g. the DB row was written by a prior server boot whose env var
+    pointed elsewhere (a unit test's pytest tmp dir, a different user
+    layout). Without the global index, ``_load_record`` globs only
+    ``_vol_root()`` and silently returns ``(None, None)`` →
+    ``destroy_sandbox`` no-ops the kill (record is None) and the
+    supervisor leaks. ``start_sandbox`` recovery falls through to
+    ``create_sandbox`` and produces a NEW ``sandbox_ref``, which broke
+    ``test_stop_sandbox_same_sandbox_after_restart[unix_local]`` under
+    -n auto.
+    """
+    proc = _spawn_dummy_supervisor()
+    try:
+        ref = "local-feedface0002"
+
+        # Marker lives at a volume path that ``_vol_root()`` (= isolated_vol_root)
+        # cannot reach — outside the glob's search scope on purpose.
+        outside_vol = tmp_path.parent / "outside" / "default-unix_local"
+        marker_dir = outside_vol / "system" / "sandboxes"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        marker = marker_dir / f"{ref}.json"
+        record = lp._SandboxRecord(
+            ref=ref, pid=proc.pid, port=0,
+            node="", supervisor_js="", acp_bin="",
+        )
+        # ``_write_record`` writes both the per-volume marker (here) and
+        # the global index (under tmp_path/_index, see fixture).
+        lp._write_record(marker, record)
+
+        # Sanity: the legacy glob path can't see this marker, so the fix
+        # is doing real work — recovery only succeeds via the global index.
+        import glob
+        assert not glob.glob(str(isolated_vol_root / "*" / "system" / "sandboxes" / f"{ref}.json"))
+
+        await lp.destroy_sandbox(ProviderInstance(
+            provider="unix_local", url="", sandbox_ref=ref,
+        ))
+
+        assert _wait_for_exit(proc), (
+            f"orphan pid {proc.pid} survived destroy — global index lookup "
+            f"didn't find the marker, so SIGTERM was never sent"
+        )
+        assert not marker.exists(), (
+            f"per-volume marker {marker} survived destroy — _clear_record "
+            f"only removed the global index entry, not the on-disk marker"
+        )
+        assert not (tmp_path / "_index" / f"{ref}.json").exists(), (
+            "global index entry survived destroy"
         )
     finally:
         if proc.poll() is None:

@@ -518,10 +518,16 @@ async def _write_marker_and_read(sdk, session_id, marker):
 
 
 async def _read_marker(sdk, session_id, marker):
+    # Sentinel is opaque on purpose. The earlier ``NOT_FOUND`` token kept
+    # tripping the absence check because chatty models would repeat it
+    # back in their explanatory text ("the `echo NOT_FOUND` fallback was
+    # not needed") even when the file existed. ``__MARKER_ABSENT__`` is
+    # weird enough that the model only emits it when it actually came
+    # out of the shell pipeline.
     return await _ask(
         sdk, session_id,
         f"Please run this shell command and tell me the output:\n"
-        f"  cat ~/{marker} || echo NOT_FOUND",
+        f"  cat ~/{marker} || echo __MARKER_ABSENT__",
     )
 
 
@@ -554,7 +560,7 @@ async def test_server_delete_persists_workspace(provider):
 
         reply2 = await _read_marker(sdk, session_id, marker)
         print(f"[test:{provider}] after server-delete reply: {reply2[:400]!r}")
-        assert "NOT_FOUND" not in reply2, (
+        assert "__MARKER_ABSENT__" not in reply2, (
             f"marker file lost after server DELETE — cold snapshot didn't run before "
             f"teardown: {reply2}"
         )
