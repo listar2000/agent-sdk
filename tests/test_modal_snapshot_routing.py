@@ -50,3 +50,73 @@ async def test_get_image_prefers_committed_modal_snapshot(monkeypatch) -> None:
 
     assert image.kind == "snapshot"
     assert calls == [snap_id]
+
+
+@pytest.mark.asyncio
+async def test_modal_runs_pre_start_before_supervisor_health(monkeypatch) -> None:
+    events: list[tuple[str, str]] = []
+
+    class FakeTunnel:
+        url = "https://example.modal.host"
+
+    class FakeSandbox:
+        object_id = "sb-test"
+        stdout = SimpleNamespace(read=lambda: "")
+        stderr = SimpleNamespace(read=lambda: "")
+
+        def tunnels(self, _timeout: int):
+            return {mprov._SUPERVISOR_CONTAINER_PORT: FakeTunnel()}
+
+        def terminate(self):
+            events.append(("terminate", ""))
+
+    fake_sb = FakeSandbox()
+
+    class FakeSandboxFactory:
+        @staticmethod
+        def create(*args, **_kwargs):
+            events.append(("create", args[2]))
+            return fake_sb
+
+    async def fake_get_app():
+        return SimpleNamespace(app_id="app-test")
+
+    async def fake_get_image():
+        return SimpleNamespace()
+
+    async def fake_get_volume(_ref: str):
+        return SimpleNamespace()
+
+    async def fake_exec(_sb, cmd: str, *, timeout: int):
+        events.append(("exec", cmd))
+        return 0, "", ""
+
+    async def fake_wait(url: str, *, max_retries: int, interval: float):
+        events.append(("health", url))
+        return True
+
+    from api.providers import _shared as shared
+
+    monkeypatch.setattr(shared, "_runtime_acp_bin_relative", lambda _agent_type: "node_modules/.bin/claude-agent-acp")
+    monkeypatch.setattr(mprov, "_require_modal", lambda: (SimpleNamespace(Sandbox=FakeSandboxFactory), SimpleNamespace()))
+    monkeypatch.setattr(mprov, "_get_app", fake_get_app)
+    monkeypatch.setattr(mprov, "_get_image", fake_get_image)
+    monkeypatch.setattr(mprov, "_get_volume", fake_get_volume)
+    monkeypatch.setattr(mprov, "_exec_modal_shell", fake_exec)
+    monkeypatch.setattr(mprov, "_wait_for_health", fake_wait)
+
+    result = await mprov.create_sandbox(
+        volume_ref="vol-test",
+        subpath="sessions/test",
+        pre_start_commands=["echo setup"],
+        shared_mounts=["workspace"],
+    )
+
+    assert result.sandbox_ref == "sb-test"
+    assert [name for name, _ in events] == ["create", "exec", "exec", "health"]
+    entrypoint = events[0][1]
+    assert "tail -f /dev/null" in entrypoint
+    assert "echo setup" not in entrypoint
+    assert "supervisor.js" not in entrypoint
+    assert "echo setup" in events[1][1]
+    assert "nohup" in events[2][1]
