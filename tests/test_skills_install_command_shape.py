@@ -26,21 +26,21 @@ def test_single_skill_filter_is_respected():
     assert len(cmds) == 1
     assert "github/awesome-copilot@excalidraw-diagram-generator" in cmds[0]
     assert "--all" not in cmds[0]
-    assert cmds[0].endswith(" -g")
+    assert cmds[0].endswith(" --yes --global")
 
 
 def test_repo_without_filter_uses_all():
     cmds = _skills_install_commands(["rllm-org/hive"])
     assert len(cmds) == 1
     assert "rllm-org/hive" in cmds[0]
-    assert "--all -g" in cmds[0]
+    assert "--all --yes --global" in cmds[0]
 
 
 def test_branch_ref_without_skill_filter_still_uses_all():
     cmds = _skills_install_commands(["rllm-org/hive#staging"])
     assert len(cmds) == 1
     assert "rllm-org/hive#staging" in cmds[0]
-    assert "--all -g" in cmds[0]
+    assert "--all --yes --global" in cmds[0]
 
 
 def test_dict_form_with_skill_filter_is_respected():
@@ -61,7 +61,7 @@ def test_mixed_list_picks_flag_per_entry():
     )
     assert len(cmds) == 2
     assert "--all" not in cmds[0]  # filtered → no --all
-    assert "--all -g" in cmds[1]   # unfiltered → --all
+    assert "--all --yes --global" in cmds[1]   # unfiltered → --all
 
 
 def test_empty_or_none_returns_no_commands():

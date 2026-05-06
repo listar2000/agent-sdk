@@ -312,7 +312,10 @@ def _skills_install_commands(skills) -> list[str]:
     sources = _normalize_skills(skills)
     cmds: list[str] = []
     for source in sources:
-        flags = "-g" if "@" in source else "--all -g"
+        # `npx -y` only answers npx's package-install prompt. Pass --yes to
+        # the skills CLI itself too, otherwise remote sandboxes can hang in
+        # pre-start before the supervisor ever reaches its health endpoint.
+        flags = "--yes --global" if "@" in source else "--all --yes --global"
         cmds.append(f"npx -y skills add {shlex.quote(source)} {flags}")
     return cmds
 
