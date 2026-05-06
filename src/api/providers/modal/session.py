@@ -20,6 +20,8 @@ from api.sandbox.state import ModalSandboxState, SandboxState
 log = logging.getLogger(__name__)
 
 _SSE_READ_TIMEOUT_S = 60.0
+_ATTACH_RETRY_ATTEMPTS = 3
+_ATTACH_RETRY_DELAY_S = 0.5
 
 
 class ModalSandboxSession(BaseSandboxSession):
@@ -34,6 +36,24 @@ class ModalSandboxSession(BaseSandboxSession):
         super().__init__(session_id=session_id, state=state)
         self._cwd = "/v"
 
+    async def _attach_with_retry(self) -> None:
+        last_error: Exception | None = None
+        for attempt in range(1, _ATTACH_RETRY_ATTEMPTS + 1):
+            try:
+                await self._attach_acp()
+                return
+            except Exception as exc:  # pragma: no cover - covered by unit tests
+                last_error = exc
+                if attempt >= _ATTACH_RETRY_ATTEMPTS:
+                    break
+                log.warning(
+                    "Modal ACP attach failed (attempt %s/%s) for session %s: %s",
+                    attempt, _ATTACH_RETRY_ATTEMPTS, self.session_id, exc,
+                )
+                await asyncio.sleep(_ATTACH_RETRY_DELAY_S * attempt)
+        assert last_error is not None
+        raise last_error
+
     async def start(self) -> None:
         if self._supervisor_url is not None and await self.running():
             return
@@ -45,6 +65,7 @@ class ModalSandboxSession(BaseSandboxSession):
 
         instance = None
         reattached = False
+        created_fresh = False
         if self.state.sandbox_ref:
             try:
                 status = await md_provider.get_sandbox_status(self.state.sandbox_ref)
@@ -82,24 +103,51 @@ class ModalSandboxSession(BaseSandboxSession):
             )
             self.state.sandbox_ref = instance.sandbox_ref
             self.state.listen_port = instance.port
+            created_fresh = True
 
         self._supervisor_url = instance.url
 
-        ok = await _wait_for_health(instance.url, max_retries=15, interval=0.5)
-        if not ok:
-            if reattached:
+        if reattached:
+            ok = await _wait_for_health(instance.url, max_retries=15, interval=0.5)
+            if not ok:
                 # Reattached to an existing modal sandbox but its supervisor
                 # is unreachable. Abandon the ref so the next get_session
                 # cold-creates fresh instead of looping on the wedged one.
                 self.state.sandbox_ref = None
-            raise RuntimeError(
-                f"Modal supervisor not responding at {instance.url}"
-            )
+                self.state.listen_port = None
+                raise RuntimeError(
+                    f"Modal supervisor not responding at {instance.url}"
+                )
 
-        self.liveness.observe_chunk()
-        if self._acp_session_id is None:
-            self._acp_session_id = str(uuid4())
-        await self._attach_acp()
+        try:
+            self.liveness.observe_chunk()
+            if self._acp_session_id is None:
+                self._acp_session_id = str(uuid4())
+            await self._attach_with_retry()
+        except Exception:
+            # Freshly-created Modal sandboxes are not visible to the SessionPool
+            # until start() returns and state is persisted; tear down on attach
+            # failure so we do not leak "created but unregistered" sandboxes.
+            if created_fresh and self.state.sandbox_ref:
+                try:
+                    from api.providers import ProviderInstance
+                    await md_provider.stop_sandbox(ProviderInstance(
+                        provider="modal",
+                        url=self._supervisor_url or "",
+                        root=self.state.recipe.root or "/v",
+                        sandbox_ref=self.state.sandbox_ref,
+                        port=self.state.listen_port,
+                    ))
+                except Exception:
+                    log.exception(
+                        "modal cleanup after attach failure failed: session=%s sandbox=%s",
+                        self.session_id, self.state.sandbox_ref,
+                    )
+            if created_fresh or reattached:
+                self.state.sandbox_ref = None
+                self.state.listen_port = None
+            self._supervisor_url = None
+            raise
 
         log.info(
             "ModalSandboxSession started: session=%s sandbox=%s url=%s",
