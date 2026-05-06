@@ -334,7 +334,9 @@ def _build_entrypoint_cmd(
 
 
 def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, str, str]:
-    proc = sb.exec("bash", "-lc", cmd)
+    # Match ``exec_in_sandbox``: use ``sh -c`` — slim Modal images may not
+    # ship ``bash``, and ``bash -lc`` can fail before any user command runs.
+    proc = sb.exec("sh", "-c", cmd)
     try:
         rc = proc.wait(timeout=timeout)
     except TypeError:
@@ -343,10 +345,22 @@ def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, s
 
 
 async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | None, str, str]:
-    return await asyncio.wait_for(
-        asyncio.to_thread(_run_modal_exec_sync, sb, cmd, timeout),
-        timeout=timeout + 5,
-    )
+    outer = timeout + 5
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_run_modal_exec_sync, sb, cmd, timeout),
+            timeout=outer,
+        )
+    except asyncio.TimeoutError as e:
+        preview = (cmd[:200] + "…") if len(cmd) > 200 else cmd
+        raise RuntimeError(
+            f"Modal exec timed out after {outer}s (inner wait={timeout}s): {preview!r}"
+        ) from e
+    except Exception as e:
+        preview = (cmd[:200] + "…") if len(cmd) > 200 else cmd
+        raise RuntimeError(
+            f"Modal exec failed for command {preview!r}: {e}"
+        ) from e
 
 
 async def create_sandbox(
