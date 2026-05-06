@@ -49,12 +49,26 @@ def _vol_root() -> Path:
     return (Path.home() / ".agent-sdk" / "volumes").resolve()
 
 
-# Source of truth: ``<vol_root>/<volume>/system/sandboxes/<ref>.json`` carries
-# the PID + spawn plan for one supervisor. Mirrors how docker uses the daemon's
-# container record, daytona/modal use their control planes — destroy/stop/
-# start/status all read from disk, never from in-memory dicts that vanish on
-# restart. ``_PROCESSES`` is a current-lifetime cache for ``proc.wait()``
-# zombie reaping only; nothing load-bearing reads it.
+# Global ref → record index. Independent of ``_vol_root()`` and of where the
+# volume directory itself sits, so a sandbox stays discoverable when the
+# volume row's ``provider_ref`` points outside the default root (custom
+# volume_id, AGENT_SDK_LOCAL_VOL_ROOT pinned to a pytest tmp dir on a prior
+# server boot, etc.). Without this, ``destroy_sandbox`` silently no-ops
+# (record=None → no kill) and ``start_sandbox`` silently provisions a NEW
+# sandbox_ref instead of reattaching — both broke goldens under -n auto.
+def _index_dir() -> Path:
+    return (Path.home() / ".agent-sdk" / "sandbox-markers").resolve()
+
+
+def _index_path(ref: str) -> Path:
+    return _index_dir() / f"{ref}.json"
+
+
+# Per-volume marker location is still ``<vol>/system/sandboxes/<ref>.json``
+# — kept for back-compat reads (legacy sandboxes created before the index
+# existed) and for human/debug discovery alongside the volume's data.
+# ``_PROCESSES`` is a current-lifetime cache for ``proc.wait()`` zombie
+# reaping only; nothing load-bearing reads it.
 
 @dataclass
 class _SandboxRecord:
@@ -67,10 +81,28 @@ class _SandboxRecord:
     extra: list[str] = field(default_factory=list)
     effective_root: str = "/tmp"
     base_env: dict[str, str] = field(default_factory=dict)
+    # Absolute path of the per-volume marker file (``<vol>/system/
+    # sandboxes/<ref>.json``). Stored inside the record so the global
+    # index lookup can also clean up the per-volume copy on destroy,
+    # even when the volume sits outside the current ``_vol_root()``.
+    # Optional for back-compat with records written before this field
+    # existed; ``_clear_record`` falls back to a glob in that case.
+    marker_path: str = ""
 
 
 def _load_record(ref: str) -> tuple[Path | None, _SandboxRecord | None]:
-    """Sync — callers wrap in ``asyncio.to_thread`` to avoid blocking the loop."""
+    """Sync — callers wrap in ``asyncio.to_thread`` to avoid blocking the loop.
+
+    Reads the global index first (works regardless of volume location);
+    falls back to the legacy per-volume glob under ``_vol_root()`` for
+    sandboxes created before the index existed.
+    """
+    idx = _index_path(ref)
+    if idx.is_file():
+        try:
+            return idx, _SandboxRecord(**json.loads(idx.read_text()))
+        except (json.JSONDecodeError, TypeError):
+            pass
     matches = glob.glob(str(_vol_root() / "*" / "system" / "sandboxes" / f"{ref}.json"))
     if not matches:
         return None, None
@@ -82,10 +114,46 @@ def _load_record(ref: str) -> tuple[Path | None, _SandboxRecord | None]:
 
 
 def _write_record(marker: Path, record: _SandboxRecord) -> None:
+    record.marker_path = str(marker)
     marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(asdict(record))
     tmp = marker.with_suffix(marker.suffix + ".tmp")
-    tmp.write_text(json.dumps(asdict(record)))
+    tmp.write_text(payload)
     os.replace(tmp, marker)
+    # Mirror to the global index so reads work even when ``_vol_root()`` no
+    # longer reaches this volume (env var changes between server runs).
+    idx_dir = _index_dir()
+    idx_dir.mkdir(parents=True, exist_ok=True)
+    idx = _index_path(record.ref)
+    tmp = idx.with_suffix(".json.tmp")
+    tmp.write_text(payload)
+    os.replace(tmp, idx)
+
+
+def _clear_record(
+    ref: str,
+    marker: Path | None,
+    record: _SandboxRecord | None = None,
+) -> None:
+    """Remove every persisted handle to ``ref``: the global index entry,
+    the per-volume marker known via ``marker``/``record.marker_path``,
+    and (legacy back-compat) any per-volume marker discoverable under
+    the active ``_vol_root()``. Idempotent."""
+    paths: set[Path] = {_index_path(ref)}
+    if marker is not None:
+        paths.add(marker)
+    if record is not None and record.marker_path:
+        paths.add(Path(record.marker_path))
+    paths.update(
+        Path(p) for p in glob.glob(
+            str(_vol_root() / "*" / "system" / "sandboxes" / f"{ref}.json")
+        )
+    )
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 def _kill_pid(pid: int) -> None:
@@ -410,12 +478,21 @@ async def start_sandbox(ref: str) -> None:
 
 
 async def _kill_and_reap(ref: str, record: _SandboxRecord | None) -> None:
-    """Kill PID via marker; reap Popen if we still own it (current lifetime)."""
+    """Kill PID via marker; reap Popen if we still own it (current lifetime).
+
+    If both the marker AND the cached Popen are present (typical) the
+    record's pid drives the kill and ``proc.wait`` reaps the zombie.
+    If only the cached Popen is present (record lookup failed for any
+    reason — pre-fix legacy state, marker corruption), fall back to the
+    Popen's own pid so the process doesn't survive.
+    """
     if record is not None:
         await asyncio.to_thread(_kill_pid, record.pid)
     async with _PROCESSES_LOCK:
         proc = _PROCESSES.pop(ref, None)
     if proc is not None:
+        if record is None and proc.poll() is None:
+            await asyncio.to_thread(_kill_pid, proc.pid)
         try:
             await asyncio.to_thread(proc.wait, 2)
         except subprocess.TimeoutExpired:
@@ -438,11 +515,7 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
         return
     marker, record = await asyncio.to_thread(_load_record, ref)
     await _kill_and_reap(ref, record)
-    if marker is not None:
-        try:
-            await asyncio.to_thread(os.remove, marker)
-        except FileNotFoundError:
-            pass
+    await asyncio.to_thread(_clear_record, ref, marker, record)
     port = getattr(inst, "port", None) or (record.port if record else None)
     if port:
         async with _port_lock:
