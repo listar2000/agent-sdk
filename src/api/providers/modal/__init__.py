@@ -91,7 +91,6 @@ _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
 _PRE_START_COMMAND_TIMEOUT_SEC = int(float(
     os.environ.get("AGENT_SDK_MODAL_PRE_START_TIMEOUT_S", "120")
 ))
-
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
 _TAG_KEY = "agent-sdk.sandbox-id"
@@ -346,6 +345,25 @@ def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, s
     return rc, proc.stdout.read() or "", proc.stderr.read() or ""
 
 
+def _pre_start_failure_message(
+    *, cmd: str, rc: int | None, out: str, err: str, timeout: int,
+) -> str:
+    snippet = (err or out or "")[-1000:].strip()
+    if not snippet:
+        snippet = "<no stdout/stderr captured>"
+    hint = ""
+    if rc == -1:
+        hint = (
+            "\nModal returned exit=-1, which usually means the exec hit its "
+            f"timeout/provider abort before the shell returned (timeout={timeout}s)."
+        )
+    return (
+        "pre_start_commands failed on Modal sandbox "
+        f"(exit={rc}, timeout={timeout}s): {cmd!r}"
+        f"{hint}\n{snippet}"
+    )
+
+
 async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | None, str, str]:
     outer = timeout + 5
     try:
@@ -462,11 +480,10 @@ async def create_sandbox(
                 sb, wrapped, timeout=_PRE_START_COMMAND_TIMEOUT_SEC,
             )
             if rc != 0:
-                snippet = (err or out or "")[-500:]
-                raise RuntimeError(
-                    f"pre_start_commands failed on Modal sandbox "
-                    f"(exit={rc}): {cmd!r}\n{snippet}"
-                )
+                raise RuntimeError(_pre_start_failure_message(
+                    cmd=cmd, rc=rc, out=out, err=err,
+                    timeout=_PRE_START_COMMAND_TIMEOUT_SEC,
+                ))
 
         start_cmd = (
             f"export HOME={shlex.quote(_AGENT_HOME_IN)} "

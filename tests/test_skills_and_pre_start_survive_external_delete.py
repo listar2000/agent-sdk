@@ -9,7 +9,7 @@ our server, simulating "the sandbox just disappears"), then triggers a
 cold-recovery via a follow-up message and asserts that BOTH the skills
 AND the marker re-appear on the freshly-provisioned replacement sandbox.
 
-How we verify skills are installed: we ASK THE AGENT. ``npx skills add
+How we verify skills are installed: we ASK THE AGENT. ``skills add
 ... --all -g`` writes into Claude's skills directory under HOME, not
 into ``/usr/local/bin`` — so ``command -v hive`` is the wrong check.
 Claude reads its skills at startup and surfaces them via the ACP
@@ -104,7 +104,7 @@ async def _ask_agent_for_skills(agent) -> str:
     can grep for expected skill names.
     """
     return await agent.arun(
-        "List your available skills (those installed via `npx skills add`, "
+        "List your available skills (those installed via `skills add`, "
         "NOT your built-in tools like Read/Write/Bash). Reply with each "
         "skill name on its own line, no other prose. If you have no "
         "skills installed, reply with the single word NONE."

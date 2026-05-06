@@ -27,6 +27,14 @@ def test_dockerfile_packages_modal_snapshot_tag() -> None:
     assert ".modal-snapshot-tag*" in text
 
 
+def test_dockerfile_bakes_skills_cli() -> None:
+    dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
+    text = dockerfile.read_text()
+
+    assert "npm install -g" in text
+    assert " skills" in text
+
+
 @pytest.mark.asyncio
 async def test_get_image_prefers_committed_modal_snapshot(monkeypatch) -> None:
     snap_id = (Path(__file__).resolve().parents[1] / ".modal-snapshot-tag").read_text().strip()
@@ -179,9 +187,24 @@ async def test_modal_uses_daytona_style_pre_start_timeout_for_skills(monkeypatch
         volume_ref="vol-test",
         subpath="sessions/test",
         pre_start_commands=[
-            "npx -y skills add claude-office-skills/skills@html-slides -g",
+            "skills add claude-office-skills/skills@html-slides -g",
             "echo setup",
         ],
     )
 
     assert exec_timeouts == [120, 120, 10]
+
+
+def test_modal_exit_minus_one_pre_start_error_explains_provider_abort() -> None:
+    message = mprov._pre_start_failure_message(
+        cmd="skills add claude-office-skills/skills@html-slides -g",
+        rc=-1,
+        out="",
+        err="",
+        timeout=120,
+    )
+
+    assert "exit=-1" in message
+    assert "timeout=120s" in message
+    assert "timeout/provider abort" in message
+    assert "<no stdout/stderr captured>" in message
