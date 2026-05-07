@@ -308,13 +308,11 @@ def _skills_install_commands(skills) -> list[str]:
     ``--all`` only when no ``@<skill>`` suffix is given, so the filter is
     respected — otherwise ``--all`` overrides it and pulls every skill
     from the repo (e.g. ``github/awesome-copilot`` ships hundreds).
-    ``npx -y`` only approves npx package resolution; ``skills add`` needs
-    its own ``--yes`` flag to avoid the agent-selection prompt.
     """
     sources = _normalize_skills(skills)
     cmds: list[str] = []
     for source in sources:
-        flags = "--yes -g" if "@" in source else "--yes --all -g"
+        flags = "-g" if "@" in source else "--all -g"
         cmds.append(f"npx -y skills add {shlex.quote(source)} {flags}")
     return cmds
 
