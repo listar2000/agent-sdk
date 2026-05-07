@@ -116,19 +116,17 @@ def test_to_modal_resources_translates():
     from api.providers.modal import _to_modal_resources
     r = Resources(cpu=1.5, memory_mib=2048, gpu="T4:2")
     out = _to_modal_resources(r)
-    assert out == {"cpu": 1.5, "memory": 2048, "gpu": "T4:2"}
+    assert out == {"cpu": 1.5, "memory": 2048}
 
 
-def test_to_modal_resources_collapses_single_gpu():
+def test_to_modal_resources_ignores_single_gpu():
     from api.providers.modal import _to_modal_resources
     out = _to_modal_resources(Resources(gpu="A100"))
-    assert out == {"gpu": "A100"}  # not "A100:1"
+    assert out == {}
 
 
 def test_to_modal_resources_drops_count_only_gpu():
     from api.providers.modal import _to_modal_resources
-    # validator rejects this at the API boundary; translator stays lenient
-    # for direct callers and silently drops the unsatisfiable count.
     out = _to_modal_resources(Resources(gpu="2"))
     assert out == {}
 
