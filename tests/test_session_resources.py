@@ -143,14 +143,182 @@ def test_modal_entrypoint_pins_pre_start_home():
 
     entrypoint = _build_entrypoint_cmd(
         subpath="agents/7",
-        supervisor_cmd="node supervisor.js",
         shared_mounts=["42"],
-        pre_start_commands=["uv tool install hivespace"],
     )
 
-    assert "export HOME=/home/agent && mkdir -p /home/agent && uv tool install hivespace" in entrypoint
     assert "ln -s /v/agents/agents/7 /home/agent" in entrypoint
-    assert entrypoint.endswith("exec node supervisor.js")
+    assert "ln -s /v/shared/42 /mnt/42" in entrypoint
+    assert "uv tool install hivespace" not in entrypoint
+    assert "node supervisor.js" not in entrypoint
+    assert entrypoint.endswith("exec tail -f /dev/null")
+
+
+@pytest.mark.asyncio
+async def test_modal_create_sandbox_runs_pre_start_before_supervisor_exec(monkeypatch):
+    from types import SimpleNamespace
+    from api.providers import modal as modal_provider
+    from api.providers import _shared as shared_provider
+
+    commands: list[tuple[tuple[str, ...], int | None]] = []
+
+    class FakeProc:
+        def __init__(self, rc=0, stdout="", stderr=""):
+            self._rc = rc
+            self.stdout = SimpleNamespace(read=lambda: stdout)
+            self.stderr = SimpleNamespace(read=lambda: stderr)
+
+        def wait(self, *args, **kwargs):
+            return self._rc
+
+    class FakeSandbox:
+        object_id = "sb-modal-unit"
+        stdout = SimpleNamespace(read=lambda: "")
+        stderr = SimpleNamespace(read=lambda: "")
+
+        def tunnels(self, timeout):
+            assert timeout == 60
+            return {9100: SimpleNamespace(url="https://modal-unit.test")}
+
+        def exec(self, *args, timeout=None):
+            commands.append((tuple(args), timeout))
+            return FakeProc()
+
+        def terminate(self):
+            raise AssertionError("healthy startup should not terminate sandbox")
+
+    class FakeSandboxFactory:
+        @staticmethod
+        def create(*args, **kwargs):
+            commands.append((tuple(args), None))
+            entrypoint = args[2]
+            assert args[:2] == ("sh", "-c")
+            assert "exec tail -f /dev/null" in entrypoint
+            assert "echo setup" not in entrypoint
+            assert "node supervisor.js" not in entrypoint
+            return FakeSandbox()
+
+    async def fake_get_app():
+        return object()
+
+    async def fake_get_image():
+        return object()
+
+    async def fake_get_volume(_ref):
+        return object()
+
+    async def fake_wait_for_health(url, *, max_retries, interval):
+        assert url == "https://modal-unit.test"
+        return True
+
+    monkeypatch.setattr(modal_provider, "_get_app", fake_get_app)
+    monkeypatch.setattr(modal_provider, "_get_image", fake_get_image)
+    monkeypatch.setattr(modal_provider, "_get_volume", fake_get_volume)
+    monkeypatch.setattr(
+        modal_provider,
+        "_require_modal",
+        lambda: (SimpleNamespace(Sandbox=FakeSandboxFactory), SimpleNamespace()),
+    )
+    monkeypatch.setattr(modal_provider, "_wait_for_health", fake_wait_for_health)
+    monkeypatch.setattr(
+        modal_provider,
+        "build_supervisor_argv",
+        lambda **_kw: "node supervisor.js --port 9100",
+    )
+    monkeypatch.setattr(
+        shared_provider,
+        "_runtime_acp_bin_relative",
+        lambda _agent_type: "node_modules/claude-agent-acp/dist/index.js",
+    )
+
+    inst = await modal_provider.create_sandbox(
+        volume_ref="modal-prod",
+        subpath="agents/7",
+        pre_start_commands=["echo setup"],
+    )
+
+    exec_cmds = [
+        cmd for cmd, timeout in commands
+        if timeout is not None and cmd[:2] == ("sh", "-c")
+    ]
+    assert "export HOME=/home/agent && mkdir -p /home/agent && echo setup" in exec_cmds[0][2]
+    assert "nohup env" in exec_cmds[1][2]
+    assert "node supervisor.js --port 9100" in exec_cmds[1][2]
+    assert inst.sandbox_ref == "sb-modal-unit"
+    assert inst.url == "https://modal-unit.test"
+
+
+@pytest.mark.asyncio
+async def test_modal_create_sandbox_reports_pre_start_failure(monkeypatch):
+    from types import SimpleNamespace
+    from api.providers import modal as modal_provider
+    from api.providers import _shared as shared_provider
+
+    terminated = []
+
+    class FakeProc:
+        stdout = SimpleNamespace(read=lambda: "")
+        stderr = SimpleNamespace(read=lambda: "setup exploded")
+
+        def wait(self, *args, **kwargs):
+            return 42
+
+    class FakeSandbox:
+        object_id = "sb-modal-fail"
+
+        def tunnels(self, _timeout):
+            return {9100: SimpleNamespace(url="https://modal-unit.test")}
+
+        def exec(self, *args, timeout=None):
+            return FakeProc()
+
+        def terminate(self):
+            terminated.append(self.object_id)
+
+    class FakeSandboxFactory:
+        @staticmethod
+        def create(*args, **kwargs):
+            return FakeSandbox()
+
+    async def fake_get_app():
+        return object()
+
+    async def fake_get_image():
+        return object()
+
+    async def fake_get_volume(_ref):
+        return object()
+
+    monkeypatch.setattr(modal_provider, "_get_app", fake_get_app)
+    monkeypatch.setattr(modal_provider, "_get_image", fake_get_image)
+    monkeypatch.setattr(modal_provider, "_get_volume", fake_get_volume)
+    monkeypatch.setattr(
+        modal_provider,
+        "_require_modal",
+        lambda: (SimpleNamespace(Sandbox=FakeSandboxFactory), SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        modal_provider,
+        "build_supervisor_argv",
+        lambda **_kw: "node supervisor.js --port 9100",
+    )
+    monkeypatch.setattr(
+        shared_provider,
+        "_runtime_acp_bin_relative",
+        lambda _agent_type: "node_modules/claude-agent-acp/dist/index.js",
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await modal_provider.create_sandbox(
+            volume_ref="modal-prod",
+            subpath="agents/7",
+            pre_start_commands=["bad setup"],
+        )
+
+    msg = str(excinfo.value)
+    assert "pre_start_commands failed on Modal sandbox" in msg
+    assert "bad setup" in msg
+    assert "setup exploded" in msg
+    assert terminated == ["sb-modal-fail"]
 
 
 @pytest.mark.asyncio
