@@ -319,6 +319,18 @@ def _skills_install_commands(skills) -> list[str]:
     return cmds
 
 
+def _resources_for_provider(provider: str, resources_data):
+    """Build and validate per-session resources, applying provider defaults."""
+    from api.sandbox.state import Resources, validate_resources_for_provider
+
+    if resources_data is None and provider == "modal":
+        resources = Resources(gpu="T4")
+    else:
+        resources = Resources(**resources_data) if resources_data else None
+    validate_resources_for_provider(provider, resources)
+    return resources
+
+
 async def _install_skills_locally(skills) -> None:
     """Install skills on the local host (for the local provider)."""
     for cmd in _skills_install_commands(skills):
@@ -1495,10 +1507,13 @@ async def _sessions_create_eager(data: dict) -> dict:
     config_data.pop("dockerfile_content", None)
     config_data.pop("dockerfile", None)
     config_data.pop("workspace", None)
-    resources_data = data.get("resources") or config_data.pop("resources", None)
+    resources_data = data.get("resources")
+    if resources_data is None:
+        resources_data = config_data.pop("resources", None)
+    else:
+        config_data.pop("resources", None)
     try:
-        resources = Resources(**resources_data) if resources_data else None
-        validate_resources_for_provider(provider, resources)
+        resources = _resources_for_provider(provider, resources_data)
     except ValueError as e:
         raise HTTPException(400, str(e))
 

@@ -105,18 +105,21 @@ _APP_NAME = "agent-sdk"
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
 
-    Modal accepts ``cpu`` (float) and ``memory`` (int MiB). Ignore GPU even
-    when requested: GPU sandboxes can sit in Modal queues long enough that
-    session startup looks wedged, while Daytona already covers GPU-backed runs.
-    ``disk_gib`` is ignored because Modal has no per-sandbox storage knob.
+    Modal accepts ``cpu`` (float), ``memory`` (int MiB), and ``gpu`` (str:
+    ``"TYPE"`` or ``"TYPE:COUNT"``). A count-only gpu request (no type) is
+    silently dropped — Modal requires a type. ``disk_gib`` is ignored.
     """
     if req is None:
         return {}
+    from api.sandbox.state import parse_gpu
     out: dict[str, Any] = {}
     if req.cpu is not None:
         out["cpu"] = float(req.cpu)
     if req.memory_mib is not None:
         out["memory"] = int(req.memory_mib)
+    gpu_type, gpu_count = parse_gpu(req.gpu)
+    if gpu_type is not None:
+        out["gpu"] = f"{gpu_type}:{gpu_count}" if (gpu_count or 1) > 1 else gpu_type
     return out
 
 
