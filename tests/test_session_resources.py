@@ -114,19 +114,21 @@ def test_to_daytona_resources_returns_none_for_empty():
 
 def test_to_modal_resources_translates():
     from api.providers.modal import _to_modal_resources
-    r = Resources(cpu=1.5, memory_mib=2048, gpu="T4:2")
+    r = Resources(cpu=1.5, memory_mib=2048, gpu="T4")
     out = _to_modal_resources(r)
-    assert out == {"cpu": 1.5, "memory": 2048}
+    assert out == {"cpu": 1.5, "memory": 2048, "gpu": "T4"}
 
 
-def test_to_modal_resources_ignores_single_gpu():
+def test_to_modal_resources_collapses_single_gpu():
     from api.providers.modal import _to_modal_resources
     out = _to_modal_resources(Resources(gpu="A100"))
-    assert out == {}
+    assert out == {"gpu": "A100"}  # not "A100:1"
 
 
 def test_to_modal_resources_drops_count_only_gpu():
     from api.providers.modal import _to_modal_resources
+    # Validator rejects this at the API boundary; translator stays lenient
+    # for direct callers and silently drops the unsatisfiable count.
     out = _to_modal_resources(Resources(gpu="2"))
     assert out == {}
 
@@ -134,6 +136,22 @@ def test_to_modal_resources_drops_count_only_gpu():
 def test_to_modal_resources_returns_empty_for_none():
     from api.providers.modal import _to_modal_resources
     assert _to_modal_resources(None) == {}
+
+
+def test_modal_default_resources_request_single_t4():
+    from api.providers.modal import _to_modal_resources
+    from api.server import _resources_for_provider
+
+    resources = _resources_for_provider("modal", None)
+    assert resources is not None
+    assert resources.gpu == "T4"
+    assert _to_modal_resources(resources) == {"gpu": "T4"}
+
+
+def test_modal_explicit_empty_resources_skips_default_gpu():
+    from api.server import _resources_for_provider
+
+    assert _resources_for_provider("modal", {}) is None
 
 
 def test_modal_entrypoint_pins_pre_start_home():
