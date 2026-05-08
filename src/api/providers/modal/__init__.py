@@ -387,7 +387,7 @@ async def create_sandbox(
     *,
     volume_ref: str,
     subpath: str,
-    agent_type: str = "claude",
+    agent_type: str = "opencode",
     root: str | None = None,
     spawn_env: dict[str, str] | None = None,
     dockerfile: str | None = None,  # ignored — Modal uses _get_image()
@@ -636,7 +636,7 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
 
 async def ensure_supervisor_url(
     inst: ProviderInstance,
-    *, agent_type: str = "claude", root: str = "/tmp",
+    *, agent_type: str = "opencode", root: str = "/tmp",
     spawn_env: dict | None = None, port: int | None = None,
 ) -> str:
     """Modal supervisor is started at ``create_sandbox`` time — URL is stable.

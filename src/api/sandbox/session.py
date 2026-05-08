@@ -431,7 +431,7 @@ class BaseSandboxSession(abc.ABC):
         await self._acp_call("set_mode", mode)
 
     async def set_model(self, model: str) -> None:
-        await self._acp_call("set_model", model)
+        await self._acp_call("set_model", model, self.state.recipe.agent_type)
 
     async def set_thought_level(self, level: str) -> None:
         await self._acp_call("set_thought_level", level)

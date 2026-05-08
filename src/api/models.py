@@ -37,7 +37,7 @@ class AgentConfig:
     live on the session (cwd, env, secrets) or sandbox (dockerfile,
     shared_mounts, root) rows.
     """
-    agent_type: str = "claude"
+    agent_type: str = "opencode"
     model: str | None = None
     mcp_servers: dict | None = None
     skills: list | dict | None = None  # npx skills sources
@@ -118,7 +118,7 @@ class SessionState:
     sandbox_id: str
     acp_session_id: str | None = None
     inner_session_id: str | None = None
-    agent_type: str = "claude"  # claude | codex (selects ProviderAdapter)
+    agent_type: str = "opencode"  # selects ProviderAdapter runtime
     client: object | None = None  # AcpClient, typed loosely to avoid circular import
     # Hibernation is now explicit state. The two writers below keep this
     # in sync with _INSTANCES on the server side: _hibernate_session flips

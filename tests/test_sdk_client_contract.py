@@ -205,7 +205,7 @@ def test_registration_payload_always_has_name_and_agent_type(monkeypatch):
     a = Agent("worker-42", provider="unix_local", api_url="http://localhost:7778")
     p = _payload(a)
     assert p["name"] == "worker-42"
-    assert p["agent_type"] == "claude"
+    assert p["agent_type"] == "opencode"
 
 
 @pytest.mark.timeout(5)

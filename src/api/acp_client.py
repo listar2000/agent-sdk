@@ -11,16 +11,16 @@ import httpx
 log = logging.getLogger(__name__)
 
 
-def _normalize_acp_model(model: str) -> str:
-    """Map any Anthropic / hivespace-style model string to the three
-    aliases ACP's claude-agent-acp accepts: ``default``, ``opus``,
-    ``haiku``. Pass-through for already-normalised values; substring
-    match for full IDs (``claude-sonnet-4-6`` → ``default``,
-    ``claude-haiku-4-5-20251001`` → ``haiku``, ``claude-opus-4-6``
-    → ``opus``). Unknown strings fall back to ``default`` — same
-    safety the runtime uses when set_model is skipped entirely. ACP
-    rejects anything outside its three aliases with -32603, so
-    "unknown" is the only sensible default."""
+def _normalize_acp_model(model: str, *, agent_type: str) -> str:
+    """Normalize model IDs based on the active ACP runtime.
+
+    ``claude-agent-acp`` only accepts ``default``/``opus``/``haiku`` for
+    ``session/set_config_option``. OpenCode and other ACP runtimes expect
+    concrete provider/model IDs and should receive the user-selected value
+    unchanged.
+    """
+    if agent_type != "claude":
+        return (model or "").strip()
     if not model:
         return "default"
     s = model.strip().lower()
@@ -374,28 +374,16 @@ class AcpClient:
             except Exception:
                 continue
 
-    async def set_model(self, session_id: str, model: str) -> None:
+    async def set_model(self, session_id: str, model: str, agent_type: str = "claude") -> None:
         """Change the agent model mid-session.
 
-        Normalises full Anthropic API model IDs (e.g. ``claude-sonnet-4-6``,
-        ``claude-haiku-4-5-20251001``) down to the three aliases that
-        claude-agent-acp's ``getAvailableModels`` accepts under OAuth:
-        ``default``, ``opus``, ``haiku``. Without this, every set_model
-        call from a hivespace agent (whose ``agent.model`` column stores
-        the public-API ID) returns ``-32603 Invalid value for config
-        option model: ...`` and the user sees harmless-but-noisy ERROR
-        rows on every Type-2 cold-recovery and on every direct config
-        forward. See the data-research / Task Builder repro
-        (2026-05-04).
-
-        Substring match is sufficient: the public-API IDs always
-        embed exactly one of ``sonnet`` / ``opus`` / ``haiku``, and
-        ACP's ``default`` slot IS the latest sonnet so the mapping is
-        semantically correct.
+        For ``agent_type="claude"``, normalizes Anthropic public IDs to
+        Claude ACP aliases (``default``/``opus``/``haiku``). For other
+        runtimes (notably ``opencode``), forwards the value as-is.
         """
         await self.call(
             session_id, "session/set_config_option",
-            {"configId": "model", "value": _normalize_acp_model(model)},
+            {"configId": "model", "value": _normalize_acp_model(model, agent_type=agent_type)},
         )
 
     async def set_thought_level(self, session_id: str, level: str) -> None:

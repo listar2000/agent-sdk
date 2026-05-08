@@ -44,6 +44,23 @@ AUTH_KEYS = frozenset({
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "XAI_API_KEY",
+    "MINIMAX_API_KEY",
+    "MOONSHOT_API_KEY",
+    "MISTRAL_API_KEY",
+    "TOGETHER_API_KEY",
+    "CEREBRAS_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_BEARER_TOKEN_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "ANTHROPIC_VERTEX_BASE_URL",
     "ANTHROPIC_VERTEX_PROJECT_ID",
@@ -194,7 +211,7 @@ def _acp_launch_args(agent_type: str) -> list[str]:
 #   1. ``$AGENT_SDK_RUNTIME_PATH`` set → use it as-is (no existence check;
 #      callers fail loudly with a clear error if the contents are wrong).
 #   2. ``/opt/agent-sdk/runtime`` exists on disk → we're in the image.
-#   3. ``<repo>/src/supervisor/node_modules/.bin/claude-agent-acp`` exists
+#   3. ``<repo>/src/supervisor/supervisor.js`` exists
 #      → we're running from source.
 #   4. Raise ``RuntimeError`` with the remediation command.
 # ---------------------------------------------------------------------------
@@ -206,7 +223,7 @@ _REPO_ROOT_FROM_SHARED = os.path.realpath(
 _IMAGE_RUNTIME_PATH = "/opt/agent-sdk/runtime"
 _SOURCE_RUNTIME_PATH = os.path.join(_REPO_ROOT_FROM_SHARED, "src", "supervisor")
 _SOURCE_RUNTIME_SENTINEL = os.path.join(
-    _SOURCE_RUNTIME_PATH, "node_modules", ".bin", "claude-agent-acp",
+    _SOURCE_RUNTIME_PATH, "supervisor.js",
 )
 
 
