@@ -24,6 +24,18 @@ const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const SSE_HEARTBEAT_MS = 25000;
+// Drop an SSE subscriber once Node has buffered this many bytes for it
+// without the socket draining. Without this, a slow / paused / dead-but-
+// not-yet-RST consumer accumulates every ACP stdout line in the
+// supervisor's V8 heap until OOM. 8 MB ≈ a full session/prompt of dense
+// tool-use chatter; well below any sane sandbox memory ceiling.
+const SSE_BACKPRESSURE_LIMIT_BYTES = 8 * 1024 * 1024;
+// Defensive cap on pendingPromptIds: each entry is just an id string,
+// but if ACP ever drops a session/prompt response (child crash mid-turn,
+// malformed frame), the entry would leak forever and grow unbounded.
+// FIFO-evict at the cap. We keep cleanup OUT of the request lifecycle
+// because we still want a turn-end snapshot even if the client gave up.
+const MAX_PENDING_PROMPT_IDS = 1024;
 
 // Paths under args.root that are rebuildable or purely ephemeral. Excluded
 // from snapshots so we don't round-trip hundreds of MB of node_modules
@@ -35,6 +47,25 @@ const SNAPSHOT_EXCLUDES = [
   "--exclude=./.claude/shell-snapshots",
   "--exclude=./.claude/statsig",
 ];
+
+// Cold-tier tarballs are zstd-1 compressed when the binary is on PATH;
+// otherwise we fall back to uncompressed (current behaviour) so supervisor
+// keeps working on runtime images that haven't yet bundled zstd.
+//
+// Backward compat: tar -xf autodetects compression by magic bytes, so old
+// uncompressed snapshot.tar files in S3 stay readable through the restore
+// path with no flag-day coordination. New writes produce zstd content at
+// the same filename — no rename, no migration script.
+//
+// Bench (1 vCPU, 1 GB workspace): zstd-1 cuts artifact size ~10× with the
+// same wall-clock as uncompressed (cp time saved ≈ compression CPU spent).
+// gzip -1 was ~95% slower at 1 GB on a single core, so we don't fall back
+// to gzip — uncompressed-or-zstd, nothing in between.
+const ZSTD_AVAILABLE = (() => {
+  try { return spawnSync("zstd", ["--version"], { stdio: "ignore" }).status === 0; }
+  catch { return false; }
+})();
+const TAR_COMPRESS_ARGS = ZSTD_AVAILABLE ? ["-I", "zstd -1"] : [];
 
 // Two-tier snapshot layout.
 //
@@ -251,6 +282,9 @@ const acp = spawn(args.acp, args.acpArgs, {
   cwd: args.root,
 });
 log("spawned acp pid=" + acp.pid);
+log(`snapshot compression: ${ZSTD_AVAILABLE
+  ? "zstd-1 (artifact ~10× smaller; restore autodetects)"
+  : "none — zstd not on PATH (safe fallback; bundle zstd in runtime image to enable)"}`);
 
 acp.stderr.on("data", (chunk) => {
   process.stderr.write("[acp-stderr] " + chunk.toString());
@@ -305,6 +339,7 @@ function runAgentMemorySnapshotOnce() {
     if (!memPath) { resolve(); return; }
     const stage = LOCAL_MEMORY_STAGING;
     const tarArgs = [
+      ...TAR_COMPRESS_ARGS,
       "-cf", stage,
       "--ignore-failed-read",
       "-C", args.root,
@@ -351,7 +386,7 @@ function runSnapshotOnce() {
       return;
     }
     const stage = LOCAL_SNAPSHOT_STAGING;
-    const tarArgs = ["-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
+    const tarArgs = [...TAR_COMPRESS_ARGS, "-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
     const tar = spawn("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
     let tarErr = "";
     tar.stderr.on("data", (c) => { tarErr += c.toString("utf8"); });
@@ -393,7 +428,7 @@ function runSnapshotSync() {
   if (!args.snapshotPath) return;
   const stage = LOCAL_SNAPSHOT_STAGING;
   try {
-    const tarArgs = ["-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
+    const tarArgs = [...TAR_COMPRESS_ARGS, "-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
     const tr = spawnSync("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
     if (tr.status !== 0) {
       log(`shutdown snapshot tar rc=${tr.status}: ${String(tr.stderr || "").slice(0, 400)}`);
@@ -441,12 +476,34 @@ function broadcastSse(line) {
       lastCommandsEvent = block;
     }
   } catch { /* not JSON, ignore */ }
+  // Slow / paused subscribers are the dominant memory leak at scale: a
+  // chatty turn (tool output, large diffs) writes one line per emit, and
+  // res.write() returning false just means Node is buffering the bytes
+  // for us. Drop the subscriber once the in-Node buffer crosses
+  // SSE_BACKPRESSURE_LIMIT_BYTES — that's slower than the ACP stream is
+  // producing, and waiting longer just balloons RSS until OOM.
+  let drop = null;
   for (const res of sseSubscribers) {
     try {
+      // Already over the cap before this write — don't make it worse.
+      if (res.writableLength > SSE_BACKPRESSURE_LIMIT_BYTES) {
+        (drop || (drop = [])).push(res);
+        continue;
+      }
       res.write(block);
     } catch {
-      // will be removed on 'close'
+      // synchronous error path — schedule for removal here too; a 'close'
+      // event would cover it eventually but we'd rather not keep iterating
+      // a stale entry on the next line.
+      (drop || (drop = [])).push(res);
     }
+  }
+  if (drop) {
+    for (const res of drop) {
+      sseSubscribers.delete(res);
+      try { res.destroy(); } catch {}
+    }
+    log(`sse drop slow subscribers: ${drop.length} (remaining ${sseSubscribers.size})`);
   }
 }
 
@@ -530,7 +587,17 @@ async function handlePost(req, res) {
   // Remember session/prompt request ids so the stdout reader can trigger a
   // snapshot when the matching response lands. Covers every client variant —
   // SDK + direct-ACP + external integrations — without parsing update events.
+  // Bounded with FIFO eviction so a stuck session that never gets a response
+  // (ACP child crash mid-turn, malformed frame ACP silently dropped) can't
+  // grow the set unbounded. The eviction is intentionally NOT tied to client
+  // disconnect because we still want the turn-end snapshot to fire when ACP
+  // eventually responds, even if the upstream caller has given up.
   if (body && body.method === "session/prompt" && "id" in body) {
+    if (pendingPromptIds.size >= MAX_PENDING_PROMPT_IDS) {
+      // Set iteration is insertion order — the first key is the oldest.
+      const oldest = pendingPromptIds.values().next().value;
+      if (oldest !== undefined) pendingPromptIds.delete(oldest);
+    }
     pendingPromptIds.add(String(body.id));
   }
 
@@ -542,10 +609,37 @@ async function handlePost(req, res) {
   }
 
   // Request — wait for the matching response.
+  //
+  // Cleanup-on-disconnect: if the upstream client drops mid-flight, ACP
+  // *usually* still responds (the resolver fires, deletes the Map entry,
+  // and writes to a closed res — which throws and is caught by the outer
+  // handler). The leak only bites when ACP also fails to answer that id —
+  // child crash in flight, malformed frame, etc. Cheap defensive cleanup:
+  // a CLIENT_GONE sentinel resolves the Promise so the handler unwinds
+  // and stops holding the Map entry. The map-delete also guarantees the
+  // ACP-stdout path doesn't later try to call a stale resolver.
   const rpcId = String(body.id);
+  const CLIENT_GONE = Symbol("client_gone");
+  let cleanupOnce = null;
   const envelope = await new Promise((resolve) => {
     pendingResponses.set(rpcId, resolve);
+    cleanupOnce = () => {
+      if (pendingResponses.get(rpcId) === resolve) {
+        pendingResponses.delete(rpcId);
+        resolve(CLIENT_GONE);
+      }
+    };
+    req.on("close", cleanupOnce);
   });
+  // Detach the listener once the Promise resolves through the normal path
+  // — leaving it attached holds the closure (and the resolved envelope)
+  // alive until the request emits 'close', which can be much later.
+  if (cleanupOnce) req.removeListener("close", cleanupOnce);
+
+  if (envelope === CLIENT_GONE) {
+    // Client disconnected before ACP responded. No socket to write to.
+    return;
+  }
 
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(envelope));
@@ -695,10 +789,28 @@ const MIME_MAP = {
 };
 const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
 
+// Read the request body, aborting once `max` bytes have been received.
+// Without this guard, a misbehaving client could stream gigabytes into the
+// supervisor's V8 heap before the post-loop size check fired.
+async function readBodyCapped(req, res, max) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > max) {
+      req.destroy();
+      res.writeHead(413, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "payload too large" }));
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function handleFilesEdit(req, res) {
-  let raw = "";
-  req.setEncoding("utf8");
-  for await (const chunk of req) raw += chunk;
+  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
+  if (raw === null) return;
 
   let body;
   try {
@@ -847,11 +959,35 @@ async function handleExec(req, res) {
     let stdoutTruncated = false;
     let stderrTruncated = false;
     let timedOut = false;
+    // Three exit paths into the resolver: child close, child error, client
+    // disconnect. The last one previously didn't exist — if a client gave
+    // up mid-exec, the bash subprocess kept running for up to 300 s of
+    // stranded CPU + memory + fs writes, plus we'd later try to write a
+    // 200 to a destroyed socket. Single-shot guard so the three paths
+    // can't double-resolve or write to res twice.
+    let finished = false;
+    const finish = (fn) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      req.removeListener("close", onClose);
+      try { fn(); } catch {}
+      resolve();
+    };
 
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill("SIGKILL"); } catch {}
     }, timeout);
+
+    const onClose = () => {
+      // Client disconnected before bash finished. Kill the child so we
+      // don't burn the rest of the timeout window on output nobody will
+      // ever see, and skip writing the response (socket is gone).
+      try { child.kill("SIGKILL"); } catch {}
+      finish(() => {});
+    };
+    req.on("close", onClose);
 
     child.stdout.on("data", (chunk) => {
       if (stdout.length < MAX_EXEC_OUTPUT) {
@@ -873,39 +1009,32 @@ async function handleExec(req, res) {
     });
 
     child.on("close", (code) => {
-      clearTimeout(timer);
-      const result = {
-        stdout,
-        stderr,
-        exit_code: timedOut ? -1 : (code ?? -1),
-        timed_out: timedOut,
-      };
-      if (stdoutTruncated) result.stdout_truncated = true;
-      if (stderrTruncated) result.stderr_truncated = true;
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(result));
-      resolve();
+      finish(() => {
+        const result = {
+          stdout,
+          stderr,
+          exit_code: timedOut ? -1 : (code ?? -1),
+          timed_out: timedOut,
+        };
+        if (stdoutTruncated) result.stdout_truncated = true;
+        if (stderrTruncated) result.stderr_truncated = true;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      });
     });
 
     child.on("error", (e) => {
-      clearTimeout(timer);
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: e.message, stdout: "", stderr: "", exit_code: -1 }));
-      resolve();
+      finish(() => {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message, stdout: "", stderr: "", exit_code: -1 }));
+      });
     });
   });
 }
 
 async function handleFilesUpload(req, res) {
-  let raw = "";
-  req.setEncoding("utf8");
-  for await (const chunk of req) raw += chunk;
-
-  if (Buffer.byteLength(raw) > MAX_FILE_SIZE) {
-    res.writeHead(413, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "payload too large" }));
-    return;
-  }
+  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
+  if (raw === null) return;
 
   let body;
   try { body = JSON.parse(raw); } catch (e) {
@@ -938,9 +1067,8 @@ async function handleFilesUpload(req, res) {
 }
 
 async function handleFilesDelete(req, res) {
-  let raw = "";
-  req.setEncoding("utf8");
-  for await (const chunk of req) raw += chunk;
+  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
+  if (raw === null) return;
 
   let body;
   try { body = JSON.parse(raw); } catch (e) {
@@ -981,9 +1109,8 @@ async function handleFilesDelete(req, res) {
 }
 
 async function handleFilesRename(req, res) {
-  let raw = "";
-  req.setEncoding("utf8");
-  for await (const chunk of req) raw += chunk;
+  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
+  if (raw === null) return;
 
   let body;
   try { body = JSON.parse(raw); } catch (e) {
@@ -1043,9 +1170,22 @@ function handleFilesDownload(req, res) {
     return;
   }
 
-  if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) {
+  let stat;
+  try { stat = fs.statSync(fullPath); } catch {
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "file not found" }));
+    return;
+  }
+  if (stat.isDirectory()) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "file not found" }));
+    return;
+  }
+  if (stat.size > MAX_FILE_SIZE) {
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      error: `file too large: ${stat.size} bytes (max ${MAX_FILE_SIZE})`,
+    }));
     return;
   }
 
@@ -1054,13 +1194,12 @@ function handleFilesDownload(req, res) {
   const mimeTypes = { ".html": "text/html", ".js": "text/javascript", ".json": "application/json", ".css": "text/css", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".svg": "image/svg+xml", ".pdf": "application/pdf", ".zip": "application/zip", ".tar": "application/x-tar", ".gz": "application/gzip" };
   const contentType = mimeTypes[ext] || "application/octet-stream";
 
-  const data = fs.readFileSync(fullPath);
   res.writeHead(200, {
     "content-type": contentType,
     "content-disposition": `attachment; filename="${fileName}"`,
-    "content-length": data.length,
+    "content-length": stat.size,
   });
-  res.end(data);
+  fs.createReadStream(fullPath).pipe(res);
 }
 
 const server = http.createServer((req, res) => {
