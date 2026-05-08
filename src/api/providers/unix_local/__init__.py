@@ -240,7 +240,7 @@ async def create_sandbox(
     *,
     volume_ref: str,
     subpath: str,
-    agent_type: str = "claude",
+    agent_type: str = "opencode",
     port: int | None = None,
     spawn_env: dict[str, str] | None = None,
     root: str | None = None,
@@ -532,7 +532,7 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
 
 async def ensure_supervisor_url(
     inst: ProviderInstance,
-    *, agent_type: str = "claude", root: str = "/tmp",
+    *, agent_type: str = "opencode", root: str = "/tmp",
     spawn_env: dict | None = None, port: int | None = None,
 ) -> str:
     """Local: the supervisor started at create_sandbox time. No-op, return

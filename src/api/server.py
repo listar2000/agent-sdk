@@ -1427,7 +1427,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
         await upsert_agent(AgentRecord(
             id=agent_id, name=data.get("name"),
             config=AgentConfig.from_dict(
-                {**config_data, "agent_type": data.get("agent_type", "claude")}
+                {**config_data, "agent_type": data.get("agent_type", "opencode")}
             ),
         ))
 
@@ -1496,7 +1496,7 @@ async def _sessions_create_eager(data: dict) -> dict:
 
     workspace = _extract_workspace(data, provider)
     volume_record = await _resolve_or_default_volume(data.get("volume_id"), provider)
-    agent_type = data.get("agent_type", "claude")
+    agent_type = data.get("agent_type", "opencode")
     config_data = data.get("config", {})
     _merge_top_level_config(data, config_data)
 

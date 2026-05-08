@@ -311,7 +311,7 @@ async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
 
 
 async def provision_daytona_sandbox(
-    agent_type: str = "claude",
+    agent_type: str = "opencode",
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
@@ -470,7 +470,7 @@ async def provision_daytona_sandbox(
 
 
 async def restart_daytona_supervisor(
-    daytona_sandbox_id: str, agent_type: str = "claude", root: str = "/tmp",
+    daytona_sandbox_id: str, agent_type: str = "opencode", root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
 ) -> ProviderInstance:
     """Re-attach to an existing daytona sandbox and respawn the supervisor
@@ -914,7 +914,7 @@ async def create_sandbox(
     *,
     volume_ref: str,
     subpath: str,
-    agent_type: str = "claude",
+    agent_type: str = "opencode",
     spawn_env: dict[str, str] | None = None,
     port: int | None = None,
     root: str | None = None,
@@ -993,7 +993,7 @@ async def _get_or_create_utility(ref: str) -> "ProviderInstance":
         # populates cache; other readers then hit the fast path above.
         log.info("daytona utility sandbox: provisioning for volume %s", ref[:16])
         inst = await provision_daytona_sandbox(
-            agent_type="claude", volume_id=ref, subpath=None,
+            agent_type="opencode", volume_id=ref, subpath=None,
         )
         _utility_cache[ref] = (inst, _time.monotonic())
         _ensure_utility_reaper()

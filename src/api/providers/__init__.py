@@ -102,7 +102,7 @@ log = logging.getLogger(__name__)
 
 async def create_instance(
     provider: str,
-    agent_type: str = "claude",
+    agent_type: str = "opencode",
     dockerfile: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
@@ -296,7 +296,7 @@ async def provision_sandbox(
     *,
     volume_ref: str,
     subpath: str,
-    agent_type: str = "claude",
+    agent_type: str = "opencode",
     spawn_env: dict | None = None,
     port: int | None = None,
     root: str | None = None,

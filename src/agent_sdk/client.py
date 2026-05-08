@@ -605,7 +605,7 @@ class Agent:
     def __init__(
         self,
         name: str,
-        agent_type: str = "claude",
+        agent_type: str = "opencode",
         provider: str | None = None,
         model: str | None = None,
         cwd: str | None = None,

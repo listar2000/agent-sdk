@@ -107,7 +107,7 @@ class Recipe(BaseModel):
     dockerfile: str | None = None
     shared_mounts: list[str] = Field(default_factory=list)
     root: str | None = None
-    agent_type: str = "claude"
+    agent_type: str = "opencode"
     pre_start_commands: list[str] = Field(default_factory=list)
     resources: Resources | None = None
 
