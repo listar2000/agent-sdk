@@ -39,9 +39,10 @@ async def test_volume_mkdir_uses_mkdir_p(monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_delete_missing_maps_to_filenotfound(monkeypatch):
     from api.providers import daytona
+    from unittest.mock import AsyncMock
 
     class FakeFs:
-        def delete_file(self, _path: str, recursive: bool = False) -> None:
+        async def delete_file(self, _path: str, recursive: bool = False) -> None:
             raise Exception("404 not found")
 
     class FakeSandbox:
@@ -51,7 +52,11 @@ async def test_volume_delete_missing_maps_to_filenotfound(monkeypatch):
         return SimpleNamespace(sandbox_ref="sandbox-ref")
 
     monkeypatch.setattr(daytona, "_get_or_create_utility", fake_get_utility)
-    monkeypatch.setattr(daytona, "_get_daytona_client", lambda: SimpleNamespace(get=lambda _ref: FakeSandbox()))
+    fake_client = SimpleNamespace(get=AsyncMock(return_value=FakeSandbox()))
+    monkeypatch.setattr(
+        daytona, "_get_async_daytona_client",
+        AsyncMock(return_value=fake_client),
+    )
 
     with pytest.raises(FileNotFoundError):
         await daytona.volume_delete("vol-ref", "shared/missing.txt")
@@ -60,11 +65,12 @@ async def test_volume_delete_missing_maps_to_filenotfound(monkeypatch):
 @pytest.mark.asyncio
 async def test_volume_delete_uses_provider_file_api(monkeypatch):
     from api.providers import daytona
+    from unittest.mock import AsyncMock
 
     captured: dict[str, object] = {}
 
     class FakeFs:
-        def delete_file(self, path: str, recursive: bool = False) -> None:
+        async def delete_file(self, path: str, recursive: bool = False) -> None:
             captured["path"] = path
             captured["recursive"] = recursive
 
@@ -75,7 +81,11 @@ async def test_volume_delete_uses_provider_file_api(monkeypatch):
         return SimpleNamespace(sandbox_ref="sandbox-ref")
 
     monkeypatch.setattr(daytona, "_get_or_create_utility", fake_get_utility)
-    monkeypatch.setattr(daytona, "_get_daytona_client", lambda: SimpleNamespace(get=lambda _ref: FakeSandbox()))
+    fake_client = SimpleNamespace(get=AsyncMock(return_value=FakeSandbox()))
+    monkeypatch.setattr(
+        daytona, "_get_async_daytona_client",
+        AsyncMock(return_value=fake_client),
+    )
 
     await daytona.volume_delete("vol-ref", "shared/docs/a.txt")
 

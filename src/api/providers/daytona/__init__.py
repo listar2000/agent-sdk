@@ -36,14 +36,15 @@ class _ExecResult(NamedTuple):
         return self.exit_code in (None, 0)
 
 
-def _run_sandbox_exec(sandbox, cmd: str, timeout: int = 120) -> "_ExecResult":
+async def _run_sandbox_exec_async(sandbox, cmd: str, timeout: int = 120) -> "_ExecResult":
     """Run ``cmd`` in ``sandbox`` and return stdout, stderr, and exit_code.
 
+    ``sandbox`` is an ``AsyncSandbox`` from ``daytona_sdk._async``.
     Defensive against SDK versions that may not expose all fields.
-    Callers that want tolerant behaviour for a command that may fail should
-    wrap their command with ``|| true`` so the shell always exits 0.
-    """
-    r = sandbox.process.exec(cmd, timeout=timeout)
+    Callers that want tolerant behaviour for a command that may fail
+    should wrap their command with ``|| true`` so the shell always
+    exits 0."""
+    r = await sandbox.process.exec(cmd, timeout=timeout)
     return _ExecResult(
         stdout=getattr(r, "result", "") or "",
         stderr=getattr(r, "stderr", "") or "",
@@ -125,26 +126,65 @@ def _to_daytona_resources(req: Any) -> Any:
     return _DR(cpu=cpu, memory=memory_gib, disk=req.disk_gib, gpu=gpu_count)
 
 
-_DAYTONA_CLIENT: "Any | None" = None
+# Process-shared async Daytona client. Constructed lazily on first
+# call inside a running event loop; subsequent callers reuse the same
+# aiohttp.ClientSession + TLS pool to api.daytona.io.
+_DAYTONA_CLIENT_ASYNC: "Any | None" = None
+_DAYTONA_ASYNC_INIT_LOCK = asyncio.Lock()
+# 300 = 250 default + 20% headroom; the 200–300 concurrent-session target
+# slots cleanly under this. aiohttp.TCPConnector(limit=...) caps how many
+# requests can be in-flight against api.daytona.io at once.
+_DAYTONA_ASYNC_POOL_MAX = int(os.environ.get("AGENT_SDK_DAYTONA_POOL_MAX", "300"))
 
 
-def _get_daytona_client():
-    """Get the process-shared Daytona SDK client. Constructed once and
-    cached. Raises ImportError or RuntimeError on first failure.
+async def _get_async_daytona_client():
+    """Process-shared AsyncDaytona client. Constructed once on first call
+    inside a running event loop; subsequent callers reuse the same
+    aiohttp.ClientSession + TLS pool to api.daytona.io.
 
-    The Daytona SDK constructor performs config validation + SDK init
-    (~50-200ms wall) that has no per-call value. There were ~20 sites
-    in this module each constructing a fresh client per request — under
-    a 5-session bench that's 100+ unnecessary inits."""
-    global _DAYTONA_CLIENT
-    if _DAYTONA_CLIENT is not None:
-        return _DAYTONA_CLIENT
-    from daytona_sdk import Daytona, DaytonaConfig
-    api_key = os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DAYTONA_API_KEY not set")
-    _DAYTONA_CLIENT = Daytona(DaytonaConfig(api_key=api_key))
-    return _DAYTONA_CLIENT
+    The aiohttp connector is created lazily on the first HTTP request,
+    not at construction — so this function is safe to call eagerly
+    during lifespan startup, even before any sandbox API call."""
+    global _DAYTONA_CLIENT_ASYNC
+    if _DAYTONA_CLIENT_ASYNC is not None:
+        return _DAYTONA_CLIENT_ASYNC
+    async with _DAYTONA_ASYNC_INIT_LOCK:
+        if _DAYTONA_CLIENT_ASYNC is not None:
+            return _DAYTONA_CLIENT_ASYNC
+        from daytona_sdk import DaytonaConfig
+        from daytona_sdk._async.daytona import AsyncDaytona
+        api_key = os.environ.get("DAYTONA_API_KEY")
+        if not api_key:
+            raise RuntimeError("DAYTONA_API_KEY not set")
+        client = AsyncDaytona(DaytonaConfig(api_key=api_key))
+        # The async REST client snapshots maxsize at __init__ time and
+        # the configuration value too, so set both — the snapshot is the
+        # one actually used by aiohttp.TCPConnector(limit=...) on first
+        # request.
+        client._api_client.configuration.connection_pool_maxsize = _DAYTONA_ASYNC_POOL_MAX
+        client._api_client.rest_client.maxsize = _DAYTONA_ASYNC_POOL_MAX
+        _DAYTONA_CLIENT_ASYNC = client
+        return _DAYTONA_CLIENT_ASYNC
+
+
+async def _shutdown_async_daytona_client() -> None:
+    """Close the shared aiohttp.ClientSession owned by AsyncDaytona.
+    Safe to call from lifespan shutdown — no-op if never initialized."""
+    global _DAYTONA_CLIENT_ASYNC
+    if _DAYTONA_CLIENT_ASYNC is None:
+        return
+    try:
+        await _DAYTONA_CLIENT_ASYNC.close()
+    finally:
+        _DAYTONA_CLIENT_ASYNC = None
+
+
+# Cap on simultaneous in-flight ``daytona.create()`` calls. Removing the
+# 32-thread executor cap (via the async client) would otherwise let 250
+# concurrent sessions hit daytona's API + disk quota without any
+# client-side admission control.
+_DAYTONA_CREATE_CONCURRENCY = int(os.environ.get("AGENT_SDK_DAYTONA_CONCURRENCY", "40"))
+_DAYTONA_CREATE_SEM = asyncio.Semaphore(_DAYTONA_CREATE_CONCURRENCY)
 
 
 async def start_supervisor_in_sandbox(
@@ -166,7 +206,6 @@ async def start_supervisor_in_sandbox(
     benchmarks (scripts/bench_recovery.py).
     """
     bin_name = _acp_bin_name(agent_type)
-    loop = asyncio.get_running_loop()
     sid8 = sandbox.id[:8] if sandbox.id else "?"
     total_t0 = time.monotonic()
     phases: list[tuple[str, float]] = []
@@ -177,8 +216,9 @@ async def start_supervisor_in_sandbox(
         log.info("[BENCH] daytona.start_supervisor sandbox=%s phase=%s s=%.3f",
                  sid8, phase, dt)
 
-    def _exec(cmd: str, timeout: int = 120) -> str:
-        return _run_sandbox_exec(sandbox, cmd, timeout=timeout).stdout
+    async def _exec(cmd: str, timeout: int = 120) -> str:
+        r = await _run_sandbox_exec_async(sandbox, cmd, timeout=timeout)
+        return r.stdout
 
     # (0) Idempotency fast-path: if a supervisor is already healthy on
     # this port (left over from a prior call in the same sandbox), skip
@@ -188,7 +228,7 @@ async def start_supervisor_in_sandbox(
     # here under separate sandbox locks.
     t0 = time.monotonic()
     try:
-        existing = await loop.run_in_executor(None, lambda: _exec(
+        existing = await _exec(
             # `-m 2` request-timeout, `-o /dev/null -w '%{http_code}'`
             # prints just the status line so we can string-match cheaply.
             # NOTE: supervisor exposes /v1/health (matches _wait_for_health
@@ -196,7 +236,7 @@ async def start_supervisor_in_sandbox(
             f"curl -s -m 2 -o /dev/null -w '%{{http_code}}' "
             f"http://127.0.0.1:{port}/v1/health 2>/dev/null || echo 000",
             10,
-        ))
+        )
     except Exception as e:
         # Not fatal — fall through to the normal spawn path.
         existing = "000"
@@ -205,9 +245,7 @@ async def start_supervisor_in_sandbox(
     _bench("idempotency_probe", t0)
     if existing.strip() == "200":
         t0 = time.monotonic()
-        signed = await loop.run_in_executor(
-            None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
-        )
+        signed = await sandbox.create_signed_preview_url(port, 24 * 3600)
         _bench("mint_url_only", t0)
         url = signed.url.rstrip("/")
         total_dt = time.monotonic() - total_t0
@@ -265,10 +303,8 @@ async def start_supervisor_in_sandbox(
     # network calls that we don't need to serialize.
     t0 = time.monotonic()
     _, signed = await asyncio.gather(
-        loop.run_in_executor(None, lambda: _exec(start_cmd, timeout=10)),
-        loop.run_in_executor(
-            None, lambda: sandbox.create_signed_preview_url(port, 24 * 3600)
-        ),
+        _exec(start_cmd, timeout=10),
+        sandbox.create_signed_preview_url(port, 24 * 3600),
     )
     _bench("spawn+mint_url", t0)
     url = signed.url.rstrip("/")
@@ -281,7 +317,7 @@ async def start_supervisor_in_sandbox(
     healthy = await _wait_for_health(url, max_retries=45, interval=1)
     _bench("health_wait", t0)
     if not healthy:
-        log_out = await loop.run_in_executor(None, lambda: _exec(f"tail -40 {log_file} 2>&1"))
+        log_out = await _exec(f"tail -40 {log_file} 2>&1")
         raise RuntimeError(
             f"supervisor on port {port} in sandbox {sandbox.id} failed health check; log:\n{log_out[:800]}"
         )
@@ -300,11 +336,9 @@ async def start_supervisor_in_sandbox(
 
 async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
     """Kill a supervisor process by port inside a Daytona sandbox."""
-    loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: _run_sandbox_exec(sandbox, f"fuser -k {port}/tcp 2>/dev/null || true", timeout=10),
+        await _run_sandbox_exec_async(
+            sandbox, f"fuser -k {port}/tcp 2>/dev/null || true", timeout=10,
         )
     except Exception as e:
         log.warning("kill_supervisor_in_sandbox port=%d failed: %s", port, e)
@@ -331,19 +365,14 @@ async def provision_daytona_sandbox(
     """
     try:
         from daytona_sdk import (
-            Daytona, DaytonaConfig, CreateSandboxFromImageParams,
+            CreateSandboxFromImageParams,
             CreateSandboxFromSnapshotParams,
         )
     except ImportError:
         raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
 
-    api_key = os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DAYTONA_API_KEY not set")
-
     env_vars = _get_sandbox_env_vars()
-    loop = asyncio.get_running_loop()
-    daytona = Daytona(DaytonaConfig(api_key=api_key))
+    daytona = await _get_async_daytona_client()
 
     # the runtime-image-unification refactor: the runtime is baked
     # into the agent-sdk Docker image. Provisioning needs either a
@@ -400,20 +429,22 @@ async def provision_daytona_sandbox(
     labels = _sandbox_labels()
 
     if use_snapshot:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes, labels=labels,
-            ), timeout=create_timeout,
-        ))
+        async with _DAYTONA_CREATE_SEM:
+            sandbox = await daytona.create(
+                CreateSandboxFromSnapshotParams(
+                    snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
+                    volumes=volumes, labels=labels,
+                ), timeout=create_timeout,
+            )
     else:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromImageParams(
-                image=image, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes, labels=labels,
-                resources=_to_daytona_resources(resources),
-            ), timeout=create_timeout,
-        ))
+        async with _DAYTONA_CREATE_SEM:
+            sandbox = await daytona.create(
+                CreateSandboxFromImageParams(
+                    image=image, auto_stop_interval=0, env_vars=env_vars,
+                    volumes=volumes, labels=labels,
+                    resources=_to_daytona_resources(resources),
+                ), timeout=create_timeout,
+            )
 
     try:
         # Run pre-start commands (skills, CLI install, etc.).
@@ -433,9 +464,7 @@ async def provision_daytona_sandbox(
                     f"export HOME={_DAYTONA_AGENT_HOME} && "
                     f"mkdir -p {_DAYTONA_AGENT_HOME} && {cmd}"
                 )
-                result = await loop.run_in_executor(
-                    None, lambda c=wrapped: _run_sandbox_exec(sandbox, c, timeout=120),
-                )
+                result = await _run_sandbox_exec_async(sandbox, wrapped, timeout=120)
                 if result.exit_code is None:
                     log.warning(
                         "pre-start command ran but Daytona SDK returned no exit_code "
@@ -463,7 +492,7 @@ async def provision_daytona_sandbox(
         )
     except BaseException:
         try:
-            await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
+            await daytona.delete(sandbox)
         except Exception:
             pass
         raise
@@ -484,16 +513,7 @@ async def restart_daytona_supervisor(
     post-volume-refactor sandbox has that cache; sandboxes old enough to
     lack it are no longer supported (pre-2026-04).
     """
-    try:
-        from daytona_sdk import Daytona, DaytonaConfig
-    except ImportError:
-        raise RuntimeError("daytona-sdk not installed. Run: pip install daytona-sdk")
-    api_key = os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DAYTONA_API_KEY not set")
-
-    loop = asyncio.get_running_loop()
-    daytona = Daytona(DaytonaConfig(api_key=api_key))
+    daytona = await _get_async_daytona_client()
     # Wait for a stable (non-transitional) state before attempting start.
     # Without this, an external stop that's still in progress makes
     # `sandbox.start()` reject with "Sandbox state change in progress",
@@ -506,9 +526,9 @@ async def restart_daytona_supervisor(
     if state_str not in ("started", "running"):
         log.info("starting stopped daytona sandbox %s (state=%s)",
                  daytona_sandbox_id, state_str)
-        await loop.run_in_executor(None, sandbox.start)
+        await sandbox.start()
         await _wait_for_daytona_sandbox_ready(daytona, daytona_sandbox_id)
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(daytona_sandbox_id))
+        sandbox = await daytona.get(daytona_sandbox_id)
 
     # Volume-cached path. Uses the fixed supervisor port so the signed URL
     # is stable across restarts for an already-issued session (Daytona maps
@@ -531,18 +551,17 @@ async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
     if not instance.sandbox_ref:
         return
     try:
-        daytona = _get_daytona_client()
+        daytona = await _get_async_daytona_client()
     except (ImportError, RuntimeError) as e:
         log.warning("cannot %s daytona sandbox %s: %s", op, instance.sandbox_ref, e)
         return
 
-    loop = asyncio.get_running_loop()
     try:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(instance.sandbox_ref))
+        sandbox = await daytona.get(instance.sandbox_ref)
         if op == "delete":
-            await loop.run_in_executor(None, lambda: daytona.delete(sandbox))
+            await daytona.delete(sandbox)
         else:
-            await loop.run_in_executor(None, sandbox.stop)
+            await sandbox.stop()
         log.info("daytona sandbox %sd: %s", op, instance.sandbox_ref)
     except Exception as e:
         log.warning("failed to %s daytona sandbox %s: %s", op, instance.sandbox_ref, e)
@@ -568,6 +587,10 @@ async def _wait_for_stable_daytona_state(
 
     Terminal states: started, running, stopped, paused, error, archived.
     Transitional: starting, stopping, pulling_image, resizing, ...
+
+    ``daytona`` must be an ``AsyncDaytona``; the returned sandbox is an
+    ``AsyncSandbox``. The Pydantic ``state`` field is read directly off
+    the freshly-fetched handle (each ``daytona.get()`` returns a new one).
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max_wait_s
@@ -576,7 +599,7 @@ async def _wait_for_stable_daytona_state(
     sandbox = None
     state_str = ""
     while True:
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
+        sandbox = await daytona.get(sandbox_ref)
         raw = sandbox.state
         state_str = (raw.value if hasattr(raw, "value") else str(raw)).lower()
         if state_str in STABLE or loop.time() > deadline:
@@ -594,20 +617,19 @@ async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=Non
     Check FIRST, then sleep — the old "sleep 2s up-front" burned ~2s on
     every restart even when the sandbox was already ready. 0.5s cadence
     also surfaces readiness ~4x faster than the old 2s polls.
+
+    ``daytona`` must be an ``AsyncDaytona``.
     """
-    loop = asyncio.get_running_loop()
     for attempt in range(30):  # 30 * 0.5s = 15s max
         if attempt > 0:
             await asyncio.sleep(0.5)
         try:
-            sandbox = await loop.run_in_executor(None, lambda: daytona.get(sandbox_ref))
+            sandbox = await daytona.get(sandbox_ref)
             raw_state = sandbox.state
             state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
             if state_str != "started":
                 continue
-            r = await loop.run_in_executor(
-                None, lambda: sandbox.process.exec("echo ready", timeout=5)
-            )
+            r = await sandbox.process.exec("echo ready", timeout=5)
             result = (r.result if hasattr(r, "result") else str(r)) or ""
             if "ready" in result:
                 log.info("daytona sandbox %s is ready", sandbox_ref[:16])
@@ -632,19 +654,18 @@ async def start_daytona(sandbox_ref: str) -> None:
     state rebuild, losing any persistent /events subscribers.
     """
     try:
-        daytona = _get_daytona_client()
+        daytona = await _get_async_daytona_client()
     except (ImportError, RuntimeError) as e:
         log.warning("cannot start daytona sandbox %s: %s", sandbox_ref, e)
         return
 
-    loop = asyncio.get_running_loop()
     sandbox, state_str = await _wait_for_stable_daytona_state(daytona, sandbox_ref)
     if state_str in ("started", "running"):
         log.info("daytona sandbox %s already started", sandbox_ref)
         await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref, sandbox=sandbox)
         return
     try:
-        await loop.run_in_executor(None, sandbox.start)
+        await sandbox.start()
         log.info("daytona sandbox started: %s", sandbox_ref)
         await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref)
     except Exception as e:
@@ -664,23 +685,23 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     After the volume is ready, a utility sandbox is spun up to pre-create
     the directory structure: shared/ and system/supervisor/.
     """
-    from daytona_api_client import VolumesApi
+    from daytona_api_client_async import VolumesApi as AsyncVolumesApi
     from daytona_api_client.models import VolumeState
 
-    client = _get_daytona_client()
+    client = await _get_async_daytona_client()
     # Idempotent: volume.get(name, create=True) returns the existing volume
     # if one already has this name, else creates a new one. Lets
     # `_get_or_create_default_volume` re-enter safely across server restarts
     # and on multi-worker deploys where the DB row was lost but the Daytona
     # volume still exists.
-    vol = await asyncio.to_thread(client.volume.get, name, True)
+    vol = await client.volume.get(name, True)
     vol_id = vol.id
 
-    volumes_api = VolumesApi(client._api_client)
+    volumes_api = AsyncVolumesApi(client._api_client)
     try:
         deadline = asyncio.get_running_loop().time() + wait_ready_timeout
         while True:
-            dto = await asyncio.to_thread(volumes_api.get_volume, vol_id)
+            dto = await volumes_api.get_volume(vol_id)
             state = dto.state
             state_val = state.value if hasattr(state, "value") else str(state)
             if state_val == VolumeState.READY:
@@ -692,7 +713,7 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
             await asyncio.sleep(3)
     except Exception:
         try:
-            await asyncio.to_thread(volumes_api.delete_volume, vol_id)
+            await volumes_api.delete_volume(vol_id)
         except Exception as cleanup_err:
             log.warning(
                 "orphaned daytona volume %s: cleanup delete failed: %s",
@@ -709,15 +730,11 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
 async def _init_volume_dirs(volume_ref: str) -> None:
     """Spin a 1-shot sandbox to mkdir -p shared/ system/supervisor/ on the volume."""
     from daytona_sdk import (
-        Daytona, DaytonaConfig, CreateSandboxFromSnapshotParams,
+        CreateSandboxFromSnapshotParams,
         CreateSandboxFromImageParams, VolumeMount,
     )
 
-    api_key = os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DAYTONA_API_KEY not set")
-    daytona = Daytona(DaytonaConfig(api_key=api_key))
-    loop = asyncio.get_running_loop()
+    daytona = await _get_async_daytona_client()
 
     # _init_volume_dirs only runs `mkdir` on a brand-new volume — any image
     # with a POSIX shell works. Phase E: no implicit hive-large default;
@@ -732,41 +749,42 @@ async def _init_volume_dirs(volume_ref: str) -> None:
     init_labels = _sandbox_labels()
 
     if use_snapshot:
-        sb = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot, auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=init_labels,
-            ), timeout=120,
-        ))
+        async with _DAYTONA_CREATE_SEM:
+            sb = await daytona.create(
+                CreateSandboxFromSnapshotParams(
+                    snapshot=snapshot, auto_stop_interval=0,
+                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                    labels=init_labels,
+                ), timeout=120,
+            )
     else:
-        sb = await loop.run_in_executor(None, lambda: daytona.create(
-            CreateSandboxFromImageParams(
-                image="node:22-slim", auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=init_labels,
-            ), timeout=120,
-        ))
+        async with _DAYTONA_CREATE_SEM:
+            sb = await daytona.create(
+                CreateSandboxFromImageParams(
+                    image="node:22-slim", auto_stop_interval=0,
+                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                    labels=init_labels,
+                ), timeout=120,
+            )
 
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: _run_sandbox_exec(sb, "mkdir -p /v/shared /v/system/supervisor", timeout=30),
+        await _run_sandbox_exec_async(
+            sb, "mkdir -p /v/shared /v/system/supervisor", timeout=30,
         )
         log.info("volume %s: initialized shared/ and system/supervisor/ dirs", volume_ref)
     finally:
         try:
-            await loop.run_in_executor(None, lambda: daytona.delete(sb))
+            await daytona.delete(sb)
         except Exception:
             pass
 
 
 async def delete_daytona_volume(provider_ref: str) -> None:
     """Delete a Daytona volume by provider-native id (UUID)."""
-    from daytona_api_client import VolumesApi
-    client = _get_daytona_client()
-    volumes_api = VolumesApi(client._api_client)
-    await asyncio.to_thread(volumes_api.delete_volume, provider_ref)
+    from daytona_api_client_async import VolumesApi as AsyncVolumesApi
+    client = await _get_async_daytona_client()
+    volumes_api = AsyncVolumesApi(client._api_client)
+    await volumes_api.delete_volume(provider_ref)
 
 
 async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
@@ -785,8 +803,8 @@ async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
     ``start_sandbox``, not to destroy + replace.
     """
     try:
-        client = _get_daytona_client()
-        sb = await asyncio.to_thread(client.get, sandbox_ref)
+        client = await _get_async_daytona_client()
+        sb = await client.get(sandbox_ref)
     except Exception as e:
         msg = str(e).lower()
         if "not found" in msg or "404" in msg:
@@ -863,17 +881,9 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     Mi3: the ``**_kw`` catch-all was removed so a mis-spelled kwarg
     surfaces as TypeError instead of being silently swallowed — matching
     the docker + local signatures."""
-    from daytona_sdk import Daytona, DaytonaConfig
-    import os as _os
-    api_key = _os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DAYTONA_API_KEY not set")
-    daytona_client = Daytona(DaytonaConfig(api_key=api_key))
-    loop = asyncio.get_running_loop()
+    daytona_client = await _get_async_daytona_client()
     try:
-        sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_ref)
-        )
+        sandbox = await daytona_client.get(inst.sandbox_ref)
     except Exception as e:
         # Daytona raises a plain Exception with "not found" in the message when
         # the sandbox has been deleted out-of-band. Surface this as a typed
@@ -890,9 +900,9 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
     if state_str != "started":
         log.info("ensure_supervisor_url: sandbox %s is %s; starting", inst.sandbox_ref[:16], state_str)
-        await loop.run_in_executor(None, sandbox.start)
+        await sandbox.start()
         await _wait_for_daytona_sandbox_ready(daytona_client, inst.sandbox_ref)
-        sandbox = await loop.run_in_executor(None, lambda: daytona_client.get(inst.sandbox_ref))
+        sandbox = await daytona_client.get(inst.sandbox_ref)
     # The agent's HOME is /home/daytona — a local ext4 dir the supervisor
     # creates and populates from the volume snapshot on boot. supervisor.js
     # sets HOME=root when spawning the ACP child so Claude Code's session
@@ -1117,19 +1127,14 @@ async def volume_download(ref: str, path: str) -> bytes:
     if not inst.sandbox_ref:
         raise RuntimeError("volume_download: utility sandbox_ref missing")
 
-    loop = asyncio.get_running_loop()
-    daytona_client = _get_daytona_client()
+    daytona_client = await _get_async_daytona_client()
     try:
-        sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_ref)
-        )
+        sandbox = await daytona_client.get(inst.sandbox_ref)
     except Exception as e:
         raise RuntimeError(f"volume_download: get sandbox failed: {e}") from e
 
     try:
-        return await loop.run_in_executor(
-            None, lambda: sandbox.fs.download_file(target)
-        )
+        return await sandbox.fs.download_file(target)
     except Exception as e:
         msg = str(e)
         if "not found" in msg.lower() or "404" in msg:
@@ -1148,22 +1153,16 @@ async def _conditional_upload_if_absent(ref: str, abs_path: str, content: bytes)
     inst = await _get_or_create_utility(ref)
     if not inst.sandbox_ref:
         raise RuntimeError("conditional upload: utility sandbox_ref missing")
-    loop = asyncio.get_running_loop()
-    daytona_client = _get_daytona_client()
+    daytona_client = await _get_async_daytona_client()
     try:
-        sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_ref)
-        )
+        sandbox = await daytona_client.get(inst.sandbox_ref)
     except Exception as e:
         raise RuntimeError(f"conditional upload: get sandbox failed: {e}") from e
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
-                path=abs_path,
-                file=content,
-                _headers={"If-None-Match": "*"},
-            ),
+        await sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
+            path=abs_path,
+            file=content,
+            _headers={"If-None-Match": "*"},
         )
         return "created"
     except Exception as e:
@@ -1178,21 +1177,15 @@ async def _upload_overwrite(ref: str, abs_path: str, content: bytes) -> None:
     inst = await _get_or_create_utility(ref)
     if not inst.sandbox_ref:
         raise RuntimeError("upload overwrite: utility sandbox_ref missing")
-    loop = asyncio.get_running_loop()
-    daytona_client = _get_daytona_client()
+    daytona_client = await _get_async_daytona_client()
     try:
-        sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_ref)
-        )
+        sandbox = await daytona_client.get(inst.sandbox_ref)
     except Exception as e:
         raise RuntimeError(f"upload overwrite: get sandbox failed: {e}") from e
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
-                path=abs_path,
-                file=content,
-            ),
+        await sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
+            path=abs_path,
+            file=content,
         )
     except Exception as e:
         raise RuntimeError(f"upload overwrite failed: {e}") from e
@@ -1203,19 +1196,13 @@ async def _move_overwrite(ref: str, src_abs: str, dst_abs: str) -> None:
     inst = await _get_or_create_utility(ref)
     if not inst.sandbox_ref:
         raise RuntimeError("move overwrite: utility sandbox_ref missing")
-    loop = asyncio.get_running_loop()
-    daytona_client = _get_daytona_client()
+    daytona_client = await _get_async_daytona_client()
     try:
-        sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_ref)
-        )
+        sandbox = await daytona_client.get(inst.sandbox_ref)
     except Exception as e:
         raise RuntimeError(f"move overwrite: get sandbox failed: {e}") from e
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: sandbox.fs.move_files(src_abs, dst_abs),
-        )
+        await sandbox.fs.move_files(src_abs, dst_abs)
     except Exception as e:
         msg = str(e)
         if "not found" in msg.lower() or "404" in msg:
@@ -1315,20 +1302,14 @@ async def volume_delete(ref: str, path: str) -> None:
     if not inst.sandbox_ref:
         raise RuntimeError("volume_delete: utility sandbox_ref missing")
 
-    loop = asyncio.get_running_loop()
-    daytona_client = _get_daytona_client()
+    daytona_client = await _get_async_daytona_client()
     try:
-        sandbox = await loop.run_in_executor(
-            None, lambda: daytona_client.get(inst.sandbox_ref)
-        )
+        sandbox = await daytona_client.get(inst.sandbox_ref)
     except Exception as e:
         raise RuntimeError(f"volume_delete: get sandbox failed: {e}") from e
 
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: sandbox.fs.delete_file(target, recursive=True),
-        )
+        await sandbox.fs.delete_file(target, recursive=True)
     except Exception as e:
         msg = str(e)
         if "not found" in msg.lower() or "404" in msg:
@@ -1433,14 +1414,14 @@ async def reconcile_on_startup() -> None:
         return
 
     try:
-        daytona = _get_daytona_client()
+        daytona = await _get_async_daytona_client()
     except Exception as e:
         log.warning("daytona reconcile: client unavailable: %s", e)
         return
 
     labels = _sandbox_labels()
     try:
-        page = await asyncio.to_thread(lambda: daytona.list(labels=labels))
+        page = await daytona.list(labels=labels)
         items = list(getattr(page, "items", None) or page)
     except Exception as e:
         log.warning("daytona reconcile: list failed: %s", e)
@@ -1458,6 +1439,6 @@ async def reconcile_on_startup() -> None:
             continue
         log.info("daytona reconcile: deleting orphan %s", sid[:16])
         try:
-            await asyncio.to_thread(lambda s=sb: daytona.delete(s))
+            await daytona.delete(sb)
         except Exception as e:
             log.warning("daytona reconcile: delete %s: %s", sid[:16], e)

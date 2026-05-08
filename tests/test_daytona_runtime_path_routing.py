@@ -81,25 +81,39 @@ def test_build_volume_mounts_omits_supervisor_mount(monkeypatch, _stub_volume_mo
 
 
 def _patch_daytona_sdk(monkeypatch, *, calls: list):
-    """Replace daytona_sdk imports inside provision_daytona_sandbox so we
-    can record what kind of CreateSandboxParams the call constructs."""
+    """Stub the AsyncDaytona singleton so we can record what kind of
+    CreateSandboxParams ``provision_daytona_sandbox`` constructs.
+
+    Post Phase 1 of the AsyncDaytona migration: ``provision_daytona_sandbox``
+    awaits the singleton from ``_get_async_daytona_client``; the only sync
+    daytona_sdk imports it does are the ``Create*Params`` factories
+    (which we still patch via sys.modules)."""
     create_snapshot_params = MagicMock(side_effect=lambda **kw: ("Snapshot", kw))
     create_image_params = MagicMock(side_effect=lambda **kw: ("Image", kw))
 
     fake_daytona_instance = MagicMock()
-    def _create(params, **kw):
+
+    async def _create(params, **kw):
         calls.append(params)
         return SimpleNamespace(id="sb-fake-id")
+
+    async def _delete(_sb):
+        return None
+
     fake_daytona_instance.create = _create
+    fake_daytona_instance.delete = _delete
 
     fake_module = MagicMock(
-        Daytona=lambda *_a, **_kw: fake_daytona_instance,
-        DaytonaConfig=lambda **_kw: None,
         CreateSandboxFromImageParams=create_image_params,
         CreateSandboxFromSnapshotParams=create_snapshot_params,
         VolumeMount=lambda **kw: SimpleNamespace(**kw),
     )
     monkeypatch.setitem(sys.modules, "daytona_sdk", fake_module)
+    monkeypatch.setattr(
+        dprov,
+        "_get_async_daytona_client",
+        AsyncMock(return_value=fake_daytona_instance),
+    )
 
 
 @pytest.mark.asyncio
@@ -183,7 +197,7 @@ async def test_start_supervisor_uses_image_runtime_paths(monkeypatch):
     # sandbox so we can assert which paths got referenced.
     exec_log: list[str] = []
 
-    def fake_run_sandbox_exec(sandbox, cmd, timeout=120):
+    async def fake_run_sandbox_exec_async(sandbox, cmd, timeout=120):
         exec_log.append(cmd)
         # Idempotency probe: pretend nothing's listening yet.
         if "/v1/health" in cmd:
@@ -191,16 +205,19 @@ async def test_start_supervisor_uses_image_runtime_paths(monkeypatch):
         # The setsid spawn returns "started" on success.
         return SimpleNamespace(stdout="started", stderr="", exit_code=0)
 
-    monkeypatch.setattr(dprov, "_run_sandbox_exec", fake_run_sandbox_exec)
+    monkeypatch.setattr(dprov, "_run_sandbox_exec_async", fake_run_sandbox_exec_async)
 
     # Skip the 45×1s health-poll — argv is recorded before health checks.
     async def _ok_health(*_a, **_kw):
         return True
     monkeypatch.setattr(dprov, "_wait_for_health", _ok_health)
 
+    async def _fake_signed_url(port, ttl):
+        return SimpleNamespace(url="https://fake.daytona.app/")
+
     fake_sandbox = SimpleNamespace(
         id="sb-fake-1234567890",
-        create_signed_preview_url=lambda port, ttl: SimpleNamespace(url="https://fake.daytona.app/"),
+        create_signed_preview_url=_fake_signed_url,
     )
 
     url = await dprov.start_supervisor_in_sandbox(
