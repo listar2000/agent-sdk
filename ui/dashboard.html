@@ -1,293 +1,432 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="utf-8">
 <title>Agent Dashboard</title>
 <style>
-:root {
-  --bg: #0d0f13;
-  --surface: #151a23;
-  --surface2: #1b2130;
-  --border: #2a303a;
-  --text: #d9dee7;
-  --muted: #7b8492;
-  --accent: #6b91ff;
-  --success: #4bb382;
-  --warning: #d2a254;
-  --danger: #d46b6b;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: "SF Pro Text", -apple-system, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  height: 100vh;
-  display: flex;
-  overflow: hidden;
-}
+  /* Hive-Team-style softer chrome */
+  :root {
+    --sidebar-bg: #1F2D3D;
+    --sidebar-bg-2: #243447;
+    --sidebar-text: #E8EBED;
+    --sidebar-text-dim: #9AA5AE;
+    --sidebar-active: #2C7BD3;
+    --sidebar-hover: rgba(255,255,255,0.07);
+    --page-bg: #1F2D3D;
+    --main-bg: #FFFFFF;
+    --main-text: #1D1C1D;
+    --main-border: #ECEEF1;
+    --bubble-agent: #FFFFFF;
+    --bubble-thinking: #FFF8E1;
+    --bubble-thinking-border: #F2C94C;
+    --bubble-tool: #F6F8FA;
+    --tool-border: #E1E4E8;
+    --primary: #1264A3;
+    --danger: #E01E5A;
+    --success: #2EB67D;
+    --warning: #ECB22E;
+    --muted: #9098A0;
+    --tab-active-border: #1264A3;
+    --radius-lg: 14px;
+    --radius-md: 10px;
+    --radius-sm: 6px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  body { display: flex; overflow: hidden; background: var(--page-bg); padding: 10px; gap: 10px; }
 
-.left-panel {
-  width: 320px;
-  min-width: 260px;
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-  overflow: hidden;
-}
-.left-top {
-  padding: 16px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.left-top h1 {
-  font-size: 1rem;
-  font-weight: 600;
-  margin-bottom: 14px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--text);
-}
-.left-top h1 .dot {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--success);
-  animation: pulse 2s infinite;
-  flex-shrink: 0;
-}
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  /* ── Left sidebar ────────────────────────────────────────── */
+  .sidebar {
+    width: 260px; flex-shrink: 0;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-text);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+  }
+  .sidebar-header {
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .sidebar-header .brand { font-weight: 700; font-size: 0.95rem; flex: 1; letter-spacing: -0.01em; }
+  .sidebar-header .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--success); box-shadow: 0 0 6px var(--success);
+  }
+  .sidebar-header .dot.err { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
 
-.stats-row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 6px;
-}
-.stat {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 6px;
-  text-align: center;
-}
-.stat .val { font-size: 1.3rem; font-weight: 700; color: var(--accent); line-height: 1; }
-.stat .val.green { color: var(--success); }
-.stat .val.amber { color: var(--warning); }
-.stat .lbl { font-size: 0.6rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 3px; }
+  .stats-row {
+    padding: 10px 16px 16px;
+    display: flex; gap: 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .stat {
+    flex: 1; text-align: center;
+    background: rgba(255,255,255,0.06);
+    border-radius: var(--radius-md);
+    padding: 8px 4px;
+    transition: background 0.15s;
+  }
+  .stat:hover { background: rgba(255,255,255,0.10); }
+  .stat .v { font-size: 0.95rem; font-weight: 700; }
+  .stat .l { font-size: 0.6rem; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+  .stat.green .v { color: var(--success); }
+  .stat.amber .v { color: var(--warning); }
 
-.health-bar {
-  margin-top: 10px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.68rem;
-  color: var(--muted);
-}
-.health-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-.health-dot.ok { background: var(--success); }
-.health-dot.err { background: var(--danger); }
+  .sidebar-section {
+    margin-top: 6px;
+    flex: 1; min-height: 0;
+    display: flex; flex-direction: column;
+  }
+  .section-label {
+    padding: 8px 18px 4px;
+    font-size: 0.68rem; text-transform: uppercase;
+    letter-spacing: 0.07em; opacity: 0.65;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .section-label .count { opacity: 0.5; font-weight: 400; }
 
-.section-hdr {
-  font-size: 0.7rem;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  padding: 12px 16px 6px;
-  flex-shrink: 0;
-}
-.session-list {
-  list-style: none;
-  overflow-y: auto;
-  flex: 1;
-  padding: 0 10px 10px;
-}
-.session-item {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 9px 11px;
-  margin-bottom: 5px;
-  cursor: pointer;
-  transition: border-color 0.12s, background 0.12s;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-}
-.session-item:hover { background: var(--surface2); border-color: #3a404d; }
-.session-item.selected { border-color: var(--accent); background: var(--surface2); }
-.session-item.busy .dot-ind { background: var(--accent); box-shadow: 0 0 5px var(--accent); animation: pulse 1.5s infinite; }
-.dot-ind { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-.session-item .info { flex: 1; min-width: 0; }
-.session-item .s-name { font-size: 0.78rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.session-item .s-sub { font-size: 0.65rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
-.session-item .s-badge {
-  font-size: 0.6rem; font-weight: 600; padding: 2px 5px; border-radius: 4px;
-  flex-shrink: 0; text-transform: uppercase; letter-spacing: 0.04em;
-}
-.badge-running { background: rgba(107,145,255,0.15); color: var(--accent); }
-.badge-idle { background: rgba(123,132,146,0.12); color: var(--muted); }
+  .session-list {
+    list-style: none; margin: 0; padding: 0;
+    overflow-y: auto;
+    flex: 1; min-height: 0;
+  }
+  .session-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px;
+    margin: 1px 8px;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: background 0.12s;
+    position: relative;
+  }
+  .session-item:hover { background: var(--sidebar-hover); }
+  .session-item.active { background: var(--sidebar-active); }
+  .session-item.active .name, .session-item.active .sub { color: white !important; }
+  .session-item .indicator {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted); flex-shrink: 0;
+  }
+  .session-item.busy .indicator { background: var(--success); animation: pulse 1.5s infinite; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.8); }
+  }
+  .session-item .info { flex: 1; min-width: 0; }
+  .session-item .name { font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .session-item .sub { font-size: 0.7rem; opacity: 0.65; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .session-item .kill {
+    display: none;
+    border: none; background: rgba(255,255,255,0.1);
+    color: var(--sidebar-text); cursor: pointer;
+    width: 22px; height: 22px; border-radius: 4px;
+    font-size: 0.95rem; line-height: 1;
+    padding: 0; flex-shrink: 0;
+  }
+  .session-item:hover .kill, .session-item.active .kill { display: inline-flex; align-items: center; justify-content: center; }
+  .session-item .kill:hover { background: var(--danger); color: white; }
 
-/* Right panel */
-.right-panel {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  background: var(--bg);
-}
-.stream-header {
-  padding: 11px 16px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  background: var(--surface);
-  flex-shrink: 0;
-}
-.stream-header .s-title { font-size: 0.88rem; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stream-header .s-meta { font-size: 0.68rem; color: var(--muted); margin-left: 10px; flex-shrink: 0; }
-.close-btn {
-  background: none; border: 1px solid var(--border); border-radius: 6px;
-  color: var(--muted); padding: 3px 9px; font-size: 0.72rem; cursor: pointer;
-  flex-shrink: 0; margin-left: 12px;
-}
-.close-btn:hover { border-color: var(--danger); color: var(--danger); }
+  /* ── Main pane ───────────────────────────────────────────── */
+  .main {
+    flex: 1; min-width: 0;
+    display: flex; flex-direction: column;
+    background: var(--main-bg); color: var(--main-text);
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }
+  .main-header { border-bottom: 1px solid var(--main-border); }
+  .main-header .title-row {
+    padding: 16px 24px 14px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .main-header .title-row .ic {
+    width: 28px; height: 28px;
+    background: #F0F2F5;
+    border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 1rem;
+  }
+  .main-header .title-row .title { font-size: 1.05rem; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .main-header .title-row .meta { font-size: 0.72rem; color: var(--muted); flex-shrink: 0; }
+  .main-header .title-row .reload {
+    border: 1px solid #E1E4E8; background: #FFF;
+    border-radius: var(--radius-sm); padding: 7px 14px;
+    font-size: 0.8rem; cursor: pointer; color: var(--main-text);
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .main-header .title-row .reload:hover { background: #F6F8FA; border-color: #D1D5DA; }
+  .main-header .title-row .stop {
+    border: 1px solid #F2C2CE; background: #FFF;
+    border-radius: var(--radius-sm); padding: 7px 14px;
+    font-size: 0.8rem; cursor: pointer;
+    color: var(--danger); font-weight: 600;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .main-header .title-row .stop:hover { background: #FFEBEF; border-color: var(--danger); }
+  .main-header .title-row .stop:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.stream-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: 14px 16px;
-  font-size: 0.81rem;
-  line-height: 1.6;
-}
-.stream-empty {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  color: var(--muted);
-  font-size: 0.88rem;
-}
+  .stream-body {
+    flex: 1; overflow-y: auto;
+    padding: 16px 24px 12px;
+  }
+  .stream-empty {
+    color: var(--muted); padding: 40px;
+    text-align: center; font-size: 0.9rem;
+  }
 
-.ev { margin-bottom: 7px; }
-.ev.agent-text {
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: var(--surface);
-  border-left: 3px solid var(--accent);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.ev.thinking {
-  padding: 7px 12px;
-  border-radius: 8px;
-  background: rgba(123,132,146,0.07);
-  border-left: 3px solid var(--muted);
-  color: var(--muted);
-  font-style: italic;
-  font-size: 0.76rem;
-}
-.ev.error-ev {
-  padding: 7px 12px;
-  border-radius: 8px;
-  background: rgba(212,107,107,0.08);
-  border-left: 3px solid var(--danger);
-  color: var(--danger);
-}
-.ev.usage-ev {
-  padding: 5px 12px;
-  border-radius: 6px;
-  background: transparent;
-  font-size: 0.68rem;
-  color: var(--muted);
-  border-left: 2px solid var(--border);
-}
-.ev .ev-label {
-  font-size: 0.6rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  margin-bottom: 3px;
-  opacity: 0.55;
-}
-.tool-card {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface);
-  overflow: hidden;
-  margin-bottom: 5px;
-}
-.tool-card summary {
-  cursor: pointer;
-  list-style: none;
-  padding: 7px 11px;
-  color: var(--accent);
-  font-size: 0.76rem;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  user-select: none;
-}
-.tool-card summary::-webkit-details-marker { display: none; }
-.tool-card summary .tool-icon { font-size: 0.65rem; opacity: 0.45; }
-.tool-card summary .tool-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tool-card summary .tool-status { font-size: 0.65rem; font-weight: 600; flex-shrink: 0; }
-.tool-status.waiting { color: var(--warning); }
-.tool-status.done { color: var(--success); }
-.tool-card pre {
-  padding: 0 11px 9px;
-  color: var(--muted);
-  font-family: "SF Mono", "JetBrains Mono", monospace;
-  font-size: 0.7rem;
-  line-height: 1.5;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 280px;
-  overflow-y: auto;
-}
+  /* User message — small left-aligned pill */
+  .ev.user-msg {
+    margin: 14px 0 18px 0;
+    padding: 12px 18px;
+    background: #FFF;
+    border: 1px solid var(--main-border);
+    border-radius: 18px;
+    font-size: 0.88rem; line-height: 1.55;
+    max-width: 62%;
+    word-wrap: break-word;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+
+  /* Agent message — plain text, no bubble */
+  .ev.agent-msg {
+    margin: 8px 0 14px 0;
+    padding: 0;
+    font-size: 0.88rem; line-height: 1.6;
+    color: var(--main-text);
+    word-wrap: break-word;
+  }
+
+  /* Collapsible Thought card — small inline dropdown */
+  .ev.thought-card {
+    margin: 6px 0 12px 0;
+    padding: 0;
+    background: transparent;
+  }
+  .ev.thought-card summary {
+    list-style: none;
+    cursor: pointer; user-select: none;
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 0.82rem; color: #6A737D;
+    padding: 4px 8px; border-radius: 4px;
+  }
+  .ev.thought-card summary::-webkit-details-marker { display: none; }
+  .ev.thought-card summary:hover { background: #F4F6F8; color: #24292E; }
+  .ev.thought-card summary .chev {
+    font-size: 0.75rem; transition: transform 0.15s;
+  }
+  .ev.thought-card[open] summary .chev { transform: rotate(180deg); }
+  .ev.thought-card .thought-body {
+    margin-top: 6px;
+    padding: 8px 14px;
+    background: #FAFBFC;
+    border-left: 2px solid #E1E4E8;
+    border-radius: 0 4px 4px 0;
+    font-size: 0.83rem; line-height: 1.5;
+    color: #5C6670; font-style: italic;
+  }
+
+  .ev.error-ev {
+    margin: 8px 0 12px 0;
+    padding: 8px 12px;
+    background: #FFEBEE;
+    border-left: 3px solid var(--danger);
+    color: #5A1F2D;
+    font-size: 0.85rem; border-radius: 4px;
+  }
+  .ev.usage-ev {
+    margin: 6px 0 10px 0;
+    padding: 4px 10px;
+    color: #6A737D; font-size: 0.75rem;
+  }
+  .ev-label {
+    font-size: 0.68rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); margin-bottom: 4px;
+  }
+
+  /* Tool cards — Claude-style INPUT / OUTPUT layout */
+  .tool-card {
+    background: white;
+    border: 1px solid #E1E4E8;
+    border-radius: var(--radius-md);
+    margin-bottom: 12px;
+    overflow: hidden;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .tool-card:hover { box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .tool-card.done { border-color: #D1D9E0; }
+  .tool-card summary {
+    padding: 12px 14px;
+    cursor: pointer; user-select: none;
+    list-style: none;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .tool-card summary::-webkit-details-marker { display: none; }
+  .tool-card summary:hover { background: #FAFBFC; }
+  .tool-card .tool-icon {
+    width: 18px; height: 18px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #6A737D; font-size: 0.95rem; flex-shrink: 0;
+  }
+  .tool-card .tool-name {
+    font-size: 0.78rem; color: #6A737D; font-weight: 600;
+    flex-shrink: 0; text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .tool-card .tool-title {
+    flex: 1; min-width: 0;
+    font-size: 0.88rem; color: #24292E;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tool-card.running .tool-title::after {
+    content: ' · running'; color: #C77800; font-size: 0.78rem;
+  }
+  .tool-card .tool-elapsed {
+    flex-shrink: 0; font-size: 0.78rem; color: #6A737D;
+    font-variant-numeric: tabular-nums; padding: 0 6px;
+    min-width: 3.5em; text-align: right;
+  }
+  .tool-card.running .tool-elapsed { color: #C77800; }
+  .tool-card.done .tool-elapsed { color: #2DA44E; }
+  .tool-card .chevron {
+    color: #959DA5; font-size: 0.95rem; flex-shrink: 0;
+    transition: transform 0.15s;
+  }
+  .tool-card[open] .chevron { transform: rotate(180deg); }
+  .tool-card .tool-body {
+    padding: 4px 16px 14px;
+    border-top: 1px solid #F0F1F3;
+  }
+  .tool-card .tool-section { margin-top: 12px; }
+  .tool-card .tool-section-label {
+    font-size: 0.66rem; text-transform: uppercase;
+    letter-spacing: 0.07em; color: #6A737D;
+    font-weight: 700; margin-bottom: 5px;
+  }
+  .tool-card pre.tool-input,
+  .tool-card pre.tool-output {
+    margin: 0;
+    background: #F6F8FA;
+    border: 1px solid #E1E4E8;
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem; line-height: 1.5;
+    overflow-x: auto; white-space: pre-wrap;
+    color: #24292E;
+    max-height: 380px; overflow-y: auto;
+  }
+
+  /* Bottom input — decorative */
+  .input-bar {
+    padding: 14px 24px 18px;
+    border-top: 1px solid var(--main-border);
+    background: #F8FAFC;
+  }
+  .input-box {
+    border: 1px solid #D7DCE3;
+    background: #FFF; border-radius: var(--radius-md);
+    padding: 11px 16px;
+    font-size: 0.85rem; color: var(--muted);
+    cursor: not-allowed; user-select: none;
+    transition: border-color 0.12s;
+  }
+  .input-box:hover { border-color: #B8C0CB; }
+
+  /* Rendered markdown inside agent/thinking bubbles */
+  .ev .md { font-size: 0.88rem; line-height: 1.6; }
+  .ev .md p { margin: 0.4em 0; }
+  .ev .md p:first-child { margin-top: 0; }
+  .ev .md p:last-child { margin-bottom: 0; }
+  .ev .md ul, .ev .md ol { margin: 0.4em 0; padding-left: 1.4em; }
+  .ev .md li { margin: 0.15em 0; }
+  .ev .md h1, .ev .md h2, .ev .md h3, .ev .md h4 {
+    margin: 0.7em 0 0.3em; font-weight: 700; line-height: 1.2;
+  }
+  .ev .md h1 { font-size: 1.15rem; }
+  .ev .md h2 { font-size: 1.05rem; }
+  .ev .md h3 { font-size: 0.95rem; }
+  .ev .md h4 { font-size: 0.88rem; }
+  .ev .md code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: rgba(27,31,35,0.07);
+    padding: 1px 5px; border-radius: 3px;
+    font-size: 0.82em;
+  }
+  .ev .md pre {
+    background: #F6F7F9;
+    border: 1px solid #E1E4E8;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 0.5em 0;
+    overflow-x: auto;
+    font-size: 0.78rem; line-height: 1.45;
+  }
+  .ev .md pre code {
+    background: none; padding: 0; border-radius: 0; font-size: 0.95em;
+  }
+  .ev .md blockquote {
+    margin: 0.5em 0; padding: 4px 12px;
+    border-left: 3px solid #DDD; color: #555;
+  }
+  .ev .md a { color: var(--sidebar-active); text-decoration: none; }
+  .ev .md a:hover { text-decoration: underline; }
+  .ev .md table { border-collapse: collapse; margin: 0.5em 0; }
+  .ev .md th, .ev .md td { border: 1px solid #E1E4E8; padding: 4px 8px; font-size: 0.82rem; }
+  .ev .md th { background: #F6F7F9; font-weight: 600; }
+  .ev .md hr { border: none; border-top: 1px solid #E1E4E8; margin: 0.7em 0; }
+  .ev.thought-card .md code, .ev.thought-card .md pre { background: rgba(180,140,40,0.1); border-color: rgba(180,140,40,0.2); }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js"></script>
 </head>
 <body>
 
-<div class="left-panel">
-  <div class="left-top">
-    <h1><span class="dot"></span> Agent Dashboard</h1>
-    <div class="stats-row">
-      <div class="stat"><div class="val" id="statSessions">-</div><div class="lbl">Sessions</div></div>
-      <div class="stat"><div class="val amber" id="statBusy">-</div><div class="lbl">Busy</div></div>
-      <div class="stat"><div class="val" id="statInstances">-</div><div class="lbl">Sandboxes</div></div>
-    </div>
-    <div class="health-bar">
-      <span class="health-dot" id="healthDot"></span>
-      <span id="healthText">connecting...</span>
-    </div>
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <span class="dot" id="healthDot"></span>
+    <span class="brand">Agent Dashboard</span>
   </div>
 
-  <div class="section-hdr">Sessions <span id="sessionCount" style="font-weight:400;opacity:.6"></span></div>
-  <ul class="session-list" id="sessionList">
-    <li style="color:var(--muted);padding:16px 6px;font-size:0.82rem;">Loading...</li>
-  </ul>
-</div>
-
-<div class="right-panel">
-  <div class="stream-header" id="streamHeader" style="display:none">
-    <span class="s-title" id="streamTitle">-</span>
-    <span class="s-meta" id="streamMeta"></span>
-    <button class="close-btn" onclick="closeStream()">Close</button>
+  <div class="stats-row">
+    <div class="stat"><div class="v" id="sSessions">-</div><div class="l">Sessions</div></div>
+    <div class="stat amber"><div class="v" id="sBusy">-</div><div class="l">Busy</div></div>
+    <div class="stat green"><div class="v" id="sJobs">-</div><div class="l">Sandboxes</div></div>
   </div>
+
+  <div class="sidebar-section">
+    <div class="section-label">Active Sessions <span class="count" id="sessionCount"></span></div>
+    <ul class="session-list" id="sessionList"></ul>
+  </div>
+</aside>
+
+<main class="main">
+  <header class="main-header">
+    <div class="title-row">
+      <span class="ic">📁</span>
+      <span class="title" id="streamTitle">Pick a session</span>
+      <span class="meta" id="streamMeta"></span>
+      <button class="stop" id="stopBtn" onclick="stopSession(currentSessionId)" disabled title="Destroy this session and its sandbox">Stop</button>
+      <button class="reload" onclick="reloadCurrent()">Reload</button>
+    </div>
+  </header>
+
   <div class="stream-body" id="streamBody">
-    <div class="stream-empty">Select a session to view its live event stream</div>
+    <div class="stream-empty" id="streamEmpty">Pick an active session from the left to view the live event stream</div>
   </div>
-</div>
+
+  <div class="input-bar">
+    <div class="input-box">Ask agent... (decorative — use the SDK to send prompts)</div>
+  </div>
+</main>
 
 <script>
-const API = 'https://agent-sdk-server-production.up.railway.app';
+const API = window.location.origin;
 let currentSessionId = null;
-let currentEventSource = null;
-let agentNames = {};  // agent_id -> name
+let currentSseAbort = null;
+let agentNames = {};       // agent_id -> name
+let lastSessionMeta = {};  // session_id -> {agent_busy, agent_id, sandbox_ref}
 
 function escHtml(s) {
   const d = document.createElement('div');
@@ -295,292 +434,584 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
-async function fetchJSON(url) {
+// Render markdown to safe HTML. Falls back to plain-text escape if libs missing.
+function renderMarkdown(text) {
+  if (!text) return '';
+  if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return escHtml(text);
   try {
-    const r = await fetch(url, {signal: AbortSignal.timeout(8000)});
+    const html = marked.parse(text, { breaks: true, gfm: true });
+    return DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
+  } catch (e) {
+    return escHtml(text);
+  }
+}
+
+async function fetchJSON(url, opts) {
+  try {
+    const r = await fetch(url, Object.assign({signal: AbortSignal.timeout(10000)}, opts || {}));
     if (!r.ok) return null;
     return await r.json();
   } catch { return null; }
 }
 
-// --- Main refresh ---
+// ── Refresh sidebar ─────────────────────────────────────────
 async function refresh() {
   const [admin, health] = await Promise.all([
     fetchJSON(`${API}/admin/sessions`),
     fetchJSON(`${API}/health`),
   ]);
 
-  // Health indicator
   const dot = document.getElementById('healthDot');
-  const txt = document.getElementById('healthText');
-  if (health) {
-    dot.className = 'health-dot ok';
-    const parts = [];
-    if (health.executor_threads != null) parts.push(`${health.executor_threads}/${health.executor_max} threads`);
-    if (health.live_shells != null) parts.push(`${health.live_shells} shells`);
-    txt.textContent = parts.length ? parts.join(' · ') : 'ok';
-  } else {
-    dot.className = 'health-dot err';
-    txt.textContent = 'unreachable';
-  }
+  if (health) dot.classList.remove('err'); else dot.classList.add('err');
 
   if (!admin) return;
-
   const sessions = (admin.sessions || []).filter(s => !s.shutdown);
   const busy = sessions.filter(s => s.agent_busy).length;
   const instances = (admin.instances || []).length;
 
-  document.getElementById('statSessions').textContent = sessions.length;
-  document.getElementById('statBusy').textContent = busy;
-  document.getElementById('statInstances').textContent = instances;
+  document.getElementById('sSessions').textContent = sessions.length;
+  document.getElementById('sBusy').textContent = busy;
+  document.getElementById('sJobs').textContent = instances;
   document.getElementById('sessionCount').textContent = `(${sessions.length})`;
 
-  // Cache agent names
+  // Cache agent display names
   if (sessions.some(s => !agentNames[s.agent_id])) {
     const agents = await fetchJSON(`${API}/agents`);
-    if (agents) {
-      for (const a of agents) {
-        if (a.name) agentNames[a.id] = a.name;
-      }
-    }
+    if (Array.isArray(agents)) for (const a of agents) if (a.name) agentNames[a.id] = a.name;
   }
+
+  lastSessionMeta = {};
+  for (const s of sessions) lastSessionMeta[s.session_id] = s;
 
   const list = document.getElementById('sessionList');
   if (sessions.length === 0) {
-    list.innerHTML = '<li style="color:var(--muted);padding:14px 6px;font-size:0.8rem;">No active sessions</li>';
-    return;
+    list.innerHTML = '<li style="color:var(--sidebar-text-dim);padding:14px 18px;font-size:0.78rem;">No active sessions</li>';
+  } else {
+    list.innerHTML = sessions.map(s => {
+      const name = agentNames[s.agent_id] || (s.agent_id || s.session_id).slice(0, 8);
+      const isActive = s.session_id === currentSessionId;
+      const busyClass = s.agent_busy ? 'busy' : '';
+      const activeClass = isActive ? 'active' : '';
+      const status = s.agent_busy ? 'running' : 'idle';
+      const sub = s.sandbox_ref ? `${status} · ${s.sandbox_ref.slice(0, 14)}` : status;
+      return `
+        <li class="session-item ${busyClass} ${activeClass}" data-sid="${escHtml(s.session_id)}" onclick="openStream('${escHtml(s.session_id)}', '${escHtml(name)}', this)">
+          <div class="indicator"></div>
+          <div class="info">
+            <div class="name">${escHtml(name)}</div>
+            <div class="sub">${escHtml(sub)}</div>
+          </div>
+          <button class="kill" title="Stop session" onclick="event.stopPropagation(); stopSession('${escHtml(s.session_id)}', '${escHtml(name)}')">×</button>
+        </li>`;
+    }).join('');
   }
 
-  const items = sessions.map(s => {
-    const name = agentNames[s.agent_id] || s.agent_id.slice(0, 8);
-    const isSelected = s.session_id === currentSessionId;
-    const agentType = s.agent_type || '';
-    const sub = [agentType, s.provider].filter(Boolean).join(' · ');
-    return `
-      <li class="session-item ${s.agent_busy ? 'busy' : ''} ${isSelected ? 'selected' : ''}"
-          onclick="openStream('${s.session_id}', '${escHtml(name)}', '${escHtml(s.agent_type || '')}', this)">
-        <div class="dot-ind"></div>
-        <div class="info">
-          <div class="s-name">${escHtml(name)}</div>
-          ${sub ? `<div class="s-sub">${escHtml(sub)}</div>` : ''}
-          ${s.sandbox_ref ? `<div title="${escHtml(s.sandbox_ref)}" style="font-family:ui-monospace,monospace;font-size:0.62rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(s.sandbox_ref)}</div>` : ''}
-        </div>
-        <span class="s-badge ${s.agent_busy ? 'badge-running' : 'badge-idle'}">${s.agent_busy ? 'running' : 'idle'}</span>
-      </li>`;
-  });
-  list.innerHTML = items.join('');
-
-  // Update stream header meta if a session is open
+  // Update header meta if a session is open
   if (currentSessionId) {
-    const cur = sessions.find(s => s.session_id === currentSessionId);
-    if (cur) {
-      document.getElementById('streamMeta').textContent =
-        cur.agent_busy ? 'running' : 'idle';
-    }
+    const cur = lastSessionMeta[currentSessionId];
+    document.getElementById('streamMeta').textContent = cur
+      ? (cur.agent_busy ? 'running' : 'idle')
+      : 'gone';
   }
 }
 
-// --- Event stream ---
-function openStream(sessionId, name, agentType, el) {
-  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+function reloadCurrent() {
+  if (!currentSessionId) return;
+  const name = document.getElementById('streamTitle').textContent;
+  const el = document.querySelector('.session-item.active');
+  openStream(currentSessionId, name, el);
+}
+
+// ── Stop session ────────────────────────────────────────────
+// Server uses DELETE /sessions/{id} (idempotent, 204) — there is no
+// /admin/sessions/{id}/reap endpoint. The DELETE both releases the pool
+// lease and destroys the underlying sandbox.
+async function stopSession(sessionId, name) {
+  if (!sessionId) return;
+  const label = name || sessionId.slice(0, 8);
+  if (!confirm(`Stop session ${label}?\nThis destroys the sandbox.`)) return;
+  try {
+    const r = await fetch(`${API}/sessions/${sessionId}`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!r.ok && r.status !== 204) {
+      alert(`Failed to stop session: HTTP ${r.status}`);
+      return;
+    }
+    if (sessionId === currentSessionId) {
+      if (currentSseAbort) { try { currentSseAbort.abort(); } catch {} currentSseAbort = null; }
+      currentSessionId = null;
+      document.getElementById('streamTitle').textContent = 'Pick a session';
+      document.getElementById('streamMeta').textContent = '';
+      document.getElementById('streamBody').innerHTML = '<div class="stream-empty">Session stopped</div>';
+      document.getElementById('stopBtn').disabled = true;
+    }
+    refresh();
+  } catch (err) {
+    alert(`Failed to stop session: ${err}`);
+  }
+}
+
+// ── Open stream ─────────────────────────────────────────────
+function openStream(sessionId, name, clickedEl) {
+  if (currentSseAbort) { try { currentSseAbort.abort(); } catch {} currentSseAbort = null; }
   currentSessionId = sessionId;
-
-  document.getElementById('streamHeader').style.display = 'flex';
   document.getElementById('streamTitle').textContent = name;
-  document.getElementById('streamMeta').textContent = agentType || '';
-
+  document.getElementById('streamMeta').textContent = '';
+  document.getElementById('stopBtn').disabled = false;
+  const emptyEl = document.getElementById('streamEmpty');
+  if (emptyEl) emptyEl.style.display = 'none';
   const body = document.getElementById('streamBody');
-  body.innerHTML = '<div style="color:var(--muted);padding:8px;font-size:0.8rem;">Loading history...</div>';
-
-  document.querySelectorAll('.session-item').forEach(i => i.classList.remove('selected'));
-  if (el) el.classList.add('selected');
-
+  body.innerHTML = '<div style="color:var(--muted);padding:8px;">Connecting to event stream...</div>';
   loadLog(sessionId, body).then(() => connectSSE(sessionId, body));
+  document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+  if (clickedEl) clickedEl.classList.add('active');
 }
 
 async function loadLog(sessionId, body) {
-  const log = await fetchJSON(`${API}/sessions/${sessionId}/log`);
+  let log = null;
+  try {
+    const r = await fetch(`${API}/sessions/${sessionId}/log`, {signal: AbortSignal.timeout(15000)});
+    if (!r.ok) { body.innerHTML = `<div style="color:var(--danger);padding:8px;">Failed to load log: HTTP ${r.status}</div>`; return; }
+    log = await r.json();
+  } catch (err) {
+    body.innerHTML = `<div style="color:var(--danger);padding:8px;">Failed to load log: ${escHtml(String(err))}</div>`;
+    return;
+  }
   body.innerHTML = '';
-  if (!log || log.length === 0) return;
-  for (const e of log) appendEvent(body, e.event_type, e.payload);
+  if (!Array.isArray(log) || log.length === 0) {
+    body.innerHTML = `<div style="color:var(--muted);padding:8px;">(no past events)</div>`;
+    return;
+  }
+  for (const e of log) appendEvent(body, e.event_type, e.payload || {}, (e.created_at || 0) * 1000);
   body.scrollTop = body.scrollHeight;
 }
 
-function connectSSE(sessionId, body) {
-  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
-  if (sessionId !== currentSessionId) return;
+// ── SSE wire format ─────────────────────────────────────────
+// Each block is `event: rpc:<id>\ndata: <json>\n\n` where the JSON is a
+// JSON-RPC envelope. We only care about three shapes:
+//   { jsonrpc, result: { stopReason } }                — turn done
+//   { jsonrpc, error: { code, message, data } }        — turn failed
+//   { jsonrpc, method: "session/update", params: { update: {...} } }
+// The `update` object's shape mirrors src/api/sse.py::parse_acp_event.
+function handleSseData(jsonStr, body) {
+  let data;
+  try { data = JSON.parse(jsonStr); }
+  catch (err) { console.warn('SSE parse error', err, jsonStr.slice(0, 200)); return; }
 
-  const es = new EventSource(`${API}/sessions/${sessionId}/events`);
-  currentEventSource = es;
+  if (data.jsonrpc && data.result && data.result.stopReason) {
+    appendEvent(body, 'turn_end', {stop_reason: data.result.stopReason});
+    return;
+  }
+  if (data.jsonrpc && data.error) {
+    appendEvent(body, 'error', {message: data.error.message || 'error', kind: data.error.data?.kind});
+    return;
+  }
+  if (data.method !== 'session/update') return;
+  const update = data.params?.update;
+  if (!update) return;
+  const ut = update.sessionUpdate || '';
+  const liveTs = Date.now();
 
-  es.onmessage = (msg) => {
-    if (sessionId !== currentSessionId) { es.close(); return; }
-    try {
-      const data = JSON.parse(msg.data);
-      if (data.jsonrpc && data.result?.stopReason) {
-        appendEvent(body, 'done', {text: `Done (${data.result.stopReason})`});
-      } else if (data.jsonrpc && data.method === 'notifications/message') {
-        const update = data.params?.update;
-        if (!update) return;
-        const su = update.sessionUpdate;
-        if (su === 'text_message_start' || su === 'text_message_content') {
-          appendEvent(body, 'assistant_message', {text: update.messagePart?.text || update.textDelta || ''});
-        } else if (su === 'tool_call_begin') {
-          appendEvent(body, 'tool_call', {name: update.toolName || '?', input: update.input || update.arguments || ''});
-        } else if (su === 'tool_call_result') {
-          appendEvent(body, 'tool_result', {output: update.output || update.result || ''});
-        } else if (su === 'thinking_message_start' || su === 'thinking_message_content') {
-          appendEvent(body, 'reasoning', {text: update.thinkingDelta || update.messagePart?.text || ''});
-        } else if (su === 'usage_update') {
-          appendEvent(body, 'usage', update);
-        }
-      }
-    } catch {}
-  };
-
-  es.addEventListener('error', () => {
-    if (sessionId !== currentSessionId) return;
-    appendEvent(body, 'system', {text: 'Stream disconnected'});
-  });
+  if (ut === 'agent_message_chunk' || ut === 'agent_message_delta') {
+    const c = update.content || {};
+    // claude-code sometimes routes thinking through message chunks; honour it.
+    if (typeof c.thinking === 'string' && c.thinking) {
+      appendEvent(body, 'reasoning', {text: c.thinking}, liveTs);
+    } else if (c.type === 'thinking' && c.text) {
+      appendEvent(body, 'reasoning', {text: c.text}, liveTs);
+    } else if (typeof c.text === 'string' && c.text) {
+      appendEvent(body, 'assistant_message', {text: c.text}, liveTs);
+    }
+  } else if (ut === 'agent_thought_chunk' || ut === 'thinking_delta') {
+    const c = update.content || {};
+    const text = c.text || c.thinking || update.text || '';
+    if (text) appendEvent(body, 'reasoning', {text}, liveTs);
+  } else if (ut === 'tool_call' || ut === 'execute_tool_started') {
+    appendEvent(body, 'tool_call', update, liveTs);
+  } else if (ut === 'tool_call_update' || ut === 'execute_tool_completed') {
+    appendEvent(body, 'tool_result', update, liveTs);
+  } else if (ut === 'usage_updated' || ut === 'usage_update') {
+    appendEvent(body, 'usage', {usage: update.cost || update}, liveTs);
+  }
 }
 
-// --- Event rendering ---
-function extractName(p) { return p.tool || p.name || p.tool_name || p.toolName || '?'; }
-function extractTitle(p) {
-  if (p.title) return p.title;
-  const inp = p.input || p.args || {};
-  if (typeof inp === 'string') return inp.slice(0, 100);
-  if (inp.command) return inp.command.slice(0, 100);
-  if (inp.file_path || inp.filePath) return inp.file_path || inp.filePath;
-  if (inp.path) return inp.path;
-  if (Object.keys(inp).length) return JSON.stringify(inp).slice(0, 100);
+// Manual SSE reader via fetch + ReadableStream — bypasses EventSource's
+// limitation that named events ("event: rpc:<id>") don't fire onmessage.
+async function connectSSE(sessionId, body) {
+  if (currentSseAbort) { try { currentSseAbort.abort(); } catch {} currentSseAbort = null; }
+  if (sessionId !== currentSessionId) return;
+  const url = `${API}/sessions/${sessionId}/events`;
+  const ctrl = new AbortController();
+  currentSseAbort = ctrl;
+  let resp;
+  try {
+    resp = await fetch(url, {headers: {'Accept': 'text/event-stream'}, signal: ctrl.signal});
+  } catch (err) {
+    if (sessionId === currentSessionId) appendEvent(body, 'usage', {text: 'SSE connect failed: ' + err});
+    return;
+  }
+  if (!resp.ok || !resp.body) {
+    if (sessionId === currentSessionId) appendEvent(body, 'usage', {text: 'SSE HTTP ' + resp.status});
+    return;
+  }
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  try {
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      if (sessionId !== currentSessionId) { ctrl.abort(); return; }
+      buf += dec.decode(value, {stream: true});
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dataLines = [];
+        for (const line of block.split('\n')) {
+          if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+        }
+        if (dataLines.length === 0) continue;
+        handleSseData(dataLines.join('\n'), body);
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError' && sessionId === currentSessionId) {
+      appendEvent(body, 'usage', {text: 'SSE stream error: ' + err});
+    }
+  } finally {
+    if (sessionId === currentSessionId) appendEvent(body, 'usage', {text: 'SSE connection closed'});
+  }
+}
+
+// ── Tool extraction (matches src/api/sse.py) ────────────────
+function extractToolName(p) {
+  // Persisted log rows carry both the canonical {tool_name, args} keys
+  // AND the flattened raw ACP update (toolName, _meta.claudeCode.toolName,
+  // rawInput.*). Live SSE updates are the raw update. Try the same chain
+  // either way.
+  const meta = p?._meta?.claudeCode;
+  if (meta?.toolName) return meta.toolName;
+  for (const k of ['tool_name', 'toolName', 'tool', 'name', 'kind']) {
+    const v = p?.[k];
+    if (typeof v === 'string' && v) return v;
+  }
+  const ri = p?.rawInput || p?.args || p?.input;
+  if (ri && typeof ri === 'object') {
+    for (const k of ['toolName', 'tool', 'name', 'kind']) {
+      if (typeof ri[k] === 'string' && ri[k]) return ri[k];
+    }
+  }
+  if (typeof p?.title === 'string' && p.title) {
+    const w = p.title.split(' ', 1)[0].trim().toLowerCase();
+    if (w) return w;
+  }
+  return 'tool';
+}
+
+function extractToolCallId(p) {
+  for (const k of ['toolCallId', 'tool_call_id', 'toolUseId', 'tool_use_id']) {
+    if (typeof p?.[k] === 'string' && p[k]) return p[k];
+  }
+  const meta = p?._meta?.claudeCode;
+  if (meta) {
+    for (const k of ['toolUseId', 'toolCallId', 'tool_use_id', 'tool_call_id', 'id']) {
+      if (typeof meta[k] === 'string' && meta[k]) return meta[k];
+    }
+  }
   return '';
 }
-function extractResult(p) {
-  const res = p.result;
-  if (typeof res === 'string') return res;
-  if (Array.isArray(res)) return res.map(r => r.content?.text || r.text || JSON.stringify(r)).join('\n');
-  if (res && typeof res === 'object') return res.stdout || res.text || res.output || JSON.stringify(res);
-  return p.output || p.text || '';
+
+function extractToolArgs(p) {
+  // Persisted log payload puts the input under `args`; live SSE under
+  // `rawInput`. `input`/`arguments` are belt-and-braces.
+  return p?.args ?? p?.rawInput ?? p?.input ?? p?.arguments ?? null;
 }
 
-function appendEvent(body, type, payload) {
+function extractToolTitle(p) {
+  if (typeof p?.title === 'string' && p.title) return p.title;
+  const args = extractToolArgs(p);
+  if (typeof args === 'string') return args.slice(0, 120);
+  if (args && typeof args === 'object') {
+    if (typeof args.command === 'string') return args.command.slice(0, 120);
+    if (typeof args.file_path === 'string') return args.file_path;
+    if (typeof args.path === 'string') return args.path;
+    if (typeof args.url === 'string') return args.url;
+    const keys = Object.keys(args);
+    if (keys.length) return JSON.stringify(args).slice(0, 120);
+  }
+  return '';
+}
+
+function extractToolResult(p) {
+  // 1) Canonical key written by parse_acp_event into the log row
+  if (p?.result !== undefined) {
+    const r = renderResult(p.result);
+    if (r) return r;
+  }
+  // 2) Live SSE update — Claude meta carries the structured response
+  const meta = p?._meta?.claudeCode;
+  if (meta) {
+    for (const k of ['toolResponse', 'toolResult', 'tool_response', 'tool_result']) {
+      if (meta[k] !== undefined) {
+        const r = renderResult(meta[k]);
+        if (r) return r;
+      }
+    }
+  }
+  // 3) Generic ACP fields
+  for (const k of ['rawOutput', 'toolResponse', 'toolResult', 'output', 'content']) {
+    if (p?.[k] !== undefined) {
+      const r = renderResult(p[k]);
+      if (r) return r;
+    }
+  }
+  return '';
+}
+
+function renderResult(res) {
+  if (res == null) return '';
+  if (typeof res === 'string') return res;
+  if (Array.isArray(res)) {
+    return res.map(r => r?.content?.text || r?.text || (typeof r === 'string' ? r : JSON.stringify(r))).join('\n');
+  }
+  if (typeof res === 'object') {
+    // Bash-style structured shell result
+    if ('stdout' in res || 'stderr' in res || 'backgroundTaskId' in res) {
+      const parts = [];
+      if (res.stdout) parts.push(res.stdout);
+      if (res.stderr) parts.push('─── stderr ───\n' + res.stderr);
+      if (res.backgroundTaskId) parts.push(`⏳ running in background (id=${res.backgroundTaskId})`);
+      if (res.interrupted) parts.push('⛔ interrupted');
+      if (res.noOutputExpected && !res.stdout && !res.stderr) parts.push('(no output expected)');
+      if (!parts.length) parts.push('(no output yet)');
+      return parts.join('\n');
+    }
+    const txt = res.stdout || res.text || res.output;
+    if (txt) return txt;
+    if (!Object.keys(res).length) return '';
+    return JSON.stringify(res, null, 2);
+  }
+  return String(res);
+}
+
+// ── Live elapsed ticker on running tool cards ───────────────
+function formatElapsed(ms) {
+  if (ms < 1000) return Math.round(ms) + 'ms';
+  if (ms < 60_000) return (ms / 1000).toFixed(ms < 10_000 ? 1 : 0) + 's';
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms - m * 60_000) / 1000);
+  return m + 'm' + (s > 0 ? s + 's' : '');
+}
+
+let _elapsedTickerId = null;
+function ensureElapsedTicker() {
+  if (_elapsedTickerId !== null) return;
+  _elapsedTickerId = setInterval(() => {
+    const cards = document.querySelectorAll('.tool-card.running');
+    if (cards.length === 0) {
+      clearInterval(_elapsedTickerId);
+      _elapsedTickerId = null;
+      return;
+    }
+    const now = Date.now();
+    cards.forEach(card => {
+      const startTime = parseFloat(card.dataset.startTime || '0');
+      if (!startTime) return;
+      const elapsedEl = card.querySelector('.tool-elapsed');
+      if (elapsedEl) elapsedEl.textContent = formatElapsed(now - startTime);
+    });
+  }, 250);
+}
+
+// ── Render a single event ───────────────────────────────────
+function appendEvent(body, type, payload, serverTimeMs) {
+  if (!serverTimeMs) serverTimeMs = Date.now();
+  payload = payload || {};
   switch (type) {
     case 'user_message': {
-      const d = document.createElement('div');
-      d.className = 'ev agent-text';
-      d.style.borderLeftColor = 'var(--success)';
-      d.innerHTML = `<div class="ev-label">User</div>${escHtml(payload.text || '')}`;
-      body.appendChild(d); break;
+      const div = document.createElement('div');
+      div.className = 'ev user-msg';
+      div.innerHTML = `<div class="md">${renderMarkdown(payload.text || '')}</div>`;
+      body.appendChild(div);
+      break;
     }
     case 'assistant_message': {
       const text = payload.text || '';
       if (!text.trim()) return;
-      const last = body.lastElementChild;
-      if (last?.dataset?.type === 'assistant_message') {
-        last.innerHTML += escHtml(text);
+      const lastEl = body.lastElementChild;
+      if (lastEl?.dataset?.type === 'assistant_message') {
+        lastEl.dataset.rawText = (lastEl.dataset.rawText || '') + text;
+        const md = lastEl.querySelector('.md');
+        if (md) md.innerHTML = renderMarkdown(lastEl.dataset.rawText);
         body.scrollTop = body.scrollHeight;
         return;
       }
-      const d = document.createElement('div');
-      d.className = 'ev agent-text';
-      d.dataset.type = 'assistant_message';
-      d.innerHTML = `<div class="ev-label">Agent</div>${escHtml(text)}`;
-      body.appendChild(d); break;
+      const div = document.createElement('div');
+      div.className = 'ev agent-msg';
+      div.dataset.type = 'assistant_message';
+      div.dataset.rawText = text;
+      div.innerHTML = `<div class="md">${renderMarkdown(text)}</div>`;
+      body.appendChild(div);
+      break;
     }
     case 'tool_call': {
-      const toolName = extractName(payload);
-      const title = extractTitle(payload);
-      const tcId = payload.tool_call_id || payload.toolCallId || '';
+      const toolName = extractToolName(payload);
+      const titleRaw = extractToolTitle(payload) || toolName;
+      const title = titleRaw.length > 110 ? titleRaw.slice(0, 110) + '…' : titleRaw;
+      const toolCallId = extractToolCallId(payload);
+      const args = extractToolArgs(payload);
+      const hasArgs = args != null && (typeof args === 'string' ? args.length > 0 : Object.keys(args).length > 0);
+      const argsStr = typeof args === 'string' ? args : JSON.stringify(args, null, 2);
       const details = document.createElement('details');
-      details.className = 'tool-card';
-      details.dataset.toolCallId = tcId;
-      const summary = document.createElement('summary');
-      summary.innerHTML = `<span class="tool-icon">&#9654;</span><span class="tool-label">${escHtml(toolName)}${title ? ' <span style="opacity:.55;font-weight:400">· ' + escHtml(title) + '</span>' : ''}</span><span class="tool-status waiting">running</span>`;
-      const pre = document.createElement('pre');
-      const args = payload.input || payload.args || {};
-      pre.textContent = typeof args === 'string' ? args : JSON.stringify(args, null, 2);
-      details.append(summary, pre);
-      body.appendChild(details); break;
+      details.className = 'tool-card running';
+      details.dataset.toolCallId = toolCallId;
+      details.dataset.toolName = toolName;
+      details.dataset.startTime = String(serverTimeMs);
+      const inputBlock = hasArgs ? `
+          <div class="tool-section">
+            <div class="tool-section-label">INPUT</div>
+            <pre class="tool-input">${escHtml(argsStr)}</pre>
+          </div>` : '';
+      details.innerHTML = `
+        <summary>
+          <span class="tool-icon">📄</span>
+          <span class="tool-name">${escHtml(toolName)}</span>
+          <span class="tool-title">${escHtml(title)}</span>
+          <span class="tool-elapsed">0.0s</span>
+          <span class="chevron">⌄</span>
+        </summary>
+        <div class="tool-body">
+          ${inputBlock}
+          <div class="tool-section tool-output-wrap" style="display:none">
+            <div class="tool-section-label">OUTPUT</div>
+            <pre class="tool-output"></pre>
+          </div>
+        </div>`;
+      body.appendChild(details);
+      ensureElapsedTicker();
+      break;
     }
     case 'tool_result': {
-      const tcId = payload.tool_call_id || payload.toolCallId || '';
+      const toolCallId = extractToolCallId(payload);
       const cards = body.querySelectorAll('.tool-card');
       let card = null;
       for (let i = cards.length - 1; i >= 0; i--) {
-        if (tcId && cards[i].dataset.toolCallId === tcId) { card = cards[i]; break; }
-        if (!tcId && cards[i].querySelector('.tool-status.waiting')) { card = cards[i]; break; }
+        if (toolCallId && cards[i].dataset.toolCallId === toolCallId) { card = cards[i]; break; }
+        if (!toolCallId && cards[i].classList.contains('running')) { card = cards[i]; break; }
       }
       if (card) {
-        const st = card.querySelector('.tool-status');
-        if (st) { st.className = 'tool-status done'; st.textContent = 'done'; }
-        card.querySelector('summary .tool-icon').textContent = '✓';
-        let out = extractResult(payload);
-        if (typeof out !== 'string') out = JSON.stringify(out);
-        if (out.length > 2000) out = out.slice(0, 2000) + '\n… (truncated)';
-        if (out.trim()) card.querySelector('pre').textContent += '\n─── result ───\n' + out;
+        // The tool_result payload sometimes carries a nicer `title` than
+        // we had at tool_call time — promote it into the summary, and
+        // preserve the original args in the INPUT block.
+        if (typeof payload.title === 'string' && payload.title) {
+          const titleEl = card.querySelector('.tool-title');
+          const summaryShort = payload.title.length > 110 ? payload.title.slice(0, 110) + '…' : payload.title;
+          if (titleEl && summaryShort.length > (titleEl.textContent || '').length) {
+            titleEl.textContent = summaryShort;
+          }
+        }
+        let output = extractToolResult(payload);
+        if (typeof output !== 'string') output = JSON.stringify(output, null, 2);
+        if (output.length > 8000) output = output.slice(0, 8000) + '\n... (truncated)';
+        const outPre = card.querySelector('.tool-output');
+        const outWrap = card.querySelector('.tool-output-wrap');
+        if (outPre && output.trim()) {
+          outPre.textContent = output;
+          if (outWrap) outWrap.style.display = '';
+        }
+        card.classList.remove('running');
+        card.classList.add('done');
+        const elapsedEl = card.querySelector('.tool-elapsed');
+        if (elapsedEl && card.dataset.startTime) {
+          const ms = serverTimeMs - parseFloat(card.dataset.startTime);
+          elapsedEl.textContent = formatElapsed(ms);
+          card.dataset.endTime = String(serverTimeMs);
+        }
       } else {
-        const d = document.createElement('div');
-        d.className = 'ev usage-ev';
-        let out = extractResult(payload);
-        if (typeof out !== 'string') out = JSON.stringify(out);
-        d.textContent = out.slice(0, 500) || '(empty result)';
-        body.appendChild(d);
+        const div = document.createElement('div');
+        div.className = 'ev usage-ev';
+        let output = extractToolResult(payload);
+        if (typeof output !== 'string') output = JSON.stringify(output);
+        if (output.length > 500) output = output.slice(0, 500) + '...';
+        div.textContent = output || '(empty result)';
+        body.appendChild(div);
       }
       break;
     }
     case 'reasoning': {
-      const text = payload.text || '';
-      if (!text.trim()) return;
-      const last = body.lastElementChild;
-      if (last?.dataset?.type === 'reasoning') {
-        last.innerHTML += escHtml(text);
+      const think = payload.text || '';
+      if (!think.trim()) return;
+      const lastThink = body.lastElementChild;
+      if (lastThink?.dataset?.type === 'reasoning') {
+        lastThink.dataset.rawText = (lastThink.dataset.rawText || '') + think;
+        const md = lastThink.querySelector('.md');
+        if (md) md.innerHTML = renderMarkdown(lastThink.dataset.rawText);
         body.scrollTop = body.scrollHeight;
         return;
       }
-      const d = document.createElement('div');
-      d.className = 'ev thinking';
-      d.dataset.type = 'reasoning';
-      d.innerHTML = `<div class="ev-label">Thinking</div>${escHtml(text)}`;
-      body.appendChild(d); break;
+      const details = document.createElement('details');
+      details.className = 'ev thought-card';
+      details.dataset.type = 'reasoning';
+      details.dataset.rawText = think;
+      details.innerHTML = `
+        <summary><span>Thought</span> <span class="chev">⌄</span></summary>
+        <div class="thought-body"><div class="md">${renderMarkdown(think)}</div></div>`;
+      body.appendChild(details);
+      break;
     }
     case 'error': {
-      const d = document.createElement('div');
-      d.className = 'ev error-ev';
-      d.innerHTML = `<div class="ev-label">Error</div>${escHtml(payload.message || payload.text || JSON.stringify(payload))}`;
-      body.appendChild(d); break;
+      const div = document.createElement('div');
+      div.className = 'ev error-ev';
+      const msg = payload.message || payload.text || JSON.stringify(payload);
+      const kind = payload.kind ? ` (${payload.kind})` : '';
+      div.innerHTML = `<div class="ev-label">Error${escHtml(kind)}</div>${escHtml(msg)}`;
+      body.appendChild(div);
+      break;
     }
     case 'usage': {
-      const d = document.createElement('div');
-      d.className = 'ev usage-ev';
-      const i = payload.inputTokens || payload.input_tokens || 0;
-      const o = payload.outputTokens || payload.output_tokens || 0;
-      const c = payload.totalCostUsd || payload.total_cost_usd || 0;
-      d.textContent = `${i.toLocaleString()} in · ${o.toLocaleString()} out${c ? ` · $${c.toFixed(4)}` : ''}`;
-      body.appendChild(d); break;
+      const div = document.createElement('div');
+      div.className = 'ev usage-ev';
+      // Server log row: {usage: {...}}; live SSE: passes through here too.
+      const u = payload.usage || payload;
+      const inTok = u.inputTokens || u.input_tokens || 0;
+      const outTok = u.outputTokens || u.output_tokens || 0;
+      const cost = u.totalCostUsd || u.total_cost_usd || u.cost;
+      if (payload.text) {
+        div.textContent = payload.text;
+      } else if (inTok || outTok || cost) {
+        const parts = [];
+        if (inTok || outTok) parts.push(`${inTok.toLocaleString()} in · ${outTok.toLocaleString()} out`);
+        if (cost) parts.push(`$${Number(cost).toFixed(4)}`);
+        div.textContent = parts.join(' · ');
+      } else {
+        return;
+      }
+      body.appendChild(div);
+      break;
     }
-    case 'done':
-    case 'system': {
-      const d = document.createElement('div');
-      d.className = 'ev usage-ev';
-      d.textContent = payload.text || 'done';
-      body.appendChild(d); break;
+    case 'turn_end': {
+      const div = document.createElement('div');
+      div.className = 'ev usage-ev';
+      div.textContent = `done (${payload.stop_reason || payload.stopReason || 'ok'})`;
+      body.appendChild(div);
+      break;
     }
-    default: return;
+    default: {
+      // Forward-compat: render unknown event types as a faint usage line
+      const div = document.createElement('div');
+      div.className = 'ev usage-ev';
+      div.textContent = `[${type}] ` + JSON.stringify(payload).slice(0, 200);
+      body.appendChild(div);
+    }
   }
   body.scrollTop = body.scrollHeight;
 }
 
-function closeStream() {
-  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
-  currentSessionId = null;
-  document.getElementById('streamHeader').style.display = 'none';
-  document.getElementById('streamBody').innerHTML = '<div class="stream-empty">Select a session to view its live event stream</div>';
-  document.querySelectorAll('.session-item').forEach(i => i.classList.remove('selected'));
-}
-
 refresh();
-setInterval(refresh, 8000);
+setInterval(refresh, 4000);
 </script>
 </body>
 </html>
