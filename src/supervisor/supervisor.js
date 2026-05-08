@@ -629,12 +629,17 @@ async function handlePost(req, res) {
         resolve(CLIENT_GONE);
       }
     };
-    req.on("close", cleanupOnce);
+    // res.on("close") fires when the underlying socket is terminated
+    // before res.end() — the actual "client gave up" signal. req.on
+    // ("close") was unreliable here under Node's HTTP server semantics
+    // when the request body had already been fully consumed.
+    res.on("close", cleanupOnce);
   });
-  // Detach the listener once the Promise resolves through the normal path
-  // — leaving it attached holds the closure (and the resolved envelope)
-  // alive until the request emits 'close', which can be much later.
-  if (cleanupOnce) req.removeListener("close", cleanupOnce);
+  // Detach the listener once the Promise resolves through the normal
+  // path. Leaving it attached holds the closure (and the resolved
+  // envelope) alive until the response emits 'close', which is later
+  // than necessary.
+  if (cleanupOnce) res.removeListener("close", cleanupOnce);
 
   if (envelope === CLIENT_GONE) {
     // Client disconnected before ACP responded. No socket to write to.
@@ -970,7 +975,7 @@ async function handleExec(req, res) {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      req.removeListener("close", onClose);
+      res.removeListener("close", onClose);
       try { fn(); } catch {}
       resolve();
     };
@@ -983,11 +988,12 @@ async function handleExec(req, res) {
     const onClose = () => {
       // Client disconnected before bash finished. Kill the child so we
       // don't burn the rest of the timeout window on output nobody will
-      // ever see, and skip writing the response (socket is gone).
+      // ever see, and skip writing the response (socket is gone). Listen
+      // on res — req.on("close") was unreliable post-body-consumption.
       try { child.kill("SIGKILL"); } catch {}
       finish(() => {});
     };
-    req.on("close", onClose);
+    res.on("close", onClose);
 
     child.stdout.on("data", (chunk) => {
       if (stdout.length < MAX_EXEC_OUTPUT) {
