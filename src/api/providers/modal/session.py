@@ -20,15 +20,6 @@ from api.sandbox.state import ModalSandboxState, SandboxState
 log = logging.getLogger(__name__)
 
 _SSE_READ_TIMEOUT_S = 60.0
-# Modal's HTTPS tunnel layer occasionally drops the upstream stream during
-# attach under parallel-test contention (observed: 3-of-5 attaches fail with
-# ``RemoteProtocolError: Server disconnected without sending a response``).
-# Old budget (3 × 0.5s linear = ~3s sleep) couldn't ride the wobble out.
-# Bumped to 6 × 1s = ~21s sleep + per-attempt timeout — modal's tunnel
-# layer recovers within that window in practice.
-#
-# We also re-resolve the supervisor URL between attempts (see _attach_with_retry)
-# because modal's tunnel can rotate the HTTPS endpoint when it reconciles.
 _ATTACH_RETRY_ATTEMPTS = 6
 _ATTACH_RETRY_DELAY_S = 1.0
 
@@ -46,43 +37,31 @@ class ModalSandboxSession(BaseSandboxSession):
         self._cwd = "/v"
 
     async def _attach_with_retry(self) -> None:
-        from api.providers import modal as md_provider
-
         last_error: Exception | None = None
         for attempt in range(1, _ATTACH_RETRY_ATTEMPTS + 1):
             try:
                 await self._attach_acp()
                 return
-            except Exception as exc:  # pragma: no cover - covered by unit tests
+            except Exception as exc:
                 last_error = exc
                 if attempt >= _ATTACH_RETRY_ATTEMPTS:
                     break
+                # Diagnostic: probe /v1/health to distinguish supervisor-dead
+                # (health 0/5xx) from POST-handler-broken (health 200, POST fails).
+                health_status = "unknown"
+                try:
+                    async with httpx.AsyncClient(timeout=3.0) as probe:
+                        r = await probe.get(f"{self._supervisor_url}/v1/health")
+                        health_status = str(r.status_code)
+                except Exception as probe_exc:
+                    health_status = f"err:{type(probe_exc).__name__}"
                 log.warning(
-                    "Modal ACP attach failed (attempt %s/%s) for session %s: %s",
-                    attempt, _ATTACH_RETRY_ATTEMPTS, self.session_id, exc,
+                    "Modal ACP attach failed (attempt %s/%s) for session %s: "
+                    "%s: %r [health=%s]",
+                    attempt, _ATTACH_RETRY_ATTEMPTS, self.session_id,
+                    type(exc).__name__, exc, health_status,
                 )
-                # Re-resolve the supervisor URL — modal's tunnel can rotate
-                # the HTTPS endpoint after a drop, and a stale URL would
-                # 502 forever. The cached AcpClient holds the old URL too;
-                # rebuild it so the next attempt actually gets the new
-                # endpoint.
-                if self.state.sandbox_ref:
-                    try:
-                        fresh = await md_provider.resolve_supervisor_url(
-                            self.state.sandbox_ref
-                        )
-                        if fresh and fresh != self._supervisor_url:
-                            log.info(
-                                "Modal supervisor URL rotated for session %s: %s -> %s",
-                                self.session_id, self._supervisor_url, fresh,
-                            )
-                            self._supervisor_url = fresh
-                            await self._aclose_acp_client()
-                    except Exception as resolve_exc:
-                        log.debug(
-                            "Modal URL re-resolve failed for session %s: %s",
-                            self.session_id, resolve_exc,
-                        )
+                await self._aclose_acp_client()
                 await asyncio.sleep(_ATTACH_RETRY_DELAY_S * attempt)
         assert last_error is not None
         raise last_error
