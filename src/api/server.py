@@ -154,21 +154,6 @@ async def lifespan(app):
         limits=httpx.Limits(max_keepalive_connections=200, max_connections=400),
     )
 
-    # Eagerly construct the AsyncDaytona client so the first sandbox
-    # creation in a burst doesn't pay the (mostly local) init cost. The
-    # aiohttp.ClientSession is still created lazily on first HTTP call.
-    # Skipped silently on dev boxes without DAYTONA_API_KEY (those use
-    # docker / unix_local providers).
-    if os.environ.get("DAYTONA_API_KEY"):
-        try:
-            from .providers.daytona import _get_async_daytona_client
-            await _get_async_daytona_client()
-        except Exception as e:
-            log.warning(
-                "daytona async client eager-init failed (will retry on first call): %s",
-                e,
-            )
-
     # Startup reconciliation: kill orphan containers labeled with a
     # sandbox_ref whose DB row is gone or marked deleted. Per-provider in
     # parallel so a slow provider doesn't serialise boot. In practice
@@ -194,11 +179,6 @@ async def lifespan(app):
     await close_pool()
     if _HTTP_CLIENT is not None:
         await _HTTP_CLIENT.aclose()
-    try:
-        from .providers.daytona import _shutdown_async_daytona_client
-        await _shutdown_async_daytona_client()
-    except Exception as e:
-        log.warning("daytona async client shutdown failed: %s", e)
 
 
 app = FastAPI(title="Agent Orchestration API", lifespan=lifespan)

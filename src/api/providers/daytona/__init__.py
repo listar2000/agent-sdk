@@ -167,18 +167,6 @@ async def _get_async_daytona_client():
         return _DAYTONA_CLIENT_ASYNC
 
 
-async def _shutdown_async_daytona_client() -> None:
-    """Close the shared aiohttp.ClientSession owned by AsyncDaytona.
-    Safe to call from lifespan shutdown — no-op if never initialized."""
-    global _DAYTONA_CLIENT_ASYNC
-    if _DAYTONA_CLIENT_ASYNC is None:
-        return
-    try:
-        await _DAYTONA_CLIENT_ASYNC.close()
-    finally:
-        _DAYTONA_CLIENT_ASYNC = None
-
-
 # Cap on simultaneous in-flight ``daytona.create()`` calls. Removing the
 # 32-thread executor cap (via the async client) would otherwise let 250
 # concurrent sessions hit daytona's API + disk quota without any
