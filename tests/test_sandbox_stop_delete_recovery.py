@@ -545,18 +545,55 @@ async def _write_marker_and_read(sdk, session_id, marker):
 
 
 async def _read_marker(sdk, session_id, marker):
-    # Verbose models (opencode/claude-3.5-haiku via openrouter, sometimes
-    # claude itself) repeat any sentinel string back in their explanatory
-    # text — "the `__MARKER_ABSENT__` fallback was not triggered" — which
-    # tripped earlier "absence-string not in reply" checks even when the
-    # file existed. The shell call is identical, but callers should rely
-    # on the "marker content present" signal alone (see usage below);
-    # presence of the sentinel in chatty prose is meaningless.
-    return await _ask(
-        sdk, session_id,
+    # Send a prompt — this triggers cold-recovery on the released session
+    # and runs ``cat`` via the agent's bash tool. We harvest the *tool
+    # result* events from the SSE stream (deterministic shell stdout),
+    # not the LLM's prose reply: opencode + verbose claude variants
+    # frequently paraphrase ("the file was read successfully") without
+    # echoing the bytes, and the test would false-fail on a perfectly-
+    # restored sandbox.
+    rpc_id = await _send_message(
+        sdk,
+        session_id,
         f"Please run this shell command and tell me the output:\n"
         f"  cat ~/{marker} || echo __MARKER_ABSENT__",
     )
+    text_parts: list[str] = []
+    tool_outputs: list[str] = []
+    deadline = time.time() + PROMPT_TIMEOUT
+    buf = b""
+    async for chunk in sdk.stream_events(session_id):
+        buf += chunk
+        while b"\n\n" in buf:
+            raw, buf = buf.split(b"\n\n", 1)
+            block = raw.decode("utf-8", errors="replace")
+            tag = extract_sse_tag(block)
+            if tag is not None and tag != rpc_id:
+                continue
+            ev = parse_acp_event(block, rpc_id)
+            if ev is None:
+                continue
+            if ev.get("type") == "text":
+                text_parts.append(ev.get("text", ""))
+            elif ev.get("type") == "tool_result":
+                result = ev.get("result")
+                if isinstance(result, dict):
+                    out = result.get("stdout") or result.get("output")
+                    if isinstance(out, str):
+                        tool_outputs.append(out)
+                elif isinstance(result, str):
+                    tool_outputs.append(result)
+            elif ev.get("type") == "done":
+                # Tool stdout wins because it's the real bytes; LLM prose
+                # is the fallback if a runtime doesn't surface
+                # tool_result content (some adapters omit ``stdout`` from
+                # the result envelope).
+                return "\n".join(tool_outputs) if tool_outputs else "".join(text_parts)
+            elif ev.get("type") == "error":
+                raise AssertionError(f"prompt errored: {ev}")
+        if time.time() > deadline:
+            raise TimeoutError(f"no reply within {PROMPT_TIMEOUT}s for rpc {rpc_id}")
+    return "\n".join(tool_outputs) if tool_outputs else "".join(text_parts)
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
