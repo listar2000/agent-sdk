@@ -90,6 +90,12 @@ const AGENT_MEMORY_DIRS = [
   ".claude",
   ".codex",
   ".opencode",
+  // OpenCode is XDG-compliant: actual session storage (the SQLite DB,
+  // session_diff/ session_message/ JSONs) lives under XDG_DATA_HOME, not
+  // ~/.opencode. Without these, session/load on a respawned sandbox
+  // finds nothing to load and opencode silently no-ops.
+  ".local/share/opencode",
+  ".local/state/opencode",
   ".gemini",
   ".cline",
   ".deepagents",

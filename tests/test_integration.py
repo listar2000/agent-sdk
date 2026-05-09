@@ -16,6 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk.client import Agent
+from tests._acp_runtimes import acp_runtime_param
 
 BASE_URL = "http://localhost:7778"
 
@@ -38,10 +39,11 @@ skip_if_no_server = pytest.mark.skipif(
 
 
 @skip_if_no_server
+@acp_runtime_param
 @pytest.mark.asyncio
-async def test_basic_arun():
+async def test_basic_arun(acp_runtime):
     """Agent can complete a simple prompt end-to-end."""
-    agent = Agent("test-basic", provider="unix_local", api_url=BASE_URL, model="haiku")
+    agent = Agent("test-basic", provider="unix_local", api_url=BASE_URL, **acp_runtime)
     resp = await asyncio.wait_for(
         agent.arun("Reply with exactly: HELLO_WORLD"),
         timeout=60,
@@ -51,13 +53,22 @@ async def test_basic_arun():
 
 
 @skip_if_no_server
+@acp_runtime_param
 @pytest.mark.asyncio
-async def test_session_resume_recalls_context():
-    """A resumed session recalls information from the previous turn."""
+async def test_session_resume_recalls_context(acp_runtime):
+    """A resumed session recalls information from the previous turn.
+
+    Both claude-agent-acp (JSONL under ``~/.claude/projects/``) and
+    opencode (SQLite at ``~/.local/share/opencode/opencode.db``) survive
+    sandbox respawn so long as ``AGENT_MEMORY_DIRS`` covers the right
+    paths and the config-replay loop forwards ``agent_type`` to
+    ``set_model`` (otherwise full opencode IDs get squashed to
+    ``"haiku"`` and parsed as ``providerID=haiku``).
+    """
     import random
     num = random.randint(100, 999)  # 3-digit to avoid false positives
 
-    agent = Agent("test-resume", provider="unix_local", api_url=BASE_URL, model="haiku")
+    agent = Agent("test-resume", provider="unix_local", api_url=BASE_URL, **acp_runtime)
     resp1 = await asyncio.wait_for(
         agent.arun(f'Remember this number: {num}. Say only "OK {num}."'),
         timeout=90,
@@ -65,7 +76,15 @@ async def test_session_resume_recalls_context():
     session_id = agent.session_id
     await agent.aclose()
 
-    agent2 = Agent("test-resume-2", session_id=session_id, api_url=BASE_URL)
+    # Pass secrets again on resume — the SDK only auto-forwards Claude creds
+    # from env; non-Claude runtimes (opencode + OPENROUTER_API_KEY) need an
+    # explicit hand-off so the respawned supervisor can authenticate.
+    agent2 = Agent(
+        "test-resume-2",
+        session_id=session_id,
+        api_url=BASE_URL,
+        secrets=acp_runtime["secrets"],
+    )
     resp2 = await asyncio.wait_for(
         agent2.arun("What number did I ask you to remember?"),
         timeout=90,
@@ -76,10 +95,11 @@ async def test_session_resume_recalls_context():
 
 
 @skip_if_no_server
+@acp_runtime_param
 @pytest.mark.asyncio
-async def test_astream_yields_text_and_done():
+async def test_astream_yields_text_and_done(acp_runtime):
     """astream yields at least one text event and a done event."""
-    agent = Agent("test-events", provider="unix_local", api_url=BASE_URL, model="haiku")
+    agent = Agent("test-events", provider="unix_local", api_url=BASE_URL, **acp_runtime)
     events = []
 
     async def _collect():
@@ -186,7 +206,7 @@ async def _run_scenario(steps: list, agent_name: str):
     """Shared harness: spawn an Agent, run a sequence of send/wait steps,
     capture all /events envelopes, return (rpc_ids, envelopes).
     """
-    agent = Agent(agent_name, provider="unix_local", api_url=BASE_URL, model="haiku")
+    agent = Agent(agent_name, provider="unix_local", agent_type="claude", api_url=BASE_URL, model="haiku")
     await agent._ensure_registered()
     session_id = agent.session_id
 

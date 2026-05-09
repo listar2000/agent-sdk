@@ -207,10 +207,22 @@ class BaseSandboxSession(abc.ABC):
                 cfg = agent.config if agent else None
             except Exception:
                 cfg = None
+            agent_type = self.state.recipe.agent_type
+            # ``client.set_model`` takes (session_id, model, agent_type) —
+            # without the third arg it defaults to ``"claude"`` and normalises
+            # full opencode IDs like ``openrouter/anthropic/claude-3.5-haiku``
+            # down to the substring ``"haiku"``, which opencode then parses
+            # as ``providerID=haiku, modelID=""`` and rejects on every
+            # subsequent prompt. Bind agent_type up front so each replay
+            # entry below can stay one fn-call wide.
+            def _bind_set_model(val: str):
+                async def _do(sid: str, _val: str = val) -> None:
+                    await client.set_model(sid, _val, agent_type)
+                return _do
             replay = []
             if cfg:
                 if cfg.model:
-                    replay.append(("model", client.set_model, cfg.model))
+                    replay.append(("model", _bind_set_model(cfg.model), cfg.model))
                 if cfg.mode:
                     replay.append(("mode", client.set_mode, cfg.mode))
                 if cfg.thought_level:

@@ -155,6 +155,7 @@ async def test_skills_and_pre_start_survive_external_sandbox_delete():
     agent = Agent(
         f"skills-survive-{uuid.uuid4().hex[:8]}",
         provider="daytona",
+        agent_type="claude",
         model="haiku",
         api_url=SERVER,
         skills=["rllm-org/hive"],

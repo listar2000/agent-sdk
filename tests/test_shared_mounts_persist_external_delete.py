@@ -99,6 +99,7 @@ async def test_shared_mounts_persist_across_external_sandbox_delete():
     agent = Agent(
         f"shared-mount-survive-{uuid.uuid4().hex[:8]}",
         provider="daytona",
+        agent_type="claude",
         model="haiku",
         api_url=SERVER,
         shared_mounts=[mount_name],
