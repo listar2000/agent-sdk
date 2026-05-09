@@ -6,7 +6,7 @@ three model IDs under OAuth — ``default``, ``opus``, ``haiku`` — and
 ``setSessionConfigOption`` rejects anything outside that set with
 ``-32603 Invalid value for config option model: <value>``. Hivespace
 stores public-API IDs (``claude-sonnet-4-6``,
-``claude-haiku-4-5-20251001``, ``claude-opus-4-6``) so without
+``claude-haiku-4-5-20251001``, ``claude-opus-4.6``) so without
 normalisation every set_model call is noise. See the data-research /
 Task Builder repro from 2026-05-04.
 
@@ -54,6 +54,7 @@ class TestPublicApiIdsCollapse:
 
     def test_claude_opus_4_6_to_opus(self):
         assert _norm_claude("claude-opus-4-6") == "opus"
+        assert _norm_claude("claude-opus-4.6") == "opus"
 
     def test_claude_haiku_4_5_dated_to_haiku(self):
         assert _norm_claude("claude-haiku-4-5-20251001") == "haiku"
@@ -73,6 +74,7 @@ class TestOlderSnapshotsAndAliases:
         # langchain-style "anthropic:claude-..." prefixed IDs.
         assert _norm_claude("anthropic:claude-sonnet-4-5") == "default"
         assert _norm_claude("anthropic:claude-opus-4-6") == "opus"
+        assert _norm_claude("anthropic:claude-opus-4.6") == "opus"
 
 
 class TestEdgeCases:
