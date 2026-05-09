@@ -2050,8 +2050,21 @@ async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
 
     yield ": heartbeat\n\n"
 
+    # Cold-create on Daytona can run 30-60s. A single t=0 heartbeat isn't
+    # enough to survive intermediate proxy idle thresholds (Railway ~30s,
+    # Cloudflare ~100s) so we interleave heartbeats every 10s while
+    # pool.get_session is in flight. ``shield`` keeps the underlying
+    # acquire alive when ``wait_for`` times out — only the wait cancels.
+    acquire = asyncio.create_task(get_pool().get_session(session_id))
     try:
-        session = await get_pool().get_session(session_id)
+        while True:
+            try:
+                session = await asyncio.wait_for(
+                    asyncio.shield(acquire), timeout=10.0,
+                )
+                break
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
     except Exception as e:
         log.exception("pool.get_session(%s) failed for rpc=%s",
                       session_id, rpc_id)

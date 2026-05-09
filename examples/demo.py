@@ -8,10 +8,10 @@ Prerequisites:
   For OpenCode:          set OPENROUTER_API_KEY in env / ~/.env
 
 Usage:
-  python examples/demo.py                          # claude + local
-  python examples/demo.py --test                   # claude + local + localhost server
+  python examples/demo.py                          # claude + unix_local
+  python examples/demo.py --test                   # claude + unix_local + localhost server
   python examples/demo.py daytona --test           # claude + remote daytona
-  python examples/demo.py --agent opencode         # opencode + local + openrouter
+  python examples/demo.py --agent opencode         # opencode + unix_local + openrouter
   python examples/demo.py --agent opencode --model openrouter/openai/gpt-4o
 """
 
@@ -47,8 +47,7 @@ AGENT_DEFAULTS = {
 }
 
 
-async def run_demo(provider: str, api_url: str, agent_type: str,
-                   model: str, cwd: str = "/tmp") -> None:
+async def run_demo(provider: str, api_url: str, agent_type: str, model: str) -> None:
     print(f"=== {agent_type} agent on {provider} (model={model}) ===\n")
     secret_env = AGENT_DEFAULTS[agent_type]["secret_env"]
     secret_val = os.environ.get(secret_env)
@@ -60,14 +59,13 @@ async def run_demo(provider: str, api_url: str, agent_type: str,
         agent_type=agent_type,
         provider=provider,
         model=model,
-        cwd=cwd,
         api_url=api_url,
         secrets={secret_env: secret_val},
     )
     try:
         async for chunk in agent.astream(
-            f"Say hello in 5 words, and then create the file "
-            f"{cwd}/hello_world.py with a simple print statement."
+            "Say hello in 5 words, and then create a hello_world.py "
+            "with a simple print statement."
         ):
             print(chunk, end="", flush=True)
         print("\n")
@@ -90,9 +88,8 @@ async def main() -> None:
 
     api_url = LOCAL_TEST_API_URL if args.test else RAILWAY_API_URL
     model = args.model or AGENT_DEFAULTS[args.agent]["model"]
-    cwd = "/home/sandbox" if args.provider == "daytona" else "/tmp"
     await run_demo(args.provider, api_url=api_url,
-                   agent_type=args.agent, model=model, cwd=cwd)
+                   agent_type=args.agent, model=model)
 
 
 if __name__ == "__main__":
