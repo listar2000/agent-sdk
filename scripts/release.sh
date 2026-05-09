@@ -104,8 +104,29 @@ build_docker() {
     echo "[release] docker not on PATH — skipping local image build"
     return 0
   fi
+  # Defang the WSL-Docker-Desktop credsStore leak: a ``credsStore`` entry
+  # pointing at ``desktop.exe`` makes ``docker build`` fail with
+  # ``exec: docker-credential-desktop.exe: file not found`` even for
+  # public ``docker.io`` images. Use a scoped DOCKER_CONFIG so we don't
+  # mutate the user's real config.
+  local docker_config_dir=""
+  if [[ -f "${HOME}/.docker/config.json" ]] \
+     && grep -q '"credsStore"[[:space:]]*:[[:space:]]*"desktop' "${HOME}/.docker/config.json"; then
+    docker_config_dir="$(mktemp -d)"
+    echo '{}' > "${docker_config_dir}/config.json"
+    echo "[release] detected Docker Desktop credsStore in ~/.docker/config.json;"
+    echo "[release]   using throwaway DOCKER_CONFIG=${docker_config_dir} for this build"
+    export DOCKER_CONFIG="${docker_config_dir}"
+  fi
+
   echo "[release] building $LOCAL_TAG"
-  docker build -t "$LOCAL_TAG" .
+  # Don't take the whole script down if docker build fails — daytona/modal
+  # snapshots build remotely and don't need the local image.
+  if ! docker build -t "$LOCAL_TAG" .; then
+    echo "[release] docker build failed — continuing without a local image" >&2
+    [[ -n "$docker_config_dir" ]] && rm -rf "$docker_config_dir"
+    return 0
+  fi
   echo "$LOCAL_TAG" > "$REPO_ROOT/.runtime-image-tag"
   echo "[release] wrote .runtime-image-tag := $LOCAL_TAG"
 
@@ -120,6 +141,8 @@ build_docker() {
   else
     echo "[release] RELEASE_PUSH unset; skipping registry push"
   fi
+
+  [[ -n "$docker_config_dir" ]] && rm -rf "$docker_config_dir"
 }
 
 # ── 2. Build / register Daytona snapshot ────────────────────────────────
