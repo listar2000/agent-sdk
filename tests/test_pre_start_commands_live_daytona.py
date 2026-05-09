@@ -46,8 +46,25 @@ from api import server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def sdk(clean_db):
-    """ApiClient bound to the in-process app via ASGITransport."""
+async def sdk(db_pool):
+    """ApiClient bound to the in-process app via ASGITransport.
+
+    ASGITransport does not invoke the FastAPI lifespan, so the module-
+    level ``_HTTP_CLIENT`` (used by the supervisor file-proxy routes)
+    stays ``None`` and every ``/sessions/{id}/files/*`` call returns
+    503 ``server not yet initialised``. We open a real ``httpx.AsyncClient``
+    and bind it to ``srv._HTTP_CLIENT`` for the lifetime of the test
+    so the proxy path works exactly like under uvicorn.
+
+    Skips ``clean_db`` — this is a real-Daytona test that mints unique
+    session ids and cleans up after itself in ``finally``; truncating
+    shared tables out from under parallel workers is the wrong shape.
+    """
+    saved = srv._HTTP_CLIENT
+    srv._HTTP_CLIENT = httpx.AsyncClient(
+        timeout=60,
+        limits=httpx.Limits(max_keepalive_connections=200, max_connections=400),
+    )
     transport = httpx.ASGITransport(app=srv.app)
     http = httpx.AsyncClient(
         transport=transport,
@@ -59,6 +76,11 @@ async def sdk(clean_db):
         yield sc
     finally:
         await sc.close()
+        try:
+            await srv._HTTP_CLIENT.aclose()
+        except Exception:
+            pass
+        srv._HTTP_CLIENT = saved
 
 
 def _decode_read(resp: dict) -> str:
