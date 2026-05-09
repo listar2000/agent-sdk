@@ -22,13 +22,18 @@ if _SRC not in sys.path:
 
 
 def _patch_client_to_return_state(monkeypatch, state_value: str):
-    """Make ``daytona._get_daytona_client().get(ref)`` return a sandbox
-    whose ``state`` is ``state_value``."""
+    """Make ``await daytona._get_async_daytona_client(); await client.get(ref)``
+    return a sandbox whose ``state`` is ``state_value``."""
     from api.providers import daytona
+    from unittest.mock import AsyncMock
 
     fake_sandbox = SimpleNamespace(state=state_value)
-    fake_client = SimpleNamespace(get=lambda _ref: fake_sandbox)
-    monkeypatch.setattr(daytona, "_get_daytona_client", lambda: fake_client)
+    fake_client = SimpleNamespace(get=AsyncMock(return_value=fake_sandbox))
+    monkeypatch.setattr(
+        daytona,
+        "_get_async_daytona_client",
+        AsyncMock(return_value=fake_client),
+    )
 
 
 @pytest.mark.asyncio
@@ -91,12 +96,16 @@ async def test_status_unknown_state_does_not_destroy_sandbox(monkeypatch):
 @pytest.mark.asyncio
 async def test_status_not_found_maps_to_missing(monkeypatch):
     from api.providers import daytona
+    from unittest.mock import AsyncMock
 
-    def raise_not_found(_ref):
+    async def raise_not_found(_ref):
         raise Exception("Sandbox with ID or name foo not found")
 
     fake_client = SimpleNamespace(get=raise_not_found)
-    monkeypatch.setattr(daytona, "_get_daytona_client", lambda: fake_client)
+    monkeypatch.setattr(
+        daytona, "_get_async_daytona_client",
+        AsyncMock(return_value=fake_client),
+    )
 
     result = await daytona.get_daytona_sandbox_status("any-ref")
     assert result == "missing"
@@ -106,12 +115,16 @@ async def test_status_not_found_maps_to_missing(monkeypatch):
 async def test_status_other_exception_maps_to_error(monkeypatch):
     """API failures other than 404 surface as 'error' (caller may retry)."""
     from api.providers import daytona
+    from unittest.mock import AsyncMock
 
-    def raise_other(_ref):
+    async def raise_other(_ref):
         raise Exception("internal server error 500")
 
     fake_client = SimpleNamespace(get=raise_other)
-    monkeypatch.setattr(daytona, "_get_daytona_client", lambda: fake_client)
+    monkeypatch.setattr(
+        daytona, "_get_async_daytona_client",
+        AsyncMock(return_value=fake_client),
+    )
 
     result = await daytona.get_daytona_sandbox_status("any-ref")
     assert result == "error"

@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.asyncio
 async def test_daytona_create_and_delete_volume():
     from api.providers import create_daytona_volume, delete_daytona_volume
-    from daytona_api_client.exceptions import ForbiddenException
+    from daytona_api_client_async.exceptions import ForbiddenException
 
     name = f"test-vol-agent-sdk-{uuid.uuid4().hex[:8]}"
     ref = await create_daytona_volume(name)
@@ -46,7 +46,7 @@ async def test_daytona_sandbox_mounts_volume_subpath():
         create_daytona_volume, delete_daytona_volume,
         provision_daytona_sandbox, destroy_daytona, exec_in_instance,
     )
-    from daytona_api_client.exceptions import ForbiddenException
+    from daytona_api_client_async.exceptions import ForbiddenException
 
     # NOTE: ExecResult.stdout is a str (not bytes); assertions check res.stdout.
     vol_name = f"test-vol-mount-{uuid.uuid4().hex[:8]}"

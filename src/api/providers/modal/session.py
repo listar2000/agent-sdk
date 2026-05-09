@@ -20,8 +20,8 @@ from api.sandbox.state import ModalSandboxState, SandboxState
 log = logging.getLogger(__name__)
 
 _SSE_READ_TIMEOUT_S = 60.0
-_ATTACH_RETRY_ATTEMPTS = 3
-_ATTACH_RETRY_DELAY_S = 0.5
+_ATTACH_RETRY_ATTEMPTS = 6
+_ATTACH_RETRY_DELAY_S = 1.0
 
 
 class ModalSandboxSession(BaseSandboxSession):
@@ -42,14 +42,26 @@ class ModalSandboxSession(BaseSandboxSession):
             try:
                 await self._attach_acp()
                 return
-            except Exception as exc:  # pragma: no cover - covered by unit tests
+            except Exception as exc:
                 last_error = exc
                 if attempt >= _ATTACH_RETRY_ATTEMPTS:
                     break
+                # Diagnostic: probe /v1/health to distinguish supervisor-dead
+                # (health 0/5xx) from POST-handler-broken (health 200, POST fails).
+                health_status = "unknown"
+                try:
+                    async with httpx.AsyncClient(timeout=3.0) as probe:
+                        r = await probe.get(f"{self._supervisor_url}/v1/health")
+                        health_status = str(r.status_code)
+                except Exception as probe_exc:
+                    health_status = f"err:{type(probe_exc).__name__}"
                 log.warning(
-                    "Modal ACP attach failed (attempt %s/%s) for session %s: %s",
-                    attempt, _ATTACH_RETRY_ATTEMPTS, self.session_id, exc,
+                    "Modal ACP attach failed (attempt %s/%s) for session %s: "
+                    "%s: %r [health=%s]",
+                    attempt, _ATTACH_RETRY_ATTEMPTS, self.session_id,
+                    type(exc).__name__, exc, health_status,
                 )
+                await self._aclose_acp_client()
                 await asyncio.sleep(_ATTACH_RETRY_DELAY_S * attempt)
         assert last_error is not None
         raise last_error
