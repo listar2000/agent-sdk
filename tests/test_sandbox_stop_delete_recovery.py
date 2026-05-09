@@ -545,12 +545,13 @@ async def _write_marker_and_read(sdk, session_id, marker):
 
 
 async def _read_marker(sdk, session_id, marker):
-    # Sentinel is opaque on purpose. The earlier ``NOT_FOUND`` token kept
-    # tripping the absence check because chatty models would repeat it
-    # back in their explanatory text ("the `echo NOT_FOUND` fallback was
-    # not needed") even when the file existed. ``__MARKER_ABSENT__`` is
-    # weird enough that the model only emits it when it actually came
-    # out of the shell pipeline.
+    # Verbose models (opencode/claude-3.5-haiku via openrouter, sometimes
+    # claude itself) repeat any sentinel string back in their explanatory
+    # text — "the `__MARKER_ABSENT__` fallback was not triggered" — which
+    # tripped earlier "absence-string not in reply" checks even when the
+    # file existed. The shell call is identical, but callers should rely
+    # on the "marker content present" signal alone (see usage below);
+    # presence of the sentinel in chatty prose is meaningless.
     return await _ask(
         sdk, session_id,
         f"Please run this shell command and tell me the output:\n"
@@ -588,11 +589,14 @@ async def test_server_delete_persists_workspace(provider, agent_type):
 
         reply2 = await _read_marker(sdk, session_id, marker)
         print(f"[test:{provider}] after server-delete reply: {reply2[:400]!r}")
-        assert "__MARKER_ABSENT__" not in reply2, (
-            f"marker file lost after server DELETE — cold snapshot didn't run before "
-            f"teardown: {reply2}"
+        # Single positive check — marker content present means the file
+        # survived the snapshot/teardown round-trip. Negative-presence on
+        # the sentinel was redundant and false-positives on verbose models
+        # (opencode explains the ``||`` fallback in prose).
+        assert "volume-test" in reply2, (
+            f"marker content missing after server DELETE — cold snapshot didn't run "
+            f"before teardown: {reply2}"
         )
-        assert "volume-test" in reply2, f"marker content missing after server DELETE: {reply2}"
 
         # Note: sandbox_ref may or may not change after release(), depending
         # on the provider. Daytona pauses the sandbox in-place (same ref);
