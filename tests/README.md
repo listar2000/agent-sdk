@@ -8,8 +8,11 @@ Unit tests run against mocks; goldens drive a real server on `localhost:7778` ag
 
 ```sh
 scripts/launch_server_test.sh &     # defaults AGENT_SDK_ORIGIN=test
-# Daytona: DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN
-# Modal:   `modal setup` + CLAUDE_CODE_OAUTH_TOKEN
+# Source whichever creds you have set so the tests can forward them:
+#   Claude  : CLAUDE_CODE_OAUTH_TOKEN
+#   OpenCode: OPENROUTER_API_KEY
+#   Daytona : DAYTONA_API_KEY
+#   Modal   : `modal setup` (writes ~/.modal.toml)
 
 .venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -n auto -v
 .venv/bin/pytest tests/test_attach_recovers_with_no_volume_journal.py -n auto -v
@@ -18,18 +21,50 @@ scripts/launch_server_test.sh &     # defaults AGENT_SDK_ORIGIN=test
 
 Warm-server timing under `-n auto`: ~1 min unix_local, ~3–5 min daytona. `test_async_correctness.py` <1 s.
 
+## ACP-runtime parametrization (claude + opencode)
+
+Tests that drive a real `Agent` end-to-end are parametrised over both ACP runtimes via `tests/_acp_runtimes.py`. There are two flavours, depending on how a test builds its request:
+
+* **`acp_runtime_param`** — yields a `dict` (`agent_type`, `model`, `secrets`) suitable for spreading into `Agent(...)`. Used by smoke / integration tests.
+
+  ```python
+  from tests._acp_runtimes import acp_runtime_param
+
+  @acp_runtime_param
+  async def test_basic(acp_runtime):
+      agent = Agent("t", provider="unix_local", api_url=BASE_URL, **acp_runtime)
+      await agent.arun("...")
+  ```
+
+* **`agent_type_param`** — yields just the `agent_type` string (`"claude"` or `"opencode"`). Used when a test goes through a helper like `_quick_session(sdk, provider, agent_type=agent_type)` rather than constructing `Agent(...)` directly. The recovery suite uses this.
+
+Each parameter auto-skips when its credential env var isn't set (no ambient claude OAuth → claude variant skips; no `OPENROUTER_API_KEY` → opencode variant skips), so unconfigured machines never see runtime parametrisation as a failure.
+
+To run only one runtime:
+
+```sh
+.venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k "claude"
+.venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k "opencode"
+```
+
+Provider × runtime is fully crossed in test ids: `test_X[claude-daytona]`, `test_X[opencode-modal]`, etc. To run a specific cell, give the full id:
+
+```sh
+.venv/bin/pytest "tests/test_sandbox_stop_delete_recovery.py::test_session_resume_after_stop[opencode-daytona]"
+```
+
 ## Golden recovery — `test_sandbox_stop_delete_recovery.py`
 
-15 tests, parametrized over `{daytona, docker, unix_local, modal}`. Each simulates an out-of-band provider event (`daytona.delete`, `docker rm -f`, `kill -9`, `pkill supervisor.js`) that bypasses the server's HTTP API; the next client request must succeed without intervention. Invariants are deterministic server-side (`inner_session_id`, `sandbox_ref`, non-empty reply) — never "agent recalls X" (LLM guardrails flake).
+16 tests, parametrized over `provider × agent_type` for **120 cases total**. Each simulates an out-of-band provider event (`daytona.delete`, `docker rm -f`, `kill -9`, `pkill supervisor.js`) that bypasses the server's HTTP API; the next client request must succeed without intervention. Invariants are deterministic server-side (`inner_session_id`, `sandbox_ref`, non-empty reply) — never "agent recalls X" (LLM guardrails flake).
 
 | # | What it pins |
 |---|---|
 | 1 | Provider stop → next request restarts the *same* sandbox (`sandbox_ref` unchanged). |
 | 2 | `/release` snapshots to volume *before* dropping compute (turn-1 marker readable turn 2). |
 | 3 | `DELETE /sessions/{id}` destroys compute (not pause) — pinned the leak that left 6 paused-with-no-row daytona sandboxes against the 2000 GiB quota in a day. Modal excluded. |
-| 4 | Out-of-band delete bypasses cold snapshot; per-turn `agent_memory.tar` (`.claude/sessions`, `.codex/sessions`) gives `session/load` enough to resume. `inner_session_id` unchanged. |
+| 4 | Out-of-band delete bypasses cold snapshot; per-turn `agent_memory.tar` (`.claude/sessions`, `.codex/sessions`, `.local/share/opencode`) gives `session/load` enough to resume. `inner_session_id` unchanged. |
 | 5 | Stop mid-conversation → fresh client turn 2: non-empty reply + `inner_session_id` unchanged (proves `session/load`, not `session/new`). |
-| 6 | #4 + #5: sandbox *deleted* between turns; new instance, continuity restored from volume JSONL. |
+| 6 | #4 + #5: sandbox *deleted* between turns; new instance, continuity restored from volume JSONL / SQLite DB. |
 | 7 | Sandbox stopped externally, no new message — SSE reader detects EOF, rebinds, preserves the conversation. Reader-driven recovery (#5/#6 are message-driven). |
 | 8 | Stop, POST `/message` with no delay — scheduler picks up before reader sees EOF. Exercises `ConnectError` retry that clears `_reader_connected` and forces rebind. |
 | 9 | Stop + 4 s wait + POST. Reader has seen the disconnect; reusable-state check must tear down cleanly rather than POST to a dead URL. "Confidently dead" path. |
@@ -39,8 +74,13 @@ Warm-server timing under `-n auto`: ~1 min unix_local, ~3–5 min daytona. `test
 | 13 | Supervisor dies in place, sandbox alive (prod 502 / OOM). `pkill supervisor.js` (daytona) / `kill -9` (local). Recovery in place — DB row untouched. No docker (`pkill` takes container PID 1 down, covered by #11). |
 | 14 | #13 with no delay — POST in the ~100 ms `_reader_connected=True` stale window; daytona 502. Exercises `_execute_one_prompt`'s retry on `ConnectError`/`RemoteProtocolError`/`ReadError`. |
 | 15 | Supervisor dies, subscribers kicked, two POSTs without subscribers — each turn must still land `user_message` + `turn_end` in `session_log`. `/events` is live-only; durable history is `/log` (UI cold-loads it on mount/reconnect). |
+| 16 | Concurrent stop + message: external stop fires while a fresh prompt is in flight. The pool's race-handling must reach a single consistent state — neither silent-failure nor double-recovery. |
 
 The earlier per-session in-memory replay buffer (re-delivering missed events through `/events`) was removed — it double-delivered everything a cold-loading UI had just fetched from `/log`.
+
+### Why both runtimes
+
+claude-agent-acp and opencode use different on-disk session formats: claude writes JSONL under `~/.claude/projects/`, opencode writes a SQLite database under `~/.local/share/opencode/`. The recovery path goes through `session/load` and the `set_model` config-replay loop, both of which are runtime-sensitive (a recent regression squashed `openrouter/anthropic/claude-3.5-haiku` to `"haiku"` because the claude normaliser ran on opencode IDs). Running the goldens against both runtimes catches per-runtime regressions in the snapshot/restore + config-replay machinery without doubling daytona-quota burn for claude-only orchestration tests.
 
 ## Companion mechanism tests — `test_async_correctness.py`
 
@@ -63,13 +103,27 @@ You touched:
 - `SandboxSession.start`, `_recover_after_disconnect`, `_shutdown_session_state`
 - The session-delete route (#3)
 - The daytona replacement branch (#11), `ensure_supervisor_url`, `restart_daytona_supervisor`
-- `HOME` in the supervisor spawn_env
+- `HOME` in the supervisor spawn_env or the snapshot tarball (`AGENT_MEMORY_DIRS`)
 - `sandbox_state.recipe` or `_build_volume_mounts`
 - Subscriber dispatch (`broadcast` / `dispatch` / `subscribe_session`)
 - `_persist_prompt_events` (#15)
 - `_execute_one_prompt`'s error handling (#8, #14)
+- The ACP config-replay loop in `_attach_acp` (set_model / set_mode / set_thought_level)
 
-Run against daytona — its sandbox↔volume separation surfaces mount/HOME bugs the others don't.
+Run against daytona — its sandbox↔volume separation surfaces mount/HOME bugs the others don't. Run with `-k opencode` after touching opencode-specific paths (terminal/permission handlers, fs delegate, XDG storage layout).
+
+## Rebuilding runtime artifacts
+
+After supervisor.js, Dockerfile, or `_ACP_NPM_SPECS` changes, rebuild whichever cloud runtime your tests will exercise — otherwise daytona/modal sandboxes will boot the previous tag's supervisor:
+
+```sh
+scripts/release.sh                          # all three (docker + daytona + modal), each skipping if its prereq is absent
+scripts/release.sh --provider daytona       # only daytona snapshot
+scripts/release.sh --provider modal         # only modal snapshot
+scripts/release.sh --provider docker        # only local docker image
+```
+
+The script writes the new tags to `.runtime-image-tag`, `.runtime-snapshot-tag`, and `.modal-snapshot-tag`; commit those alongside the runtime-affecting source change so other developers / CI pick up the right artifacts.
 
 ## Open issues
 

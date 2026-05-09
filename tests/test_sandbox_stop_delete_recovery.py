@@ -559,8 +559,9 @@ async def _read_marker(sdk, session_id, marker):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_server_delete_persists_workspace(provider):
+async def test_server_delete_persists_workspace(provider, agent_type):
     """Server-mediated DELETE triggers a cold snapshot (filesystem_cache)
     before teardown, so arbitrary HOME files survive onto the replacement
     sandbox. Conversation continuity is also preserved (agent_memory).
@@ -569,7 +570,7 @@ async def test_server_delete_persists_workspace(provider):
     marker = "server-delete-marker.txt"
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
@@ -603,8 +604,9 @@ async def test_server_delete_persists_workspace(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_delete_session_destroys_sandbox(provider):
+async def test_delete_session_destroys_sandbox(provider, agent_type):
     """``DELETE /sessions/{id}`` must destroy the underlying sandbox, not
     just pause it. Hibernation (``stop_daytona`` / ``docker stop``) is
     correct for the idle reaper and ``POST /sessions/{id}/release`` —
@@ -622,7 +624,7 @@ async def test_delete_session_destroys_sandbox(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         sandbox = await _get_sandbox(sdk, session_id)
         sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
@@ -707,8 +709,9 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_external_delete_preserves_agent_memory(provider):
+async def test_external_delete_preserves_agent_memory(provider, agent_type):
     """Out-of-band delete (daytona dashboard / docker rm) bypasses the
     server, so no server-driven cold snapshot runs. The invariant we
     require is agent_memory preservation — conversation continues on
@@ -723,7 +726,7 @@ async def test_external_delete_preserves_agent_memory(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner={inner_before}")
@@ -843,8 +846,9 @@ async def test_session_resume_after_delete(provider, agent_type):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_session_survives_midstream_sandbox_stop(provider):
+async def test_session_survives_midstream_sandbox_stop(provider, agent_type):
     """SSE upstream death triggers sandbox recovery — MUST resume, not reset.
 
     Reproduces the exact failure mode from the UI flow: user chats, then
@@ -875,7 +879,7 @@ async def test_session_survives_midstream_sandbox_stop(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
@@ -946,8 +950,9 @@ async def test_session_survives_midstream_sandbox_stop(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_message_immediately_after_stop(provider):
+async def test_message_immediately_after_stop(provider, agent_type):
     """Turn 1 → stop sandbox → turn 2 with NO sleep. Reproduces the race
     the user flagged: the POST /message arrives before the server's SSE
     reader has observed the upstream disconnect, so ensure_session_live's
@@ -974,7 +979,7 @@ async def test_message_immediately_after_stop(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
@@ -1012,8 +1017,9 @@ async def test_message_immediately_after_stop(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_message_after_stop_with_delay(provider):
+async def test_message_after_stop_with_delay(provider, agent_type):
     """Turn 1 → stop sandbox → wait ~4s → turn 2. User-reported repro.
 
     Different from test_message_immediately_after_stop: by the time we
@@ -1032,7 +1038,7 @@ async def test_message_after_stop_with_delay(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         inner_sid_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_sid_before}")
@@ -1177,8 +1183,9 @@ async def _ask_on_stream(
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_persistent_sse_stop_then_message(provider):
+async def test_persistent_sse_stop_then_message(provider, agent_type):
     """UI-shape repro: one persistent /events connection spans turn1 →
     external stop → a few seconds wait → turn 2.
 
@@ -1196,7 +1203,7 @@ async def test_persistent_sse_stop_then_message(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
@@ -1230,9 +1237,10 @@ async def test_persistent_sse_stop_then_message(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(240)
-async def test_persistent_sse_external_delete_then_message(provider):
+async def test_persistent_sse_external_delete_then_message(provider, agent_type):
     """UI repro for an OUT-OF-BAND sandbox delete (Daytona dashboard, ``docker rm``,
     ``kill -9``) with a persistent /events stream held open.
 
@@ -1257,7 +1265,7 @@ async def test_persistent_sse_external_delete_then_message(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
@@ -1283,8 +1291,9 @@ async def test_persistent_sse_external_delete_then_message(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_persistent_sse_delete_sandbox_then_message(provider):
+async def test_persistent_sse_delete_sandbox_then_message(provider, agent_type):
     """UI repro for the `DELETE /sandboxes/{id}` + persistent /events flow.
 
     User-reported: open UI (which holds /events), send msg, wait for reply,
@@ -1305,7 +1314,7 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
@@ -1337,8 +1346,9 @@ async def test_persistent_sse_delete_sandbox_then_message(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_persistent_sse_supervisor_killed_then_message(provider):
+async def test_persistent_sse_supervisor_killed_then_message(provider, agent_type):
     """Prod UI repro: supervisor process dies, sandbox stays alive.
 
     Exact trace the user reported against prod daytona:
@@ -1363,7 +1373,7 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
@@ -1393,8 +1403,9 @@ async def test_persistent_sse_supervisor_killed_then_message(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_persistent_sse_supervisor_killed_immediate_message(provider):
+async def test_persistent_sse_supervisor_killed_immediate_message(provider, agent_type):
     """Prod UI race: kill supervisor, then POST /message BEFORE the server
     has observed the upstream disconnect.
 
@@ -1422,7 +1433,7 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
@@ -1452,8 +1463,9 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_ui_reconnect_gap_persists_replies_to_session_log(provider):
+async def test_ui_reconnect_gap_persists_replies_to_session_log(provider, agent_type):
     """End-to-end wiring: prompts submitted while no /events subscriber is
     attached must still land in ``session_log`` so a reconnecting UI can
     cold-load them via ``GET /sessions/{id}/log``.
@@ -1481,7 +1493,7 @@ async def test_ui_reconnect_gap_persists_replies_to_session_log(provider):
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
@@ -1548,8 +1560,9 @@ async def test_ui_reconnect_gap_persists_replies_to_session_log(provider):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_no_silent_failure_concurrent_stop_and_message(provider):
+async def test_no_silent_failure_concurrent_stop_and_message(provider, agent_type):
     """Repro of the data-research / Task Builder silent-failure bug
     (2026-05-04).
 
@@ -1600,7 +1613,7 @@ async def test_no_silent_failure_concurrent_stop_and_message(provider):
     silent_timeout_s = 90.0
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
