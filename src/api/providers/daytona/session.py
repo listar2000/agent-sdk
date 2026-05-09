@@ -130,13 +130,11 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 )
                 # restart_daytona_supervisor returned an instance with .url
                 # set; we also need the daytona sandbox handle for later
-                # stop()/exec() calls. Use the cached process-shared
-                # client so we don't pay SDK init on every reattach.
-                client = dt_provider._get_daytona_client()
-                loop = asyncio.get_running_loop()
-                sandbox = await loop.run_in_executor(
-                    None, lambda: client.get(self.state.sandbox_ref)
-                )
+                # stop()/exec() calls. Use the process-shared async client
+                # — the handle is an ``AsyncSandbox`` which threads through
+                # ``start_supervisor_in_sandbox`` and the snapshot path.
+                client = await dt_provider._get_async_daytona_client()
+                sandbox = await client.get(self.state.sandbox_ref)
                 self._supervisor_url = instance.url
                 return sandbox
             except Exception as e:
@@ -178,12 +176,11 @@ class DaytonaSandboxSession(BaseSandboxSession):
             shared_mounts=self.state.recipe.shared_mounts or None,
             resources=self.state.recipe.resources,
         )
-        # Use the cached process-shared client (avoids 50-200ms of SDK
-        # init per session) and offload the sync .get() onto the
-        # executor so we don't block the loop.
-        client = dt_provider._get_daytona_client()
-        loop = asyncio.get_running_loop()
-        sandbox = await loop.run_in_executor(None, lambda: client.get(instance.sandbox_ref))
+        # Async-singleton path: returns an ``AsyncSandbox`` handle that
+        # threads through ``start_supervisor_in_sandbox`` and the snapshot
+        # path without any further sync boundary.
+        client = await dt_provider._get_async_daytona_client()
+        sandbox = await client.get(instance.sandbox_ref)
         return sandbox
 
     # ------------------------------------------------------------------ #
@@ -265,16 +262,12 @@ class DaytonaSandboxSession(BaseSandboxSession):
     async def _daytona_sandbox_state(self) -> str:
         """Fetch current Daytona sandbox state string. Empty on error
         — caller treats unknown state as non-transitional. Uses the
-        process-shared Daytona SDK client (same singleton as PR #82's
-        ``_DAYTONA_CLIENT``) so we don't pay SDK init on every probe
-        layer-2 fallback."""
+        process-shared async Daytona client so we don't pay SDK init
+        on every probe layer-2 fallback."""
         try:
-            from . import _get_daytona_client
-            client = _get_daytona_client()
-            loop = asyncio.get_running_loop()
-            sb = await loop.run_in_executor(
-                None, lambda: client.get(self._daytona_sandbox.id),
-            )
+            from . import _get_async_daytona_client
+            client = await _get_async_daytona_client()
+            sb = await client.get(self._daytona_sandbox.id)
             raw = sb.state
             return (raw.value if hasattr(raw, "value") else str(raw)).lower()
         except Exception:

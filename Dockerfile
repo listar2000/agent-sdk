@@ -2,8 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install Node.js (required for ACP supervisor)
-RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm git && rm -rf /var/lib/apt/lists/*
+# Install Node.js (required for ACP supervisor) plus zstd (used by supervisor.js
+# for cold-tier snapshot compression — bench showed zstd-1 cuts artifact size
+# ~10× with no wall-clock regression on a 1-vCPU sandbox; absence triggers
+# a safe uncompressed fallback in supervisor.js but you lose the win).
+RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm git zstd && rm -rf /var/lib/apt/lists/*
 
 # Install agent CLIs
 RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai

@@ -59,7 +59,7 @@ from .daytona import (
     provision_daytona_sandbox,
     restart_daytona_supervisor,
     kill_supervisor_in_sandbox,
-    _get_daytona_client,
+    _get_async_daytona_client,
     _daytona_sandbox_op,
 )
 
@@ -175,14 +175,12 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
     elif instance.provider == "daytona":
         if not instance.sandbox_ref:
             raise RuntimeError("no sandbox_ref for daytona exec")
-        daytona = _get_daytona_client()
-        loop = asyncio.get_running_loop()
-        sandbox = await loop.run_in_executor(None, lambda: daytona.get(instance.sandbox_ref))
+        from .daytona import _get_async_daytona_client
+        daytona = await _get_async_daytona_client()
+        sandbox = await daytona.get(instance.sandbox_ref)
         try:
             r = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, lambda: sandbox.process.exec(cmd, timeout=timeout)
-                ),
+                sandbox.process.exec(cmd, timeout=timeout),
                 timeout=timeout + 5,
             )
             out = (r.result if hasattr(r, "result") else str(r)) or ""

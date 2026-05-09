@@ -297,17 +297,17 @@ async def delete_volume(ref: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_entrypoint_cmd(
-    *, subpath: str,
+    *, subpath: str, supervisor_cmd: str,
     shared_mounts: list[str] | None,
+    pre_start_commands: list[str] | None,
 ) -> str:
     """Compose the sandbox's PID-1 shell script.
 
-    Creates the agent HOME directory and Docker-shaped symlinks, then keeps
-    the sandbox alive. Pre-start commands and supervisor launch run later via
-    ``Sandbox.exec`` so health checks do not race setup work.
-
-    Phase E: the supervisor is at ``/opt/agent-sdk/runtime`` (image-baked),
-    so no ``/opt/supervisor → /v/system/supervisor`` symlink is required.
+    Creates the agent HOME directory + Docker-shaped symlinks, runs pre-start
+    commands, then exec's the supervisor as PID 1. Keeping supervisor as PID 1
+    means the modal sandbox is "running" when supervisor is up, so /v1/health
+    going green serves as the supervisor-and-mount-are-live signal — no separate
+    sb.exec() round-trip whose timing is invisible to the health-check.
     """
     safe_sub = subpath.strip("/")
     agent_home_target = f"/v/agents/{safe_sub}"
@@ -315,10 +315,7 @@ def _build_entrypoint_cmd(
     lines = [
         "set -e",
         f"mkdir -p {shlex.quote(agent_home_target)}",
-        # Ensure /home and /opt exist in the slim debian image.
         "mkdir -p /home /opt",
-        # Clean + recreate the agent-home symlink so a restart can't end up
-        # with a dangling or wrong-target link.
         f"rm -rf {_AGENT_HOME_IN}",
         f"ln -s {shlex.quote(agent_home_target)} {_AGENT_HOME_IN}",
     ]
@@ -329,7 +326,13 @@ def _build_entrypoint_cmd(
         lines.append(f"mkdir -p /v/shared/{clean} /mnt")
         lines.append(f"rm -rf /mnt/{clean}")
         lines.append(f"ln -s /v/shared/{clean} /mnt/{clean}")
-    lines.append("exec tail -f /dev/null")
+    for cmd in pre_start_commands or []:
+        lines.append(
+            f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
+            f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
+            f"&& {cmd}"
+        )
+    lines.append(f"exec {supervisor_cmd}")
     return "\n".join(lines)
 
 
@@ -430,7 +433,9 @@ async def create_sandbox(
     supervisor_cmd = f"env {env_prefix} {supervisor_argv}"
     entrypoint = _build_entrypoint_cmd(
         subpath=subpath,
+        supervisor_cmd=supervisor_cmd,
         shared_mounts=shared_mounts,
+        pre_start_commands=pre_start_commands,
     )
 
     log.info(
@@ -466,37 +471,8 @@ async def create_sandbox(
             )
         url = tun.url
 
-        # Match Daytona's sequencing: run setup as explicit execs before the
-        # supervisor starts. Health checks should measure supervisor readiness,
-        # not long skill/package installs.
-        for cmd in pre_start_commands or []:
-            log.info("modal provision pre-start: %s", cmd)
-            wrapped = (
-                f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
-                f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
-                f"&& {cmd}"
-            )
-            rc, out, err = await _exec_modal_shell(
-                sb, wrapped, timeout=_PRE_START_COMMAND_TIMEOUT_SEC,
-            )
-            if rc != 0:
-                raise RuntimeError(_pre_start_failure_message(
-                    cmd=cmd, rc=rc, out=out, err=err,
-                    timeout=_PRE_START_COMMAND_TIMEOUT_SEC,
-                ))
-
-        start_cmd = (
-            f"export HOME={shlex.quote(_AGENT_HOME_IN)} "
-            f"&& mkdir -p {shlex.quote(_AGENT_HOME_IN)} "
-            f"&& nohup {supervisor_cmd} > /tmp/agent-sdk-supervisor.log 2>&1 &"
-        )
-        rc, out, err = await _exec_modal_shell(sb, start_cmd, timeout=10)
-        if rc != 0:
-            snippet = (err or out or "")[-500:].strip()
-            raise RuntimeError(
-                f"failed to start Modal supervisor (exit={rc}): {snippet}"
-            )
-
+        # Pre-start commands and supervisor are inlined into the sandbox's
+        # PID-1 entrypoint, so by the time we get here they have already begun.
         # Health check against the supervisor over HTTPS.
         if not await _wait_for_health(url, max_retries=120, interval=1):
             # Capture tail of logs before tearing down.
