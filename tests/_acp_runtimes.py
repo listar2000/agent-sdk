@@ -75,3 +75,26 @@ else:
 
 
 acp_runtime_param = pytest.mark.parametrize("acp_runtime", _PARAMS)
+
+
+# Lightweight variant that yields just the ``agent_type`` string for tests
+# (e.g. ``test_sandbox_stop_delete_recovery``) that build their own body
+# via a helper rather than spreading ``acp_runtime`` into ``Agent(...)``.
+# Same skip-on-missing-cred behaviour as ``acp_runtime_param``.
+_AT_PARAMS: list = []
+_AT_PARAMS.append(
+    pytest.param(
+        "claude",
+        id="claude",
+        marks=([] if _oauth else [pytest.mark.skip(reason="CLAUDE_CODE_OAUTH_TOKEN not set")]),
+    )
+)
+_AT_PARAMS.append(
+    pytest.param(
+        "opencode",
+        id="opencode",
+        marks=([] if _openrouter else [pytest.mark.skip(reason="OPENROUTER_API_KEY not set")]),
+    )
+)
+
+agent_type_param = pytest.mark.parametrize("agent_type", _AT_PARAMS)

@@ -55,6 +55,7 @@ load_dotenv(os.path.expanduser("~/.env"), override=False)
 
 from agent_sdk import ApiClient  # noqa: E402
 from api.sse import extract_sse_tag, parse_acp_event  # noqa: E402
+from tests._acp_runtimes import agent_type_param  # noqa: E402
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY")
@@ -121,20 +122,39 @@ def _require_provider(provider: str) -> None:
 # pinned in test_api_client.py + server route tests)
 # ---------------------------------------------------------------------------
 
-async def _quick_session(sdk: ApiClient, provider: str) -> dict:
-    # Pin haiku for the recovery suite — sonnet's per-key weekly quota
-    # trips before this suite finishes when other suites have run on
+_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+# Per-runtime defaults so a test can pass ``agent_type="opencode"`` (or
+# leave the default ``"claude"``) and ``_quick_session`` picks the right
+# model + secret env var. Pinned to the cheapest available models — the
+# recovery suite issues tiny tool-use prompts and would burn budget on
+# anything bigger.
+_RUNTIME_DEFAULTS: dict[str, dict] = {
+    "claude": {"model": "haiku", "secret_env": "CLAUDE_CODE_OAUTH_TOKEN"},
+    "opencode": {"model": "openrouter/anthropic/claude-3.5-haiku",
+                 "secret_env": "OPENROUTER_API_KEY"},
+}
+
+
+async def _quick_session(
+    sdk: ApiClient, provider: str, *, agent_type: str = "claude",
+) -> dict:
+    # Pin haiku-class models for the recovery suite — sonnet's per-key weekly
+    # quota trips before this suite finishes when other suites have run on
     # the same OAuth token recently. Haiku is on a separate quota
     # bucket and answers the tiny tool-use prompts these tests exercise
     # just as reliably. See server.py _sessions_create_eager — the
     # ``model`` body field is forwarded via ``set_model`` after the
     # SandboxSession is up.
+    defaults = _RUNTIME_DEFAULTS[agent_type]
     body: dict = {
-        "provider": provider, "agent_type": "claude",
-        "model": "haiku",
+        "provider": provider,
+        "agent_type": agent_type,
+        "model": defaults["model"],
     }
-    if OAUTH_TOKEN:
-        body["secrets"] = {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN}
+    secret_val = os.environ.get(defaults["secret_env"])
+    if secret_val:
+        body["secrets"] = {defaults["secret_env"]: secret_val}
     sess = await sdk.create_session(**body)
     # Register for autouse-fixture teardown so the daytona/docker/local
     # sandbox provisioned by this session is destroyed even if the test
@@ -453,13 +473,20 @@ def _extract_kv(text: str, key: str) -> str | None:
 # simply doesn't apply. Session continuity is covered by
 # ``test_session_resume_after_stop[modal]`` instead.
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_stop_sandbox_same_sandbox_after_restart(provider):
-    """Stop sandbox externally → server restarts it → same sandbox_ref, sandbox responds."""
+async def test_stop_sandbox_same_sandbox_after_restart(provider, agent_type):
+    """Stop sandbox externally → server restarts it → same sandbox_ref, sandbox responds.
+
+    Parameterised over ``agent_type`` because the recovery path goes
+    through ACP ``session/load`` and the per-runtime ``set_model``
+    replay — both of which had opencode-specific bugs that this test
+    catches when run with ``agent_type="opencode"``.
+    """
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]}")
 
@@ -727,8 +754,9 @@ async def test_external_delete_preserves_agent_memory(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_session_resume_after_stop(provider):
+async def test_session_resume_after_stop(provider, agent_type):
     """Full session resume: stop sandbox between turns, reconnect, session is
     LOADED (not recreated).
 
@@ -737,11 +765,14 @@ async def test_session_resume_after_stop(provider):
       B. ``inner_session_id`` on the in-memory SessionState is unchanged
          across stop+resume — proves the server did ``session/load``, not
          ``session/new``.
+    Parameterised over ``agent_type`` because the resume path differs per
+    runtime (claude-agent-acp reads ``~/.claude/projects/…``; opencode
+    reads ``~/.local/share/opencode/opencode.db``).
     """
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
@@ -767,8 +798,9 @@ async def test_session_resume_after_stop(provider):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
 @pytest.mark.asyncio
-async def test_session_resume_after_delete(provider):
+async def test_session_resume_after_delete(provider, agent_type):
     """Delete sandbox between turns → NEW sandbox provisioned → session/load
     restores conversation via the persistent volume.
 
@@ -776,11 +808,13 @@ async def test_session_resume_after_delete(provider):
       A. Turn 2 returns a non-empty reply.
       B. ``inner_session_id`` unchanged — session/load succeeded against
          the volume-persisted JSONL on the replacement sandbox.
+    Parameterised over ``agent_type`` to verify the snapshot/restore
+    machinery covers both runtimes' on-disk session formats.
     """
     _require_provider(provider)
 
     async with ApiClient(SERVER) as sdk:
-        sess = await _quick_session(sdk, provider)
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
         inner_before = sess["inner_session_id"]
         print(f"\n[test:{provider}] session={session_id[:8]} inner_sid={inner_before}")
