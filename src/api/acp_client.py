@@ -155,9 +155,27 @@ class AcpClient:
         resp.raise_for_status()
 
     async def handshake(self, session_id: str, agent: str) -> dict:
-        """ACP protocol handshake only. Does NOT create a session."""
-        return await self._send_rpc(session_id, "initialize",
-                                     {"protocolVersion": 1}, agent=agent)
+        """ACP protocol handshake only. Does NOT create a session.
+
+        Advertises the client capabilities our supervisor.js implements:
+        ``fs.read_text_file``, ``fs.write_text_file``, and ``terminal``.
+        Without these, opencode falls back to its internal filesystem layer
+        which has stricter per-path permission checks (denies writes outside
+        cwd even after we auto-allow the ACP permission gate). With them
+        declared, opencode delegates fs/terminal ops to the supervisor —
+        which executes them directly in-sandbox. Claude ignores the fields.
+        """
+        return await self._send_rpc(
+            session_id, "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": True, "writeTextFile": True},
+                    "terminal": True,
+                },
+            },
+            agent=agent,
+        )
 
     async def initialize(self, session_id: str, agent: str, cwd: str = "/tmp",
                          mcp_servers: dict | None = None) -> dict:

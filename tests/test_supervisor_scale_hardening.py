@@ -91,21 +91,22 @@ def _pending_responses(url: str) -> int:
 def test_pending_responses_cleanup_on_client_disconnect(supervisor_proc):
     """Without req.on('close') cleanup in handlePost, a request whose ACP
     response never arrives leaves a resolver in pendingResponses forever.
-    /bin/cat echoes the request line verbatim — same JSON, with the
-    method/params still present — so handleAcpLine sees no
-    ``result``/``error`` and never resolves the matching resolver.
+    /bin/cat echoes the request line verbatim — same JSON. We deliberately
+    omit ``method`` so the echoed line matches NEITHER ``handleAcpLine``
+    branch: not a client-initiated ACP request (no method) and not a
+    response (no result/error). The resolver therefore never fires; only
+    the ``res.on('close')`` cleanup path can drain it.
     The fix must clear the entry when the upstream client disconnects.
     """
     url, _root, port = supervisor_proc
 
     assert _pending_responses(url) == 0
 
-    # Send a request with an id, then close the socket before the (never-
-    # arriving) response. Use a raw socket so we can drop it cleanly
-    # mid-await without the request library trying to read the response.
-    body = (
-        b'{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}'
-    )
+    # Send a request with an id (but no method/result/error), then close
+    # the socket before the (never-arriving) response. Use a raw socket
+    # so we can drop it cleanly mid-await without the request library
+    # trying to read the response.
+    body = b'{"jsonrpc":"2.0","id":42}'
     request = (
         b"POST /v1/acp/sess-1 HTTP/1.1\r\n"
         b"Host: 127.0.0.1\r\n"

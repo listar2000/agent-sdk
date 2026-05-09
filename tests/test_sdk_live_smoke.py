@@ -23,6 +23,7 @@ import pytest_asyncio
 
 from agent_sdk import ApiClient
 from agent_sdk.client import Agent
+from tests._acp_runtimes import acp_runtime_param
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 
@@ -206,7 +207,8 @@ async def test_serverclient_session_lifecycle(sc):
 # ---------------------------------------------------------------------------
 
 
-async def test_agent_run_streams_done():
+@acp_runtime_param
+async def test_agent_run_streams_done(acp_runtime):
     """``Agent.arun`` returns the final text after streaming ``done``.
     Validates that the SDK's full streaming pipeline (POST /message+stream
     → SSE drain → parse_acp_event → text accumulation) still works."""
@@ -214,7 +216,7 @@ async def test_agent_run_streams_done():
         pytest.skip(f"no server at {SERVER}")
     agent = Agent(
         f"smoke-{uuid.uuid4().hex[:8]}",
-        provider="unix_local", api_url=SERVER, model="haiku",
+        provider="unix_local", api_url=SERVER, **acp_runtime,
     )
     try:
         text = await asyncio.wait_for(
@@ -226,14 +228,15 @@ async def test_agent_run_streams_done():
         await agent.aclose()
 
 
-async def test_agent_astream_yields_typed_dicts():
+@acp_runtime_param
+async def test_agent_astream_yields_typed_dicts(acp_runtime):
     """``Agent.astream`` yields parsed event dicts. Smoke-test that
     text events are produced before done."""
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
     agent = Agent(
         f"smoke-ev-{uuid.uuid4().hex[:8]}",
-        provider="unix_local", api_url=SERVER, model="haiku",
+        provider="unix_local", api_url=SERVER, **acp_runtime,
     )
     seen_types: set[str] = set()
     try:
@@ -249,7 +252,8 @@ async def test_agent_astream_yields_typed_dicts():
         await agent.aclose()
 
 
-async def test_agent_sandbox_helpers_round_trip():
+@acp_runtime_param
+async def test_agent_sandbox_helpers_round_trip(acp_runtime):
     """``Agent.sandbox`` shells out via ``POST /sessions/{id}/sandbox/exec``
     for read_file / write_file / ls / exec. End-to-end smoke that:
 
@@ -266,12 +270,12 @@ async def test_agent_sandbox_helpers_round_trip():
         pytest.skip(f"no server at {SERVER}")
     agent = Agent(
         f"smoke-sb-{uuid.uuid4().hex[:8]}",
-        provider="unix_local", api_url=SERVER, model="haiku",
+        provider="unix_local", api_url=SERVER, **acp_runtime,
     )
     try:
         # _ensure_registered is private; trigger it via any public call.
-        # ``configure(model="haiku")`` is cheap and idempotent.
-        await agent.configure(model="haiku")
+        # ``configure`` is cheap and idempotent and forces registration.
+        await agent.configure(model=acp_runtime["model"])
 
         sb = agent.sandbox
 

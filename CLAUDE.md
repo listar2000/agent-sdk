@@ -5,6 +5,12 @@ goldens are 8–15+ min; xdist parallel is mandatory. `-n auto` is fine
 with `-k` filters — xdist negotiates worker count down.
 
     .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto
+    .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k claude
+    .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k opencode
+
+End-to-end tests are parametrized over `claude` + `opencode` via
+`tests/_acp_runtimes.py`. Each runtime auto-skips on missing
+credential (`CLAUDE_CODE_OAUTH_TOKEN` / `OPENROUTER_API_KEY`).
 
 For local dev and the golden suite, launch the server with
 `scripts/launch_server_test.sh` — the only local launcher. It defaults
@@ -42,3 +48,15 @@ Maximum allowed: 2000GiB`, that's orphaned sandboxes from a prior
 failed run, NOT a code regression. Run
 `cleanup_orphans.py --provider daytona --yes` (defaults to the `test`
 origin; production is safe).
+
+## Rebuilding runtime artifacts
+
+After touching `src/supervisor/supervisor.js`, `Dockerfile`, or
+`_ACP_NPM_SPECS`, rebuild before re-running daytona/modal goldens —
+the snapshot tags are pinned to a specific commit:
+
+    scripts/release.sh                       # docker + daytona + modal
+    scripts/release.sh --provider daytona    # one provider only
+
+Commit `.runtime-image-tag` / `.runtime-snapshot-tag` /
+`.modal-snapshot-tag` alongside the runtime-affecting source change.

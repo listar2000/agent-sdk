@@ -6,7 +6,14 @@ Python SDK and orchestration server for running Claude Code, Codex, OpenCode, an
 
 ```bash
 echo "CLAUDE_CODE_OAUTH_TOKEN=..." > .env       # or ANTHROPIC_API_KEY=sk-ant-...
-echo "DAYTONA_API_KEY=dtn_..." >> .env          # optional, for cloud sandboxes
+echo "OPENROUTER_API_KEY=..."     >> .env       # for --agent opencode
+echo "DAYTONA_API_KEY=dtn_..."    >> .env       # optional, for cloud sandboxes
+
+scripts/launch_server_test.sh &
+python examples/demo.py --test                              # claude + unix_local
+python examples/demo.py daytona --test                      # claude + daytona
+python examples/demo.py --test --agent opencode             # opencode + unix_local
+python examples/demo.py daytona --test --agent opencode     # opencode + daytona
 ```
 
 For a managed venv + Postgres without compose, use `scripts/launch_server_docker.sh` (Docker Postgres) or `scripts/launch_server_test.sh` (project-local conda Postgres). All three local-dev paths default `AGENT_SDK_ORIGIN=test` so daytona sandboxes are isolatable from production; override with `AGENT_SDK_ORIGIN=production <launcher>`.

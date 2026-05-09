@@ -19,7 +19,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk.client import Agent
 
 # Load API keys from ~/.env if not already set
-_KEY_PREFIXES = ("ANTHROPIC_API_KEY=", "GEMINI_API_KEY=", "GOOGLE_API_KEY=")
+_KEY_PREFIXES = (
+    "ANTHROPIC_API_KEY=",
+    "GEMINI_API_KEY=",
+    "GOOGLE_API_KEY=",
+    "OPENROUTER_API_KEY=",
+    "CLAUDE_CODE_OAUTH_TOKEN=",
+)
 env_path = os.path.expanduser("~/.env")
 if os.path.exists(env_path):
     with open(env_path) as f:
@@ -58,6 +64,7 @@ class TestInterruptIntegration:
         """Sanity check: a single prompt round-trips correctly."""
         agent = Agent(
             "test-basic",
+            agent_type="claude",
             provider="unix_local",
             model=MODEL,
             cwd="/tmp",
@@ -80,6 +87,7 @@ class TestInterruptIntegration:
         """
         agent = Agent(
             "test-interrupt",
+            agent_type="claude",
             provider="unix_local",
             model=MODEL,
             cwd="/tmp",
@@ -154,6 +162,7 @@ class TestInterruptIntegration:
         """interrupt=True on an idle agent just submits normally (no cancel)."""
         agent = Agent(
             "test-int-idle",
+            agent_type="claude",
             provider="unix_local",
             model=MODEL,
             cwd="/tmp",
@@ -193,6 +202,7 @@ class TestInterruptIntegration:
         """
         agent = Agent(
             "test-queue",
+            agent_type="claude",
             provider="unix_local",
             model=MODEL,
             cwd="/tmp",
@@ -392,11 +402,20 @@ class TestGeminiIntegration:
 # OpenCode integration
 # ---------------------------------------------------------------------------
 
+_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+_OPENCODE_MODEL = "openrouter/anthropic/claude-3.5-haiku"
+
+
 @skip_no_server
-@pytest.mark.skipif(True, reason="OpenCode ships macOS-only binary; skipped when server runs in Docker/Linux")
+@pytest.mark.skipif(
+    not _OPENROUTER_KEY,
+    reason="OPENROUTER_API_KEY required for OpenCode (uses openrouter/* models)",
+)
 class TestOpenCodeIntegration:
-    """OpenCode uses ANTHROPIC_API_KEY by default (claude provider).
-    Requires native macOS server — OpenCode ships platform-native binaries."""
+    """OpenCode delegates fs/terminal access to the client. Tests confirm the
+    full ACP loop (handshake → session/new → session/prompt → tool calls →
+    stopReason) works with the supervisor's session/request_permission +
+    fs/* + terminal/* handlers."""
 
     @pytest.mark.asyncio
     async def test_opencode_basic_prompt(self):
@@ -405,8 +424,10 @@ class TestOpenCodeIntegration:
             "test-opencode",
             agent_type="opencode",
             provider="unix_local",
+            model=_OPENCODE_MODEL,
             cwd="/tmp",
             api_url=API_URL,
+            secrets={"OPENROUTER_API_KEY": _OPENROUTER_KEY},
         )
         try:
             result = await agent.arun("Reply with exactly one word: OPENCODE_OK")
@@ -422,8 +443,10 @@ class TestOpenCodeIntegration:
             "test-opencode-stream",
             agent_type="opencode",
             provider="unix_local",
+            model=_OPENCODE_MODEL,
             cwd="/tmp",
             api_url=API_URL,
+            secrets={"OPENROUTER_API_KEY": _OPENROUTER_KEY},
         )
         try:
             events = []
@@ -435,6 +458,56 @@ class TestOpenCodeIntegration:
             text = "".join(str(ev) for ev in events if ev["type"] == "text")
             print(f"\n[opencode-stream] text: {text}")
             assert "OC_STREAM" in text
+        finally:
+            await agent.aclose()
+
+    @pytest.mark.asyncio
+    async def test_opencode_write_in_cwd(self):
+        """OpenCode write tool: create a file in cwd via the agent."""
+        import uuid as _uuid
+        marker = f"oc-write-{_uuid.uuid4().hex[:8]}"
+        agent = Agent(
+            f"test-{marker}",
+            agent_type="opencode",
+            provider="unix_local",
+            model=_OPENCODE_MODEL,
+            cwd="/tmp",
+            api_url=API_URL,
+            secrets={"OPENROUTER_API_KEY": _OPENROUTER_KEY},
+        )
+        try:
+            await agent.arun(
+                f"Use the write tool to create the file /tmp/{marker}.txt "
+                f"containing exactly: {marker}-CONTENT"
+            )
+            assert os.path.exists(f"/tmp/{marker}.txt"), \
+                "opencode did not create the file in cwd"
+            with open(f"/tmp/{marker}.txt") as f:
+                assert marker in f.read()
+        finally:
+            try: os.remove(f"/tmp/{marker}.txt")
+            except Exception: pass
+            await agent.aclose()
+
+    @pytest.mark.asyncio
+    async def test_opencode_bash(self):
+        """OpenCode bash tool: run a shell command and observe output."""
+        agent = Agent(
+            "test-opencode-bash",
+            agent_type="opencode",
+            provider="unix_local",
+            model=_OPENCODE_MODEL,
+            cwd="/tmp",
+            api_url=API_URL,
+            secrets={"OPENROUTER_API_KEY": _OPENROUTER_KEY},
+        )
+        try:
+            result = await agent.arun(
+                "Use the bash tool to run `echo OC_BASH_OK_$(uname -s)` "
+                "and tell me what it printed."
+            )
+            print(f"\n[opencode-bash] result: {result}")
+            assert "OC_BASH_OK_Linux" in result or "OC_BASH_OK" in result
         finally:
             await agent.aclose()
 
@@ -630,7 +703,7 @@ class TestSSELogParity:
     async def test_simple_prompt_parity(self):
         """Simple text response: SSE events match session log."""
         agent = Agent(
-            "parity-simple", provider="unix_local",
+            "parity-simple", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -663,7 +736,7 @@ class TestSSELogParity:
     async def test_tool_use_parity(self):
         """Tool call + result: SSE events match session log."""
         agent = Agent(
-            "parity-tool", provider="unix_local",
+            "parity-tool", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -696,7 +769,7 @@ class TestSSELogParity:
     async def test_interrupt_parity(self):
         """Interrupted prompt: both turns logged with correct stop_reasons."""
         agent = Agent(
-            "parity-int", provider="unix_local",
+            "parity-int", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -766,7 +839,7 @@ class TestSSELogParity:
     async def test_queued_prompts_parity(self):
         """Multiple queued prompts: all user_messages and turn_ends logged."""
         agent = Agent(
-            "parity-queue", provider="unix_local",
+            "parity-queue", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -827,7 +900,7 @@ class TestSSELogParity:
     async def test_multi_tool_parity(self):
         """Multiple tool calls in one turn: all logged in order."""
         agent = Agent(
-            "parity-multitool", provider="unix_local",
+            "parity-multitool", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -877,7 +950,7 @@ class TestSSELogParity:
     async def test_interrupt_mid_tool_parity(self):
         """Interrupt while a tool (Bash sleep) is running."""
         agent = Agent(
-            "parity-midtool", provider="unix_local",
+            "parity-midtool", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -945,7 +1018,7 @@ class TestSSELogParity:
         Expected order: A(cancelled) -> B -> C (queue preserved).
         """
         agent = Agent(
-            "parity-qi", provider="unix_local",
+            "parity-qi", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
@@ -1011,7 +1084,7 @@ class TestSSELogParity:
     async def test_reasoning_only_parity(self):
         """Prompt that triggers reasoning but minimal output: reasoning logged."""
         agent = Agent(
-            "parity-reason", provider="unix_local",
+            "parity-reason", agent_type="claude", provider="unix_local",
             model=MODEL, cwd="/tmp", api_url=API_URL,
         )
         try:
