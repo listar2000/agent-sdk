@@ -21,41 +21,11 @@ scripts/launch_server_test.sh &     # defaults AGENT_SDK_ORIGIN=test
 
 Warm-server timing under `-n auto`: ~1 min unix_local, ~3–5 min daytona. `test_async_correctness.py` <1 s.
 
-## ACP-runtime parametrization (claude + opencode)
-
-Tests that drive a real `Agent` end-to-end are parametrised over both ACP runtimes via `tests/_acp_runtimes.py`. There are two flavours, depending on how a test builds its request:
-
-* **`acp_runtime_param`** — yields a `dict` (`agent_type`, `model`, `secrets`) suitable for spreading into `Agent(...)`. Used by smoke / integration tests.
-
-  ```python
-  from tests._acp_runtimes import acp_runtime_param
-
-  @acp_runtime_param
-  async def test_basic(acp_runtime):
-      agent = Agent("t", provider="unix_local", api_url=BASE_URL, **acp_runtime)
-      await agent.arun("...")
-  ```
-
-* **`agent_type_param`** — yields just the `agent_type` string (`"claude"` or `"opencode"`). Used when a test goes through a helper like `_quick_session(sdk, provider, agent_type=agent_type)` rather than constructing `Agent(...)` directly. The recovery suite uses this.
-
-Each parameter auto-skips when its credential env var isn't set (no ambient claude OAuth → claude variant skips; no `OPENROUTER_API_KEY` → opencode variant skips), so unconfigured machines never see runtime parametrisation as a failure.
-
-To run only one runtime:
-
-```sh
-.venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k "claude"
-.venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k "opencode"
-```
-
-Provider × runtime is fully crossed in test ids: `test_X[claude-daytona]`, `test_X[opencode-modal]`, etc. To run a specific cell, give the full id:
-
-```sh
-.venv/bin/pytest "tests/test_sandbox_stop_delete_recovery.py::test_session_resume_after_stop[opencode-daytona]"
-```
+End-to-end tests are parametrized over `claude` + `opencode` via `tests/_acp_runtimes.py`. Each runtime auto-skips when its credential env var (`CLAUDE_CODE_OAUTH_TOKEN` / `OPENROUTER_API_KEY`) is unset. Filter with `-k claude` / `-k opencode` to run one runtime.
 
 ## Golden recovery — `test_sandbox_stop_delete_recovery.py`
 
-16 tests, parametrized over `provider × agent_type` for **120 cases total**. Each simulates an out-of-band provider event (`daytona.delete`, `docker rm -f`, `kill -9`, `pkill supervisor.js`) that bypasses the server's HTTP API; the next client request must succeed without intervention. Invariants are deterministic server-side (`inner_session_id`, `sandbox_ref`, non-empty reply) — never "agent recalls X" (LLM guardrails flake).
+16 tests × `provider × agent_type` = **120 cases**. Each simulates an out-of-band provider event (`daytona.delete`, `docker rm -f`, `kill -9`, `pkill supervisor.js`) that bypasses the server's HTTP API; the next client request must succeed without intervention. Invariants are deterministic server-side (`inner_session_id`, `sandbox_ref`, non-empty reply) — never "agent recalls X" (LLM guardrails flake).
 
 | # | What it pins |
 |---|---|
@@ -77,10 +47,6 @@ Provider × runtime is fully crossed in test ids: `test_X[claude-daytona]`, `tes
 | 16 | Concurrent stop + message: external stop fires while a fresh prompt is in flight. The pool's race-handling must reach a single consistent state — neither silent-failure nor double-recovery. |
 
 The earlier per-session in-memory replay buffer (re-delivering missed events through `/events`) was removed — it double-delivered everything a cold-loading UI had just fetched from `/log`.
-
-### Why both runtimes
-
-claude-agent-acp and opencode use different on-disk session formats: claude writes JSONL under `~/.claude/projects/`, opencode writes a SQLite database under `~/.local/share/opencode/`. The recovery path goes through `session/load` and the `set_model` config-replay loop, both of which are runtime-sensitive (a recent regression squashed `openrouter/anthropic/claude-3.5-haiku` to `"haiku"` because the claude normaliser ran on opencode IDs). Running the goldens against both runtimes catches per-runtime regressions in the snapshot/restore + config-replay machinery without doubling daytona-quota burn for claude-only orchestration tests.
 
 ## Companion mechanism tests — `test_async_correctness.py`
 
