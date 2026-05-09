@@ -4,11 +4,15 @@ Prerequisites:
   1. Ensure the API server is reachable.
   2. curl https://agent-sdk-server-production.up.railway.app/health
 
+  For Claude (default):  set CLAUDE_CODE_OAUTH_TOKEN in env / ~/.env
+  For OpenCode:          set OPENROUTER_API_KEY in env / ~/.env
+
 Usage:
-  python examples/demo.py
-  python examples/demo.py --test
-  python examples/demo.py daytona         # optional — use remote daytona sandbox
-  python examples/demo.py daytona --test
+  python examples/demo.py                          # claude + local
+  python examples/demo.py --test                   # claude + local + localhost server
+  python examples/demo.py daytona --test           # claude + remote daytona
+  python examples/demo.py --agent opencode         # opencode + local + openrouter
+  python examples/demo.py --agent opencode --model openrouter/openai/gpt-4o
 """
 
 import argparse
@@ -17,35 +21,78 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+# Optional dotenv: tests + interactive runs both want ~/.env auto-loaded.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv(os.path.expanduser("~/.env"))
+except ImportError:
+    pass
+
 from agent_sdk import Agent
 
 RAILWAY_API_URL = "https://agent-sdk-server-production.up.railway.app"
 LOCAL_TEST_API_URL = "http://localhost:7778"
 
+# Per-agent defaults: model + the env var that carries credentials.
+AGENT_DEFAULTS = {
+    "claude": {
+        "model": "haiku",
+        "secret_env": "CLAUDE_CODE_OAUTH_TOKEN",
+    },
+    "opencode": {
+        "model": "openrouter/anthropic/claude-3.5-haiku",
+        "secret_env": "OPENROUTER_API_KEY",
+    },
+}
 
-async def run_demo(provider: str, api_url: str, cwd: str = "/tmp"):
-    print(f"=== {provider.capitalize()} agent ===\n")
+
+async def run_demo(provider: str, api_url: str, agent_type: str,
+                   model: str, cwd: str = "/tmp") -> None:
+    print(f"=== {agent_type} agent on {provider} (model={model}) ===\n")
+    secret_env = AGENT_DEFAULTS[agent_type]["secret_env"]
+    secret_val = os.environ.get(secret_env)
+    if not secret_val:
+        sys.exit(f"ERROR: {secret_env} not set (required for agent_type={agent_type!r})")
+
     agent = Agent(
-        f"demo-{provider}", provider=provider, cwd=cwd,
-        model="haiku", api_url=api_url,
+        f"demo-{agent_type}-{provider}",
+        agent_type=agent_type,
+        provider=provider,
+        model=model,
+        cwd=cwd,
+        api_url=api_url,
+        secrets={secret_env: secret_val},
     )
-    async for chunk in agent.astream("Say hello in 5 words, and then create a hello_world.py."):
-        print(chunk, end="", flush=True)
-    print("\n")
-    await agent.aclose()
+    try:
+        async for chunk in agent.astream(
+            f"Say hello in 5 words, and then create the file "
+            f"{cwd}/hello_world.py with a simple print statement."
+        ):
+            print(chunk, end="", flush=True)
+        print("\n")
+    finally:
+        await agent.aclose()
 
 
-async def main():
+async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("provider", nargs="?", default="local", choices=["local", "daytona"])
-    parser.add_argument("--test", action="store_true", help="Use local http://localhost:7778 instead of Railway.")
+    parser.add_argument("provider", nargs="?", default="unix_local",
+                        choices=["unix_local", "daytona", "modal"])
+    parser.add_argument("--test", action="store_true",
+                        help="Use http://localhost:7778 instead of Railway.")
+    parser.add_argument("--agent", default="claude",
+                        choices=sorted(AGENT_DEFAULTS),
+                        help="ACP agent runtime (default: claude).")
+    parser.add_argument("--model", default=None,
+                        help="Override the per-agent default model.")
     args = parser.parse_args()
 
     api_url = LOCAL_TEST_API_URL if args.test else RAILWAY_API_URL
-    if args.provider == "daytona":
-        await run_demo("daytona", api_url=api_url, cwd="/home/sandbox")
-    else:
-        await run_demo("local", api_url=api_url)
+    model = args.model or AGENT_DEFAULTS[args.agent]["model"]
+    cwd = "/home/sandbox" if args.provider == "daytona" else "/tmp"
+    await run_demo(args.provider, api_url=api_url,
+                   agent_type=args.agent, model=model, cwd=cwd)
 
 
 if __name__ == "__main__":

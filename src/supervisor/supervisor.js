@@ -507,16 +507,230 @@ function broadcastSse(line) {
   }
 }
 
+// Pick an "allow" option from a session/request_permission's params.options
+// list. ACP options are objects like { optionId: "allow_always", kind:
+// "allow_always", name: "..." }. Prefer allow_always so the agent stops
+// asking for the same permission later this turn; fall back to allow_once;
+// last resort echo the first option's optionId so the agent doesn't deadlock
+// if a runtime ships only non-standard option ids.
+function pickAllowOptionId(params) {
+  const options = params && Array.isArray(params.options) ? params.options : [];
+  for (const want of ["allow_always", "allow_once"]) {
+    const hit = options.find(
+      (o) => o && (o.kind === want || o.optionId === want),
+    );
+    if (hit && hit.optionId) return hit.optionId;
+  }
+  return options[0]?.optionId || "allow_always";
+}
+
+// Active terminals from terminal/create. ACP runtimes (opencode in particular)
+// delegate shell execution to the client, so we spawn here and stash output
+// for terminal/output to drain. Lifetime: from terminal/create to whichever
+// of terminal/release or terminal/kill the agent calls last.
+const terminals = new Map();
+let _termSeq = 0;
+
+function _terminalCreate(params) {
+  const command = params.command;
+  if (!command || typeof command !== "string") {
+    throw new Error("terminal/create: command is required");
+  }
+  const args = Array.isArray(params.args) ? params.args : [];
+  const cwd = params.cwd || args.cwd || undefined;
+  const envObj = { ...process.env };
+  if (Array.isArray(params.env)) {
+    for (const e of params.env) {
+      if (e && typeof e.name === "string") envObj[e.name] = String(e.value ?? "");
+    }
+  }
+  const limit = Number.isFinite(params.outputByteLimit)
+    ? Math.max(1024, Math.min(params.outputByteLimit, 32 * 1024 * 1024))
+    : 1024 * 1024;
+  const id = `term-${++_termSeq}-${Math.random().toString(36).slice(2, 8)}`;
+  const proc = spawn(command, args, {
+    cwd,
+    env: envObj,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  let truncated = false;
+  const collect = (chunk) => {
+    if (truncated) return;
+    const s = chunk.toString("utf8");
+    if (output.length + s.length > limit) {
+      output += s.slice(0, limit - output.length);
+      truncated = true;
+    } else {
+      output += s;
+    }
+  };
+  proc.stdout.on("data", collect);
+  proc.stderr.on("data", collect);
+  const term = {
+    proc,
+    get output() { return output; },
+    get truncated() { return truncated; },
+    exitStatus: null,
+    waiters: [],
+  };
+  proc.on("exit", (code, signal) => {
+    term.exitStatus = { exitCode: code, signal: signal || null };
+    for (const w of term.waiters) w(term.exitStatus);
+    term.waiters.length = 0;
+  });
+  proc.on("error", (e) => {
+    term.exitStatus = { exitCode: null, signal: null, error: e.message };
+    for (const w of term.waiters) w(term.exitStatus);
+    term.waiters.length = 0;
+  });
+  terminals.set(id, term);
+  return id;
+}
+
+function _terminalGet(terminalId) {
+  const term = terminals.get(terminalId);
+  if (!term) throw new Error(`unknown terminalId: ${terminalId}`);
+  return term;
+}
+
+// ACP client-side method handlers. Each takes the request params and returns
+// the JSON-RPC ``result`` value (or throws to surface an error frame). The
+// supervisor IS the agent's runtime environment (sandboxed container or local
+// subprocess), so fs/terminal calls execute directly against node fs and
+// child_process — no roundtrip to the Python server.
+const CLIENT_HANDLERS = {
+  async "session/request_permission"(params) {
+    // Sandbox trust model: agent runs in an isolated container/VM, so the
+    // OS layer already constrains what tools can do. Auto-allow rather than
+    // deadlock waiting for a human approval that won't come. Claude never
+    // reaches here — session/setMode("bypassPermissions") at attach turns
+    // off its permission flow before the first tool call.
+    const optionId = pickAllowOptionId(params);
+    return { outcome: { outcome: "selected", optionId } };
+  },
+  async "fs/read_text_file"(params) {
+    const filePath = params.path;
+    if (typeof filePath !== "string") throw new Error("fs/read_text_file: path required");
+    let content = fs.readFileSync(filePath, "utf8");
+    // ACP optional line/limit windowing — applied AFTER read to keep the
+    // implementation compact (1-based line numbering per spec).
+    if (Number.isFinite(params.line) || Number.isFinite(params.limit)) {
+      const lines = content.split("\n");
+      const start = Number.isFinite(params.line) ? Math.max(0, params.line - 1) : 0;
+      const end = Number.isFinite(params.limit) ? start + params.limit : lines.length;
+      content = lines.slice(start, end).join("\n");
+    }
+    return { content };
+  },
+  async "fs/write_text_file"(params) {
+    const filePath = params.path;
+    const content = params.content;
+    if (typeof filePath !== "string") throw new Error("fs/write_text_file: path required");
+    if (typeof content !== "string") throw new Error("fs/write_text_file: content required");
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content, "utf8");
+    return null;
+  },
+  async "terminal/create"(params) {
+    const terminalId = _terminalCreate(params);
+    return { terminalId };
+  },
+  async "terminal/output"(params) {
+    const term = _terminalGet(params.terminalId);
+    return {
+      output: term.output,
+      truncated: term.truncated,
+      exitStatus: term.exitStatus,
+    };
+  },
+  async "terminal/wait_for_exit"(params) {
+    const term = _terminalGet(params.terminalId);
+    if (term.exitStatus) {
+      return {
+        exitCode: term.exitStatus.exitCode,
+        signal: term.exitStatus.signal,
+      };
+    }
+    return new Promise((resolve) => {
+      term.waiters.push((status) => resolve({
+        exitCode: status.exitCode,
+        signal: status.signal,
+      }));
+    });
+  },
+  async "terminal/kill"(params) {
+    const term = _terminalGet(params.terminalId);
+    try { term.proc.kill("SIGKILL"); } catch {}
+    return null;
+  },
+  async "terminal/release"(params) {
+    const term = terminals.get(params.terminalId);
+    if (term) {
+      try { term.proc.kill("SIGKILL"); } catch {}
+      terminals.delete(params.terminalId);
+    }
+    return null;
+  },
+};
+
+async function dispatchClientRequest(msg) {
+  const handler = CLIENT_HANDLERS[msg.method];
+  if (!handler) {
+    return {
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32601,
+        message: `Method not found: ${msg.method}`,
+      },
+    };
+  }
+  try {
+    const result = await handler(msg.params || {});
+    return { jsonrpc: "2.0", id: msg.id, result: result === undefined ? null : result };
+  } catch (e) {
+    return {
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32000,
+        message: `client handler ${msg.method} failed: ${e && e.message ? e.message : e}`,
+      },
+    };
+  }
+}
+
 async function handleAcpLine(line) {
   // Always fan out to SSE subscribers — the Python server's reader
   // consumes this stream for event broadcast + terminal attribution.
   broadcastSse(line);
 
-  // If this is a JSON-RPC response, unblock the waiting POST.
   let msg = null;
   try {
     msg = JSON.parse(line);
   } catch {
+    return;
+  }
+  // ACP-initiated request from the agent (fs/*, terminal/*,
+  // session/request_permission). Has method+id, no result/error.
+  if (
+    msg &&
+    typeof msg === "object" &&
+    "id" in msg &&
+    "method" in msg &&
+    !("result" in msg) &&
+    !("error" in msg)
+  ) {
+    const reply = await dispatchClientRequest(msg);
+    if (reply.error) {
+      log(`client handler ${msg.method} id=${msg.id} returned error: ${reply.error.message}`);
+    }
+    try {
+      acp.stdin.write(JSON.stringify(reply) + "\n");
+    } catch (e) {
+      log(`failed to send reply for ${msg.method} id=${msg.id}: ${e.message}`);
+    }
     return;
   }
   if (
