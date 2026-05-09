@@ -126,25 +126,13 @@ def _to_daytona_resources(req: Any) -> Any:
     return _DR(cpu=cpu, memory=memory_gib, disk=req.disk_gib, gpu=gpu_count)
 
 
-# Process-shared async Daytona client. Constructed lazily on first
-# call inside a running event loop; subsequent callers reuse the same
-# aiohttp.ClientSession + TLS pool to api.daytona.io.
 _DAYTONA_CLIENT_ASYNC: "Any | None" = None
 _DAYTONA_ASYNC_INIT_LOCK = asyncio.Lock()
-# 300 = 250 default + 20% headroom; the 200–300 concurrent-session target
-# slots cleanly under this. aiohttp.TCPConnector(limit=...) caps how many
-# requests can be in-flight against api.daytona.io at once.
 _DAYTONA_ASYNC_POOL_MAX = int(os.environ.get("AGENT_SDK_DAYTONA_POOL_MAX", "300"))
 
 
 async def _get_async_daytona_client():
-    """Process-shared AsyncDaytona client. Constructed once on first call
-    inside a running event loop; subsequent callers reuse the same
-    aiohttp.ClientSession + TLS pool to api.daytona.io.
-
-    The aiohttp connector is created lazily on the first HTTP request,
-    not at construction — so this function is safe to call eagerly
-    during lifespan startup, even before any sandbox API call."""
+    """Process-shared AsyncDaytona client. Lazy-init under a lock."""
     global _DAYTONA_CLIENT_ASYNC
     if _DAYTONA_CLIENT_ASYNC is not None:
         return _DAYTONA_CLIENT_ASYNC
@@ -157,22 +145,11 @@ async def _get_async_daytona_client():
         if not api_key:
             raise RuntimeError("DAYTONA_API_KEY not set")
         client = AsyncDaytona(DaytonaConfig(api_key=api_key))
-        # The async REST client snapshots maxsize at __init__ time and
-        # the configuration value too, so set both — the snapshot is the
-        # one actually used by aiohttp.TCPConnector(limit=...) on first
-        # request.
+        # rest_client.maxsize is snapshotted from configuration at init; set both.
         client._api_client.configuration.connection_pool_maxsize = _DAYTONA_ASYNC_POOL_MAX
         client._api_client.rest_client.maxsize = _DAYTONA_ASYNC_POOL_MAX
         _DAYTONA_CLIENT_ASYNC = client
         return _DAYTONA_CLIENT_ASYNC
-
-
-# Cap on simultaneous in-flight ``daytona.create()`` calls. Removing the
-# 32-thread executor cap (via the async client) would otherwise let 250
-# concurrent sessions hit daytona's API + disk quota without any
-# client-side admission control.
-_DAYTONA_CREATE_CONCURRENCY = int(os.environ.get("AGENT_SDK_DAYTONA_CONCURRENCY", "40"))
-_DAYTONA_CREATE_SEM = asyncio.Semaphore(_DAYTONA_CREATE_CONCURRENCY)
 
 
 async def start_supervisor_in_sandbox(
@@ -417,22 +394,20 @@ async def provision_daytona_sandbox(
     labels = _sandbox_labels()
 
     if use_snapshot:
-        async with _DAYTONA_CREATE_SEM:
-            sandbox = await daytona.create(
-                CreateSandboxFromSnapshotParams(
-                    snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
-                    volumes=volumes, labels=labels,
-                ), timeout=create_timeout,
-            )
+        sandbox = await daytona.create(
+            CreateSandboxFromSnapshotParams(
+                snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
+                volumes=volumes, labels=labels,
+            ), timeout=create_timeout,
+        )
     else:
-        async with _DAYTONA_CREATE_SEM:
-            sandbox = await daytona.create(
-                CreateSandboxFromImageParams(
-                    image=image, auto_stop_interval=0, env_vars=env_vars,
-                    volumes=volumes, labels=labels,
-                    resources=_to_daytona_resources(resources),
-                ), timeout=create_timeout,
-            )
+        sandbox = await daytona.create(
+            CreateSandboxFromImageParams(
+                image=image, auto_stop_interval=0, env_vars=env_vars,
+                volumes=volumes, labels=labels,
+                resources=_to_daytona_resources(resources),
+            ), timeout=create_timeout,
+        )
 
     try:
         # Run pre-start commands (skills, CLI install, etc.).
@@ -737,23 +712,21 @@ async def _init_volume_dirs(volume_ref: str) -> None:
     init_labels = _sandbox_labels()
 
     if use_snapshot:
-        async with _DAYTONA_CREATE_SEM:
-            sb = await daytona.create(
-                CreateSandboxFromSnapshotParams(
-                    snapshot=snapshot, auto_stop_interval=0,
-                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                    labels=init_labels,
-                ), timeout=120,
-            )
+        sb = await daytona.create(
+            CreateSandboxFromSnapshotParams(
+                snapshot=snapshot, auto_stop_interval=0,
+                env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=init_labels,
+            ), timeout=120,
+        )
     else:
-        async with _DAYTONA_CREATE_SEM:
-            sb = await daytona.create(
-                CreateSandboxFromImageParams(
-                    image="node:22-slim", auto_stop_interval=0,
-                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                    labels=init_labels,
-                ), timeout=120,
-            )
+        sb = await daytona.create(
+            CreateSandboxFromImageParams(
+                image="node:22-slim", auto_stop_interval=0,
+                env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                labels=init_labels,
+            ), timeout=120,
+        )
 
     try:
         await _run_sandbox_exec_async(
