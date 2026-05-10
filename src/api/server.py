@@ -53,6 +53,7 @@ from .db import (
     init_db,
     init_pool,
     list_agents,
+    list_sessions,
     list_volumes,
     log_event,
     read_sandbox_state,
@@ -1043,6 +1044,27 @@ async def admin_list_sessions():
             if sess.supervisor_url is not None
         ],
     }
+
+
+@app.get("/admin/sessions/inactive")
+async def admin_list_inactive_sessions(
+    q: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    """DB session rows not currently leased by the pool. Optional ``q``
+    name-substring filter and ``limit`` cap (default 100, max 1000)
+    are applied at the DB layer."""
+    from api.sandbox import get_pool
+    active = get_pool()._active  # noqa: SLF001 — admin readout
+    return {"sessions": [
+        {
+            "session_id": r["id"],
+            "agent_id": r["agent_id"],
+            "inner_session_id": r["inner_session_id"],
+            "sandbox_ref": (r["sandbox_state"] or {}).get("sandbox_ref"),
+        }
+        for r in await list_sessions(q=q, limit=limit) if r["id"] not in active
+    ]}
 
 
 # ---------------------------------------------------------------------------
