@@ -401,10 +401,22 @@
     <div class="section-label" style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 10px;">
       Inactive Sessions <span class="count" id="inactiveCount"></span>
     </div>
-    <input id="inactiveSearch" placeholder="Search inactive…"
-      style="margin: 0 14px 6px; padding: 5px 8px; font-size: 0.78rem;
-             background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
-             border-radius: 4px; color: var(--sidebar-text); outline: none;">
+    <div style="display: flex; gap: 6px; margin: 0 14px 6px;">
+      <input id="inactiveSearch" placeholder="Search inactive…"
+        style="flex: 1; padding: 5px 8px; font-size: 0.78rem;
+               background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+               border-radius: 4px; color: var(--sidebar-text); outline: none;">
+      <select id="inactiveLimit" title="Max rows"
+        style="padding: 5px 6px; font-size: 0.78rem;
+               background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+               border-radius: 4px; color: var(--sidebar-text); outline: none;">
+        <option value="50">50</option>
+        <option value="100" selected>100</option>
+        <option value="200">200</option>
+        <option value="500">500</option>
+        <option value="1000">1000</option>
+      </select>
+    </div>
     <ul class="session-list" id="inactiveList"></ul>
   </div>
 </aside>
@@ -516,7 +528,8 @@ async function refresh() {
 
   // Inactive sessions — DB rows not currently held by the pool.
   const q = document.getElementById('inactiveSearch').value.trim();
-  const inactiveResp = await fetchJSON(`${API}/admin/sessions/inactive?q=${encodeURIComponent(q)}`);
+  const lim = document.getElementById('inactiveLimit').value;
+  const inactiveResp = await fetchJSON(`${API}/admin/sessions/inactive?q=${encodeURIComponent(q)}&limit=${lim}`);
   const inactive = inactiveResp?.sessions || [];
   document.getElementById('inactiveCount').textContent = `(${inactive.length})`;
   for (const s of inactive) lastSessionMeta[s.session_id] = s;
@@ -1048,10 +1061,12 @@ function appendEvent(body, type, payload, serverTimeMs) {
 refresh();
 setInterval(refresh, 4000);
 // Debounced search: refetch inactive list 250ms after the user stops typing.
+// Limit dropdown refetches immediately on change.
 let _searchT = null;
 document.getElementById('inactiveSearch').addEventListener('input', () => {
   clearTimeout(_searchT); _searchT = setTimeout(refresh, 250);
 });
+document.getElementById('inactiveLimit').addEventListener('change', refresh);
 </script>
 </body>
 </html>

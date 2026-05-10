@@ -410,9 +410,11 @@ async def get_session(session_id: str) -> dict | None:
     return dict(row)
 
 
-async def list_sessions(q: str | None = None) -> list[dict]:
+async def list_sessions(q: str | None = None, limit: int = 100) -> list[dict]:
     """Session rows, newest first. ``q`` is an optional case-insensitive
-    substring filter on the agent's display name."""
+    substring filter on the agent's display name. ``limit`` caps the
+    result set (default 100) so the dashboard doesn't pull thousands of
+    rows when no search is active."""
     sql = (
         "SELECT s.id, s.agent_id, s.inner_session_id, s.volume_id, s.workspace,"
         " s.sandbox_state, s.created_at"
@@ -422,7 +424,8 @@ async def list_sessions(q: str | None = None) -> list[dict]:
     if q:
         sql += " WHERE a.name ILIKE %s"
         params = (f"%{q}%",)
-    sql += " ORDER BY s.created_at DESC"
+    sql += " ORDER BY s.created_at DESC LIMIT %s"
+    params = params + (limit,)
     async with get_db() as conn:
         rows = await (await conn.execute(sql, params)).fetchall()
     return [dict(r) for r in rows]
