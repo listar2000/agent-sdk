@@ -410,6 +410,24 @@ async def get_session(session_id: str) -> dict | None:
     return dict(row)
 
 
+async def list_sessions(q: str | None = None) -> list[dict]:
+    """Session rows, newest first. ``q`` is an optional case-insensitive
+    substring filter on the agent's display name."""
+    sql = (
+        "SELECT s.id, s.agent_id, s.inner_session_id, s.volume_id, s.workspace,"
+        " s.sandbox_state, s.created_at"
+        " FROM sessions s LEFT JOIN agents a ON a.id = s.agent_id"
+    )
+    params: tuple = ()
+    if q:
+        sql += " WHERE a.name ILIKE %s"
+        params = (f"%{q}%",)
+    sql += " ORDER BY s.created_at DESC"
+    async with get_db() as conn:
+        rows = await (await conn.execute(sql, params)).fetchall()
+    return [dict(r) for r in rows]
+
+
 async def get_session_env(session_id: str) -> dict[str, str]:
     """Return stored session env, or {} if session not found."""
     async with get_db() as conn:

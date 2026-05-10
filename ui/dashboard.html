@@ -398,6 +398,14 @@
   <div class="sidebar-section">
     <div class="section-label">Active Sessions <span class="count" id="sessionCount"></span></div>
     <ul class="session-list" id="sessionList"></ul>
+    <div class="section-label" style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 10px;">
+      Inactive Sessions <span class="count" id="inactiveCount"></span>
+    </div>
+    <input id="inactiveSearch" placeholder="Search inactive…"
+      style="margin: 0 14px 6px; padding: 5px 8px; font-size: 0.78rem;
+             background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+             border-radius: 4px; color: var(--sidebar-text); outline: none;">
+    <ul class="session-list" id="inactiveList"></ul>
   </div>
 </aside>
 
@@ -506,6 +514,32 @@ async function refresh() {
     }).join('');
   }
 
+  // Inactive sessions — DB rows not currently held by the pool.
+  const q = document.getElementById('inactiveSearch').value.trim();
+  const inactiveResp = await fetchJSON(`${API}/admin/sessions/inactive?q=${encodeURIComponent(q)}`);
+  const inactive = inactiveResp?.sessions || [];
+  document.getElementById('inactiveCount').textContent = `(${inactive.length})`;
+  for (const s of inactive) lastSessionMeta[s.session_id] = s;
+  const inactiveList = document.getElementById('inactiveList');
+  if (inactive.length === 0) {
+    inactiveList.innerHTML = '<li style="color:var(--sidebar-text-dim);padding:14px 18px;font-size:0.78rem;">No inactive sessions</li>';
+  } else {
+    inactiveList.innerHTML = inactive.map(s => {
+      const name = agentNames[s.agent_id] || (s.agent_id || s.session_id).slice(0, 8);
+      const activeClass = s.session_id === currentSessionId ? 'active' : '';
+      const sub = s.sandbox_ref ? `inactive · ${s.sandbox_ref.slice(0, 14)}` : 'inactive';
+      return `
+        <li class="session-item inactive ${activeClass}" data-sid="${escHtml(s.session_id)}" onclick="openStream('${escHtml(s.session_id)}', '${escHtml(name)}', this)">
+          <div class="indicator"></div>
+          <div class="info">
+            <div class="name">${escHtml(name)}</div>
+            <div class="sub">${escHtml(sub)}</div>
+          </div>
+          <button class="kill" title="Delete session" onclick="event.stopPropagation(); stopSession('${escHtml(s.session_id)}', '${escHtml(name)}')">×</button>
+        </li>`;
+    }).join('');
+  }
+
   // Update header meta if a session is open
   if (currentSessionId) {
     const cur = lastSessionMeta[currentSessionId];
@@ -564,7 +598,8 @@ function openStream(sessionId, name, clickedEl) {
   if (emptyEl) emptyEl.style.display = 'none';
   const body = document.getElementById('streamBody');
   body.innerHTML = '<div style="color:var(--muted);padding:8px;">Connecting to event stream...</div>';
-  loadLog(sessionId, body).then(() => connectSSE(sessionId, body));
+  const isInactive = clickedEl?.classList.contains('inactive');
+  loadLog(sessionId, body).then(() => { if (!isInactive) connectSSE(sessionId, body); });
   document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
   if (clickedEl) clickedEl.classList.add('active');
 }
@@ -1012,6 +1047,11 @@ function appendEvent(body, type, payload, serverTimeMs) {
 
 refresh();
 setInterval(refresh, 4000);
+// Debounced search: refetch inactive list 250ms after the user stops typing.
+let _searchT = null;
+document.getElementById('inactiveSearch').addEventListener('input', () => {
+  clearTimeout(_searchT); _searchT = setTimeout(refresh, 250);
+});
 </script>
 </body>
 </html>
