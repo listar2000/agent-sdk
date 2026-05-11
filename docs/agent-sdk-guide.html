@@ -567,6 +567,54 @@ result = <span class="kw">await</span> agent.sandbox.<span class="fn">exec</span
     </div>
   </div>
 
+  <!-- ── extra_options ── -->
+  <div class="section" id="extra-options">
+    <div class="section-header">
+      <h2><span class="section-icon" style="background:rgba(245,158,11,0.15);color:#fbbf24">🧪</span>extra_options — vendor-specific ACP options</h2>
+      <p class="section-sub">Pass-through to the ACP wrapper's <code style="color:#fbbf24">_meta.&lt;vendor&gt;.options</code> channel. For <code style="color:#fbbf24">agent_type="claude"</code> this lands in claude-agent-acp's <code style="color:#fbbf24">userProvidedOptions</code> and onward into <code style="color:#fbbf24">@anthropic-ai/claude-agent-sdk</code>'s <code style="color:#fbbf24">ClaudeAgentOptions</code>. Session-scoped — set at session/new, immutable for the session's lifetime.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Tool restriction — allow/deny lists honored end-to-end</div>
+      <pre><code>agent = <span class="fn">Agent</span>(
+    <span class="st">"reader"</span>, agent_type=<span class="st">"claude"</span>, provider=<span class="st">"unix_local"</span>,
+    extra_options={
+        <span class="st">"allowedTools"</span>: [<span class="st">"Read"</span>, <span class="st">"Glob"</span>, <span class="st">"Grep"</span>],
+        <span class="st">"disallowedTools"</span>: [<span class="st">"Bash"</span>, <span class="st">"Edit"</span>, <span class="st">"Write"</span>],
+        <span class="st">"maxThinkingTokens"</span>: <span class="st">10000</span>,
+    },
+)
+<span class="cm"># Verified empirically: with disallowedTools=["Read"...], asking the</span>
+<span class="cm"># agent to read a file results in a clean refusal, not a fallback Bash.</span></code></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Schema-enforced JSON output — use <code style="color:#fbbf24">jsonSchema</code>, not <code style="color:#fbbf24">outputFormat</code></div>
+      <pre><code><span class="cm"># Claude code constrains its output to the schema. The JSON streams</span>
+<span class="cm"># back as agent_message_chunk text — agent.arun() returns it raw,</span>
+<span class="cm"># json.loads(text) is guaranteed to succeed.</span>
+schema = MyResponseModel.model_json_schema()
+agent = <span class="fn">Agent</span>(
+    <span class="st">"schema-bound"</span>, agent_type=<span class="st">"claude"</span>, provider=<span class="st">"unix_local"</span>,
+    extra_options={<span class="st">"jsonSchema"</span>: schema},
+)
+text = await agent.<span class="fn">arun</span>(<span class="st">"…"</span>)
+result = json.loads(text)  <span class="cm"># schema-validated by the CLI</span></code></pre>
+      <p style="font-size:13px;color:var(--muted);margin-top:8px"><strong>Why <code style="color:#fbbf24">jsonSchema</code> and not <code style="color:#fbbf24">outputFormat: {type:"json_schema", schema:…}</code>?</strong> The wrapped form routes through a <code style="color:#fbbf24">StructuredOutput</code> pseudo-tool inside claude-agent-acp that captures the structured payload as a tool result — never re-emitted as assistant text. <code style="color:#fbbf24">extraArgs.json-schema</code> takes the same broken path. Setting the bare <code style="color:#fbbf24">jsonSchema</code> field instead causes claude code to stream the JSON as <code style="color:#fbbf24">agent_message_chunk</code> events, which is what <code style="color:#fbbf24">arun()</code> concatenates. Diagnosed by triplet-comparison on the same prompt; see <code style="color:#fbbf24">EXTRA_OPTIONS_PLAN.md</code>.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Known field shapes (subset of <code style="color:#fbbf24">ClaudeAgentOptions</code>)</div>
+      <pre><code><span class="cm"># Field          shape                  notes</span>
+allowedTools     <span class="st">string[]</span>               <span class="cm"># whitelist; merged with built-in defaults</span>
+disallowedTools  <span class="st">string[]</span>               <span class="cm"># denylist; merged with ACP's ["AskUserQuestion"]</span>
+maxThinkingTokens<span class="st">number</span>                 <span class="cm"># thinking-token budget</span>
+jsonSchema       <span class="st">object</span>                 <span class="cm"># JSON Schema; constrains response shape</span>
+extraArgs        <span class="st">Record&lt;string,string&gt;</span>  <span class="cm"># raw claude-cli flags (escape hatch)</span></code></pre>
+      <p style="font-size:13px;color:var(--muted);margin-top:8px">For other agent types (codex, opencode), <code style="color:#fbbf24">extra_options</code> is currently dropped with a warning at registration — the vendor's ACP-namespace mapping must be added to <code style="color:#fbbf24">api.acp_client._VENDOR_META_NAMESPACE</code> after confirming the wrapper's <code style="color:#fbbf24">_meta</code> key. claude is the only entry today.</p>
+    </div>
+  </div>
+
   <!-- ── Token usage ── -->
   <div class="section" id="usage">
     <div class="section-header">

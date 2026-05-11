@@ -875,7 +875,21 @@ function ensureElapsedTicker() {
 }
 
 // ── Render a single event ───────────────────────────────────
+// Sticky-bottom autoscroll: only follow new events if the user is
+// already near the bottom of the scroll area. If they've scrolled up
+// to read earlier messages, don't yank them back down. Threshold of
+// 80px matches "is the last line basically visible?" — a single agent
+// chunk pushes us less than that. Capture BEFORE appending so the
+// post-append scrollHeight delta doesn't confuse the heuristic.
+function _isNearBottom(el, threshold = 80) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+}
+
 function appendEvent(body, type, payload, serverTimeMs) {
+  const wasNearBottom = _isNearBottom(body);
+  // After the switch, only scroll if the user was already at/near the
+  // bottom. Each individual scroll call inside the switch also checks
+  // wasNearBottom — duplicating is fine since the helper short-circuits.
   if (!serverTimeMs) serverTimeMs = Date.now();
   payload = payload || {};
   switch (type) {
@@ -894,7 +908,7 @@ function appendEvent(body, type, payload, serverTimeMs) {
         lastEl.dataset.rawText = (lastEl.dataset.rawText || '') + text;
         const md = lastEl.querySelector('.md');
         if (md) md.innerHTML = renderMarkdown(lastEl.dataset.rawText);
-        body.scrollTop = body.scrollHeight;
+        if (wasNearBottom) body.scrollTop = body.scrollHeight;
         return;
       }
       const div = document.createElement('div');
@@ -997,7 +1011,7 @@ function appendEvent(body, type, payload, serverTimeMs) {
         lastThink.dataset.rawText = (lastThink.dataset.rawText || '') + think;
         const md = lastThink.querySelector('.md');
         if (md) md.innerHTML = renderMarkdown(lastThink.dataset.rawText);
-        body.scrollTop = body.scrollHeight;
+        if (wasNearBottom) body.scrollTop = body.scrollHeight;
         return;
       }
       const details = document.createElement('details');
@@ -1055,7 +1069,9 @@ function appendEvent(body, type, payload, serverTimeMs) {
       body.appendChild(div);
     }
   }
-  body.scrollTop = body.scrollHeight;
+  // Only follow if we were already at the bottom when this event arrived.
+  // If the user scrolled up to read history, leave them there.
+  if (wasNearBottom) body.scrollTop = body.scrollHeight;
 }
 
 refresh();
