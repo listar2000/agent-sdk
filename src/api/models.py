@@ -48,6 +48,13 @@ class AgentConfig:
     mode: str | None = None              # "default" | "plan" | "bypassPermissions" | "acceptEdits" | ...
     thought_level: str | None = None     # "low" | "medium" | "high" — Claude's "thinking" config_id
 
+    # Vendor-specific ACP ``extra_options`` is NOT here — it's session-scoped
+    # (claude-agent-acp only reads ``_meta.<vendor>.options`` on session/new,
+    # see ``acp_client._VENDOR_META_NAMESPACE``). Stored on the ``sessions``
+    # row and threaded through ``acp_client.attach`` at session creation
+    # time. Mirrors the ``workspace`` pattern (also session-scoped, not on
+    # AgentConfig).
+
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
 

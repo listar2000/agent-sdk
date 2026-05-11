@@ -1439,6 +1439,13 @@ async def _sessions_create_lazy(data: dict) -> dict:
     config_data.pop("shared_mounts", None)
     config_data.pop("root", None)
     config_data.pop("workspace", None)
+    # ``extra_options`` is session-scoped (matches workspace); pop out of
+    # config_data so it doesn't land in AgentConfig.
+    extra_options = data.get("extra_options")
+    if extra_options is None:
+        extra_options = config_data.pop("extra_options", None)
+    else:
+        config_data.pop("extra_options", None)
 
     agent_id = data.get("agent_id")
     if agent_id:
@@ -1475,6 +1482,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
         cwd=cwd,
         pre_start_commands=list(lazy_user_pre_start),
         workspace=workspace,
+        extra_options=extra_options,
     )
 
     return {
@@ -1529,6 +1537,13 @@ async def _sessions_create_eager(data: dict) -> dict:
     config_data.pop("dockerfile_content", None)
     config_data.pop("dockerfile", None)
     config_data.pop("workspace", None)
+    # ``extra_options`` is session-scoped (matches workspace); pop it before
+    # building AgentConfig so it doesn't appear as agent-identity config.
+    extra_options = data.get("extra_options")
+    if extra_options is None:
+        extra_options = config_data.pop("extra_options", None)
+    else:
+        config_data.pop("extra_options", None)
     resources_data = data.get("resources")
     if resources_data is None:
         resources_data = config_data.pop("resources", None)
@@ -1601,6 +1616,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         # column is consumed by /sessions/{id} (GET) introspection.
         pre_start_commands=merged_pre_start,
         workspace=workspace,
+        extra_options=extra_options,
     )
     pool = get_pool()
     try:

@@ -599,7 +599,7 @@ class Agent:
         "agent_type", "provider", "model", "cwd", "root",
         "mcp_servers", "skills", "dockerfile",
         "volume_id", "pre_start_commands", "shared_mounts",
-        "resources", "workspace",
+        "resources", "workspace", "extra_options",
     )
 
     def __init__(
@@ -625,6 +625,7 @@ class Agent:
         secrets: dict[str, str] | None = None,
         resources: dict[str, Any] | None = None,
         workspace: str | None = None,
+        extra_options: dict[str, Any] | None = None,
     ):
         self.name = name
         self.agent_type = agent_type
@@ -650,6 +651,14 @@ class Agent:
         # rejects daytona; the property below reads back the raw input,
         # the canonical form lives on the session row.
         self.workspace = workspace
+        # Vendor-specific ACP options forwarded as ``_meta.<vendor>.options``
+        # on the underlying ``session/new`` RPC (see
+        # ``api.acp_client._VENDOR_META_NAMESPACE`` for agent_type → vendor
+        # key). For agent_type="claude" the dict is claude-agent-acp's
+        # ``userProvidedOptions`` (tools, disallowedTools, maxThinkingTokens,
+        # extraArgs, ...). Session-scoped on the server side — set at
+        # session/new, immutable for that session's lifetime.
+        self.extra_options = dict(extra_options) if extra_options else None
         self._user_secrets: dict[str, str] = dict(secrets) if secrets else {}
         self._persist: SqliteSessionDriver | None = SqliteSessionDriver(db) if db else None
 

@@ -83,6 +83,11 @@ class BaseSandboxSession(abc.ABC):
         self._acp_session_id: str | None = None
         self._acp_attached: bool = False
         self._supervisor_installed: bool = False
+        # Session-scoped ACP vendor-options forwarded as
+        # ``_meta.<vendor>.options`` on session/new. Source-of-truth is
+        # the sessions row; bootstrap copies it here so ``_attach_acp``
+        # doesn't need to re-query the DB on cold-create / Type-2 paths.
+        self._extra_options: dict | None = None
         # Cached AcpClient bound to this session's supervisor URL. Constructed
         # lazily on first use, reused across every acp_call / set_mode / etc.
         # so we don't re-handshake TCP+TLS on every notification. Closed in
@@ -153,6 +158,7 @@ class BaseSandboxSession(abc.ABC):
         self._inner_session_id = (
             sess.get("inner_session_id") or self._inner_session_id
         )
+        self._extra_options = sess.get("extra_options") or None
 
         # the runtime-image-unification refactor: the per-volume
         # ``install_supervisor`` step is gone. The supervisor + ACP bins
@@ -190,6 +196,7 @@ class BaseSandboxSession(abc.ABC):
             self.state.recipe.agent_type,
             cwd=self._cwd,
             inner_session_id=self._inner_session_id,
+            extra_options=self._extra_options,
         )
         self._inner_session_id = client.get_inner_session_id(
             self._acp_session_id

@@ -35,6 +35,44 @@ def _normalize_acp_model(model: str, *, agent_type: str) -> str:
     return "default"
 
 
+_VENDOR_META_NAMESPACE: dict[str, str] = {
+    # claude-agent-acp reads `_meta.claudeCode.options` in its session/new
+    # handler (see claude-agent-acp/dist/acp-agent.js:1037). The "options"
+    # dict is then forwarded into Claude Code's userProvidedOptions
+    # (tools, disallowedTools, maxThinkingTokens, extraArgs, ...).
+    "claude": "claudeCode",
+    # TODO: confirm the namespace from each wrapper's actual source before
+    # turning these on. Until then the agent_type is unknown and we drop
+    # ``extra_options`` with a warning.
+    # "codex": "<from @zed-industries/codex-acp>",
+    # "opencode": "<from sst/opencode>",
+    # "cline": "<from cline-acp>",
+}
+
+
+def _meta_for_extra_options(agent: str, extra_options: dict | None) -> dict | None:
+    """Translate ``extra_options`` into the ACP-protocol ``_meta`` payload.
+
+    Returns the dict to set as ``params._meta`` (or ``None`` if there's
+    nothing to send). Logs a warning when the agent_type isn't in the
+    vendor map yet — the option is then dropped rather than guessed.
+    """
+    if not extra_options:
+        return None
+    ns = _VENDOR_META_NAMESPACE.get(agent)
+    if not ns:
+        log.warning(
+            "agent_type=%r has no _meta namespace mapping; "
+            "extra_options will be ignored by the ACP wrapper",
+            agent,
+        )
+        return None
+    # Defensive copy so later mutation of the caller's dict doesn't bleed
+    # through into the on-wire payload (and so the same dict can be reused
+    # across initialize / attach calls).
+    return {ns: {"options": dict(extra_options)}}
+
+
 def _mcp_dict_to_acp_array(mcp_servers: dict) -> list[dict]:
     """Convert {name: config} dict to ACP session/new array format.
 
@@ -178,11 +216,24 @@ class AcpClient:
         )
 
     async def initialize(self, session_id: str, agent: str, cwd: str = "/tmp",
-                         mcp_servers: dict | None = None) -> dict:
-        """Initialize ACP connection and create a fresh agent session."""
+                         mcp_servers: dict | None = None,
+                         extra_options: dict | None = None) -> dict:
+        """Initialize ACP connection and create a fresh agent session.
+
+        ``extra_options`` is a vendor-specific dict (claude-agent-acp's
+        ``userProvidedOptions`` shape for agent_type="claude"). It is
+        wrapped into ``params._meta.<vendor>.options`` on the
+        ``session/new`` RPC, where ``<vendor>`` comes from
+        ``_VENDOR_META_NAMESPACE``. Unknown agent types log a warning
+        and send no ``_meta``.
+        """
         result = await self.handshake(session_id, agent)
         try:
             mcp_array = _mcp_dict_to_acp_array(mcp_servers) if mcp_servers else []
+            meta = _meta_for_extra_options(agent, extra_options)
+            base_params: dict = {"cwd": cwd, "mcpServers": mcp_array}
+            if meta:
+                base_params["_meta"] = meta
             # Retry session/new to absorb transient CLI-not-fully-ready errors
             # on freshly-provisioned sandboxes (observed as ACP -32603 Internal
             # error even after the supervisor's health endpoint reports OK).
@@ -195,7 +246,7 @@ class AcpClient:
             for attempt in range(5):
                 try:
                     new_result = await self._send_rpc(session_id, "session/new",
-                                                      {"cwd": cwd, "mcpServers": mcp_array})
+                                                      base_params)
                     last_exc = None
                     break
                 except RuntimeError as e:
@@ -204,7 +255,7 @@ class AcpClient:
                         await self._send_rpc(session_id, "authenticate",
                                              {"methodId": "openai-api-key"})
                         new_result = await self._send_rpc(session_id, "session/new",
-                                                          {"cwd": cwd, "mcpServers": mcp_array})
+                                                          base_params)
                         last_exc = None
                         break
                     last_exc = e
@@ -253,8 +304,18 @@ class AcpClient:
         cwd: str = "/tmp",
         inner_session_id: str | None = None,
         mcp_servers: dict | None = None,
+        extra_options: dict | None = None,
     ) -> dict:
         """Handshake, then load an existing ACP session or create a new one.
+
+        ``extra_options``: see :meth:`initialize`. Forwarded to the
+        fallback ``initialize`` path when ``session/load`` fails (e.g.
+        sandbox was recreated without a volume snapshot). ``session/load``
+        itself does NOT accept ``_meta.<vendor>.options`` — the options
+        baked in at the original ``session/new`` are restored from the
+        ACP wrapper's session state, so they don't need to be re-sent on
+        load. (Verified against claude-agent-acp/dist/acp-agent.js, where
+        the load handler reuses the session's stored config.)
 
         If ``inner_session_id`` is provided but ``session/load`` fails — the
         ACP server returns ``-32603 Internal error`` when the inner session
@@ -267,7 +328,9 @@ class AcpClient:
         failure forever.
         """
         if not inner_session_id:
-            return await self.initialize(session_id, agent, cwd=cwd, mcp_servers=mcp_servers)
+            return await self.initialize(session_id, agent, cwd=cwd,
+                                         mcp_servers=mcp_servers,
+                                         extra_options=extra_options)
 
         result = await self.handshake(session_id, agent)
         mcp_array = _mcp_dict_to_acp_array(mcp_servers) if mcp_servers else []
@@ -283,7 +346,9 @@ class AcpClient:
                 "session/new (sandbox likely recreated without volume snapshot): %s",
                 inner_session_id, e,
             )
-            return await self.initialize(session_id, agent, cwd=cwd, mcp_servers=mcp_servers)
+            return await self.initialize(session_id, agent, cwd=cwd,
+                                         mcp_servers=mcp_servers,
+                                         extra_options=extra_options)
         self._inner_session_ids[session_id] = inner_session_id
         try:
             await self.set_mode(session_id, "bypassPermissions")

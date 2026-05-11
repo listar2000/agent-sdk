@@ -139,6 +139,14 @@ _MIGRATIONS = [
     # name shape before insert, so the column itself stores the canonical
     # form already.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workspace TEXT",
+    # 2026-05-10: ACP vendor-options pass-through. Stored as JSONB so a
+    # caller can supply an arbitrary dict that ``acp_client.initialize``
+    # translates into ``_meta.<vendor>.options`` on the ``session/new``
+    # RPC (vendor = "claudeCode" for agent_type "claude"; other agent
+    # types' namespaces filled in as their wrappers are confirmed).
+    # NULL = nothing extra; ``session/new`` payload is byte-identical
+    # to pre-extra-options behavior.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS extra_options JSONB",
 ]
 
 
@@ -343,13 +351,17 @@ async def upsert_session(session_id: str, agent_id: str,
                          secrets: dict[str, str] | None = None,
                          cwd: str | None = None,
                          pre_start_commands: list[str] | None = None,
-                         workspace: str | None = None) -> None:
+                         workspace: str | None = None,
+                         extra_options: dict | None = None) -> None:
     """Upsert a session row.
 
     PATCH-like semantics: ``env=None`` / ``secrets=None`` / ``cwd=None`` /
-    ``workspace=None`` means don't touch the stored column on update. Pass
-    ``{}`` / ``""`` to explicitly wipe. ``workspace`` should be the
-    already-normalized form — this writer doesn't validate.
+    ``workspace=None`` / ``extra_options=None`` means don't touch the
+    stored column on update. Pass ``{}`` / ``""`` to explicitly wipe.
+    ``workspace`` should be the already-normalized form — this writer
+    doesn't validate. ``extra_options`` is stored verbatim as JSONB; the
+    translation into ``_meta.<vendor>.options`` happens at the protocol
+    edge in ``acp_client.initialize``.
     """
     cols = ["id", "agent_id", "inner_session_id"]
     vals: list = [session_id, agent_id, inner_session_id]
@@ -364,6 +376,7 @@ async def upsert_session(session_id: str, agent_id: str,
         ("cwd", cwd, lambda v: v),
         ("pre_start_commands", pre_start_commands, Json),
         ("workspace", workspace, lambda v: v),
+        ("extra_options", extra_options, Json),
     ]
     for col, raw, transform in optional:
         if raw is None:
