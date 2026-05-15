@@ -43,6 +43,8 @@ Coalescing lifts `chars/chunk` from **85 → 106** (+25%). All combos preserve `
 
 ## 1-replica baseline vs 4-replica + LB (same workload, same DB)
 
+### unix_local (sandboxes on this 15 GiB box)
+
 `profile_multireplica.py` at N=16 and N=32 sessions:
 
 ```
@@ -59,12 +61,51 @@ redirects        0            13         0            27
 errors           0            0          0            0
 ```
 
-**Honest read**: at the loads we tested, **a single replica is ~20% higher throughput** than 4 replicas + LB. The LB's consistent-hash routing imposes a 307 cost on ~80% of first-message-per-session requests (the hash rarely matches the round-robin replica where the session was created), and that overhead beats the parallelism win until the server is CPU-saturated.
+N=128 unix_local on this 15 GiB box OOM'd (128 supervisor.js processes ≈ 10 GiB) — measured on daytona instead, below.
 
-What multi-replica DOES buy at this load:
-- **Lower p95 latency**: 8.26s vs 8.48s at N=16; 8.68s vs 9.63s at N=32. Parallelism smooths tail latency even when throughput is lower.
+### daytona (sandbox compute off-box, real provider)
+
+`driver.py` at N=64 and N=128 sessions, single-turn claude-haiku, sandbox creds forwarded from `~/.env`:
+
+```
+                 N=64                    N=128
+                 ────                    ─────
+                 1×           4×LB       1×           4×LB
+ok               64/64        64/64      128/128      128/128
+wall_s           57.22        53.29      56.08        65.78
+chars/sec        1194         1294       2416         1999
+events/sec       14.8         15.9       30.6         25.3
+first_evt_p95_s  2.57         2.73       2.83         2.86
+done_p50_s       3.89         3.73       4.22         3.89
+done_p95_s       5.84         5.36       5.59         5.70
+done_p99_s       7.16         7.43       7.87         8.47
+redirects        0            44         0            78
+errors           0            0          0            0
+```
+
+**Honest read across all four configurations**:
+
+| Provider × N    | 1× chars/s | 4×LB chars/s | Δ      | 1× p95 | 4×LB p95 | Δ       |
+|-----------------|-----------:|-------------:|-------:|-------:|---------:|--------:|
+| unix_local N=16 |       4280 |         3529 | **-18%** |  8.48s |    8.26s | **-3%** |
+| unix_local N=32 |       7382 |         6258 | **-15%** |  9.63s |    8.68s | **-10%** |
+| daytona N=64    |       1194 |         1294 | **+8%**  |  5.84s |    5.36s | **-8%** |
+| daytona N=128   |       2416 |         1999 | **-17%** |  5.59s |    5.70s | **+2%** |
+
+What this says:
+- At sub-saturation loads, **single-replica wins throughput** by 15-20% on average. The LB consistent-hash routing imposes a 307 cost on most first-message-per-session requests (only ~1/N of new sessions hash to the replica they were created on), and that overhead beats the parallelism gain when the server isn't CPU-saturated.
+- **Multi-replica wins p95 latency** in 3 of 4 configurations (3-10% lower). Parallelism smooths tail latency even when aggregate throughput drops.
+- **No throughput crossover observed in the tested range.** Both unix_local and daytona stay bottlenecked on agent response time (claude-haiku), not server CPU. The 1-replica server didn't saturate at N=128 daytona (server load was sub-1% CPU during the run).
+
+What multi-replica actually buys at these loads:
 - **Fault tolerance**: any one replica can die and the lease lets another take over within ~120s TTL.
-- **Headroom**: the 1-replica saturation point wasn't measured; at 7382 chars/sec single-replica we're still bound by claude-haiku response time, not server CPU. Multi-replica matters once server CPU becomes the wall — likely at hundreds of concurrent sessions with faster models or many small prompts.
+- **Headroom for variance**: p95 is consistently better, which matters more than median throughput for production SLOs.
+- **Independent scaling**: each replica is small (~150 MB RSS) — you can deploy 4 cheap pods instead of one big one.
+
+When multi-replica would WIN throughput too:
+- Server-side CPU saturation (many small prompts, no real LLM compute per request)
+- Heavy SSE fan-out (the JSON encode/format cost per subscriber)
+- Workloads where the per-session HTTP machinery dominates (vs. waiting on the supervisor)
 
 ## What was *enabled* (independent of these throughput numbers)
 

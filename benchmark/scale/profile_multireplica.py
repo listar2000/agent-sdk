@@ -73,6 +73,7 @@ DB_URL = os.environ.get(
 N_REPLICAS = int(os.environ.get("N_REPLICAS", "4"))
 PORT_BASE = int(os.environ.get("PORT_BASE", "7791"))
 LB_PORT = int(os.environ.get("LB_PORT", "7790"))
+PROVIDER = os.environ.get("PROVIDER", "unix_local")
 # Deployment shape:
 #   "lb"          — N single-worker replicas behind benchmark/scale/lb.py.
 #                   Consistent-hash routing by session_id.
@@ -158,9 +159,9 @@ async def _create_session(c: httpx.AsyncClient, base_url: str, name: str) -> str
     (no session_id in the path yet), so claims spread across replicas."""
     r = await c.post(
         f"{base_url}/sessions",
-        json={"name": name, "provider": "unix_local",
+        json={"name": name, "provider": PROVIDER,
               "agent_type": "claude", "model": "haiku"},
-        timeout=120,
+        timeout=300,  # daytona cold-create can take ~30-60s under load
     )
     r.raise_for_status()
     return r.json()["session_id"]

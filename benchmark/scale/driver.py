@@ -127,14 +127,27 @@ async def _drive_prompt(client: httpx.AsyncClient, session_id: str, idx: int) ->
 
 
 async def _create_session(client: httpx.AsyncClient, idx: int) -> str:
-    """POST /sessions and return session_id. Eager (provisions sandbox)."""
+    """POST /sessions and return session_id. Eager (provisions sandbox).
+
+    Forwards CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY) as a session
+    secret so non-host providers (daytona, modal) can launch claude
+    inside the sandbox. For unix_local the sandbox shares the host's
+    env so the explicit secret is redundant but harmless.
+    """
+    secrets: dict[str, str] = {}
+    for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
+        v = os.environ.get(k)
+        if v:
+            secrets[k] = v
     body = {
         "name": f"bench-{idx}",
         "provider": PROVIDER,
         "agent_type": AGENT_TYPE,
         "model": MODEL,
     }
-    r = await client.post(f"{API}/sessions", json=body, timeout=120)
+    if secrets:
+        body["secrets"] = secrets
+    r = await client.post(f"{API}/sessions", json=body, timeout=300)
     r.raise_for_status()
     return r.json()["session_id"]
 
