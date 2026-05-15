@@ -59,14 +59,17 @@ _LEASE_HEARTBEAT_S = float(os.environ.get("AGENT_SDK_LEASE_HEARTBEAT_S", "15"))
 
 class NotOwner(Exception):
     """Raised by ``SessionPool.get_session`` when another replica holds
-    an unexpired lease on the session. Route handlers translate this into
-    a 307 redirect to ``owner_addr``; if ``owner_addr`` is empty (lease
-    row gone), the caller should map to 503."""
+    an unexpired lease on the session. The 307 handler in ``server.py``
+    consumes ``owner_id`` (replica id, used as the routing cookie value)
+    and ``owner_addr`` (the host:port, for diagnostics). If
+    ``owner_addr`` is empty (lease row gone), the caller should map to
+    503."""
 
-    def __init__(self, session_id: str, owner_addr: str = "") -> None:
-        super().__init__(f"session {session_id} owned by {owner_addr or '<unknown>'}")
+    def __init__(self, session_id: str, owner_addr: str = "", owner_id: str = "") -> None:
+        super().__init__(f"session {session_id} owned by {owner_id or owner_addr or '<unknown>'}")
         self.session_id = session_id
         self.owner_addr = owner_addr
+        self.owner_id = owner_id
 
 
 class SessionPool:
@@ -126,7 +129,8 @@ class SessionPool:
         # We didn't get it. Find out who did so the caller can 307.
         current = claim if claim is not None else await db.read_lease(session_id)
         owner_addr = (current or {}).get("lease_owner_addr") or ""
-        raise NotOwner(session_id=session_id, owner_addr=owner_addr)
+        owner_id = (current or {}).get("lease_owner_id") or ""
+        raise NotOwner(session_id=session_id, owner_addr=owner_addr, owner_id=owner_id)
 
     async def _heartbeat_loop(self, session_id: str) -> None:
         """Renew the lease every ``_LEASE_HEARTBEAT_S``. If we ever lose
@@ -161,6 +165,20 @@ class SessionPool:
                 if cached is not None:
                     asyncio.create_task(_safe_shutdown(cached))
                 return
+            # Refresh the cluster-visible busy flag if there's an
+            # in-flight prompt (signaled by ``_prompt_lock.locked()``).
+            # Without this, prompts that take longer than the 60s TTL
+            # filter on ``busy_at`` would briefly look idle in the
+            # dashboard. Same-owner renewals preserve busy_at so the
+            # only risk is undercount, not overcount.
+            cached = self._active.get(session_id)
+            if cached is not None and cached._prompt_lock.locked():
+                try:
+                    await db.set_session_busy(
+                        session_id, owner_id=self._owner_id, busy=True,
+                    )
+                except Exception:
+                    log.warning("heartbeat: busy refresh failed for %s", session_id)
 
     async def get_session(
         self,

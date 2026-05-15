@@ -270,18 +270,30 @@ async def _not_owner_handler(request: Request, exc: _NotOwner):
                 "Connection": "close",
             },
         )
-    target = f"http://{exc.owner_addr}{request.url.path}"
+    # Relative Location so the client (browser, SDK) retries against the
+    # same public URL — the LB will use the Set-Cookie below to steer the
+    # retry at the owner replica. Absolute URLs into ``*.railway.internal``
+    # don't resolve from a browser sitting outside Railway's private net.
+    target = request.url.path
     if request.url.query:
         target += f"?{request.url.query}"
-    return Response(
-        status_code=307,
-        headers={
-            "Location": target,
-            # Surface the owner explicitly so clients that don't follow
-            # 307 can still see where to retry against.
-            "X-Session-Owner": exc.owner_addr,
-        },
-    )
+    headers = {
+        "Location": target,
+        "X-Session-Owner": exc.owner_addr,
+    }
+    # Per-session sticky-route cookie. ``Path=/sessions/<sid>`` scopes it
+    # so cookies for different sessions don't collide and POST /sessions
+    # (which has no sid in the URL) isn't influenced by a previous
+    # session's owner. The cookie value is the OWNER's replica_id, which
+    # nginx maps to the owner's private hostname via the cookie→backend
+    # map in ``benchmark/scale/nginx.conf`` / ``deploy/nginx/nginx.conf``.
+    if exc.owner_id:
+        path_scope = f"/sessions/{exc.session_id}"
+        headers["Set-Cookie"] = (
+            f"agent_sdk_route={exc.owner_id}; "
+            f"Path={path_scope}; Max-Age=86400; HttpOnly; SameSite=Lax"
+        )
+    return Response(status_code=307, headers=headers)
 
 
 async def _json_body(request: Request) -> dict:
@@ -1073,17 +1085,12 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
 async def admin_list_sessions():
     """List sessions for the dashboard + cleanup debugging.
 
-    Cluster-aware: in a multi-replica deploy each replica's in-memory
-    pool only holds sessions where it owns the lease. Aggregating across
-    replicas would require fanning out HTTP calls; instead we synthesize
-    the row from the DB (sessions row + lease columns) so any replica
-    can answer the global query consistently.
-
-    The fields the UI / golden tests consume (``inner_session_id``,
-    ``sandbox_ref``, ``agent_id``) are all persisted by the pool right
-    after each ACP attach, so the DB row IS the live-snapshot for these
-    keys. Subscriber-count / busy fields are local-only — we mark them
-    as ``0`` / ``False`` for sessions owned by peer replicas.
+    Cluster-aware. Only sessions with a currently-held lease are
+    returned here (the "active" list); cold / inactive sessions are
+    available at ``/admin/sessions/inactive``. ``agent_busy`` is read
+    from the DB ``busy_at`` column with a 60s TTL filter so a crashed
+    replica can't leave a stuck flag — the next lease claim resets it
+    too as a belt-and-braces.
     """
     from api.sandbox import get_pool
     pool = get_pool()
@@ -1092,6 +1099,9 @@ async def admin_list_sessions():
     sessions_out: list[dict] = []
     instances_out: list[dict] = []
     for r in rows:
+        if not r.get("leased"):
+            # Cold / unleased — surfaced via /admin/sessions/inactive.
+            continue
         sid = r["id"]
         sb = r.get("sandbox_state") or {}
         sandbox_ref = sb.get("sandbox_ref") if isinstance(sb, dict) else None
@@ -1104,17 +1114,18 @@ async def admin_list_sessions():
             "agent_id": r["agent_id"],
             "sandbox_ref": sandbox_ref,
             "inner_session_id": r.get("inner_session_id"),
-            "agent_busy": bool(cached and cached._subscribers),
+            # Cluster-wide busy signal — set by the owner on prompt
+            # start, refreshed every heartbeat while in-flight,
+            # cleared on prompt end. TTL filter on the DB read
+            # auto-cleans crashed replicas.
+            "agent_busy": bool(r.get("busy")),
             "active_rpc_id": None,
             "pending_count": 0,
             "session_subscribers": len(cached._subscribers) if cached else 0,
             "rpc_subscribers": 0,
             "shutdown": False,
-            # New: surface the lease owner so dashboards + tests can see
-            # which replica is currently driving the session.
-            "lease_owner_addr": (
-                cached._acp_client.base_url if cached and cached._acp_client else None
-            ) or None,
+            "lease_owner_id": r.get("lease_owner_id"),
+            "lease_owner_addr": r.get("lease_owner_addr"),
             "owned_by_me": is_mine,
         })
         if sandbox_ref:
@@ -1134,11 +1145,15 @@ async def admin_list_inactive_sessions(
     q: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
 ):
-    """DB session rows not currently leased by the pool. Optional ``q``
-    name-substring filter and ``limit`` cap (default 100, max 1000)
-    are applied at the DB layer."""
-    from api.sandbox import get_pool
-    active = get_pool()._active  # noqa: SLF001 — admin readout
+    """DB session rows whose lease is expired or absent — cluster-wide.
+    Optional ``q`` name-substring filter and ``limit`` cap (default 100,
+    max 1000) are applied at the DB layer.
+
+    Cluster-aware via the ``leased`` derived column on
+    ``list_sessions``: ``leased = lease_owner_id IS NOT NULL AND
+    lease_expires_at > now()``. A peer replica's leased session won't
+    show up here regardless of which replica answers the query.
+    """
     return {"sessions": [
         {
             "session_id": r["id"],
@@ -1146,7 +1161,7 @@ async def admin_list_inactive_sessions(
             "inner_session_id": r["inner_session_id"],
             "sandbox_ref": (r["sandbox_state"] or {}).get("sandbox_ref"),
         }
-        for r in await list_sessions(q=q, limit=limit) if r["id"] not in active
+        for r in await list_sessions(q=q, limit=limit) if not r.get("leased")
     ]}
 
 
@@ -1496,25 +1511,33 @@ async def sessions_create(request: Request):
     (eager) into one endpoint with consistent naming.
     """
     data = await _json_body(request)
+    # Client-supplied session_id. The SDK generates a UUID up front and
+    # sends it BOTH in the request body (``id``) and in the
+    # ``X-Session-Id`` header so the LB can consistent-hash on it (the
+    # body isn't visible to nginx; the header is). If both are present
+    # they must match — otherwise routing and storage disagree. Fall
+    # back to server-generated UUID if neither is set (backward-compat
+    # for old SDK builds).
+    header_id = request.headers.get("x-session-id")
+    body_id = data.get("id")
+    if header_id and body_id and header_id != body_id:
+        raise HTTPException(
+            400,
+            "X-Session-Id header does not match body 'id'",
+        )
+    supplied_id = header_id or body_id
+    if supplied_id is not None:
+        try:
+            uuid.UUID(supplied_id)
+        except (ValueError, TypeError):
+            raise HTTPException(400, f"invalid session id format: {supplied_id!r}")
+        existing = await get_session(supplied_id)
+        if existing is not None:
+            raise HTTPException(409, f"session id {supplied_id} already exists")
+        data["id"] = supplied_id
     if data.get("provision", True):
-        result = await _sessions_create_eager(data)
-    else:
-        result = await _sessions_create_lazy(data)
-    # Sticky-session hint for an external LB: set a cookie naming THIS
-    # replica so subsequent /sessions/{id}/* requests can hash on
-    # ``$cookie_agent_sdk_route`` and land on the lease owner without
-    # paying the lease's 307 tax. The cookie is opaque to anything but
-    # the LB — clients don't need to read it. Path is restricted to
-    # /sessions so it doesn't pollute other endpoints' cookie space.
-    from api.identity import replica_id as _replica_id
-    from fastapi.responses import JSONResponse as _JR
-    response = _JR(result)
-    response.set_cookie(
-        "agent_sdk_route", _replica_id(),
-        path="/sessions", httponly=True, samesite="lax",
-        max_age=86400,
-    )
-    return response
+        return await _sessions_create_eager(data)
+    return await _sessions_create_lazy(data)
 
 
 async def _sessions_create_lazy(data: dict) -> dict:
@@ -1572,7 +1595,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
         default_cwd = default_cwd_for_provider(default_provider)
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
-    session_id = str(uuid.uuid4())
+    session_id = data.get("id") or str(uuid.uuid4())
     lazy_user_pre_start = data.get("pre_start_commands") or []
     await upsert_session(
         session_id, agent_id, inner_session_id=None,
@@ -1710,7 +1733,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         credential_refresh_token=data.get("credential_refresh_token"),
     )
 
-    session_id = str(uuid.uuid4())
+    session_id = data.get("id") or str(uuid.uuid4())
     await upsert_session(
         session_id, agent_id, inner_session_id=None,
         volume_id=volume_record.id,
@@ -2286,6 +2309,17 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
     # ever runs. The two-step split eliminates that 20s phantom delay.
     sid, q = session.register_subscriber()
 
+    # Cluster-visible busy flag — ``busy_at`` on the sessions row is
+    # read by /admin/sessions with a 60s TTL so a crashed replica
+    # can't leave it stuck (lease takeover also resets it).
+    from api.sandbox import get_pool as _get_pool
+    from api import db as _db
+    _owner_id = _get_pool()._owner_id  # noqa: SLF001 — same module's pool
+    try:
+        await _db.set_session_busy(session.session_id, owner_id=_owner_id, busy=True)
+    except Exception:
+        log.warning("set_session_busy(True) failed for %s", session.session_id)
+
     async def _drive():
         await _persist_prompt_events(session, message, rpc_id)
 
@@ -2350,6 +2384,10 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
                 await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
             except (asyncio.TimeoutError, Exception):
                 pass
+        try:
+            await _db.set_session_busy(session.session_id, owner_id=_owner_id, busy=False)
+        except Exception:
+            log.warning("set_session_busy(False) failed for %s", session.session_id)
 
 
 @app.post("/sessions/{session_id}/cancel")

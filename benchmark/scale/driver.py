@@ -133,17 +133,25 @@ async def _drive_prompt(client: httpx.AsyncClient, session_id: str, idx: int) ->
 async def _create_session(client: httpx.AsyncClient, idx: int) -> str:
     """POST /sessions and return session_id. Eager (provisions sandbox).
 
+    Mirrors the SDK's client-side UUID + ``X-Session-Id`` pattern so the
+    LB can consistent-hash POST + subsequent requests to the same
+    replica (zero-redirect steady state). Without the header the LB
+    would round-robin POST and then consistent-hash subsequent
+    requests; the resulting mismatch pays one 307 + Set-Cookie hop per
+    session.
+
     Forwards CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY) as a session
-    secret so non-host providers (daytona, modal) can launch claude
-    inside the sandbox. For unix_local the sandbox shares the host's
-    env so the explicit secret is redundant but harmless.
+    secret so non-host providers can launch claude inside the sandbox.
     """
+    import uuid as _uuid
+    session_id = str(_uuid.uuid4())
     secrets: dict[str, str] = {}
     for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
         v = os.environ.get(k)
         if v:
             secrets[k] = v
     body = {
+        "id": session_id,
         "name": f"bench-{idx}",
         "provider": PROVIDER,
         "agent_type": AGENT_TYPE,
@@ -151,9 +159,14 @@ async def _create_session(client: httpx.AsyncClient, idx: int) -> str:
     }
     if secrets:
         body["secrets"] = secrets
-    r = await client.post(f"{API}/sessions", json=body, timeout=300)
+    r = await client.post(
+        f"{API}/sessions",
+        json=body,
+        headers={"X-Session-Id": session_id},
+        timeout=300,
+    )
     r.raise_for_status()
-    return r.json()["session_id"]
+    return session_id
 
 
 async def _delete_session(client: httpx.AsyncClient, sid: str) -> None:

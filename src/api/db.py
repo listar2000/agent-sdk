@@ -165,6 +165,12 @@ _MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_sessions_lease_expiry"
     " ON sessions(lease_expires_at) WHERE lease_owner_id IS NOT NULL",
+    # 2026-05-15: per-session ``busy`` flag — wall-time of the most
+    # recent prompt activity on the lease-owning replica. Cluster-wide
+    # readable; read with a TTL filter (e.g. ``busy_at > now() - 60s``)
+    # so stale flags from crashed replicas auto-clean. The atomic lease
+    # claim also resets this on takeover.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS busy_at TIMESTAMPTZ",
 ]
 
 
@@ -445,10 +451,16 @@ async def list_sessions(q: str | None = None, limit: int = 100) -> list[dict]:
     """Session rows, newest first. ``q`` is an optional case-insensitive
     substring filter on the agent's display name. ``limit`` caps the
     result set (default 100) so the dashboard doesn't pull thousands of
-    rows when no search is active."""
+    rows when no search is active. Returns the lease columns so callers
+    can distinguish ``leased`` (some replica owns it) from ``cold``
+    (no live lease) without a second query."""
     sql = (
         "SELECT s.id, s.agent_id, s.inner_session_id, s.volume_id, s.workspace,"
-        " s.sandbox_state, s.created_at"
+        " s.sandbox_state, s.created_at,"
+        " s.lease_owner_id, s.lease_owner_addr, s.lease_expires_at,"
+        " (s.lease_owner_id IS NOT NULL AND s.lease_expires_at > now()) AS leased,"
+        " s.busy_at,"
+        " (s.busy_at > now() - interval '60 seconds') AS busy"
         " FROM sessions s LEFT JOIN agents a ON a.id = s.agent_id"
     )
     params: tuple = ()
@@ -460,6 +472,8 @@ async def list_sessions(q: str | None = None, limit: int = 100) -> list[dict]:
     async with get_db() as conn:
         rows = await (await conn.execute(sql, params)).fetchall()
     return [dict(r) for r in rows]
+
+
 
 
 async def get_session_env(session_id: str) -> dict[str, str]:
@@ -552,6 +566,11 @@ async def try_claim_lease(
     actual ownership transfer (previous owner was NULL or expired) does.
     """
     async with get_db() as conn:
+        # Reset ``busy_at`` on every ownership transfer (i.e. when
+        # lease_owner_id changes) so a crashed prior owner can't leave
+        # a stale busy flag stuck on the row. Same-owner renewals
+        # preserve the existing busy_at — the running prompt should
+        # continue to look busy across heartbeats.
         row = await (await conn.execute(
             "UPDATE sessions"
             "   SET lease_owner_id = %s,"
@@ -560,13 +579,17 @@ async def try_claim_lease(
             "       lease_generation = CASE"
             "           WHEN lease_owner_id = %s THEN lease_generation"
             "           ELSE lease_generation + 1"
+            "       END,"
+            "       busy_at = CASE"
+            "           WHEN lease_owner_id = %s THEN busy_at"
+            "           ELSE NULL"
             "       END"
             " WHERE id = %s"
             "   AND (lease_owner_id IS NULL"
             "        OR lease_owner_id = %s"
             "        OR lease_expires_at < now())"
             " RETURNING lease_owner_id, lease_owner_addr, lease_generation",
-            (owner_id, owner_addr, ttl_seconds, owner_id, session_id, owner_id),
+            (owner_id, owner_addr, ttl_seconds, owner_id, owner_id, session_id, owner_id),
         )).fetchone()
     return dict(row) if row else None
 
@@ -589,10 +612,31 @@ async def release_lease(session_id: str, *, owner_id: str) -> None:
     async with get_db() as conn:
         await conn.execute(
             "UPDATE sessions SET lease_owner_id = NULL,"
-            " lease_owner_addr = NULL, lease_expires_at = NULL"
+            " lease_owner_addr = NULL, lease_expires_at = NULL,"
+            " busy_at = NULL"
             " WHERE id = %s AND lease_owner_id = %s",
             (session_id, owner_id),
         )
+
+
+async def set_session_busy(session_id: str, *, owner_id: str, busy: bool) -> None:
+    """Set or clear the ``busy_at`` flag. Scoped to the lease owner so
+    a stale background task on a former owner can't bump the flag after
+    ownership transferred. Idempotent and safe to call without checking
+    the lease (the WHERE clause filters)."""
+    async with get_db() as conn:
+        if busy:
+            await conn.execute(
+                "UPDATE sessions SET busy_at = now()"
+                " WHERE id = %s AND lease_owner_id = %s",
+                (session_id, owner_id),
+            )
+        else:
+            await conn.execute(
+                "UPDATE sessions SET busy_at = NULL"
+                " WHERE id = %s AND lease_owner_id = %s",
+                (session_id, owner_id),
+            )
 
 
 async def live_sandbox_refs() -> set[str]:
