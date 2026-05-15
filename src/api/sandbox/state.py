@@ -110,6 +110,19 @@ class Recipe(BaseModel):
     agent_type: str = "opencode"
     pre_start_commands: list[str] = Field(default_factory=list)
     resources: Resources | None = None
+    # Optional credential-refresh hook. When set, ``SessionPool`` spawns
+    # one background task per active session that POSTs to
+    # ``credential_refresh_url`` with ``credential_refresh_token`` as
+    # bearer, expecting JSON:
+    #     {"contents": {"<abs-path>": "<base64-content>", ...},
+    #      "next_refresh_at": <unix-ts>}
+    # Each file is written atomically into the sandbox; the task sleeps
+    # until ``next_refresh_at`` and polls again. Lifecycle is tied to
+    # the active session: started on every wake (cold create + resume),
+    # cancelled on hibernation/release. Designed for short-TTL tokens
+    # (GitHub installation tokens, etc.) without an in-sandbox daemon.
+    credential_refresh_url: str | None = None
+    credential_refresh_token: str | None = None
 
 
 class _BaseSandboxState(BaseModel):
