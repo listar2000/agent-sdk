@@ -104,6 +104,10 @@ class ApiClient:
             # read=None lets SSE streams stay open indefinitely; other
             # verbs are bounded by ``timeout``.
             timeout=httpx.Timeout(timeout, read=None),
+            # Multi-replica deploys send 307s when a request lands on a
+            # non-owner. Follow transparently so callers don't need to
+            # know about the lease routing layer.
+            follow_redirects=True,
         )
 
     @property
