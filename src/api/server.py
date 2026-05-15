@@ -37,6 +37,7 @@ from fastapi.responses import (
 )
 
 from .acp_client import AcpClient, _mcp_dict_to_acp_array
+from .event_buffer import get_batcher, start_batcher, stop_batcher
 from .db import (
     close_pool,
     count_sessions_by_volume,
@@ -148,6 +149,7 @@ async def lifespan(app):
         )
     init_db()
     await init_pool()
+    await start_batcher()
 
     global _HTTP_CLIENT
     _HTTP_CLIENT = httpx.AsyncClient(
@@ -177,6 +179,10 @@ async def lifespan(app):
         await shutdown_pool()
     except Exception as e:
         log.warning("shutdown_pool failed: %s", e)
+    try:
+        await stop_batcher()
+    except Exception as e:
+        log.warning("stop_batcher failed: %s", e)
     await close_pool()
     if _HTTP_CLIENT is not None:
         await _HTTP_CLIENT.aclose()
@@ -214,6 +220,68 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
     if isinstance(detail, dict):
         return JSONResponse(detail, status_code=exc.status_code)
     return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+# NotOwner → 307 redirect. Triggered when ``SessionPool.get_session`` finds
+# that another replica holds the unexpired lease for this session.
+# Streaming endpoints (``/message+stream``, ``/events``) hit this too —
+# httpx clients with ``follow_redirects=True`` transparently follow; clients
+# that don't will see the 307 and can reconnect at the Location URL.
+from .sandbox.pool import NotOwner as _NotOwner  # noqa: E402
+
+
+@app.exception_handler(_NotOwner)
+async def _not_owner_handler(request: Request, exc: _NotOwner):
+    if not exc.owner_addr:
+        # Lease row missing the addr column or no owner currently — most
+        # likely a session whose row was deleted out-of-band. 503 lets the
+        # client retry; we don't want to redirect into a black hole.
+        return JSONResponse(
+            {"error": "session has no reachable owner", "session_id": exc.session_id},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    # Intra-replica miss: another worker on the SAME host:port already
+    # holds the lease. 307'ing to our own addr just kernel-rebalances
+    # via SO_REUSEPORT and (1/N)·N retries hit a redirect loop until
+    # httpx's max_redirects gives up. Return 503 with a tight retry-after
+    # instead — the client (or its LB) backs off briefly, the kernel
+    # re-schedules, and eventually the request lands on the right worker.
+    # See `benchmark/scale/RESULTS.md` for the recommended deploy shape
+    # (workers=1 per replica; scale via replica count, not worker count).
+    from .identity import owner_addr as _my_addr
+    if exc.owner_addr == _my_addr():
+        return JSONResponse(
+            {
+                "error": "session owned by peer worker on this replica",
+                "session_id": exc.session_id,
+                "owner_addr": exc.owner_addr,
+            },
+            status_code=503,
+            headers={
+                "Retry-After": "0",
+                "X-Session-Owner": exc.owner_addr,
+                "X-Intra-Replica-Miss": "1",
+                # Force the client to drop the TCP connection. SO_REUSEPORT
+                # is 4-tuple-stable, so reusing the same socket would
+                # deterministically reroute the retry to THIS same worker
+                # → infinite 503 loop. Closing the conn forces a fresh
+                # 4-tuple and lets the kernel schedule onto a peer.
+                "Connection": "close",
+            },
+        )
+    target = f"http://{exc.owner_addr}{request.url.path}"
+    if request.url.query:
+        target += f"?{request.url.query}"
+    return Response(
+        status_code=307,
+        headers={
+            "Location": target,
+            # Surface the owner explicitly so clients that don't follow
+            # 307 can still see where to retry against.
+            "X-Session-Owner": exc.owner_addr,
+        },
+    )
 
 
 async def _json_body(request: Request) -> dict:
@@ -1003,47 +1071,62 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
 
 @app.get("/admin/sessions")
 async def admin_list_sessions():
-    """List in-memory pool sessions for the dashboard + cleanup debugging.
+    """List sessions for the dashboard + cleanup debugging.
 
-    The legacy response shape is preserved so ``ui/dashboard.html``
-    doesn't have to change: ``sessions[].agent_busy`` /
-    ``active_rpc_id`` / etc. are constants — the pool's per-prompt SSE
-    replaced the persistent reader's busy-flag bookkeeping.
+    Cluster-aware: in a multi-replica deploy each replica's in-memory
+    pool only holds sessions where it owns the lease. Aggregating across
+    replicas would require fanning out HTTP calls; instead we synthesize
+    the row from the DB (sessions row + lease columns) so any replica
+    can answer the global query consistently.
+
+    The fields the UI / golden tests consume (``inner_session_id``,
+    ``sandbox_ref``, ``agent_id``) are all persisted by the pool right
+    after each ACP attach, so the DB row IS the live-snapshot for these
+    keys. Subscriber-count / busy fields are local-only — we mark them
+    as ``0`` / ``False`` for sessions owned by peer replicas.
     """
     from api.sandbox import get_pool
     pool = get_pool()
-    return {
-        "sessions": [
-            {
-                "session_id": sid,
-                "agent_id": sess._agent_id,
-                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
-                "inner_session_id": sess.inner_session_id,
-                # "active subscriber" is the closest pool-level proxy for
-                # the dashboard's "running" badge — there's no per-prompt
-                # busy flag in the pool (per-prompt SSE replaces it).
-                "agent_busy": len(sess._subscribers) > 0,
-                "active_rpc_id": None,
-                "pending_count": 0,
-                "session_subscribers": len(sess._subscribers),
-                "rpc_subscribers": 0,
-                "shutdown": False,
-            }
-            for sid, sess in pool._active.items()  # noqa: SLF001 — admin readout
-        ],
-        "instances": [
-            {
-                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
-                "provider": getattr(sess.state, "type", "unknown"),
-                "url": sess.supervisor_url,
-                "port": getattr(sess.state, "listen_port", None),
+    my_addr = pool._owner_addr  # noqa: SLF001
+    rows = await list_sessions(limit=10000)
+    sessions_out: list[dict] = []
+    instances_out: list[dict] = []
+    for r in rows:
+        sid = r["id"]
+        sb = r.get("sandbox_state") or {}
+        sandbox_ref = sb.get("sandbox_ref") if isinstance(sb, dict) else None
+        provider = sb.get("type", "unknown") if isinstance(sb, dict) else "unknown"
+        listen_port = sb.get("listen_port") if isinstance(sb, dict) else None
+        cached = pool._active.get(sid)  # noqa: SLF001 — admin readout
+        is_mine = cached is not None
+        sessions_out.append({
+            "session_id": sid,
+            "agent_id": r["agent_id"],
+            "sandbox_ref": sandbox_ref,
+            "inner_session_id": r.get("inner_session_id"),
+            "agent_busy": bool(cached and cached._subscribers),
+            "active_rpc_id": None,
+            "pending_count": 0,
+            "session_subscribers": len(cached._subscribers) if cached else 0,
+            "rpc_subscribers": 0,
+            "shutdown": False,
+            # New: surface the lease owner so dashboards + tests can see
+            # which replica is currently driving the session.
+            "lease_owner_addr": (
+                cached._acp_client.base_url if cached and cached._acp_client else None
+            ) or None,
+            "owned_by_me": is_mine,
+        })
+        if sandbox_ref:
+            instances_out.append({
+                "sandbox_ref": sandbox_ref,
+                "provider": provider,
+                "url": cached.supervisor_url if cached else None,
+                "port": listen_port,
                 "container_id": None,
-                "process_alive": sess.supervisor_url is not None,
-            }
-            for _sid, sess in pool._active.items()  # noqa: SLF001
-            if sess.supervisor_url is not None
-        ],
-    }
+                "process_alive": is_mine and cached.supervisor_url is not None,
+            })
+    return {"sessions": sessions_out, "instances": instances_out, "this_replica": my_addr}
 
 
 @app.get("/admin/sessions/inactive")
@@ -1730,14 +1813,29 @@ async def _persist_user_message(session, message: str, rpc_id: str) -> None:
     Best-effort — a DB hiccup must not block the prompt from being sent
     to the supervisor. The matching turn-end / tool / text rows are
     written by ``_persist_prompt_events`` as ``execute_prompt`` yields.
+
+    Routes through the per-process ``SessionLogBatcher`` when available
+    (the production path under lifespan); falls back to a direct INSERT
+    in test contexts that bypass ``start_batcher`` so unit tests keep
+    seeing user_message rows synchronously.
     """
+    payload = {"text": redact_secrets(message), "prompt_id": rpc_id}
     try:
-        await log_event(
-            session_id=session.session_id,
-            agent_id=session._agent_id or "",
-            event_type=EVT_USER_MESSAGE,
-            payload={"text": redact_secrets(message), "prompt_id": rpc_id},
-        )
+        batcher = get_batcher()
+        if batcher is not None:
+            await batcher.add(
+                session_id=session.session_id,
+                agent_id=session._agent_id or "",
+                event_type=EVT_USER_MESSAGE,
+                payload=payload,
+            )
+        else:
+            await log_event(
+                session_id=session.session_id,
+                agent_id=session._agent_id or "",
+                event_type=EVT_USER_MESSAGE,
+                payload=payload,
+            )
     except Exception:
         log.exception("user_message log_event failed for session %s rpc=%s",
                       session.session_id, rpc_id)
@@ -1790,12 +1888,21 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
             payload["text"] = redact_secrets(payload["text"])
         payload["prompt_id"] = rpc_id
         try:
-            await log_event(
-                session_id=session.session_id,
-                agent_id=agent_id,
-                event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
-                payload=payload,
-            )
+            batcher = get_batcher()
+            if batcher is not None:
+                await batcher.add(
+                    session_id=session.session_id,
+                    agent_id=agent_id,
+                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
+                    payload=payload,
+                )
+            else:
+                await log_event(
+                    session_id=session.session_id,
+                    agent_id=agent_id,
+                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
+                    payload=payload,
+                )
         except Exception:
             log.exception("log_event(%s) failed for session %s rpc=%s",
                           etype, session.session_id, rpc_id)
@@ -1822,22 +1929,19 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
     # cancel buffer flush) MUST run while the lock is held — otherwise
     # the next prompt's persist task can interleave its writes with
     # this prompt's tail and the log row order de-syncs from SSE.
-    async with session._prompt_lock:
-        # Log the user_message INSIDE the lock so log row order tracks
-        # actual execution order. Writing it outside (as the SSE caller
-        # does, before spawning ``_drive``) lets queued prompts produce
-        # interleaved ``user_message_A, user_message_B, user_message_C,
-        # turn_end_A, ...`` — the test ``test_queued_prompts_parity``
-        # asserts user_message[i] < turn_end[i] which that ordering
-        # violates.
-        await _persist_user_message(session, message, rpc_id)
+    async def _drive_one(active_session) -> tuple[bool, Exception | None]:
+        """Drive execute_prompt on a specific session; return
+        (terminal_seen, last_exception). ``terminal_seen=True`` means we
+        consumed a ``done`` or ``error`` event — the rpc is complete and
+        no retry is appropriate. Otherwise ``False`` + exception means
+        the supervisor died mid-flight and the caller should retry on
+        the pool's current session."""
+        terminal = False
         try:
-            async for event in session.execute_prompt(message, rpc_id=rpc_id):
+            async for event in active_session.execute_prompt(message, rpc_id=rpc_id):
                 if not isinstance(event, dict):
                     continue
                 t = event.get("type")
-                # Coalesce consecutive text/reasoning chunks; flush on
-                # type-change so order and adjacency are preserved.
                 if t == "text":
                     if think_buf:
                         await _flush_buffers()
@@ -1847,47 +1951,77 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
                         await _flush_buffers()
                     think_buf.append(event.get("text", ""))
                 elif t == "usage":
-                    # Usage updates can fire mid-stream and don't break
-                    # the surrounding text/reasoning block — write usage
-                    # as a discrete row without flushing buffers, matching
-                    # the SSE canonicalization in ``_sse_to_canonical``.
                     await _write(event)
                 else:
-                    # Tool/tool_result/done/error terminate the current
-                    # text/think block before writing themselves, so
-                    # order is stable across consumers.
                     await _flush_buffers()
                     await _write(event)
-            # Stream ended without a terminal event (rare — usually
-            # ``done`` closes it); flush anything still buffered.
+                    if t in ("done", "error"):
+                        terminal = True
             await _flush_buffers()
+            return True, None
         except Exception as e:
-            log.exception("execute_prompt failed for session %s rpc=%s",
-                          session.session_id, rpc_id)
-            await _flush_buffers()
-            await _write({
-                "type": "error",
-                "message": str(e)[:500], "kind": type(e).__name__,
-            })
-            # Broadcast as a JSON-RPC error envelope so consumers that
-            # parse SSE blocks via ``parse_acp_event`` (UI, the test
-            # ``_PersistentSse`` reader, the SDK ``astream`` adapter)
-            # recognise it as an ``error`` frame and surface it. The
-            # ``rpc_id`` / ``type`` keys remain for the older dict-shape
-            # consumers in ``_execute_and_stream_sse`` that filter by
-            # rpc_id before yielding to SSE.
-            session._broadcast({
-                "type": "error", "rpc_id": rpc_id,
-                "jsonrpc": "2.0", "id": rpc_id,
-                "error": {
-                    "code": -32603,
-                    "message": str(e),
-                    "data": {
-                        "kind": type(e).__name__,
-                        "exception_type": type(e).__name__,
+            return terminal, e
+
+    async with session._prompt_lock:
+        # Log the user_message INSIDE the lock so log row order tracks
+        # actual execution order.
+        await _persist_user_message(session, message, rpc_id)
+        try:
+            ok, exc = await _drive_one(session)
+            # Supervisor died mid-prompt? If the pool already cold-recovered
+            # the session (a sibling request observed alive=False and swapped
+            # in a new SandboxSession), retry once on the fresh session —
+            # this is the race that lost ``rpc=41095a61`` events on modal
+            # ``test_message_immediately_after_stop``: the error broadcast
+            # would otherwise land on a dict that was cleared during the
+            # migration, and the SDK would time out waiting for an event
+            # that never arrives.
+            if not ok and exc is not None:
+                try:
+                    from api.sandbox import get_pool as _gp
+                    replacement = await _gp().get_session(session.session_id)
+                except Exception:
+                    replacement = None
+                if replacement is not None and replacement is not session:
+                    log.info(
+                        "execute_prompt retry: session %s recovered rpc=%s",
+                        session.session_id, rpc_id,
+                    )
+                    text_buf.clear(); think_buf.clear()
+                    session = replacement  # downstream writes use the new one
+                    ok, exc = await _drive_one(replacement)
+            if not ok:
+                e = exc if exc is not None else RuntimeError(
+                    "stream ended without terminal event"
+                )
+                log.exception(
+                    "execute_prompt failed for session %s rpc=%s: %s",
+                    session.session_id, rpc_id, e,
+                )
+                await _flush_buffers()
+                await _write({
+                    "type": "error",
+                    "message": str(e)[:500], "kind": type(e).__name__,
+                })
+                # Broadcast to whichever session the pool currently has —
+                # NOT necessarily the one we started with. The old session's
+                # ``_subscribers`` dict may have been migrated to the new
+                # session by ``pool.get_session``'s subscriber hand-off;
+                # broadcasting to the stale ref reaches an empty dict.
+                from api.sandbox import get_pool as _gp2
+                current = _gp2()._active.get(session.session_id, session)  # noqa: SLF001
+                current._broadcast({
+                    "type": "error", "rpc_id": rpc_id,
+                    "jsonrpc": "2.0", "id": rpc_id,
+                    "error": {
+                        "code": -32603,
+                        "message": str(e),
+                        "data": {
+                            "kind": type(e).__name__,
+                            "exception_type": type(e).__name__,
+                        },
                     },
-                },
-            })
+                })
         finally:
             # Hard-cancel path: ``CancelledError`` is a ``BaseException``
             # in Python 3.8+ and bypasses ``except Exception``. Without
@@ -1917,6 +2051,12 @@ async def post_session_message(session_id: str, request: Request):
     the in-flight prompt (if any) is cancelled — same effect as
     ``POST /sessions/{id}/cancel`` followed by this POST — so callers
     don't have to round-trip twice.
+
+    Lease acquisition happens BEFORE the 200 reply so a NotOwner can
+    surface as 307 via the global exception handler. Deferring the
+    claim into the background drain would 200 the client, fire-and-
+    silently-fail the drain (no way to signal back), and leave the
+    rpc orphaned — the multi-replica flake that broke goldens before.
     """
     data = await _json_body(request)
     message = data.get("message")
@@ -1925,20 +2065,24 @@ async def post_session_message(session_id: str, request: Request):
 
     rpc_id = str(uuid.uuid4())
 
+    # Claim the lease before returning 200. NotOwner propagates to the
+    # FastAPI exception handler which emits 307 (cross-replica) or 503
+    # (peer worker) — the SDK retries against the right replica.
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+
     if data.get("interrupt"):
         # Best-effort: cancel the running ACP turn so this prompt
         # supersedes it. The cancelled turn's ``done`` event arrives via
         # the existing SSE stream with ``stop_reason="cancelled"`` and
         # is logged like any other turn_end.
-        from api.sandbox import get_pool
         try:
-            pool_session = await get_pool().get_session(session_id)
             await pool_session.cancel_active_prompt()
         except Exception:
             log.exception("interrupt cancel failed for session %s", session_id)
 
     async def _drain() -> None:
-        async for _ in _execute_and_stream_sse(session_id, message, rpc_id):
+        async for _ in _execute_and_stream_sse_for(pool_session, message, rpc_id):
             pass
 
     task = asyncio.create_task(_drain())
@@ -1953,17 +2097,24 @@ async def _log_session_acquire_error(session_id: str, rpc_id: str,
     a session object to broadcast through. Writes the error to
     session_log so /sessions/{id}/log readers see it.
     """
+    payload = {
+        "prompt_id": rpc_id,
+        "kind": type(err).__name__,
+        "message": str(err)[:500],
+        "phase": "pool.get_session",
+    }
     try:
-        await log_event(
-            session_id=session_id, agent_id="",
-            event_type=EVT_ERROR,
-            payload={
-                "prompt_id": rpc_id,
-                "kind": type(err).__name__,
-                "message": str(err)[:500],
-                "phase": "pool.get_session",
-            },
-        )
+        batcher = get_batcher()
+        if batcher is not None:
+            await batcher.add(
+                session_id=session_id, agent_id="",
+                event_type=EVT_ERROR, payload=payload,
+            )
+        else:
+            await log_event(
+                session_id=session_id, agent_id="",
+                event_type=EVT_ERROR, payload=payload,
+            )
     except Exception:
         log.exception("failed to log session-acquire error for %s rpc=%s",
                       session_id, rpc_id)
@@ -1993,6 +2144,10 @@ async def session_events(session_id: str):
       * yields the ``_HEARTBEAT`` sentinel during idle so intermediaries
         (nginx / cloudflare / browser EventSource) don't close the
         connection between prompts.
+
+    Lease check fires before the StreamingResponse so a NotOwner becomes
+    a 307/503 via the global exception handler (rather than a 200 with
+    an empty body if we deferred the get_session into the generator).
     """
     from api.sandbox import get_pool
     from api.sandbox.session import _HEARTBEAT
@@ -2051,6 +2206,13 @@ async def post_session_message_stream(session_id: str, request: Request):
 
     Both POST /message and GET /events continue to work unchanged for
     callers that need separate submit + multi-subscriber semantics.
+
+    Lease acquisition happens BEFORE the StreamingResponse is constructed
+    so a NotOwner (lease held by another replica/worker) can surface as
+    a 307/503 via the global exception handler. If we deferred this into
+    the SSE generator, response headers (200) would already be on the
+    wire by the time we discover the lease miss — the client would see
+    a successful-looking stream that never produces a turn end.
     """
     data = await _json_body(request)
     message = data.get("message")
@@ -2058,8 +2220,16 @@ async def post_session_message_stream(session_id: str, request: Request):
         raise HTTPException(400, "message required")
 
     rpc_id = str(uuid.uuid4())
+
+    # Claim the lease eagerly. Any NotOwner here propagates to the global
+    # exception handler and returns 307 (cross-replica) or 503 + Retry-After
+    # (peer worker on the same replica) without the client ever seeing a
+    # partial stream.
+    from api.sandbox import get_pool
+    session = await get_pool().get_session(session_id)
+
     return StreamingResponse(
-        _execute_and_stream_sse(session_id, message, rpc_id),
+        _execute_and_stream_sse_for(session, message, rpc_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -2068,50 +2238,16 @@ async def post_session_message_stream(session_id: str, request: Request):
     )
 
 
-async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
-    """Canonical execution path: cold-recover (if needed) → log
-    user_message → subscribe + drive → emit per-rpc SSE blocks.
+async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
+    """Stream branch with an ALREADY-RESOLVED session (lease already held).
 
-    Used as the response body of ``POST /message+stream`` and as the
-    sole drain inside the background task fired by ``POST /message``.
-    Single source of truth for "execute one prompt and persist its
-    events" — both endpoints exercise identical persistence + broadcast
-    behaviour.
-
-    Yields SSE lines (``event:``/``data:``/``: heartbeat``) terminated
-    by ``\\n\\n``. The first yield is an immediate heartbeat so a
-    streaming client knows the request is alive while ``pool.get_session``
-    cold-recovers (30-60s on Daytona under contended control plane).
+    Used by ``POST /message+stream`` so the lease check happens in the
+    route handler (where NotOwner can become a 307 before headers are
+    sent). The lease-acquire branch lives in ``_execute_and_stream_sse``
+    and yields heartbeats during the wait — that's only useful for the
+    background-drain path now.
     """
-    from api.sandbox import get_pool
     from api.sandbox.session import _HEARTBEAT
-
-    yield ": heartbeat\n\n"
-
-    # Cold-create on Daytona can run 30-60s. A single t=0 heartbeat isn't
-    # enough to survive intermediate proxy idle thresholds (Railway ~30s,
-    # Cloudflare ~100s) so we interleave heartbeats every 10s while
-    # pool.get_session is in flight. ``shield`` keeps the underlying
-    # acquire alive when ``wait_for`` times out — only the wait cancels.
-    acquire = asyncio.create_task(get_pool().get_session(session_id))
-    try:
-        while True:
-            try:
-                session = await asyncio.wait_for(
-                    asyncio.shield(acquire), timeout=10.0,
-                )
-                break
-            except asyncio.TimeoutError:
-                yield ": heartbeat\n\n"
-    except Exception as e:
-        log.exception("pool.get_session(%s) failed for rpc=%s",
-                      session_id, rpc_id)
-        await _log_session_acquire_error(session_id, rpc_id, e)
-        err = {"type": "error", "rpc_id": rpc_id,
-               "error": {"message": str(e)[:500],
-                         "exception_type": type(e).__name__}}
-        yield f"data: {json.dumps(err)}\n\n"
-        return
 
     # ``_persist_user_message`` was previously called HERE, but that
     # races concurrent queued prompts: three POSTs land three
@@ -2199,17 +2335,14 @@ async def session_cancel(session_id: str):
     """Cancel the in-flight prompt on this session, if any.
 
     Best-effort: sends ``session/cancel`` (JSON-RPC notification) to
-    the supervisor's ACP child via the SessionPool. The ACP child
-    aborts the turn; the ``done`` event arrives on the same SSE
-    subscribers that ``POST /message`` opened. No active lease →
-    returns ``{"status": "ok", "detail": "no active lease"}``.
+    the supervisor's ACP child. Looks the session up via
+    ``pool.get_session`` so cancel requests against a session owned by
+    a peer replica route there (307 from the global exception handler)
+    rather than no-oping on this replica's empty local cache.
     """
     from api.sandbox import get_pool
 
-    pool = get_pool()
-    pool_session = pool._active.get(session_id)  # noqa: SLF001 — read-only peek
-    if pool_session is None:
-        return {"status": "ok", "detail": "no active lease"}
+    pool_session = await get_pool().get_session(session_id)
     await pool_session.cancel_active_prompt()
     return {"status": "ok"}
 
