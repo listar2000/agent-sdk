@@ -47,4 +47,4 @@ EXPOSE 7778
 # ``lifespan`` initialises via ``init_pool()``. The dotted form creates two
 # distinct module objects and the pool global is invisible to the pool path.
 ENV PYTHONPATH=/app/src
-CMD uvicorn api.server:app --host 0.0.0.0 --port ${PORT:-7778}
+CMD uvicorn api.server:app --host 0.0.0.0 --port ${PORT:-7778} --workers ${AGENT_SDK_WORKERS:-1}

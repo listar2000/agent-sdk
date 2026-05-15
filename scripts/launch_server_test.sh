@@ -196,5 +196,7 @@ if [[ -f "${REPO_ROOT}/.runtime-snapshot-tag" ]]; then
   echo "Daytona snapshot: $(cat "${REPO_ROOT}/.runtime-snapshot-tag")"
 fi
 
-echo "Starting local server on http://localhost:7778 ..."
-exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port 7778
+: "${AGENT_SDK_WORKERS:=1}"
+echo "Starting local server on http://localhost:7778 (workers=${AGENT_SDK_WORKERS}) ..."
+exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port 7778 \
+    --workers "${AGENT_SDK_WORKERS}"
