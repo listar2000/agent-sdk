@@ -1603,6 +1603,12 @@ async def _sessions_create_eager(data: dict) -> dict:
         root=root,
         pre_start_commands=merged_pre_start,
         resources=resources,
+        # Optional credential-refresh hook. When set, the SessionPool
+        # spawns a background task per active session that polls this
+        # URL and writes the returned files into the sandbox. Stays on
+        # the recipe so it survives hibernation + recovery.
+        credential_refresh_url=data.get("credential_refresh_url"),
+        credential_refresh_token=data.get("credential_refresh_token"),
     )
 
     session_id = str(uuid.uuid4())

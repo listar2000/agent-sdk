@@ -15,8 +15,13 @@ session.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import shlex
+import time
 from collections.abc import Callable
+
+import httpx
 
 from api import db
 
@@ -140,6 +145,20 @@ class SessionPool:
             await session.start()
             await db.write_sandbox_state(session_id, serialize(session.state))
             self._active[session_id] = session
+            # Spawn the credential-refresh loop if the recipe asks for
+            # one. Fires on every wake — cold create AND resume from
+            # hibernation — so the agent always has fresh credentials.
+            # Cancelled in ``release()`` before shutdown.
+            recipe = session.state.recipe
+            if recipe.credential_refresh_url:
+                session._credential_refresh_task = asyncio.create_task(
+                    _credential_refresh_loop(
+                        session_id,
+                        url=recipe.credential_refresh_url,
+                        bearer=recipe.credential_refresh_token or "",
+                        get_supervisor_url=lambda s=session: s.supervisor_url,
+                    )
+                )
             return session
 
     async def cold_create(
@@ -173,6 +192,14 @@ class SessionPool:
             session = self._active.pop(session_id, None)
             if session is None:
                 return
+            # Cancel the credential-refresh loop (if any) before tearing
+            # down compute. Suppress exceptions on await — the task may
+            # have already crashed; we just want it gone.
+            task = getattr(session, "_credential_refresh_task", None)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
             try:
                 try:
                     await session.stop()
@@ -293,3 +320,88 @@ async def _safe_shutdown(session: BaseSandboxSession) -> None:
         await session.shutdown()
     except Exception:
         log.exception("shutdown() failed for session %s", session.session_id)
+
+
+# ────────────────────────── credential refresh ──────────────────────────
+
+
+async def _credential_refresh_loop(
+    session_id: str,
+    *,
+    url: str,
+    bearer: str,
+    get_supervisor_url: Callable[[], str | None],
+) -> None:
+    """Poll ``url`` and write the returned files into the session sandbox
+    until cancelled. One task per active session, spawned in
+    ``get_session`` and cancelled in ``release``.
+
+    Caller's endpoint must return JSON of the form::
+
+        {"contents": {"<abs-path>": "<base64>", ...},
+         "next_refresh_at": <unix-ts>}
+
+    ``contents`` may be empty (no-op tick); ``next_refresh_at`` is
+    advisory. Sleep delay is clamped to [60s, 1h] so a buggy response
+    can't tight-loop or hang forever.
+    """
+    log.info("[credential-refresh] session=%s starting", session_id)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    url, headers={"Authorization": f"Bearer {bearer}"},
+                )
+                r.raise_for_status()
+                payload = r.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "[credential-refresh] session=%s fetch failed", session_id,
+                exc_info=True,
+            )
+            await asyncio.sleep(60)
+            continue
+        contents = payload.get("contents") or {}
+        next_at = float(payload.get("next_refresh_at") or 0)
+        sup_url = get_supervisor_url()
+        if sup_url and contents:
+            try:
+                await _write_credentials_via_supervisor(sup_url, contents)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning(
+                    "[credential-refresh] session=%s write failed",
+                    session_id, exc_info=True,
+                )
+                await asyncio.sleep(60)
+                continue
+        delay = max(60.0, min(3600.0, next_at - time.time()))
+        await asyncio.sleep(delay)
+
+
+async def _write_credentials_via_supervisor(
+    supervisor_url: str, contents: dict[str, str],
+) -> None:
+    """Write each {abs_path: base64_content} into the sandbox atomically
+    using the supervisor's /v1/exec channel. base64 carries arbitrary
+    bytes safely across the HTTP boundary; tmp + chmod + rename keeps
+    in-flight readers from seeing partial files."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        for path, b64 in contents.items():
+            q_path = shlex.quote(path)
+            q_b64 = shlex.quote(b64)
+            cmd = (
+                f"set -e; dir=$(dirname {q_path}); mkdir -p \"$dir\"; "
+                f"tmp=$(mktemp \"$dir/.creds.XXXXXX\"); "
+                f"printf %s {q_b64} | base64 -d > \"$tmp\"; "
+                f"chmod 600 \"$tmp\"; "
+                f"mv \"$tmp\" {q_path}"
+            )
+            r = await client.post(
+                f"{supervisor_url}/v1/exec",
+                json={"command": cmd, "timeout": 10},
+            )
+            r.raise_for_status()
