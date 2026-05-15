@@ -1497,8 +1497,24 @@ async def sessions_create(request: Request):
     """
     data = await _json_body(request)
     if data.get("provision", True):
-        return await _sessions_create_eager(data)
-    return await _sessions_create_lazy(data)
+        result = await _sessions_create_eager(data)
+    else:
+        result = await _sessions_create_lazy(data)
+    # Sticky-session hint for an external LB: set a cookie naming THIS
+    # replica so subsequent /sessions/{id}/* requests can hash on
+    # ``$cookie_agent_sdk_route`` and land on the lease owner without
+    # paying the lease's 307 tax. The cookie is opaque to anything but
+    # the LB — clients don't need to read it. Path is restricted to
+    # /sessions so it doesn't pollute other endpoints' cookie space.
+    from api.identity import replica_id as _replica_id
+    from fastapi.responses import JSONResponse as _JR
+    response = _JR(result)
+    response.set_cookie(
+        "agent_sdk_route", _replica_id(),
+        path="/sessions", httponly=True, samesite="lax",
+        max_age=86400,
+    )
+    return response
 
 
 async def _sessions_create_lazy(data: dict) -> dict:

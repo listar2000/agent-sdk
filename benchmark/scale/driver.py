@@ -163,23 +163,32 @@ async def _delete_session(client: httpx.AsyncClient, sid: str) -> None:
         pass
 
 
-async def _run_session_lifecycle(client: httpx.AsyncClient, idx: int) -> list[PromptResult]:
-    """Create → run N_TURNS prompts → delete. Returns one result per turn."""
+async def _run_session_lifecycle(_shared: httpx.AsyncClient, idx: int) -> list[PromptResult]:
+    """Create → run N_TURNS prompts → delete. Returns one result per turn.
+
+    Uses a per-session ``AsyncClient`` so each session has its own cookie
+    jar — the sticky-route cookie that nginx hashes on must not be
+    shared across sessions, or all sessions converge on whichever
+    replica handled the most recent POST /sessions. This mirrors how
+    real clients work (one Client per user, not one shared globally).
+    """
     sid = None
     out: list[PromptResult] = []
     t0 = time.perf_counter()
-    try:
-        sid = await _create_session(client, idx)
-        create_s = time.perf_counter() - t0
-        for turn in range(N_TURNS):
-            r = await _drive_prompt(client, sid, idx)
-            r.create_s = create_s if turn == 0 else None
-            out.append(r)
-    except Exception as e:
-        out.append(PromptResult(idx=idx, error=f"create: {e}"[:200]))
-    finally:
-        if sid:
-            await _delete_session(client, sid)
+    limits = httpx.Limits(max_keepalive_connections=4, max_connections=8)
+    async with httpx.AsyncClient(limits=limits, follow_redirects=True) as client:
+        try:
+            sid = await _create_session(client, idx)
+            create_s = time.perf_counter() - t0
+            for turn in range(N_TURNS):
+                r = await _drive_prompt(client, sid, idx)
+                r.create_s = create_s if turn == 0 else None
+                out.append(r)
+        except Exception as e:
+            out.append(PromptResult(idx=idx, error=f"create: {e}"[:200]))
+        finally:
+            if sid:
+                await _delete_session(client, sid)
     return out
 
 
