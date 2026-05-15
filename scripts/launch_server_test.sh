@@ -289,9 +289,16 @@ lb_log="${REPO_ROOT}/logs/server-lb.log"
 : > "${lb_log}"
 : "${AGENT_SDK_LB:=nginx}"
 if [[ "${AGENT_SDK_LB}" == "nginx" ]]; then
+  # Auto-install nginx via conda into .nginx-env/ if not on PATH —
+  # same brainfree pattern as the Postgres bootstrap above. Skips
+  # the install if a system nginx is already available.
   if ! command -v nginx >/dev/null 2>&1; then
-    echo "ERROR: AGENT_SDK_LB=nginx but nginx is not on PATH." >&2
-    exit 1
+    NGINX_ENV_DIR="${REPO_ROOT}/.nginx-env"
+    if [[ ! -x "${NGINX_ENV_DIR}/bin/nginx" ]]; then
+      echo "Installing nginx into ${NGINX_ENV_DIR} (one-time, ~1 min)..."
+      "${CONDA_BIN}" create -y -p "${NGINX_ENV_DIR}" -c conda-forge nginx >/dev/null
+    fi
+    export PATH="${NGINX_ENV_DIR}/bin:${PATH}"
   fi
   # Render the nginx config dynamically so any N + port base works.
   # Same routing as deploy/nginx/nginx.conf (cookie-failover override +
