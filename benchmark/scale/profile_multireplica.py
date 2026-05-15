@@ -74,13 +74,11 @@ N_REPLICAS = int(os.environ.get("N_REPLICAS", "4"))
 PORT_BASE = int(os.environ.get("PORT_BASE", "7791"))
 LB_PORT = int(os.environ.get("LB_PORT", "7790"))
 PROVIDER = os.environ.get("PROVIDER", "unix_local")
-# Deployment shape:
-#   "lb"          — N single-worker replicas behind benchmark/scale/lb.py.
-#                   Consistent-hash routing by session_id.
-#   "workers"     — One uvicorn with --workers N. No LB.
-#                   Kernel SO_REUSEPORT does the routing; the 503-retry
-#                   path handles peer-worker misses.
-DEPLOY_MODE = os.environ.get("DEPLOY_MODE", "lb")
+# Deployment shape: always N single-worker replicas behind
+# ``benchmark/scale/lb.py`` (consistent-hash on session_id). The
+# multi-worker SO_REUSEPORT path was removed — it routes randomly across
+# workers and pays the lease's 307 redirect tax on most requests.
+DEPLOY_MODE = "lb"
 N_SESSIONS = int(os.environ.get("N_SESSIONS", "16"))
 PROMPT = os.environ.get(
     "PROMPT",
@@ -102,11 +100,7 @@ class Replica:
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def __init_workers__(self, workers: int) -> None:
-        self.workers = workers
-
     def start(self) -> None:
-        workers = getattr(self, "workers", 1)
         env = os.environ.copy()
         env["DATABASE_URL"] = DB_URL
         env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
@@ -115,17 +109,14 @@ class Replica:
         env["AGENT_SDK_INTERNAL_HOST"] = "127.0.0.1"
         env["AGENT_SDK_LEASE_TTL_S"] = "30"
         env["AGENT_SDK_LEASE_HEARTBEAT_S"] = "10"
-        # Production-target Wave 1 settings
         env["AGENT_SDK_SUPERVISOR_FLUSH_MS"] = "40"
         env["AGENT_SDK_LOG_FLUSH_MS"] = "100"
         env["AGENT_SDK_ORIGIN"] = "test"
-        env["AGENT_SDK_WORKERS"] = str(workers)
         self.log_path.write_text("")
         log_f = open(self.log_path, "ab")
         self.proc = subprocess.Popen(
             [VENV_PY, "-m", "uvicorn", "api.server:app",
-             "--host", "127.0.0.1", "--port", str(self.port),
-             "--workers", str(workers)],
+             "--host", "127.0.0.1", "--port", str(self.port)],
             env=env, cwd=str(REPO_ROOT), stdout=log_f, stderr=log_f,
         )
 
@@ -323,33 +314,15 @@ async def main(do_pyspy: bool) -> int:
     from api.db import init_db
     init_db()
 
-    workers_per_replica = int(os.environ.get("WORKERS_PER_REPLICA", "1"))
     replicas: list[Replica] = []
     lb_proc = None
 
-    if DEPLOY_MODE == "workers":
-        # One uvicorn, N workers, one port. No LB — the bench hits the
-        # uvicorn port directly and the kernel SO_REUSEPORT-balances
-        # across workers. Cheapest deployment, accepts higher 503 retry.
-        workers = N_REPLICAS  # treat N_REPLICAS as the worker count
-        r = Replica("worker_pool", PORT_BASE)
-        r.__init_workers__(workers)
-        replicas.append(r)
+    for i in range(N_REPLICAS):
+        replicas.append(Replica(f"r{i}", PORT_BASE + i))
+    print(f"[mr] {N_REPLICAS} single-worker replicas on ports "
+          f"{[r.port for r in replicas]}, DB={DB_URL}")
+    for r in replicas:
         r.start()
-        lb_url = f"http://127.0.0.1:{PORT_BASE}"
-        print(f"[mr] DEPLOY_MODE=workers; one uvicorn with {workers} workers "
-              f"on :{PORT_BASE}; no LB. DB={DB_URL}")
-    else:
-        # N single-worker uvicorn replicas behind benchmark/scale/lb.py.
-        for i in range(N_REPLICAS):
-            r = Replica(f"r{i}", PORT_BASE + i)
-            r.__init_workers__(workers_per_replica)
-            replicas.append(r)
-        print(f"[mr] DEPLOY_MODE=lb; {N_REPLICAS} replicas on ports "
-              f"{[r.port for r in replicas]} "
-              f"(workers/replica={workers_per_replica}), DB={DB_URL}")
-        for r in replicas:
-            r.start()
         # LB sidecar.
         lb_env = os.environ.copy()
         lb_env["BACKENDS"] = ",".join(r.url() for r in replicas)

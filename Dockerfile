@@ -47,4 +47,9 @@ EXPOSE 7778
 # ``lifespan`` initialises via ``init_pool()``. The dotted form creates two
 # distinct module objects and the pool global is invisible to the pool path.
 ENV PYTHONPATH=/app/src
-CMD uvicorn api.server:app --host 0.0.0.0 --port ${PORT:-7778} --workers ${AGENT_SDK_WORKERS:-1}
+# Always a single uvicorn worker. Scale via additional REPLICAS behind a
+# consistent-hash / sticky-cookie LB (see benchmark/scale/nginx.conf) —
+# multi-worker (SO_REUSEPORT) routes requests randomly across workers,
+# which forces the lease's 307 redirect on most session-scoped requests
+# and loses throughput vs multi-replica.
+CMD uvicorn api.server:app --host 0.0.0.0 --port ${PORT:-7778}

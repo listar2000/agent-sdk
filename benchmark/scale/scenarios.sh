@@ -16,6 +16,11 @@
 #   benchmark/scale/scenarios.sh --provider daytona    # full sweep on daytona
 #   benchmark/scale/scenarios.sh --n 32 --turns 1      # custom load
 #   benchmark/scale/scenarios.sh --only baseline       # one scenario
+#
+# Note: every scenario runs a single uvicorn worker. The horizontal-scale
+# story is multi-replica + LB (see profile_multireplica.py /
+# goldens_multireplica.sh) — multi-worker SO_REUSEPORT routes requests
+# randomly across workers and defeats the lease's session-locality.
 
 set -euo pipefail
 
@@ -34,7 +39,11 @@ BENCH_PORT="${BENCH_PORT:-7779}"
 
 # Default scenarios. Each is a (label, server-env, server-disable-flags) tuple
 # encoded by the case statement below.
-declare -a SCENARIOS=(baseline wave1 wave1_w4 wave1_w4_lease)
+# Wave 2 (multi-worker) was removed — SO_REUSEPORT routes requests
+# randomly across workers, defeating the lease's session-locality. The
+# horizontal-scale story is exclusively multi-replica + LB, exercised
+# by ``profile_multireplica.py`` and ``goldens_multireplica.sh``.
+declare -a SCENARIOS=(baseline wave1)
 
 # Argument parsing (light — env vars are the primary knob).
 while [[ $# -gt 0 ]]; do
@@ -79,22 +88,18 @@ SERVER_LOG="${REPO_ROOT}/logs/scale-server.log"
 mkdir -p "${REPO_ROOT}/logs"
 
 _start_server() {
-  local workers="$1"
-  shift
   # extra env=value args follow
   local pid_file="${REPO_ROOT}/logs/scale-server.pid"
   _stop_server || true
-  echo "--- starting server (workers=${workers}; extra: $*) ---"
+  echo "--- starting server (extra: $*) ---"
   (
     cd "${REPO_ROOT}"
     PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
     DATABASE_URL="${DATABASE_URL}" \
     AGENT_SDK_ORIGIN="${AGENT_SDK_ORIGIN}" \
-    AGENT_SDK_WORKERS="${workers}" \
     AGENT_SDK_PORT="${BENCH_PORT}" \
       "$@" \
       "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port ${BENCH_PORT} \
-        --workers "${workers}" \
         > "${SERVER_LOG}" 2>&1 &
     echo $! > "${pid_file}"
   )
@@ -158,39 +163,20 @@ for scenario in "${SCENARIOS[@]}"; do
   case "${scenario}" in
     baseline)
       # Wave 1 disabled: supervisor flush=0 (immediate), batcher flush=0,
-      # lease disabled. Single uvicorn worker.
-      _start_server 1 env \
+      # lease disabled.
+      _start_server env \
         AGENT_SDK_SUPERVISOR_FLUSH_MS=0 \
         AGENT_SDK_LOG_FLUSH_MS=0 \
         AGENT_SDK_DISABLE_LEASE=1
       _run_driver "baseline"
       ;;
     wave1)
-      # Wave 1 ON, single worker, no lease.
-      _start_server 1 env \
+      # Wave 1 ON, no lease.
+      _start_server env \
         AGENT_SDK_SUPERVISOR_FLUSH_MS=40 \
         AGENT_SDK_LOG_FLUSH_MS=100 \
         AGENT_SDK_DISABLE_LEASE=1
       _run_driver "wave1"
-      ;;
-    wave1_w4)
-      # Wave 1 + 4 workers, lease still off (sequential bench, multi-worker).
-      _start_server 4 env \
-        AGENT_SDK_SUPERVISOR_FLUSH_MS=40 \
-        AGENT_SDK_LOG_FLUSH_MS=100 \
-        AGENT_SDK_DISABLE_LEASE=1
-      _run_driver "wave1_w4"
-      ;;
-    wave1_w4_lease)
-      # Wave 1 + 4 workers + lease ON. Tests the 307 redirect path under
-      # concurrent prompts; for a same-host bench every worker shares the
-      # same private addr (127.0.0.1:7778) so 307 round-trips through the
-      # kernel SO_REUSEPORT pool — useful as a smoke test, not as a
-      # perf proxy for a true multi-replica deploy.
-      _start_server 4 env \
-        AGENT_SDK_SUPERVISOR_FLUSH_MS=40 \
-        AGENT_SDK_LOG_FLUSH_MS=100
-      _run_driver "wave1_w4_lease"
       ;;
     *)
       echo "unknown scenario: ${scenario}" >&2

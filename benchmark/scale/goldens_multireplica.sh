@@ -11,7 +11,6 @@
 #   --providers     comma-separated list (default: unix_local; add
 #                   daytona,modal if creds + runtime snapshot tags
 #                   are in place)
-#   --workers       workers per replica (default 1 — recommended)
 #   --replicas      number of replicas (default 4)
 #
 # Env:
@@ -31,12 +30,10 @@ DB="${DATABASE_URL:-postgresql://postgres@localhost:5433/agent_sdk_test_scale}"
 
 PROVIDERS="unix_local"
 N_REPLICAS=4
-WORKERS_PER_REPLICA=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --providers) PROVIDERS="$2"; shift 2 ;;
     --replicas)  N_REPLICAS="$2"; shift 2 ;;
-    --workers)   WORKERS_PER_REPLICA="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -97,7 +94,6 @@ for i in $(seq 0 $((N_REPLICAS - 1))); do
     AGENT_SDK_LOG_FLUSH_MS=100 \
     AGENT_SDK_ORIGIN=test \
       "${VENV_PY}" -m uvicorn api.server:app --host 127.0.0.1 --port "${port}" \
-        --workers "${WORKERS_PER_REPLICA}" \
         > "${log_path}" 2>&1 &
     echo $!
   ) > "${REPO}/logs/golden-${name}.pid"

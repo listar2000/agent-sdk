@@ -196,17 +196,20 @@ if [[ -f "${REPO_ROOT}/.runtime-snapshot-tag" ]]; then
   echo "Daytona snapshot: $(cat "${REPO_ROOT}/.runtime-snapshot-tag")"
 fi
 
-: "${AGENT_SDK_WORKERS:=1}"
 : "${AGENT_SDK_REPLICAS:=1}"
 : "${AGENT_SDK_PUBLIC_PORT:=7778}"
 : "${AGENT_SDK_BACKEND_PORT_BASE:=7791}"
 
+# uvicorn is always single-worker. Scale via AGENT_SDK_REPLICAS + LB —
+# multi-worker SO_REUSEPORT routes requests randomly across workers,
+# which defeats the lease's session-locality and pays the 307 tax on
+# most requests.
+
 if [[ "${AGENT_SDK_REPLICAS}" -le 1 ]]; then
   # Single-replica path — the historical default.
-  echo "Starting local server on http://localhost:${AGENT_SDK_PUBLIC_PORT} (workers=${AGENT_SDK_WORKERS}) ..."
+  echo "Starting local server on http://localhost:${AGENT_SDK_PUBLIC_PORT} ..."
   exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 \
-      --port "${AGENT_SDK_PUBLIC_PORT}" \
-      --workers "${AGENT_SDK_WORKERS}"
+      --port "${AGENT_SDK_PUBLIC_PORT}"
 fi
 
 # Multi-replica + LB path. Spawns N single-worker uvicorn replicas on
@@ -246,13 +249,12 @@ for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
   name="r${i}"
   log_path="${REPO_ROOT}/logs/server-${name}.log"
   : > "${log_path}"
-  echo "  launching replica ${name} on :${port} (workers=${AGENT_SDK_WORKERS}) -> ${log_path}"
+  echo "  launching replica ${name} on :${port} -> ${log_path}"
   AGENT_SDK_REPLICA_ID="${name}" \
     AGENT_SDK_PORT="${port}" \
     AGENT_SDK_INTERNAL_HOST="127.0.0.1" \
     "${VENV_PYTHON}" -m uvicorn api.server:app \
       --host 127.0.0.1 --port "${port}" \
-      --workers "${AGENT_SDK_WORKERS}" \
       > "${log_path}" 2>&1 &
   PIDS+=("$!")
   if [[ -n "${backends_csv}" ]]; then backends_csv="${backends_csv},"; fi
@@ -279,14 +281,36 @@ if [[ "${all_up}" -ne 1 ]]; then
   exit 1
 fi
 
-# Start the LB.
+# Start the LB. Default is ``nginx`` (cookie-sticky upstream, see
+# benchmark/scale/nginx.conf) — it's the production deployment shape so
+# the local test stack runs the same code path. ``AGENT_SDK_LB=python``
+# falls back to ``benchmark/scale/lb.py`` (affinity-learning) for local
+# dev when you don't want to depend on nginx being on PATH.
 lb_log="${REPO_ROOT}/logs/server-lb.log"
 : > "${lb_log}"
-echo "  launching LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
-BACKENDS="${backends_csv}" PORT="${AGENT_SDK_PUBLIC_PORT}" \
-  "${VENV_PYTHON}" "${REPO_ROOT}/benchmark/scale/lb.py" \
-  > "${lb_log}" 2>&1 &
-PIDS+=("$!")
+: "${AGENT_SDK_LB:=nginx}"
+if [[ "${AGENT_SDK_LB}" == "nginx" ]]; then
+  if ! command -v nginx >/dev/null 2>&1; then
+    echo "ERROR: AGENT_SDK_LB=nginx but nginx is not on PATH." >&2
+    exit 1
+  fi
+  echo "  launching nginx LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
+  # nginx.conf hardcodes ports 7791..7794 (benchmark default). Reject
+  # other layouts loudly rather than silently 404 backends.
+  if [[ "${AGENT_SDK_REPLICAS}" -ne 4 || "${AGENT_SDK_BACKEND_PORT_BASE}" -ne 7791 ]]; then
+    echo "ERROR: AGENT_SDK_LB=nginx requires REPLICAS=4 BACKEND_PORT_BASE=7791 (got ${AGENT_SDK_REPLICAS} on ${AGENT_SDK_BACKEND_PORT_BASE})." >&2
+    exit 1
+  fi
+  nginx -p "${REPO_ROOT}" -c benchmark/scale/nginx.conf \
+    > "${lb_log}" 2>&1 &
+  PIDS+=("$!")
+else
+  echo "  launching python LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
+  BACKENDS="${backends_csv}" PORT="${AGENT_SDK_PUBLIC_PORT}" \
+    "${VENV_PYTHON}" "${REPO_ROOT}/benchmark/scale/lb.py" \
+    > "${lb_log}" 2>&1 &
+  PIDS+=("$!")
+fi
 
 # Wait for LB.
 deadline=$(( $(date +%s) + 15 ))
