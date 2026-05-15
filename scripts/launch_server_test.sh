@@ -196,5 +196,138 @@ if [[ -f "${REPO_ROOT}/.runtime-snapshot-tag" ]]; then
   echo "Daytona snapshot: $(cat "${REPO_ROOT}/.runtime-snapshot-tag")"
 fi
 
-echo "Starting local server on http://localhost:7778 ..."
-exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port 7778
+: "${AGENT_SDK_REPLICAS:=1}"
+: "${AGENT_SDK_PUBLIC_PORT:=7778}"
+: "${AGENT_SDK_BACKEND_PORT_BASE:=7791}"
+
+# uvicorn is always single-worker. Scale via AGENT_SDK_REPLICAS + LB —
+# multi-worker SO_REUSEPORT routes requests randomly across workers,
+# which defeats the lease's session-locality and pays the 307 tax on
+# most requests.
+
+if [[ "${AGENT_SDK_REPLICAS}" -le 1 ]]; then
+  # Single-replica path — the historical default.
+  echo "Starting local server on http://localhost:${AGENT_SDK_PUBLIC_PORT} ..."
+  exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 \
+      --port "${AGENT_SDK_PUBLIC_PORT}"
+fi
+
+# Multi-replica + LB path. Spawns N single-worker uvicorn replicas on
+# AGENT_SDK_BACKEND_PORT_BASE..(BASE+N-1) and benchmark/scale/lb.py in
+# front on AGENT_SDK_PUBLIC_PORT. The LB does consistent-hash routing
+# on /sessions/{id}/...; the per-session Postgres lease + 307 redirect
+# handles ownership safety so the LB itself can be dumb.
+#
+# Tear-down: trap forwards SIGINT/SIGTERM to the whole process group
+# so Ctrl-C tears down all replicas + the LB.
+
+PIDS=()
+_cleanup() {
+  for pid in "${PIDS[@]:-}"; do
+    [[ -z "${pid}" ]] && continue
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    local alive=0
+    for pid in "${PIDS[@]:-}"; do
+      kill -0 "${pid}" 2>/dev/null && alive=1
+    done
+    [[ "${alive}" -eq 0 ]] && return
+  done
+  for pid in "${PIDS[@]:-}"; do
+    kill -KILL "${pid}" 2>/dev/null || true
+  done
+}
+trap _cleanup EXIT INT TERM
+
+mkdir -p "${REPO_ROOT}/logs"
+
+backends_csv=""
+for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+  port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+  name="r${i}"
+  log_path="${REPO_ROOT}/logs/server-${name}.log"
+  : > "${log_path}"
+  echo "  launching replica ${name} on :${port} -> ${log_path}"
+  AGENT_SDK_REPLICA_ID="${name}" \
+    AGENT_SDK_PORT="${port}" \
+    AGENT_SDK_INTERNAL_HOST="127.0.0.1" \
+    "${VENV_PYTHON}" -m uvicorn api.server:app \
+      --host 127.0.0.1 --port "${port}" \
+      > "${log_path}" 2>&1 &
+  PIDS+=("$!")
+  if [[ -n "${backends_csv}" ]]; then backends_csv="${backends_csv},"; fi
+  backends_csv="${backends_csv}http://127.0.0.1:${port}"
+done
+
+# Wait for every replica to answer /health before bringing the LB up.
+for pid in "${PIDS[@]}"; do
+  : "${pid}"  # validate
+done
+
+deadline=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < deadline )); do
+  all_up=1
+  for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+    port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+    curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1 || { all_up=0; break; }
+  done
+  [[ "${all_up}" -eq 1 ]] && break
+  sleep 0.5
+done
+if [[ "${all_up}" -ne 1 ]]; then
+  echo "ERROR: not all replicas became healthy in 30s; see logs/server-r*.log" >&2
+  exit 1
+fi
+
+# Start the LB. Default is ``nginx`` (cookie-sticky upstream, see
+# benchmark/scale/nginx.conf) — it's the production deployment shape so
+# the local test stack runs the same code path. ``AGENT_SDK_LB=python``
+# falls back to ``benchmark/scale/lb.py`` (affinity-learning) for local
+# dev when you don't want to depend on nginx being on PATH.
+lb_log="${REPO_ROOT}/logs/server-lb.log"
+: > "${lb_log}"
+: "${AGENT_SDK_LB:=nginx}"
+if [[ "${AGENT_SDK_LB}" == "nginx" ]]; then
+  if ! command -v nginx >/dev/null 2>&1; then
+    echo "ERROR: AGENT_SDK_LB=nginx but nginx is not on PATH." >&2
+    exit 1
+  fi
+  echo "  launching nginx LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
+  # nginx.conf hardcodes ports 7791..7794 (benchmark default). Reject
+  # other layouts loudly rather than silently 404 backends.
+  if [[ "${AGENT_SDK_REPLICAS}" -ne 4 || "${AGENT_SDK_BACKEND_PORT_BASE}" -ne 7791 ]]; then
+    echo "ERROR: AGENT_SDK_LB=nginx requires REPLICAS=4 BACKEND_PORT_BASE=7791 (got ${AGENT_SDK_REPLICAS} on ${AGENT_SDK_BACKEND_PORT_BASE})." >&2
+    exit 1
+  fi
+  nginx -p "${REPO_ROOT}" -c benchmark/scale/nginx.conf \
+    > "${lb_log}" 2>&1 &
+  PIDS+=("$!")
+else
+  echo "  launching python LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
+  BACKENDS="${backends_csv}" PORT="${AGENT_SDK_PUBLIC_PORT}" \
+    "${VENV_PYTHON}" "${REPO_ROOT}/benchmark/scale/lb.py" \
+    > "${lb_log}" 2>&1 &
+  PIDS+=("$!")
+fi
+
+# Wait for LB.
+deadline=$(( $(date +%s) + 15 ))
+while (( $(date +%s) < deadline )); do
+  curl -fsS "http://127.0.0.1:${AGENT_SDK_PUBLIC_PORT}/health" >/dev/null 2>&1 && break
+  sleep 0.3
+done
+if ! curl -fsS "http://127.0.0.1:${AGENT_SDK_PUBLIC_PORT}/health" >/dev/null 2>&1; then
+  echo "ERROR: LB did not become ready in 15s; see ${lb_log}" >&2
+  exit 1
+fi
+
+echo "Stack ready:"
+echo "  client URL : http://localhost:${AGENT_SDK_PUBLIC_PORT}"
+echo "  replicas   : ${AGENT_SDK_REPLICAS} on ports ${AGENT_SDK_BACKEND_PORT_BASE}..$(( AGENT_SDK_BACKEND_PORT_BASE + AGENT_SDK_REPLICAS - 1 ))"
+echo "  LB         : benchmark/scale/lb.py (consistent-hash on session_id)"
+echo "  logs       : logs/server-r*.log + logs/server-lb.log"
+echo
+echo "Press Ctrl-C to tear down."
+wait

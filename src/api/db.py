@@ -147,6 +147,24 @@ _MIGRATIONS = [
     # NULL = nothing extra; ``session/new`` payload is byte-identical
     # to pre-extra-options behavior.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS extra_options JSONB",
+    # 2026-05-15: per-session lease for cross-replica ownership.
+    #   lease_owner_id    — "<replica_id>-<pid>"; the SessionPool that
+    #                       currently holds the in-memory SandboxSession.
+    #   lease_owner_addr  — "<host>:<port>" reachable from peer replicas;
+    #                       used by the route-layer 307 redirect.
+    #   lease_expires_at  — heartbeat TTL; an owner that fails to renew
+    #                       past this time loses the lease automatically.
+    #   lease_generation  — monotonic fencing token. Bumped on every
+    #                       ownership transfer; same owner renewals don't
+    #                       bump. Stale-generation writes can be fenced
+    #                       at the data layer (future work — currently
+    #                       diagnostic-only).
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_owner_id TEXT",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_owner_addr TEXT",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_lease_expiry"
+    " ON sessions(lease_expires_at) WHERE lease_owner_id IS NOT NULL",
 ]
 
 
@@ -515,6 +533,65 @@ async def delete_sessions_by_volume(volume_id: str) -> None:
     async with get_db() as conn:
         await conn.execute(
             "DELETE FROM sessions WHERE volume_id = %s", (volume_id,),
+        )
+
+
+async def try_claim_lease(
+    session_id: str, *, owner_id: str, owner_addr: str,
+    ttl_seconds: float = 30.0,
+) -> dict | None:
+    """Atomically claim or renew the session's lease.
+
+    Returns ``{lease_owner_id, lease_owner_addr, lease_generation}`` when
+    we successfully hold the lease at return time. Returns ``None`` when
+    the row is missing OR another owner holds an unexpired lease (in
+    which case the caller should ``read_lease`` to learn the current
+    owner_addr for a 307 redirect).
+
+    Renewing our own lease does NOT bump ``lease_generation``; only an
+    actual ownership transfer (previous owner was NULL or expired) does.
+    """
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "UPDATE sessions"
+            "   SET lease_owner_id = %s,"
+            "       lease_owner_addr = %s,"
+            "       lease_expires_at = now() + (interval '1 second' * %s),"
+            "       lease_generation = CASE"
+            "           WHEN lease_owner_id = %s THEN lease_generation"
+            "           ELSE lease_generation + 1"
+            "       END"
+            " WHERE id = %s"
+            "   AND (lease_owner_id IS NULL"
+            "        OR lease_owner_id = %s"
+            "        OR lease_expires_at < now())"
+            " RETURNING lease_owner_id, lease_owner_addr, lease_generation",
+            (owner_id, owner_addr, ttl_seconds, owner_id, session_id, owner_id),
+        )).fetchone()
+    return dict(row) if row else None
+
+
+async def read_lease(session_id: str) -> dict | None:
+    """Inspect the current lease state for a session row. Used after a
+    failed ``try_claim_lease`` to learn the owner_addr for the 307."""
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT lease_owner_id, lease_owner_addr, lease_generation,"
+            " lease_expires_at FROM sessions WHERE id = %s",
+            (session_id,),
+        )).fetchone()
+    return dict(row) if row else None
+
+
+async def release_lease(session_id: str, *, owner_id: str) -> None:
+    """Clear the lease if we still hold it. Idempotent and safe to call
+    on a session we never owned (the WHERE clause filters)."""
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET lease_owner_id = NULL,"
+            " lease_owner_addr = NULL, lease_expires_at = NULL"
+            " WHERE id = %s AND lease_owner_id = %s",
+            (session_id, owner_id),
         )
 
 

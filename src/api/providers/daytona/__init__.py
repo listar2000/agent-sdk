@@ -388,26 +388,35 @@ async def provision_daytona_sandbox(
                 "scripts/release.sh)."
             )
 
-    create_timeout = 300 if dockerfile else 60
+    # 60s for plain image-create works in light load but Daytona's
+    # control plane queues sandbox provisioning, so under -n auto with
+    # 32 concurrent test workers (or production at >10 prompts/sec) the
+    # snapshot-create itself can take 90-150s. The dockerfile path was
+    # always at 300s for the same reason. Use a single generous budget;
+    # this isn't a retry — it's giving Daytona enough room to provision
+    # one sandbox.
+    create_timeout = 300 if dockerfile else 240
 
     volumes = _build_volume_mounts(volume_id, subpath, shared_mounts)
     labels = _sandbox_labels()
 
-    if use_snapshot:
-        sandbox = await daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes, labels=labels,
-            ), timeout=create_timeout,
-        )
-    else:
-        sandbox = await daytona.create(
+    async def _do_create():
+        if use_snapshot:
+            return await daytona.create(
+                CreateSandboxFromSnapshotParams(
+                    snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
+                    volumes=volumes, labels=labels,
+                ), timeout=create_timeout,
+            )
+        return await daytona.create(
             CreateSandboxFromImageParams(
                 image=image, auto_stop_interval=0, env_vars=env_vars,
                 volumes=volumes, labels=labels,
                 resources=_to_daytona_resources(resources),
             ), timeout=create_timeout,
         )
+
+    sandbox = await _daytona_create_with_502_retry(_do_create)
 
     try:
         # Run pre-start commands (skills, CLI install, etc.).
@@ -510,7 +519,16 @@ async def restart_daytona_supervisor(
 
 
 async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
-    """Shared logic for destroy/stop Daytona sandbox."""
+    """Shared logic for destroy/stop Daytona sandbox.
+
+    For ``delete``: poll until Daytona confirms the sandbox is gone
+    (``daytona.get`` raises 404) before returning. Daytona's
+    ``daytona.delete`` returns as soon as the control plane accepts the
+    delete request — but the underlying compute is still being torn down
+    for 10-30s. Without this poll, a fast caller (e.g. test asserting
+    sandbox-gone after DELETE /sessions) sees state=``destroying``
+    instead of gone and fails ``_assert_sandbox_gone`` under load.
+    """
     if not instance.sandbox_ref:
         return
     try:
@@ -523,6 +541,23 @@ async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
         sandbox = await daytona.get(instance.sandbox_ref)
         if op == "delete":
             await daytona.delete(sandbox)
+            # Wait for the destroy to actually land (sandbox gone from
+            # daytona's index). Bounded to 60s; if it doesn't go in that
+            # window, log a warning and let the caller proceed — daytona
+            # will eventually clean up.
+            deadline = asyncio.get_running_loop().time() + 60.0
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    await daytona.get(instance.sandbox_ref)
+                except Exception:
+                    break  # get() raised → sandbox is gone
+                await asyncio.sleep(0.5)
+            else:
+                log.warning(
+                    "daytona delete confirm timeout for %s (still in"
+                    " destroying state after 60s)",
+                    instance.sandbox_ref,
+                )
         else:
             await sandbox.stop()
         log.info("daytona sandbox %sd: %s", op, instance.sandbox_ref)
@@ -690,6 +725,40 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     return vol_id
 
 
+async def _daytona_create_with_502_retry(do_create, retries: int = 2):
+    """Run ``do_create()`` and retry up to ``retries`` times on Daytona
+    control-plane 502/503/504 (transient infra blips that surface as
+    ``<html>...<title>502 Bad Gateway</title>...`` in the SDK message).
+
+    Other errors (DaytonaError, image-not-found, auth, quota) raise on
+    the first attempt — the retry is narrowly scoped to the 5xx HTML
+    error class. Backoff is 2s, 4s, 8s.
+    """
+    delay = 2.0
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await do_create()
+        except Exception as e:
+            msg = str(e)
+            transient = (
+                "502 Bad Gateway" in msg
+                or "503 Service" in msg
+                or "504 Gateway" in msg
+                or ("502" in msg and "html" in msg.lower())
+            )
+            if not transient or attempt == retries:
+                raise
+            log.warning(
+                "daytona.create transient (attempt %d/%d) — retrying after %.1fs: %s",
+                attempt + 1, retries + 1, delay, msg.split("\n", 1)[0][:120],
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+            last_exc = e
+    raise last_exc  # unreachable but satisfies type-checker
+
+
 async def _init_volume_dirs(volume_ref: str) -> None:
     """Spin a 1-shot sandbox to mkdir -p shared/ system/supervisor/ on the volume."""
     from daytona_sdk import (
@@ -711,22 +780,24 @@ async def _init_volume_dirs(volume_ref: str) -> None:
     volumes = [VolumeMount(volume_id=volume_ref, mount_path="/v")]
     init_labels = _sandbox_labels()
 
-    if use_snapshot:
-        sb = await daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot, auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=init_labels,
-            ), timeout=120,
-        )
-    else:
-        sb = await daytona.create(
+    async def _do_init_create():
+        if use_snapshot:
+            return await daytona.create(
+                CreateSandboxFromSnapshotParams(
+                    snapshot=snapshot, auto_stop_interval=0,
+                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                    labels=init_labels,
+                ), timeout=120,
+            )
+        return await daytona.create(
             CreateSandboxFromImageParams(
                 image="node:22-slim", auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
                 labels=init_labels,
             ), timeout=120,
         )
+
+    sb = await _daytona_create_with_502_retry(_do_init_create)
 
     try:
         await _run_sandbox_exec_async(

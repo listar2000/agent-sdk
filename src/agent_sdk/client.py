@@ -119,11 +119,28 @@ class UsageStats:
     call_count: int = 0
 
     def update(self, usage: dict) -> None:
-        """Update stats from a usage event dict."""
+        """Update stats from a usage event dict.
+
+        Two shapes are accepted:
+
+        - ``{inputTokens, outputTokens, totalCostUsd}`` (or snake_case) —
+          the generic token+cost form some agents emit.
+        - ``{amount, currency}`` — claude-code's ``usage_update``
+          sessionUpdate carries dollars only (no token counts). The
+          canonicaliser in ``api/sse.py`` unwraps ``cost`` so this dict
+          is what arrives here.
+        """
         self.input_tokens += usage.get("inputTokens", usage.get("input_tokens", 0))
         self.output_tokens += usage.get("outputTokens", usage.get("output_tokens", 0))
         self.total_tokens = self.input_tokens + self.output_tokens
         cost = usage.get("totalCostUsd", usage.get("total_cost_usd", 0))
+        if not cost:
+            amount = usage.get("amount")
+            if amount is not None and usage.get("currency", "USD") == "USD":
+                try:
+                    cost = float(amount)
+                except (TypeError, ValueError):
+                    cost = 0
         if cost:
             self.total_cost_usd += cost
 
@@ -462,6 +479,14 @@ class Session:
                                 kind=event.get("kind"),
                                 data=event.get("data"),
                             )
+                        if event["type"] == "usage":
+                            # Accumulate before yielding so direct
+                            # astream callers see updated stats by the
+                            # time they receive the usage event.
+                            try:
+                                self.usage.update(event.get("usage") or {})
+                            except Exception:  # noqa: BLE001
+                                pass
                         yield event
                     raise StreamError(f"[{self._agent.name}] Connection closed before response completed")
         except httpx.ReadTimeout:
@@ -495,6 +520,7 @@ class Session:
             http_client=httpx.AsyncClient(
                 base_url=agent._api_url,
                 timeout=httpx.Timeout(30.0, read=120.0),
+                follow_redirects=True,
             ),
         )
         agent._agent_register_lock = asyncio.Lock()
@@ -688,6 +714,7 @@ class Agent:
             http_client=httpx.AsyncClient(
                 base_url=self._api_url,
                 timeout=httpx.Timeout(30.0, read=120.0),
+                follow_redirects=True,
             ),
         )
         # Agent-level lock: serialises "first session registers the
