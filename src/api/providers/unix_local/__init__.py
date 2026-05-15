@@ -280,7 +280,17 @@ async def create_sandbox(
             f"Set AGENT_SDK_RUNTIME_PATH or run "
             f"`npm --prefix src/supervisor install`."
         )
-    if agent_type in _ACP_NPM_SPECS:
+    # ``AGENT_SDK_MOCK_ACP_PATH`` overrides the per-agent-type ACP bin
+    # selection. Used by ``benchmark/scale/mock_acp.js`` to drive server-
+    # saturation benches without going through claude. The supervisor's
+    # contract is "stdin/stdout JSON-RPC ACP"; whatever path you point
+    # at must implement that.
+    mock_acp = os.environ.get("AGENT_SDK_MOCK_ACP_PATH")
+    if mock_acp:
+        if not Path(mock_acp).exists():
+            raise RuntimeError(f"AGENT_SDK_MOCK_ACP_PATH does not exist: {mock_acp}")
+        acp_bin_str = mock_acp
+    elif agent_type in _ACP_NPM_SPECS:
         acp_bin_str = _runtime_acp_bin(agent_type)
         if not Path(acp_bin_str).exists():
             raise RuntimeError(
