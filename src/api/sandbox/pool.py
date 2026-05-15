@@ -165,6 +165,20 @@ class SessionPool:
                 if cached is not None:
                     asyncio.create_task(_safe_shutdown(cached))
                 return
+            # Refresh the cluster-visible busy flag if there's an
+            # in-flight prompt (signaled by ``_prompt_lock.locked()``).
+            # Without this, prompts that take longer than the 60s TTL
+            # filter on ``busy_at`` would briefly look idle in the
+            # dashboard. Same-owner renewals preserve busy_at so the
+            # only risk is undercount, not overcount.
+            cached = self._active.get(session_id)
+            if cached is not None and cached._prompt_lock.locked():
+                try:
+                    await db.set_session_busy(
+                        session_id, owner_id=self._owner_id, busy=True,
+                    )
+                except Exception:
+                    log.warning("heartbeat: busy refresh failed for %s", session_id)
 
     async def get_session(
         self,
