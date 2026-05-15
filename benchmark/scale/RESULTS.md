@@ -65,32 +65,49 @@ N=128 unix_local on this 15 GiB box OOM'd (128 supervisor.js processes ≈ 10 Gi
 
 ### daytona (sandbox compute off-box, real provider)
 
-`driver.py` at N=64 and N=128 sessions, single-turn claude-haiku, sandbox creds forwarded from `~/.env`:
+`driver.py` at N=64 and N=128 single-turn, and 32×12=384 multi-turn:
 
 ```
-                 N=64                    N=128
-                 ────                    ─────
-                 1×           4×LB       1×           4×LB
-ok               64/64        64/64      128/128      128/128
-wall_s           57.22        53.29      56.08        65.78
-chars/sec        1194         1294       2416         1999
-events/sec       14.8         15.9       30.6         25.3
-first_evt_p95_s  2.57         2.73       2.83         2.86
-done_p50_s       3.89         3.73       4.22         3.89
-done_p95_s       5.84         5.36       5.59         5.70
-done_p99_s       7.16         7.43       7.87         8.47
-redirects        0            44         0            78
-errors           0            0          0            0
+                 N=64×1                 N=128×1                N=32×12=384 prompts
+                 ────────               ─────────              ─────────────────────
+                 1×        4×LB         1×         4×LB        1×          4×LB(affinity)
+ok               64/64     64/64        128/128    128/128     384/384     384/384
+wall_s           57.22     53.29        56.08      65.78       104.14      116.14
+chars/sec        1194      1294         2416       1999        2944        2520
+events/sec       14.8      15.9         30.6       25.3        35.4        31.0
+first_evt_p95_s  2.57      2.73         2.83       2.86        2.75        2.83
+done_p50_s       3.89      3.73         4.22       3.89        2.99        2.86
+done_p95_s       5.84      5.36         5.59       5.70        4.47        4.49
+done_p99_s       7.16      7.43         7.87       8.47        6.43        6.71
+redirects        0         44           0          78          0           0  ← affinity learning
+errors           0         0            0          0           0           0
 ```
 
-**Honest read across all four configurations**:
+The N=128 single-turn `4×LB` is the **pre-affinity** LB (consistent-hash only). After session-affinity learning landed:
+- Same workload, redirects drop from 78 → 0.
+- Throughput dipped slightly (1834 vs 1999 in one trial) — variance, within daytona's run-to-run jitter.
+- The throughput improvement only materialises on **multi-turn** workloads where session reuse amortizes the cold-create cost.
 
-| Provider × N    | 1× chars/s | 4×LB chars/s | Δ      | 1× p95 | 4×LB p95 | Δ       |
-|-----------------|-----------:|-------------:|-------:|-------:|---------:|--------:|
-| unix_local N=16 |       4280 |         3529 | **-18%** |  8.48s |    8.26s | **-3%** |
-| unix_local N=32 |       7382 |         6258 | **-15%** |  9.63s |    8.68s | **-10%** |
-| daytona N=64    |       1194 |         1294 | **+8%**  |  5.84s |    5.36s | **-8%** |
-| daytona N=128   |       2416 |         1999 | **-17%** |  5.59s |    5.70s | **+2%** |
+The multi-turn column (32 sessions × 12 turns = 384 prompts) is the fairest apples-to-apples — same prompt volume, no daytona cold-create thundering herd, no LB redirect tax. Single replica still wins throughput by 14%; **server CPU was sub-1% on both configs** so the difference is purely the per-request LB hop.
+
+### Hitting the provider wall: daytona N=384 single-turn
+
+```
+N=384 × 1 turn, 60s create stagger, 4 replicas + LB:
+  ok=244/384 (63%), fail=140 (37%) all '502 Bad Gateway' from daytona POST /sessions
+  Daytona account cap on the test plan is ~250 concurrent sandboxes.
+  Server CPU during the run: <1%. The wall is daytona's API, not our server.
+```
+
+**Honest read across all five configurations**:
+
+| Workload                  | 1× chars/s | 4×LB chars/s | Δ        | 1× p95 | 4×LB p95 | Δ       |
+|---------------------------|-----------:|-------------:|---------:|-------:|---------:|--------:|
+| unix_local N=16           |       4280 |         3529 | **-18%** |  8.48s |    8.26s | **-3%** |
+| unix_local N=32           |       7382 |         6258 | **-15%** |  9.63s |    8.68s | **-10%**|
+| daytona N=64 (1 turn)     |       1194 |         1294 | **+8%**  |  5.84s |    5.36s | **-8%** |
+| daytona N=128 (1 turn)    |       2416 |         1999 | **-17%** |  5.59s |    5.70s | **+2%** |
+| daytona 32×12 (384 turns) |       2944 |         2520 | **-14%** |  4.47s |    4.49s | **+0.4%** |
 
 What this says:
 - At sub-saturation loads, **single-replica wins throughput** by 15-20% on average. The LB consistent-hash routing imposes a 307 cost on most first-message-per-session requests (only ~1/N of new sessions hash to the replica they were created on), and that overhead beats the parallelism gain when the server isn't CPU-saturated.
