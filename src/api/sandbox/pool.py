@@ -59,14 +59,17 @@ _LEASE_HEARTBEAT_S = float(os.environ.get("AGENT_SDK_LEASE_HEARTBEAT_S", "15"))
 
 class NotOwner(Exception):
     """Raised by ``SessionPool.get_session`` when another replica holds
-    an unexpired lease on the session. Route handlers translate this into
-    a 307 redirect to ``owner_addr``; if ``owner_addr`` is empty (lease
-    row gone), the caller should map to 503."""
+    an unexpired lease on the session. The 307 handler in ``server.py``
+    consumes ``owner_id`` (replica id, used as the routing cookie value)
+    and ``owner_addr`` (the host:port, for diagnostics). If
+    ``owner_addr`` is empty (lease row gone), the caller should map to
+    503."""
 
-    def __init__(self, session_id: str, owner_addr: str = "") -> None:
-        super().__init__(f"session {session_id} owned by {owner_addr or '<unknown>'}")
+    def __init__(self, session_id: str, owner_addr: str = "", owner_id: str = "") -> None:
+        super().__init__(f"session {session_id} owned by {owner_id or owner_addr or '<unknown>'}")
         self.session_id = session_id
         self.owner_addr = owner_addr
+        self.owner_id = owner_id
 
 
 class SessionPool:
@@ -126,7 +129,8 @@ class SessionPool:
         # We didn't get it. Find out who did so the caller can 307.
         current = claim if claim is not None else await db.read_lease(session_id)
         owner_addr = (current or {}).get("lease_owner_addr") or ""
-        raise NotOwner(session_id=session_id, owner_addr=owner_addr)
+        owner_id = (current or {}).get("lease_owner_id") or ""
+        raise NotOwner(session_id=session_id, owner_addr=owner_addr, owner_id=owner_id)
 
     async def _heartbeat_loop(self, session_id: str) -> None:
         """Renew the lease every ``_LEASE_HEARTBEAT_S``. If we ever lose

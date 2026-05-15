@@ -270,18 +270,30 @@ async def _not_owner_handler(request: Request, exc: _NotOwner):
                 "Connection": "close",
             },
         )
-    target = f"http://{exc.owner_addr}{request.url.path}"
+    # Relative Location so the client (browser, SDK) retries against the
+    # same public URL — the LB will use the Set-Cookie below to steer the
+    # retry at the owner replica. Absolute URLs into ``*.railway.internal``
+    # don't resolve from a browser sitting outside Railway's private net.
+    target = request.url.path
     if request.url.query:
         target += f"?{request.url.query}"
-    return Response(
-        status_code=307,
-        headers={
-            "Location": target,
-            # Surface the owner explicitly so clients that don't follow
-            # 307 can still see where to retry against.
-            "X-Session-Owner": exc.owner_addr,
-        },
-    )
+    headers = {
+        "Location": target,
+        "X-Session-Owner": exc.owner_addr,
+    }
+    # Per-session sticky-route cookie. ``Path=/sessions/<sid>`` scopes it
+    # so cookies for different sessions don't collide and POST /sessions
+    # (which has no sid in the URL) isn't influenced by a previous
+    # session's owner. The cookie value is the OWNER's replica_id, which
+    # nginx maps to the owner's private hostname via the cookie→backend
+    # map in ``benchmark/scale/nginx.conf`` / ``deploy/nginx/nginx.conf``.
+    if exc.owner_id:
+        path_scope = f"/sessions/{exc.session_id}"
+        headers["Set-Cookie"] = (
+            f"agent_sdk_route={exc.owner_id}; "
+            f"Path={path_scope}; Max-Age=86400; HttpOnly; SameSite=Lax"
+        )
+    return Response(status_code=307, headers=headers)
 
 
 async def _json_body(request: Request) -> dict:
@@ -1496,25 +1508,33 @@ async def sessions_create(request: Request):
     (eager) into one endpoint with consistent naming.
     """
     data = await _json_body(request)
+    # Client-supplied session_id. The SDK generates a UUID up front and
+    # sends it BOTH in the request body (``id``) and in the
+    # ``X-Session-Id`` header so the LB can consistent-hash on it (the
+    # body isn't visible to nginx; the header is). If both are present
+    # they must match — otherwise routing and storage disagree. Fall
+    # back to server-generated UUID if neither is set (backward-compat
+    # for old SDK builds).
+    header_id = request.headers.get("x-session-id")
+    body_id = data.get("id")
+    if header_id and body_id and header_id != body_id:
+        raise HTTPException(
+            400,
+            "X-Session-Id header does not match body 'id'",
+        )
+    supplied_id = header_id or body_id
+    if supplied_id is not None:
+        try:
+            uuid.UUID(supplied_id)
+        except (ValueError, TypeError):
+            raise HTTPException(400, f"invalid session id format: {supplied_id!r}")
+        existing = await get_session(supplied_id)
+        if existing is not None:
+            raise HTTPException(409, f"session id {supplied_id} already exists")
+        data["id"] = supplied_id
     if data.get("provision", True):
-        result = await _sessions_create_eager(data)
-    else:
-        result = await _sessions_create_lazy(data)
-    # Sticky-session hint for an external LB: set a cookie naming THIS
-    # replica so subsequent /sessions/{id}/* requests can hash on
-    # ``$cookie_agent_sdk_route`` and land on the lease owner without
-    # paying the lease's 307 tax. The cookie is opaque to anything but
-    # the LB — clients don't need to read it. Path is restricted to
-    # /sessions so it doesn't pollute other endpoints' cookie space.
-    from api.identity import replica_id as _replica_id
-    from fastapi.responses import JSONResponse as _JR
-    response = _JR(result)
-    response.set_cookie(
-        "agent_sdk_route", _replica_id(),
-        path="/sessions", httponly=True, samesite="lax",
-        max_age=86400,
-    )
-    return response
+        return await _sessions_create_eager(data)
+    return await _sessions_create_lazy(data)
 
 
 async def _sessions_create_lazy(data: dict) -> dict:
@@ -1572,7 +1592,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
         default_cwd = default_cwd_for_provider(default_provider)
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
-    session_id = str(uuid.uuid4())
+    session_id = data.get("id") or str(uuid.uuid4())
     lazy_user_pre_start = data.get("pre_start_commands") or []
     await upsert_session(
         session_id, agent_id, inner_session_id=None,
@@ -1710,7 +1730,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         credential_refresh_token=data.get("credential_refresh_token"),
     )
 
-    session_id = str(uuid.uuid4())
+    session_id = data.get("id") or str(uuid.uuid4())
     await upsert_session(
         session_id, agent_id, inner_session_id=None,
         volume_id=volume_record.id,
