@@ -43,6 +43,10 @@ AGENT_TYPE = os.environ.get("AGENT_TYPE", "claude")
 MODEL = os.environ.get("MODEL", "haiku")
 N_SESSIONS = int(os.environ.get("N_SESSIONS", "16"))
 N_TURNS = int(os.environ.get("N_TURNS", "1"))
+# Spread session creates over CREATE_STAGGER_S so the provider's
+# control plane isn't thunder-herded. Daytona returns 502 at >~50
+# simultaneous creates; staggering keeps the rate sane.
+CREATE_STAGGER_S = float(os.environ.get("CREATE_STAGGER_S", "0"))
 PROMPT = os.environ.get("PROMPT", "Reply with exactly five short sentences about the weather.")
 WARMUP = int(os.environ.get("WARMUP", "0"))
 TIMEOUT_S = float(os.environ.get("TIMEOUT_S", "180"))
@@ -245,11 +249,17 @@ async def main() -> None:
         print(f"[main] launching {N_SESSIONS} concurrent sessions × {N_TURNS} turn(s) ...",
               flush=True)
         t0 = time.perf_counter()
-        # Stagger session-creates slightly so we don't hammer the daytona
-        # control plane with 1000 simultaneous create requests; the
-        # interesting load is during the prompt phase, not provisioning.
+        # Stagger session-creates to keep the provider's control plane
+        # happy. CREATE_STAGGER_S (env) spreads N sessions over that many
+        # seconds — daytona's create API returns 502 above ~50 simultaneous
+        # cold-creates, so for N=512 use CREATE_STAGGER_S=60+. Default 0
+        # preserves the old behavior (small randomised jitter only).
         async def _staggered(i: int):
-            await asyncio.sleep(random.uniform(0, min(2.0, N_SESSIONS * 0.02)))
+            if CREATE_STAGGER_S > 0:
+                # Even-rate stagger: session i starts at i / N * STAGGER.
+                await asyncio.sleep(CREATE_STAGGER_S * i / max(N_SESSIONS, 1))
+            else:
+                await asyncio.sleep(random.uniform(0, min(2.0, N_SESSIONS * 0.02)))
             return await _run_session_lifecycle(client, i)
 
         per_session = await asyncio.gather(
