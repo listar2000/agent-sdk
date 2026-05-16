@@ -205,23 +205,18 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
 
 # ---------------------------------------------------------------------------
 # Uniform-API dispatch helpers — each forwards to the per-provider function
-# of the same name via ``__getattr__`` so we don't hand-write 12 wrappers.
+# of the same name. Per-volume file ops moved to ``BaseVolumeAdapter``
+# (use ``get_volume_adapter(provider, ref)``).
 # ---------------------------------------------------------------------------
 
-_DISPATCH_FNS = frozenset({
-    "create_volume", "delete_volume", "ensure_supervisor_url",
-    # Per-volume file ops moved to ``BaseVolumeAdapter`` —
-    # ``get_volume_adapter(provider, ref)``.
-})
+async def create_volume(provider: str, *args, **kwargs):
+    return await _dispatch_mod(provider).create_volume(*args, **kwargs)
 
+async def delete_volume(provider: str, *args, **kwargs):
+    return await _dispatch_mod(provider).delete_volume(*args, **kwargs)
 
-def __getattr__(name: str):
-    if name in _DISPATCH_FNS:
-        async def _dispatch(provider: str, *args, **kwargs):
-            return await getattr(_dispatch_mod(provider), name)(*args, **kwargs)
-        _dispatch.__name__ = name
-        return _dispatch
-    raise AttributeError(name)
+async def ensure_supervisor_url(provider: str, *args, **kwargs):
+    return await _dispatch_mod(provider).ensure_supervisor_url(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
