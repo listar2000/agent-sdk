@@ -5,6 +5,7 @@ Uses psycopg v3 + psycopg_pool, matching the pattern in ~/hive/src/hive/server/d
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -147,30 +148,40 @@ _MIGRATIONS = [
     # NULL = nothing extra; ``session/new`` payload is byte-identical
     # to pre-extra-options behavior.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS extra_options JSONB",
-    # 2026-05-15: per-session lease for cross-replica ownership.
-    #   lease_owner_id    — "<replica_id>-<pid>"; the SessionPool that
-    #                       currently holds the in-memory SandboxSession.
-    #   lease_owner_addr  — "<host>:<port>" reachable from peer replicas;
-    #                       used by the route-layer 307 redirect.
-    #   lease_expires_at  — heartbeat TTL; an owner that fails to renew
-    #                       past this time loses the lease automatically.
-    #   lease_generation  — monotonic fencing token. Bumped on every
-    #                       ownership transfer; same owner renewals don't
-    #                       bump. Stale-generation writes can be fenced
-    #                       at the data layer (future work — currently
-    #                       diagnostic-only).
+    # 2026-05-15: per-session lease (DEPRECATED — replaced by the
+    # per-worker scheme below on 2026-05-16). Columns kept nullable
+    # for one release cycle so a rollback can re-enable the old code
+    # path without losing data; new code never writes them. Drop in a
+    # follow-up after the per-worker design has run in production for
+    # a release cycle.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_owner_id TEXT",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_owner_addr TEXT",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_lease_expiry"
-    " ON sessions(lease_expires_at) WHERE lease_owner_id IS NOT NULL",
     # 2026-05-15: per-session ``busy`` flag — wall-time of the most
-    # recent prompt activity on the lease-owning replica. Cluster-wide
+    # recent prompt activity on the owning replica. Cluster-wide
     # readable; read with a TTL filter (e.g. ``busy_at > now() - 60s``)
-    # so stale flags from crashed replicas auto-clean. The atomic lease
-    # claim also resets this on takeover.
+    # so stale flags from crashed replicas auto-clean.
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS busy_at TIMESTAMPTZ",
+    # 2026-05-16: per-worker lease (replaces per-session lease entirely).
+    # We trust the LB's consistent-hash routing — no per-session ownership
+    # tracking, no 307 redirects. The workers table exists for two reasons:
+    #   1. Liveness — ``lease_expires_at`` says which replicas are alive.
+    #   2. Aggregation — ``session_ids`` is the worker's in-memory pool's
+    #      keys (snapshotted on heartbeat AND on every pool mutation).
+    #      Lets the dashboard answer "what's leased and where" with a
+    #      single SQL JOIN, no HTTP fan-out across replicas.
+    # One write per replica per ``AGENT_SDK_WORKER_HEARTBEAT_S`` (vs
+    # one per session in the old design — ~50x DB-write reduction at
+    # N=200 active sessions / 4 replicas).
+    "CREATE TABLE IF NOT EXISTS workers ("
+    "  owner_id TEXT PRIMARY KEY,"
+    "  owner_addr TEXT NOT NULL,"
+    "  lease_expires_at TIMESTAMPTZ NOT NULL,"
+    "  session_ids JSONB NOT NULL DEFAULT '[]'::jsonb,"
+    "  registered_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_workers_expiry ON workers(lease_expires_at)",
 ]
 
 
@@ -450,18 +461,36 @@ async def get_session(session_id: str) -> dict | None:
 async def list_sessions(q: str | None = None, limit: int = 100) -> list[dict]:
     """Session rows, newest first. ``q`` is an optional case-insensitive
     substring filter on the agent's display name. ``limit`` caps the
-    result set (default 100) so the dashboard doesn't pull thousands of
-    rows when no search is active. Returns the lease columns so callers
-    can distinguish ``leased`` (some replica owns it) from ``cold``
-    (no live lease) without a second query."""
+    result set (default 100).
+
+    ``leased`` is derived by joining each session against the live
+    ``workers`` view: a session is leased iff some worker's
+    ``session_ids`` JSONB array contains the session id AND that worker
+    is still alive. The JSONB ``?`` operator + the partial index on
+    ``workers(lease_expires_at)`` keeps this O(workers × log sessions),
+    which is fine — N workers is tiny.
+
+    The returned shape keeps the old ``lease_owner_id`` /
+    ``lease_owner_addr`` field names so the dashboard's payload stays
+    compatible across the migration."""
     sql = (
         "SELECT s.id, s.agent_id, s.inner_session_id, s.volume_id, s.workspace,"
         " s.sandbox_state, s.created_at,"
-        " s.lease_owner_id, s.lease_owner_addr, s.lease_expires_at,"
-        " (s.lease_owner_id IS NOT NULL AND s.lease_expires_at > now()) AS leased,"
+        " w.owner_id AS lease_owner_id,"
+        " w.owner_addr AS lease_owner_addr,"
+        " w.lease_expires_at,"
+        " (w.owner_id IS NOT NULL) AS leased,"
         " s.busy_at,"
         " (s.busy_at > now() - interval '60 seconds') AS busy"
-        " FROM sessions s LEFT JOIN agents a ON a.id = s.agent_id"
+        " FROM sessions s"
+        " LEFT JOIN agents a ON a.id = s.agent_id"
+        " LEFT JOIN LATERAL ("
+        "    SELECT owner_id, owner_addr, lease_expires_at"
+        "      FROM workers"
+        "     WHERE lease_expires_at > now()"
+        "       AND session_ids ? s.id"
+        "     LIMIT 1"
+        " ) w ON true"
     )
     params: tuple = ()
     if q:
@@ -550,92 +579,70 @@ async def delete_sessions_by_volume(volume_id: str) -> None:
         )
 
 
-async def try_claim_lease(
-    session_id: str, *, owner_id: str, owner_addr: str,
-    ttl_seconds: float = 30.0,
-) -> dict | None:
-    """Atomically claim or renew the session's lease.
+async def update_worker_state(
+    *,
+    owner_id: str,
+    owner_addr: str,
+    ttl_seconds: float,
+    session_ids: list[str],
+) -> None:
+    """Single-write heartbeat + pool snapshot.
 
-    Returns ``{lease_owner_id, lease_owner_addr, lease_generation}`` when
-    we successfully hold the lease at return time. Returns ``None`` when
-    the row is missing OR another owner holds an unexpired lease (in
-    which case the caller should ``read_lease`` to learn the current
-    owner_addr for a 307 redirect).
+    Upserts our row in ``workers``: ``lease_expires_at`` gets pushed
+    forward (the "I'm alive" signal) and ``session_ids`` gets replaced
+    with whatever this worker currently holds in memory (the dashboard
+    answer for "what's leased and where").
 
-    Renewing our own lease does NOT bump ``lease_generation``; only an
-    actual ownership transfer (previous owner was NULL or expired) does.
-    """
-    async with get_db() as conn:
-        # Reset ``busy_at`` on every ownership transfer (i.e. when
-        # lease_owner_id changes) so a crashed prior owner can't leave
-        # a stale busy flag stuck on the row. Same-owner renewals
-        # preserve the existing busy_at — the running prompt should
-        # continue to look busy across heartbeats.
-        row = await (await conn.execute(
-            "UPDATE sessions"
-            "   SET lease_owner_id = %s,"
-            "       lease_owner_addr = %s,"
-            "       lease_expires_at = now() + (interval '1 second' * %s),"
-            "       lease_generation = CASE"
-            "           WHEN lease_owner_id = %s THEN lease_generation"
-            "           ELSE lease_generation + 1"
-            "       END,"
-            "       busy_at = CASE"
-            "           WHEN lease_owner_id = %s THEN busy_at"
-            "           ELSE NULL"
-            "       END"
-            " WHERE id = %s"
-            "   AND (lease_owner_id IS NULL"
-            "        OR lease_owner_id = %s"
-            "        OR lease_expires_at < now())"
-            " RETURNING lease_owner_id, lease_owner_addr, lease_generation",
-            (owner_id, owner_addr, ttl_seconds, owner_id, owner_id, session_id, owner_id),
-        )).fetchone()
-    return dict(row) if row else None
-
-
-async def read_lease(session_id: str) -> dict | None:
-    """Inspect the current lease state for a session row. Used after a
-    failed ``try_claim_lease`` to learn the owner_addr for the 307."""
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT lease_owner_id, lease_owner_addr, lease_generation,"
-            " lease_expires_at FROM sessions WHERE id = %s",
-            (session_id,),
-        )).fetchone()
-    return dict(row) if row else None
-
-
-async def release_lease(session_id: str, *, owner_id: str) -> None:
-    """Clear the lease if we still hold it. Idempotent and safe to call
-    on a session we never owned (the WHERE clause filters)."""
+    Called both periodically (heartbeat tick, every
+    ``AGENT_SDK_WORKER_HEARTBEAT_S``) and immediately whenever the
+    pool's active-session set mutates, so the dashboard never lags
+    further than one tick behind reality."""
     async with get_db() as conn:
         await conn.execute(
-            "UPDATE sessions SET lease_owner_id = NULL,"
-            " lease_owner_addr = NULL, lease_expires_at = NULL,"
-            " busy_at = NULL"
-            " WHERE id = %s AND lease_owner_id = %s",
-            (session_id, owner_id),
+            "INSERT INTO workers (owner_id, owner_addr, lease_expires_at, session_ids)"
+            " VALUES (%s, %s, now() + (interval '1 second' * %s), %s::jsonb)"
+            " ON CONFLICT (owner_id) DO UPDATE"
+            "    SET owner_addr = EXCLUDED.owner_addr,"
+            "        lease_expires_at = EXCLUDED.lease_expires_at,"
+            "        session_ids = EXCLUDED.session_ids",
+            (owner_id, owner_addr, ttl_seconds, json.dumps(list(session_ids))),
         )
 
 
-async def set_session_busy(session_id: str, *, owner_id: str, busy: bool) -> None:
-    """Set or clear the ``busy_at`` flag. Scoped to the lease owner so
-    a stale background task on a former owner can't bump the flag after
-    ownership transferred. Idempotent and safe to call without checking
-    the lease (the WHERE clause filters)."""
+async def unregister_worker(*, owner_id: str) -> None:
+    """Drop our row on graceful shutdown. The next dashboard refresh
+    will see this worker's sessions as inactive immediately, rather
+    than waiting for the lease to expire. Idempotent."""
+    async with get_db() as conn:
+        await conn.execute("DELETE FROM workers WHERE owner_id = %s", (owner_id,))
+
+
+async def reap_expired_workers() -> int:
+    """Best-effort cleanup of worker rows whose lease expired past a
+    grace period. Any replica may run this — idempotent housekeeping."""
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "DELETE FROM workers"
+            " WHERE lease_expires_at < now() - interval '5 minutes'"
+            " RETURNING owner_id",
+        )).fetchall()
+    return len(rows)
+
+
+async def set_session_busy(session_id: str, *, busy: bool) -> None:
+    """Set or clear the ``busy_at`` flag. Unscoped — the only caller
+    is the request handler driving an in-flight prompt, which can only
+    be the worker the LB hash routes to. Idempotent."""
     async with get_db() as conn:
         if busy:
             await conn.execute(
-                "UPDATE sessions SET busy_at = now()"
-                " WHERE id = %s AND lease_owner_id = %s",
-                (session_id, owner_id),
+                "UPDATE sessions SET busy_at = now() WHERE id = %s",
+                (session_id,),
             )
         else:
             await conn.execute(
-                "UPDATE sessions SET busy_at = NULL"
-                " WHERE id = %s AND lease_owner_id = %s",
-                (session_id, owner_id),
+                "UPDATE sessions SET busy_at = NULL WHERE id = %s",
+                (session_id,),
             )
 
 

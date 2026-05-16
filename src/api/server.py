@@ -119,12 +119,6 @@ def _configure_logging() -> None:
 # routing is broken") without per-request log spam.
 # ---------------------------------------------------------------------------
 
-# Counter for cross-replica 307 redirects since the last snapshot. Bumped
-# in the NotOwner exception handler; reset every snapshot tick. A non-
-# trivial steady-state value here means the LB's consistent-hash isn't
-# routing as designed.
-_REDIRECT_COUNT_307 = 0
-_REDIRECT_COUNT_503_PEER = 0  # same-replica peer-worker miss (uvicorn --workers > 1)
 _SNAPSHOT_INTERVAL_S = float(os.environ.get("AGENT_SDK_SNAPSHOT_S", "30"))
 
 
@@ -135,10 +129,7 @@ async def _cluster_snapshot_loop() -> None:
       * ``active`` — sessions held by this replica's pool right now
       * ``db_pool`` — psycopg async-pool size / available connections
       * ``exec_queue`` — work items waiting in the default ThreadPoolExecutor
-      * ``r307`` / ``r503`` — cross-replica redirects / peer-worker misses
-        since the previous snapshot (reset each tick)
     """
-    global _REDIRECT_COUNT_307, _REDIRECT_COUNT_503_PEER
     from .identity import replica_id
     from api.sandbox import get_pool
     while True:
@@ -176,13 +167,9 @@ async def _cluster_snapshot_loop() -> None:
                     exec_queue = str(executor._work_queue.qsize())  # noqa: SLF001
             except Exception:
                 pass
-            r307 = _REDIRECT_COUNT_307
-            r503 = _REDIRECT_COUNT_503_PEER
-            _REDIRECT_COUNT_307 = 0
-            _REDIRECT_COUNT_503_PEER = 0
             log.info(
-                "[%s] snapshot: active=%d busy=%d exec_queue=%s %s r307=%d r503=%d",
-                replica_id(), active, busy, exec_queue, db_stats, r307, r503,
+                "[%s] snapshot: active=%d busy=%d exec_queue=%s %s",
+                replica_id(), active, busy, exec_queue, db_stats,
             )
         except asyncio.CancelledError:
             return
@@ -275,8 +262,9 @@ async def lifespan(app):
 
     # SessionPool owns idle eviction now (per
     # ).
-    from api.sandbox import start_reaper, shutdown_pool
+    from api.sandbox import shutdown_pool, start_reaper, start_worker_heartbeat
     _p0 = time.perf_counter(); await start_reaper(); _phases["reaper"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await start_worker_heartbeat(); _phases["worker_hb"] = (time.perf_counter() - _p0) * 1000
     _phase_str = " ".join(f"{k}={v:.0f}ms" for k, v in _phases.items())
     log.info(
         "[%s] startup ready in %.0fms: %s",
@@ -370,81 +358,13 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
 
 
-# NotOwner → 307 redirect. Triggered when ``SessionPool.get_session`` finds
-# that another replica holds the unexpired lease for this session.
-# Streaming endpoints (``/message+stream``, ``/events``) hit this too —
-# httpx clients with ``follow_redirects=True`` transparently follow; clients
-# that don't will see the 307 and can reconnect at the Location URL.
-from .sandbox.pool import NotOwner as _NotOwner  # noqa: E402
-
-
-@app.exception_handler(_NotOwner)
-async def _not_owner_handler(request: Request, exc: _NotOwner):
-    global _REDIRECT_COUNT_307, _REDIRECT_COUNT_503_PEER
-    if not exc.owner_addr:
-        # Lease row missing the addr column or no owner currently — most
-        # likely a session whose row was deleted out-of-band. 503 lets the
-        # client retry; we don't want to redirect into a black hole.
-        return JSONResponse(
-            {"error": "session has no reachable owner", "session_id": exc.session_id},
-            status_code=503,
-            headers={"Retry-After": "1"},
-        )
-    # Intra-replica miss: another worker on the SAME host:port already
-    # holds the lease. 307'ing to our own addr just kernel-rebalances
-    # via SO_REUSEPORT and (1/N)·N retries hit a redirect loop until
-    # httpx's max_redirects gives up. Return 503 with a tight retry-after
-    # instead — the client (or its LB) backs off briefly, the kernel
-    # re-schedules, and eventually the request lands on the right worker.
-    # See `benchmark/scale/RESULTS.md` for the recommended deploy shape
-    # (workers=1 per replica; scale via replica count, not worker count).
-    from .identity import owner_addr as _my_addr
-    if exc.owner_addr == _my_addr():
-        _REDIRECT_COUNT_503_PEER += 1
-        return JSONResponse(
-            {
-                "error": "session owned by peer worker on this replica",
-                "session_id": exc.session_id,
-                "owner_addr": exc.owner_addr,
-            },
-            status_code=503,
-            headers={
-                "Retry-After": "0",
-                "X-Session-Owner": exc.owner_addr,
-                "X-Intra-Replica-Miss": "1",
-                # Force the client to drop the TCP connection. SO_REUSEPORT
-                # is 4-tuple-stable, so reusing the same socket would
-                # deterministically reroute the retry to THIS same worker
-                # → infinite 503 loop. Closing the conn forces a fresh
-                # 4-tuple and lets the kernel schedule onto a peer.
-                "Connection": "close",
-            },
-        )
-    # Relative Location so the client (browser, SDK) retries against the
-    # same public URL — the LB will use the Set-Cookie below to steer the
-    # retry at the owner replica. Absolute URLs into ``*.railway.internal``
-    # don't resolve from a browser sitting outside Railway's private net.
-    target = request.url.path
-    if request.url.query:
-        target += f"?{request.url.query}"
-    headers = {
-        "Location": target,
-        "X-Session-Owner": exc.owner_addr,
-    }
-    # Per-session sticky-route cookie. ``Path=/sessions/<sid>`` scopes it
-    # so cookies for different sessions don't collide and POST /sessions
-    # (which has no sid in the URL) isn't influenced by a previous
-    # session's owner. The cookie value is the OWNER's replica_id, which
-    # nginx maps to the owner's private hostname via the cookie→backend
-    # map in ``benchmark/scale/nginx.conf`` / ``deploy/nginx/nginx.conf``.
-    if exc.owner_id:
-        path_scope = f"/sessions/{exc.session_id}"
-        headers["Set-Cookie"] = (
-            f"agent_sdk_route={exc.owner_id}; "
-            f"Path={path_scope}; Max-Age=86400; HttpOnly; SameSite=Lax"
-        )
-    _REDIRECT_COUNT_307 += 1
-    return Response(status_code=307, headers=headers)
+# No NotOwner handler. The per-session lease was retired in favor of
+# per-worker liveness: we trust the LB's consistent-hash to route a given
+# session to the same replica every time, and accept the narrow
+# split-brain window at rebalance (mitigated in a follow-up via volume
+# flock — see PR description). The previous handler emitted 307s for
+# wrong-replica requests; with no per-session owner_id we can no longer
+# point at "the right replica" — but we no longer need to.
 
 
 async def _json_body(request: Request) -> dict:
@@ -2256,11 +2176,9 @@ async def post_session_message(session_id: str, request: Request):
     ``POST /sessions/{id}/cancel`` followed by this POST — so callers
     don't have to round-trip twice.
 
-    Lease acquisition happens BEFORE the 200 reply so a NotOwner can
-    surface as 307 via the global exception handler. Deferring the
-    claim into the background drain would 200 the client, fire-and-
-    silently-fail the drain (no way to signal back), and leave the
-    rpc orphaned — the multi-replica flake that broke goldens before.
+    Session resolution happens BEFORE the 200 reply (vs deferring into
+    the background drain) so a hard-failure surfaces immediately to
+    the client instead of returning 200 with a silently-broken stream.
     """
     data = await _json_body(request)
     message = data.get("message")
@@ -2269,9 +2187,7 @@ async def post_session_message(session_id: str, request: Request):
 
     rpc_id = str(uuid.uuid4())
 
-    # Claim the lease before returning 200. NotOwner propagates to the
-    # FastAPI exception handler which emits 307 (cross-replica) or 503
-    # (peer worker) — the SDK retries against the right replica.
+    # Resolve (cold-recover if needed) before returning 200.
     from api.sandbox import get_pool
     pool_session = await get_pool().get_session(session_id)
 
@@ -2349,9 +2265,9 @@ async def session_events(session_id: str):
         (nginx / cloudflare / browser EventSource) don't close the
         connection between prompts.
 
-    Lease check fires before the StreamingResponse so a NotOwner becomes
-    a 307/503 via the global exception handler (rather than a 200 with
-    an empty body if we deferred the get_session into the generator).
+    Session resolution fires before the StreamingResponse is built so a
+    hard-failure surfaces immediately rather than as a 200 with an empty
+    body.
     """
     from api.sandbox import get_pool
     from api.sandbox.session import _HEARTBEAT
@@ -2411,12 +2327,9 @@ async def post_session_message_stream(session_id: str, request: Request):
     Both POST /message and GET /events continue to work unchanged for
     callers that need separate submit + multi-subscriber semantics.
 
-    Lease acquisition happens BEFORE the StreamingResponse is constructed
-    so a NotOwner (lease held by another replica/worker) can surface as
-    a 307/503 via the global exception handler. If we deferred this into
-    the SSE generator, response headers (200) would already be on the
-    wire by the time we discover the lease miss — the client would see
-    a successful-looking stream that never produces a turn end.
+    Session resolution happens BEFORE the StreamingResponse is constructed
+    so a hard-failure surfaces as a normal HTTP error rather than as a
+    200 with an empty body once the generator runs.
     """
     data = await _json_body(request)
     message = data.get("message")
@@ -2425,10 +2338,6 @@ async def post_session_message_stream(session_id: str, request: Request):
 
     rpc_id = str(uuid.uuid4())
 
-    # Claim the lease eagerly. Any NotOwner here propagates to the global
-    # exception handler and returns 307 (cross-replica) or 503 + Retry-After
-    # (peer worker on the same replica) without the client ever seeing a
-    # partial stream.
     from api.sandbox import get_pool
     session = await get_pool().get_session(session_id)
 
@@ -2443,13 +2352,11 @@ async def post_session_message_stream(session_id: str, request: Request):
 
 
 async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
-    """Stream branch with an ALREADY-RESOLVED session (lease already held).
+    """Stream branch with an ALREADY-RESOLVED session.
 
-    Used by ``POST /message+stream`` so the lease check happens in the
-    route handler (where NotOwner can become a 307 before headers are
-    sent). The lease-acquire branch lives in ``_execute_and_stream_sse``
-    and yields heartbeats during the wait — that's only useful for the
-    background-drain path now.
+    Used by ``POST /message+stream`` so session resolution (cold-recover
+    on the receiving replica) happens in the route handler — surfaces
+    failures before the StreamingResponse goes on the wire.
     """
     from api.sandbox.session import _HEARTBEAT
 
@@ -2473,9 +2380,8 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
     # can't leave it stuck (lease takeover also resets it).
     from api.sandbox import get_pool as _get_pool
     from api import db as _db
-    _owner_id = _get_pool()._owner_id  # noqa: SLF001 — same module's pool
     try:
-        await _db.set_session_busy(session.session_id, owner_id=_owner_id, busy=True)
+        await _db.set_session_busy(session.session_id, busy=True)
     except Exception:
         log.warning("set_session_busy(True) failed for %s", session.session_id)
 
@@ -2549,7 +2455,7 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
             except (asyncio.TimeoutError, Exception):
                 pass
         try:
-            await _db.set_session_busy(session.session_id, owner_id=_owner_id, busy=False)
+            await _db.set_session_busy(session.session_id, busy=False)
         except Exception:
             log.warning("set_session_busy(False) failed for %s", session.session_id)
         _turn_ms = (time.perf_counter() - _turn_t0) * 1000
