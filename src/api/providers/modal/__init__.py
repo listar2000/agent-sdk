@@ -79,10 +79,6 @@ _SANDBOX_TIMEOUT_SEC = 3600
 _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
     os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "2100")
 ))
-_PRE_START_COMMAND_TIMEOUT_SEC = int(float(
-    os.environ.get("AGENT_SDK_MODAL_PRE_START_TIMEOUT_S", "120")
-))
-
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
 _TAG_KEY = "agent-sdk.sandbox-id"
