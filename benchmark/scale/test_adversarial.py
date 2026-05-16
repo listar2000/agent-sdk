@@ -411,6 +411,13 @@ async def t4_coalescing_preserves_text(a: Replica, _b: Replica) -> None:
     except StopAsyncIteration:
         pass
 
+    # The SSE generator returned the moment we saw ``stopReason``; the
+    # batched session_log writer needs a beat to flush (100ms flush
+    # window) AND the persister's text-buffer flush runs AFTER our
+    # break (it's coalesced server-side). Sleep long enough to let
+    # both settle.
+    await asyncio.sleep(2.0)
+
     # Read the session_log rows that the batcher wrote.
     async with httpx.AsyncClient(timeout=30) as c:
         log = await c.get(f"{a.base_url()}/sessions/{sid}/log?limit=500")
@@ -438,6 +445,189 @@ async def t4_coalescing_preserves_text(a: Replica, _b: Replica) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def _start_nginx_lb(a: Replica, b: Replica, lb_port: int) -> subprocess.Popen:
+    """Spin up an nginx LB in front of the two replicas with the same
+    cookie-failover + consistent-hash config used in production. Cookie
+    map keys are the replicas' ``owner_id`` (``<name>-<pid>``) so the
+    server's NotOwner Set-Cookie steers retries correctly.
+
+    Required so T5 (and any future tests exercising the full routing
+    chain) can hit the LB URL the way an SDK client would in
+    production, rather than poking replicas directly.
+    """
+    assert a.proc and b.proc, "replicas must be started first"
+    pid_a, pid_b = a.proc.pid, b.proc.pid
+    owner_a = f"{a.name}-{pid_a}"
+    owner_b = f"{b.name}-{pid_b}"
+    conf_path = SERVER_LOG_DIR / f"adv-nginx-{lb_port}.conf"
+    pid_path = SERVER_LOG_DIR / f"adv-nginx-{lb_port}.pid"
+    log_path = SERVER_LOG_DIR / f"adv-nginx-{lb_port}.log"
+    conf_path.write_text(
+        f"""daemon off;
+worker_processes 1;
+error_log stderr warn;
+pid {pid_path};
+events {{ worker_connections 4096; }}
+http {{
+  access_log off;
+  map $request_uri $url_sid {{
+    "~^/sessions/(?<sid>[0-9a-f-]+)" $sid;
+    default "";
+  }}
+  map $url_sid $route_key {{
+    ""      $http_x_session_id;
+    default $url_sid;
+  }}
+  map $cookie_agent_sdk_route $sticky_backend {{
+    "{owner_a}"    127.0.0.1:{a.port};
+    "{owner_b}"    127.0.0.1:{b.port};
+    default "";
+  }}
+  upstream agent_sdk_hash {{
+    hash $route_key consistent;
+    server 127.0.0.1:{a.port};
+    server 127.0.0.1:{b.port};
+    keepalive 64;
+  }}
+  upstream agent_sdk_rr {{
+    server 127.0.0.1:{a.port};
+    server 127.0.0.1:{b.port};
+    keepalive 64;
+  }}
+  proxy_http_version 1.1;
+  proxy_set_header   Connection "";
+  proxy_buffering    off;
+  proxy_read_timeout 1h;
+  proxy_send_timeout 1h;
+  server {{
+    listen {lb_port};
+    location ~ ^/sessions/[0-9a-f-]+(/.*)?$ {{
+      if ($sticky_backend != "") {{ proxy_pass http://$sticky_backend; break; }}
+      proxy_pass http://agent_sdk_hash;
+    }}
+    location = /sessions {{
+      if ($http_x_session_id != "") {{ proxy_pass http://agent_sdk_hash; break; }}
+      proxy_pass http://agent_sdk_rr;
+    }}
+    location / {{ proxy_pass http://agent_sdk_rr; }}
+  }}
+}}
+"""
+    )
+    return subprocess.Popen(
+        ["nginx", "-p", str(REPO_ROOT), "-c", str(conf_path)],
+        stdout=open(log_path, "ab"), stderr=subprocess.STDOUT,
+    )
+
+
+async def t5_parallel_prompts_across_replicas(a: Replica, b: Replica) -> None:
+    """Regression: N sessions spread across replicas, fire a prompt at
+    EACH, every one of them must persist a complete turn (user_message +
+    assistant_message + turn_end) to session_log.
+
+    Failure mode this catches: a prompt POSTed to the wrong-owner replica
+    silent-fails (the pre-fix bug where /message returned 200 with a bg
+    drain that lost NotOwner events). Or a routing regression where some
+    sessions never reach their lease owner.
+    """
+    print("\n[T5] parallel prompts at N=10 spread across replicas")
+    import uuid as _uuid
+    secrets = {}
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        secrets["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+    if not secrets:
+        print(_red("     T5 SKIP: CLAUDE_CODE_OAUTH_TOKEN not set"))
+        return
+
+    N = 10
+    sids = [str(_uuid.uuid4()) for _ in range(N)]
+
+    # Start nginx in front of the two replicas — same routing config
+    # as production. SDK clients hit the LB URL, never replica URLs
+    # directly; the cookie-failover path needs an LB to read the
+    # cookie back on retry.
+    LB_PORT = 7790
+    nginx_proc = _start_nginx_lb(a, b, LB_PORT)
+    LB = f"http://127.0.0.1:{LB_PORT}"
+    # Wait for nginx to bind.
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                async with httpx.AsyncClient(timeout=1.0) as probe:
+                    r = await probe.get(f"{LB}/health")
+                if r.status_code == 200:
+                    break
+            except Exception:
+                await asyncio.sleep(0.2)
+        else:
+            raise AssertionError("nginx LB did not become ready in 10s")
+    except Exception:
+        nginx_proc.terminate()
+        raise
+
+    try:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+            # All requests go through the LB. ``X-Session-Id`` on POST
+            # so consistent-hash routes POST + subsequent requests to
+            # the same replica.
+            async def _create(i, sid):
+                r = await c.post(
+                    f"{LB}/sessions",
+                    headers={"X-Session-Id": sid},
+                    json={
+                        "id": sid,
+                        "name": f"t5-{i:02d}",
+                        "provider": "unix_local",
+                        "agent_type": "claude",
+                        "model": "haiku",
+                        "secrets": secrets,
+                    },
+                )
+                r.raise_for_status()
+            await asyncio.gather(*[_create(i, sid) for i, sid in enumerate(sids)])
+
+            async def _prompt(i, sid):
+                r = await c.post(
+                    f"{LB}/sessions/{sid}/message",
+                    json={"message": f"reply with exactly: hello {i}"},
+                    timeout=120,
+                )
+                r.raise_for_status()
+            await asyncio.gather(*[_prompt(i, sid) for i, sid in enumerate(sids)])
+
+            # Wait for events to drain (claude reply + batcher flush).
+            await asyncio.sleep(15)
+
+            # Verify EVERY session has a complete turn in its log.
+            missing = []
+            for i, sid in enumerate(sids):
+                r = await c.get(f"{LB}/sessions/{sid}/log?limit=500")
+                r.raise_for_status()
+                rows = r.json()
+                types = {x["event_type"] for x in rows}
+                need = {"user_message", "assistant_message", "turn_end"}
+                if not need.issubset(types):
+                    missing.append((sid, sorted(types)))
+
+            if missing:
+                for sid, types in missing[:5]:
+                    print(_red(f"     incomplete turn for {sid[:8]}: got {types}"))
+                raise AssertionError(
+                    f"T5: {len(missing)}/{N} sessions did not complete a turn"
+                )
+            print(_green(f"     T5 PASS  ({N}/{N} sessions completed)"))
+
+            for sid in sids:
+                await _delete_session(LB, sid)
+    finally:
+        nginx_proc.terminate()
+        try:
+            nginx_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            nginx_proc.kill()
+
+
 async def main() -> int:
     # Ensure the schema is in place (idempotent).
     os.environ["DATABASE_URL"] = DB_URL
@@ -461,6 +651,7 @@ async def main() -> int:
             ("T2", t2_takeover_after_kill),
             ("T3", t3_concurrent_claim_race),
             ("T4", t4_coalescing_preserves_text),
+            ("T5", t5_parallel_prompts_across_replicas),
         ]:
             try:
                 # T2 kills A — restart it after.

@@ -9,9 +9,10 @@ build/
 node_modules/
 .claude/
 
-# Local Postgres for launch_server_test.sh
+# Local Postgres + nginx for launch_server_test.sh
 .postgres-env/
 .postgres-data/
+.nginx-env/
 
 # Worktrees for subagent-driven development
 .worktrees/

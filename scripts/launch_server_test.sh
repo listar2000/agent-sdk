@@ -281,28 +281,95 @@ if [[ "${all_up}" -ne 1 ]]; then
   exit 1
 fi
 
-# Start the LB. Default is ``nginx`` (cookie-sticky upstream, see
-# benchmark/scale/nginx.conf) — it's the production deployment shape so
-# the local test stack runs the same code path. ``AGENT_SDK_LB=python``
-# falls back to ``benchmark/scale/lb.py`` (affinity-learning) for local
-# dev when you don't want to depend on nginx being on PATH.
+# Start the LB. Default is ``nginx`` (cookie-sticky upstream, same
+# routing as ``deploy/nginx/`` on Railway). ``AGENT_SDK_LB=python``
+# falls back to ``benchmark/scale/lb.py`` for local dev when you don't
+# want to depend on nginx being on PATH.
 lb_log="${REPO_ROOT}/logs/server-lb.log"
 : > "${lb_log}"
 : "${AGENT_SDK_LB:=nginx}"
 if [[ "${AGENT_SDK_LB}" == "nginx" ]]; then
+  # Auto-install nginx via conda into .nginx-env/ if not on PATH —
+  # same brainfree pattern as the Postgres bootstrap above. Skips
+  # the install if a system nginx is already available.
   if ! command -v nginx >/dev/null 2>&1; then
-    echo "ERROR: AGENT_SDK_LB=nginx but nginx is not on PATH." >&2
-    exit 1
+    NGINX_ENV_DIR="${REPO_ROOT}/.nginx-env"
+    if [[ ! -x "${NGINX_ENV_DIR}/bin/nginx" ]]; then
+      echo "Installing nginx into ${NGINX_ENV_DIR} (one-time, ~1 min)..."
+      "${CONDA_BIN}" create -y -p "${NGINX_ENV_DIR}" -c conda-forge nginx >/dev/null
+    fi
+    export PATH="${NGINX_ENV_DIR}/bin:${PATH}"
   fi
+  # Render the nginx config dynamically so any N + port base works.
+  # Same routing as deploy/nginx/nginx.conf (cookie-failover override +
+  # consistent-hash on session_id, with X-Session-Id header for POST).
+  nginx_conf="${REPO_ROOT}/logs/server-nginx.conf"
+  nginx_pid="${REPO_ROOT}/logs/server-nginx.pid"
+  {
+    echo "daemon off;"
+    echo "worker_processes 2;"
+    echo "error_log stderr warn;"
+    echo "pid ${nginx_pid};"
+    echo "events { worker_connections 4096; }"
+    echo "http {"
+    echo "  access_log off;"
+    echo "  map \$request_uri \$url_sid {"
+    echo "    \"~^/sessions/(?<sid>[0-9a-f-]+)\" \$sid;"
+    echo "    default \"\";"
+    echo "  }"
+    echo "  map \$url_sid \$route_key {"
+    echo "    \"\"      \$http_x_session_id;"
+    echo "    default \$url_sid;"
+    echo "  }"
+    echo "  map \$cookie_agent_sdk_route \$sticky_backend {"
+    for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+      port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+      echo "    \"r${i}\"    127.0.0.1:${port};"
+    done
+    echo "    default \"\";"
+    echo "  }"
+    echo "  upstream agent_sdk_hash {"
+    echo "    hash \$route_key consistent;"
+    for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+      port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+      echo "    server 127.0.0.1:${port};"
+    done
+    echo "    keepalive 128;"
+    echo "  }"
+    echo "  upstream agent_sdk_rr {"
+    for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+      port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+      echo "    server 127.0.0.1:${port};"
+    done
+    echo "    keepalive 128;"
+    echo "  }"
+    echo "  proxy_http_version 1.1;"
+    echo "  proxy_set_header   Connection \"\";"
+    echo "  proxy_set_header   Host              \$host;"
+    echo "  proxy_set_header   X-Real-IP         \$remote_addr;"
+    echo "  proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+    echo "  proxy_set_header   X-Forwarded-Proto \$scheme;"
+    echo "  proxy_buffering    off;"
+    echo "  proxy_request_buffering off;"
+    echo "  proxy_read_timeout 1h;"
+    echo "  proxy_send_timeout 1h;"
+    echo "  server {"
+    echo "    listen ${AGENT_SDK_PUBLIC_PORT};"
+    echo "    location ~ ^/sessions/[0-9a-f-]+(/.*)?\$ {"
+    echo "      if (\$sticky_backend != \"\") { proxy_pass http://\$sticky_backend; break; }"
+    echo "      proxy_pass http://agent_sdk_hash;"
+    echo "    }"
+    echo "    location = /sessions {"
+    echo "      if (\$http_x_session_id != \"\") { proxy_pass http://agent_sdk_hash; break; }"
+    echo "      proxy_pass http://agent_sdk_rr;"
+    echo "    }"
+    echo "    location / { proxy_pass http://agent_sdk_rr; }"
+    echo "  }"
+    echo "}"
+  } > "${nginx_conf}"
   echo "  launching nginx LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
-  # nginx.conf hardcodes ports 7791..7794 (benchmark default). Reject
-  # other layouts loudly rather than silently 404 backends.
-  if [[ "${AGENT_SDK_REPLICAS}" -ne 4 || "${AGENT_SDK_BACKEND_PORT_BASE}" -ne 7791 ]]; then
-    echo "ERROR: AGENT_SDK_LB=nginx requires REPLICAS=4 BACKEND_PORT_BASE=7791 (got ${AGENT_SDK_REPLICAS} on ${AGENT_SDK_BACKEND_PORT_BASE})." >&2
-    exit 1
-  fi
-  nginx -p "${REPO_ROOT}" -c benchmark/scale/nginx.conf \
-    > "${lb_log}" 2>&1 &
+  echo "  nginx config: ${nginx_conf}"
+  nginx -p "${REPO_ROOT}" -c "${nginx_conf}" > "${lb_log}" 2>&1 &
   PIDS+=("$!")
 else
   echo "  launching python LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"

@@ -59,8 +59,7 @@ def _reap_daytona(origin: str, *, dry_run: bool) -> int:
         return 0
 
     daytona = Daytona(DaytonaConfig(api_key=api_key))
-    page = daytona.list(labels={"agent_sdk_origin": origin})
-    items = list(getattr(page, "items", None) or page)
+    items = _daytona_list_all(daytona, labels={"agent_sdk_origin": origin})
 
     if not items:
         print(f"[daytona] no sandboxes with agent_sdk_origin={origin!r}")
@@ -86,6 +85,46 @@ def _reap_daytona(origin: str, *, dry_run: bool) -> int:
     if failed:
         print(f"[daytona] {failed} delete(s) failed")
     return len(items) - failed
+
+
+def _daytona_list_all(daytona, *, labels: dict[str, str]) -> list:
+    """Walk all pages of ``daytona.list(labels=...)``.
+
+    Returns a flat list of Sandbox objects. The daytona-sdk's ``list``
+    returns a ``PaginatedSandboxes`` whose ``items`` field is just the
+    first page (default 100); without pagination, ``cleanup_orphans``
+    silently leaves later pages behind and the "Reaped 100 resource(s)"
+    counter looks complete even when there are 200+ orphans against
+    the account quota. Walk pages explicitly until items < page_size
+    or we see total_pages exhausted.
+    """
+    out: list = []
+    page = 1
+    while True:
+        result = daytona.list(labels=labels, page=page)
+        # PaginatedSandboxes exposes ``items`` plus ``total`` / ``total_pages``
+        # via attributes or as tuple entries on older SDK versions. Probe
+        # both shapes so a daytona-sdk bump doesn't silently regress.
+        items: list = []
+        total_pages: int | None = None
+        if hasattr(result, "items"):
+            items = list(result.items)
+            total_pages = getattr(result, "total_pages", None)
+        else:
+            for tup in result:
+                if not isinstance(tup, tuple) or len(tup) != 2:
+                    continue
+                if tup[0] == "items":
+                    items = list(tup[1])
+                elif tup[0] == "total_pages":
+                    total_pages = tup[1]
+        if not items:
+            break
+        out.extend(items)
+        if total_pages is None or page >= total_pages:
+            break
+        page += 1
+    return out
 
 
 def _reap_docker(origin: str, *, dry_run: bool) -> int:
