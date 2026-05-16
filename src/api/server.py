@@ -475,21 +475,6 @@ def _resources_for_provider(provider: str, resources_data):
     return resources
 
 
-async def _install_skills_locally(skills) -> None:
-    """Install skills on the local host (for the local provider)."""
-    for cmd in _skills_install_commands(skills):
-        log.info("installing skill (local): %s", cmd)
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        if proc.returncode != 0:
-            raise RuntimeError(f"skill install failed: {stderr.decode()[:500]}")
-        log.info("skill installed: %s", stdout.decode()[-200:].strip())
-
-
 async def _build_pre_start_commands(
     config, provider: str, user_cmds: list[str] | None,
 ) -> list[str] | None:
@@ -497,18 +482,31 @@ async def _build_pre_start_commands(
 
     Concatenates skill-install commands (from ``config.skills``) with
     caller-supplied ``user_cmds``, preserving order so skills land first.
-    For the ``unix_local`` provider we install skills on the host and return
-    ``None`` — the unix_local sandbox shares HOME with the server, so skill
-    install runs once on the host and user commands there would execute
-    with server privileges (deliberately unsupported).
+    For ``unix_local`` we run the skill installs on the host directly and
+    return ``None`` — the unix_local sandbox shares HOME with the server,
+    so caller-supplied user commands would execute with server privileges
+    (deliberately unsupported).
     """
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     if provider == "unix_local":
-        if skill_cmds:
+        for cmd in skill_cmds:
             try:
-                await _install_skills_locally(config.skills)
+                log.info("installing skill (local): %s", cmd)
+                proc = await asyncio.create_subprocess_shell(
+                    cmd, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=120,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"skill install failed: {stderr.decode()[:500]}"
+                    )
+                log.info("skill installed: %s", stdout.decode()[-200:].strip())
             except Exception as e:
                 log.error("skill install failed, continuing without skills: %s", e)
+                break
         return None
     combined = skill_cmds + list(user_cmds or [])
     return combined or None
