@@ -1185,16 +1185,10 @@ async def admin_list_sessions():
             "agent_id": r["agent_id"],
             "sandbox_ref": sandbox_ref,
             "inner_session_id": r.get("inner_session_id"),
-            # Cluster-wide busy signal — set by the owner on prompt
-            # start, refreshed every heartbeat while in-flight,
-            # cleared on prompt end. TTL filter on the DB read
-            # auto-cleans crashed replicas.
+            # Cluster-wide busy signal — TTL-filtered at the DB layer so
+            # crashed replicas can't leave a stuck flag.
             "agent_busy": bool(r.get("busy")),
-            "active_rpc_id": None,
-            "pending_count": 0,
             "session_subscribers": len(cached._subscribers) if cached else 0,
-            "rpc_subscribers": 0,
-            "shutdown": False,
             "lease_owner_id": r.get("lease_owner_id"),
             "lease_owner_addr": r.get("lease_owner_addr"),
             "owned_by_me": is_mine,
@@ -1305,13 +1299,7 @@ async def session_status(session_id: str):
     back to a DB read of ``sessions.sandbox_state`` JSONB plus the
     ``sessions`` row. Live-only fields (``last_activity``, subscriber
     count, ``has_client``, ``supervisor_url``) become None / 0 / False
-    when the session isn't live in the pool.
-
-    Several response keys (``agent_busy`` / ``active_rpc_id`` /
-    ``pending_count`` / ``rpc_subscriber_count`` / ``available_commands``)
-    are constants — the pool has no equivalent bookkeeping after
-    per-prompt SSE replaced the persistent reader. Kept for response-
-    shape back-compat with the dashboard."""
+    when the session isn't live in the pool."""
     from api.sandbox import get_pool
 
     now = time.time()
@@ -1329,15 +1317,10 @@ async def session_status(session_id: str):
             "sandbox_ref": sandbox_ref,
             "inner_session_id": sess.get("inner_session_id"),
             "agent_busy": False,
-            "active_rpc_id": None,
-            "pending_count": 0,
             "session_subscriber_count": 0,
-            "rpc_subscriber_count": 0,
             "last_activity": None,
             "idle_seconds": None,
             "has_client": False,
-            "shutdown_requested": False,
-            "available_commands": [],
             "supervisor_url": None,
             "supervisor_port": sb_state.get("listen_port") if isinstance(sb_state, dict) else None,
         }
@@ -1349,15 +1332,10 @@ async def session_status(session_id: str):
         "sandbox_ref": getattr(state, "sandbox_ref", None),
         "inner_session_id": pool_session.inner_session_id,
         "agent_busy": False,
-        "active_rpc_id": None,
-        "pending_count": 0,
         "session_subscriber_count": len(pool_session._subscribers),
-        "rpc_subscriber_count": 0,
         "last_activity": last_chunk,
         "idle_seconds": round(now - last_chunk, 1) if last_chunk else None,
         "has_client": pool_session.supervisor_url is not None,
-        "shutdown_requested": False,
-        "available_commands": [],
         "supervisor_url": pool_session.supervisor_url,
         "supervisor_port": getattr(state, "listen_port", None),
     }
