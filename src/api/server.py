@@ -1386,9 +1386,6 @@ async def session_sandbox_info(session_id: str):
     if url:
         result["url"] = url
     if provider == "unix_local" and sandbox_ref:
-        # ``_SPAWN_ARGS`` was removed in the on-disk-marker refactor (PR #57);
-        # ``_load_record`` now resolves the marker path on the fly by globbing
-        # ``<vol_root>/*/system/sandboxes/<ref>.json``.
         from .providers.unix_local import _load_record
         marker, _rec = await asyncio.to_thread(_load_record, sandbox_ref)
         if marker is not None:

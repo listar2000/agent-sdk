@@ -224,11 +224,6 @@ async def delete_volume(ref: str) -> None:
     log.info("local volume deleted: %s", ref)
 
 
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. The supervisor + ACP bins now ship in
-# the agent-sdk Docker image at ``/opt/agent-sdk/runtime/`` (or in
-# ``<repo>/src/supervisor`` for source-tree dev) and ``create_sandbox``
-# resolves them via ``_runtime_supervisor_js()`` / ``_runtime_acp_bin()``.
 
 
 # ---------------------------------------------------------------------------

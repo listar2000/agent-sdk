@@ -286,11 +286,6 @@ async def start_supervisor_in_sandbox(
     return url
 
 
-# ``_resolve_legacy_volume_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor — all its volume-cache + tar-extract +
-# legacy-fallback work is obsolete now that the runtime is in the image.
-
-
 async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
     """Kill a supervisor process by port inside a Daytona sandbox."""
     try:
@@ -937,11 +932,6 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     )
 
 
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. The daytona sandbox now boots from an
-# image whose /opt/agent-sdk/runtime/ contains supervisor.js + every ACP
-# bin; ``provision_daytona_sandbox`` reads ``DAYTONA_IMAGE`` /
-# ``.runtime-image-tag`` for that image.
 
 
 async def create_sandbox(
