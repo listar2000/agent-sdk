@@ -26,7 +26,6 @@ from typing import Any
 from .._shared import (
     ProviderInstance,
     VolumeFileExistsError,
-    _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
     _find_free_port,
@@ -228,7 +227,6 @@ async def create_sandbox(
         raise ValueError("docker create_sandbox requires a non-empty subpath")
     await _ensure_subpath_dir(volume_ref, subpath)
 
-    bin_name = _acp_bin_name(agent_type)
     agent_root = root or _AGENT_HOME_IN
     if port is None:
         port = await _find_free_port()

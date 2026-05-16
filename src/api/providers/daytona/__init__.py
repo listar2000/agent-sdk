@@ -55,7 +55,6 @@ async def _run_sandbox_exec_async(sandbox, cmd: str, timeout: int = 120) -> "_Ex
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
 from .._shared import (
-    _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
     _build_volume_mounts,
@@ -169,7 +168,6 @@ async def start_supervisor_in_sandbox(
     lines for each critical-path phase; grep-friendly for recovery-time
     benchmarks (scripts/bench_recovery.py).
     """
-    bin_name = _acp_bin_name(agent_type)
     sid8 = sandbox.id[:8] if sandbox.id else "?"
     total_t0 = time.monotonic()
     phases: list[tuple[str, float]] = []

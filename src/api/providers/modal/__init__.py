@@ -40,7 +40,6 @@ from .._shared import (
     SandboxMissingError,
     VolumeFileExistsError,
     _MAX_OUTPUT_BYTES,
-    _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
     _safe_path,
@@ -261,7 +260,7 @@ async def create_volume(name: str) -> str:
     support the append semantics the agent filesystem needs.
     """
     modal, api_pb2 = _require_modal()
-    vol = await asyncio.to_thread(
+    await asyncio.to_thread(
         modal.Volume.from_name,
         name,
         create_if_missing=True,
@@ -392,7 +391,6 @@ async def create_sandbox(
     image = await _get_image()
     vol = await _get_volume(volume_ref)
 
-    bin_name = _acp_bin_name(agent_type)
     agent_root = root or _AGENT_HOME_IN
     env_prefix = _build_env_prefix(spawn_env)
     # Resolve the ACP bin via package.json#bin (daytona/modal flatten the
