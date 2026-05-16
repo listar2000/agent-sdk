@@ -505,33 +505,6 @@ async def list_sessions(q: str | None = None, limit: int = 100) -> list[dict]:
 
 
 
-async def get_session_env(session_id: str) -> dict[str, str]:
-    """Return stored session env, or {} if session not found."""
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT env FROM sessions WHERE id = %s", (session_id,)
-        )).fetchone()
-    if row is None:
-        return {}
-    return row["env"] or {}
-
-
-async def get_session_secrets(session_id: str) -> dict[str, str]:
-    """Return stored session secrets, or {} if session not found.
-
-    SECURITY: never log the return value. Passed directly into supervisor
-    spawn env; never serialized to clients (GET /sessions/{id} returns only
-    key names, not values).
-    """
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT secrets FROM sessions WHERE id = %s", (session_id,)
-        )).fetchone()
-    if row is None:
-        return {}
-    return row["secrets"] or {}
-
-
 async def read_sandbox_state(session_id: str) -> dict | None:
     """Read ``sessions.sandbox_state`` JSONB. None if the row is missing."""
     async with get_db() as conn:
@@ -615,18 +588,6 @@ async def unregister_worker(*, owner_id: str) -> None:
     than waiting for the lease to expire. Idempotent."""
     async with get_db() as conn:
         await conn.execute("DELETE FROM workers WHERE owner_id = %s", (owner_id,))
-
-
-async def reap_expired_workers() -> int:
-    """Best-effort cleanup of worker rows whose lease expired past a
-    grace period. Any replica may run this — idempotent housekeeping."""
-    async with get_db() as conn:
-        rows = await (await conn.execute(
-            "DELETE FROM workers"
-            " WHERE lease_expires_at < now() - interval '5 minutes'"
-            " RETURNING owner_id",
-        )).fetchall()
-    return len(rows)
 
 
 async def set_session_busy(session_id: str, *, busy: bool) -> None:
