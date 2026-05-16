@@ -345,25 +345,6 @@ def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, s
     return rc, proc.stdout.read() or "", proc.stderr.read() or ""
 
 
-def _pre_start_failure_message(
-    *, cmd: str, rc: int | None, out: str, err: str, timeout: int,
-) -> str:
-    snippet = (err or out or "")[-1000:].strip()
-    if not snippet:
-        snippet = "<no stdout/stderr captured>"
-    hint = ""
-    if rc == -1:
-        hint = (
-            "\nModal returned exit=-1, which usually means the exec hit its "
-            f"timeout/provider abort before the shell returned (timeout={timeout}s)."
-        )
-    return (
-        "pre_start_commands failed on Modal sandbox "
-        f"(exit={rc}, timeout={timeout}s): {cmd!r}"
-        f"{hint}\n{snippet}"
-    )
-
-
 async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | None, str, str]:
     outer = timeout + 5
     try:

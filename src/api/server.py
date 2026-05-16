@@ -2182,34 +2182,6 @@ async def post_session_message(session_id: str, request: Request):
     return {"rpc_id": rpc_id, "status": "ok"}
 
 
-async def _log_session_acquire_error(session_id: str, rpc_id: str,
-                                     err: Exception) -> None:
-    """Best-effort error log when pool.get_session fails before we have
-    a session object to broadcast through. Writes the error to
-    session_log so /sessions/{id}/log readers see it.
-    """
-    payload = {
-        "prompt_id": rpc_id,
-        "kind": type(err).__name__,
-        "message": str(err)[:500],
-        "phase": "pool.get_session",
-    }
-    try:
-        batcher = get_batcher()
-        if batcher is not None:
-            await batcher.add(
-                session_id=session_id, agent_id="",
-                event_type=EVT_ERROR, payload=payload,
-            )
-        else:
-            await log_event(
-                session_id=session_id, agent_id="",
-                event_type=EVT_ERROR, payload=payload,
-            )
-    except Exception:
-        log.exception("failed to log session-acquire error for %s rpc=%s",
-                      session_id, rpc_id)
-
 
 # Track in-flight POST /message background drains so asyncio doesn't GC them.
 _BG_TASKS: set[asyncio.Task] = set()

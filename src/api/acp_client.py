@@ -379,22 +379,6 @@ class AcpClient:
         result = await self._send_rpc(session_id, "session/list", {})
         return result.get("sessions", [])
 
-    async def cancel_prompt(self, session_id: str) -> None:
-        """Cancel the currently running prompt (best-effort).
-
-        MUST be a JSON-RPC notification — ACP dispatches session/cancel
-        through notificationHandler. Sending it as a request gets
-        "method not found" and the cancel silently no-ops.
-        """
-        inner_sid = self._inner_session_ids.get(session_id)
-        if not inner_sid:
-            return
-        try:
-            await self._notify(session_id, "session/cancel",
-                                {"sessionId": inner_sid})
-        except Exception as e:
-            log.warning("cancel_prompt failed for session %s: %s", session_id, e)
-
     async def call(
         self,
         session_id: str,

@@ -1203,25 +1203,6 @@ async def _conditional_upload_if_absent(ref: str, abs_path: str, content: bytes)
         raise RuntimeError(f"conditional upload failed: {e}") from e
 
 
-async def _upload_overwrite(ref: str, abs_path: str, content: bytes) -> None:
-    """Upload bytes to ``abs_path``, replacing any existing file."""
-    inst = await _get_or_create_utility(ref)
-    if not inst.sandbox_ref:
-        raise RuntimeError("upload overwrite: utility sandbox_ref missing")
-    daytona_client = await _get_async_daytona_client()
-    try:
-        sandbox = await daytona_client.get(inst.sandbox_ref)
-    except Exception as e:
-        raise RuntimeError(f"upload overwrite: get sandbox failed: {e}") from e
-    try:
-        await sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
-            path=abs_path,
-            file=content,
-        )
-    except Exception as e:
-        raise RuntimeError(f"upload overwrite failed: {e}") from e
-
-
 async def _move_overwrite(ref: str, src_abs: str, dst_abs: str) -> None:
     """Move ``src_abs`` to ``dst_abs`` through Daytona's filesystem API."""
     inst = await _get_or_create_utility(ref)
