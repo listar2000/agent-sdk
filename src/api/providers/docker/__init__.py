@@ -29,10 +29,7 @@ from .._shared import (
     _acp_launch_args,
     _build_env_prefix,
     _find_free_port,
-    _port_lock,
-    _freed_ports,
     _read_runtime_image_tag,
-    _recycle_port,
     _safe_path,
     _wait_for_health,
     build_supervisor_argv,
@@ -312,8 +309,6 @@ async def create_sandbox(
         # taken between probe and ``docker run``.  Retry ONCE with a fresh
         # port if the daemon reports a port collision.
         if rc != 0 and _is_port_collision(err):
-            async with _port_lock:
-                _freed_ports.append(port)
             new_port = await _find_free_port()
             log.warning(
                 "docker run port %d collided; retrying on %d (err: %s)",
@@ -359,8 +354,6 @@ async def create_sandbox(
             port=port,
         )
     except BaseException:
-        async with _port_lock:
-            _freed_ports.append(port)
         raise
 
 
@@ -426,7 +419,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
         if "no such container" not in msg:
             log.warning("docker rm -f %s rc=%d: %s", cid[:12], rc, msg[:200])
     port = inst.port
-    await _recycle_port(inst)
     inst.container_id = None
     if port is not None:
         log.info("docker sandbox destroyed: %s (port %d freed)", cid[:12], port)

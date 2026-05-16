@@ -488,26 +488,9 @@ async def _wait_for_health(url: str, max_retries: int = 150, interval: float = 0
 # Port allocator
 # ---------------------------------------------------------------------------
 
-# ``_freed_ports`` was a recycle pool when ports came from a per-process
-# monotonic counter. It's now vestigial — the OS allocator never re-issues
-# the same ephemeral port back-to-back, so recycling has no value. Kept as
-# a still-existing-but-unread list so existing call sites that append on
-# error paths don't need rewiring; entries are never consumed.
-_freed_ports: list[int] = []
 _port_lock = asyncio.Lock()
-
 _sandbox_port_counters: dict[str, int] = {}
 _sandbox_freed_ports: dict[str, list[int]] = {}
-
-
-async def _recycle_port(instance) -> None:
-    """Return instance's port to the free pool (idempotent)."""
-    port = instance.port
-    if port is None:
-        return
-    instance.port = None
-    async with _port_lock:
-        _freed_ports.append(port)
 
 
 async def _find_free_port() -> int:
