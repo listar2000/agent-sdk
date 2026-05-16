@@ -38,38 +38,19 @@ log = logging.getLogger(__name__)
 SessionFactory = Callable[[str, SandboxState], BaseSandboxSession]
 
 
-# Lease tuning. TTL/heartbeat ratio must give enough headroom for the
-# heartbeat to survive a long-running event-loop hop without losing the
-# lease. The realistic worst case is a provider cold-create
-# (``daytona.create`` / ``modal.Sandbox.create``) which can hold the
-# event loop for 30-60s under -n auto bench load even though the call
-# itself runs in a thread — the wall time for the surrounding
-# ``pool.get_session`` lock + the ACP attach round-trip blocks the
-# heartbeat task from being scheduled.
+# Per-worker lease tuning. One heartbeat per process, not per session.
+# The worker keeps a single row in the ``workers`` table; sessions point
+# at it via ``sessions.owner_id``. A session is "owned" iff its
+# owner_id matches a worker whose lease_expires_at is in the future.
 #
-# With TTL=30 / HB=10 (3:1), missing 2 consecutive heartbeats expired
-# the lease and a peer replica claimed mid-recovery — exactly the
-# split-brain we saw under modal cold-create. TTL=120 / HB=15 gives
-# 8:1 headroom; the worst observed cold-recovery is ~60s so we're at
-# 2x that with a comfortable margin. Crashed-owner takeover still
-# completes within the TTL (target: <2 min after dead replica).
-_LEASE_TTL_S = float(os.environ.get("AGENT_SDK_LEASE_TTL_S", "120"))
-_LEASE_HEARTBEAT_S = float(os.environ.get("AGENT_SDK_LEASE_HEARTBEAT_S", "15"))
-
-
-class NotOwner(Exception):
-    """Raised by ``SessionPool.get_session`` when another replica holds
-    an unexpired lease on the session. The 307 handler in ``server.py``
-    consumes ``owner_id`` (replica id, used as the routing cookie value)
-    and ``owner_addr`` (the host:port, for diagnostics). If
-    ``owner_addr`` is empty (lease row gone), the caller should map to
-    503."""
-
-    def __init__(self, session_id: str, owner_addr: str = "", owner_id: str = "") -> None:
-        super().__init__(f"session {session_id} owned by {owner_id or owner_addr or '<unknown>'}")
-        self.session_id = session_id
-        self.owner_addr = owner_addr
-        self.owner_id = owner_id
+# Beat at 25s, expire at 60s. 2.4:1 ratio — one missed beat is fine,
+# two means the worker is probably wedged and a peer should take over.
+# Compared to the previous per-session 8:1 (15s/120s), the worker-level
+# heartbeat doesn't need to survive provider cold-creates because the
+# worker is alive enough to run cold-create iff it's alive enough to
+# heartbeat. Override both at boot via env if the deployment needs it.
+_WORKER_HEARTBEAT_S = float(os.environ.get("AGENT_SDK_WORKER_HEARTBEAT_S", "25"))
+_WORKER_TTL_S = float(os.environ.get("AGENT_SDK_WORKER_TTL_S", "60"))
 
 
 class SessionPool:
@@ -90,14 +71,9 @@ class SessionPool:
         self._factory = factory
         self._active: dict[str, BaseSandboxSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        # One renewal task per session_id we currently own. Stopped in
-        # ``release``/``shutdown_all`` BEFORE the lease itself is dropped
-        # so the heartbeat can't reacquire mid-teardown.
-        self._heartbeat_tasks: dict[str, asyncio.Task] = {}
         # Lazy import — keeps test fixtures that don't go through the
         # FastAPI lifespan from blowing up on the identity module's
-        # import-time env reads (they happen at module load, which is
-        # fine, but explicit lazy keeps the dependency obvious).
+        # import-time env reads.
         from api.identity import owner_addr, owner_id
         self._owner_id = owner_id()
         self._owner_addr = owner_addr()
@@ -108,77 +84,29 @@ class SessionPool:
             lock = self._locks.setdefault(session_id, asyncio.Lock())
         return lock
 
-    async def _claim_lease_or_raise(self, session_id: str) -> int:
-        """Try to claim/renew the lease. Returns ``lease_generation`` on
-        success; raises ``NotOwner`` when another live owner holds it.
+    async def _publish_state(self) -> None:
+        """Snapshot our in-memory pool's session_ids to the ``workers``
+        row + push lease_expires_at forward. Called on every mutation
+        of ``_active`` (so the dashboard JOIN is always within a few
+        ms of reality) and periodically from the worker heartbeat task
+        in ``runtime.py`` (so a long-idle worker still proves it's
+        alive). Best-effort — a transient DB hiccup just delays the
+        dashboard view; the next mutation or heartbeat retries.
 
-        Disabling: setting ``AGENT_SDK_DISABLE_LEASE=1`` bypasses the
-        claim entirely. Useful for unit tests that exercise the pool
-        without a real DB row backing every session.
+        Disabled via ``AGENT_SDK_DISABLE_LEASE=1`` for unit-test
+        fixtures that don't have the ``workers`` table provisioned.
         """
         if os.environ.get("AGENT_SDK_DISABLE_LEASE") == "1":
-            return 0
-        claim = await db.try_claim_lease(
-            session_id,
-            owner_id=self._owner_id,
-            owner_addr=self._owner_addr,
-            ttl_seconds=_LEASE_TTL_S,
-        )
-        if claim is not None and claim["lease_owner_id"] == self._owner_id:
-            return int(claim["lease_generation"])
-        # We didn't get it. Find out who did so the caller can 307.
-        current = claim if claim is not None else await db.read_lease(session_id)
-        owner_addr = (current or {}).get("lease_owner_addr") or ""
-        owner_id = (current or {}).get("lease_owner_id") or ""
-        raise NotOwner(session_id=session_id, owner_addr=owner_addr, owner_id=owner_id)
-
-    async def _heartbeat_loop(self, session_id: str) -> None:
-        """Renew the lease every ``_LEASE_HEARTBEAT_S``. If we ever lose
-        ownership (another replica reclaimed after we missed a beat
-        because of an event-loop stall, etc.), drop the in-memory session
-        instead of continuing to drive a sandbox we don't own."""
-        while True:
-            try:
-                await asyncio.sleep(_LEASE_HEARTBEAT_S)
-            except asyncio.CancelledError:
-                return
-            try:
-                claim = await db.try_claim_lease(
-                    session_id,
-                    owner_id=self._owner_id,
-                    owner_addr=self._owner_addr,
-                    ttl_seconds=_LEASE_TTL_S,
-                )
-            except Exception:
-                log.exception("heartbeat: renewal failed for %s; retrying", session_id)
-                continue
-            if claim is None or claim["lease_owner_id"] != self._owner_id:
-                # We lost the lease — somebody else reclaimed it after
-                # a stall longer than the TTL. Surrender the in-memory
-                # state so the rightful owner can drive the sandbox.
-                log.warning(
-                    "heartbeat: lost lease for %s (claim=%r); surrendering",
-                    session_id, claim,
-                )
-                cached = self._active.pop(session_id, None)
-                self._heartbeat_tasks.pop(session_id, None)
-                if cached is not None:
-                    asyncio.create_task(_safe_shutdown(cached))
-                return
-            # Refresh the cluster-visible busy flag if there's an
-            # in-flight prompt (signaled by ``_prompt_lock.locked()``).
-            # Without this, prompts that take longer than the 60s TTL
-            # filter on ``busy_at`` would briefly look idle in the
-            # dashboard. Same-owner renewals preserve busy_at so the
-            # only risk is undercount, not overcount.
-            cached = self._active.get(session_id)
-            if cached is not None and cached._prompt_lock.locked():
-                try:
-                    await db.set_session_busy(
-                        session_id, owner_id=self._owner_id, busy=True,
-                    )
-                except Exception:
-                    log.warning("heartbeat: busy refresh failed for %s", session_id)
+            return
+        try:
+            await db.update_worker_state(
+                owner_id=self._owner_id,
+                owner_addr=self._owner_addr,
+                ttl_seconds=_WORKER_TTL_S,
+                session_ids=list(self._active.keys()),
+            )
+        except Exception:
+            log.warning("pool: _publish_state failed", exc_info=True)
 
     async def get_session(
         self,
@@ -240,21 +168,17 @@ class SessionPool:
                 cached._subscribers.clear()
                 asyncio.create_task(_safe_shutdown(cached))
                 self._active.pop(session_id, None)
-                # Stop the heartbeat for the dead session; the replacement
-                # path below will start a fresh one after the new claim.
-                hb = self._heartbeat_tasks.pop(session_id, None)
-                if hb is not None and not hb.done():
-                    hb.cancel()
 
             if peek:
                 # No cached entry → don't cold-recover; caller will read
                 # from DB.
                 raise KeyError(f"session {session_id} not in live pool (peek=True)")
 
-            # Claim the cross-replica lease BEFORE we touch any sandbox
-            # state. NotOwner propagates up to the FastAPI handler which
-            # emits a 307 to ``owner_addr``.
-            await self._claim_lease_or_raise(session_id)
+            # No per-session ownership claim. We trust the LB's
+            # consistent-hash routing: if this request landed on us,
+            # we're the right replica. The narrow split-brain window
+            # at LB rebalance is the cost of dropping the lease (see
+            # README §scaling for the volume-flock follow-up).
 
             if initial_state is not None:
                 state: SandboxState = initial_state
@@ -273,13 +197,11 @@ class SessionPool:
             await session.start()
             await db.write_sandbox_state(session_id, serialize(session.state))
             self._active[session_id] = session
-            # Start the lease renewal task. One per active session; cancelled
-            # in release() / shutdown_all() before the lease row is cleared.
-            if os.environ.get("AGENT_SDK_DISABLE_LEASE") != "1":
-                self._heartbeat_tasks[session_id] = asyncio.create_task(
-                    self._heartbeat_loop(session_id),
-                    name=f"lease-heartbeat-{session_id[:8]}",
-                )
+            # Publish the updated session_ids snapshot so the dashboard
+            # sees this session as "active" without waiting for the
+            # 25s heartbeat tick. Best-effort; the periodic heartbeat
+            # in runtime.py would catch it within one tick anyway.
+            await self._publish_state()
             # Spawn the credential-refresh loop if the recipe asks for
             # one. Fires on every wake — cold create AND resume from
             # hibernation — so the agent always has fresh credentials.
@@ -324,27 +246,8 @@ class SessionPool:
         Triggered by the reaper or explicit ``POST /sessions/{id}/release``.
         """
         async with self._lock(session_id):
-            # Stop renewal first so an in-flight heartbeat doesn't extend
-            # the TTL between our shutdown and our lease release.
-            hb = self._heartbeat_tasks.pop(session_id, None)
-            if hb is not None and not hb.done():
-                hb.cancel()
-                try:
-                    await hb
-                except (asyncio.CancelledError, Exception):
-                    pass
             session = self._active.pop(session_id, None)
             if session is None:
-                # Even with no in-memory session, attempt to clear any
-                # lease we somehow still hold (e.g. partial start that
-                # never landed in ``_active``).
-                try:
-                    await db.release_lease(session_id, owner_id=self._owner_id)
-                except Exception:
-                    log.warning(
-                        "release: db.release_lease(%s) failed", session_id,
-                        exc_info=True,
-                    )
                 return
             # Cancel the credential-refresh loop (if any) before tearing
             # down compute. Suppress exceptions on await — the task may
@@ -365,13 +268,10 @@ class SessionPool:
                     )
             finally:
                 await _safe_shutdown(session)
-                try:
-                    await db.release_lease(session_id, owner_id=self._owner_id)
-                except Exception:
-                    log.warning(
-                        "release: db.release_lease(%s) failed", session_id,
-                        exc_info=True,
-                    )
+                # Publish the updated session_ids snapshot so the
+                # dashboard drops this session out of the active list
+                # right away (vs waiting up to one heartbeat tick).
+                await self._publish_state()
 
     def has_active(self, session_id: str) -> bool:
         """For derived UI/admin info ('lifecycle: active|hibernated').
