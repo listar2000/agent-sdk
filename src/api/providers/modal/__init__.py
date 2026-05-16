@@ -51,17 +51,11 @@ from .._shared import (
 
 log = logging.getLogger(__name__)
 
-# ``_SUPERVISOR_JS_HOST`` was deleted in Phase E of
-# the runtime-image-unification refactor — it was used only by install_supervisor.
-
 
 # Inside-sandbox paths — matches Docker's layout so the supervisor and
 # downstream code see the same filesystem shape across providers.
 _VOLUME_MOUNT = "/v"
 _AGENT_HOME_IN = "/home/agent"
-# ``_SUPERVISOR_IN`` was deleted in Phase E of
-# the runtime-image-unification refactor — the supervisor lives at the fixed
-# ``_RUNTIME_IN`` path baked into the image, not symlinked from the volume.
 
 # Fixed in-image path where the agent-sdk runtime
 # (supervisor.js + node_modules) is baked at Docker build time.
@@ -174,11 +168,6 @@ async def _get_image():
        persisted snapshot id can't be looked up (e.g. transient Modal
        error). Slow but always works as long as the Dockerfile is
        valid.
-
-    the runtime-image-unification refactor is preserved: the
-    agent-sdk runtime (``/opt/agent-sdk/runtime/{supervisor.js,node_modules}``)
-    is baked into the image, so the sandbox does NOT need a per-volume
-    install regardless of which path we take here.
     """
     global _image
     if _image is not None:
@@ -279,12 +268,6 @@ async def delete_volume(ref: str) -> None:
         modal.Volume.objects.delete, ref, allow_missing=True,
     )
     log.info("modal volume %s removed", ref)
-
-
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. Modal sandboxes now boot from a
-# ``modal.Image.from_dockerfile(<repo>/Dockerfile)`` whose
-# /opt/agent-sdk/runtime/ contains supervisor.js + every ACP bin.
 
 
 # ---------------------------------------------------------------------------

@@ -370,11 +370,6 @@ async def delete_volume(volume_id: str) -> None:
         await conn.execute("DELETE FROM volumes WHERE id = %s", (volume_id,))
 
 
-# add_supervisor_agent_type was deleted in Phase E of
-# the runtime-image-unification refactor — the supervisor_agent_types cache
-# is no longer used. The DB column survives until the column-drop migration.
-
-
 # ---------------------------------------------------------------------------
 # Session CRUD
 # ---------------------------------------------------------------------------

@@ -69,10 +69,8 @@ from .._shared import (
     normalize_find_output,
 )
 
-# the runtime-image-unification refactor: ``_SUPERVISOR_DIR``,
-# ``_SUPERVISOR_REMOTE_DIR``, and ``_SUPERVISOR_VOLUME_DIR`` were deleted
-# along with the install/cache helpers that used them. The supervisor now
-# lives at ``/opt/agent-sdk/runtime/`` inside the daytona sandbox image.
+# The supervisor lives at ``/opt/agent-sdk/runtime/`` inside the daytona
+# sandbox image; this is the port it listens on.
 _SUPERVISOR_REMOTE_PORT = 9100
 
 # The agent's HOME inside a Daytona sandbox — a LOCAL ext4 directory the
@@ -223,13 +221,10 @@ async def start_supervisor_in_sandbox(
         )
         return url
 
-    # the runtime-image-unification refactor: the daytona sandbox boots
-    # from an image whose ``/opt/agent-sdk/runtime/`` already contains
-    # supervisor.js + every ACP bin. No volume-side cache check, no
-    # deps.tar.gz extract, no legacy /tmp install — all gone with the image.
-    # The bin path is resolved via ``package.json#bin`` (not
-    # ``node_modules/.bin/``) because daytona's image-build flattens
-    # symlinks; the underlying scripts survive but the symlinks don't.
+    # The daytona sandbox boots from an image whose
+    # ``/opt/agent-sdk/runtime/`` already contains supervisor.js + every
+    # ACP bin. The bin path resolves via ``package.json#bin`` (not
+    # ``node_modules/.bin/``) — daytona's image-build flattens symlinks.
     from .._shared import _runtime_acp_bin_relative
     sup_dir = "/opt/agent-sdk/runtime"
     acp_bin = f"{sup_dir}/{_runtime_acp_bin_relative(agent_type)}"

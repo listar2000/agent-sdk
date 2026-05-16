@@ -41,10 +41,6 @@ from .._shared import (
 
 log = logging.getLogger(__name__)
 
-# ``_SUPERVISOR_JS_HOST`` was deleted in Phase E of
-# the runtime-image-unification refactor — install_supervisor (the only reader)
-# is gone. ``_runtime_supervisor_js()`` resolves supervisor.js for callers.
-
 
 # Inside-container supervisor port (mapped to a random host port at create time).
 _SUPERVISOR_CONTAINER_PORT = 9100
@@ -56,9 +52,6 @@ _UTIL_IMAGE = "alpine:3.19"
 
 # Canonical in-container paths for sandbox mounts.
 _AGENT_HOME_IN = "/home/agent"
-# ``_SUPERVISOR_IN`` was deleted in Phase E of
-# the runtime-image-unification refactor — the runtime is bind-mounted to
-# ``/opt/agent-sdk/runtime`` from the host's ``_detect_runtime_path()``.
 
 
 def _require_docker() -> str:
@@ -132,13 +125,6 @@ async def delete_volume(ref: str) -> None:
         return
     # In-use or any other error: raise.
     raise RuntimeError(f"docker volume rm {ref} failed: {err.decode(errors='replace').strip()[:400]}")
-
-
-# ---------------------------------------------------------------------------
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. Sandbox containers now boot from the
-# agent-sdk Docker image whose ``/opt/agent-sdk/runtime/`` is bind-mounted
-# read-only via ``create_sandbox`` below, so no per-volume install runs.
 
 
 # ---------------------------------------------------------------------------

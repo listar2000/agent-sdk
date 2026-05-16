@@ -159,14 +159,6 @@ class BaseSandboxSession(abc.ABC):
             sess.get("inner_session_id") or self._inner_session_id
         )
         self._extra_options = sess.get("extra_options") or None
-
-        # the runtime-image-unification refactor: the per-volume
-        # ``install_supervisor`` step is gone. The supervisor + ACP bins
-        # ship in the agent-sdk Docker image at ``/opt/agent-sdk/runtime/``,
-        # so each provider's ``create_sandbox`` resolves them from a fixed
-        # in-image path. ``volumes.supervisor_agent_types`` (the cache that
-        # used to gate this branch) is also removed; the column drop is
-        # the last commit of Phase E.
         return self._volume_ref
 
     async def _attach_acp(self) -> None:
