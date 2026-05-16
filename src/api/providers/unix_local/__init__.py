@@ -22,7 +22,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .._shared import (
-    AUTH_KEYS,
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_BIN_NAMES,

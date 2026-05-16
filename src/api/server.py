@@ -74,7 +74,6 @@ from .models import (
 )
 from . import providers as _providers_mod
 from .providers import (
-    ProviderInstance,
     VolumeFileExistsError,
     default_cwd_for_provider,
     get_volume_adapter,
@@ -1674,7 +1673,6 @@ async def _sessions_create_eager(data: dict) -> dict:
     on the session row).
     """
     from api.sandbox import Recipe, get_pool, state_for_provider
-    from api.sandbox.state import Resources, validate_resources_for_provider
 
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)

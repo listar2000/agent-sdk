@@ -21,7 +21,6 @@ import logging
 import os
 import shlex
 import shutil
-import time
 from typing import Any
 
 from .._shared import (
