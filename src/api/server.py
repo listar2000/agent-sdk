@@ -38,6 +38,7 @@ from fastapi.responses import (
 
 from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .event_buffer import get_batcher, start_batcher, stop_batcher
+from .timing import extract_session_id, log_request, timed_phase
 from .db import (
     close_pool,
     count_sessions_by_volume,
@@ -93,14 +94,100 @@ log = logging.getLogger(__name__)
 
 
 def _configure_logging() -> None:
-    """Set up logging. Called once at server startup, not on import."""
+    """Set up logging. Called once at server startup, not on import.
+
+    Format includes milliseconds in the timestamp so request timings line
+    up against `[%(name)s]` phase logs at sub-second resolution — without
+    this you can't tell from the log whether two ``[r0] /message+stream``
+    starts happened 20 ms apart or in the same tick.
+    """
     level = os.environ.get("LOG_LEVEL", "INFO")
     logging.basicConfig(
-        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=level,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
         force=True,
     )
     logging.getLogger("api").setLevel(level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight cluster counters — periodic snapshot, NOT per-request.
+# The goal is to spot scaling bottlenecks ("the DB pool is saturated",
+# "executor is queueing", "we're doing 50 redirects/min so the hash
+# routing is broken") without per-request log spam.
+# ---------------------------------------------------------------------------
+
+# Counter for cross-replica 307 redirects since the last snapshot. Bumped
+# in the NotOwner exception handler; reset every snapshot tick. A non-
+# trivial steady-state value here means the LB's consistent-hash isn't
+# routing as designed.
+_REDIRECT_COUNT_307 = 0
+_REDIRECT_COUNT_503_PEER = 0  # same-replica peer-worker miss (uvicorn --workers > 1)
+_SNAPSHOT_INTERVAL_S = float(os.environ.get("AGENT_SDK_SNAPSHOT_S", "30"))
+
+
+async def _cluster_snapshot_loop() -> None:
+    """Periodic per-replica state snapshot. ONE line every N seconds.
+
+    Surfaces the few signals that actually move at scale:
+      * ``active`` — sessions held by this replica's pool right now
+      * ``db_pool`` — psycopg async-pool size / available connections
+      * ``exec_queue`` — work items waiting in the default ThreadPoolExecutor
+      * ``r307`` / ``r503`` — cross-replica redirects / peer-worker misses
+        since the previous snapshot (reset each tick)
+    """
+    global _REDIRECT_COUNT_307, _REDIRECT_COUNT_503_PEER
+    from .identity import replica_id
+    from api.sandbox import get_pool
+    while True:
+        try:
+            await asyncio.sleep(_SNAPSHOT_INTERVAL_S)
+            pool = get_pool()
+            active = len(pool._active)  # noqa: SLF001
+            busy = sum(1 for s in pool._active.values() if s._subscribers)  # noqa: SLF001
+            # psycopg pool internals: ``get_stats`` returns counters like
+            # ``pool_size`` / ``pool_available`` / ``requests_waiting``.
+            # Wrapped in try because the helper is opt-in and the column
+            # name has drifted between psycopg-pool versions.
+            from . import db as _db
+            db_stats = ""
+            try:
+                p = getattr(_db, "_pool", None)
+                if p is not None and hasattr(p, "get_stats"):
+                    s = p.get_stats()
+                    db_stats = (
+                        f"db_pool={s.get('pool_size', '?')}/"
+                        f"{s.get('pool_max', '?')} "
+                        f"db_wait={s.get('requests_waiting', 0)}"
+                    )
+            except Exception:
+                db_stats = ""
+            # Executor queue depth — saturation here is THE signal that
+            # a sync provider SDK (daytona/docker) is back-pressuring.
+            # Default to 0 (not "?") when the executor hasn't been
+            # lazily created yet — same semantically, less noisy.
+            exec_queue = "0"
+            try:
+                loop = asyncio.get_running_loop()
+                executor = loop._default_executor  # noqa: SLF001
+                if executor is not None and hasattr(executor, "_work_queue"):
+                    exec_queue = str(executor._work_queue.qsize())  # noqa: SLF001
+            except Exception:
+                pass
+            r307 = _REDIRECT_COUNT_307
+            r503 = _REDIRECT_COUNT_503_PEER
+            _REDIRECT_COUNT_307 = 0
+            _REDIRECT_COUNT_503_PEER = 0
+            log.info(
+                "[%s] snapshot: active=%d busy=%d exec_queue=%s %s r307=%d r503=%d",
+                replica_id(), active, busy, exec_queue, db_stats, r307, r503,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.warning("cluster snapshot tick failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +216,16 @@ _HTTP_CLIENT: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app):
     _configure_logging()
+    # Startup banner — pin replica + pid + addr so a merged tail across
+    # replicas (or a single replica restart) is greppable. The same
+    # ``replica_id()`` appears in every request line / phase log so you
+    # can trace one session end-to-end with a single filter.
+    from .identity import owner_addr, owner_id, replica_id
+    log.info(
+        "[%s] startup: pid=%d owner_id=%s addr=%s slow_threshold=%.0fms",
+        replica_id(), os.getpid(), owner_id(), owner_addr(),
+        float(os.environ.get("AGENT_SDK_SLOW_MS", "500")),
+    )
     # Default ThreadPoolExecutor caps at ``min(32, cpu_count + 4)``. Every
     # sync provider SDK call (Daytona create/get/start/delete, unix_local
     # filesystem ops) goes through this pool via run_in_executor /
@@ -147,9 +244,14 @@ async def lifespan(app):
         asyncio.get_running_loop().set_default_executor(
             _cf.ThreadPoolExecutor(max_workers=_exec_max, thread_name_prefix="asdk-io")
         )
-    init_db()
-    await init_pool()
-    await start_batcher()
+    # Startup phase timing as a single summary line (fires once per
+    # process — useful for spotting slow init_pool / slow reconcile at
+    # boot, but cheap to keep because it never recurs).
+    _t0 = time.perf_counter()
+    _phases: dict[str, float] = {}
+    _p0 = time.perf_counter(); init_db(); _phases["db"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await init_pool(); _phases["pool"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await start_batcher(); _phases["batcher"] = (time.perf_counter() - _p0) * 1000
 
     global _HTTP_CLIENT
     _HTTP_CLIENT = httpx.AsyncClient(
@@ -167,12 +269,28 @@ async def lifespan(app):
         except Exception as e:
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
+    _p0 = time.perf_counter()
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "unix_local", "modal")])
+    _phases["reconcile"] = (time.perf_counter() - _p0) * 1000
 
     # SessionPool owns idle eviction now (per
     # ).
     from api.sandbox import start_reaper, shutdown_pool
-    await start_reaper()
+    _p0 = time.perf_counter(); await start_reaper(); _phases["reaper"] = (time.perf_counter() - _p0) * 1000
+    _phase_str = " ".join(f"{k}={v:.0f}ms" for k, v in _phases.items())
+    log.info(
+        "[%s] startup ready in %.0fms: %s",
+        replica_id(), (time.perf_counter() - _t0) * 1000, _phase_str,
+    )
+
+    # Periodic cluster-state snapshot — the single most useful log line
+    # for spotting scaling bottlenecks at a glance:
+    #   active sessions / DB pool busy / executor queue / 307 count since last
+    # Logs every AGENT_SDK_SNAPSHOT_S seconds (default 30). One line per
+    # replica; grep ``[r0] snapshot`` to follow a single replica.
+    _snapshot_task = asyncio.create_task(_cluster_snapshot_loop())
+    _BG_TASKS.add(_snapshot_task)
+    _snapshot_task.add_done_callback(_BG_TASKS.discard)
 
     yield
     try:
@@ -213,6 +331,36 @@ app.add_middleware(
 )
 
 
+# Per-request timing line. ``api.timing`` decides the log level:
+#   * polling endpoints (/health, /admin/*, /*/status, /*/sandbox) → DEBUG
+#   * slow requests (≥ AGENT_SDK_SLOW_MS, default 500ms) → WARNING
+#   * 5xx responses → WARNING
+#   * everything else → INFO
+# StreamingResponses log time-to-headers (lease + first chunk), NOT
+# total stream duration; the matching phase log inside ``message+stream``
+# covers full turn-to-done time.
+@app.middleware("http")
+async def _request_timing(request: Request, call_next):
+    t0 = time.perf_counter()
+    sid = extract_session_id(request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        log_request(
+            method=request.method, path=request.url.path,
+            status="ERR", duration_ms=(time.perf_counter() - t0) * 1000,
+            session_id=sid,
+        )
+        raise
+    log_request(
+        method=request.method, path=request.url.path,
+        status=response.status_code,
+        duration_ms=(time.perf_counter() - t0) * 1000,
+        session_id=sid,
+    )
+    return response
+
+
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException):
     """Uniform error shape: ``{"error": ...}`` for string details, pass-through for dict."""
@@ -232,6 +380,7 @@ from .sandbox.pool import NotOwner as _NotOwner  # noqa: E402
 
 @app.exception_handler(_NotOwner)
 async def _not_owner_handler(request: Request, exc: _NotOwner):
+    global _REDIRECT_COUNT_307, _REDIRECT_COUNT_503_PEER
     if not exc.owner_addr:
         # Lease row missing the addr column or no owner currently — most
         # likely a session whose row was deleted out-of-band. 503 lets the
@@ -251,6 +400,7 @@ async def _not_owner_handler(request: Request, exc: _NotOwner):
     # (workers=1 per replica; scale via replica count, not worker count).
     from .identity import owner_addr as _my_addr
     if exc.owner_addr == _my_addr():
+        _REDIRECT_COUNT_503_PEER += 1
         return JSONResponse(
             {
                 "error": "session owned by peer worker on this replica",
@@ -293,6 +443,7 @@ async def _not_owner_handler(request: Request, exc: _NotOwner):
             f"agent_sdk_route={exc.owner_id}; "
             f"Path={path_scope}; Max-Age=86400; HttpOnly; SameSite=Lax"
         )
+    _REDIRECT_COUNT_307 += 1
     return Response(status_code=307, headers=headers)
 
 
@@ -1748,9 +1899,17 @@ async def _sessions_create_eager(data: dict) -> dict:
     )
     pool = get_pool()
     try:
-        pool_session = await pool.cold_create(
-            session_id, provider=provider, recipe=recipe,
-        )
+        # One phase log per cold_create — the slowest single call in the
+        # session lifecycle (daytona ~15-30s, modal ~10-20s, local ~2-3s).
+        # Slow cold_creates trip the WARNING level so they pop out of the
+        # log without per-step instrumentation.
+        async with timed_phase(
+            "sessions.cold_create",
+            session_id=session_id[:8], provider=provider,
+        ):
+            pool_session = await pool.cold_create(
+                session_id, provider=provider, recipe=recipe,
+            )
     except HTTPException:
         if agent_was_created_here:
             await delete_agent(agent_id)
@@ -2324,6 +2483,11 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
         await _persist_prompt_events(session, message, rpc_id)
 
     drive_task = asyncio.create_task(_drive())
+    # Wrap the full turn so we get one log line per prompt with the
+    # actual wall-clock duration (the request middleware only sees
+    # time-to-headers for StreamingResponse). Slow turns surface as
+    # WARNING in the log without per-frame instrumentation.
+    _turn_t0 = time.perf_counter()
     try:
         async for item in session.iterate_subscriber(sid, q):
             if item is _HEARTBEAT:
@@ -2388,6 +2552,19 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
             await _db.set_session_busy(session.session_id, owner_id=_owner_id, busy=False)
         except Exception:
             log.warning("set_session_busy(False) failed for %s", session.session_id)
+        _turn_ms = (time.perf_counter() - _turn_t0) * 1000
+        # Direct log (not timed_phase) so the rpc_id is in-line for
+        # cross-correlation with /events subscribers and DB session_log
+        # rows. Turns are inherently long (5-30s typical), so the
+        # warning threshold is its own knob — AGENT_SDK_SLOW_TURN_MS,
+        # default 60s. Everything else is INFO.
+        from .identity import replica_id as _rid
+        _slow_turn = float(os.environ.get("AGENT_SDK_SLOW_TURN_MS", "60000"))
+        _lvl = logging.WARNING if _turn_ms >= _slow_turn else logging.INFO
+        log.log(
+            _lvl, "[%s] turn done session=%s rpc=%s %.0fms",
+            _rid(), session.session_id[:8], rpc_id[:8], _turn_ms,
+        )
 
 
 @app.post("/sessions/{session_id}/cancel")
