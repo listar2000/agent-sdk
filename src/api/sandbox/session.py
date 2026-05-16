@@ -82,7 +82,6 @@ class BaseSandboxSession(abc.ABC):
         self._inner_session_id: str | None = None
         self._acp_session_id: str | None = None
         self._acp_attached: bool = False
-        self._supervisor_installed: bool = False
         # Session-scoped ACP vendor-options forwarded as
         # ``_meta.<vendor>.options`` on session/new. Source-of-truth is
         # the sessions row; bootstrap copies it here so ``_attach_acp``
