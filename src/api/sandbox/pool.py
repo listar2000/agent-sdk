@@ -273,11 +273,6 @@ class SessionPool:
                 # right away (vs waiting up to one heartbeat tick).
                 await self._publish_state()
 
-    def has_active(self, session_id: str) -> bool:
-        """For derived UI/admin info ('lifecycle: active|hibernated').
-        No I/O — just whether the pool currently holds a session."""
-        return session_id in self._active
-
     async def reap_idle(
         self,
         idle_s: float,
