@@ -17,15 +17,12 @@ import re
 import shlex
 import tempfile
 import time
-import traceback
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from psycopg.types.json import Json
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -36,7 +33,6 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .event_buffer import get_batcher, start_batcher, stop_batcher
 from .timing import extract_session_id, log_request, timed_phase
 from .db import (
@@ -47,7 +43,6 @@ from .db import (
     delete_sessions_by_volume,
     delete_volume,
     get_agent,
-    get_db,
     get_session,
     get_session_log,
     get_volume,
@@ -64,7 +59,6 @@ from .db import (
     upsert_agent,
     upsert_session,
     upsert_volume,
-    write_sandbox_state,
 )
 from .models import (
     EVT_ASSISTANT_MESSAGE,
@@ -80,7 +74,6 @@ from .models import (
 )
 from . import providers as _providers_mod
 from .providers import (
-    PORT_BASED_PROVIDERS,
     ProviderInstance,
     VolumeFileExistsError,
     default_cwd_for_provider,
