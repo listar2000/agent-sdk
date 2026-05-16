@@ -1133,12 +1133,6 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
         raise _volume_fs_err("Rename", vol.provider, e)
 
 
-# Sandbox CRUD routes removed: the standalone ``sandboxes`` table is gone;
-# session-scoped routes (``GET /sessions/{id}/sandbox``,
-# ``DELETE /sessions/{id}``) replace them. Reverse lookups by sandbox_ref
-# go through ``SessionPool.find_by_sandbox_ref``.
-
-
 # ---------------------------------------------------------------------------
 # Admin
 # ---------------------------------------------------------------------------

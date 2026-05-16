@@ -302,16 +302,6 @@ async def delete_agent(agent_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox CRUD
-# ---------------------------------------------------------------------------
-
-# Sandbox CRUD removed: the sandboxes table is gone (see migration in
-# _MIGRATIONS that drops it). Pool's sandbox_state JSONB on the sessions
-# row is the single source of truth; provider sandbox refs live there
-# directly.
-
-
-# ---------------------------------------------------------------------------
 # Volume CRUD
 # ---------------------------------------------------------------------------
 
@@ -612,11 +602,6 @@ async def live_sandbox_refs() -> set[str]:
             " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
         )).fetchall()
     return {r["sid"] for r in rows}
-
-
-# get_any_session_for_sandbox removed: it walked sessions.current_sandbox_id
-# (gone with the sandboxes table) and was only used by the legacy back-compat
-# spawn_env-reconstruction path that the SessionPool replaced.
 
 
 # ---------------------------------------------------------------------------
