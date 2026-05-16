@@ -32,7 +32,6 @@ import logging
 import os
 import shlex
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -41,12 +40,10 @@ from .._shared import (
     ProviderInstance,
     SandboxMissingError,
     VolumeFileExistsError,
-    _ACP_NPM_SPECS,
     _MAX_OUTPUT_BYTES,
     _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
-    _read_runtime_image_tag,
     _safe_path,
     _truncate,
     _wait_for_health,

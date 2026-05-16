@@ -57,7 +57,6 @@ async def _run_sandbox_exec_async(sandbox, cmd: str, timeout: int = 120) -> "_Ex
 from .._shared import (
     _acp_bin_name,
     _acp_launch_args,
-    _ACP_NPM_SPECS,
     _build_env_prefix,
     _build_volume_mounts,
     _get_sandbox_env_vars,

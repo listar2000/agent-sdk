@@ -49,10 +49,7 @@ import httpx
 
 from api.sse import iter_sse_blocks, parse_acp_event
 from agent_sdk.api_client import ApiClient, _raise_for_status
-from agent_sdk.errors import (
-    AgentConnectionError, AgentNotRegisteredError, AgentBusyError,
-    AgentTimeoutError, StreamError, PromptError,
-)
+from agent_sdk.errors import StreamError, PromptError
 from agent_sdk.persist import SessionRecord, SqliteSessionDriver
 
 log = logging.getLogger(__name__)

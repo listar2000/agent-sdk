@@ -22,14 +22,11 @@ import os
 import shlex
 import shutil
 import time
-import uuid
-from pathlib import Path
 from typing import Any
 
 from .._shared import (
     ProviderInstance,
     VolumeFileExistsError,
-    _ACP_NPM_SPECS,
     _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
