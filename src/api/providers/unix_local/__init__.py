@@ -465,7 +465,6 @@ async def create_sandbox(
         root=str(home_dir),
         sandbox_ref=ref,
         port=port,
-        process=proc,
     )
 
 

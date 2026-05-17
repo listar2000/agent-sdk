@@ -96,8 +96,6 @@ _ACP_LAUNCH_ARGS: dict[str, list[str]] = {
     "goose": ["acp"],
 }
 
-# Remote supervisor constants (also used by daytona.py)
-_SUPERVISOR_REMOTE_PORT = 9100
 
 
 # Per-provider "where the agent's persistent HOME lives". For docker this
@@ -172,7 +170,6 @@ class ProviderInstance:
     url: str                   # http:// base URL
     root: str = "/tmp"         # filesystem root for the sandbox
     sandbox_ref: str | None = None  # provider's opaque ref (Daytona id, docker container id, local "local-<hex>")
-    process: asyncio.subprocess.Process | None = None  # local subprocess
     port: int | None = 0       # local port (if local or docker)
     container_id: str | None = None  # Docker container ID (if docker)
 
@@ -189,14 +186,6 @@ class ExecResult:
     stderr_truncated: bool = False
     timed_out: bool = False
 
-    def to_dict(self) -> dict:
-        from dataclasses import asdict
-        return asdict(self)
-
-
-# ---------------------------------------------------------------------------
-# ACP helpers
-# ---------------------------------------------------------------------------
 
 def _acp_bin_name(agent_type: str) -> str:
     try:
