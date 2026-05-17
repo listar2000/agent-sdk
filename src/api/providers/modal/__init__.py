@@ -31,8 +31,6 @@ import base64
 import logging
 import os
 import shlex
-import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -41,12 +39,9 @@ from .._shared import (
     ProviderInstance,
     SandboxMissingError,
     VolumeFileExistsError,
-    _ACP_NPM_SPECS,
     _MAX_OUTPUT_BYTES,
-    _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
-    _read_runtime_image_tag,
     _safe_path,
     _truncate,
     _wait_for_health,
@@ -56,17 +51,11 @@ from .._shared import (
 
 log = logging.getLogger(__name__)
 
-# ``_SUPERVISOR_JS_HOST`` was deleted in Phase E of
-# the runtime-image-unification refactor — it was used only by install_supervisor.
-
 
 # Inside-sandbox paths — matches Docker's layout so the supervisor and
 # downstream code see the same filesystem shape across providers.
 _VOLUME_MOUNT = "/v"
 _AGENT_HOME_IN = "/home/agent"
-# ``_SUPERVISOR_IN`` was deleted in Phase E of
-# the runtime-image-unification refactor — the supervisor lives at the fixed
-# ``_RUNTIME_IN`` path baked into the image, not symlinked from the volume.
 
 # Fixed in-image path where the agent-sdk runtime
 # (supervisor.js + node_modules) is baked at Docker build time.
@@ -90,10 +79,6 @@ _SANDBOX_TIMEOUT_SEC = 3600
 _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
     os.environ.get("AGENT_SDK_MODAL_IDLE_TIMEOUT_S", "2100")
 ))
-_PRE_START_COMMAND_TIMEOUT_SEC = int(float(
-    os.environ.get("AGENT_SDK_MODAL_PRE_START_TIMEOUT_S", "120")
-))
-
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
 _TAG_KEY = "agent-sdk.sandbox-id"
@@ -179,11 +164,6 @@ async def _get_image():
        persisted snapshot id can't be looked up (e.g. transient Modal
        error). Slow but always works as long as the Dockerfile is
        valid.
-
-    the runtime-image-unification refactor is preserved: the
-    agent-sdk runtime (``/opt/agent-sdk/runtime/{supervisor.js,node_modules}``)
-    is baked into the image, so the sandbox does NOT need a per-volume
-    install regardless of which path we take here.
     """
     global _image
     if _image is not None:
@@ -265,7 +245,7 @@ async def create_volume(name: str) -> str:
     support the append semantics the agent filesystem needs.
     """
     modal, api_pb2 = _require_modal()
-    vol = await asyncio.to_thread(
+    await asyncio.to_thread(
         modal.Volume.from_name,
         name,
         create_if_missing=True,
@@ -284,12 +264,6 @@ async def delete_volume(ref: str) -> None:
         modal.Volume.objects.delete, ref, allow_missing=True,
     )
     log.info("modal volume %s removed", ref)
-
-
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. Modal sandboxes now boot from a
-# ``modal.Image.from_dockerfile(<repo>/Dockerfile)`` whose
-# /opt/agent-sdk/runtime/ contains supervisor.js + every ACP bin.
 
 
 # ---------------------------------------------------------------------------
@@ -348,25 +322,6 @@ def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, s
     return rc, proc.stdout.read() or "", proc.stderr.read() or ""
 
 
-def _pre_start_failure_message(
-    *, cmd: str, rc: int | None, out: str, err: str, timeout: int,
-) -> str:
-    snippet = (err or out or "")[-1000:].strip()
-    if not snippet:
-        snippet = "<no stdout/stderr captured>"
-    hint = ""
-    if rc == -1:
-        hint = (
-            "\nModal returned exit=-1, which usually means the exec hit its "
-            f"timeout/provider abort before the shell returned (timeout={timeout}s)."
-        )
-    return (
-        "pre_start_commands failed on Modal sandbox "
-        f"(exit={rc}, timeout={timeout}s): {cmd!r}"
-        f"{hint}\n{snippet}"
-    )
-
-
 async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | None, str, str]:
     outer = timeout + 5
     try:
@@ -415,7 +370,6 @@ async def create_sandbox(
     image = await _get_image()
     vol = await _get_volume(volume_ref)
 
-    bin_name = _acp_bin_name(agent_type)
     agent_root = root or _AGENT_HOME_IN
     env_prefix = _build_env_prefix(spawn_env)
     # Resolve the ACP bin via package.json#bin (daytona/modal flatten the

@@ -17,15 +17,12 @@ import re
 import shlex
 import tempfile
 import time
-import traceback
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from psycopg.types.json import Json
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -36,7 +33,6 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from .acp_client import AcpClient, _mcp_dict_to_acp_array
 from .event_buffer import get_batcher, start_batcher, stop_batcher
 from .timing import extract_session_id, log_request, timed_phase
 from .db import (
@@ -47,7 +43,6 @@ from .db import (
     delete_sessions_by_volume,
     delete_volume,
     get_agent,
-    get_db,
     get_session,
     get_session_log,
     get_volume,
@@ -64,7 +59,6 @@ from .db import (
     upsert_agent,
     upsert_session,
     upsert_volume,
-    write_sandbox_state,
 )
 from .models import (
     EVT_ASSISTANT_MESSAGE,
@@ -80,8 +74,6 @@ from .models import (
 )
 from . import providers as _providers_mod
 from .providers import (
-    PORT_BASED_PROVIDERS,
-    ProviderInstance,
     VolumeFileExistsError,
     default_cwd_for_provider,
     get_volume_adapter,
@@ -483,21 +475,6 @@ def _resources_for_provider(provider: str, resources_data):
     return resources
 
 
-async def _install_skills_locally(skills) -> None:
-    """Install skills on the local host (for the local provider)."""
-    for cmd in _skills_install_commands(skills):
-        log.info("installing skill (local): %s", cmd)
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        if proc.returncode != 0:
-            raise RuntimeError(f"skill install failed: {stderr.decode()[:500]}")
-        log.info("skill installed: %s", stdout.decode()[-200:].strip())
-
-
 async def _build_pre_start_commands(
     config, provider: str, user_cmds: list[str] | None,
 ) -> list[str] | None:
@@ -505,18 +482,31 @@ async def _build_pre_start_commands(
 
     Concatenates skill-install commands (from ``config.skills``) with
     caller-supplied ``user_cmds``, preserving order so skills land first.
-    For the ``unix_local`` provider we install skills on the host and return
-    ``None`` — the unix_local sandbox shares HOME with the server, so skill
-    install runs once on the host and user commands there would execute
-    with server privileges (deliberately unsupported).
+    For ``unix_local`` we run the skill installs on the host directly and
+    return ``None`` — the unix_local sandbox shares HOME with the server,
+    so caller-supplied user commands would execute with server privileges
+    (deliberately unsupported).
     """
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     if provider == "unix_local":
-        if skill_cmds:
+        for cmd in skill_cmds:
             try:
-                await _install_skills_locally(config.skills)
+                log.info("installing skill (local): %s", cmd)
+                proc = await asyncio.create_subprocess_shell(
+                    cmd, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=120,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"skill install failed: {stderr.decode()[:500]}"
+                    )
+                log.info("skill installed: %s", stdout.decode()[-200:].strip())
             except Exception as e:
                 log.error("skill install failed, continuing without skills: %s", e)
+                break
         return None
     combined = skill_cmds + list(user_cmds or [])
     return combined or None
@@ -1141,12 +1131,6 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
         raise _volume_fs_err("Rename", vol.provider, e)
 
 
-# Sandbox CRUD routes removed: the standalone ``sandboxes`` table is gone;
-# session-scoped routes (``GET /sessions/{id}/sandbox``,
-# ``DELETE /sessions/{id}``) replace them. Reverse lookups by sandbox_ref
-# go through ``SessionPool.find_by_sandbox_ref``.
-
-
 # ---------------------------------------------------------------------------
 # Admin
 # ---------------------------------------------------------------------------
@@ -1185,16 +1169,10 @@ async def admin_list_sessions():
             "agent_id": r["agent_id"],
             "sandbox_ref": sandbox_ref,
             "inner_session_id": r.get("inner_session_id"),
-            # Cluster-wide busy signal — set by the owner on prompt
-            # start, refreshed every heartbeat while in-flight,
-            # cleared on prompt end. TTL filter on the DB read
-            # auto-cleans crashed replicas.
+            # Cluster-wide busy signal — TTL-filtered at the DB layer so
+            # crashed replicas can't leave a stuck flag.
             "agent_busy": bool(r.get("busy")),
-            "active_rpc_id": None,
-            "pending_count": 0,
             "session_subscribers": len(cached._subscribers) if cached else 0,
-            "rpc_subscribers": 0,
-            "shutdown": False,
             "lease_owner_id": r.get("lease_owner_id"),
             "lease_owner_addr": r.get("lease_owner_addr"),
             "owned_by_me": is_mine,
@@ -1305,13 +1283,7 @@ async def session_status(session_id: str):
     back to a DB read of ``sessions.sandbox_state`` JSONB plus the
     ``sessions`` row. Live-only fields (``last_activity``, subscriber
     count, ``has_client``, ``supervisor_url``) become None / 0 / False
-    when the session isn't live in the pool.
-
-    Several response keys (``agent_busy`` / ``active_rpc_id`` /
-    ``pending_count`` / ``rpc_subscriber_count`` / ``available_commands``)
-    are constants — the pool has no equivalent bookkeeping after
-    per-prompt SSE replaced the persistent reader. Kept for response-
-    shape back-compat with the dashboard."""
+    when the session isn't live in the pool."""
     from api.sandbox import get_pool
 
     now = time.time()
@@ -1329,15 +1301,10 @@ async def session_status(session_id: str):
             "sandbox_ref": sandbox_ref,
             "inner_session_id": sess.get("inner_session_id"),
             "agent_busy": False,
-            "active_rpc_id": None,
-            "pending_count": 0,
             "session_subscriber_count": 0,
-            "rpc_subscriber_count": 0,
             "last_activity": None,
             "idle_seconds": None,
             "has_client": False,
-            "shutdown_requested": False,
-            "available_commands": [],
             "supervisor_url": None,
             "supervisor_port": sb_state.get("listen_port") if isinstance(sb_state, dict) else None,
         }
@@ -1349,15 +1316,10 @@ async def session_status(session_id: str):
         "sandbox_ref": getattr(state, "sandbox_ref", None),
         "inner_session_id": pool_session.inner_session_id,
         "agent_busy": False,
-        "active_rpc_id": None,
-        "pending_count": 0,
         "session_subscriber_count": len(pool_session._subscribers),
-        "rpc_subscriber_count": 0,
         "last_activity": last_chunk,
         "idle_seconds": round(now - last_chunk, 1) if last_chunk else None,
         "has_client": pool_session.supervisor_url is not None,
-        "shutdown_requested": False,
-        "available_commands": [],
         "supervisor_url": pool_session.supervisor_url,
         "supervisor_port": getattr(state, "listen_port", None),
     }
@@ -1416,9 +1378,6 @@ async def session_sandbox_info(session_id: str):
     if url:
         result["url"] = url
     if provider == "unix_local" and sandbox_ref:
-        # ``_SPAWN_ARGS`` was removed in the on-disk-marker refactor (PR #57);
-        # ``_load_record`` now resolves the marker path on the fly by globbing
-        # ``<vol_root>/*/system/sandboxes/<ref>.json``.
         from .providers.unix_local import _load_record
         marker, _rec = await asyncio.to_thread(_load_record, sandbox_ref)
         if marker is not None:
@@ -1703,7 +1662,6 @@ async def _sessions_create_eager(data: dict) -> dict:
     on the session row).
     """
     from api.sandbox import Recipe, get_pool, state_for_provider
-    from api.sandbox.state import Resources, validate_resources_for_provider
 
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
@@ -2210,34 +2168,6 @@ async def post_session_message(session_id: str, request: Request):
     task.add_done_callback(_BG_TASKS.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
 
-
-async def _log_session_acquire_error(session_id: str, rpc_id: str,
-                                     err: Exception) -> None:
-    """Best-effort error log when pool.get_session fails before we have
-    a session object to broadcast through. Writes the error to
-    session_log so /sessions/{id}/log readers see it.
-    """
-    payload = {
-        "prompt_id": rpc_id,
-        "kind": type(err).__name__,
-        "message": str(err)[:500],
-        "phase": "pool.get_session",
-    }
-    try:
-        batcher = get_batcher()
-        if batcher is not None:
-            await batcher.add(
-                session_id=session_id, agent_id="",
-                event_type=EVT_ERROR, payload=payload,
-            )
-        else:
-            await log_event(
-                session_id=session_id, agent_id="",
-                event_type=EVT_ERROR, payload=payload,
-            )
-    except Exception:
-        log.exception("failed to log session-acquire error for %s rpc=%s",
-                      session_id, rpc_id)
 
 
 # Track in-flight POST /message background drains so asyncio doesn't GC them.

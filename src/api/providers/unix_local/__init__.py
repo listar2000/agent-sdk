@@ -22,7 +22,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .._shared import (
-    AUTH_KEYS,
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_BIN_NAMES,
@@ -31,8 +30,6 @@ from .._shared import (
     _acp_launch_args,
     _find_free_port,
     _get_sandbox_env_vars,
-    _port_lock,
-    _freed_ports,
     _runtime_acp_bin,
     _runtime_supervisor_js,
     _safe_path,
@@ -225,11 +222,6 @@ async def delete_volume(ref: str) -> None:
     log.info("local volume deleted: %s", ref)
 
 
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. The supervisor + ACP bins now ship in
-# the agent-sdk Docker image at ``/opt/agent-sdk/runtime/`` (or in
-# ``<repo>/src/supervisor`` for source-tree dev) and ``create_sandbox``
-# resolves them via ``_runtime_supervisor_js()`` / ``_runtime_acp_bin()``.
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +364,6 @@ async def create_sandbox(
                 stderr=subprocess.PIPE,
             )
         except Exception:
-            async with _port_lock:
-                _freed_ports.append(final_port)
             raise
 
         url = f"http://127.0.0.1:{final_port}"
@@ -416,16 +406,12 @@ async def create_sandbox(
             healthy = await _wait_for_health(url)
         except BaseException:
             await asyncio.to_thread(_kill_proc, proc)
-            async with _port_lock:
-                _freed_ports.append(final_port)
             raise
         if healthy:
             break
         # Not healthy — kill and try a fresh port (could be a stuck listener
         # left behind by a peer process that crashed mid-bind).
         await asyncio.to_thread(_kill_proc, proc)
-        async with _port_lock:
-            _freed_ports.append(final_port)
         final_port = 0
     if not healthy:
         raise RuntimeError(
@@ -580,8 +566,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
     await asyncio.to_thread(_clear_record, ref, marker, record)
     port = getattr(inst, "port", None) or (record.port if record else None)
     if port:
-        async with _port_lock:
-            _freed_ports.append(port)
         try:
             inst.port = None
         except Exception:

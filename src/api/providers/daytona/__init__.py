@@ -55,9 +55,7 @@ async def _run_sandbox_exec_async(sandbox, cmd: str, timeout: int = 120) -> "_Ex
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
 from .._shared import (
-    _acp_bin_name,
     _acp_launch_args,
-    _ACP_NPM_SPECS,
     _build_env_prefix,
     _build_volume_mounts,
     _get_sandbox_env_vars,
@@ -71,10 +69,8 @@ from .._shared import (
     normalize_find_output,
 )
 
-# the runtime-image-unification refactor: ``_SUPERVISOR_DIR``,
-# ``_SUPERVISOR_REMOTE_DIR``, and ``_SUPERVISOR_VOLUME_DIR`` were deleted
-# along with the install/cache helpers that used them. The supervisor now
-# lives at ``/opt/agent-sdk/runtime/`` inside the daytona sandbox image.
+# The supervisor lives at ``/opt/agent-sdk/runtime/`` inside the daytona
+# sandbox image; this is the port it listens on.
 _SUPERVISOR_REMOTE_PORT = 9100
 
 # The agent's HOME inside a Daytona sandbox — a LOCAL ext4 directory the
@@ -170,7 +166,6 @@ async def start_supervisor_in_sandbox(
     lines for each critical-path phase; grep-friendly for recovery-time
     benchmarks (scripts/bench_recovery.py).
     """
-    bin_name = _acp_bin_name(agent_type)
     sid8 = sandbox.id[:8] if sandbox.id else "?"
     total_t0 = time.monotonic()
     phases: list[tuple[str, float]] = []
@@ -226,13 +221,10 @@ async def start_supervisor_in_sandbox(
         )
         return url
 
-    # the runtime-image-unification refactor: the daytona sandbox boots
-    # from an image whose ``/opt/agent-sdk/runtime/`` already contains
-    # supervisor.js + every ACP bin. No volume-side cache check, no
-    # deps.tar.gz extract, no legacy /tmp install — all gone with the image.
-    # The bin path is resolved via ``package.json#bin`` (not
-    # ``node_modules/.bin/``) because daytona's image-build flattens
-    # symlinks; the underlying scripts survive but the symlinks don't.
+    # The daytona sandbox boots from an image whose
+    # ``/opt/agent-sdk/runtime/`` already contains supervisor.js + every
+    # ACP bin. The bin path resolves via ``package.json#bin`` (not
+    # ``node_modules/.bin/``) — daytona's image-build flattens symlinks.
     from .._shared import _runtime_acp_bin_relative
     sup_dir = "/opt/agent-sdk/runtime"
     acp_bin = f"{sup_dir}/{_runtime_acp_bin_relative(agent_type)}"
@@ -292,11 +284,6 @@ async def start_supervisor_in_sandbox(
              sid8, total_dt, ", ".join(f"{p}={d:.2f}" for p, d in phases))
     log.info("supervisor on port %d ready: %s (sandbox %s, dir %s)", port, url[:60], sandbox.id[:16], sup_dir)
     return url
-
-
-# ``_resolve_legacy_volume_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor — all its volume-cache + tar-extract +
-# legacy-fallback work is obsolete now that the runtime is in the image.
 
 
 async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
@@ -945,11 +932,6 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     )
 
 
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. The daytona sandbox now boots from an
-# image whose /opt/agent-sdk/runtime/ contains supervisor.js + every ACP
-# bin; ``provision_daytona_sandbox`` reads ``DAYTONA_IMAGE`` /
-# ``.runtime-image-tag`` for that image.
 
 
 async def create_sandbox(
@@ -1202,25 +1184,6 @@ async def _conditional_upload_if_absent(ref: str, abs_path: str, content: bytes)
         if "412" in msg or "precondition" in msg:
             return "exists"
         raise RuntimeError(f"conditional upload failed: {e}") from e
-
-
-async def _upload_overwrite(ref: str, abs_path: str, content: bytes) -> None:
-    """Upload bytes to ``abs_path``, replacing any existing file."""
-    inst = await _get_or_create_utility(ref)
-    if not inst.sandbox_ref:
-        raise RuntimeError("upload overwrite: utility sandbox_ref missing")
-    daytona_client = await _get_async_daytona_client()
-    try:
-        sandbox = await daytona_client.get(inst.sandbox_ref)
-    except Exception as e:
-        raise RuntimeError(f"upload overwrite: get sandbox failed: {e}") from e
-    try:
-        await sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
-            path=abs_path,
-            file=content,
-        )
-    except Exception as e:
-        raise RuntimeError(f"upload overwrite failed: {e}") from e
 
 
 async def _move_overwrite(ref: str, src_abs: str, dst_abs: str) -> None:

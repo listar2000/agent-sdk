@@ -526,9 +526,6 @@ function _appendChunkText(into, add) {
 }
 
 function broadcastSse(line) {
-  // FLUSH_MS<=0 → bypass coalescing entirely. Lets benchmarks measure
-  // the legacy 1-event-per-chunk baseline without code-path drift.
-  if (COALESCE_FLUSH_MS <= 0) { _broadcastSseRaw(line); return; }
   // Try to interpret as a JSON-RPC frame. Non-JSON lines (shouldn't happen
   // from claude-agent-acp's stdout but defend anyway) just flush + pass
   // through so we never silently drop a line.

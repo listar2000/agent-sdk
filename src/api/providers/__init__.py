@@ -205,28 +205,18 @@ async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 
 
 # ---------------------------------------------------------------------------
 # Uniform-API dispatch helpers — each forwards to the per-provider function
-# of the same name via ``__getattr__`` so we don't hand-write 12 wrappers.
+# of the same name. Per-volume file ops moved to ``BaseVolumeAdapter``
+# (use ``get_volume_adapter(provider, ref)``).
 # ---------------------------------------------------------------------------
 
-_DISPATCH_FNS = frozenset({
-    "create_volume", "delete_volume", "get_sandbox_status",
-    "start_sandbox", "destroy_sandbox", "stop_sandbox",
-    "ensure_supervisor_url",
-    # Per-volume file ops (volume_tree / volume_read / volume_download /
-    # volume_exists / volume_write / volume_upload / volume_mkdir /
-    # volume_delete / volume_rename) used to live here too. Phase 2
-    # migrated them to ``BaseVolumeAdapter`` — callers go through
-    # ``get_volume_adapter(provider, ref)`` for a typed interface.
-})
+async def create_volume(provider: str, *args, **kwargs):
+    return await _dispatch_mod(provider).create_volume(*args, **kwargs)
 
+async def delete_volume(provider: str, *args, **kwargs):
+    return await _dispatch_mod(provider).delete_volume(*args, **kwargs)
 
-def __getattr__(name: str):
-    if name in _DISPATCH_FNS:
-        async def _dispatch(provider: str, *args, **kwargs):
-            return await getattr(_dispatch_mod(provider), name)(*args, **kwargs)
-        _dispatch.__name__ = name
-        return _dispatch
-    raise AttributeError(name)
+async def ensure_supervisor_url(provider: str, *args, **kwargs):
+    return await _dispatch_mod(provider).ensure_supervisor_url(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

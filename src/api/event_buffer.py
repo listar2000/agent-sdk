@@ -79,20 +79,7 @@ class SessionLogBatcher:
         """Enqueue one row. Non-blocking. If the buffer reaches
         ``max_batch``, wake the flusher early — the bounded enqueue
         bounds memory at maybe 500 rows × ~1 KB = 500 KB worst case.
-
-        ``flush_ms == 0`` is the legacy unbatched baseline path: route
-        the row directly to ``db.log_event`` so we can A/B-bench against
-        Wave-1b without code-path drift through the batcher's queue.
         """
-        if self.flush_ms <= 0:
-            from . import db as _db
-            await _db.log_event(
-                session_id=session_id,
-                agent_id=agent_id,
-                event_type=event_type,
-                payload=payload,
-            )
-            return
         self._pending.append((session_id, agent_id, event_type, payload))
         if len(self._pending) >= self.max_batch:
             self._wake.set()

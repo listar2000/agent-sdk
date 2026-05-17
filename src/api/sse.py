@@ -15,7 +15,6 @@ UT_TOOL_CALL = "tool_call"
 UT_TOOL_CALL_UPDATE = "tool_call_update"
 UT_USAGE_UPDATED = "usage_updated"
 UT_USAGE_UPDATE = "usage_update"
-UT_COMMANDS_UPDATE = "available_commands_update"
 
 
 async def iter_sse_blocks(response: httpx.Response) -> AsyncIterator[str]:

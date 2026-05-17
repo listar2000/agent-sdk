@@ -302,16 +302,6 @@ async def delete_agent(agent_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox CRUD
-# ---------------------------------------------------------------------------
-
-# Sandbox CRUD removed: the sandboxes table is gone (see migration in
-# _MIGRATIONS that drops it). Pool's sandbox_state JSONB on the sessions
-# row is the single source of truth; provider sandbox refs live there
-# directly.
-
-
-# ---------------------------------------------------------------------------
 # Volume CRUD
 # ---------------------------------------------------------------------------
 
@@ -368,11 +358,6 @@ async def list_volumes(provider: str | None = None) -> list[VolumeRecord]:
 async def delete_volume(volume_id: str) -> None:
     async with get_db() as conn:
         await conn.execute("DELETE FROM volumes WHERE id = %s", (volume_id,))
-
-
-# add_supervisor_agent_type was deleted in Phase E of
-# the runtime-image-unification refactor — the supervisor_agent_types cache
-# is no longer used. The DB column survives until the column-drop migration.
 
 
 # ---------------------------------------------------------------------------
@@ -505,33 +490,6 @@ async def list_sessions(q: str | None = None, limit: int = 100) -> list[dict]:
 
 
 
-async def get_session_env(session_id: str) -> dict[str, str]:
-    """Return stored session env, or {} if session not found."""
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT env FROM sessions WHERE id = %s", (session_id,)
-        )).fetchone()
-    if row is None:
-        return {}
-    return row["env"] or {}
-
-
-async def get_session_secrets(session_id: str) -> dict[str, str]:
-    """Return stored session secrets, or {} if session not found.
-
-    SECURITY: never log the return value. Passed directly into supervisor
-    spawn env; never serialized to clients (GET /sessions/{id} returns only
-    key names, not values).
-    """
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT secrets FROM sessions WHERE id = %s", (session_id,)
-        )).fetchone()
-    if row is None:
-        return {}
-    return row["secrets"] or {}
-
-
 async def read_sandbox_state(session_id: str) -> dict | None:
     """Read ``sessions.sandbox_state`` JSONB. None if the row is missing."""
     async with get_db() as conn:
@@ -617,18 +575,6 @@ async def unregister_worker(*, owner_id: str) -> None:
         await conn.execute("DELETE FROM workers WHERE owner_id = %s", (owner_id,))
 
 
-async def reap_expired_workers() -> int:
-    """Best-effort cleanup of worker rows whose lease expired past a
-    grace period. Any replica may run this — idempotent housekeeping."""
-    async with get_db() as conn:
-        rows = await (await conn.execute(
-            "DELETE FROM workers"
-            " WHERE lease_expires_at < now() - interval '5 minutes'"
-            " RETURNING owner_id",
-        )).fetchall()
-    return len(rows)
-
-
 async def set_session_busy(session_id: str, *, busy: bool) -> None:
     """Set or clear the ``busy_at`` flag. Unscoped — the only caller
     is the request handler driving an in-flight prompt, which can only
@@ -656,11 +602,6 @@ async def live_sandbox_refs() -> set[str]:
             " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
         )).fetchall()
     return {r["sid"] for r in rows}
-
-
-# get_any_session_for_sandbox removed: it walked sessions.current_sandbox_id
-# (gone with the sandboxes table) and was only used by the legacy back-compat
-# spawn_env-reconstruction path that the SessionPool replaced.
 
 
 # ---------------------------------------------------------------------------

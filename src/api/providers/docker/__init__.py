@@ -21,23 +21,15 @@ import logging
 import os
 import shlex
 import shutil
-import time
-import uuid
-from pathlib import Path
 from typing import Any
 
 from .._shared import (
     ProviderInstance,
     VolumeFileExistsError,
-    _ACP_NPM_SPECS,
-    _acp_bin_name,
     _acp_launch_args,
     _build_env_prefix,
     _find_free_port,
-    _port_lock,
-    _freed_ports,
     _read_runtime_image_tag,
-    _recycle_port,
     _safe_path,
     _wait_for_health,
     build_supervisor_argv,
@@ -45,10 +37,6 @@ from .._shared import (
 )
 
 log = logging.getLogger(__name__)
-
-# ``_SUPERVISOR_JS_HOST`` was deleted in Phase E of
-# the runtime-image-unification refactor — install_supervisor (the only reader)
-# is gone. ``_runtime_supervisor_js()`` resolves supervisor.js for callers.
 
 
 # Inside-container supervisor port (mapped to a random host port at create time).
@@ -61,9 +49,6 @@ _UTIL_IMAGE = "alpine:3.19"
 
 # Canonical in-container paths for sandbox mounts.
 _AGENT_HOME_IN = "/home/agent"
-# ``_SUPERVISOR_IN`` was deleted in Phase E of
-# the runtime-image-unification refactor — the runtime is bind-mounted to
-# ``/opt/agent-sdk/runtime`` from the host's ``_detect_runtime_path()``.
 
 
 def _require_docker() -> str:
@@ -137,13 +122,6 @@ async def delete_volume(ref: str) -> None:
         return
     # In-use or any other error: raise.
     raise RuntimeError(f"docker volume rm {ref} failed: {err.decode(errors='replace').strip()[:400]}")
-
-
-# ---------------------------------------------------------------------------
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. Sandbox containers now boot from the
-# agent-sdk Docker image whose ``/opt/agent-sdk/runtime/`` is bind-mounted
-# read-only via ``create_sandbox`` below, so no per-volume install runs.
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +210,6 @@ async def create_sandbox(
         raise ValueError("docker create_sandbox requires a non-empty subpath")
     await _ensure_subpath_dir(volume_ref, subpath)
 
-    bin_name = _acp_bin_name(agent_type)
     agent_root = root or _AGENT_HOME_IN
     if port is None:
         port = await _find_free_port()
@@ -332,8 +309,6 @@ async def create_sandbox(
         # taken between probe and ``docker run``.  Retry ONCE with a fresh
         # port if the daemon reports a port collision.
         if rc != 0 and _is_port_collision(err):
-            async with _port_lock:
-                _freed_ports.append(port)
             new_port = await _find_free_port()
             log.warning(
                 "docker run port %d collided; retrying on %d (err: %s)",
@@ -379,8 +354,6 @@ async def create_sandbox(
             port=port,
         )
     except BaseException:
-        async with _port_lock:
-            _freed_ports.append(port)
         raise
 
 
@@ -446,7 +419,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
         if "no such container" not in msg:
             log.warning("docker rm -f %s rc=%d: %s", cid[:12], rc, msg[:200])
     port = inst.port
-    await _recycle_port(inst)
     inst.container_id = None
     if port is not None:
         log.info("docker sandbox destroyed: %s (port %d freed)", cid[:12], port)
