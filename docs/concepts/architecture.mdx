@@ -1,0 +1,80 @@
+---
+title: Architecture
+description: "How the SDK, server, supervisor, and providers fit together."
+---
+
+`agent-sdk` is three processes connected by HTTP + JSON-RPC.
+
+```
+┌───────────┐    HTTP+SSE     ┌───────────┐   JSON-RPC over POST+SSE   ┌──────────────┐
+│  SDK /    │  ─────────────> │  FastAPI  │  ─────────────────────────> │  Supervisor  │
+│ ApiClient │                 │  server   │                            │ (in sandbox) │
+└───────────┘                 └───────────┘                            └──────────────┘
+                                    │                                         │
+                                    │                                         ▼
+                                    │                                  ┌──────────────┐
+                                    │                                  │  ACP child   │
+                                    │                                  │ (claude /    │
+                                    │                                  │  opencode /  │
+                                    │                                  │  codex / …)  │
+                                    │                                  └──────────────┘
+                                    ▼
+                              ┌──────────────┐
+                              │  Postgres    │
+                              │ (sessions,   │
+                              │  agents,     │
+                              │  volumes,    │
+                              │  session_log,│
+                              │  workers)    │
+                              └──────────────┘
+```
+
+## The three layers
+
+### 1. SDK / ApiClient (Python)
+
+What your application code uses. `Agent` is the high-level entry point; `ApiClient` is the operator-level wrapper. Both speak HTTP + SSE to the server. Stateless across processes — all durable state is on the server.
+
+### 2. FastAPI server
+
+Owns sessions, sandboxes, volumes, and the `SessionPool`. Per-request handlers:
+
+- Look up (or cold-create) a session from `sessions.sandbox_state` JSONB.
+- Forward prompts to the supervisor.
+- Stream events back to the SDK.
+- Persist every event in `session_log`.
+
+The server is the single source of truth. The SDK is a thin client.
+
+### 3. Supervisor (inside the sandbox)
+
+A small Node.js process that the server boots inside each sandbox. It:
+
+- Speaks JSON-RPC to the **ACP child** (the actual agent — Claude Code CLI, OpenCode, etc.).
+- Exposes `POST /v1/acp/{session_id}` + SSE `/v1/acp/{session_id}/events` to the server.
+- Coalesces text/reasoning deltas.
+
+Sandboxes are pluggable. Today: `unix_local` (host subprocess), `docker` (container), `daytona` (managed VM), `modal` (serverless GPU). Each provider implements the same supervisor-spawning + lifecycle contract.
+
+## State model
+
+| Where | What |
+|---|---|
+| `sessions` row (Postgres) | Identity + `sandbox_state` JSONB (recipe + provider ref). |
+| `volumes` row (Postgres) | Durable storage handle (per-provider). |
+| `session_log` row (Postgres) | Append-only event log. |
+| `agents` row (Postgres) | Reusable persona config. |
+| `workers` row (Postgres) | One row per running replica; per-worker heartbeat lease. |
+| `SessionPool` (in-process) | Live `BaseSandboxSession` objects holding ACP client + subscribers. |
+| Sandbox FS | The agent's workspace (under the mounted volume). |
+
+## Why this shape
+
+- **Recipe lives on the session row, not the sandbox.** Deleting a sandbox can never lose the recipe — recovery rebuilds the sandbox from `sessions.sandbox_state`.
+- **One worker = one heartbeat row.** Multi-replica deploys don't need per-session locking; each worker writes its `session_ids` snapshot on a tick.
+- **Append-only log.** Every assistant text chunk, tool call, tool result, and usage event lands in `session_log` — durable history without forcing the SDK to buffer.
+- **Provider-pluggable.** Each provider package implements `provision_sandbox`, `destroy_sandbox`, `exec_in_instance`, `volume_*` — the rest of the system is provider-agnostic.
+
+## Recovery
+
+A session can be **cold** (no live sandbox), **warm** (sandbox up, supervisor up), or **active** (someone's holding a prompt open). The pool transparently promotes cold → warm on the next call. See [Recovery](/concepts/recovery).

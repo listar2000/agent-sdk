@@ -1,0 +1,208 @@
+---
+title: Agent
+description: "User-persona SDK class. One Agent = one persistent persona that owns a default session."
+---
+
+`Agent` is the high-level entry point. It registers a server-side session on first use, sends prompts, streams events, and persists state for resume.
+
+```python
+from agent_sdk import Agent
+
+agent = Agent("worker", agent_type="claude", provider="unix_local")
+reply = await agent.arun("Hello!")
+```
+
+## Constructor
+
+```python
+Agent(
+    name: str,
+    agent_type: str = "opencode",
+    provider: str | None = None,
+    model: str | None = None,
+    cwd: str | None = None,
+    root: str | None = None,
+    api_url: str | None = None,
+    mcp_servers: dict[str, dict] | None = None,
+    skills: list[str] | dict[str, dict] | None = None,
+    db: str | None = None,
+    session_id: str | None = None,
+    sandbox_ref: str | None = None,
+    dockerfile: str | None = None,
+    oauth_token: str | None = None,
+    api_key: str | None = None,
+    volume_id: str | None = None,
+    pre_start_commands: list[str] | None = None,
+    shared_mounts: list[str] | None = None,
+    secrets: dict[str, str] | None = None,
+    resources: dict[str, Any] | None = None,
+    workspace: str | None = None,
+    extra_options: dict[str, Any] | None = None,
+)
+```
+
+<ParamField path="name" type="str" required>
+  Human-readable persona name. Used for logging + dashboard display.
+</ParamField>
+
+<ParamField path="agent_type" type="str" default="opencode">
+  Which agent runtime to launch. One of `claude`, `codex`, `opencode`, `gemini`, `cline`, `deepagents`, `openhands`, `goose`. See [Constants](/sdk/constants).
+</ParamField>
+
+<ParamField path="provider" type="str | None">
+  Sandbox provider. One of `unix_local`, `docker`, `daytona`, `modal`. If `None`, the server picks its default.
+</ParamField>
+
+<ParamField path="model" type="str | None">
+  Override the agent's default model.
+</ParamField>
+
+<ParamField path="api_url" type="str | None">
+  Server URL. Defaults to `http://localhost:7778` (or `AGENT_API_URL` env var).
+</ParamField>
+
+<ParamField path="mcp_servers" type="dict[str, dict] | None">
+  MCP server configs to register with the agent. Keyed by name.
+</ParamField>
+
+<ParamField path="skills" type="list[str] | dict[str, dict] | None">
+  npx-installable skills to wire into the sandbox before the agent starts.
+</ParamField>
+
+<ParamField path="db" type="str | None">
+  SQLite path for local session persistence. When set, the SDK records `session_id` + `sandbox_ref` so you can resume on next process start.
+</ParamField>
+
+<ParamField path="session_id" type="str | None">
+  Resume an existing server-side session instead of creating one.
+</ParamField>
+
+<ParamField path="sandbox_ref" type="str | None">
+  Bind to a specific existing sandbox (advanced — usually managed automatically).
+</ParamField>
+
+<ParamField path="dockerfile" type="str | None">
+  Inline Dockerfile string for the `docker`/`daytona` providers.
+</ParamField>
+
+<ParamField path="oauth_token" type="str | None">
+  OAuth token forwarded to the agent (e.g., `CLAUDE_CODE_OAUTH_TOKEN`).
+</ParamField>
+
+<ParamField path="api_key" type="str | None">
+  API key forwarded to the agent (e.g., `OPENROUTER_API_KEY`).
+</ParamField>
+
+<ParamField path="volume_id" type="str | None">
+  Attach an existing volume. If `None`, the server provisions one.
+</ParamField>
+
+<ParamField path="pre_start_commands" type="list[str] | None">
+  Shell commands to run inside the sandbox **before** the supervisor starts. Used for one-time setup (apt-get install, etc.).
+</ParamField>
+
+<ParamField path="shared_mounts" type="list[str] | None">
+  Volume paths to share read-only across siblings of the same volume.
+</ParamField>
+
+<ParamField path="secrets" type="dict[str, str] | None">
+  Per-session secrets forwarded as env vars to the supervisor process. Never logged.
+</ParamField>
+
+<ParamField path="resources" type="dict[str, Any] | None">
+  Compute request: `{"cpu": 2.0, "memory_mib": 4096, "gpu": "T4", "disk_gib": 20}`. Each provider applies the subset it supports.
+</ParamField>
+
+<ParamField path="workspace" type="str | None">
+  Sandbox CWD. Defaults to a per-session subdirectory of the volume.
+</ParamField>
+
+<ParamField path="extra_options" type="dict[str, Any] | None">
+  Vendor-specific ACP options. For `claude`, this becomes `params._meta.claudeCode.options` (e.g., `{"disallowedTools": ["Bash"]}`). See [Extra Options](/guides/extra-options).
+</ParamField>
+
+## Methods
+
+### `arun(message, *, interrupt=False) -> str`
+
+Send a prompt and await the full reply. Blocks until the agent's turn ends.
+
+```python
+reply = await agent.arun("List the files in src/")
+```
+
+### `astream(message, *, interrupt=False)`
+
+Send a prompt and yield structured events as they arrive.
+
+```python
+async for event in agent.astream("Refactor utils.py"):
+    print(event["type"], event)
+```
+
+See [Events](/sdk/events) for the full event taxonomy.
+
+### `send(message, *, interrupt=False) -> str`
+
+Submit a prompt without waiting. Returns the `rpc_id` of the queued prompt. Useful for fire-and-forget patterns where you collect events via `agent.events()`.
+
+### `events()`
+
+Async generator yielding events from the live SSE stream. Persists across multiple `send()` calls.
+
+### `run(message, timeout=None, *, interrupt=False) -> str`
+
+Sync wrapper around `arun()`. Creates its own event loop.
+
+### `configure(**kwargs)`
+
+Re-apply ACP dynamic config (`mode`, `model`, `thought_level`) on the live session.
+
+### `cancel()`
+
+Best-effort cancellation of the in-flight prompt. Same wire effect as `send(..., interrupt=True)` but without submitting a new prompt.
+
+### `reset()`
+
+Drop all client-side async state. Useful in test fixtures.
+
+### `aclose()`
+
+Close the underlying HTTP client + SSE streams. Use as `async with Agent(...)` to auto-close.
+
+### `clone(name=None, **overrides) -> Agent`
+
+Return a new `Agent` with the same config, optionally overriding fields. Useful for spawning sibling personas.
+
+### `create_session(...)` → `Session`
+
+Create a sibling `Session` that shares the same volume + JSONL history. Allows multi-session workflows from one `Agent`.
+
+### Class methods
+
+#### `Agent.from_config(name, config: dict, **kwargs)`
+
+Build an `Agent` from a config dict (typically loaded from YAML/TOML).
+
+#### `Agent.from_file(config_path, **kwargs)`
+
+Build an `Agent` from a YAML/TOML/JSON file.
+
+## Properties
+
+- `agent.session_id` — server-assigned session ID (None until first call).
+- `agent.sandbox_ref` — opaque sandbox handle.
+- `agent.inner_session_id` — the ACP child's own session ID.
+- `agent.usage` — `UsageStats` (input/output/cache tokens).
+- `agent.sandbox` — a `Sandbox` proxy for shell + file ops in this session's sandbox.
+
+## Interrupt
+
+```python
+task = asyncio.create_task(agent.arun("Write a long essay..."))
+await asyncio.sleep(2)
+await agent.send("Stop — give me bullet points instead.", interrupt=True)
+await task  # the cancelled prompt's reply will indicate stop_reason="cancelled"
+```
+
+The `interrupt=True` flag posts `session/cancel` to the supervisor, then submits the new prompt. The cancelled turn's `done` event arrives via the SSE stream with `stop_reason="cancelled"`.

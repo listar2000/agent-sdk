@@ -1,0 +1,57 @@
+---
+title: Recovery
+description: "Sessions resume across server restarts, sandbox deletions, and replica failover."
+---
+
+`agent-sdk` is built around the assumption that sandboxes are ephemeral and servers restart. Recovery is automatic at multiple levels.
+
+## The recipe is the contract
+
+Every session's `sandbox_state` JSONB carries a **recipe**: enough information to rebuild the sandbox from scratch. Recipes live on the session row, never on the compute itself — so deleting a sandbox cannot lose the recipe.
+
+## Type-1 vs Type-2 recovery
+
+### Type-1: warm recovery (in-process)
+
+The session's `BaseSandboxSession` is still alive in this server's `SessionPool`. The next call just uses it.
+
+### Type-2: cold recovery (cross-process)
+
+The session's `BaseSandboxSession` is gone (server restart, replica failover, idle reap). The pool reconstructs it from `sandbox_state`:
+
+```
+GET /sessions/{id}/events
+  → SessionPool.get_session(id)
+    → read sessions.sandbox_state from Postgres
+    → factory dispatches to the right provider class
+    → provider's `start()`:
+        case sandbox_ref exists + alive → re-attach supervisor
+        case sandbox_ref exists + paused → resume sandbox → re-attach
+        case sandbox_ref missing       → cold-create from recipe
+    → re-bind subscribers (the /events SSE stream picks up without a gap)
+```
+
+The route handler never sees this decision tree — it calls `pool.get_session(id)` and gets back a ready session.
+
+## Subscriber hand-off
+
+When recovery happens mid-stream, the existing subscriber queues are handed to the new session **before** `start()` runs. This keeps `/events` consumers gap-free across recovery.
+
+## Multi-replica
+
+Per-worker lease (one heartbeat row per replica) lets N servers share the same Postgres. Each replica only manages its own pool; cluster-aware admin endpoints join across replicas.
+
+## When recovery can fail
+
+| Failure | Symptom | Recovery |
+|---|---|---|
+| Sandbox ref points to deleted compute | `SandboxMissingError` in logs | Pool falls back to cold-create from recipe. |
+| Volume deleted out-of-band | Cold-create fails | Manual intervention — recreate the volume. |
+| Credentials expired | Supervisor rejects ACP `initialize` | `credential_refresh_url` if set; else manual rotation. |
+| Provider API down | Recovery loops with backoff | Wait for provider; sessions stay in `error` state. |
+
+## Idle reaping
+
+The pool runs a reaper every `AGENT_SDK_REAPER_INTERVAL_S` (default 60s) that releases sessions idle for `AGENT_SDK_REAPER_IDLE_S` (default 180s). Modal-specific threshold is `AGENT_SDK_MODAL_REAPER_IDLE_S` (default 1800s) since Modal cold-starts are cheap.
+
+Released sessions stay in Postgres; they cold-recover on the next call.

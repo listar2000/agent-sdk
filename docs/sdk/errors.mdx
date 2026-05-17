@@ -1,0 +1,50 @@
+---
+title: Errors
+description: "Exception hierarchy raised by the SDK."
+---
+
+All SDK exceptions inherit from `AgentSDKError`.
+
+```python
+from agent_sdk import (
+    AgentSDKError,
+    AgentConnectionError,
+    AgentNotRegisteredError,
+    SandboxError,
+    VolumeFileExistsError,
+    AgentBusyError,
+    AgentTimeoutError,
+    PromptError,
+    StreamError,
+)
+```
+
+## Hierarchy
+
+| Exception | When raised |
+|---|---|
+| `AgentSDKError` | Base class; catch this to swallow all SDK errors. |
+| `AgentConnectionError` | HTTP-level failure talking to the server (refused, timeout, DNS). |
+| `AgentNotRegisteredError` | A call needed a server-registered session but none exists yet. |
+| `SandboxError` | Sandbox lifecycle issue (provider error, sandbox missing, exec failure). |
+| `VolumeFileExistsError` | A volume write was attempted at an existing path without `overwrite=True`. |
+| `AgentBusyError` | A new prompt was submitted while another is still running (without `interrupt=True`). Server may queue it depending on endpoint. |
+| `AgentTimeoutError` | `run()` / `arun()` exceeded its `timeout`. |
+| `PromptError` | The agent's turn ended with `stop_reason="error"`. |
+| `StreamError` | SSE stream parsing failure or unexpected disconnect. |
+
+## Usage
+
+```python
+from agent_sdk import Agent, AgentConnectionError, PromptError
+
+agent = Agent("worker", agent_type="claude")
+try:
+    reply = await agent.arun("Hello")
+except AgentConnectionError:
+    print("Server unreachable; retrying...")
+except PromptError as e:
+    print(f"Agent failed: {e}")
+```
+
+Most errors are recoverable — for transient `AgentConnectionError`s, retry. For `SandboxError`, the server may have already cold-recovered the session; the next call typically succeeds without intervention.

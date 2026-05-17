@@ -1,0 +1,55 @@
+---
+title: Sandbox
+description: "Shell + file proxy into the sandbox bound to a Session."
+---
+
+Each `Session` (and `Agent` via `agent.sandbox`) exposes a `Sandbox` for direct shell exec and file ops, bypassing the agent.
+
+```python
+out = await agent.sandbox.exec("ls -la")
+print(out["stdout"])
+
+await agent.sandbox.write_file("/work/notes.md", "## Today\n- ...")
+content = await agent.sandbox.read_file("/work/notes.md")
+```
+
+## Methods
+
+### `exec(command, *, timeout=30) -> dict`
+
+Run a shell command inside the sandbox. Returns:
+
+```python
+{
+    "stdout": str,
+    "stderr": str,
+    "exit_code": int | None,
+    "stdout_truncated": bool,
+    "timed_out": bool,
+}
+```
+
+Output is truncated to a server-configured byte limit; check `stdout_truncated`.
+
+### `read_file(path, *, timeout=30) -> str`
+
+Read a UTF-8 text file from the sandbox FS.
+
+### `write_file(path, content, *, timeout=30)`
+
+Write a UTF-8 text file. Parent dirs are created.
+
+### `ls(path=".", *, timeout=10) -> str`
+
+Return the output of `ls` for `path`. Convenience wrapper around `exec`.
+
+## When to use Sandbox vs Agent
+
+| Use | Pick |
+|---|---|
+| You want the agent to read/write files | Send a prompt; let the agent use its tools |
+| You want to set up the workspace before prompting | `sandbox.write_file`, `sandbox.exec` |
+| You want to inspect results after | `sandbox.read_file`, `sandbox.ls` |
+| You want to verify the agent's claims | `sandbox.read_file` to confirm what was written |
+
+The `Sandbox` is for **you** doing things inside the sandbox; the agent's tools (Bash, Edit, etc.) handle what the agent itself does.

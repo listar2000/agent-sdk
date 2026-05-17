@@ -1,0 +1,60 @@
+---
+title: Installation
+description: "SDK install + server setup."
+---
+
+## SDK
+
+```bash
+pip install agent-sdk
+```
+
+Requires Python ≥ 3.11.
+
+## Server
+
+The SDK talks to an `agent-sdk` server over HTTP. For local development:
+
+```bash
+git clone https://github.com/rllm-org/agent-sdk.git
+cd agent-sdk
+./scripts/launch_server_test.sh
+```
+
+The launcher:
+- Bootstraps a project-local Postgres at `.postgres-data/` (port 5433).
+- Starts the FastAPI server on `http://localhost:7778`.
+- Loads credentials from `~/.env` then `./.env` (in that order).
+- Defaults `AGENT_SDK_ORIGIN=test` so `cleanup_orphans.py` can distinguish your test sandboxes from production.
+
+Override the origin if you really need a production-tagged server locally:
+
+```bash
+AGENT_SDK_ORIGIN=production ./scripts/launch_server_test.sh
+```
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | Required for the `claude` agent. |
+| `OPENROUTER_API_KEY` | Required for the `opencode` agent. |
+| `DAYTONA_API_KEY` | Required for the `daytona` provider. |
+| `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` | Required for the `modal` provider (plus `~/.modal.toml`). |
+| `AGENT_SDK_ORIGIN` | `test` or `production` — labels sandboxes for cleanup tooling. |
+| `AGENT_SDK_TEST_AUTO_CLEANUP` | `1` to enable autouse session cleanup in pytest runs. |
+| `AGENT_SDK_REAPER_INTERVAL_S` | Idle-session reaper tick (default 60s). |
+| `AGENT_SDK_REAPER_IDLE_S` | Idle threshold (default 180s). |
+| `AGENT_SDK_MODAL_REAPER_IDLE_S` | Modal-specific idle threshold (default 1800s). |
+
+## Sandbox cleanup
+
+Tests that create real sandboxes are wrapped by an autouse pytest fixture that fires `DELETE /sessions/{id}` at teardown. For paused-on-release residue:
+
+```bash
+python scripts/cleanup_orphans.py            # dry run, all providers
+python scripts/cleanup_orphans.py --yes      # reap origin=test
+python scripts/cleanup_orphans.py --provider daytona --yes
+```
+
+Defaults to `--provider all` and `--origin $AGENT_SDK_ORIGIN` (falls back to `test`).

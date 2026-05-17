@@ -1,0 +1,118 @@
+---
+title: Events
+description: "Event types yielded by Agent.astream() and Session.astream()."
+---
+
+`astream()` yields events parsed from the underlying ACP `sessionUpdate` stream. Every event is a `dict` with a `type` field.
+
+## Event taxonomy
+
+### `text`
+
+Assistant text delta.
+
+```json
+{ "type": "text", "text": "Hello, ", "raw": {...} }
+```
+
+### `reasoning`
+
+Reasoning / thinking delta (for agents that expose chain-of-thought).
+
+```json
+{ "type": "reasoning", "text": "Let me think about...", "raw": {...} }
+```
+
+### `tool`
+
+A tool call.
+
+```json
+{
+  "type": "tool",
+  "tool_name": "Bash",
+  "tool_call_id": "call_abc123",
+  "args": { "command": "ls -la" },
+  "raw": {...}
+}
+```
+
+### `tool_result`
+
+The result of a tool call.
+
+```json
+{
+  "type": "tool_result",
+  "tool_name": "Bash",
+  "tool_call_id": "call_abc123",
+  "result": "file1.txt\nfile2.txt\n",
+  "raw": {...}
+}
+```
+
+### `usage`
+
+Token usage update.
+
+```json
+{
+  "type": "usage",
+  "input_tokens": 123,
+  "output_tokens": 45,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 200,
+  "raw": {...}
+}
+```
+
+### `done`
+
+End of one prompt turn. `stop_reason` is one of `end_turn`, `cancelled`, `max_tokens`, `max_turn_requests`, `tool_use`.
+
+```json
+{ "type": "done", "stop_reason": "end_turn", "rpc_id": "..." }
+```
+
+### `error`
+
+An error during the turn.
+
+```json
+{ "type": "error", "code": -32603, "message": "...", "rpc_id": "..." }
+```
+
+## Patterns
+
+### Print just the text
+
+```python
+async for event in agent.astream("Hello"):
+    if event["type"] == "text":
+        print(event["text"], end="", flush=True)
+```
+
+### Track tool calls
+
+```python
+calls: dict[str, str] = {}
+async for event in agent.astream("Read pyproject.toml"):
+    if event["type"] == "tool":
+        calls[event["tool_call_id"]] = event["tool_name"]
+    elif event["type"] == "tool_result":
+        name = calls.get(event["tool_call_id"], "?")
+        print(f"[{name}] -> {event['result'][:80]}")
+```
+
+### Stop on tool-use signal
+
+```python
+async for event in agent.astream("Do X"):
+    if event["type"] == "done" and event["stop_reason"] == "tool_use":
+        # Agent paused waiting for tool approval — break and ask user
+        break
+```
+
+## Forward-compat
+
+New ACP `sessionUpdate` kinds appear as `{"type": "<new-kind>", "raw": {...}}` — your handler should default-pass on unknown types rather than raise. The `raw` field always carries the unparsed event.

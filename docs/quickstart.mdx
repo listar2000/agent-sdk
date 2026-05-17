@@ -1,0 +1,90 @@
+---
+title: Quickstart
+description: "Run a Claude agent in five lines."
+---
+
+## Install
+
+```bash
+pip install agent-sdk
+```
+
+You also need an agent server running. For local dev, the repo ships one:
+
+```bash
+git clone https://github.com/rllm-org/agent-sdk.git
+cd agent-sdk
+./scripts/launch_server_test.sh
+```
+
+The server binds to `http://localhost:7778`.
+
+## Set a credential
+
+The SDK forwards credentials to the agent at session creation; the server never adds its own. Pick the one matching the agent you'll use:
+
+<CodeGroup>
+```bash Claude
+export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...
+```
+
+```bash OpenCode
+export OPENROUTER_API_KEY=sk-or-...
+```
+</CodeGroup>
+
+## Send a prompt
+
+```python
+import asyncio
+from agent_sdk import Agent
+
+async def main():
+    agent = Agent("hello", agent_type="claude", provider="unix_local")
+    reply = await agent.arun("Write a Python one-liner that prints fizzbuzz to 20.")
+    print(reply)
+
+asyncio.run(main())
+```
+
+`provider="unix_local"` runs the agent as a host subprocess — fastest to set up, no isolation. For real workloads pick `docker`, `daytona`, or `modal` (see [Sandboxes](/concepts/sandboxes)).
+
+## Stream events
+
+`arun()` blocks until the agent finishes. To see tool calls and reasoning live:
+
+```python
+async for event in agent.astream("Read README.md and summarize it."):
+    if event["type"] == "text":
+        print(event["text"], end="", flush=True)
+    elif event["type"] == "tool":
+        print(f"\n[tool] {event['tool_name']}({event['args']})")
+    elif event["type"] == "tool_result":
+        print(f"\n[result] {event['result'][:80]}")
+```
+
+Event types: `text`, `reasoning`, `tool`, `tool_result`, `usage`, `done`, `error`. Full list in [Events](/sdk/events).
+
+## Interrupt mid-prompt
+
+```python
+# Submit a long prompt
+asyncio.create_task(agent.arun("Refactor the entire codebase..."))
+
+# 2 seconds later, change your mind
+await asyncio.sleep(2)
+await agent.send("Forget that — just list the top-level directories.", interrupt=True)
+```
+
+`interrupt=True` cancels the in-flight prompt before submitting the new one. See [Streaming](/guides/streaming) for details.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Persistence" icon="database" href="/guides/persistence">
+    Resume conversations across server restarts.
+  </Card>
+  <Card title="Sandboxes" icon="box" href="/concepts/sandboxes">
+    Pick the right compute provider.
+  </Card>
+</CardGroup>

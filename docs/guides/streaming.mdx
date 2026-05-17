@@ -1,0 +1,80 @@
+---
+title: Streaming
+description: "Receive events as the agent runs."
+---
+
+`arun()` is convenient when you only care about the final reply. For everything else — progress UIs, server-sent events, tool approval flows — use `astream()` or `events()`.
+
+## astream
+
+Yields events for **one** prompt's lifetime. Closes when `done` arrives.
+
+```python
+async for event in agent.astream("Refactor utils.py"):
+    if event["type"] == "text":
+        print(event["text"], end="", flush=True)
+```
+
+## events
+
+Yields events from the **live session SSE stream** indefinitely. Use when you want to watch events from prompts submitted elsewhere (e.g., via `send()`).
+
+```python
+async def watch():
+    async for event in agent.events():
+        print(event)
+
+asyncio.create_task(watch())
+await agent.send("Hello")
+```
+
+## Patterns
+
+### Buffer the assistant text
+
+```python
+buf: list[str] = []
+async for event in agent.astream("Summarize README.md"):
+    if event["type"] == "text":
+        buf.append(event["text"])
+    elif event["type"] == "done":
+        break
+reply = "".join(buf)
+```
+
+### Pause-on-tool-use
+
+```python
+async for event in agent.astream("Look up the docs"):
+    if event["type"] == "done" and event["stop_reason"] == "tool_use":
+        # Agent paused for tool approval
+        await present_to_user(event)
+        break
+```
+
+### Track usage in real-time
+
+```python
+async for event in agent.astream("Long task"):
+    if event["type"] == "usage":
+        print(f"tokens: in={event['input_tokens']} out={event['output_tokens']}")
+```
+
+## Interrupt
+
+`interrupt=True` cancels the in-flight prompt before submitting a new one. The cancelled prompt's `done` event arrives with `stop_reason="cancelled"`.
+
+```python
+task = asyncio.create_task(agent.arun("Long task"))
+await asyncio.sleep(2)
+await agent.send("Pivot.", interrupt=True)
+await task   # may raise, depending on timing
+```
+
+For pure cancellation (no new prompt), call `agent.cancel()`.
+
+## SSE under the hood
+
+Streaming is implemented over server-sent events at `GET /sessions/{id}/events`. Each event is JSON-parsed from a `data:` line, decorated with a `type`, and yielded. The raw ACP envelope is in `event["raw"]`.
+
+The server **persists** every event to `session_log` before broadcasting. If your SSE consumer drops, you can read backfill via `GET /sessions/{id}/log` and resume from the latest `id`.

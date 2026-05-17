@@ -1,0 +1,84 @@
+---
+title: Sandboxes
+description: "Pick a compute provider for your agent."
+---
+
+A **sandbox** is where the agent runs. `agent-sdk` supports four providers, each with different tradeoffs.
+
+## Provider comparison
+
+| | `unix_local` | `docker` | `daytona` | `modal` |
+|---|---|---|---|---|
+| **Setup** | nothing | docker daemon | `DAYTONA_API_KEY` | `~/.modal.toml` |
+| **Isolation** | none (host subprocess) | container | VM | serverless container |
+| **Cold-start** | <1s | ~3s | ~10s | ~5s |
+| **GPU** | host | count only | count only | type + count |
+| **Per-session disk quota** | — | — | ✓ | — |
+| **Survives server restart** | no | ✓ | ✓ | ✓ |
+| **Best for** | dev / CI | self-hosted | managed VMs | serverless GPU |
+
+## Choosing
+
+<CardGroup cols={2}>
+  <Card title="unix_local" icon="terminal">
+    Fastest. No isolation. Use for local dev, unit tests, CI.
+  </Card>
+  <Card title="docker" icon="docker">
+    Isolation without a control plane. Use for self-hosted prod where you own the host.
+  </Card>
+  <Card title="daytona" icon="cloud">
+    Managed VMs, durable across server restarts. Use when you want pause/resume + disk quotas without running your own infra.
+  </Card>
+  <Card title="modal" icon="bolt">
+    Serverless GPUs. Use for inference-heavy agents that need a `T4` / `A100` per session.
+  </Card>
+</CardGroup>
+
+## Recipe
+
+Every sandbox is provisioned from a **recipe** on the session row:
+
+```python
+{
+    "agent_type": "claude",
+    "dockerfile": None,                # optional inline Dockerfile (docker, daytona)
+    "shared_mounts": [],               # paths to mount read-only across siblings
+    "root": "/work",                   # CWD inside the sandbox
+    "pre_start_commands": [
+        "apt-get install -y graphviz",
+    ],
+    "resources": {"cpu": 2.0, "memory_mib": 4096},
+    "credential_refresh_url": None,    # optional short-TTL token refresh hook
+    "credential_refresh_token": None,
+}
+```
+
+The recipe is durable on the session row — deleting a sandbox can never lose it.
+
+## Lifecycle
+
+```
+POST /sessions       ─►  cold-create   ─►  running
+                                              │
+                                              │ idle ≥ AGENT_SDK_REAPER_IDLE_S
+                                              ▼
+                                          released  (paused/stopped)
+                                              │
+                                              │ next request
+                                              ▼
+                                       cold-recovery  ─►  running
+```
+
+A released sandbox stays paused; the next call rebuilds it from `sandbox_state.recipe` and re-attaches the supervisor.
+
+## Volume mount
+
+Every sandbox has a volume mounted at its root path. Volumes are durable — they outlive sandboxes. See [Volumes](/concepts/volumes).
+
+## Pre-start commands
+
+Run as `root` inside the sandbox **before** the supervisor process starts. Use for one-time setup (apt packages, language runtimes) that should land in the snapshot for the daytona/modal providers.
+
+## Shared mounts
+
+Volume paths to mount read-only across sibling sessions of the same volume. Useful for shared reference data that several agents need to see.

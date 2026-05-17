@@ -1,0 +1,41 @@
+---
+title: Introduction
+description: "Python SDK + REST API for orchestrating coding agents across sandboxed compute."
+---
+
+`agent-sdk` is two things in one repo:
+
+- A **Python SDK** (`agent_sdk.Agent`, `Sandbox`, `ApiClient`) for sending prompts to coding agents and streaming their replies.
+- A **FastAPI server** that runs those agents inside isolated sandboxes — local subprocess, Docker container, Daytona, or Modal — and persists sessions so they can be resumed.
+
+## Why it exists
+
+Coding agents (Claude Code, OpenCode, Codex, Gemini, Cline, OpenHands, Goose) all speak the [Agent Client Protocol](https://github.com/agentclientprotocol/spec) but bring their own runtime requirements, credential models, and lifecycle quirks. `agent-sdk` gives you one interface across all of them, plus the durable session + sandbox layer needed to run them in production.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a Claude agent running locally in five lines.
+  </Card>
+  <Card title="Architecture" icon="cube" href="/concepts/architecture">
+    How sessions, sandboxes, and the supervisor fit together.
+  </Card>
+  <Card title="SDK reference" icon="code" href="/sdk/agent">
+    Full reference for `Agent`, `Sandbox`, `ApiClient`.
+  </Card>
+  <Card title="REST API" icon="server" href="/api-reference">
+    The 41 endpoints the SDK is built on.
+  </Card>
+</CardGroup>
+
+## What you get
+
+- **One SDK, eight agents.** `claude`, `codex`, `opencode`, `gemini`, `cline`, `deepagents`, `openhands`, `goose`.
+- **Four sandbox providers.** `unix_local` (host subprocess), `docker`, `daytona`, `modal`.
+- **Durable sessions.** Submit a prompt, kill the server, restart, resume — the conversation continues.
+- **Live streaming.** SSE events for tool calls, reasoning, text deltas, usage.
+- **Volume management.** Per-volume file ops independent of any sandbox lifecycle.
+- **Multi-replica safe.** Per-worker lease + cluster-aware admin make it run across N replicas.
+
+## License + repository
+
+[github.com/rllm-org/agent-sdk](https://github.com/rllm-org/agent-sdk)

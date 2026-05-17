@@ -1,0 +1,48 @@
+---
+title: Session
+description: "Lower-level session handle. Use Agent unless you need sibling sessions."
+---
+
+`Session` is the unit `Agent` wraps. Each `Agent` owns a default `Session`; you only use `Session` directly when spawning siblings via `Agent.create_session()`.
+
+```python
+sibling = agent.create_session(name="reviewer", workspace="/work/review")
+reply = await sibling.arun("Review the diff.")
+```
+
+## Constructor
+
+`Session` is constructed by `Agent.create_session()` — do not instantiate directly.
+
+## Methods
+
+The `Session` surface mirrors `Agent`'s prompt methods:
+
+- `arun(message, *, interrupt=False) -> str`
+- `astream(message, *, interrupt=False)` — async generator of events
+- `send(message, *, interrupt=False) -> str`
+- `events()` — async generator over the live SSE stream
+- `run(message, timeout=None, *, interrupt=False) -> str` — sync wrapper
+- `configure(**kwargs)` — re-apply ACP config
+- `cancel()` — best-effort cancel
+- `reset()` — drop async state
+- `aclose()` — close client
+
+Plus context-manager support: `async with session: ...`.
+
+## Properties
+
+- `session.session_id` — server session ID
+- `session.sandbox_ref` — sandbox handle
+- `session.inner_session_id` — ACP child's session ID
+- `session.usage` — `UsageStats`
+- `session.sandbox` — `Sandbox` proxy
+
+## When to use `Session` directly
+
+Almost never. The exceptions:
+
+- **Sibling personas sharing one volume.** Reviewer + writer agents collaborating in the same workspace.
+- **Multi-window UIs** where each window owns its own `Session` against a shared `Agent` persona.
+
+For everything else, use `Agent` and let it manage its default `Session`.

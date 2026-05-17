@@ -1,0 +1,55 @@
+---
+title: Persistence
+description: "Resume conversations across process restarts."
+---
+
+The server already persists everything — sessions, agents, sandboxes, the event log. Local persistence in the SDK is only about your **client process** remembering which `session_id` to talk to.
+
+## SqliteSessionDriver
+
+```python
+from agent_sdk import Agent
+
+agent = Agent("worker", agent_type="claude", db="local.db")
+await agent.arun("Hello")            # creates session, records to local.db
+# ... process exits ...
+
+# New process: same db path → same session.
+agent = Agent("worker", agent_type="claude", db="local.db")
+await agent.arun("Continue")         # server cold-recovers from sandbox_state
+```
+
+`db=...` writes a SQLite file with one row per `(host, name)` pair recording the `session_id` and `sandbox_ref`. On next construction, the SDK reads this and re-uses the session.
+
+## Explicit session_id
+
+If you're already managing IDs (a SaaS storing per-user session IDs in your own DB), pass `session_id=` directly:
+
+```python
+agent = Agent("worker", agent_type="claude", session_id=user.agent_session_id)
+```
+
+The SDK doesn't try to persist anything locally.
+
+## Recovery semantics
+
+When a process starts and finds an existing `session_id` in its local db, it doesn't try to validate the session up-front — the next prompt call triggers server-side recovery:
+
+- Session row exists + sandbox up → warm path.
+- Session row exists + sandbox paused/missing → cold-recovery from recipe.
+- Session row gone → `AgentNotRegisteredError`; SDK will register a new session on next call.
+
+## Forgetting
+
+```python
+agent.reset()         # drop async state in-process (locks, tasks)
+```
+
+To delete server-side state:
+
+```python
+async with ApiClient() as sdk:
+    await sdk.delete_session(session_id)
+```
+
+This destroys the sandbox + drops the session row + leaves the volume intact (delete the volume separately if you want).

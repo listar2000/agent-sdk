@@ -1,0 +1,89 @@
+---
+title: Sessions
+description: "What a session is, what it owns, and how it lives."
+---
+
+A **session** is a conversation with an agent, bound to a volume, anchored to a recipe. Sessions are the unit of work in `agent-sdk`.
+
+## Identity
+
+Every session has:
+
+- `session_id` (server-assigned UUID) — your public handle.
+- `agent_id` — which persona the session belongs to.
+- `volume_id` — durable storage.
+- `inner_session_id` — the ACP child's own session ID (ephemeral).
+- `sandbox_state` (JSONB) — the recipe + current sandbox ref + snapshot pointer.
+
+## What a session owns
+
+- **A recipe**: dockerfile, shared_mounts, root, pre_start_commands, resources, credential_refresh hooks.
+- **A volume**: mounted at the recipe's root path.
+- **A sandbox** (transient): may be alive, paused, or absent. The server can rebuild it from the recipe at any time.
+- **An event log**: every assistant message, tool call, tool result, usage event is appended to `session_log`.
+
+## States
+
+| State | Description |
+|---|---|
+| `creating` | Cold-create in progress. |
+| `running` | Sandbox up, supervisor up, ready to take prompts. |
+| `stopped` | Sandbox paused (daytona) or stopped (docker). Recipe + volume preserved. |
+| `error` | Last cold-recovery attempt failed. |
+| `missing` | `sandbox_state` references a sandbox that no longer exists. |
+
+## Lifecycle
+
+```python
+agent = Agent("worker", agent_type="claude", provider="daytona", db="local.db")
+
+# 1. First prompt — cold-create: provisions sandbox, boots supervisor, runs session/new.
+reply = await agent.arun("Hello")
+
+# 2. Subsequent prompts — warm path.
+reply = await agent.arun("List files")
+
+# 3. Process exits.
+
+# 4. New process — Agent reads session_id + sandbox_ref from local.db.
+agent = Agent("worker", agent_type="claude", provider="daytona", db="local.db")
+reply = await agent.arun("Continue where we left off")
+#                                ^^^
+# Server cold-recovers from sessions.sandbox_state if the sandbox was paused.
+```
+
+## Cancellation
+
+```python
+await agent.cancel()                              # cancel current turn, no new prompt
+await agent.send("Pivot.", interrupt=True)        # cancel + submit new prompt
+```
+
+The HTTP endpoint is `POST /sessions/{id}/cancel`; the SDK `interrupt=True` kwarg is the same wire effect plus a new prompt submission.
+
+## Deletion
+
+- `DELETE /sessions/{id}` — drops the row, destroys the sandbox.
+- `POST /sessions/{id}/release` — pauses the sandbox (daytona) / stops it (docker) without dropping the row. Reopen via the next request.
+
+## Per-session resources
+
+```python
+agent = Agent(
+    "trainer",
+    agent_type="claude",
+    provider="modal",
+    resources={"cpu": 4.0, "memory_mib": 16384, "gpu": "T4"},
+)
+```
+
+Each provider applies the subset it supports and silently ignores the rest:
+
+| Provider | cpu | memory_mib | gpu | disk_gib |
+|---|---|---|---|---|
+| `unix_local` | — | — | — | — |
+| `docker` | ✓ | ✓ | count only | — |
+| `daytona` | ✓ | ✓ | count only | ✓ |
+| `modal` | ✓ | ✓ | type required | — |
+
+Invalid combinations raise `ValueError` at session creation (HTTP 400).

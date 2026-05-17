@@ -1,0 +1,85 @@
+---
+title: ApiClient
+description: "Operator-persona client. One method per REST route."
+---
+
+`ApiClient` is the flat, low-level wrapper around the server's REST surface. Use it when you're managing other people's sessions (a SaaS, a queue worker, a CI runner) rather than acting as the user.
+
+```python
+from agent_sdk import ApiClient
+
+async with ApiClient("http://localhost:7778") as sdk:
+    sessions = await sdk.list_sessions()
+    for s in sessions:
+        print(s["session_id"], s["agent_id"])
+```
+
+## Constructor
+
+```python
+ApiClient(base_url: str = "http://localhost:7778")
+```
+
+Use as `async with` for automatic cleanup of the underlying HTTPX client.
+
+## Method surface
+
+`ApiClient` has one method per REST route. Method names mirror the route. See [REST API](/api-reference) for full request/response shapes; this page lists what's available.
+
+### Sessions
+
+- `create_session(...)` — POST `/sessions`
+- `get_session(id)` — GET `/sessions/{id}`
+- `list_sessions(...)` — GET `/sessions`
+- `delete_session(id)` — DELETE `/sessions/{id}`
+- `resume_session(id, ...)` — POST `/sessions/{id}/resume`
+- `release_session(id)` — POST `/sessions/{id}/release`
+- `get_session_status(id)` — GET `/sessions/{id}/status`
+- `get_session_sandbox(id)` — GET `/sessions/{id}/sandbox`
+- `get_session_log(id, ...)` — GET `/sessions/{id}/log`
+
+### Messages + events
+
+- `send_message(id, text, *, interrupt=False)` — POST `/sessions/{id}/message`
+- `stream_message(id, text, *, interrupt=False)` — POST `/sessions/{id}/message+stream` (returns async generator)
+- `events(id, ...)` — GET `/sessions/{id}/events` (SSE)
+- `cancel(id)` — POST `/sessions/{id}/cancel`
+- `configure(id, **kwargs)` — POST `/sessions/{id}/config`
+- `acp_call(id, method, params)` — POST `/sessions/{id}/acp/call`
+
+### Sandbox ops
+
+- `sandbox_exec(id, command, *, timeout=30)` — POST `/sessions/{id}/sandbox/exec`
+- `read_file(id, path)` / `write_file(id, path, content)` / `tree(id, path)` / `delete_file(id, path)` / `rename(id, src, dst)` / `download_file(id, path)` — `/sessions/{id}/files/*`
+
+### Volumes
+
+- `create_volume(...)` / `get_volume(id)` / `list_volumes()` / `delete_volume(id)`
+- `volume_tree(id, path)` / `volume_read(id, path)` / `volume_write(id, path, content)` / `volume_mkdir(id, path)` / `volume_delete(id, path)` / `volume_rename(id, src, dst)` / `volume_exists(id, path)` / `volume_download(id, path)` — `/volumes/{id}/files/*`
+
+### Agents
+
+- `register_agent(...)` — POST `/agents`
+- `get_agent(id)` — GET `/agents/{id}`
+- `list_agents()` — GET `/agents`
+- `delete_agent(id)` — DELETE `/agents/{id}`
+
+### Admin
+
+- `admin_list_sessions()` — GET `/admin/sessions`
+- `admin_list_inactive(...)` — GET `/admin/sessions/inactive`
+
+### Meta
+
+- `health()` — GET `/health`
+- `info()` — GET `/info`
+
+## When to use ApiClient vs Agent
+
+| Situation | Pick |
+|---|---|
+| You're the human in the loop | `Agent` |
+| You're orchestrating sessions for other users | `ApiClient` |
+| You're building a worker that drains a queue | `ApiClient` |
+| You're writing a one-off script | `Agent` |
+| You need fine-grained control over session lifecycle | `ApiClient` |

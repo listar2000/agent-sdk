@@ -1,0 +1,49 @@
+---
+title: Constants
+description: "Agent and provider name constants exported from agent_sdk."
+---
+
+The SDK exports string constants for the supported agents and providers. Use them instead of bare strings to get autocompletion + catch typos at import time.
+
+## Agent types
+
+```python
+from agent_sdk import (
+    CLAUDE,       # "claude"
+    CODEX,        # "codex"
+    OPENCODE,     # "opencode"
+    GEMINI,       # "gemini"
+    CLINE,        # "cline"
+    DEEPAGENTS,   # "deepagents"
+    OPENHANDS,    # "openhands"
+    GOOSE,        # "goose"
+    AGENT_TYPES,  # frozenset of all above
+)
+
+agent = Agent("worker", agent_type=CLAUDE)
+```
+
+## Providers
+
+```python
+from agent_sdk import (
+    UNIX_LOCAL,   # "unix_local"
+    DOCKER,       # "docker"
+    DAYTONA,      # "daytona"
+    MODAL,        # "modal"
+    PROVIDERS,    # frozenset of all above
+)
+
+agent = Agent("worker", provider=DAYTONA)
+```
+
+## Version
+
+```python
+from agent_sdk import __version__
+print(__version__)
+```
+
+## Validation
+
+`Agent.__init__` validates `agent_type` against `AGENT_TYPES` at construction time and raises `ValueError` for unknown values. Providers are validated server-side at session creation.

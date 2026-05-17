@@ -1,0 +1,56 @@
+---
+title: Extra Options
+description: "Pass vendor-specific ACP options to the underlying agent."
+---
+
+Some agents accept vendor-specific configuration via the ACP `params._meta` envelope. `agent-sdk` exposes this as one generic `extra_options` kwarg that's translated at the protocol edge.
+
+## Usage
+
+```python
+agent = Agent(
+    "worker",
+    agent_type="claude",
+    extra_options={
+        "disallowedTools": ["Bash"],
+        "tools": ["Read", "Edit"],         # whitelist only
+        "extraArgs": {"--json-schema": "..."},
+        "maxThinkingTokens": 8000,
+    },
+)
+```
+
+For `claude`, this becomes `params._meta.claudeCode.options` in the `session/new` payload.
+
+## Vendor namespace map
+
+| `agent_type` | Wrapped into |
+|---|---|
+| `claude` | `params._meta.claudeCode.options` |
+| (others) | not yet mapped — logs a warning and drops |
+
+When the agent type isn't in the map, `extra_options` is dropped with a server log warning rather than raising. This is forward-compat for new agents that don't yet have a namespace.
+
+## Immutability
+
+`extra_options` is **session-scoped** — it's applied at session creation and not re-applied on cold-recovery. To change it, create a new session.
+
+This differs from `mode`, `model`, `thought_level` which are dynamic and re-applied via `configure()` on every fresh attach.
+
+## What's supported
+
+Refer to the agent's own docs for what keys it accepts:
+
+- **Claude Code**: `tools`, `disallowedTools`, `extraArgs`, `maxThinkingTokens`, `mcpServers` — see [claude-agent-acp](https://github.com/anthropics/claude-code/tree/main/agent-acp).
+- **Others**: each ACP wrapper defines its own envelope; check upstream.
+
+## Forwarding through ApiClient
+
+```python
+await sdk.create_session(
+    agent_id=agent_id,
+    extra_options={"disallowedTools": ["Bash"]},
+)
+```
+
+The server persists it on the session row and forwards it on every ACP `initialize`.

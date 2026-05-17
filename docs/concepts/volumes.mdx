@@ -1,0 +1,63 @@
+---
+title: Volumes
+description: "Durable storage for sessions. Outlive sandboxes."
+---
+
+A **volume** is durable storage attached to one or more sessions. Sandboxes come and go; volumes survive.
+
+## Lifecycle
+
+```python
+from agent_sdk import ApiClient
+
+async with ApiClient() as sdk:
+    # 1. Create a volume.
+    vol = await sdk.create_volume(name="project-x", provider="daytona")
+    volume_id = vol["id"]
+
+    # 2. Bind sessions to it.
+    agent = Agent("worker", agent_type="claude", provider="daytona", volume_id=volume_id)
+
+    # 3. File ops happen independently of any sandbox.
+    await sdk.volume_write(volume_id, "/data/input.txt", "hello\n")
+    files = await sdk.volume_tree(volume_id, "/data")
+
+    # 4. Delete when done.
+    await sdk.delete_volume(volume_id)
+```
+
+## File ops via REST
+
+The `/volumes/{id}/files/*` endpoints expose a full file tree:
+
+| Op | Endpoint |
+|---|---|
+| Read | `GET /volumes/{id}/files/read?path=...` |
+| Write | `POST /volumes/{id}/files/write` |
+| Tree | `GET /volumes/{id}/files/tree?path=...` |
+| Exists | `GET /volumes/{id}/files/exists?path=...` |
+| Delete | `DELETE /volumes/{id}/files/delete?path=...` |
+| Rename | `POST /volumes/{id}/files/rename` |
+| Mkdir | `POST /volumes/{id}/files/mkdir` |
+| Download | `GET /volumes/{id}/files/download?path=...` (binary) |
+| Upload | `POST /volumes/{id}/files/upload` (multipart) |
+
+These work **without any active session**, which is the point — you can populate a volume with input data, run agents over it, then download results.
+
+## Per-provider notes
+
+- `unix_local`: volumes are directories under the host filesystem.
+- `docker`: volumes are Docker named volumes; file ops happen via a one-shot helper container.
+- `daytona`: volumes are Daytona-managed; file ops use the Daytona SDK.
+- `modal`: volumes are Modal `Volume` objects; file ops use the Modal SDK.
+
+The semantics are the same across providers; performance differs (local FS is fastest, Modal is slowest for many small files).
+
+## Conflicts
+
+`POST /volumes/{id}/files/write` with `overwrite=false` (default) raises `VolumeFileExistsError` if the path exists. Pass `overwrite=true` to replace.
+
+## Lifecycle pitfalls
+
+- **Don't delete a volume that has live sessions.** The next request will fail to find its sandbox.
+- **Volume deletion is per-provider.** A `daytona` volume must be deleted via the Daytona control plane (or `DELETE /volumes/{id}` which calls into it).

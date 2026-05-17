@@ -1,0 +1,83 @@
+---
+title: MCP + Skills
+description: "Wire MCP servers and npx skills into the agent."
+---
+
+## MCP servers
+
+Model Context Protocol servers expose tools to the agent. `agent-sdk` forwards your MCP config into the ACP session.
+
+```python
+agent = Agent(
+    "worker",
+    agent_type="claude",
+    mcp_servers={
+        "github": {
+            "command": "npx",
+            "args": ["@modelcontextprotocol/server-github"],
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..."},
+        },
+        "memory": {
+            "command": "npx",
+            "args": ["@modelcontextprotocol/server-memory"],
+        },
+    },
+)
+```
+
+The dict structure matches what Claude Code / OpenCode / etc. consume natively — `command`, `args`, `env`, `cwd`.
+
+## Skills
+
+Skills are npx-installable scripts that get wired into the sandbox before the supervisor starts. The simplest form is a list of npm package specs:
+
+```python
+agent = Agent(
+    "worker",
+    agent_type="claude",
+    skills=["@my-org/awesome-skill", "@my-org/other-skill@1.2.3"],
+)
+```
+
+The server runs `npx -y <spec>` inside the sandbox as a pre-start command and the agent picks them up.
+
+Full form lets you pin sources + pass per-skill config:
+
+```python
+agent = Agent(
+    "worker",
+    skills={
+        "@my-org/skill-a": {"version": "1.2.3"},
+        "@my-org/skill-b": {"source": "github.com/foo/bar"},
+    },
+)
+```
+
+## Sandbox pre-start commands
+
+For installs that aren't npx, use `pre_start_commands`:
+
+```python
+agent = Agent(
+    "worker",
+    provider="docker",
+    pre_start_commands=[
+        "apt-get update && apt-get install -y graphviz",
+        "pip install graphviz",
+    ],
+)
+```
+
+These run as root inside the sandbox **before** the supervisor process starts. For `daytona`/`modal` they're baked into the snapshot.
+
+## Order of execution
+
+1. Sandbox is provisioned (provider-specific).
+2. Volume is mounted.
+3. `pre_start_commands` run (as root).
+4. Skills get `npx -y` installed.
+5. Supervisor starts.
+6. Supervisor spawns the ACP child (claude/opencode/etc.).
+7. SDK gets a `session_id` back.
+
+Steps 3–4 add to cold-start time; for daytona/modal they're amortized via snapshots.

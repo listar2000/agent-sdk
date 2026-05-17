@@ -1,0 +1,111 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "agent-sdk",
+  "description": "Python SDK + REST API to orchestrate Claude, Codex, OpenCode and other coding agents across sandboxed compute (unix_local, docker, daytona, modal).",
+  "colors": {
+    "primary": "#6366f1",
+    "light": "#a5b4fc",
+    "dark": "#4338ca"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/sessions",
+              "concepts/sandboxes",
+              "concepts/volumes",
+              "concepts/recovery"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/streaming",
+              "guides/persistence",
+              "guides/credentials",
+              "guides/mcp-and-skills",
+              "guides/extra-options"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SDK Reference",
+        "groups": [
+          {
+            "group": "Client SDK",
+            "pages": [
+              "sdk/agent",
+              "sdk/session",
+              "sdk/sandbox",
+              "sdk/api-client",
+              "sdk/events",
+              "sdk/errors",
+              "sdk/constants"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "REST API",
+        "groups": [
+          {
+            "group": "Reference",
+            "pages": [
+              "api-overview"
+            ]
+          },
+          {
+            "group": "Auto-generated",
+            "openapi": "openapi.json"
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/rllm-org/agent-sdk",
+          "icon": "github"
+        }
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Source",
+        "href": "https://github.com/rllm-org/agent-sdk"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/rllm-org/agent-sdk"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/rllm-org/agent-sdk"
+    }
+  }
+}
