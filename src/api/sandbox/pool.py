@@ -198,7 +198,7 @@ class SessionPool:
             task = getattr(session, "_credential_refresh_task", None)
             if task is not None:
                 task.cancel()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BaseException):
                     await task
             try:
                 try:
