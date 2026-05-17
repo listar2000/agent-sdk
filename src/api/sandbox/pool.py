@@ -216,6 +216,12 @@ class SessionPool:
                         get_supervisor_url=lambda s=session: s.supervisor_url,
                     )
                 )
+            # Fire lifecycle webhook so the orchestrator knows the
+            # sandbox is now alive.  URL is derived from the
+            # credential_refresh_url already on the recipe.
+            lifecycle_url = _lifecycle_url_from_recipe(session.state.recipe)
+            if lifecycle_url:
+                asyncio.create_task(_fire_lifecycle_webhook(lifecycle_url, session_id, "started"))
             return session
 
     async def cold_create(
@@ -249,6 +255,7 @@ class SessionPool:
             session = self._active.pop(session_id, None)
             if session is None:
                 return
+            lifecycle_url = _lifecycle_url_from_recipe(session.state.recipe)
             # Cancel the credential-refresh loop (if any) before tearing
             # down compute. Suppress exceptions on await — the task may
             # have already crashed; we just want it gone.
@@ -272,6 +279,10 @@ class SessionPool:
                 # dashboard drops this session out of the active list
                 # right away (vs waiting up to one heartbeat tick).
                 await self._publish_state()
+            # Fire lifecycle webhook so the orchestrator knows the
+            # sandbox is now hibernated.
+            if lifecycle_url:
+                asyncio.create_task(_fire_lifecycle_webhook(lifecycle_url, session_id, "hibernated"))
 
     async def reap_idle(
         self,
@@ -461,3 +472,33 @@ async def _write_credentials_via_supervisor(
                 json={"command": cmd, "timeout": 10},
             )
             r.raise_for_status()
+
+
+def _lifecycle_url_from_recipe(recipe: Recipe) -> str | None:
+    """Derive the lifecycle webhook URL from the credential_refresh_url.
+
+    ``credential_refresh_url`` looks like:
+        ``https://hivespace/api/internal/agents/{id}/credentials/refresh``
+
+    We strip the per-agent suffix and replace with the lifecycle path:
+        ``https://hivespace/api/internal/session-lifecycle``
+    """
+    url = recipe.credential_refresh_url
+    if not url:
+        return None
+    marker = "/api/internal/agents/"
+    idx = url.find(marker)
+    if idx < 0:
+        return None
+    return url[:idx] + "/api/internal/session-lifecycle"
+
+
+async def _fire_lifecycle_webhook(url: str, session_id: str, event: str) -> None:
+    """POST a session lifecycle event to the orchestrator.
+    Fire-and-forget — failures are logged but never block the caller."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(url, json={"session_id": session_id, "event": event})
+    except Exception:
+        log.debug("lifecycle webhook failed for session=%s event=%s",
+                  session_id, event, exc_info=True)
