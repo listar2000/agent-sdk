@@ -9,9 +9,16 @@ build/
 node_modules/
 .claude/
 
-# Local Postgres for launch_server_test.sh
+# Local Postgres + nginx for launch_server_test.sh
 .postgres-env/
 .postgres-data/
+.nginx-env/
 
 # Worktrees for subagent-driven development
 .worktrees/
+
+# Benchmark transient outputs (results files, py-spy flame graphs, server logs)
+logs/
+benchmark/scale/results.jsonl
+benchmark/scale/tune_results.jsonl
+benchmark/scale/flame-*.svg

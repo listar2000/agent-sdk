@@ -21,7 +21,7 @@ What's here:
 from .factory import make_session, register
 from .liveness import Liveness, LivenessState
 from .pool import SessionPool
-from .runtime import get_pool, shutdown_pool, start_reaper
+from .runtime import get_pool, shutdown_pool, start_reaper, start_worker_heartbeat
 from .session import BaseSandboxSession
 from .state import (
     DaytonaSandboxState,
@@ -55,5 +55,6 @@ __all__ = [
     "serialize",
     "shutdown_pool",
     "start_reaper",
+    "start_worker_heartbeat",
     "state_for_provider",
 ]

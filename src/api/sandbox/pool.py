@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import shlex
 import time
 from collections.abc import Callable
@@ -37,6 +38,21 @@ log = logging.getLogger(__name__)
 SessionFactory = Callable[[str, SandboxState], BaseSandboxSession]
 
 
+# Per-worker lease tuning. One heartbeat per process, not per session.
+# The worker keeps a single row in the ``workers`` table; sessions point
+# at it via ``sessions.owner_id``. A session is "owned" iff its
+# owner_id matches a worker whose lease_expires_at is in the future.
+#
+# Beat at 25s, expire at 60s. 2.4:1 ratio — one missed beat is fine,
+# two means the worker is probably wedged and a peer should take over.
+# Compared to the previous per-session 8:1 (15s/120s), the worker-level
+# heartbeat doesn't need to survive provider cold-creates because the
+# worker is alive enough to run cold-create iff it's alive enough to
+# heartbeat. Override both at boot via env if the deployment needs it.
+_WORKER_HEARTBEAT_S = float(os.environ.get("AGENT_SDK_WORKER_HEARTBEAT_S", "25"))
+_WORKER_TTL_S = float(os.environ.get("AGENT_SDK_WORKER_TTL_S", "60"))
+
+
 class SessionPool:
     """Holds at-most-one active SandboxSession per session_id.
 
@@ -55,12 +71,42 @@ class SessionPool:
         self._factory = factory
         self._active: dict[str, BaseSandboxSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # Lazy import — keeps test fixtures that don't go through the
+        # FastAPI lifespan from blowing up on the identity module's
+        # import-time env reads.
+        from api.identity import owner_addr, owner_id
+        self._owner_id = owner_id()
+        self._owner_addr = owner_addr()
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         lock = self._locks.get(session_id)
         if lock is None:
             lock = self._locks.setdefault(session_id, asyncio.Lock())
         return lock
+
+    async def _publish_state(self) -> None:
+        """Snapshot our in-memory pool's session_ids to the ``workers``
+        row + push lease_expires_at forward. Called on every mutation
+        of ``_active`` (so the dashboard JOIN is always within a few
+        ms of reality) and periodically from the worker heartbeat task
+        in ``runtime.py`` (so a long-idle worker still proves it's
+        alive). Best-effort — a transient DB hiccup just delays the
+        dashboard view; the next mutation or heartbeat retries.
+
+        Disabled via ``AGENT_SDK_DISABLE_LEASE=1`` for unit-test
+        fixtures that don't have the ``workers`` table provisioned.
+        """
+        if os.environ.get("AGENT_SDK_DISABLE_LEASE") == "1":
+            return
+        try:
+            await db.update_worker_state(
+                owner_id=self._owner_id,
+                owner_addr=self._owner_addr,
+                ttl_seconds=_WORKER_TTL_S,
+                session_ids=list(self._active.keys()),
+            )
+        except Exception:
+            log.warning("pool: _publish_state failed", exc_info=True)
 
     async def get_session(
         self,
@@ -128,6 +174,12 @@ class SessionPool:
                 # from DB.
                 raise KeyError(f"session {session_id} not in live pool (peek=True)")
 
+            # No per-session ownership claim. We trust the LB's
+            # consistent-hash routing: if this request landed on us,
+            # we're the right replica. The narrow split-brain window
+            # at LB rebalance is the cost of dropping the lease (see
+            # README §scaling for the volume-flock follow-up).
+
             if initial_state is not None:
                 state: SandboxState = initial_state
             else:
@@ -145,6 +197,11 @@ class SessionPool:
             await session.start()
             await db.write_sandbox_state(session_id, serialize(session.state))
             self._active[session_id] = session
+            # Publish the updated session_ids snapshot so the dashboard
+            # sees this session as "active" without waiting for the
+            # 25s heartbeat tick. Best-effort; the periodic heartbeat
+            # in runtime.py would catch it within one tick anyway.
+            await self._publish_state()
             # Spawn the credential-refresh loop if the recipe asks for
             # one. Fires on every wake — cold create AND resume from
             # hibernation — so the agent always has fresh credentials.
@@ -218,15 +275,14 @@ class SessionPool:
                     )
             finally:
                 await _safe_shutdown(session)
+                # Publish the updated session_ids snapshot so the
+                # dashboard drops this session out of the active list
+                # right away (vs waiting up to one heartbeat tick).
+                await self._publish_state()
             # Fire lifecycle webhook so the orchestrator knows the
             # sandbox is now hibernated.
             if lifecycle_url:
                 asyncio.create_task(_fire_lifecycle_webhook(lifecycle_url, session_id, "hibernated"))
-
-    def has_active(self, session_id: str) -> bool:
-        """For derived UI/admin info ('lifecycle: active|hibernated').
-        No I/O — just whether the pool currently holds a session."""
-        return session_id in self._active
 
     async def reap_idle(
         self,

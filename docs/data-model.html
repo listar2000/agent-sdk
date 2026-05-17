@@ -745,12 +745,6 @@
               <span class="method-ret">→ (rpc_id, PromptResponse)</span>
             </div>
             <div class="method-row">
-              <span class="method-name">cancel_prompt(session_id)</span>
-            </div>
-            <div class="method-row">
-              <span class="method-name">close_session(session_id)</span>
-            </div>
-            <div class="method-row">
               <span class="method-name">list_sessions(session_id)</span>
               <span class="method-ret">→ list[dict]</span>
             </div>
@@ -770,7 +764,8 @@
               <span class="method-ret">→ dict</span>
             </div>
             <div class="method-row">
-              <span class="method-name">get_inner_session_id / set_inner_session_id</span>
+              <span class="method-name">get_inner_session_id(session_id)</span>
+              <span class="method-ret">→ str?</span>
             </div>
             <div class="method-row">
               <span class="method-name">aclose()</span>

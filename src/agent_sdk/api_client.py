@@ -104,6 +104,10 @@ class ApiClient:
             # read=None lets SSE streams stay open indefinitely; other
             # verbs are bounded by ``timeout``.
             timeout=httpx.Timeout(timeout, read=None),
+            # Multi-replica deploys send 307s when a request lands on a
+            # non-owner. Follow transparently so callers don't need to
+            # know about the lease routing layer.
+            follow_redirects=True,
         )
 
     @property
@@ -275,9 +279,28 @@ class ApiClient:
         Eager by default (``provision: true``) — provisions a sandbox
         and connects ACP before returning. Pass ``provision: false`` in
         the body to get a session shell without a sandbox; pass
-        `sandbox_ref` to reuse an existing sandbox.
+        ``sandbox_ref`` to reuse an existing sandbox.
+
+        Generates a client-side ``session_id`` (UUID4) if the caller
+        didn't pass one and sends it as the ``X-Session-Id`` header so
+        a consistent-hash LB (nginx) routes the POST to the same
+        replica that will own the session for its lifetime. Subsequent
+        ``/sessions/{id}/*`` requests hash on the same id from the URL
+        and land on the same replica — zero redirects in steady state.
+        Old SDK builds that don't set the header still work; the LB
+        falls through to round-robin and the server-generated id is
+        returned in the response.
         """
-        return await self._json("POST", "/sessions", json=body)
+        import uuid as _uuid
+        sid = body.get("id")
+        if sid is None:
+            sid = str(_uuid.uuid4())
+            body["id"] = sid
+        return await self._json(
+            "POST", "/sessions",
+            json=body,
+            headers={"X-Session-Id": sid},
+        )
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         """``GET /sessions``."""

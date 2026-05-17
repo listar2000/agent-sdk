@@ -22,7 +22,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .._shared import (
-    AUTH_KEYS,
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_BIN_NAMES,
@@ -31,8 +30,6 @@ from .._shared import (
     _acp_launch_args,
     _find_free_port,
     _get_sandbox_env_vars,
-    _port_lock,
-    _freed_ports,
     _runtime_acp_bin,
     _runtime_supervisor_js,
     _safe_path,
@@ -225,11 +222,6 @@ async def delete_volume(ref: str) -> None:
     log.info("local volume deleted: %s", ref)
 
 
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. The supervisor + ACP bins now ship in
-# the agent-sdk Docker image at ``/opt/agent-sdk/runtime/`` (or in
-# ``<repo>/src/supervisor`` for source-tree dev) and ``create_sandbox``
-# resolves them via ``_runtime_supervisor_js()`` / ``_runtime_acp_bin()``.
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +272,17 @@ async def create_sandbox(
             f"Set AGENT_SDK_RUNTIME_PATH or run "
             f"`npm --prefix src/supervisor install`."
         )
-    if agent_type in _ACP_NPM_SPECS:
+    # ``AGENT_SDK_MOCK_ACP_PATH`` overrides the per-agent-type ACP bin
+    # selection. Used by ``benchmark/scale/mock_acp.js`` to drive server-
+    # saturation benches without going through claude. The supervisor's
+    # contract is "stdin/stdout JSON-RPC ACP"; whatever path you point
+    # at must implement that.
+    mock_acp = os.environ.get("AGENT_SDK_MOCK_ACP_PATH")
+    if mock_acp:
+        if not Path(mock_acp).exists():
+            raise RuntimeError(f"AGENT_SDK_MOCK_ACP_PATH does not exist: {mock_acp}")
+        acp_bin_str = mock_acp
+    elif agent_type in _ACP_NPM_SPECS:
         acp_bin_str = _runtime_acp_bin(agent_type)
         if not Path(acp_bin_str).exists():
             raise RuntimeError(
@@ -299,12 +301,6 @@ async def create_sandbox(
         os.makedirs(home_dir, exist_ok=True)
         os.makedirs(home_dir / ".claude", exist_ok=True)
     await asyncio.to_thread(_mkhome)
-
-    # Allocate a port via the shared allocator. port=0 is treated the same
-    # as None — it's always an invalid listen port for us, and historical
-    # bugs pushed 0 into _freed_ports, so defend at the entry point too.
-    if port is None or port == 0:
-        port = await _find_free_port()
 
     # Build the supervisor env. Local provider is by definition single-tenant
     # on the user's own host — inherit the host's AUTH_KEYS (CLAUDE_CODE_OAUTH_TOKEN,
@@ -335,42 +331,94 @@ async def create_sandbox(
 
     effective_root = root or str(home_dir)
 
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.Popen,
-            [
-                node, str(supervisor_js),
-                "--host", "127.0.0.1",
-                "--port", str(port),
-                "--acp", acp_bin_str,
-                *extra,
-                "--root", effective_root,
-            ],
-            env=base_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-    except Exception:
-        async with _port_lock:
-            _freed_ports.append(port)
-        raise
+    # Port allocation is the only race-y bit. ``_find_free_port`` does a
+    # bind-probe but the OS can hand the same ephemeral out to another
+    # process between our probe and supervisor.js's bind. Under 32-way
+    # pytest concurrency this happens occasionally and the supervisor
+    # process exits with EADDRINUSE; the docker provider already retries
+    # the same way (see ``docker/__init__.py:_is_port_collision``). Loop
+    # at most ``port_retries`` times, picking a fresh port each round.
+    port_retries = 5
+    proc = None
+    url = None
+    final_port = port
+    healthy = False
+    last_err = ""
+    for _attempt in range(port_retries):
+        # Allocate fresh on each attempt. port=0 is treated the same as None.
+        if final_port is None or final_port == 0:
+            final_port = await _find_free_port()
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.Popen,
+                [
+                    node, str(supervisor_js),
+                    "--host", "127.0.0.1",
+                    "--port", str(final_port),
+                    "--acp", acp_bin_str,
+                    *extra,
+                    "--root", effective_root,
+                ],
+                env=base_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            raise
 
-    url = f"http://127.0.0.1:{port}"
-    try:
-        healthy = await _wait_for_health(url)
-    except BaseException:
-        # ``_kill_proc`` calls blocking ``proc.wait(timeout=5)`` twice; running
-        # it on the event-loop thread would stall every other coroutine for up
-        # to ten seconds.  Offload to a worker thread.
+        url = f"http://127.0.0.1:{final_port}"
+        # Quick liveness check: did the child immediately die from EADDRINUSE?
+        # Polling at ~50ms intervals for up to 500ms catches the common case
+        # without delaying the happy path more than two polls. The stderr is
+        # async-read in a small buffer so we don't drain forever.
+        died_eaddrinuse = False
+        for _ in range(10):
+            await asyncio.sleep(0.05)
+            if proc.poll() is None:
+                continue
+            # Process exited fast. Read whatever stderr made it.
+            try:
+                err_bytes = await asyncio.to_thread(
+                    lambda: proc.stderr.read() if proc.stderr else b""
+                )
+            except Exception:
+                err_bytes = b""
+            last_err = err_bytes.decode(errors="replace")[:400]
+            if (b"EADDRINUSE" in err_bytes
+                    or b"address already in use" in err_bytes.lower()):
+                died_eaddrinuse = True
+            break
+        if died_eaddrinuse:
+            # Pick a fresh port and retry.
+            log.warning(
+                "local supervisor EADDRINUSE on port %d; retrying", final_port,
+            )
+            final_port = 0  # force re-allocate next round
+            continue
+        if proc.poll() is not None:
+            # Died for another reason — surface immediately.
+            raise RuntimeError(
+                f"local supervisor exited rc={proc.returncode} during boot: "
+                f"{last_err}"
+            )
+
+        try:
+            healthy = await _wait_for_health(url)
+        except BaseException:
+            await asyncio.to_thread(_kill_proc, proc)
+            raise
+        if healthy:
+            break
+        # Not healthy — kill and try a fresh port (could be a stuck listener
+        # left behind by a peer process that crashed mid-bind).
         await asyncio.to_thread(_kill_proc, proc)
-        async with _port_lock:
-            _freed_ports.append(port)
-        raise
+        final_port = 0
     if not healthy:
-        await asyncio.to_thread(_kill_proc, proc)
-        async with _port_lock:
-            _freed_ports.append(port)
-        raise RuntimeError(f"local supervisor failed to become healthy on port {port}")
+        raise RuntimeError(
+            f"local supervisor failed to become healthy after {port_retries} "
+            f"port-retries; last err={last_err!r}"
+        )
+    port = final_port
 
     # Stable ref that outlives the PID — what sandboxes.sandbox_ref stores.
     ref = f"local-{uuid.uuid4().hex[:12]}"
@@ -518,8 +566,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
     await asyncio.to_thread(_clear_record, ref, marker, record)
     port = getattr(inst, "port", None) or (record.port if record else None)
     if port:
-        async with _port_lock:
-            _freed_ports.append(port)
         try:
             inst.port = None
         except Exception:

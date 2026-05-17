@@ -55,9 +55,7 @@ async def _run_sandbox_exec_async(sandbox, cmd: str, timeout: int = 120) -> "_Ex
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
 from .._shared import (
-    _acp_bin_name,
     _acp_launch_args,
-    _ACP_NPM_SPECS,
     _build_env_prefix,
     _build_volume_mounts,
     _get_sandbox_env_vars,
@@ -71,10 +69,8 @@ from .._shared import (
     normalize_find_output,
 )
 
-# the runtime-image-unification refactor: ``_SUPERVISOR_DIR``,
-# ``_SUPERVISOR_REMOTE_DIR``, and ``_SUPERVISOR_VOLUME_DIR`` were deleted
-# along with the install/cache helpers that used them. The supervisor now
-# lives at ``/opt/agent-sdk/runtime/`` inside the daytona sandbox image.
+# The supervisor lives at ``/opt/agent-sdk/runtime/`` inside the daytona
+# sandbox image; this is the port it listens on.
 _SUPERVISOR_REMOTE_PORT = 9100
 
 # The agent's HOME inside a Daytona sandbox — a LOCAL ext4 directory the
@@ -170,7 +166,6 @@ async def start_supervisor_in_sandbox(
     lines for each critical-path phase; grep-friendly for recovery-time
     benchmarks (scripts/bench_recovery.py).
     """
-    bin_name = _acp_bin_name(agent_type)
     sid8 = sandbox.id[:8] if sandbox.id else "?"
     total_t0 = time.monotonic()
     phases: list[tuple[str, float]] = []
@@ -226,13 +221,10 @@ async def start_supervisor_in_sandbox(
         )
         return url
 
-    # the runtime-image-unification refactor: the daytona sandbox boots
-    # from an image whose ``/opt/agent-sdk/runtime/`` already contains
-    # supervisor.js + every ACP bin. No volume-side cache check, no
-    # deps.tar.gz extract, no legacy /tmp install — all gone with the image.
-    # The bin path is resolved via ``package.json#bin`` (not
-    # ``node_modules/.bin/``) because daytona's image-build flattens
-    # symlinks; the underlying scripts survive but the symlinks don't.
+    # The daytona sandbox boots from an image whose
+    # ``/opt/agent-sdk/runtime/`` already contains supervisor.js + every
+    # ACP bin. The bin path resolves via ``package.json#bin`` (not
+    # ``node_modules/.bin/``) — daytona's image-build flattens symlinks.
     from .._shared import _runtime_acp_bin_relative
     sup_dir = "/opt/agent-sdk/runtime"
     acp_bin = f"{sup_dir}/{_runtime_acp_bin_relative(agent_type)}"
@@ -292,11 +284,6 @@ async def start_supervisor_in_sandbox(
              sid8, total_dt, ", ".join(f"{p}={d:.2f}" for p, d in phases))
     log.info("supervisor on port %d ready: %s (sandbox %s, dir %s)", port, url[:60], sandbox.id[:16], sup_dir)
     return url
-
-
-# ``_resolve_legacy_volume_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor — all its volume-cache + tar-extract +
-# legacy-fallback work is obsolete now that the runtime is in the image.
 
 
 async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
@@ -388,26 +375,35 @@ async def provision_daytona_sandbox(
                 "scripts/release.sh)."
             )
 
-    create_timeout = 300 if dockerfile else 60
+    # 60s for plain image-create works in light load but Daytona's
+    # control plane queues sandbox provisioning, so under -n auto with
+    # 32 concurrent test workers (or production at >10 prompts/sec) the
+    # snapshot-create itself can take 90-150s. The dockerfile path was
+    # always at 300s for the same reason. Use a single generous budget;
+    # this isn't a retry — it's giving Daytona enough room to provision
+    # one sandbox.
+    create_timeout = 300 if dockerfile else 240
 
     volumes = _build_volume_mounts(volume_id, subpath, shared_mounts)
     labels = _sandbox_labels()
 
-    if use_snapshot:
-        sandbox = await daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
-                volumes=volumes, labels=labels,
-            ), timeout=create_timeout,
-        )
-    else:
-        sandbox = await daytona.create(
+    async def _do_create():
+        if use_snapshot:
+            return await daytona.create(
+                CreateSandboxFromSnapshotParams(
+                    snapshot=snapshot, auto_stop_interval=0, env_vars=env_vars,
+                    volumes=volumes, labels=labels,
+                ), timeout=create_timeout,
+            )
+        return await daytona.create(
             CreateSandboxFromImageParams(
                 image=image, auto_stop_interval=0, env_vars=env_vars,
                 volumes=volumes, labels=labels,
                 resources=_to_daytona_resources(resources),
             ), timeout=create_timeout,
         )
+
+    sandbox = await _daytona_create_with_502_retry(_do_create)
 
     try:
         # Run pre-start commands (skills, CLI install, etc.).
@@ -510,7 +506,16 @@ async def restart_daytona_supervisor(
 
 
 async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
-    """Shared logic for destroy/stop Daytona sandbox."""
+    """Shared logic for destroy/stop Daytona sandbox.
+
+    For ``delete``: poll until Daytona confirms the sandbox is gone
+    (``daytona.get`` raises 404) before returning. Daytona's
+    ``daytona.delete`` returns as soon as the control plane accepts the
+    delete request — but the underlying compute is still being torn down
+    for 10-30s. Without this poll, a fast caller (e.g. test asserting
+    sandbox-gone after DELETE /sessions) sees state=``destroying``
+    instead of gone and fails ``_assert_sandbox_gone`` under load.
+    """
     if not instance.sandbox_ref:
         return
     try:
@@ -523,6 +528,23 @@ async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
         sandbox = await daytona.get(instance.sandbox_ref)
         if op == "delete":
             await daytona.delete(sandbox)
+            # Wait for the destroy to actually land (sandbox gone from
+            # daytona's index). Bounded to 60s; if it doesn't go in that
+            # window, log a warning and let the caller proceed — daytona
+            # will eventually clean up.
+            deadline = asyncio.get_running_loop().time() + 60.0
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    await daytona.get(instance.sandbox_ref)
+                except Exception:
+                    break  # get() raised → sandbox is gone
+                await asyncio.sleep(0.5)
+            else:
+                log.warning(
+                    "daytona delete confirm timeout for %s (still in"
+                    " destroying state after 60s)",
+                    instance.sandbox_ref,
+                )
         else:
             await sandbox.stop()
         log.info("daytona sandbox %sd: %s", op, instance.sandbox_ref)
@@ -690,6 +712,40 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     return vol_id
 
 
+async def _daytona_create_with_502_retry(do_create, retries: int = 2):
+    """Run ``do_create()`` and retry up to ``retries`` times on Daytona
+    control-plane 502/503/504 (transient infra blips that surface as
+    ``<html>...<title>502 Bad Gateway</title>...`` in the SDK message).
+
+    Other errors (DaytonaError, image-not-found, auth, quota) raise on
+    the first attempt — the retry is narrowly scoped to the 5xx HTML
+    error class. Backoff is 2s, 4s, 8s.
+    """
+    delay = 2.0
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await do_create()
+        except Exception as e:
+            msg = str(e)
+            transient = (
+                "502 Bad Gateway" in msg
+                or "503 Service" in msg
+                or "504 Gateway" in msg
+                or ("502" in msg and "html" in msg.lower())
+            )
+            if not transient or attempt == retries:
+                raise
+            log.warning(
+                "daytona.create transient (attempt %d/%d) — retrying after %.1fs: %s",
+                attempt + 1, retries + 1, delay, msg.split("\n", 1)[0][:120],
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+            last_exc = e
+    raise last_exc  # unreachable but satisfies type-checker
+
+
 async def _init_volume_dirs(volume_ref: str) -> None:
     """Spin a 1-shot sandbox to mkdir -p shared/ system/supervisor/ on the volume."""
     from daytona_sdk import (
@@ -711,22 +767,24 @@ async def _init_volume_dirs(volume_ref: str) -> None:
     volumes = [VolumeMount(volume_id=volume_ref, mount_path="/v")]
     init_labels = _sandbox_labels()
 
-    if use_snapshot:
-        sb = await daytona.create(
-            CreateSandboxFromSnapshotParams(
-                snapshot=snapshot, auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=init_labels,
-            ), timeout=120,
-        )
-    else:
-        sb = await daytona.create(
+    async def _do_init_create():
+        if use_snapshot:
+            return await daytona.create(
+                CreateSandboxFromSnapshotParams(
+                    snapshot=snapshot, auto_stop_interval=0,
+                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
+                    labels=init_labels,
+                ), timeout=120,
+            )
+        return await daytona.create(
             CreateSandboxFromImageParams(
                 image="node:22-slim", auto_stop_interval=0,
                 env_vars=_get_sandbox_env_vars(), volumes=volumes,
                 labels=init_labels,
             ), timeout=120,
         )
+
+    sb = await _daytona_create_with_502_retry(_do_init_create)
 
     try:
         await _run_sandbox_exec_async(
@@ -874,11 +932,6 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     )
 
 
-# ``install_supervisor`` was deleted in Phase E of
-# the runtime-image-unification refactor. The daytona sandbox now boots from an
-# image whose /opt/agent-sdk/runtime/ contains supervisor.js + every ACP
-# bin; ``provision_daytona_sandbox`` reads ``DAYTONA_IMAGE`` /
-# ``.runtime-image-tag`` for that image.
 
 
 async def create_sandbox(
@@ -1131,25 +1184,6 @@ async def _conditional_upload_if_absent(ref: str, abs_path: str, content: bytes)
         if "412" in msg or "precondition" in msg:
             return "exists"
         raise RuntimeError(f"conditional upload failed: {e}") from e
-
-
-async def _upload_overwrite(ref: str, abs_path: str, content: bytes) -> None:
-    """Upload bytes to ``abs_path``, replacing any existing file."""
-    inst = await _get_or_create_utility(ref)
-    if not inst.sandbox_ref:
-        raise RuntimeError("upload overwrite: utility sandbox_ref missing")
-    daytona_client = await _get_async_daytona_client()
-    try:
-        sandbox = await daytona_client.get(inst.sandbox_ref)
-    except Exception as e:
-        raise RuntimeError(f"upload overwrite: get sandbox failed: {e}") from e
-    try:
-        await sandbox.fs._api_client.upload_file(  # pyright: ignore[reportPrivateUsage]
-            path=abs_path,
-            file=content,
-        )
-    except Exception as e:
-        raise RuntimeError(f"upload overwrite failed: {e}") from e
 
 
 async def _move_overwrite(ref: str, src_abs: str, dst_abs: str) -> None:

@@ -196,5 +196,205 @@ if [[ -f "${REPO_ROOT}/.runtime-snapshot-tag" ]]; then
   echo "Daytona snapshot: $(cat "${REPO_ROOT}/.runtime-snapshot-tag")"
 fi
 
-echo "Starting local server on http://localhost:7778 ..."
-exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 --port 7778
+: "${AGENT_SDK_REPLICAS:=1}"
+: "${AGENT_SDK_PUBLIC_PORT:=7778}"
+: "${AGENT_SDK_BACKEND_PORT_BASE:=7791}"
+
+# uvicorn is always single-worker. Scale via AGENT_SDK_REPLICAS + LB —
+# multi-worker SO_REUSEPORT routes requests randomly across workers,
+# which defeats the lease's session-locality and pays the 307 tax on
+# most requests.
+
+if [[ "${AGENT_SDK_REPLICAS}" -le 1 ]]; then
+  # Single-replica path — the historical default.
+  echo "Starting local server on http://localhost:${AGENT_SDK_PUBLIC_PORT} ..."
+  exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 \
+      --port "${AGENT_SDK_PUBLIC_PORT}"
+fi
+
+# Multi-replica + LB path. Spawns N single-worker uvicorn replicas on
+# AGENT_SDK_BACKEND_PORT_BASE..(BASE+N-1) and benchmark/scale/lb.py in
+# front on AGENT_SDK_PUBLIC_PORT. The LB does consistent-hash routing
+# on /sessions/{id}/...; the per-session Postgres lease + 307 redirect
+# handles ownership safety so the LB itself can be dumb.
+#
+# Tear-down: trap forwards SIGINT/SIGTERM to the whole process group
+# so Ctrl-C tears down all replicas + the LB.
+
+PIDS=()
+_cleanup() {
+  for pid in "${PIDS[@]:-}"; do
+    [[ -z "${pid}" ]] && continue
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    local alive=0
+    for pid in "${PIDS[@]:-}"; do
+      kill -0 "${pid}" 2>/dev/null && alive=1
+    done
+    [[ "${alive}" -eq 0 ]] && return
+  done
+  for pid in "${PIDS[@]:-}"; do
+    kill -KILL "${pid}" 2>/dev/null || true
+  done
+}
+trap _cleanup EXIT INT TERM
+
+mkdir -p "${REPO_ROOT}/logs"
+
+backends_csv=""
+for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+  port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+  name="r${i}"
+  log_path="${REPO_ROOT}/logs/server-${name}.log"
+  : > "${log_path}"
+  echo "  launching replica ${name} on :${port} -> ${log_path}"
+  AGENT_SDK_REPLICA_ID="${name}" \
+    AGENT_SDK_PORT="${port}" \
+    AGENT_SDK_INTERNAL_HOST="127.0.0.1" \
+    "${VENV_PYTHON}" -m uvicorn api.server:app \
+      --host 127.0.0.1 --port "${port}" \
+      > "${log_path}" 2>&1 &
+  PIDS+=("$!")
+  if [[ -n "${backends_csv}" ]]; then backends_csv="${backends_csv},"; fi
+  backends_csv="${backends_csv}http://127.0.0.1:${port}"
+done
+
+# Wait for every replica to answer /health before bringing the LB up.
+for pid in "${PIDS[@]}"; do
+  : "${pid}"  # validate
+done
+
+deadline=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < deadline )); do
+  all_up=1
+  for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+    port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+    curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1 || { all_up=0; break; }
+  done
+  [[ "${all_up}" -eq 1 ]] && break
+  sleep 0.5
+done
+if [[ "${all_up}" -ne 1 ]]; then
+  echo "ERROR: not all replicas became healthy in 30s; see logs/server-r*.log" >&2
+  exit 1
+fi
+
+# Start the LB. Default is ``nginx`` (cookie-sticky upstream, same
+# routing as ``deploy/nginx/`` on Railway). ``AGENT_SDK_LB=python``
+# falls back to ``benchmark/scale/lb.py`` for local dev when you don't
+# want to depend on nginx being on PATH.
+lb_log="${REPO_ROOT}/logs/server-lb.log"
+: > "${lb_log}"
+: "${AGENT_SDK_LB:=nginx}"
+if [[ "${AGENT_SDK_LB}" == "nginx" ]]; then
+  # Auto-install nginx via conda into .nginx-env/ if not on PATH —
+  # same brainfree pattern as the Postgres bootstrap above. Skips
+  # the install if a system nginx is already available.
+  if ! command -v nginx >/dev/null 2>&1; then
+    NGINX_ENV_DIR="${REPO_ROOT}/.nginx-env"
+    if [[ ! -x "${NGINX_ENV_DIR}/bin/nginx" ]]; then
+      echo "Installing nginx into ${NGINX_ENV_DIR} (one-time, ~1 min)..."
+      "${CONDA_BIN}" create -y -p "${NGINX_ENV_DIR}" -c conda-forge nginx >/dev/null
+    fi
+    export PATH="${NGINX_ENV_DIR}/bin:${PATH}"
+  fi
+  # Render the nginx config dynamically so any N + port base works.
+  # Same routing as deploy/nginx/nginx.conf (cookie-failover override +
+  # consistent-hash on session_id, with X-Session-Id header for POST).
+  nginx_conf="${REPO_ROOT}/logs/server-nginx.conf"
+  nginx_pid="${REPO_ROOT}/logs/server-nginx.pid"
+  {
+    echo "daemon off;"
+    echo "worker_processes 2;"
+    echo "error_log stderr warn;"
+    echo "pid ${nginx_pid};"
+    echo "events { worker_connections 4096; }"
+    echo "http {"
+    echo "  access_log off;"
+    echo "  map \$request_uri \$url_sid {"
+    echo "    \"~^/sessions/(?<sid>[0-9a-f-]+)\" \$sid;"
+    echo "    default \"\";"
+    echo "  }"
+    echo "  map \$url_sid \$route_key {"
+    echo "    \"\"      \$http_x_session_id;"
+    echo "    default \$url_sid;"
+    echo "  }"
+    echo "  map \$cookie_agent_sdk_route \$sticky_backend {"
+    for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+      port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+      echo "    \"r${i}\"    127.0.0.1:${port};"
+    done
+    echo "    default \"\";"
+    echo "  }"
+    echo "  upstream agent_sdk_hash {"
+    echo "    hash \$route_key consistent;"
+    for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+      port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+      echo "    server 127.0.0.1:${port};"
+    done
+    echo "    keepalive 128;"
+    echo "  }"
+    echo "  upstream agent_sdk_rr {"
+    for ((i = 0; i < AGENT_SDK_REPLICAS; i++)); do
+      port=$((AGENT_SDK_BACKEND_PORT_BASE + i))
+      echo "    server 127.0.0.1:${port};"
+    done
+    echo "    keepalive 128;"
+    echo "  }"
+    echo "  proxy_http_version 1.1;"
+    echo "  proxy_set_header   Connection \"\";"
+    echo "  proxy_set_header   Host              \$host;"
+    echo "  proxy_set_header   X-Real-IP         \$remote_addr;"
+    echo "  proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+    echo "  proxy_set_header   X-Forwarded-Proto \$scheme;"
+    echo "  proxy_buffering    off;"
+    echo "  proxy_request_buffering off;"
+    echo "  proxy_read_timeout 1h;"
+    echo "  proxy_send_timeout 1h;"
+    echo "  server {"
+    echo "    listen ${AGENT_SDK_PUBLIC_PORT};"
+    echo "    location ~ ^/sessions/[0-9a-f-]+(/.*)?\$ {"
+    echo "      if (\$sticky_backend != \"\") { proxy_pass http://\$sticky_backend; break; }"
+    echo "      proxy_pass http://agent_sdk_hash;"
+    echo "    }"
+    echo "    location = /sessions {"
+    echo "      if (\$http_x_session_id != \"\") { proxy_pass http://agent_sdk_hash; break; }"
+    echo "      proxy_pass http://agent_sdk_rr;"
+    echo "    }"
+    echo "    location / { proxy_pass http://agent_sdk_rr; }"
+    echo "  }"
+    echo "}"
+  } > "${nginx_conf}"
+  echo "  launching nginx LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
+  echo "  nginx config: ${nginx_conf}"
+  nginx -p "${REPO_ROOT}" -c "${nginx_conf}" > "${lb_log}" 2>&1 &
+  PIDS+=("$!")
+else
+  echo "  launching python LB on :${AGENT_SDK_PUBLIC_PORT} -> ${backends_csv}"
+  BACKENDS="${backends_csv}" PORT="${AGENT_SDK_PUBLIC_PORT}" \
+    "${VENV_PYTHON}" "${REPO_ROOT}/benchmark/scale/lb.py" \
+    > "${lb_log}" 2>&1 &
+  PIDS+=("$!")
+fi
+
+# Wait for LB.
+deadline=$(( $(date +%s) + 15 ))
+while (( $(date +%s) < deadline )); do
+  curl -fsS "http://127.0.0.1:${AGENT_SDK_PUBLIC_PORT}/health" >/dev/null 2>&1 && break
+  sleep 0.3
+done
+if ! curl -fsS "http://127.0.0.1:${AGENT_SDK_PUBLIC_PORT}/health" >/dev/null 2>&1; then
+  echo "ERROR: LB did not become ready in 15s; see ${lb_log}" >&2
+  exit 1
+fi
+
+echo "Stack ready:"
+echo "  client URL : http://localhost:${AGENT_SDK_PUBLIC_PORT}"
+echo "  replicas   : ${AGENT_SDK_REPLICAS} on ports ${AGENT_SDK_BACKEND_PORT_BASE}..$(( AGENT_SDK_BACKEND_PORT_BASE + AGENT_SDK_REPLICAS - 1 ))"
+echo "  LB         : benchmark/scale/lb.py (consistent-hash on session_id)"
+echo "  logs       : logs/server-r*.log + logs/server-lb.log"
+echo
+echo "Press Ctrl-C to tear down."
+wait
