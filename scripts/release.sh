@@ -158,14 +158,24 @@ build_daytona() {
   echo "[release] registering Daytona snapshot $SNAPSHOT_NAME (remote build, ~5 min)"
   SNAPSHOT_NAME="$SNAPSHOT_NAME" DOCKERFILE="$DOCKERFILE" "${VENV_PYTHON}" - <<'PYEOF'
 import os, sys, time
-from daytona_sdk import Daytona, DaytonaConfig, CreateSnapshotParams, Image
+from daytona_sdk import Daytona, DaytonaConfig, CreateSnapshotParams, Image, Resources
 
 snapshot_name = os.environ["SNAPSHOT_NAME"]
 dockerfile = os.environ["DOCKERFILE"]
 client = Daytona(DaytonaConfig(api_key=os.environ["DAYTONA_API_KEY"]))
 t0 = time.time()
+# Bake a small per-sandbox footprint into the snapshot. Daytona snapshots
+# lock resources at creation time; CreateSandboxFromSnapshotParams has no
+# ``resources`` field, so passing per-session resources would force the
+# slower image-path fallback (which needs DAYTONA_IMAGE on the registry).
+# 1 vCPU / 1 GiB RAM / 3 GiB disk is plenty for a claude session, and
+# leaves ~500 concurrent grader sandboxes inside a 500 GiB account quota.
 result = client.snapshot.create(
-    CreateSnapshotParams(name=snapshot_name, image=Image.from_dockerfile(dockerfile)),
+    CreateSnapshotParams(
+        name=snapshot_name,
+        image=Image.from_dockerfile(dockerfile),
+        resources=Resources(cpu=1, memory=1, disk=3),
+    ),
 )
 print(f"[release] daytona snapshot {result.name} state={result.state} elapsed={time.time() - t0:.1f}s",
       file=sys.stderr)

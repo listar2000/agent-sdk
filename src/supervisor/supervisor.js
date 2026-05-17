@@ -472,7 +472,120 @@ async function handleSnapshot(req, res) {
 // Cache the last available_commands_update so late SSE subscribers receive it.
 let lastCommandsEvent = null;
 
+// Coalesce consecutive text/reasoning chunks before they hit the SSE wire.
+// claude-agent-acp emits ~1 char per ``agent_message_delta`` — at high
+// concurrency this is the dominant Python-side parse+fanout load. Buffer
+// chunks for FLUSH_MS or until a non-coalescable event arrives (tool call,
+// done, error, usage), then emit ONE synthesized session/update message
+// with the concatenated text. The downstream parser (api/sse.py
+// ``classify_message_content``) is shape-agnostic about chunk size, so the
+// coalesced message is observed identically by every existing consumer.
+//
+// FLUSH_MS = 40 picked from the gap between Claude's typical 25-30 chunks/s
+// and a UI cursor refresh rate where "appears responsive" plateaus. Tune
+// via AGENT_SDK_SUPERVISOR_FLUSH_MS.
+const COALESCE_FLUSH_MS = (() => {
+  const v = parseInt(process.env.AGENT_SDK_SUPERVISOR_FLUSH_MS || "40", 10);
+  return Number.isFinite(v) && v >= 0 ? v : 40;
+})();
+let textBuf = null;       // { msg }  — pending coalesced agent_message_* chunk
+let thinkBuf = null;      // { msg }  — pending coalesced agent_thought_chunk / thinking
+let coalesceTimer = null;
+
+function _scheduleCoalesceFlush() {
+  if (coalesceTimer !== null) return;
+  // setTimeout 0 still defers across a microtask boundary, so subsequent
+  // synchronous chunks from the same acp.stdout 'data' callback keep
+  // appending to the same buffer before the flush fires.
+  coalesceTimer = setTimeout(_flushCoalesce, COALESCE_FLUSH_MS);
+}
+
+function _flushCoalesce() {
+  if (coalesceTimer !== null) { clearTimeout(coalesceTimer); coalesceTimer = null; }
+  if (textBuf) {
+    const line = JSON.stringify(textBuf.msg);
+    textBuf = null;
+    _broadcastSseRaw(line);
+  }
+  if (thinkBuf) {
+    const line = JSON.stringify(thinkBuf.msg);
+    thinkBuf = null;
+    _broadcastSseRaw(line);
+  }
+}
+
+// Mutate ``into.params.update.content``'s text/thinking field by appending
+// ``add``. Handles both ``content.text`` (the dominant shape) and
+// ``content.thinking`` (older Claude thinking blocks) without flipping
+// shape mid-buffer.
+function _appendChunkText(into, add) {
+  const c = into.params && into.params.update && into.params.update.content;
+  if (!c || !add) return;
+  if (typeof c.text === "string") c.text += add;
+  else if (typeof c.thinking === "string") c.thinking += add;
+}
+
 function broadcastSse(line) {
+  // Try to interpret as a JSON-RPC frame. Non-JSON lines (shouldn't happen
+  // from claude-agent-acp's stdout but defend anyway) just flush + pass
+  // through so we never silently drop a line.
+  let msg;
+  try { msg = JSON.parse(line); } catch { _flushCoalesce(); _broadcastSseRaw(line); return; }
+  if (!msg || typeof msg !== "object") { _flushCoalesce(); _broadcastSseRaw(line); return; }
+  const update = msg.method === "session/update" && msg.params && msg.params.update;
+  if (!update) {
+    // JSON-RPC result/error envelopes (turn-end, ACP-initiated requests)
+    // must flush any pending text first so the consumer sees the chunk
+    // BEFORE the done frame.
+    _flushCoalesce();
+    _broadcastSseRaw(line);
+    return;
+  }
+  const su = update.sessionUpdate;
+  const content = update.content;
+  const isText = typeof content === "object" && content !== null
+    && typeof content.text === "string" && content.text.length > 0
+    && content.type !== "thinking" && typeof content.thinking !== "string";
+  const isThinkInline = typeof content === "object" && content !== null
+    && (typeof content.thinking === "string" || content.type === "thinking");
+
+  if ((su === "agent_message_delta" || su === "agent_message_chunk") && isText) {
+    if (textBuf === null) {
+      textBuf = { msg: structuredClone(msg) };
+    } else {
+      _appendChunkText(textBuf.msg, content.text);
+    }
+    _scheduleCoalesceFlush();
+    return;
+  }
+  if ((su === "agent_message_delta" || su === "agent_message_chunk") && isThinkInline) {
+    const add = content.text || content.thinking || "";
+    if (thinkBuf === null) {
+      thinkBuf = { msg: structuredClone(msg) };
+    } else {
+      _appendChunkText(thinkBuf.msg, add);
+    }
+    _scheduleCoalesceFlush();
+    return;
+  }
+  if (su === "agent_thought_chunk") {
+    const add = (content && (content.text || content.thinking)) || "";
+    if (thinkBuf === null) {
+      thinkBuf = { msg: structuredClone(msg) };
+    } else {
+      _appendChunkText(thinkBuf.msg, add);
+    }
+    _scheduleCoalesceFlush();
+    return;
+  }
+  // Non-coalescable session/update: tool_call, tool_call_update, usage,
+  // available_commands_update, plan, etc. Flush pending text/think first
+  // so consumer-visible order is preserved across the transition.
+  _flushCoalesce();
+  _broadcastSseRaw(line);
+}
+
+function _broadcastSseRaw(line) {
   const block = `data: ${line}\n\n`;
   // Cache available_commands_update for late subscribers
   try {

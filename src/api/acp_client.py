@@ -124,9 +124,6 @@ class AcpClient:
     def get_inner_session_id(self, session_id: str) -> str | None:
         return self._inner_session_ids.get(session_id)
 
-    def set_inner_session_id(self, session_id: str, inner_id: str) -> None:
-        self._inner_session_ids[session_id] = inner_id
-
     async def health(self) -> dict:
         resp = await self._client.get("/v1/health")
         resp.raise_for_status()
@@ -381,28 +378,6 @@ class AcpClient:
         """List agent sessions within this ACP connection."""
         result = await self._send_rpc(session_id, "session/list", {})
         return result.get("sessions", [])
-
-    async def cancel_prompt(self, session_id: str) -> None:
-        """Cancel the currently running prompt (best-effort).
-
-        MUST be a JSON-RPC notification — ACP dispatches session/cancel
-        through notificationHandler. Sending it as a request gets
-        "method not found" and the cancel silently no-ops.
-        """
-        inner_sid = self._inner_session_ids.get(session_id)
-        if not inner_sid:
-            return
-        try:
-            await self._notify(session_id, "session/cancel",
-                                {"sessionId": inner_sid})
-        except Exception as e:
-            log.warning("cancel_prompt failed for session %s: %s", session_id, e)
-
-    async def close_session(self, session_id: str) -> None:
-        """Close the ACP connection."""
-        resp = await self._client.delete(f"/v1/acp/{session_id}")
-        resp.raise_for_status()
-        self._inner_session_ids.pop(session_id, None)
 
     async def call(
         self,

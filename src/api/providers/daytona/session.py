@@ -15,7 +15,6 @@ No "Type 1 vs Type 2" branching outside this class — recovery just calls
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -70,7 +69,6 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # Lazy imports — keeps test imports cheap and avoids hauling in the
         # daytona SDK at module-load time.
         from api.providers import daytona as dt_provider
-        from api.providers._shared import _wait_for_health
 
         await self._bootstrap_session()
 

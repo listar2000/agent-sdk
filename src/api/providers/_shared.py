@@ -339,12 +339,6 @@ def _spec_package_name(spec: str) -> str:
     return spec[:at_idx]
 
 
-# ``_use_image_runtime()`` was deleted in Phase E of
-# the runtime-image-unification refactor. The image-runtime path is now
-# unconditional (the only path); ``AGENT_SDK_USE_IMAGE_RUNTIME=0`` is no
-# longer honoured.
-
-
 def _read_runtime_image_tag() -> str | None:
     """Read ``.runtime-image-tag`` from the repo root.
 
@@ -494,26 +488,9 @@ async def _wait_for_health(url: str, max_retries: int = 150, interval: float = 0
 # Port allocator
 # ---------------------------------------------------------------------------
 
-# ``_freed_ports`` was a recycle pool when ports came from a per-process
-# monotonic counter. It's now vestigial — the OS allocator never re-issues
-# the same ephemeral port back-to-back, so recycling has no value. Kept as
-# a still-existing-but-unread list so existing call sites that append on
-# error paths don't need rewiring; entries are never consumed.
-_freed_ports: list[int] = []
 _port_lock = asyncio.Lock()
-
 _sandbox_port_counters: dict[str, int] = {}
 _sandbox_freed_ports: dict[str, list[int]] = {}
-
-
-async def _recycle_port(instance) -> None:
-    """Return instance's port to the free pool (idempotent)."""
-    port = instance.port
-    if port is None:
-        return
-    instance.port = None
-    async with _port_lock:
-        _freed_ports.append(port)
 
 
 async def _find_free_port() -> int:
@@ -602,9 +579,9 @@ def _build_volume_mounts(
     if not subpath:
         # Utility sandbox: whole-volume mount so we can inspect/create any dir.
         return [VolumeMount(volume_id=volume_id, mount_path="/v")]
-    # the runtime-image-unification refactor: the supervisor lives
-    # in the image at /opt/agent-sdk/runtime, never on the volume. Volume
-    # is data-only — only /vol is mounted (plus any opt-in shared mounts).
+    # Supervisor lives at /opt/agent-sdk/runtime inside the image, never on
+    # the volume — volume is data-only (only /vol is mounted, plus opt-in
+    # shared mounts).
     mounts = [
         VolumeMount(volume_id=volume_id, mount_path="/vol", subpath=subpath),
     ]

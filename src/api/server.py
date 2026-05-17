@@ -17,15 +17,12 @@ import re
 import shlex
 import tempfile
 import time
-import traceback
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from psycopg.types.json import Json
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -36,7 +33,8 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from .acp_client import AcpClient, _mcp_dict_to_acp_array
+from .event_buffer import get_batcher, start_batcher, stop_batcher
+from .timing import extract_session_id, log_request, timed_phase
 from .db import (
     close_pool,
     count_sessions_by_volume,
@@ -45,7 +43,6 @@ from .db import (
     delete_sessions_by_volume,
     delete_volume,
     get_agent,
-    get_db,
     get_session,
     get_session_log,
     get_volume,
@@ -62,7 +59,6 @@ from .db import (
     upsert_agent,
     upsert_session,
     upsert_volume,
-    write_sandbox_state,
 )
 from .models import (
     EVT_ASSISTANT_MESSAGE,
@@ -78,8 +74,6 @@ from .models import (
 )
 from . import providers as _providers_mod
 from .providers import (
-    PORT_BASED_PROVIDERS,
-    ProviderInstance,
     VolumeFileExistsError,
     default_cwd_for_provider,
     get_volume_adapter,
@@ -92,14 +86,87 @@ log = logging.getLogger(__name__)
 
 
 def _configure_logging() -> None:
-    """Set up logging. Called once at server startup, not on import."""
+    """Set up logging. Called once at server startup, not on import.
+
+    Format includes milliseconds in the timestamp so request timings line
+    up against `[%(name)s]` phase logs at sub-second resolution — without
+    this you can't tell from the log whether two ``[r0] /message+stream``
+    starts happened 20 ms apart or in the same tick.
+    """
     level = os.environ.get("LOG_LEVEL", "INFO")
     logging.basicConfig(
-        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=level,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
         force=True,
     )
     logging.getLogger("api").setLevel(level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight cluster counters — periodic snapshot, NOT per-request.
+# The goal is to spot scaling bottlenecks ("the DB pool is saturated",
+# "executor is queueing", "we're doing 50 redirects/min so the hash
+# routing is broken") without per-request log spam.
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_INTERVAL_S = float(os.environ.get("AGENT_SDK_SNAPSHOT_S", "30"))
+
+
+async def _cluster_snapshot_loop() -> None:
+    """Periodic per-replica state snapshot. ONE line every N seconds.
+
+    Surfaces the few signals that actually move at scale:
+      * ``active`` — sessions held by this replica's pool right now
+      * ``db_pool`` — psycopg async-pool size / available connections
+      * ``exec_queue`` — work items waiting in the default ThreadPoolExecutor
+    """
+    from .identity import replica_id
+    from api.sandbox import get_pool
+    while True:
+        try:
+            await asyncio.sleep(_SNAPSHOT_INTERVAL_S)
+            pool = get_pool()
+            active = len(pool._active)  # noqa: SLF001
+            busy = sum(1 for s in pool._active.values() if s._subscribers)  # noqa: SLF001
+            # psycopg pool internals: ``get_stats`` returns counters like
+            # ``pool_size`` / ``pool_available`` / ``requests_waiting``.
+            # Wrapped in try because the helper is opt-in and the column
+            # name has drifted between psycopg-pool versions.
+            from . import db as _db
+            db_stats = ""
+            try:
+                p = getattr(_db, "_pool", None)
+                if p is not None and hasattr(p, "get_stats"):
+                    s = p.get_stats()
+                    db_stats = (
+                        f"db_pool={s.get('pool_size', '?')}/"
+                        f"{s.get('pool_max', '?')} "
+                        f"db_wait={s.get('requests_waiting', 0)}"
+                    )
+            except Exception:
+                db_stats = ""
+            # Executor queue depth — saturation here is THE signal that
+            # a sync provider SDK (daytona/docker) is back-pressuring.
+            # Default to 0 (not "?") when the executor hasn't been
+            # lazily created yet — same semantically, less noisy.
+            exec_queue = "0"
+            try:
+                loop = asyncio.get_running_loop()
+                executor = loop._default_executor  # noqa: SLF001
+                if executor is not None and hasattr(executor, "_work_queue"):
+                    exec_queue = str(executor._work_queue.qsize())  # noqa: SLF001
+            except Exception:
+                pass
+            log.info(
+                "[%s] snapshot: active=%d busy=%d exec_queue=%s %s",
+                replica_id(), active, busy, exec_queue, db_stats,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.warning("cluster snapshot tick failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +195,16 @@ _HTTP_CLIENT: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app):
     _configure_logging()
+    # Startup banner — pin replica + pid + addr so a merged tail across
+    # replicas (or a single replica restart) is greppable. The same
+    # ``replica_id()`` appears in every request line / phase log so you
+    # can trace one session end-to-end with a single filter.
+    from .identity import owner_addr, owner_id, replica_id
+    log.info(
+        "[%s] startup: pid=%d owner_id=%s addr=%s slow_threshold=%.0fms",
+        replica_id(), os.getpid(), owner_id(), owner_addr(),
+        float(os.environ.get("AGENT_SDK_SLOW_MS", "500")),
+    )
     # Default ThreadPoolExecutor caps at ``min(32, cpu_count + 4)``. Every
     # sync provider SDK call (Daytona create/get/start/delete, unix_local
     # filesystem ops) goes through this pool via run_in_executor /
@@ -146,8 +223,14 @@ async def lifespan(app):
         asyncio.get_running_loop().set_default_executor(
             _cf.ThreadPoolExecutor(max_workers=_exec_max, thread_name_prefix="asdk-io")
         )
-    init_db()
-    await init_pool()
+    # Startup phase timing as a single summary line (fires once per
+    # process — useful for spotting slow init_pool / slow reconcile at
+    # boot, but cheap to keep because it never recurs).
+    _t0 = time.perf_counter()
+    _phases: dict[str, float] = {}
+    _p0 = time.perf_counter(); init_db(); _phases["db"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await init_pool(); _phases["pool"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await start_batcher(); _phases["batcher"] = (time.perf_counter() - _p0) * 1000
 
     global _HTTP_CLIENT
     _HTTP_CLIENT = httpx.AsyncClient(
@@ -165,18 +248,39 @@ async def lifespan(app):
         except Exception as e:
             log.warning("startup reconcile for %s failed: %s", prov, e)
 
+    _p0 = time.perf_counter()
     await asyncio.gather(*[_safe_reconcile(p) for p in ("docker", "daytona", "unix_local", "modal")])
+    _phases["reconcile"] = (time.perf_counter() - _p0) * 1000
 
     # SessionPool owns idle eviction now (per
     # ).
-    from api.sandbox import start_reaper, shutdown_pool
-    await start_reaper()
+    from api.sandbox import shutdown_pool, start_reaper, start_worker_heartbeat
+    _p0 = time.perf_counter(); await start_reaper(); _phases["reaper"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await start_worker_heartbeat(); _phases["worker_hb"] = (time.perf_counter() - _p0) * 1000
+    _phase_str = " ".join(f"{k}={v:.0f}ms" for k, v in _phases.items())
+    log.info(
+        "[%s] startup ready in %.0fms: %s",
+        replica_id(), (time.perf_counter() - _t0) * 1000, _phase_str,
+    )
+
+    # Periodic cluster-state snapshot — the single most useful log line
+    # for spotting scaling bottlenecks at a glance:
+    #   active sessions / DB pool busy / executor queue / 307 count since last
+    # Logs every AGENT_SDK_SNAPSHOT_S seconds (default 30). One line per
+    # replica; grep ``[r0] snapshot`` to follow a single replica.
+    _snapshot_task = asyncio.create_task(_cluster_snapshot_loop())
+    _BG_TASKS.add(_snapshot_task)
+    _snapshot_task.add_done_callback(_BG_TASKS.discard)
 
     yield
     try:
         await shutdown_pool()
     except Exception as e:
         log.warning("shutdown_pool failed: %s", e)
+    try:
+        await stop_batcher()
+    except Exception as e:
+        log.warning("stop_batcher failed: %s", e)
     await close_pool()
     if _HTTP_CLIENT is not None:
         await _HTTP_CLIENT.aclose()
@@ -207,6 +311,36 @@ app.add_middleware(
 )
 
 
+# Per-request timing line. ``api.timing`` decides the log level:
+#   * polling endpoints (/health, /admin/*, /*/status, /*/sandbox) → DEBUG
+#   * slow requests (≥ AGENT_SDK_SLOW_MS, default 500ms) → WARNING
+#   * 5xx responses → WARNING
+#   * everything else → INFO
+# StreamingResponses log time-to-headers (lease + first chunk), NOT
+# total stream duration; the matching phase log inside ``message+stream``
+# covers full turn-to-done time.
+@app.middleware("http")
+async def _request_timing(request: Request, call_next):
+    t0 = time.perf_counter()
+    sid = extract_session_id(request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        log_request(
+            method=request.method, path=request.url.path,
+            status="ERR", duration_ms=(time.perf_counter() - t0) * 1000,
+            session_id=sid,
+        )
+        raise
+    log_request(
+        method=request.method, path=request.url.path,
+        status=response.status_code,
+        duration_ms=(time.perf_counter() - t0) * 1000,
+        session_id=sid,
+    )
+    return response
+
+
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException):
     """Uniform error shape: ``{"error": ...}`` for string details, pass-through for dict."""
@@ -214,6 +348,15 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
     if isinstance(detail, dict):
         return JSONResponse(detail, status_code=exc.status_code)
     return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+# No NotOwner handler. The per-session lease was retired in favor of
+# per-worker liveness: we trust the LB's consistent-hash to route a given
+# session to the same replica every time, and accept the narrow
+# split-brain window at rebalance (mitigated in a follow-up via volume
+# flock — see PR description). The previous handler emitted 307s for
+# wrong-replica requests; with no per-session owner_id we can no longer
+# point at "the right replica" — but we no longer need to.
 
 
 async def _json_body(request: Request) -> dict:
@@ -332,21 +475,6 @@ def _resources_for_provider(provider: str, resources_data):
     return resources
 
 
-async def _install_skills_locally(skills) -> None:
-    """Install skills on the local host (for the local provider)."""
-    for cmd in _skills_install_commands(skills):
-        log.info("installing skill (local): %s", cmd)
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        if proc.returncode != 0:
-            raise RuntimeError(f"skill install failed: {stderr.decode()[:500]}")
-        log.info("skill installed: %s", stdout.decode()[-200:].strip())
-
-
 async def _build_pre_start_commands(
     config, provider: str, user_cmds: list[str] | None,
 ) -> list[str] | None:
@@ -354,18 +482,31 @@ async def _build_pre_start_commands(
 
     Concatenates skill-install commands (from ``config.skills``) with
     caller-supplied ``user_cmds``, preserving order so skills land first.
-    For the ``unix_local`` provider we install skills on the host and return
-    ``None`` — the unix_local sandbox shares HOME with the server, so skill
-    install runs once on the host and user commands there would execute
-    with server privileges (deliberately unsupported).
+    For ``unix_local`` we run the skill installs on the host directly and
+    return ``None`` — the unix_local sandbox shares HOME with the server,
+    so caller-supplied user commands would execute with server privileges
+    (deliberately unsupported).
     """
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     if provider == "unix_local":
-        if skill_cmds:
+        for cmd in skill_cmds:
             try:
-                await _install_skills_locally(config.skills)
+                log.info("installing skill (local): %s", cmd)
+                proc = await asyncio.create_subprocess_shell(
+                    cmd, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=120,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"skill install failed: {stderr.decode()[:500]}"
+                    )
+                log.info("skill installed: %s", stdout.decode()[-200:].strip())
             except Exception as e:
                 log.error("skill install failed, continuing without skills: %s", e)
+                break
         return None
     combined = skill_cmds + list(user_cmds or [])
     return combined or None
@@ -990,12 +1131,6 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
         raise _volume_fs_err("Rename", vol.provider, e)
 
 
-# Sandbox CRUD routes removed: the standalone ``sandboxes`` table is gone;
-# session-scoped routes (``GET /sessions/{id}/sandbox``,
-# ``DELETE /sessions/{id}``) replace them. Reverse lookups by sandbox_ref
-# go through ``SessionPool.find_by_sandbox_ref``.
-
-
 # ---------------------------------------------------------------------------
 # Admin
 # ---------------------------------------------------------------------------
@@ -1003,47 +1138,55 @@ async def volume_files_rename(id_or_name: str, body: _VolumeRenameBody):
 
 @app.get("/admin/sessions")
 async def admin_list_sessions():
-    """List in-memory pool sessions for the dashboard + cleanup debugging.
+    """List sessions for the dashboard + cleanup debugging.
 
-    The legacy response shape is preserved so ``ui/dashboard.html``
-    doesn't have to change: ``sessions[].agent_busy`` /
-    ``active_rpc_id`` / etc. are constants — the pool's per-prompt SSE
-    replaced the persistent reader's busy-flag bookkeeping.
+    Cluster-aware. Only sessions with a currently-held lease are
+    returned here (the "active" list); cold / inactive sessions are
+    available at ``/admin/sessions/inactive``. ``agent_busy`` is read
+    from the DB ``busy_at`` column with a 60s TTL filter so a crashed
+    replica can't leave a stuck flag — the next lease claim resets it
+    too as a belt-and-braces.
     """
     from api.sandbox import get_pool
     pool = get_pool()
-    return {
-        "sessions": [
-            {
-                "session_id": sid,
-                "agent_id": sess._agent_id,
-                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
-                "inner_session_id": sess.inner_session_id,
-                # "active subscriber" is the closest pool-level proxy for
-                # the dashboard's "running" badge — there's no per-prompt
-                # busy flag in the pool (per-prompt SSE replaces it).
-                "agent_busy": len(sess._subscribers) > 0,
-                "active_rpc_id": None,
-                "pending_count": 0,
-                "session_subscribers": len(sess._subscribers),
-                "rpc_subscribers": 0,
-                "shutdown": False,
-            }
-            for sid, sess in pool._active.items()  # noqa: SLF001 — admin readout
-        ],
-        "instances": [
-            {
-                "sandbox_ref": getattr(sess.state, "sandbox_ref", None),
-                "provider": getattr(sess.state, "type", "unknown"),
-                "url": sess.supervisor_url,
-                "port": getattr(sess.state, "listen_port", None),
+    my_addr = pool._owner_addr  # noqa: SLF001
+    rows = await list_sessions(limit=10000)
+    sessions_out: list[dict] = []
+    instances_out: list[dict] = []
+    for r in rows:
+        if not r.get("leased"):
+            # Cold / unleased — surfaced via /admin/sessions/inactive.
+            continue
+        sid = r["id"]
+        sb = r.get("sandbox_state") or {}
+        sandbox_ref = sb.get("sandbox_ref") if isinstance(sb, dict) else None
+        provider = sb.get("type", "unknown") if isinstance(sb, dict) else "unknown"
+        listen_port = sb.get("listen_port") if isinstance(sb, dict) else None
+        cached = pool._active.get(sid)  # noqa: SLF001 — admin readout
+        is_mine = cached is not None
+        sessions_out.append({
+            "session_id": sid,
+            "agent_id": r["agent_id"],
+            "sandbox_ref": sandbox_ref,
+            "inner_session_id": r.get("inner_session_id"),
+            # Cluster-wide busy signal — TTL-filtered at the DB layer so
+            # crashed replicas can't leave a stuck flag.
+            "agent_busy": bool(r.get("busy")),
+            "session_subscribers": len(cached._subscribers) if cached else 0,
+            "lease_owner_id": r.get("lease_owner_id"),
+            "lease_owner_addr": r.get("lease_owner_addr"),
+            "owned_by_me": is_mine,
+        })
+        if sandbox_ref:
+            instances_out.append({
+                "sandbox_ref": sandbox_ref,
+                "provider": provider,
+                "url": cached.supervisor_url if cached else None,
+                "port": listen_port,
                 "container_id": None,
-                "process_alive": sess.supervisor_url is not None,
-            }
-            for _sid, sess in pool._active.items()  # noqa: SLF001
-            if sess.supervisor_url is not None
-        ],
-    }
+                "process_alive": is_mine and cached.supervisor_url is not None,
+            })
+    return {"sessions": sessions_out, "instances": instances_out, "this_replica": my_addr}
 
 
 @app.get("/admin/sessions/inactive")
@@ -1051,11 +1194,15 @@ async def admin_list_inactive_sessions(
     q: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
 ):
-    """DB session rows not currently leased by the pool. Optional ``q``
-    name-substring filter and ``limit`` cap (default 100, max 1000)
-    are applied at the DB layer."""
-    from api.sandbox import get_pool
-    active = get_pool()._active  # noqa: SLF001 — admin readout
+    """DB session rows whose lease is expired or absent — cluster-wide.
+    Optional ``q`` name-substring filter and ``limit`` cap (default 100,
+    max 1000) are applied at the DB layer.
+
+    Cluster-aware via the ``leased`` derived column on
+    ``list_sessions``: ``leased = lease_owner_id IS NOT NULL AND
+    lease_expires_at > now()``. A peer replica's leased session won't
+    show up here regardless of which replica answers the query.
+    """
     return {"sessions": [
         {
             "session_id": r["id"],
@@ -1063,7 +1210,7 @@ async def admin_list_inactive_sessions(
             "inner_session_id": r["inner_session_id"],
             "sandbox_ref": (r["sandbox_state"] or {}).get("sandbox_ref"),
         }
-        for r in await list_sessions(q=q, limit=limit) if r["id"] not in active
+        for r in await list_sessions(q=q, limit=limit) if not r.get("leased")
     ]}
 
 
@@ -1136,13 +1283,7 @@ async def session_status(session_id: str):
     back to a DB read of ``sessions.sandbox_state`` JSONB plus the
     ``sessions`` row. Live-only fields (``last_activity``, subscriber
     count, ``has_client``, ``supervisor_url``) become None / 0 / False
-    when the session isn't live in the pool.
-
-    Several response keys (``agent_busy`` / ``active_rpc_id`` /
-    ``pending_count`` / ``rpc_subscriber_count`` / ``available_commands``)
-    are constants — the pool has no equivalent bookkeeping after
-    per-prompt SSE replaced the persistent reader. Kept for response-
-    shape back-compat with the dashboard."""
+    when the session isn't live in the pool."""
     from api.sandbox import get_pool
 
     now = time.time()
@@ -1160,15 +1301,10 @@ async def session_status(session_id: str):
             "sandbox_ref": sandbox_ref,
             "inner_session_id": sess.get("inner_session_id"),
             "agent_busy": False,
-            "active_rpc_id": None,
-            "pending_count": 0,
             "session_subscriber_count": 0,
-            "rpc_subscriber_count": 0,
             "last_activity": None,
             "idle_seconds": None,
             "has_client": False,
-            "shutdown_requested": False,
-            "available_commands": [],
             "supervisor_url": None,
             "supervisor_port": sb_state.get("listen_port") if isinstance(sb_state, dict) else None,
         }
@@ -1180,15 +1316,10 @@ async def session_status(session_id: str):
         "sandbox_ref": getattr(state, "sandbox_ref", None),
         "inner_session_id": pool_session.inner_session_id,
         "agent_busy": False,
-        "active_rpc_id": None,
-        "pending_count": 0,
         "session_subscriber_count": len(pool_session._subscribers),
-        "rpc_subscriber_count": 0,
         "last_activity": last_chunk,
         "idle_seconds": round(now - last_chunk, 1) if last_chunk else None,
         "has_client": pool_session.supervisor_url is not None,
-        "shutdown_requested": False,
-        "available_commands": [],
         "supervisor_url": pool_session.supervisor_url,
         "supervisor_port": getattr(state, "listen_port", None),
     }
@@ -1247,9 +1378,6 @@ async def session_sandbox_info(session_id: str):
     if url:
         result["url"] = url
     if provider == "unix_local" and sandbox_ref:
-        # ``_SPAWN_ARGS`` was removed in the on-disk-marker refactor (PR #57);
-        # ``_load_record`` now resolves the marker path on the fly by globbing
-        # ``<vol_root>/*/system/sandboxes/<ref>.json``.
         from .providers.unix_local import _load_record
         marker, _rec = await asyncio.to_thread(_load_record, sandbox_ref)
         if marker is not None:
@@ -1413,6 +1541,30 @@ async def sessions_create(request: Request):
     (eager) into one endpoint with consistent naming.
     """
     data = await _json_body(request)
+    # Client-supplied session_id. The SDK generates a UUID up front and
+    # sends it BOTH in the request body (``id``) and in the
+    # ``X-Session-Id`` header so the LB can consistent-hash on it (the
+    # body isn't visible to nginx; the header is). If both are present
+    # they must match — otherwise routing and storage disagree. Fall
+    # back to server-generated UUID if neither is set (backward-compat
+    # for old SDK builds).
+    header_id = request.headers.get("x-session-id")
+    body_id = data.get("id")
+    if header_id and body_id and header_id != body_id:
+        raise HTTPException(
+            400,
+            "X-Session-Id header does not match body 'id'",
+        )
+    supplied_id = header_id or body_id
+    if supplied_id is not None:
+        try:
+            uuid.UUID(supplied_id)
+        except (ValueError, TypeError):
+            raise HTTPException(400, f"invalid session id format: {supplied_id!r}")
+        existing = await get_session(supplied_id)
+        if existing is not None:
+            raise HTTPException(409, f"session id {supplied_id} already exists")
+        data["id"] = supplied_id
     if data.get("provision", True):
         return await _sessions_create_eager(data)
     return await _sessions_create_lazy(data)
@@ -1473,7 +1625,7 @@ async def _sessions_create_lazy(data: dict) -> dict:
         default_cwd = default_cwd_for_provider(default_provider)
     cwd = data.get("cwd", config_data.pop("cwd", default_cwd))
 
-    session_id = str(uuid.uuid4())
+    session_id = data.get("id") or str(uuid.uuid4())
     lazy_user_pre_start = data.get("pre_start_commands") or []
     await upsert_session(
         session_id, agent_id, inner_session_id=None,
@@ -1510,7 +1662,6 @@ async def _sessions_create_eager(data: dict) -> dict:
     on the session row).
     """
     from api.sandbox import Recipe, get_pool, state_for_provider
-    from api.sandbox.state import Resources, validate_resources_for_provider
 
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
@@ -1611,7 +1762,7 @@ async def _sessions_create_eager(data: dict) -> dict:
         credential_refresh_token=data.get("credential_refresh_token"),
     )
 
-    session_id = str(uuid.uuid4())
+    session_id = data.get("id") or str(uuid.uuid4())
     await upsert_session(
         session_id, agent_id, inner_session_id=None,
         volume_id=volume_record.id,
@@ -1626,9 +1777,17 @@ async def _sessions_create_eager(data: dict) -> dict:
     )
     pool = get_pool()
     try:
-        pool_session = await pool.cold_create(
-            session_id, provider=provider, recipe=recipe,
-        )
+        # One phase log per cold_create — the slowest single call in the
+        # session lifecycle (daytona ~15-30s, modal ~10-20s, local ~2-3s).
+        # Slow cold_creates trip the WARNING level so they pop out of the
+        # log without per-step instrumentation.
+        async with timed_phase(
+            "sessions.cold_create",
+            session_id=session_id[:8], provider=provider,
+        ):
+            pool_session = await pool.cold_create(
+                session_id, provider=provider, recipe=recipe,
+            )
     except HTTPException:
         if agent_was_created_here:
             await delete_agent(agent_id)
@@ -1736,14 +1895,29 @@ async def _persist_user_message(session, message: str, rpc_id: str) -> None:
     Best-effort — a DB hiccup must not block the prompt from being sent
     to the supervisor. The matching turn-end / tool / text rows are
     written by ``_persist_prompt_events`` as ``execute_prompt`` yields.
+
+    Routes through the per-process ``SessionLogBatcher`` when available
+    (the production path under lifespan); falls back to a direct INSERT
+    in test contexts that bypass ``start_batcher`` so unit tests keep
+    seeing user_message rows synchronously.
     """
+    payload = {"text": redact_secrets(message), "prompt_id": rpc_id}
     try:
-        await log_event(
-            session_id=session.session_id,
-            agent_id=session._agent_id or "",
-            event_type=EVT_USER_MESSAGE,
-            payload={"text": redact_secrets(message), "prompt_id": rpc_id},
-        )
+        batcher = get_batcher()
+        if batcher is not None:
+            await batcher.add(
+                session_id=session.session_id,
+                agent_id=session._agent_id or "",
+                event_type=EVT_USER_MESSAGE,
+                payload=payload,
+            )
+        else:
+            await log_event(
+                session_id=session.session_id,
+                agent_id=session._agent_id or "",
+                event_type=EVT_USER_MESSAGE,
+                payload=payload,
+            )
     except Exception:
         log.exception("user_message log_event failed for session %s rpc=%s",
                       session.session_id, rpc_id)
@@ -1796,12 +1970,21 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
             payload["text"] = redact_secrets(payload["text"])
         payload["prompt_id"] = rpc_id
         try:
-            await log_event(
-                session_id=session.session_id,
-                agent_id=agent_id,
-                event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
-                payload=payload,
-            )
+            batcher = get_batcher()
+            if batcher is not None:
+                await batcher.add(
+                    session_id=session.session_id,
+                    agent_id=agent_id,
+                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
+                    payload=payload,
+                )
+            else:
+                await log_event(
+                    session_id=session.session_id,
+                    agent_id=agent_id,
+                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
+                    payload=payload,
+                )
         except Exception:
             log.exception("log_event(%s) failed for session %s rpc=%s",
                           etype, session.session_id, rpc_id)
@@ -1828,22 +2011,19 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
     # cancel buffer flush) MUST run while the lock is held — otherwise
     # the next prompt's persist task can interleave its writes with
     # this prompt's tail and the log row order de-syncs from SSE.
-    async with session._prompt_lock:
-        # Log the user_message INSIDE the lock so log row order tracks
-        # actual execution order. Writing it outside (as the SSE caller
-        # does, before spawning ``_drive``) lets queued prompts produce
-        # interleaved ``user_message_A, user_message_B, user_message_C,
-        # turn_end_A, ...`` — the test ``test_queued_prompts_parity``
-        # asserts user_message[i] < turn_end[i] which that ordering
-        # violates.
-        await _persist_user_message(session, message, rpc_id)
+    async def _drive_one(active_session) -> tuple[bool, Exception | None]:
+        """Drive execute_prompt on a specific session; return
+        (terminal_seen, last_exception). ``terminal_seen=True`` means we
+        consumed a ``done`` or ``error`` event — the rpc is complete and
+        no retry is appropriate. Otherwise ``False`` + exception means
+        the supervisor died mid-flight and the caller should retry on
+        the pool's current session."""
+        terminal = False
         try:
-            async for event in session.execute_prompt(message, rpc_id=rpc_id):
+            async for event in active_session.execute_prompt(message, rpc_id=rpc_id):
                 if not isinstance(event, dict):
                     continue
                 t = event.get("type")
-                # Coalesce consecutive text/reasoning chunks; flush on
-                # type-change so order and adjacency are preserved.
                 if t == "text":
                     if think_buf:
                         await _flush_buffers()
@@ -1853,47 +2033,77 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
                         await _flush_buffers()
                     think_buf.append(event.get("text", ""))
                 elif t == "usage":
-                    # Usage updates can fire mid-stream and don't break
-                    # the surrounding text/reasoning block — write usage
-                    # as a discrete row without flushing buffers, matching
-                    # the SSE canonicalization in ``_sse_to_canonical``.
                     await _write(event)
                 else:
-                    # Tool/tool_result/done/error terminate the current
-                    # text/think block before writing themselves, so
-                    # order is stable across consumers.
                     await _flush_buffers()
                     await _write(event)
-            # Stream ended without a terminal event (rare — usually
-            # ``done`` closes it); flush anything still buffered.
+                    if t in ("done", "error"):
+                        terminal = True
             await _flush_buffers()
+            return True, None
         except Exception as e:
-            log.exception("execute_prompt failed for session %s rpc=%s",
-                          session.session_id, rpc_id)
-            await _flush_buffers()
-            await _write({
-                "type": "error",
-                "message": str(e)[:500], "kind": type(e).__name__,
-            })
-            # Broadcast as a JSON-RPC error envelope so consumers that
-            # parse SSE blocks via ``parse_acp_event`` (UI, the test
-            # ``_PersistentSse`` reader, the SDK ``astream`` adapter)
-            # recognise it as an ``error`` frame and surface it. The
-            # ``rpc_id`` / ``type`` keys remain for the older dict-shape
-            # consumers in ``_execute_and_stream_sse`` that filter by
-            # rpc_id before yielding to SSE.
-            session._broadcast({
-                "type": "error", "rpc_id": rpc_id,
-                "jsonrpc": "2.0", "id": rpc_id,
-                "error": {
-                    "code": -32603,
-                    "message": str(e),
-                    "data": {
-                        "kind": type(e).__name__,
-                        "exception_type": type(e).__name__,
+            return terminal, e
+
+    async with session._prompt_lock:
+        # Log the user_message INSIDE the lock so log row order tracks
+        # actual execution order.
+        await _persist_user_message(session, message, rpc_id)
+        try:
+            ok, exc = await _drive_one(session)
+            # Supervisor died mid-prompt? If the pool already cold-recovered
+            # the session (a sibling request observed alive=False and swapped
+            # in a new SandboxSession), retry once on the fresh session —
+            # this is the race that lost ``rpc=41095a61`` events on modal
+            # ``test_message_immediately_after_stop``: the error broadcast
+            # would otherwise land on a dict that was cleared during the
+            # migration, and the SDK would time out waiting for an event
+            # that never arrives.
+            if not ok and exc is not None:
+                try:
+                    from api.sandbox import get_pool as _gp
+                    replacement = await _gp().get_session(session.session_id)
+                except Exception:
+                    replacement = None
+                if replacement is not None and replacement is not session:
+                    log.info(
+                        "execute_prompt retry: session %s recovered rpc=%s",
+                        session.session_id, rpc_id,
+                    )
+                    text_buf.clear(); think_buf.clear()
+                    session = replacement  # downstream writes use the new one
+                    ok, exc = await _drive_one(replacement)
+            if not ok:
+                e = exc if exc is not None else RuntimeError(
+                    "stream ended without terminal event"
+                )
+                log.exception(
+                    "execute_prompt failed for session %s rpc=%s: %s",
+                    session.session_id, rpc_id, e,
+                )
+                await _flush_buffers()
+                await _write({
+                    "type": "error",
+                    "message": str(e)[:500], "kind": type(e).__name__,
+                })
+                # Broadcast to whichever session the pool currently has —
+                # NOT necessarily the one we started with. The old session's
+                # ``_subscribers`` dict may have been migrated to the new
+                # session by ``pool.get_session``'s subscriber hand-off;
+                # broadcasting to the stale ref reaches an empty dict.
+                from api.sandbox import get_pool as _gp2
+                current = _gp2()._active.get(session.session_id, session)  # noqa: SLF001
+                current._broadcast({
+                    "type": "error", "rpc_id": rpc_id,
+                    "jsonrpc": "2.0", "id": rpc_id,
+                    "error": {
+                        "code": -32603,
+                        "message": str(e),
+                        "data": {
+                            "kind": type(e).__name__,
+                            "exception_type": type(e).__name__,
+                        },
                     },
-                },
-            })
+                })
         finally:
             # Hard-cancel path: ``CancelledError`` is a ``BaseException``
             # in Python 3.8+ and bypasses ``except Exception``. Without
@@ -1923,6 +2133,10 @@ async def post_session_message(session_id: str, request: Request):
     the in-flight prompt (if any) is cancelled — same effect as
     ``POST /sessions/{id}/cancel`` followed by this POST — so callers
     don't have to round-trip twice.
+
+    Session resolution happens BEFORE the 200 reply (vs deferring into
+    the background drain) so a hard-failure surfaces immediately to
+    the client instead of returning 200 with a silently-broken stream.
     """
     data = await _json_body(request)
     message = data.get("message")
@@ -1931,20 +2145,22 @@ async def post_session_message(session_id: str, request: Request):
 
     rpc_id = str(uuid.uuid4())
 
+    # Resolve (cold-recover if needed) before returning 200.
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+
     if data.get("interrupt"):
         # Best-effort: cancel the running ACP turn so this prompt
         # supersedes it. The cancelled turn's ``done`` event arrives via
         # the existing SSE stream with ``stop_reason="cancelled"`` and
         # is logged like any other turn_end.
-        from api.sandbox import get_pool
         try:
-            pool_session = await get_pool().get_session(session_id)
             await pool_session.cancel_active_prompt()
         except Exception:
             log.exception("interrupt cancel failed for session %s", session_id)
 
     async def _drain() -> None:
-        async for _ in _execute_and_stream_sse(session_id, message, rpc_id):
+        async for _ in _execute_and_stream_sse_for(pool_session, message, rpc_id):
             pass
 
     task = asyncio.create_task(_drain())
@@ -1952,27 +2168,6 @@ async def post_session_message(session_id: str, request: Request):
     task.add_done_callback(_BG_TASKS.discard)
     return {"rpc_id": rpc_id, "status": "ok"}
 
-
-async def _log_session_acquire_error(session_id: str, rpc_id: str,
-                                     err: Exception) -> None:
-    """Best-effort error log when pool.get_session fails before we have
-    a session object to broadcast through. Writes the error to
-    session_log so /sessions/{id}/log readers see it.
-    """
-    try:
-        await log_event(
-            session_id=session_id, agent_id="",
-            event_type=EVT_ERROR,
-            payload={
-                "prompt_id": rpc_id,
-                "kind": type(err).__name__,
-                "message": str(err)[:500],
-                "phase": "pool.get_session",
-            },
-        )
-    except Exception:
-        log.exception("failed to log session-acquire error for %s rpc=%s",
-                      session_id, rpc_id)
 
 
 # Track in-flight POST /message background drains so asyncio doesn't GC them.
@@ -1999,6 +2194,10 @@ async def session_events(session_id: str):
       * yields the ``_HEARTBEAT`` sentinel during idle so intermediaries
         (nginx / cloudflare / browser EventSource) don't close the
         connection between prompts.
+
+    Session resolution fires before the StreamingResponse is built so a
+    hard-failure surfaces immediately rather than as a 200 with an empty
+    body.
     """
     from api.sandbox import get_pool
     from api.sandbox.session import _HEARTBEAT
@@ -2057,6 +2256,10 @@ async def post_session_message_stream(session_id: str, request: Request):
 
     Both POST /message and GET /events continue to work unchanged for
     callers that need separate submit + multi-subscriber semantics.
+
+    Session resolution happens BEFORE the StreamingResponse is constructed
+    so a hard-failure surfaces as a normal HTTP error rather than as a
+    200 with an empty body once the generator runs.
     """
     data = await _json_body(request)
     message = data.get("message")
@@ -2064,8 +2267,12 @@ async def post_session_message_stream(session_id: str, request: Request):
         raise HTTPException(400, "message required")
 
     rpc_id = str(uuid.uuid4())
+
+    from api.sandbox import get_pool
+    session = await get_pool().get_session(session_id)
+
     return StreamingResponse(
-        _execute_and_stream_sse(session_id, message, rpc_id),
+        _execute_and_stream_sse_for(session, message, rpc_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -2074,50 +2281,14 @@ async def post_session_message_stream(session_id: str, request: Request):
     )
 
 
-async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
-    """Canonical execution path: cold-recover (if needed) → log
-    user_message → subscribe + drive → emit per-rpc SSE blocks.
+async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
+    """Stream branch with an ALREADY-RESOLVED session.
 
-    Used as the response body of ``POST /message+stream`` and as the
-    sole drain inside the background task fired by ``POST /message``.
-    Single source of truth for "execute one prompt and persist its
-    events" — both endpoints exercise identical persistence + broadcast
-    behaviour.
-
-    Yields SSE lines (``event:``/``data:``/``: heartbeat``) terminated
-    by ``\\n\\n``. The first yield is an immediate heartbeat so a
-    streaming client knows the request is alive while ``pool.get_session``
-    cold-recovers (30-60s on Daytona under contended control plane).
+    Used by ``POST /message+stream`` so session resolution (cold-recover
+    on the receiving replica) happens in the route handler — surfaces
+    failures before the StreamingResponse goes on the wire.
     """
-    from api.sandbox import get_pool
     from api.sandbox.session import _HEARTBEAT
-
-    yield ": heartbeat\n\n"
-
-    # Cold-create on Daytona can run 30-60s. A single t=0 heartbeat isn't
-    # enough to survive intermediate proxy idle thresholds (Railway ~30s,
-    # Cloudflare ~100s) so we interleave heartbeats every 10s while
-    # pool.get_session is in flight. ``shield`` keeps the underlying
-    # acquire alive when ``wait_for`` times out — only the wait cancels.
-    acquire = asyncio.create_task(get_pool().get_session(session_id))
-    try:
-        while True:
-            try:
-                session = await asyncio.wait_for(
-                    asyncio.shield(acquire), timeout=10.0,
-                )
-                break
-            except asyncio.TimeoutError:
-                yield ": heartbeat\n\n"
-    except Exception as e:
-        log.exception("pool.get_session(%s) failed for rpc=%s",
-                      session_id, rpc_id)
-        await _log_session_acquire_error(session_id, rpc_id, e)
-        err = {"type": "error", "rpc_id": rpc_id,
-               "error": {"message": str(e)[:500],
-                         "exception_type": type(e).__name__}}
-        yield f"data: {json.dumps(err)}\n\n"
-        return
 
     # ``_persist_user_message`` was previously called HERE, but that
     # races concurrent queued prompts: three POSTs land three
@@ -2134,10 +2305,25 @@ async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
     # ever runs. The two-step split eliminates that 20s phantom delay.
     sid, q = session.register_subscriber()
 
+    # Cluster-visible busy flag — ``busy_at`` on the sessions row is
+    # read by /admin/sessions with a 60s TTL so a crashed replica
+    # can't leave it stuck (lease takeover also resets it).
+    from api.sandbox import get_pool as _get_pool
+    from api import db as _db
+    try:
+        await _db.set_session_busy(session.session_id, busy=True)
+    except Exception:
+        log.warning("set_session_busy(True) failed for %s", session.session_id)
+
     async def _drive():
         await _persist_prompt_events(session, message, rpc_id)
 
     drive_task = asyncio.create_task(_drive())
+    # Wrap the full turn so we get one log line per prompt with the
+    # actual wall-clock duration (the request middleware only sees
+    # time-to-headers for StreamingResponse). Slow turns surface as
+    # WARNING in the log without per-frame instrumentation.
+    _turn_t0 = time.perf_counter()
     try:
         async for item in session.iterate_subscriber(sid, q):
             if item is _HEARTBEAT:
@@ -2198,6 +2384,23 @@ async def _execute_and_stream_sse(session_id: str, message: str, rpc_id: str):
                 await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
             except (asyncio.TimeoutError, Exception):
                 pass
+        try:
+            await _db.set_session_busy(session.session_id, busy=False)
+        except Exception:
+            log.warning("set_session_busy(False) failed for %s", session.session_id)
+        _turn_ms = (time.perf_counter() - _turn_t0) * 1000
+        # Direct log (not timed_phase) so the rpc_id is in-line for
+        # cross-correlation with /events subscribers and DB session_log
+        # rows. Turns are inherently long (5-30s typical), so the
+        # warning threshold is its own knob — AGENT_SDK_SLOW_TURN_MS,
+        # default 60s. Everything else is INFO.
+        from .identity import replica_id as _rid
+        _slow_turn = float(os.environ.get("AGENT_SDK_SLOW_TURN_MS", "60000"))
+        _lvl = logging.WARNING if _turn_ms >= _slow_turn else logging.INFO
+        log.log(
+            _lvl, "[%s] turn done session=%s rpc=%s %.0fms",
+            _rid(), session.session_id[:8], rpc_id[:8], _turn_ms,
+        )
 
 
 @app.post("/sessions/{session_id}/cancel")
@@ -2205,17 +2408,14 @@ async def session_cancel(session_id: str):
     """Cancel the in-flight prompt on this session, if any.
 
     Best-effort: sends ``session/cancel`` (JSON-RPC notification) to
-    the supervisor's ACP child via the SessionPool. The ACP child
-    aborts the turn; the ``done`` event arrives on the same SSE
-    subscribers that ``POST /message`` opened. No active lease →
-    returns ``{"status": "ok", "detail": "no active lease"}``.
+    the supervisor's ACP child. Looks the session up via
+    ``pool.get_session`` so cancel requests against a session owned by
+    a peer replica route there (307 from the global exception handler)
+    rather than no-oping on this replica's empty local cache.
     """
     from api.sandbox import get_pool
 
-    pool = get_pool()
-    pool_session = pool._active.get(session_id)  # noqa: SLF001 — read-only peek
-    if pool_session is None:
-        return {"status": "ok", "detail": "no active lease"}
+    pool_session = await get_pool().get_session(session_id)
     await pool_session.cancel_active_prompt()
     return {"status": "ok"}
 
