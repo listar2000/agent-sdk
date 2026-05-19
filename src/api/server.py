@@ -1295,12 +1295,20 @@ async def session_status(session_id: str):
             raise HTTPException(404, f"Session {session_id} not found")
         sb_state = sess.get("sandbox_state") or {}
         sandbox_ref = sb_state.get("sandbox_ref") if isinstance(sb_state, dict) else None
+        # busy_at is a timestamptz; treat non-NULL within the last 60s as busy
+        busy_at = sess.get("busy_at")
+        _busy = False
+        if busy_at is not None:
+            import datetime as _dt
+            _now = _dt.datetime.now(_dt.timezone.utc)
+            if hasattr(busy_at, "tzinfo"):
+                _busy = (_now - busy_at).total_seconds() < 60
         return {
             "session_id": session_id,
             "agent_id": sess.get("agent_id"),
             "sandbox_ref": sandbox_ref,
             "inner_session_id": sess.get("inner_session_id"),
-            "agent_busy": False,
+            "agent_busy": _busy,
             "session_subscriber_count": 0,
             "last_activity": None,
             "idle_seconds": None,
@@ -1310,12 +1318,27 @@ async def session_status(session_id: str):
         }
     state = pool_session.state
     last_chunk = pool_session.liveness._last_chunk_at
+    # Read the cluster-wide busy flag from the DB (set by the prompt
+    # handler via set_session_busy). TTL-filtered at 60s so a crashed
+    # replica can't leave it stuck.
+    _live_busy = False
+    try:
+        _sess_row = await get_session(session_id)
+        if _sess_row:
+            _ba = _sess_row.get("busy_at")
+            if _ba is not None:
+                import datetime as _dt
+                _now_utc = _dt.datetime.now(_dt.timezone.utc)
+                if hasattr(_ba, "tzinfo"):
+                    _live_busy = (_now_utc - _ba).total_seconds() < 60
+    except Exception:
+        pass
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
         "sandbox_ref": getattr(state, "sandbox_ref", None),
         "inner_session_id": pool_session.inner_session_id,
-        "agent_busy": False,
+        "agent_busy": _live_busy,
         "session_subscriber_count": len(pool_session._subscribers),
         "last_activity": last_chunk,
         "idle_seconds": round(now - last_chunk, 1) if last_chunk else None,
