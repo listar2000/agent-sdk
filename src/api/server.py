@@ -59,6 +59,7 @@ from .db import (
     upsert_agent,
     upsert_session,
     upsert_volume,
+    write_sandbox_state,
 )
 from .models import (
     EVT_ASSISTANT_MESSAGE,
@@ -1768,10 +1769,13 @@ async def _sessions_create_eager(data: dict) -> dict:
         volume_id=volume_record.id,
         env=body_env or {}, secrets=body_secrets or {},
         cwd=cwd,
-        # Mirror the recipe so the column matches what's persisted on the
-        # session row's sandbox_state JSONB. Pool reads from JSONB; this
-        # column is consumed by /sessions/{id} (GET) introspection.
-        pre_start_commands=merged_pre_start,
+        # Column stores RAW USER commands (not the merged skill+user
+        # result). Skills come from ``agents.config.skills``; the merged
+        # list lives on ``sandbox_state.recipe.pre_start_commands`` and
+        # is re-derived on every reload. Matches the lazy path
+        # (``server.py`` ~L1635) and the contract documented in
+        # ``tests/test_pre_start_commands_persist.py``.
+        pre_start_commands=user_pre_start,
         workspace=workspace,
         extra_options=extra_options,
     )
@@ -2527,6 +2531,106 @@ async def session_set_config(session_id: str, request: Request):
     pool_session = await get_pool().get_session(session_id)
     await _forward_session_config(pool_session, data)
     return {"status": "ok"}
+
+
+@app.post("/sessions/{session_id}/reload")
+async def session_reload(session_id: str, request: Request):
+    """Hot-reload skills and/or MCP servers on a live session.
+
+    Body (PATCH-shaped — omit fields you don't want to change)::
+
+        {"skills": [...] | {...}, "mcp_servers": {...}}
+
+    Steps:
+      1. Update ``agents.config.skills`` / ``agents.config.mcp_servers``
+         — persistent across cold-recovery.
+      2. Re-derive the merged ``pre_start_commands`` from
+         ``_skills_install_commands(agent.config.skills)`` +
+         ``sessions.pre_start_commands`` (raw user portion) and
+         overwrite ``sandbox_state.recipe.pre_start_commands`` so the
+         next Type-2 recovery re-runs the new install list.
+      3. Exec the new skill installs on the LIVE sandbox so they land
+         on disk now — release+resume below is Type-1 and Type-1 does
+         NOT re-run ``pre_start_commands``.
+      4. ``release`` + ``get_session`` — supervisor respawns; ACP
+         re-attaches with the new MCP set (``session.py:_attach_acp``
+         reads ``agent.config.mcp_servers`` and forwards to
+         ``client.attach``). Conversation continuity is preserved via
+         ``session/load``.
+
+    Old skills are NOT uninstalled — their directories stay under
+    ``$HOME/.claude/skills/`` until the volume is wiped. Removal is a
+    follow-up: ``rm -rf`` the per-skill subdir before exec.
+    """
+    data = await _json_body(request)
+    if "skills" not in data and "mcp_servers" not in data:
+        raise HTTPException(
+            400, "body must include at least one of 'skills', 'mcp_servers'",
+        )
+
+    session_row = await _require_session_row(session_id)
+    agent_id = session_row["agent_id"]
+    agent = await _require_agent(agent_id)
+
+    # 1. Persist on agent config.
+    if "skills" in data:
+        agent.config.skills = data["skills"]
+    if "mcp_servers" in data:
+        agent.config.mcp_servers = data["mcp_servers"]
+    await upsert_agent(agent)
+
+    # 2. Re-derive merged pre_start, write to recipe in sandbox_state.
+    #    Column stores raw user commands (post-2026-05 contract); skills
+    #    are layered in at use time.
+    user_pre_start = list(session_row.get("pre_start_commands") or [])
+    skill_install_cmds = (
+        _skills_install_commands(agent.config.skills)
+        if agent.config.skills else []
+    )
+    merged = skill_install_cmds + user_pre_start
+    state_jsonb = await read_sandbox_state(session_id)
+    if state_jsonb is not None:
+        recipe = state_jsonb.get("recipe") or {}
+        recipe["pre_start_commands"] = merged
+        state_jsonb["recipe"] = recipe
+        await write_sandbox_state(session_id, state_jsonb)
+
+    # 3. Exec the install set on the live sandbox so it's hot.
+    #    ``npx skills add`` is idempotent on already-installed skills,
+    #    so running the full install set (not just the delta) keeps the
+    #    code simple. ``mkdir -p $HOME/.claude/skills`` mirrors the
+    #    daytona pre-start wrapper. Best-effort: a single failed exec
+    #    doesn't abort the reload — release+resume below still runs.
+    for cmd in skill_install_cmds:
+        wrapped = f"mkdir -p $HOME/.claude/skills && {cmd}"
+        try:
+            resp = await _proxy_from_session(
+                session_id, "POST", "/v1/exec",
+                json={"command": wrapped, "timeout": 120},
+                timeout=130,
+            )
+            if resp.status_code >= 400:
+                log.warning(
+                    "reload: live install exec returned HTTP %d for %r",
+                    resp.status_code, cmd,
+                )
+        except Exception:
+            log.exception("reload: live install exec raised for %r", cmd)
+
+    # 4. Release + cold_recover. The supervisor restarts and rescans
+    #    ``~/.claude/skills/`` on boot; attach passes the new MCP set
+    #    via the fix at session.py:_attach_acp.
+    from api.sandbox import get_pool
+    pool = get_pool()
+    await pool.release(session_id)
+    await pool.get_session(session_id)
+
+    return {
+        "status": "ok",
+        "skills": agent.config.skills,
+        "mcp_servers": agent.config.mcp_servers,
+        "pre_start_commands": merged,
+    }
 
 
 @app.post("/sessions/{session_id}/acp/call")

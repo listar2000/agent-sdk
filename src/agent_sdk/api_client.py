@@ -379,6 +379,38 @@ class ApiClient:
             timeout=httpx.Timeout(5.0, read=10.0),
         )
 
+    async def reload_session(
+        self,
+        session_id: str,
+        *,
+        skills: list | dict | None = None,
+        mcp_servers: dict | None = None,
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/reload`` — hot-swap skills / MCP.
+
+        ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
+        clear. Updates ``agents.config``, re-derives the merged
+        ``pre_start_commands`` so future cold-recoveries use the new
+        install set, execs the new skill installs against the live
+        sandbox, then restarts the supervisor via release + resume.
+
+        Side-effect ordering means the supervisor is briefly torn down
+        — in-flight prompts are cancelled. Wait for any active prompt
+        to finish before calling.
+        """
+        body: dict[str, Any] = {}
+        if skills is not None:
+            body["skills"] = skills
+        if mcp_servers is not None:
+            body["mcp_servers"] = mcp_servers
+        if not body:
+            raise ValueError("reload_session: pass at least one of skills, mcp_servers")
+        return await self._json(
+            "POST", f"/sessions/{session_id}/reload",
+            json=body,
+            timeout=httpx.Timeout(30.0, read=180.0),
+        )
+
     # ------------------------------------------------------------------
     # Sessions — runtime
     # ------------------------------------------------------------------

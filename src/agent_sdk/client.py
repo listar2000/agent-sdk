@@ -549,6 +549,33 @@ class Session:
         await self._ensure_registered()
         await self._agent._api.set_session_config(self.session_id, **kwargs)
 
+    async def reload(
+        self,
+        *,
+        skills: list | dict | None = None,
+        mcp_servers: dict | None = None,
+    ) -> dict[str, Any]:
+        """Hot-swap skills / MCP on this session.
+
+        ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
+        clear. Updates ``agents.config`` and restarts the supervisor
+        (release + cold_recover) so the new skill set lands on disk
+        and the new MCP set is wired into ACP. Conversation continuity
+        is preserved via ``session/load``.
+
+        Writes the new values back onto the parent ``Agent`` so a
+        subsequent ``clone()`` carries the updated config.
+        """
+        await self._ensure_registered()
+        result = await self._agent._api.reload_session(
+            self.session_id, skills=skills, mcp_servers=mcp_servers,
+        )
+        if skills is not None:
+            self._agent.skills = skills
+        if mcp_servers is not None:
+            self._agent.mcp_servers = mcp_servers
+        return result
+
     async def cancel(self) -> None:
         """Cancel the currently running prompt (best-effort)."""
         await self._ensure_registered()
@@ -1010,6 +1037,21 @@ class Agent:
     async def configure(self, **kwargs) -> None:
         """Set default-session config dynamically. Accepts: mode, model, thought_level."""
         await self._ensure_default_session().configure(**kwargs)
+
+    async def reload(
+        self,
+        *,
+        skills: list | dict | None = None,
+        mcp_servers: dict | None = None,
+    ) -> dict[str, Any]:
+        """Hot-swap skills / MCP on the default session.
+
+        ``None`` (default) = leave alone; ``[]`` / ``{}`` = clear; a
+        value = replace. See :meth:`Session.reload` for details.
+        """
+        return await self._ensure_default_session().reload(
+            skills=skills, mcp_servers=mcp_servers,
+        )
 
     async def cancel(self) -> None:
         """Cancel the default session's currently running prompt."""

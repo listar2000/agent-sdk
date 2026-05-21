@@ -181,30 +181,40 @@ class BaseSandboxSession(abc.ABC):
 
         from api import db as _db
 
+        # Read agent config BEFORE attach so we can thread
+        # ``mcp_servers`` into ``session/new`` / ``session/load`` (ACP
+        # rebuilds the MCP set from this param on every attach). Without
+        # this read, ``agents.config.mcp_servers`` is dead — set on the
+        # row but never wired into the runtime. POST /reload also
+        # depends on this path picking up freshly-edited MCP entries.
+        cfg = None
+        if self._agent_id:
+            try:
+                agent = await _db.get_agent(self._agent_id)
+                cfg = agent.config if agent else None
+            except Exception:
+                cfg = None
+        mcp_servers = cfg.mcp_servers if cfg else None
+
         client = self._get_acp_client()
         await client.attach(
             self._acp_session_id,
             self.state.recipe.agent_type,
             cwd=self._cwd,
             inner_session_id=self._inner_session_id,
+            mcp_servers=mcp_servers,
             extra_options=self._extra_options,
         )
         self._inner_session_id = client.get_inner_session_id(
             self._acp_session_id
         )
-        # Re-apply persisted ACP dynamic config. Read fresh from DB
-        # rather than caching on the session object — POST /config
-        # writes to agents.config so a mid-flight change there also
-        # propagates on the next attach. Each set_* is bounded best-
-        # effort: a transient failure on one shouldn't block the
-        # others (e.g. supervisor accepts model but rejects an
-        # unknown thought_level — keep the model change).
+        # Re-apply persisted ACP dynamic config. ``cfg`` was already
+        # read above for the MCP plumbing — reuse it rather than
+        # re-fetching. Each set_* is bounded best-effort: a transient
+        # failure on one shouldn't block the others (e.g. supervisor
+        # accepts model but rejects an unknown thought_level — keep
+        # the model change).
         if self._agent_id and self._inner_session_id:
-            try:
-                agent = await _db.get_agent(self._agent_id)
-                cfg = agent.config if agent else None
-            except Exception:
-                cfg = None
             agent_type = self.state.recipe.agent_type
             # ``client.set_model`` takes (session_id, model, agent_type) —
             # without the third arg it defaults to ``"claude"`` and normalises

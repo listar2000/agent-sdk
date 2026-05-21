@@ -1286,9 +1286,15 @@ async function handleExec(req, res) {
   }
 
   await new Promise((resolve) => {
+    // HOME pinned to args.root so /v1/exec sees the same agent home
+    // as the ACP child (see ~L287). Without this, the supervisor's own
+    // process.env.HOME is whatever it inherited from the provider's
+    // launch context (commonly /root on daytona) — and `npx skills
+    // add ... -g`, ~/.claude config reads, anything HOME-relative
+    // lands in the wrong directory, invisible to Claude / opencode.
     const child = spawn("bash", ["-c", command], {
       cwd: args.root,
-      env: process.env,
+      env: { ...process.env, HOME: args.root },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
