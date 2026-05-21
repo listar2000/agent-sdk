@@ -339,6 +339,13 @@ async def test_create_session_passthrough():
     assert rec.last.method == "POST"
     assert rec.last.url.path == "/sessions"
     body = json.loads(rec.last.content)
+    # ``create_session`` auto-mints a client-side ``id`` (UUID4) and sends
+    # it as the X-Session-Id header so a consistent-hash LB pins the POST
+    # to the replica that will own the session (see ApiClient docstring).
+    # Pop it to keep the passthrough assertion stable across runs.
+    auto_id = body.pop("id", None)
+    assert isinstance(auto_id, str) and len(auto_id) == 36
+    assert rec.last.headers.get("X-Session-Id") == auto_id
     assert body == {"provider": "daytona", "provision": False, "foo": "bar"}
 
 
