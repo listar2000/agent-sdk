@@ -554,26 +554,36 @@ class Session:
         *,
         skills: list | dict | None = None,
         mcp_servers: dict | None = None,
+        cli_tools: list | dict | None = None,
+        secrets: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Hot-swap skills / MCP on this session.
+        """Hot-swap skills / MCP / CLI tools / secrets on this session.
 
         ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
-        clear. Updates ``agents.config`` and restarts the supervisor
-        (release + cold_recover) so the new skill set lands on disk
-        and the new MCP set is wired into ACP. Conversation continuity
-        is preserved via ``session/load``.
+        clear. Updates ``agents.config`` (skills / MCP / CLI) or the
+        session row (secrets) and restarts the supervisor (release +
+        cold_recover) so the new skill / CLI installs land on disk,
+        new MCP is wired into ACP, and new secrets land in
+        ``spawn_env`` on the next boot. Conversation continuity is
+        preserved via ``session/load``.
 
-        Writes the new values back onto the parent ``Agent`` so a
-        subsequent ``clone()`` carries the updated config.
+        Writes ``skills`` / ``mcp_servers`` / ``cli_tools`` back onto
+        the parent ``Agent`` so a subsequent ``clone()`` carries the
+        updated config. ``secrets`` are session-scoped and are NOT
+        mirrored onto the Agent — only the active session reflects them.
         """
         await self._ensure_registered()
         result = await self._agent._api.reload_session(
-            self.session_id, skills=skills, mcp_servers=mcp_servers,
+            self.session_id,
+            skills=skills, mcp_servers=mcp_servers,
+            cli_tools=cli_tools, secrets=secrets,
         )
         if skills is not None:
             self._agent.skills = skills
         if mcp_servers is not None:
             self._agent.mcp_servers = mcp_servers
+        if cli_tools is not None:
+            self._agent.cli_tools = cli_tools
         return result
 
     async def cancel(self) -> None:
@@ -647,7 +657,7 @@ class Agent:
     # explicitly below.
     _CLONABLE_FIELDS = (
         "agent_type", "provider", "model", "cwd", "root",
-        "mcp_servers", "skills", "dockerfile",
+        "mcp_servers", "skills", "cli_tools", "dockerfile",
         "volume_id", "pre_start_commands", "shared_mounts",
         "resources", "workspace", "extra_options",
     )
@@ -663,6 +673,7 @@ class Agent:
         api_url: str | None = None,
         mcp_servers: dict[str, dict] | None = None,  # name -> config dict
         skills: list[str] | dict[str, dict] | None = None,  # npx skills sources
+        cli_tools: list[str] | dict[str, dict] | None = None,  # uv tool install sources
         db: str | None = None,
         session_id: str | None = None,
         sandbox_ref: str | None = None,
@@ -687,6 +698,7 @@ class Agent:
         self.root = root
         self.mcp_servers = mcp_servers
         self.skills = skills
+        self.cli_tools = cli_tools
         self.id: str | None = None  # set after registration (server-side agent_id)
         self.dockerfile = dockerfile
         self.volume_id = volume_id
@@ -1043,14 +1055,19 @@ class Agent:
         *,
         skills: list | dict | None = None,
         mcp_servers: dict | None = None,
+        cli_tools: list | dict | None = None,
+        secrets: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Hot-swap skills / MCP on the default session.
+        """Hot-swap skills / MCP / CLI tools / secrets on the default session.
 
-        ``None`` (default) = leave alone; ``[]`` / ``{}`` = clear; a
-        value = replace. See :meth:`Session.reload` for details.
+        Per-field PATCH semantics: ``None`` (default) = leave alone;
+        ``[]`` / ``{}`` = clear; a value = replace just that field.
+        Other fields are untouched. See :meth:`Session.reload` for
+        details.
         """
         return await self._ensure_default_session().reload(
             skills=skills, mcp_servers=mcp_servers,
+            cli_tools=cli_tools, secrets=secrets,
         )
 
     async def cancel(self) -> None:

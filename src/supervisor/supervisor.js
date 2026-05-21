@@ -282,9 +282,18 @@ try {
 // (and therefore get captured by the next snapshot). Provider-agnostic —
 // local/docker already align HOME with root, Daytona previously needed a
 // force-override that this replaces.
+//
+// PATH is widened to include $HOME/.local/bin so binaries installed by
+// ``uv tool install`` (AgentConfig.cli_tools / hivespace CLI / etc.) are
+// invocable from the ACP child without a full path. Without this, the
+// agent has to know the install directory and can't ``hive submit`` etc.
+// directly. Mirrors the /v1/exec env (see handleExec below). ``path``
+// is already required at the top of the file.
+const homeLocalBin = path.join(args.root, ".local/bin");
+const _spawnPath = `${homeLocalBin}:${process.env.PATH || ""}`;
 const acp = spawn(args.acp, args.acpArgs, {
   stdio: ["pipe", "pipe", "pipe"],
-  env: { ...process.env, HOME: args.root },
+  env: { ...process.env, HOME: args.root, PATH: _spawnPath },
   cwd: args.root,
 });
 log("spawned acp pid=" + acp.pid);
@@ -1292,9 +1301,13 @@ async function handleExec(req, res) {
     // launch context (commonly /root on daytona) — and `npx skills
     // add ... -g`, ~/.claude config reads, anything HOME-relative
     // lands in the wrong directory, invisible to Claude / opencode.
+    //
+    // PATH also extended to include $HOME/.local/bin so uv-installed
+    // tools (AgentConfig.cli_tools) are reachable from /sandbox/exec
+    // — mirrors the ACP child env. Same _spawnPath as the ACP child.
     const child = spawn("bash", ["-c", command], {
       cwd: args.root,
-      env: { ...process.env, HOME: args.root },
+      env: { ...process.env, HOME: args.root, PATH: _spawnPath },
       stdio: ["ignore", "pipe", "pipe"],
     });
 

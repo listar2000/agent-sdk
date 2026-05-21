@@ -464,6 +464,55 @@ def _skills_install_commands(skills) -> list[str]:
     return cmds
 
 
+def _normalize_cli_tools(cli_tools) -> list[str]:
+    """Normalize cli_tools config into a list of source strings for ``uv tool install``.
+
+    Accepts:
+      - list[str]:  ["hive-evolve", "git+https://github.com/owner/repo@v1"]
+      - dict:       {"hive": {"source": "git+https://...", "version": "1.2.3"}, ...}
+
+    Dict-form ``version`` becomes a ``==<version>`` suffix when the source has
+    no version specifier already (PEP 440 / uv syntax). VCS sources with a
+    ``@<ref>`` already pinned are passed through unchanged.
+    """
+    if cli_tools is None:
+        return []
+    if isinstance(cli_tools, list):
+        return [str(s) for s in cli_tools if s]
+    if isinstance(cli_tools, dict):
+        sources: list[str] = []
+        for _name, cfg in cli_tools.items():
+            if isinstance(cfg, str):
+                sources.append(cfg)
+            elif isinstance(cfg, dict):
+                src = cfg.get("source", "")
+                version = cfg.get("version")
+                if not src:
+                    continue
+                if version and "==" not in src and not (
+                    "git+" in src and "@" in src.split("/")[-1]
+                ):
+                    src = f"{src}=={version}"
+                sources.append(src)
+        return sources
+    return []
+
+
+def _cli_install_commands(cli_tools) -> list[str]:
+    """Return shell commands to install CLI tools via ``uv tool install``.
+
+    Assumes ``uv`` is on PATH (baked into the runtime image — see Dockerfile).
+    Per-tool binaries land in ``$HOME/.local/bin/`` which the supervisor wires
+    into the ACP child / ``/v1/exec`` PATH so the agent can invoke them.
+
+    ``uv tool install`` is idempotent: skipped silently when the source is
+    already at the requested version. Callers wanting forced upgrade should
+    pin a version in the spec (``hive==2.0.0`` or VCS ``@<new-ref>``).
+    """
+    sources = _normalize_cli_tools(cli_tools)
+    return [f"uv tool install {shlex.quote(s)}" for s in sources]
+
+
 def _resources_for_provider(provider: str, resources_data):
     """Build and validate per-session resources, applying provider defaults."""
     from api.sandbox.state import Resources, validate_resources_for_provider
@@ -481,35 +530,44 @@ async def _build_pre_start_commands(
 ) -> list[str] | None:
     """Build the combined pre-start command list for provisioning.
 
-    Concatenates skill-install commands (from ``config.skills``) with
-    caller-supplied ``user_cmds``, preserving order so skills land first.
-    For ``unix_local`` we run the skill installs on the host directly and
+    Layer order (CLI tools FIRST, then skills, then user):
+        cli_install_commands + skill_install_commands + user_cmds
+
+    Rationale: ``cli_tools`` (e.g. ``hive``, ``gh``) are foundational —
+    user-supplied ``pre_start_commands`` may invoke them (``hive setup``,
+    ``gh auth login`` ...). Skills are independent of both, kept after
+    CLI for symmetry with the historical merge order.
+
+    For ``unix_local`` we run skill + CLI installs on the host directly and
     return ``None`` — the unix_local sandbox shares HOME with the server,
     so caller-supplied user commands would execute with server privileges
-    (deliberately unsupported).
+    (deliberately unsupported). Host-installed binaries land in
+    ``$HOME/.local/bin`` (host), reachable from the supervisor because its
+    PATH inherits the launching shell's.
     """
+    cli_cmds = _cli_install_commands(config.cli_tools) if config.cli_tools else []
     skill_cmds = _skills_install_commands(config.skills) if config.skills else []
     if provider == "unix_local":
-        for cmd in skill_cmds:
+        for cmd in cli_cmds + skill_cmds:
             try:
-                log.info("installing skill (local): %s", cmd)
+                log.info("installing on host (unix_local): %s", cmd)
                 proc = await asyncio.create_subprocess_shell(
                     cmd, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=120,
+                    proc.communicate(), timeout=180,
                 )
                 if proc.returncode != 0:
                     raise RuntimeError(
-                        f"skill install failed: {stderr.decode()[:500]}"
+                        f"host install failed: {stderr.decode()[:500]}"
                     )
-                log.info("skill installed: %s", stdout.decode()[-200:].strip())
+                log.info("host install OK: %s", stdout.decode()[-200:].strip())
             except Exception as e:
-                log.error("skill install failed, continuing without skills: %s", e)
+                log.error("host install failed, continuing without it: %s", e)
                 break
         return None
-    combined = skill_cmds + list(user_cmds or [])
+    combined = cli_cmds + skill_cmds + list(user_cmds or [])
     return combined or None
 
 
@@ -521,6 +579,7 @@ _CONFIG_KEYS = (
     "model",
     "mcp_servers",
     "skills",
+    "cli_tools",
     "agent_type",
     "mode",
     "thought_level",
@@ -2535,39 +2594,53 @@ async def session_set_config(session_id: str, request: Request):
 
 @app.post("/sessions/{session_id}/reload")
 async def session_reload(session_id: str, request: Request):
-    """Hot-reload skills and/or MCP servers on a live session.
+    """Hot-reload skills / MCP servers / CLI tools on a live session.
 
     Body (PATCH-shaped — omit fields you don't want to change)::
 
-        {"skills": [...] | {...}, "mcp_servers": {...}}
+        {
+          "skills":     [...] | {...},
+          "mcp_servers": {...},
+          "cli_tools":  [...] | {...},
+          "secrets":    {...}
+        }
 
     Steps:
-      1. Update ``agents.config.skills`` / ``agents.config.mcp_servers``
-         — persistent across cold-recovery.
-      2. Re-derive the merged ``pre_start_commands`` from
-         ``_skills_install_commands(agent.config.skills)`` +
-         ``sessions.pre_start_commands`` (raw user portion) and
-         overwrite ``sandbox_state.recipe.pre_start_commands`` so the
-         next Type-2 recovery re-runs the new install list.
-      3. Exec the new skill installs on the LIVE sandbox so they land
+      1. Update ``agents.config.{skills, mcp_servers, cli_tools}`` —
+         persistent across cold-recovery. Update ``sessions.secrets``
+         (session-scoped) via the existing PATCH path so the next
+         supervisor spawn picks up new env values.
+      2. Re-derive the merged ``pre_start_commands`` =
+         ``_cli_install_commands(cli_tools)`` +
+         ``_skills_install_commands(skills)`` +
+         ``sessions.pre_start_commands`` (raw user portion)
+         and overwrite ``sandbox_state.recipe.pre_start_commands`` so
+         the next Type-2 recovery re-runs the new install set.
+      3. Exec the install commands on the LIVE sandbox so they land
          on disk now — release+resume below is Type-1 and Type-1 does
          NOT re-run ``pre_start_commands``.
-      4. ``release`` + ``get_session`` — supervisor respawns; ACP
-         re-attaches with the new MCP set (``session.py:_attach_acp``
-         reads ``agent.config.mcp_servers`` and forwards to
+      4. ``release`` + ``get_session`` — supervisor respawns with the
+         updated secrets in ``spawn_env``; ACP re-attaches with the
+         new MCP set (``session.py:_attach_acp`` reads
+         ``agent.config.mcp_servers`` and forwards to
          ``client.attach``). Conversation continuity is preserved via
          ``session/load``.
 
-    Old skills are NOT uninstalled — their directories stay under
-    ``$HOME/.claude/skills/`` until the volume is wiped. Removal is a
-    follow-up: ``rm -rf`` the per-skill subdir before exec.
+    Old skills / CLI tools are NOT uninstalled — their files stay on
+    disk until the volume is wiped. Removal is a follow-up.
     """
     data = await _json_body(request)
-    if "skills" not in data and "mcp_servers" not in data:
+    mutable = {"skills", "mcp_servers", "cli_tools", "secrets"}
+    if not (mutable & data.keys()):
         raise HTTPException(
-            400, "body must include at least one of 'skills', 'mcp_servers'",
+            400, f"body must include at least one of {sorted(mutable)}",
         )
 
+    # ``secrets`` is session-scoped (lives on the sessions row, not
+    # agents.config). Pop it before _require_session_row so it doesn't
+    # accidentally collide with the row's existing secrets field on
+    # the response shape.
+    new_secrets = data.pop("secrets", None)
     session_row = await _require_session_row(session_id)
     agent_id = session_row["agent_id"]
     agent = await _require_agent(agent_id)
@@ -2577,17 +2650,31 @@ async def session_reload(session_id: str, request: Request):
         agent.config.skills = data["skills"]
     if "mcp_servers" in data:
         agent.config.mcp_servers = data["mcp_servers"]
+    if "cli_tools" in data:
+        agent.config.cli_tools = data["cli_tools"]
     await upsert_agent(agent)
+    # 1b. Persist secrets on the session row. PATCH-shaped: ``{}`` clears,
+    #     ``{...}`` replaces. Validated via the same dict-coercion the
+    #     ``/sessions/{id}`` resume path uses so auth-key offenders are
+    #     rejected here too instead of silently landing on the row.
+    if new_secrets is not None:
+        coerced = _coerce_env_dict(new_secrets, "reload body 'secrets'")
+        await update_session_secrets(session_id, coerced)
 
     # 2. Re-derive merged pre_start, write to recipe in sandbox_state.
-    #    Column stores raw user commands (post-2026-05 contract); skills
-    #    are layered in at use time.
+    #    Column stores raw user commands (post-2026-05 contract); skill +
+    #    cli installs are layered in at use time. Order matches
+    #    ``_build_pre_start_commands``: cli + skills + user.
     user_pre_start = list(session_row.get("pre_start_commands") or [])
+    cli_install_cmds = (
+        _cli_install_commands(agent.config.cli_tools)
+        if agent.config.cli_tools else []
+    )
     skill_install_cmds = (
         _skills_install_commands(agent.config.skills)
         if agent.config.skills else []
     )
-    merged = skill_install_cmds + user_pre_start
+    merged = cli_install_cmds + skill_install_cmds + user_pre_start
     state_jsonb = await read_sandbox_state(session_id)
     if state_jsonb is not None:
         recipe = state_jsonb.get("recipe") or {}
@@ -2596,18 +2683,24 @@ async def session_reload(session_id: str, request: Request):
         await write_sandbox_state(session_id, state_jsonb)
 
     # 3. Exec the install set on the live sandbox so it's hot.
-    #    ``npx skills add`` is idempotent on already-installed skills,
-    #    so running the full install set (not just the delta) keeps the
-    #    code simple. ``mkdir -p $HOME/.claude/skills`` mirrors the
-    #    daytona pre-start wrapper. Best-effort: a single failed exec
-    #    doesn't abort the reload — release+resume below still runs.
-    for cmd in skill_install_cmds:
-        wrapped = f"mkdir -p $HOME/.claude/skills && {cmd}"
+    #    Both ``npx skills add`` and ``uv tool install`` are idempotent
+    #    on already-installed sources, so running the full set (not just
+    #    the delta) keeps the code simple. ``mkdir -p
+    #    $HOME/.claude/skills`` mirrors the daytona pre-start wrapper.
+    #    Best-effort: a single failed exec doesn't abort the reload —
+    #    release+resume below still runs.
+    live_cmds = (
+        # CLI installs first so user tools depending on them work right away.
+        cli_install_cmds
+        # Skills install, with the mkdir guard.
+        + [f"mkdir -p $HOME/.claude/skills && {c}" for c in skill_install_cmds]
+    )
+    for cmd in live_cmds:
         try:
             resp = await _proxy_from_session(
                 session_id, "POST", "/v1/exec",
-                json={"command": wrapped, "timeout": 120},
-                timeout=130,
+                json={"command": cmd, "timeout": 180},
+                timeout=200,
             )
             if resp.status_code >= 400:
                 log.warning(
@@ -2618,8 +2711,9 @@ async def session_reload(session_id: str, request: Request):
             log.exception("reload: live install exec raised for %r", cmd)
 
     # 4. Release + cold_recover. The supervisor restarts and rescans
-    #    ``~/.claude/skills/`` on boot; attach passes the new MCP set
-    #    via the fix at session.py:_attach_acp.
+    #    ``~/.claude/skills/`` + sees newly-installed CLIs on PATH;
+    #    attach passes the new MCP set via the fix at
+    #    session.py:_attach_acp.
     from api.sandbox import get_pool
     pool = get_pool()
     await pool.release(session_id)
@@ -2629,6 +2723,10 @@ async def session_reload(session_id: str, request: Request):
         "status": "ok",
         "skills": agent.config.skills,
         "mcp_servers": agent.config.mcp_servers,
+        "cli_tools": agent.config.cli_tools,
+        # secrets are session-scoped + sensitive — surface only the key
+        # set in the response (mirrors ``GET /sessions/{id}``'s redaction).
+        "secret_keys": sorted(new_secrets.keys()) if new_secrets else None,
         "pre_start_commands": merged,
     }
 
