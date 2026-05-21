@@ -379,6 +379,57 @@ class ApiClient:
             timeout=httpx.Timeout(5.0, read=10.0),
         )
 
+    async def reload_session(
+        self,
+        session_id: str,
+        *,
+        skills: list | dict | None = None,
+        mcp_servers: dict | None = None,
+        cli_tools: list | dict | None = None,
+        secrets: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/reload`` — hot-swap skills / MCP / CLI / secrets.
+
+        ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
+        clear. Updates ``agents.config`` for skills/MCP/CLI and
+        ``sessions.secrets`` for secrets, re-derives the merged
+        ``pre_start_commands`` so future cold-recoveries use the new
+        install set, execs the new installs against the live sandbox,
+        then restarts the supervisor via release + resume — the new
+        secrets land in the supervisor's ``spawn_env`` on the next boot.
+
+        ``cli_tools`` accepts ``list[str]`` of ``uv tool install``
+        sources (PyPI packages or VCS URLs) or
+        ``dict[label, {source, version?}]`` — same shape as ``skills``.
+
+        ``secrets`` is full-replace: ``{}`` wipes all secrets,
+        ``{"FOO": "bar"}`` replaces with just that entry.
+
+        Lazy: returns once installs have run on the live sandbox and
+        the lease is released. The supervisor stays down until the
+        NEXT user message cold-recovers it (with all the new state).
+        Any prompt in-flight at call time is cancelled by the release.
+        """
+        body: dict[str, Any] = {}
+        if skills is not None:
+            body["skills"] = skills
+        if mcp_servers is not None:
+            body["mcp_servers"] = mcp_servers
+        if cli_tools is not None:
+            body["cli_tools"] = cli_tools
+        if secrets is not None:
+            body["secrets"] = secrets
+        if not body:
+            raise ValueError(
+                "reload_session: pass at least one of skills, mcp_servers, "
+                "cli_tools, secrets"
+            )
+        return await self._json(
+            "POST", f"/sessions/{session_id}/reload",
+            json=body,
+            timeout=httpx.Timeout(30.0, read=180.0),
+        )
+
     # ------------------------------------------------------------------
     # Sessions — runtime
     # ------------------------------------------------------------------

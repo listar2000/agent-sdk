@@ -11,6 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm
 # Install agent CLIs
 RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
+# Install ``uv`` system-wide so AgentConfig.cli_tools (declarative ``uv tool
+# install`` sources) works on every sandbox without bootstrap-in-pre_start.
+# Per-tool binaries land in ``$HOME/.local/bin`` at install time; the
+# supervisor adds that to PATH on ACP-child + /v1/exec spawns so the agent
+# can invoke them. Pinning a recent version explicitly; uv has been stable
+# but the install script defaults to ``latest`` and that breaks
+# reproducible image builds.
+RUN pip install --no-cache-dir uv
+
 COPY pyproject.toml .
 COPY Dockerfile .
 COPY src/ src/
