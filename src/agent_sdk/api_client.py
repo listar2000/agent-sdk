@@ -405,9 +405,10 @@ class ApiClient:
         ``secrets`` is full-replace: ``{}`` wipes all secrets,
         ``{"FOO": "bar"}`` replaces with just that entry.
 
-        Side-effect ordering means the supervisor is briefly torn down
-        — in-flight prompts are cancelled. Wait for any active prompt
-        to finish before calling.
+        Lazy: returns once installs have run on the live sandbox and
+        the lease is released. The supervisor stays down until the
+        NEXT user message cold-recovers it (with all the new state).
+        Any prompt in-flight at call time is cancelled by the release.
         """
         body: dict[str, Any] = {}
         if skills is not None:

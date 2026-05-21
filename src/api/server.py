@@ -2619,12 +2619,16 @@ async def session_reload(session_id: str, request: Request):
       3. Exec the install commands on the LIVE sandbox so they land
          on disk now — release+resume below is Type-1 and Type-1 does
          NOT re-run ``pre_start_commands``.
-      4. ``release`` + ``get_session`` — supervisor respawns with the
-         updated secrets in ``spawn_env``; ACP re-attaches with the
-         new MCP set (``session.py:_attach_acp`` reads
+      4. ``release`` only. Returns immediately. The NEXT user
+         message cold-recovers the supervisor with the updated
+         secrets in ``spawn_env``; ACP re-attaches with the new MCP
+         set (``session.py:_attach_acp`` reads
          ``agent.config.mcp_servers`` and forwards to
-         ``client.attach``). Conversation continuity is preserved via
-         ``session/load``.
+         ``client.attach``). Conversation continuity is preserved
+         via ``session/load``. Lazy on purpose — bringing the
+         supervisor back up here would add 15-30s of sync latency on
+         daytona/modal cold-recover for no benefit; the user's next
+         prompt pays the cost they'd pay anyway.
 
     Old skills / CLI tools are NOT uninstalled — their files stay on
     disk until the volume is wiped. Removal is a follow-up.
@@ -2710,14 +2714,17 @@ async def session_reload(session_id: str, request: Request):
         except Exception:
             log.exception("reload: live install exec raised for %r", cmd)
 
-    # 4. Release + cold_recover. The supervisor restarts and rescans
-    #    ``~/.claude/skills/`` + sees newly-installed CLIs on PATH;
-    #    attach passes the new MCP set via the fix at
-    #    session.py:_attach_acp.
+    # 4. Release. The next user message cold-recovers the supervisor:
+    #    it rescans ``~/.claude/skills/``, sees newly-installed CLIs
+    #    on PATH, and ACP attach passes the new MCP set (via the fix
+    #    at session.py:_attach_acp) + the new secrets in spawn_env.
+    #    Lazy on purpose — bringing the supervisor back up here would
+    #    add 15-30s of sync latency on daytona/modal cold-recover for
+    #    no benefit; the user's next prompt pays the cost they'd pay
+    #    anyway. Matches hive-space's release_session-then-next-message
+    #    pattern.
     from api.sandbox import get_pool
-    pool = get_pool()
-    await pool.release(session_id)
-    await pool.get_session(session_id)
+    await get_pool().release(session_id)
 
     return {
         "status": "ok",

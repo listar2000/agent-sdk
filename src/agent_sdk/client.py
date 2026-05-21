@@ -561,10 +561,10 @@ class Session:
 
         ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
         clear. Updates ``agents.config`` (skills / MCP / CLI) or the
-        session row (secrets) and restarts the supervisor (release +
-        cold_recover) so the new skill / CLI installs land on disk,
-        new MCP is wired into ACP, and new secrets land in
-        ``spawn_env`` on the next boot. Conversation continuity is
+        session row (secrets), runs new installs on the live sandbox,
+        then releases the lease — supervisor stays down. The NEXT user
+        message cold-recovers it with the new state visible. Lazy on
+        purpose: no 15-30s sync wait. Conversation continuity is
         preserved via ``session/load``.
 
         Writes ``skills`` / ``mcp_servers`` / ``cli_tools`` back onto
