@@ -82,7 +82,11 @@ async def test_eager_post_sessions_stores_user_only_pre_start_commands(client):
     fake_pool.cold_create = AsyncMock(return_value=fake_session)
     fake_pool.get_session = AsyncMock(return_value=fake_session)
 
-    with patch("api.sandbox.runtime.get_pool", return_value=fake_pool):
+    # ``server._sessions_create_eager`` does ``from api.sandbox import
+    # get_pool`` which is re-exported from ``api.sandbox.runtime`` via
+    # ``api/sandbox/__init__.py:24``. The lazy import resolves through
+    # ``api.sandbox`` — patch THAT binding, not ``runtime.get_pool``.
+    with patch("api.sandbox.get_pool", return_value=fake_pool):
         r = await client.post("/sessions", json={
             "name": "eager-column-flip",
             "provider": "daytona",
@@ -135,7 +139,11 @@ async def test_eager_post_sessions_no_user_commands_stores_empty_list(client):
     fake_pool.cold_create = AsyncMock(return_value=fake_session)
     fake_pool.get_session = AsyncMock(return_value=fake_session)
 
-    with patch("api.sandbox.runtime.get_pool", return_value=fake_pool):
+    # ``server._sessions_create_eager`` does ``from api.sandbox import
+    # get_pool`` which is re-exported from ``api.sandbox.runtime`` via
+    # ``api/sandbox/__init__.py:24``. The lazy import resolves through
+    # ``api.sandbox`` — patch THAT binding, not ``runtime.get_pool``.
+    with patch("api.sandbox.get_pool", return_value=fake_pool):
         r = await client.post("/sessions", json={
             "name": "eager-column-empty",
             "provider": "daytona",

@@ -69,24 +69,27 @@ async def _server_up() -> bool:
 _EXPECTED_SKILLS = ("hive-create-task", "hive-setup")
 
 
-def _seen_skills(reply: str) -> set[str]:
-    lower = reply.lower()
-    return {n for n in _EXPECTED_SKILLS if n in lower}
+async def _list_skills_on_disk(sdk: ApiClient, session_id: str) -> set[str]:
+    """Read ``~/.claude/skills/`` directly via ``POST /sandbox/exec``.
 
-
-async def _ask_for_skills(agent) -> str:
-    """Ask the agent to enumerate its skills. Returns the assistant reply.
-
-    Phrased to discourage the agent from listing built-in tools (Read,
-    Write, Bash, etc.) which would be noisy and bury the skill tokens.
+    This is the ground-truth check. We previously asked the agent to
+    enumerate its skills via a text prompt, but haiku occasionally
+    HALLUCINATED plausible Anthropic skill names ("update-config",
+    "keybindings-help", "claude-api" — names it has seen in training
+    data) rather than actually checking. The supervisor's exec runs
+    in the same HOME the ACP child sees (after the supervisor.js
+    HOME=args.root fix), so this returns what Claude / OpenCode
+    would scan at boot.
     """
-    return await agent.arun(
-        "List your available skills (those installed via `npx skills add` — "
-        "things like hive-create-task, hive-setup, agent-skills, etc.). "
-        "Do NOT list built-in tools like Read/Write/Bash/Edit. Reply with "
-        "each skill name on its own line, no other prose. If you have no "
-        "installed skills, reply with the single word NONE."
+    r = await sdk._json(
+        "POST", f"/sessions/{session_id}/sandbox/exec",
+        json={
+            "command": "ls -1 $HOME/.claude/skills/ 2>/dev/null || true",
+            "timeout": 10,
+        },
     )
+    out = (r.get("stdout") or "").strip()
+    return {line.strip() for line in out.splitlines() if line.strip()}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -125,11 +128,10 @@ async def test_reload_hot_installs_skill_preserves_conversation(acp_runtime):
         await agent.configure(model=acp_runtime["model"])
         assert agent.session_id and agent.sandbox_ref
 
-        # Baseline: agent reports no installed skills.
-        reply0 = await asyncio.wait_for(_ask_for_skills(agent), timeout=180)
-        assert not _seen_skills(reply0), (
-            f"agent reports hive skills BEFORE any install: "
-            f"saw {_seen_skills(reply0)} in baseline reply:\n{reply0}"
+        # Baseline: hive skills NOT yet on disk.
+        baseline = await _list_skills_on_disk(sdk, agent.session_id)
+        assert not (set(_EXPECTED_SKILLS) & baseline), (
+            f"hive skills present BEFORE install: {sorted(baseline)}"
         )
 
         # ── Plant a fact for the conversation-continuity check ──────────
@@ -156,12 +158,18 @@ async def test_reload_hot_installs_skill_preserves_conversation(acp_runtime):
         # The SDK should have mirrored the new value onto Agent.skills.
         assert agent.skills == ["rllm-org/hive"]
 
-        # ── A. Skills surface to the LLM ────────────────────────────────
-        reply1 = await asyncio.wait_for(_ask_for_skills(agent), timeout=180)
-        missing = set(_EXPECTED_SKILLS) - _seen_skills(reply1)
+        # ── A. Skills landed in the agent's HOME/.claude/skills/ ────────
+        # Ground truth: scan the directory directly via /sandbox/exec.
+        # This also confirms the supervisor.js HOME=args.root fix landed
+        # in the snapshot — without it, the install goes to /root and
+        # this set comes back empty.
+        on_disk = await _list_skills_on_disk(sdk, agent.session_id)
+        missing = set(_EXPECTED_SKILLS) - on_disk
         assert not missing, (
-            f"agent did NOT see expected skills after hot reload — "
-            f"missing {sorted(missing)}. Full reply:\n{reply1}"
+            f"skills did NOT land in $HOME/.claude/skills/ after hot "
+            f"reload — missing {sorted(missing)} from {sorted(on_disk)}. "
+            f"Either the install exec failed or supervisor.js still "
+            f"runs /v1/exec with the wrong HOME."
         )
 
         # ── B. Conversation history preserved across the restart ────────
@@ -248,18 +256,24 @@ async def test_reload_skills_survive_type2_cold_recovery():
         )
         assert result["status"] == "ok"
 
-        # Sanity: skill is seen on the current sandbox right after reload.
-        reply_pre = await asyncio.wait_for(_ask_for_skills(agent), timeout=180)
-        assert not (set(_EXPECTED_SKILLS) - _seen_skills(reply_pre)), (
-            f"baseline post-reload missing skills: {reply_pre!r}"
+        # Sanity: install landed on the current sandbox right after reload.
+        on_disk_pre = await _list_skills_on_disk(sdk, sid)
+        assert not (set(_EXPECTED_SKILLS) - on_disk_pre), (
+            f"baseline post-reload missing skills on disk: {sorted(on_disk_pre)}"
         )
 
         # ── Externally nuke the Daytona sandbox ─────────────────────────
         await _external_delete_daytona(sandbox_ref_1)
         await asyncio.sleep(2)
 
-        # ── Force cold-recovery via a follow-up prompt ──────────────────
-        reply_post = await asyncio.wait_for(_ask_for_skills(agent), timeout=300)
+        # ── Force cold-recovery via a follow-up turn ────────────────────
+        # Any session-touching call wakes the pool; arun goes through
+        # the canonical recovery path. We don't care about the LLM's
+        # reply — the assertion is on the post-recovery filesystem.
+        await asyncio.wait_for(
+            agent.arun("Reply with the single word OK."),
+            timeout=300,
+        )
 
         # Sanity: a brand-new sandbox was actually provisioned.
         sb = await sdk.get_session_sandbox(sid)
@@ -269,11 +283,12 @@ async def test_reload_skills_survive_type2_cold_recovery():
             f"old={sandbox_ref_1[:16]} new={sandbox_ref_2}"
         )
 
-        missing = set(_EXPECTED_SKILLS) - _seen_skills(reply_post)
+        on_disk_post = await _list_skills_on_disk(sdk, sid)
+        missing = set(_EXPECTED_SKILLS) - on_disk_post
         assert not missing, (
             f"skills did NOT survive Type-2 cold-recovery — missing "
-            f"{sorted(missing)}. Recipe update from /reload likely "
-            f"didn't take. Full reply:\n{reply_post}"
+            f"{sorted(missing)} from {sorted(on_disk_post)}. Recipe "
+            f"update from /reload likely didn't take."
         )
     finally:
         try:
