@@ -112,7 +112,11 @@ async def test_reload_hot_installs_skill_preserves_conversation(acp_runtime):
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
 
-    secret_word = f"pineapple-{uuid.uuid4().hex[:6]}"
+    # ``opencode`` haiku refuses to repeat a "secret word" citing safety
+    # ("I am designed to protect sensitive information…"), so frame this
+    # as a neutral marker. The recall assertion only cares that the
+    # exact token survives the supervisor restart.
+    marker = f"pineapple-{uuid.uuid4().hex[:6]}"
 
     agent = Agent(
         f"reload-skill-{uuid.uuid4().hex[:8]}",
@@ -134,11 +138,12 @@ async def test_reload_hot_installs_skill_preserves_conversation(acp_runtime):
             f"hive skills present BEFORE install: {sorted(baseline)}"
         )
 
-        # ── Plant a fact for the conversation-continuity check ──────────
+        # ── Plant a marker for the conversation-continuity check ────────
         await asyncio.wait_for(
             agent.arun(
-                f"Please remember the following for later — my secret "
-                f"word is {secret_word!r}. Acknowledge by repeating it back."
+                f"I am testing message persistence across a restart. "
+                f"The marker for this test is the literal string "
+                f"{marker!r}. Please acknowledge by repeating the marker."
             ),
             timeout=180,
         )
@@ -175,14 +180,14 @@ async def test_reload_hot_installs_skill_preserves_conversation(acp_runtime):
         # ── B. Conversation history preserved across the restart ────────
         recall = await asyncio.wait_for(
             agent.arun(
-                "What is the secret word I asked you to remember earlier? "
-                "Reply with just the word, nothing else."
+                "What was the marker string I asked you to acknowledge "
+                "earlier? Reply with just the marker, nothing else."
             ),
             timeout=180,
         )
-        assert secret_word.lower() in recall.lower(), (
+        assert marker.lower() in recall.lower(), (
             f"conversation history LOST across reload — agent did not "
-            f"recall {secret_word!r}. Reply: {recall!r}"
+            f"recall {marker!r}. Reply: {recall!r}"
         )
     finally:
         try:
