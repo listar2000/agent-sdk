@@ -182,11 +182,20 @@ class BaseSandboxSession(abc.ABC):
         from api import db as _db
 
         client = self._get_acp_client()
+        mcp_servers = None
+        if self._agent_id:
+            try:
+                agent = await _db.get_agent(self._agent_id)
+                if agent and agent.config and agent.config.mcp_servers:
+                    mcp_servers = agent.config.mcp_servers
+            except Exception:
+                mcp_servers = None
         await client.attach(
             self._acp_session_id,
             self.state.recipe.agent_type,
             cwd=self._cwd,
             inner_session_id=self._inner_session_id,
+            mcp_servers=mcp_servers,
             extra_options=self._extra_options,
         )
         self._inner_session_id = client.get_inner_session_id(
