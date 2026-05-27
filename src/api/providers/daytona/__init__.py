@@ -208,7 +208,6 @@ async def start_supervisor_in_sandbox(
         signed = await sandbox.create_signed_preview_url(port, 24 * 3600)
         _bench("mint_url_only", t0)
         url = signed.url.rstrip("/")
-        log.info("[DEBUG-SIGNED-URL] sandbox=%s url=%s token=%s", sid8, signed.url, signed.token[:16] + "..." if signed.token else "NONE")
         total_dt = time.monotonic() - total_t0
         log.info(
             "[BENCH] daytona.start_supervisor sandbox=%s TOTAL s=%.3f "
@@ -266,7 +265,6 @@ async def start_supervisor_in_sandbox(
     )
     _bench("spawn+mint_url", t0)
     url = signed.url.rstrip("/")
-    log.info("[DEBUG-SIGNED-URL] sandbox=%s url=%s token=%s", sid8, signed.url, signed.token[:16] + "..." if signed.token else "NONE")
 
     t0 = time.monotonic()
     # Budget covers worst-case Type 2 boot inside supervisor.js: cold
