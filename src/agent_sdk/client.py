@@ -549,6 +549,43 @@ class Session:
         await self._ensure_registered()
         await self._agent._api.set_session_config(self.session_id, **kwargs)
 
+    async def reload(
+        self,
+        *,
+        skills: list | dict | None = None,
+        mcp_servers: dict | None = None,
+        cli_tools: list | dict | None = None,
+        secrets: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Hot-swap skills / MCP / CLI tools / secrets on this session.
+
+        ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
+        clear. Updates ``agents.config`` (skills / MCP / CLI) or the
+        session row (secrets), runs new installs on the live sandbox,
+        then releases the lease — supervisor stays down. The NEXT user
+        message cold-recovers it with the new state visible. Lazy on
+        purpose: no 15-30s sync wait. Conversation continuity is
+        preserved via ``session/load``.
+
+        Writes ``skills`` / ``mcp_servers`` / ``cli_tools`` back onto
+        the parent ``Agent`` so a subsequent ``clone()`` carries the
+        updated config. ``secrets`` are session-scoped and are NOT
+        mirrored onto the Agent — only the active session reflects them.
+        """
+        await self._ensure_registered()
+        result = await self._agent._api.reload_session(
+            self.session_id,
+            skills=skills, mcp_servers=mcp_servers,
+            cli_tools=cli_tools, secrets=secrets,
+        )
+        if skills is not None:
+            self._agent.skills = skills
+        if mcp_servers is not None:
+            self._agent.mcp_servers = mcp_servers
+        if cli_tools is not None:
+            self._agent.cli_tools = cli_tools
+        return result
+
     async def cancel(self) -> None:
         """Cancel the currently running prompt (best-effort)."""
         await self._ensure_registered()
@@ -620,7 +657,7 @@ class Agent:
     # explicitly below.
     _CLONABLE_FIELDS = (
         "agent_type", "provider", "model", "cwd", "root",
-        "mcp_servers", "skills", "dockerfile",
+        "mcp_servers", "skills", "cli_tools", "dockerfile",
         "volume_id", "pre_start_commands", "shared_mounts",
         "resources", "workspace", "extra_options",
     )
@@ -636,6 +673,7 @@ class Agent:
         api_url: str | None = None,
         mcp_servers: dict[str, dict] | None = None,  # name -> config dict
         skills: list[str] | dict[str, dict] | None = None,  # npx skills sources
+        cli_tools: list[str] | dict[str, dict] | None = None,  # uv tool install sources
         db: str | None = None,
         session_id: str | None = None,
         sandbox_ref: str | None = None,
@@ -660,6 +698,7 @@ class Agent:
         self.root = root
         self.mcp_servers = mcp_servers
         self.skills = skills
+        self.cli_tools = cli_tools
         self.id: str | None = None  # set after registration (server-side agent_id)
         self.dockerfile = dockerfile
         self.volume_id = volume_id
@@ -1010,6 +1049,26 @@ class Agent:
     async def configure(self, **kwargs) -> None:
         """Set default-session config dynamically. Accepts: mode, model, thought_level."""
         await self._ensure_default_session().configure(**kwargs)
+
+    async def reload(
+        self,
+        *,
+        skills: list | dict | None = None,
+        mcp_servers: dict | None = None,
+        cli_tools: list | dict | None = None,
+        secrets: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Hot-swap skills / MCP / CLI tools / secrets on the default session.
+
+        Per-field PATCH semantics: ``None`` (default) = leave alone;
+        ``[]`` / ``{}`` = clear; a value = replace just that field.
+        Other fields are untouched. See :meth:`Session.reload` for
+        details.
+        """
+        return await self._ensure_default_session().reload(
+            skills=skills, mcp_servers=mcp_servers,
+            cli_tools=cli_tools, secrets=secrets,
+        )
 
     async def cancel(self) -> None:
         """Cancel the default session's currently running prompt."""

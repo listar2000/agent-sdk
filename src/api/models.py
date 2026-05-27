@@ -40,6 +40,7 @@ class AgentConfig:
     model: str | None = None
     mcp_servers: dict | None = None
     skills: list | dict | None = None  # npx skills sources
+    cli_tools: list | dict | None = None  # uv tool install sources
     # ACP dynamic config that gets re-applied on every fresh attach so
     # cold-recovery (Type-2) doesn't silently revert a caller's
     # set_mode / set_thought_level. Keep model on its own field above
