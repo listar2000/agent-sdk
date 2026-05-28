@@ -26,7 +26,7 @@ import httpx
 
 from api import db
 
-from .session import BaseSandboxSession
+from .session import BaseSandboxSession, _Subscriber
 from .state import Recipe, SandboxState, deserialize, serialize, state_for_provider
 
 log = logging.getLogger(__name__)
@@ -137,7 +137,7 @@ class SessionPool:
         """
         async with self._lock(session_id):
             cached = self._active.get(session_id)
-            handed_off_subscribers: dict[str, asyncio.Queue] = {}
+            handed_off_subscribers: dict[str, _Subscriber] = {}
             if cached is not None:
                 # Force-probe so an externally-killed supervisor is detected
                 # immediately, even if the previous prompt's last chunk was
@@ -193,6 +193,14 @@ class SessionPool:
                 # ``execute_prompt`` failure) reach the existing /events
                 # consumers. Done before ``start()`` so the first chunk
                 # observed by the supervisor goes to the right queues.
+                #
+                # Rebind each subscriber's ``owner`` to this replacement
+                # session so the consumer's ``iterate_subscriber`` finally
+                # pops from HERE, not from the dead session it was created
+                # on. Without this the entry leaks onto ``session`` and the
+                # idle reaper skips it forever (zombie subscriber).
+                for sub in handed_off_subscribers.values():
+                    sub.owner = session
                 session._subscribers.update(handed_off_subscribers)
             await session.start()
             await db.write_sandbox_state(session_id, serialize(session.state))

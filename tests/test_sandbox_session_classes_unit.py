@@ -233,3 +233,128 @@ class TestSessionPoolReaper:
 
         assert count == 0
         assert released == []
+
+
+class _MiniSession(BaseSandboxSession):
+    """Concrete ``BaseSandboxSession`` with no real compute — exercises the
+    in-memory subscriber fan-out + recovery hand-off cleanup without a
+    sandbox. ``running()`` reports dead so ``pool.get_session`` always
+    takes the hand-off branch."""
+
+    volume_provider = "test"
+
+    async def start(self) -> None:
+        pass
+
+    async def running(self, *, force_probe: bool = False) -> bool:
+        return False
+
+    async def execute_prompt(self, *args, **kwargs):
+        if False:  # pragma: no cover — make this an async generator
+            yield
+
+    async def stop(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        self._close_subscribers()
+
+
+class TestSubscriberHandoffCleanup:
+    """Regression for the zombie-subscriber leak: when a session dies
+    mid-prompt and its SSE subscribers are handed off to a replacement,
+    ``iterate_subscriber``'s cleanup must pop from the REPLACEMENT (the
+    current owner), not the original session it was bound to. A leaked
+    entry pins the replacement against ``reap_idle`` forever, leaking the
+    backing compute (the 'hibernated' webhook + provider stop never fire)."""
+
+    @pytest.mark.asyncio
+    async def test_iterate_subscriber_cleanup_targets_current_owner(self):
+        from api.sandbox.session import _END
+
+        a = _MiniSession(session_id="s", state=ModalSandboxState(recipe=Recipe()))
+        b = _MiniSession(session_id="s", state=ModalSandboxState(recipe=Recipe()))
+
+        sid, q = a.register_subscriber()
+        assert sid in a._subscribers
+
+        # Drain on A; the generator's ``self`` is permanently A.
+        agen = a.iterate_subscriber(sid, q)
+        step = asyncio.ensure_future(agen.__anext__())
+        await asyncio.sleep(0)  # run body to the q.get() await -> captures sub
+
+        # Simulate the pool cold-recovery hand-off A -> B.
+        handed = dict(a._subscribers)
+        a._subscribers.clear()
+        for sub in handed.values():
+            sub.owner = b
+        b._subscribers.update(handed)
+        assert sid in b._subscribers and sid not in a._subscribers
+
+        # End the stream; the generator returns and runs its finally.
+        q.put_nowait(_END)
+        with pytest.raises(StopAsyncIteration):
+            await step
+
+        # Cleanup followed the queue to B — no zombie on either session.
+        assert sid not in b._subscribers, "zombie subscriber left on replacement"
+        assert sid not in a._subscribers
+
+    @pytest.mark.asyncio
+    async def test_pool_handoff_then_drain_lets_reaper_reclaim(self, monkeypatch):
+        from api.sandbox.pool import SessionPool
+        from api.sandbox.session import _END
+        from api import db as db_mod
+
+        pool = SessionPool(factory=lambda sid, state: _MiniSession(
+            session_id=sid, state=state,
+        ))
+
+        async def _noop(*a, **k):
+            return None
+
+        monkeypatch.setattr(pool, "_publish_state", _noop)
+        monkeypatch.setattr(db_mod, "write_sandbox_state", _noop)
+
+        # Seed a cached (soon-to-be-dead) session with a live subscriber.
+        cached = _MiniSession(
+            session_id="sess", state=ModalSandboxState(recipe=Recipe()),
+        )
+        pool._active["sess"] = cached
+        sid, q = cached.register_subscriber()
+
+        # Consumer draining the cached session (generator bound to cached).
+        agen = cached.iterate_subscriber(sid, q)
+        step = asyncio.ensure_future(agen.__anext__())
+        await asyncio.sleep(0)
+
+        # Real hand-off: cached.running() -> False triggers the replacement.
+        replacement = await pool.get_session(
+            "sess", initial_state=ModalSandboxState(recipe=Recipe()),
+        )
+        assert replacement is not cached
+        assert sid in replacement._subscribers
+        assert sid not in cached._subscribers
+        # The pool rebound the owner — not just moved the queue.
+        assert replacement._subscribers[sid].owner is replacement
+
+        # Consumer ends -> finally cleans the REPLACEMENT (the fix).
+        q.put_nowait(_END)
+        with pytest.raises(StopAsyncIteration):
+            await step
+        assert sid not in replacement._subscribers
+
+        # Symptom gone: with an empty _subscribers the idle reaper reclaims it.
+        released = []
+
+        async def _release(session_id):
+            released.append(session_id)
+
+        monkeypatch.setattr(pool, "release", _release)
+        replacement.liveness.observe_activity()
+        replacement.liveness._last_chunk_at -= 10_000
+        count = await pool.reap_idle(5)
+        assert count == 1
+        assert released == ["sess"]
+
+        await asyncio.sleep(0)  # let the background _safe_shutdown(cached) settle

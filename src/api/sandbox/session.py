@@ -37,6 +37,29 @@ _HEARTBEAT_INTERVAL_S = 20.0
 _QUEUE_MAXSIZE = 2048
 
 
+class _Subscriber:
+    """A single fan-out subscriber: its bounded queue plus a pointer to the
+    session whose ``_subscribers`` dict currently holds it.
+
+    ``owner`` exists so the consumer's cleanup targets the *right* dict
+    after a cold-recovery hand-off. ``iterate_subscriber``'s ``finally``
+    pops via ``owner``; ``pool.get_session`` rebinds ``owner`` when it
+    splices subscribers onto a replacement session. Without it the
+    generator — whose ``self`` is permanently the original (now-dead)
+    session — would pop ``sid`` from the original's already-cleared dict
+    and leave a zombie entry on the replacement, which pins that session
+    against the idle reaper forever (``reap_idle`` treats any non-empty
+    ``_subscribers`` as live activity)."""
+
+    __slots__ = ("queue", "owner")
+
+    def __init__(
+        self, queue: "asyncio.Queue[Any]", owner: "BaseSandboxSession",
+    ) -> None:
+        self.queue = queue
+        self.owner = owner
+
+
 class BaseSandboxSession(abc.ABC):
     """One session's running compute. Lifetime: from ``start()`` to
     ``shutdown()``. Owns provider-side handles, the per-session lock for
@@ -68,7 +91,7 @@ class BaseSandboxSession(abc.ABC):
         # so that GET /events can stay open across N prompts. Subscribers
         # only receive events broadcast AFTER they register — historical
         # events live in ``session_log`` (GET /sessions/{id}/log).
-        self._subscribers: dict[str, asyncio.Queue[Any]] = {}
+        self._subscribers: dict[str, _Subscriber] = {}
         # Set by concrete start(); used by file-proxy endpoints to talk
         # to the supervisor without going through ACP.
         self._supervisor_url: str | None = None
@@ -492,7 +515,7 @@ class BaseSandboxSession(abc.ABC):
         # Bounded queue: slow subscribers drop events rather than backpressuring
         # the source supervisor stream. Per docs §15.5 — keep today's behaviour.
         q: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
-        self._subscribers[sid] = q
+        self._subscribers[sid] = _Subscriber(q, self)
         self.liveness.observe_activity()
         return sid, q
 
@@ -507,6 +530,15 @@ class BaseSandboxSession(abc.ABC):
         EventSource close idle persistent connections between prompts.
         Cleans up the registration on exit.
         """
+        # Capture the subscriber record now — synchronously, before the
+        # first ``await`` — so cleanup pops from whichever session owns it
+        # at exit, not the one this generator was bound to. During mid-
+        # prompt cold-recovery the pool hands this queue off to a
+        # replacement session and rebinds ``owner``; popping from ``self``
+        # (the original, now-dead session) would miss the replacement and
+        # leak a zombie entry that pins it against the idle reaper. See
+        # ``_Subscriber``.
+        sub = self._subscribers.get(sid)
         try:
             while True:
                 try:
@@ -522,7 +554,8 @@ class BaseSandboxSession(abc.ABC):
                 self.liveness.observe_activity()
                 yield event
         finally:
-            self._subscribers.pop(sid, None)
+            owner = sub.owner if sub is not None else self
+            owner._subscribers.pop(sid, None)
 
     async def subscribe(self) -> AsyncIterator[Any]:
         """Convenience wrapper: register + iterate. Suits callers that
@@ -546,9 +579,9 @@ class BaseSandboxSession(abc.ABC):
         endpoint is the source of truth for everything broadcast on this
         session. Mixing the two would double-deliver every event a
         cold-loading UI just fetched from /log."""
-        for q in list(self._subscribers.values()):
+        for sub in list(self._subscribers.values()):
             try:
-                q.put_nowait(event)
+                sub.queue.put_nowait(event)
             except asyncio.QueueFull:
                 # Slow subscriber: drop. They'll catch up on whatever's next.
                 pass
@@ -556,7 +589,8 @@ class BaseSandboxSession(abc.ABC):
     def _close_subscribers(self) -> None:
         """Signal end-of-stream to every subscriber. Called from
         ``shutdown()`` so pending ``subscribe()`` consumers exit."""
-        for q in list(self._subscribers.values()):
+        for sub in list(self._subscribers.values()):
+            q = sub.queue
             try:
                 q.put_nowait(_END)
             except asyncio.QueueFull:
