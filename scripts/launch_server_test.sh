@@ -196,7 +196,11 @@ if [[ -f "${REPO_ROOT}/.runtime-snapshot-tag" ]]; then
   echo "Daytona snapshot: $(cat "${REPO_ROOT}/.runtime-snapshot-tag")"
 fi
 
-: "${AGENT_SDK_REPLICAS:=1}"
+# Default to 4 replicas + LB: the golden suite is meant to run against the
+# multi-replica topology (that's what surfaces the lease / cross-replica
+# recovery lock-in bugs). Set AGENT_SDK_REPLICAS=1 for a plain single
+# uvicorn when you don't need the LB.
+: "${AGENT_SDK_REPLICAS:=4}"
 : "${AGENT_SDK_PUBLIC_PORT:=7778}"
 : "${AGENT_SDK_BACKEND_PORT_BASE:=7791}"
 
@@ -206,7 +210,7 @@ fi
 # most requests.
 
 if [[ "${AGENT_SDK_REPLICAS}" -le 1 ]]; then
-  # Single-replica path — the historical default.
+  # Single-replica path — opt in with AGENT_SDK_REPLICAS=1.
   echo "Starting local server on http://localhost:${AGENT_SDK_PUBLIC_PORT} ..."
   exec "${VENV_PYTHON}" -m uvicorn api.server:app --host 0.0.0.0 \
       --port "${AGENT_SDK_PUBLIC_PORT}"
