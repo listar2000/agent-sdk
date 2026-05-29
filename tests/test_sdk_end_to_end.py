@@ -73,7 +73,8 @@ def _make_fake_session(session_id: str, sandbox_ref: str = "fake-ref-1") -> Magi
       * ``_supervisor_url`` (status / sandbox introspection)
       * ``_acp_session_id`` / ``_inner_session_id`` (acp_call)
       * ``_subscribers`` dict (admin / status)
-      * ``liveness._last_chunk_at`` (status / pool reaper)
+      * ``liveness._last_chunk_at`` (status), ``_last_compute_at`` +
+        ``in_flight`` (pool reaper decision)
     """
     sess = MagicMock()
     sess.session_id = session_id
@@ -85,7 +86,11 @@ def _make_fake_session(session_id: str, sandbox_ref: str = "fake-ref-1") -> Magi
     sess._subscribers = {}
     sess._agent_id = None  # set by upsert
     sess.supervisor_url = sess._supervisor_url
-    sess.liveness = MagicMock(_last_chunk_at=None)
+    # Explicit reaper-relevant attrs: a bare MagicMock auto-returns truthy
+    # children, so ``in_flight`` must be set False (else the reaper sees a
+    # truthy mock and treats every session as mid-prompt) and the compute
+    # clock None so idle math doesn't run against a MagicMock.
+    sess.liveness = MagicMock(_last_chunk_at=None, _last_compute_at=None, in_flight=False)
 
     async def _empty_iter():
         if False:

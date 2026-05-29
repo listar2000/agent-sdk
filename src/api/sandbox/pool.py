@@ -202,7 +202,25 @@ class SessionPool:
                 for sub in handed_off_subscribers.values():
                     sub.owner = session
                 session._subscribers.update(handed_off_subscribers)
-            await session.start()
+            try:
+                await session.start()
+            except BaseException:
+                # Bug A fix — fail-safe compute release. ``start()`` may have
+                # already acquired the sandbox (create_sandbox succeeded)
+                # before failing at a later stage (health probe / ACP attach /
+                # session/new -32603). The session never enters ``_active``,
+                # so nothing else will ever release it: without this teardown
+                # the SLURM job / daytona VM / container leaks until its own
+                # time limit. Tear it down here, then re-raise for the caller
+                # to translate (HTTP 5xx).
+                #
+                # Call ``stop()`` + ``_safe_shutdown`` DIRECTLY, never
+                # ``release()`` — release() re-acquires ``self._lock(session_id)``
+                # which we still hold here, so it would deadlock.
+                with contextlib.suppress(Exception):
+                    await session.stop()
+                await _safe_shutdown(session)
+                raise
             await db.write_sandbox_state(session_id, serialize(session.state))
             self._active[session_id] = session
             # Publish the updated session_ids snapshot so the dashboard
@@ -292,44 +310,96 @@ class SessionPool:
             if lifecycle_url:
                 asyncio.create_task(_fire_lifecycle_webhook(lifecycle_url, session_id, "hibernated"))
 
+    def _should_reap(
+        self,
+        sess,
+        idle_s: float,
+        now: float,
+        provider_idle_s: dict[str, float] | None = None,
+    ) -> tuple[bool, str]:
+        """The SINGLE idle-decision for one active session.
+
+        Shared by the background ``reap_idle`` scan and the per-session
+        ``reap_session`` (POST /sessions/{id}/reap) so both agree — and so
+        the idle policy lives in exactly one place. Returns
+        ``(should_hibernate, reason)``.
+
+        De-conflation of the two lifecycles (the fix for the subscriber-pin
+        leak): the decision keys off COMPUTE activity only —
+        ``Liveness._last_compute_at`` (prompt chunks + successful health
+        probes) plus an ``in_flight`` gate for chunk-silent long turns.
+        Subscriber presence is NO LONGER consulted: an open /events
+        consumer (dashboard, monitor, idle chat UI) marks the session
+        ``alive`` for the re-probe path via ``observe_activity`` but does
+        not advance the compute clock, so it can no longer pin an idle
+        sandbox. A reaped session keeps its conversation (session/load) and
+        cold-resumes on the next message; an SSE consumer reconnects.
+        """
+        # Never hibernate mid-prompt — even a multi-minute, chunk-silent
+        # tool call whose compute clock has gone stale.
+        if sess.liveness.in_flight:
+            return False, "prompt_in_flight"
+        last = sess.liveness._last_compute_at
+        if last is None:
+            # No compute observed yet — likely a session that started
+            # but hasn't had a prompt yet. Seed the idle window from now.
+            sess.liveness._last_compute_at = now
+            return False, "no_activity_yet"
+        provider = getattr(sess.state, "type", "")
+        limit = (provider_idle_s or {}).get(provider, idle_s)
+        if (now - last) > limit:
+            return True, "idle"
+        return False, "recent_activity"
+
     async def reap_idle(
         self,
         idle_s: float,
         *,
         provider_idle_s: dict[str, float] | None = None,
     ) -> int:
-        """Hibernate every active session whose last observed activity is
-        older than ``idle_s``. Returns the count of sessions released.
-
-        Activity = the session's ``Liveness._last_chunk_at``. Prompt
-        chunks, successful health probes, file/status traffic, and live
-        /events subscribers all count as activity so an open UI does not
-        hibernate underneath the user.
+        """Hibernate every active session that ``_should_reap`` flags as
+        idle. Returns the count of sessions released.
         """
         import time as _time
         now = _time.monotonic()
-        stale = []
-        for sid, sess in list(self._active.items()):
-            if sess._subscribers:
-                sess.liveness.observe_activity()
-                continue
-            last = sess.liveness._last_chunk_at
-            if last is None:
-                # Never observed a chunk — likely a session that started
-                # but hasn't had a prompt yet. Use creation as a proxy
-                # by giving it the full idle window from now.
-                sess.liveness._last_chunk_at = now
-                continue
-            provider = getattr(sess.state, "type", "")
-            limit = (provider_idle_s or {}).get(provider, idle_s)
-            if (now - last) > limit:
-                stale.append(sid)
+        stale = [
+            sid for sid, sess in list(self._active.items())
+            if self._should_reap(sess, idle_s, now, provider_idle_s)[0]
+        ]
         for sid in stale:
             try:
                 await self.release(sid)
             except Exception:
                 log.exception("reap_idle: release(%s) failed", sid)
         return len(stale)
+
+    async def reap_session(
+        self,
+        session_id: str,
+        idle_s: float,
+        *,
+        provider_idle_s: dict[str, float] | None = None,
+    ) -> dict:
+        """Hibernate ONE session iff it meets the same idle criteria the
+        background reaper uses (``_should_reap``).
+
+        Exposed via ``POST /sessions/{id}/reap`` for ops ("reclaim this
+        idle sandbox now without waiting for the reaper tick") and as the
+        deterministic, per-session, ``-n auto``-safe seam the golden
+        reaper test drives. Returns ``{hibernated, reason}``. A session not
+        active on THIS replica returns ``reason='not_active'`` (the
+        consistent-hash routing should land the call on the owner).
+        """
+        import time as _time
+        now = _time.monotonic()
+        sess = self._active.get(session_id)
+        if sess is None:
+            return {"hibernated": False, "reason": "not_active"}
+        should, reason = self._should_reap(sess, idle_s, now, provider_idle_s)
+        if not should:
+            return {"hibernated": False, "reason": reason}
+        await self.release(session_id)
+        return {"hibernated": True, "reason": "idle"}
 
     def find_by_sandbox_ref(self, sandbox_ref: str) -> BaseSandboxSession | None:
         """Reverse lookup: find an active session whose underlying compute

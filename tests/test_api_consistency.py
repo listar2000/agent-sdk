@@ -90,7 +90,7 @@ async def test_post_non_object_body_returns_400(client, path, body):
 # deprecated ``POST /sandboxes/{id}/start`` route + the ``_type1_recover``
 # helper it patched are both gone. Callers use ``POST /sessions/{id}/message``
 # which provisions on demand through the SessionPool; provider-failure
-# error mapping for that path is covered in test_sandbox_stop_delete_recovery.
+# error mapping for that path is covered in test_golden.
 
 
 # test_post_sandboxes_provision_exposes_both_id_and_sandbox_id was

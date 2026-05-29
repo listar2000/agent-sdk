@@ -174,7 +174,7 @@ async def test_live_daytona_realistic_workflow_via_sdk(sdk: ApiClient):
         # is no longer findable, otherwise the next get_session can race
         # the cleanup and either reattach to a half-dead sandbox or hit
         # "An unexpected error occurred" from the create path. Bounded
-        # 10 s — same budget as test_sandbox_stop_delete_recovery's
+        # 10 s — same budget as test_golden's
         # _external_delete helper.
         deadline = loop.time() + 10.0
         while loop.time() < deadline:

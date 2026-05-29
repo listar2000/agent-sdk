@@ -342,5 +342,5 @@ value; the perf number is a downstream consequence.
 
 ### Goldens (peek mode on top of new main)
 
-`tests/test_sandbox_stop_delete_recovery.py` — the canonical golden
+`tests/test_golden.py` — the canonical golden
 suite — passes 60/60 in 158s with `-n auto`. No regressions.
