@@ -1725,38 +1725,47 @@ async def _forward_session_config(
             )
 
 
+async def _log_one(
+    session, agent_id: str, event_type: str, payload: dict,
+) -> None:
+    """Write ONE ``session_log`` row — single source for both the
+    user_message row and every per-event row.
+
+    Routes through the per-process ``SessionLogBatcher`` when available (the
+    production path under lifespan); falls back to a direct ``log_event``
+    INSERT in test contexts that bypass ``start_batcher`` so unit tests keep
+    seeing rows synchronously. ``get_batcher`` / ``log_event`` are resolved
+    as module globals at call time so test monkeypatches bind. Best-effort:
+    a DB hiccup is logged and swallowed so it never blocks/aborts the turn.
+    """
+    try:
+        batcher = get_batcher()
+        if batcher is not None:
+            await batcher.add(
+                session_id=session.session_id, agent_id=agent_id,
+                event_type=event_type, payload=payload,
+            )
+        else:
+            await log_event(
+                session_id=session.session_id, agent_id=agent_id,
+                event_type=event_type, payload=payload,
+            )
+    except Exception:
+        log.exception(
+            "log_event(%s) failed for session %s rpc=%s",
+            event_type, session.session_id, payload.get("prompt_id"),
+        )
+
+
 async def _persist_user_message(session, message: str, rpc_id: str) -> None:
     """Write the EVT_USER_MESSAGE row for a freshly-submitted prompt.
 
     Best-effort — a DB hiccup must not block the prompt from being sent
     to the supervisor. The matching turn-end / tool / text rows are
     written by ``_persist_prompt_events`` as ``execute_prompt`` yields.
-
-    Routes through the per-process ``SessionLogBatcher`` when available
-    (the production path under lifespan); falls back to a direct INSERT
-    in test contexts that bypass ``start_batcher`` so unit tests keep
-    seeing user_message rows synchronously.
     """
     payload = {"text": redact_secrets(message), "prompt_id": rpc_id}
-    try:
-        batcher = get_batcher()
-        if batcher is not None:
-            await batcher.add(
-                session_id=session.session_id,
-                agent_id=session._agent_id or "",
-                event_type=EVT_USER_MESSAGE,
-                payload=payload,
-            )
-        else:
-            await log_event(
-                session_id=session.session_id,
-                agent_id=session._agent_id or "",
-                event_type=EVT_USER_MESSAGE,
-                payload=payload,
-            )
-    except Exception:
-        log.exception("user_message log_event failed for session %s rpc=%s",
-                      session.session_id, rpc_id)
+    await _log_one(session, session._agent_id or "", EVT_USER_MESSAGE, payload)
 
 
 # execute_prompt yields events whose ``type`` matches what
@@ -1805,25 +1814,9 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
         if "text" in payload:
             payload["text"] = redact_secrets(payload["text"])
         payload["prompt_id"] = rpc_id
-        try:
-            batcher = get_batcher()
-            if batcher is not None:
-                await batcher.add(
-                    session_id=session.session_id,
-                    agent_id=agent_id,
-                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
-                    payload=payload,
-                )
-            else:
-                await log_event(
-                    session_id=session.session_id,
-                    agent_id=agent_id,
-                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
-                    payload=payload,
-                )
-        except Exception:
-            log.exception("log_event(%s) failed for session %s rpc=%s",
-                          etype, session.session_id, rpc_id)
+        await _log_one(
+            session, agent_id, _EVENT_TYPE_TO_LOG.get(etype, etype), payload,
+        )
 
     async def _flush_buffers() -> None:
         if text_buf:
