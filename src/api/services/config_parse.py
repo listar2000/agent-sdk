@@ -27,6 +27,12 @@ _CONFIG_KEYS = (
 )
 
 
+# Keys that were once inside AgentConfig but now live on session / sandbox
+# rows. ``POST /agents`` rejects them with 400 so callers migrate cleanly;
+# ``/sessions`` consume them and route to the right row.
+_AGENT_REJECTED_KEYS = ("cwd", "env", "dockerfile", "dockerfile_content", "shared_mounts")
+
+
 def _merge_top_level_config(data: dict, config_data: dict) -> None:
     """Merge SDK top-level keys into config_data if not already present."""
     for key in _CONFIG_KEYS:

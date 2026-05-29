@@ -361,41 +361,13 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
 # point at "the right replica" — but we no longer need to.
 
 
-async def _json_body(request: Request) -> dict:
-    """Parse JSON body and require it to be an object.
-
-    Handlers that ``data = await request.json(); data.get(...)`` used to
-    blow up with a 500 ``AttributeError: 'str' object has no attribute 'get'``
-    when the client sent a JSON scalar/array instead of an object.  Route
-    all such reads through this helper so the failure is a clean 400 with
-    the canonical ``{"error": ...}`` shape.
-    """
-    try:
-        data = await request.json()
-    except Exception as e:
-        raise HTTPException(400, f"invalid JSON body: {e}")
-    if not isinstance(data, dict):
-        raise HTTPException(400, "request body must be a JSON object")
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Lookup preamble helpers — raise HTTPException(404) on missing records so the
-# caller never has to write ``if rec is None: return JSONResponse(...)``.
-# ---------------------------------------------------------------------------
-
-async def _require_agent(agent_id: str) -> AgentRecord:
-    rec = await get_agent(agent_id)
-    if rec is None:
-        raise HTTPException(404, "agent not found")
-    return rec
-
-
-async def _require_session_row(session_id: str) -> dict:
-    rec = await get_session(session_id)
-    if rec is None:
-        raise HTTPException(404, f"Session {session_id} not found")
-    return rec
+# JSON-body parsing + 404 lookups live in ``api.deps`` (cycle-free so routers
+# can share them). Re-exported so existing call sites + tests keep resolving.
+from .deps import (  # noqa: E402,F401
+    _json_body,
+    _require_agent,
+    _require_session_row,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -451,57 +423,13 @@ from .services.config_parse import (  # noqa: E402,F401
     _validate_volume_name,
 )
 
-# Keys that were once inside AgentConfig but now live on session / sandbox
-# rows. `/agents` POST rejects them with 400 so callers migrate cleanly;
-# `/sessions` and `/sessions` consume them and route to the right row.
-_AGENT_REJECTED_KEYS = ("cwd", "env", "dockerfile", "dockerfile_content", "shared_mounts")
-
-
 # ---------------------------------------------------------------------------
-# Agent CRUD (config only, no sandbox)
+# Agent CRUD routes live in api.routers.agents (refactor slice 6b)
 # ---------------------------------------------------------------------------
 
+from .routers import agents as _agents_router  # noqa: E402
 
-@app.post("/agents")
-async def create_agent(request: Request):
-    data = await _json_body(request)
-    agent_id = str(uuid.uuid4())
-    name = data.get("name")
-    config_data = data.get("config", {})
-    _merge_top_level_config(data, config_data)
-    # cwd / env / dockerfile / shared_mounts moved off AgentConfig — reject
-    # them at the boundary so stale clients get a clear 400 instead of
-    # silently-discarded fields.
-    for k in _AGENT_REJECTED_KEYS:
-        if k in data or k in config_data:
-            raise HTTPException(
-                400,
-                f"'{k}' no longer belongs to agent config. "
-                "cwd → session; env → session; dockerfile + shared_mounts → sandbox. "
-                "Set these on POST /sessions or /sessions instead.",
-            )
-    config = AgentConfig.from_dict(config_data)
-    await upsert_agent(AgentRecord(id=agent_id, name=name, config=config))
-    return {"id": agent_id, "name": name, "config": config.to_dict()}
-
-
-@app.get("/agents")
-async def list_agents_route():
-    agents = await list_agents()
-    return [{"id": a.id, "name": a.name, "config": a.config.to_dict()} for a in agents]
-
-
-@app.get("/agents/{agent_id}")
-async def get_agent_route(agent_id: str):
-    record = await _require_agent(agent_id)
-    return {"id": record.id, "name": record.name, "config": record.config.to_dict()}
-
-
-@app.delete("/agents/{agent_id}")
-async def delete_agent_route(agent_id: str):
-    await _require_agent(agent_id)
-    await delete_agent(agent_id)
-    return {"status": "deleted"}
+app.include_router(_agents_router.router)
 
 
 # ---------------------------------------------------------------------------
