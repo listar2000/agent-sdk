@@ -9,80 +9,48 @@ Run: uvicorn src.api.server:app --port 7778
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
-import re
-import shlex
-import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from fastapi.responses import (
     JSONResponse,
-    PlainTextResponse,
-    Response,
     StreamingResponse,
 )
 
-from .event_buffer import get_batcher, start_batcher, stop_batcher
+from .event_buffer import start_batcher, stop_batcher
 from .timing import extract_session_id, log_request, timed_phase
 from .db import (
     close_pool,
-    count_sessions_by_volume,
     delete_agent,
     delete_session,
-    delete_sessions_by_volume,
-    delete_volume,
     get_agent,
     get_session,
-    get_session_log,
-    get_volume,
-    get_volume_by_name,
     init_db,
     init_pool,
-    list_agents,
-    list_sessions,
-    list_volumes,
-    log_event,
     read_sandbox_state,
     update_session_env,
     update_session_pre_start_commands,
     update_session_secrets,
     upsert_agent,
     upsert_session,
-    upsert_volume,
     write_sandbox_state,
 )
 from .models import (
-    EVT_ASSISTANT_MESSAGE,
-    EVT_ERROR,
-    EVT_REASONING,
-    EVT_TOOL_CALL,
-    EVT_TOOL_RESULT,
-    EVT_USAGE,
-    EVT_USER_MESSAGE,
     AgentConfig,
     AgentRecord,
-    VolumeRecord,
 )
 from . import providers as _providers_mod
 from .providers import (
-    VolumeFileExistsError,
     default_cwd_for_provider,
-    get_volume_adapter,
-    _normalize_workspace,
 )
-from .providers._shared import _safe_path as _shared_safe_path
-from .redact import redact_pre_start_commands, redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -1124,145 +1092,12 @@ async def post_session_message_stream(session_id: str, request: Request):
     )
 
 
-def _sse_frame_for(item, rpc_id: str) -> str | None:
-    """Render one subscriber-queue item as an SSE frame for THIS rpc.
-
-    Two shapes share the queue: ``(rpc_tag, raw_acp_block)`` tuples from the
-    supervisor stream, and error-broadcast dicts from the persister's failure
-    path (these carry ``rpc_id`` + are JSON-encoded so per-rpc consumers can
-    dispatch them like ACP frames — without the tag they'd be yielded untagged
-    and silently dropped by tag-filtering consumers, the Task-Builder
-    silent-failure repro). Returns ``None`` to skip: other-rpc traffic (a
-    concurrent /events subscriber's prompt shares this queue) or an unknown
-    shape. Heartbeats are handled by the caller.
-    """
-    if isinstance(item, tuple) and len(item) == 2:
-        tag, block = item
-        if tag != rpc_id:
-            return None
-        return f"event: rpc:{tag}\n{block}\n\n"
-    if isinstance(item, dict):
-        if item.get("rpc_id") != rpc_id:
-            return None
-        return f"event: rpc:{rpc_id}\ndata: {json.dumps(item)}\n\n"
-    return None
-
-
-def _is_terminal_frame(item, rpc_id: str) -> bool:
-    """True iff this item ends the turn for ``rpc_id``.
-
-    For ACP blocks (tuple):
-      * ``"stopReason"`` — JSON-RPC ``result`` envelope for a clean turn-end
-        (end_turn / cancelled / max_tokens / max_turn_requests). ACP wires
-        camelCase, so the older snake_case ``"stop_reason"`` check never fired
-        on real frames — success-termination used to depend on client
-        disconnect.
-      * ``'"type":"done"'`` — canonicalized done marker.
-      * ``'"error":'`` — top-level JSON-RPC error envelope (auth failure /
-        internal error / process death). Verified with claude-agent-acp 0.31.4.
-    Tool-call failures arrive as ``session/update`` notifications with no
-    top-level ``error`` field; ``-32601`` handshake errors are filtered by
-    ``parse_acp_payload`` before broadcast, so neither reaches here.
-    For error-broadcast dicts: ``type == "error"``.
-    """
-    if isinstance(item, tuple) and len(item) == 2:
-        tag, block = item
-        return tag == rpc_id and (
-            "stopReason" in block
-            or '"type":"done"' in block
-            or '"error":' in block
-        )
-    if isinstance(item, dict):
-        return item.get("rpc_id") == rpc_id and item.get("type") == "error"
-    return False
-
-
-async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
-    """Stream branch with an ALREADY-RESOLVED session.
-
-    Used by ``POST /message+stream`` so session resolution (cold-recover
-    on the receiving replica) happens in the route handler — surfaces
-    failures before the StreamingResponse goes on the wire.
-    """
-    from api.sandbox.session import _HEARTBEAT
-
-    # ``_persist_user_message`` was previously called HERE, but that
-    # races concurrent queued prompts: three POSTs land three
-    # user_message rows before any turn_end. ``_persist_prompt_events``
-    # now writes user_message inside its prompt_lock, so log row
-    # order matches actual execution order.
-
-    # Eager registration so drive_task can start immediately — the
-    # generator-form ``subscribe()`` defers queue registration to the
-    # first iteration, which means a producer started before iterating
-    # would broadcast into a queue that hasn't been registered yet
-    # AND the consumer would block up to _HEARTBEAT_INTERVAL_S (20s)
-    # waiting for the empty queue to surface a sentinel before drive
-    # ever runs. The two-step split eliminates that 20s phantom delay.
-    sid, q = session.register_subscriber()
-
-    # Cluster-visible busy flag — ``busy_at`` on the sessions row is
-    # read by /admin/sessions with a 60s TTL so a crashed replica
-    # can't leave it stuck (lease takeover also resets it).
-    from api.sandbox import get_pool as _get_pool
-    from api import db as _db
-    try:
-        await _db.set_session_busy(session.session_id, busy=True)
-    except Exception:
-        log.warning("set_session_busy(True) failed for %s", session.session_id)
-
-    async def _drive():
-        await _persist_prompt_events(session, message, rpc_id)
-
-    drive_task = asyncio.create_task(_drive())
-    # Wrap the full turn so we get one log line per prompt with the
-    # actual wall-clock duration (the request middleware only sees
-    # time-to-headers for StreamingResponse). Slow turns surface as
-    # WARNING in the log without per-frame instrumentation.
-    _turn_t0 = time.perf_counter()
-    try:
-        async for item in session.iterate_subscriber(sid, q):
-            if item is _HEARTBEAT:
-                yield ": heartbeat\n\n"
-                continue
-            # Two item shapes share this queue (ACP-block tuples + error
-            # dicts). ``_sse_frame_for`` filters to THIS rpc and renders the
-            # frame (None = skip); ``_is_terminal_frame`` ends the turn.
-            frame = _sse_frame_for(item, rpc_id)
-            if frame is None:
-                continue
-            yield frame
-            if _is_terminal_frame(item, rpc_id):
-                return
-    finally:
-        # The generator returns the moment the ``done`` block reaches
-        # us — but the persister (driven by execute_prompt's yield) is
-        # one async hop behind, still awaiting log_event(turn_end).
-        # Await it (bounded) so the turn_end row lands before we
-        # close. Never cancel: a mid-write cancel leaves the DB
-        # connection in BAD state and the pool has to discard it.
-        if drive_task is not None and not drive_task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(drive_task), timeout=10)
-            except (asyncio.TimeoutError, Exception):
-                pass
-        try:
-            await _db.set_session_busy(session.session_id, busy=False)
-        except Exception:
-            log.warning("set_session_busy(False) failed for %s", session.session_id)
-        _turn_ms = (time.perf_counter() - _turn_t0) * 1000
-        # Direct log (not timed_phase) so the rpc_id is in-line for
-        # cross-correlation with /events subscribers and DB session_log
-        # rows. Turns are inherently long (5-30s typical), so the
-        # warning threshold is its own knob — AGENT_SDK_SLOW_TURN_MS,
-        # default 60s. Everything else is INFO.
-        from .identity import replica_id as _rid
-        _slow_turn = float(os.environ.get("AGENT_SDK_SLOW_TURN_MS", "60000"))
-        _lvl = logging.WARNING if _turn_ms >= _slow_turn else logging.INFO
-        log.log(
-            _lvl, "[%s] turn done session=%s rpc=%s %.0fms",
-            _rid(), session.session_id[:8], rpc_id[:8], _turn_ms,
-        )
+# SSE streaming of a turn lives in api.services.turn_runner (slice 7b).
+from .services.turn_runner import (  # noqa: E402,F401
+    _execute_and_stream_sse_for,
+    _is_terminal_frame,
+    _sse_frame_for,
+)
 
 
 @app.post("/sessions/{session_id}/cancel")
