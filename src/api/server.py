@@ -1783,6 +1783,72 @@ _EVENT_TYPE_TO_LOG = {
 }
 
 
+class _PromptGate:
+    """Owns one turn's per-session bookkeeping as a STRUCTURAL invariant.
+
+    Replaces the hand-managed observe_prompt_start / observe_prompt_end
+    balance that previously had to be threaded by hand across the mid-prompt
+    recovery swap (start on entry, end+start at the swap, end in a finally).
+    Getting that balance wrong left a session pinned "in flight" forever (the
+    reaper would never reclaim it) or underflowed the counter.
+
+    The gate:
+      * holds the ORIGINATING session's ``_prompt_lock`` for the whole turn
+        (the lock serialises prompts per session_id; the replacement after a
+        recovery swap is a different object, but we keep the original lock so
+        log-row order stays tied to one mutex);
+      * marks the prompt in-flight on enter and releases it on exit, on
+        whichever session is current — so a long chunk-silent tool call is
+        never reaped mid-turn;
+      * runs the shielded final flush while the lock is still held, so the
+        next prompt's writes can't interleave with this turn's tail.
+
+    ``handoff(replacement)`` moves the in-flight marker old→new atomically so
+    each session's counter balances independently.
+    """
+
+    def __init__(self, session, *, final_flush, rpc_id: str) -> None:
+        self._origin = session          # whose _prompt_lock we hold
+        self.session = session          # current target (changes on handoff)
+        self._final_flush = final_flush
+        self._rpc_id = rpc_id
+
+    async def __aenter__(self) -> "_PromptGate":
+        await self._origin._prompt_lock.acquire()
+        try:
+            self.session.liveness.observe_prompt_start()
+        except BaseException:
+            self._origin._prompt_lock.release()
+            raise
+        return self
+
+    def handoff(self, replacement) -> None:
+        """Recovery swap: move the in-flight marker to the session the pool
+        now owns. old: +1 on enter, -1 here; new: +1 here, -1 on exit."""
+        self.session.liveness.observe_prompt_end()
+        self.session = replacement
+        self.session.liveness.observe_prompt_start()
+
+    async def __aexit__(self, *_exc) -> bool:
+        try:
+            self.session.liveness.observe_prompt_end()
+            # Final flush MUST run while the lock is still held — otherwise
+            # the next prompt's persist task interleaves its writes with this
+            # turn's tail and the log row order de-syncs from SSE. shield
+            # keeps it running even under task cancellation (CancelledError
+            # is a BaseException that bypasses ``except Exception``).
+            try:
+                await asyncio.shield(self._final_flush())
+            except Exception:
+                log.exception(
+                    "final flush failed for session %s rpc=%s — buffer lost",
+                    self._origin.session_id, self._rpc_id,
+                )
+        finally:
+            self._origin._prompt_lock.release()
+        return False  # never suppress exceptions
+
+
 async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
     """Drive ``execute_prompt`` and write coalesced rows to ``session_log``.
 
@@ -1873,98 +1939,68 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
         except Exception as e:
             return terminal, e
 
-    async with session._prompt_lock:
+    # The gate holds the per-session prompt lock, marks the turn in-flight
+    # for the reaper, and runs the shielded final flush on exit — all as a
+    # structural invariant so the body below stays focused on driving the
+    # turn and handling mid-prompt recovery. See ``_PromptGate``.
+    async with _PromptGate(session, final_flush=_flush_buffers, rpc_id=rpc_id) as gate:
         # Log the user_message INSIDE the lock so log row order tracks
         # actual execution order.
-        await _persist_user_message(session, message, rpc_id)
-        # Mark the prompt in flight so the idle reaper never hibernates this
-        # session mid-turn — covers a long, chunk-silent tool call whose
-        # compute clock would otherwise go stale. Balanced across the
-        # recovery swap below and released in the finally.
-        session.liveness.observe_prompt_start()
-        try:
-            ok, exc = await _drive_one(session)
-            # Supervisor died mid-prompt? If the pool already cold-recovered
-            # the session (a sibling request observed alive=False and swapped
-            # in a new SandboxSession), retry once on the fresh session —
-            # this is the race that lost ``rpc=41095a61`` events on modal
-            # ``test_message_immediately_after_stop``: the error broadcast
-            # would otherwise land on a dict that was cleared during the
-            # migration, and the SDK would time out waiting for an event
-            # that never arrives.
-            if not ok and exc is not None:
-                try:
-                    from api.sandbox import get_pool as _gp
-                    replacement = await _gp().get_session(session.session_id)
-                except Exception:
-                    replacement = None
-                if replacement is not None and replacement is not session:
-                    log.info(
-                        "execute_prompt retry: session %s recovered rpc=%s",
-                        session.session_id, rpc_id,
-                    )
-                    text_buf.clear(); think_buf.clear()
-                    # Move the in-flight marker onto the session the pool now
-                    # owns so each session's counter balances independently
-                    # (old: +1 at top then -1 here; new: +1 here then -1 in
-                    # the finally).
-                    session.liveness.observe_prompt_end()
-                    session = replacement  # downstream writes use the new one
-                    session.liveness.observe_prompt_start()
-                    ok, exc = await _drive_one(replacement)
-            if not ok:
-                e = exc if exc is not None else RuntimeError(
-                    "stream ended without terminal event"
+        await _persist_user_message(gate.session, message, rpc_id)
+        ok, exc = await _drive_one(gate.session)
+        # Supervisor died mid-prompt? If the pool already cold-recovered
+        # the session (a sibling request observed alive=False and swapped
+        # in a new SandboxSession), retry once on the fresh session — this
+        # is the race that lost ``rpc=41095a61`` events on modal
+        # ``test_message_immediately_after_stop``: the error broadcast would
+        # otherwise land on a dict that was cleared during the migration,
+        # and the SDK would time out waiting for an event that never arrives.
+        if not ok and exc is not None:
+            try:
+                from api.sandbox import get_pool as _gp
+                replacement = await _gp().get_session(gate.session.session_id)
+            except Exception:
+                replacement = None
+            if replacement is not None and replacement is not gate.session:
+                log.info(
+                    "execute_prompt retry: session %s recovered rpc=%s",
+                    gate.session.session_id, rpc_id,
                 )
-                log.exception(
-                    "execute_prompt failed for session %s rpc=%s: %s",
-                    session.session_id, rpc_id, e,
-                )
-                await _flush_buffers()
-                await _write({
-                    "type": "error",
-                    "message": str(e)[:500], "kind": type(e).__name__,
-                })
-                # Broadcast to whichever session the pool currently has —
-                # NOT necessarily the one we started with. The old session's
-                # ``_subscribers`` dict may have been migrated to the new
-                # session by ``pool.get_session``'s subscriber hand-off;
-                # broadcasting to the stale ref reaches an empty dict.
-                from api.sandbox import get_pool as _gp2
-                current = _gp2()._active.get(session.session_id, session)  # noqa: SLF001
-                current._broadcast({
-                    "type": "error", "rpc_id": rpc_id,
-                    "jsonrpc": "2.0", "id": rpc_id,
-                    "error": {
-                        "code": -32603,
-                        "message": str(e),
-                        "data": {
-                            "kind": type(e).__name__,
-                            "exception_type": type(e).__name__,
-                        },
+                text_buf.clear(); think_buf.clear()
+                gate.handoff(replacement)  # in-flight marker moves old->new
+                ok, exc = await _drive_one(gate.session)
+        if not ok:
+            e = exc if exc is not None else RuntimeError(
+                "stream ended without terminal event"
+            )
+            log.exception(
+                "execute_prompt failed for session %s rpc=%s: %s",
+                gate.session.session_id, rpc_id, e,
+            )
+            await _flush_buffers()
+            await _write({
+                "type": "error",
+                "message": str(e)[:500], "kind": type(e).__name__,
+            })
+            # Broadcast to whichever session the pool currently has — NOT
+            # necessarily the one we started with. The old session's
+            # ``_subscribers`` dict may have been migrated to the new session
+            # by ``pool.get_session``'s subscriber hand-off; broadcasting to
+            # the stale ref reaches an empty dict.
+            from api.sandbox import get_pool as _gp2
+            current = _gp2()._active.get(gate.session.session_id, gate.session)  # noqa: SLF001
+            current._broadcast({
+                "type": "error", "rpc_id": rpc_id,
+                "jsonrpc": "2.0", "id": rpc_id,
+                "error": {
+                    "code": -32603,
+                    "message": str(e),
+                    "data": {
+                        "kind": type(e).__name__,
+                        "exception_type": type(e).__name__,
                     },
-                })
-        finally:
-            # Release the in-flight marker on whichever session is current
-            # (the original, or the replacement after a recovery swap) so
-            # the reaper can hibernate it once it goes idle. The counter is
-            # floored at 0, so this is safe even on the unbalanced error
-            # paths.
-            session.liveness.observe_prompt_end()
-            # Hard-cancel path: ``CancelledError`` is a ``BaseException``
-            # in Python 3.8+ and bypasses ``except Exception``. Without
-            # this finally an asyncio Task cancellation (server shutdown,
-            # session DELETE) drops the in-flight buffer. ``asyncio.shield``
-            # keeps the flush running even if the surrounding task is in
-            # a cancelling state.
-            if text_buf or think_buf:
-                try:
-                    await asyncio.shield(_flush_buffers())
-                except Exception:
-                    log.exception(
-                        "final flush failed for session %s rpc=%s — buffer lost",
-                        session.session_id, rpc_id,
-                    )
+                },
+            })
 
 
 @app.post("/sessions/{session_id}/message")
