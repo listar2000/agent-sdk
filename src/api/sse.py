@@ -288,3 +288,28 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
         return {"type": "usage", "usage": data.get("cost", data)}
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Shared ACP-stream constants + the block parser used by every provider's
+# execute_prompt. Lives here (with parse_acp_event) so providers don't import
+# it from daytona.session — and the read timeout isn't copy-pasted per module.
+# ---------------------------------------------------------------------------
+
+# SSE read timeout for the session/prompt POST client (the GET stream itself
+# uses read=None for an open-ended stream). 60s matches the supervisor's
+# per-chunk cadence ceiling.
+_SSE_READ_TIMEOUT_S = 60.0
+
+
+def _parse_sse_block(block: str, rpc_id: str) -> dict | None:
+    """Parse one ``data: <json>`` block into a structured event dict.
+
+    Single source of truth: delegates to ``parse_acp_event`` so every consumer
+    (SDK ``astream``, server ``_persist_prompt_events``, /events SSE, and every
+    provider's ``execute_prompt``) sees the same event taxonomy. Returns
+    ``None`` for heartbeats, non-event meta updates (e.g.
+    ``available_commands_update``), empty-text chunks, or events whose JSON-RPC
+    ``id`` doesn't match ``rpc_id`` (concurrent ACP traffic on one supervisor).
+    """
+    return parse_acp_event(block, rpc_id)

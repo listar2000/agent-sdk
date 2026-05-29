@@ -26,7 +26,7 @@ from api.sandbox.state import DockerSandboxState, SandboxState
 log = logging.getLogger(__name__)
 
 # Per-prompt SSE drain budget; matches DaytonaSandboxSession.
-_SSE_READ_TIMEOUT_S = 60.0
+from api.sse import _SSE_READ_TIMEOUT_S  # noqa: F401
 
 
 class DockerSandboxSession(BaseSandboxSession):
@@ -155,7 +155,7 @@ class DockerSandboxSession(BaseSandboxSession):
         # SSE pipe is identical to daytona's — supervisor.js exposes the
         # same /v1/acp/{id} endpoint regardless of which container it
         # runs in. Reuse the daytona module's parser.
-        from api.providers.daytona.session import _parse_sse_block
+        from api.sse import _parse_sse_block
         import asyncio
 
         if rpc_id is None:

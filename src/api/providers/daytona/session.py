@@ -32,10 +32,11 @@ log = logging.getLogger(__name__)
 # ``_SUPERVISOR_REMOTE_PORT`` in src/api/providers/daytona.py.
 _SUPERVISOR_PORT = 9100
 
-# Per-prompt SSE drain budget. supervisor.js sends a ``: heartbeat\n\n``
-# every 25 s, so any 60 s gap means the supervisor (or the proxy path
-# to it) is gone. Same value as src/api/server.py ``_SSE_READ_TIMEOUT_S``.
-_SSE_READ_TIMEOUT_S = 60.0
+# SSE stream constants + block parser now live in api.sse (shared by all
+# providers). Re-imported here so this module's execute_prompt + the parity
+# test's ``from api.providers.daytona.session import _parse_sse_block`` keep
+# resolving.
+from api.sse import _parse_sse_block, _SSE_READ_TIMEOUT_S  # noqa: E402,F401
 
 
 class DaytonaSandboxSession(BaseSandboxSession):
@@ -421,15 +422,4 @@ class DaytonaSandboxSession(BaseSandboxSession):
 # ---------------------------------------------------------------------------
 
 
-def _parse_sse_block(block: str, rpc_id: str) -> dict[str, Any] | None:
-    """Parse one ``data: <json>\\n`` block into a structured event dict.
-
-    Single source of truth: delegates to ``api.sse.parse_acp_event`` so
-    every consumer (SDK ``astream``, server ``_persist_prompt_events``,
-    /events SSE) sees the same event taxonomy. Returns ``None`` for
-    heartbeats, non-event meta updates (e.g. ``available_commands_update``),
-    empty-text chunks, or events whose JSON-RPC ``id`` doesn't match
-    ``rpc_id`` (concurrent ACP traffic on the same supervisor).
-    """
-    from api.sse import parse_acp_event
-    return parse_acp_event(block, rpc_id)
+# ``_parse_sse_block`` now lives in api.sse (re-imported above).

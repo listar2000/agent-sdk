@@ -20,7 +20,7 @@ from api.sandbox.state import SandboxState, UnixLocalSandboxState
 
 log = logging.getLogger(__name__)
 
-_SSE_READ_TIMEOUT_S = 60.0
+from api.sse import _SSE_READ_TIMEOUT_S  # noqa: F401
 
 
 class UnixLocalSandboxSession(BaseSandboxSession):
@@ -130,7 +130,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         if self._supervisor_url is None or self._acp_session_id is None:
             raise RuntimeError("UnixLocalSandboxSession.execute_prompt called before start()")
 
-        from api.providers.daytona.session import _parse_sse_block
+        from api.sse import _parse_sse_block
 
         if rpc_id is None:
             rpc_id = str(uuid4())
