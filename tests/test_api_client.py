@@ -8,7 +8,7 @@ The point of these tests is to lock the wire contract between the
 client and the server. If a method silently sends the wrong verb or
 path, these tests catch it before the PR lands. They don't test the
 server's behaviour — that's what the golden-suite in
-test_sandbox_stop_delete_recovery.py is for.
+test_golden.py is for.
 """
 from __future__ import annotations
 

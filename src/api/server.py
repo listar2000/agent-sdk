@@ -55,6 +55,7 @@ from .db import (
     log_event,
     read_sandbox_state,
     update_session_env,
+    update_session_pre_start_commands,
     update_session_secrets,
     upsert_agent,
     upsert_session,
@@ -1290,7 +1291,9 @@ async def list_sessions_route():
     now = time.time()
     out = []
     for s in get_pool()._active.values():  # noqa: SLF001
-        last = s.liveness._last_chunk_at  # noqa: SLF001
+        # Report the reaper's clock (compute-only) so idle_seconds matches
+        # when the session will actually hibernate — not viewer activity.
+        last = s.liveness._last_compute_at  # noqa: SLF001
         out.append({
             "session_id": s.session_id,
             "agent_id": s._agent_id,  # noqa: SLF001
@@ -1369,7 +1372,9 @@ async def session_status(session_id: str):
             "supervisor_port": sb_state.get("listen_port") if isinstance(sb_state, dict) else None,
         }
     state = pool_session.state
-    last_chunk = pool_session.liveness._last_chunk_at
+    # Compute-only clock so idle_seconds reflects reaper timing, not viewer
+    # traffic (an open /events or status poll no longer skews this).
+    last_chunk = pool_session.liveness._last_compute_at
     return {
         "session_id": session_id,
         "agent_id": pool_session._agent_id,
@@ -1383,6 +1388,46 @@ async def session_status(session_id: str):
         "supervisor_url": pool_session.supervisor_url,
         "supervisor_port": getattr(state, "listen_port", None),
     }
+
+
+@app.post("/sessions/{session_id}/reap")
+async def session_reap(session_id: str, request: Request):
+    """Hibernate this session IFF it meets the idle reaper's criteria.
+
+    Ops / diagnostic route: reclaim a sandbox you know is idle now,
+    without waiting for the background reaper's next tick. Also the
+    deterministic, per-session seam the golden reaper test drives (the
+    global reaper's timing can't be exercised per-session under
+    ``-n auto``).
+
+    Query ``idle_s`` sets an EXPLICIT idle threshold and is authoritative
+    when provided — it overrides the per-provider windows (so ``idle_s=0``
+    really does hibernate any session that isn't actively producing
+    output, even on modal whose background window is 30 min). When
+    ``idle_s`` is omitted, the configured background windows apply,
+    including the modal-specific one. Session-scoped path so the
+    consistent-hash routing lands it on the owning replica; a session
+    not active here returns ``{hibernated: false, reason: 'not_active'}``.
+    Unlike ``/release`` (which hibernates unconditionally) this runs the
+    SAME decision the reaper uses, so it reflects the real reap policy.
+    """
+    from api.sandbox import get_pool
+    from api.sandbox.runtime import _MODAL_REAPER_IDLE_S, _REAPER_IDLE_S
+    raw = request.query_params.get("idle_s")
+    if raw is not None:
+        # Explicit threshold wins — no per-provider override, so the
+        # caller's number means exactly what it says on every provider.
+        try:
+            idle_s = float(raw)
+        except ValueError:
+            raise HTTPException(400, f"idle_s must be a number, got {raw!r}")
+        provider_idle_s = None
+    else:
+        idle_s = _REAPER_IDLE_S
+        provider_idle_s = {"modal": _MODAL_REAPER_IDLE_S}
+    return await get_pool().reap_session(
+        session_id, idle_s, provider_idle_s=provider_idle_s,
+    )
 
 
 @app.get("/sessions/{session_id}/sandbox")
@@ -2111,6 +2156,11 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
         # Log the user_message INSIDE the lock so log row order tracks
         # actual execution order.
         await _persist_user_message(session, message, rpc_id)
+        # Mark the prompt in flight so the idle reaper never hibernates this
+        # session mid-turn — covers a long, chunk-silent tool call whose
+        # compute clock would otherwise go stale. Balanced across the
+        # recovery swap below and released in the finally.
+        session.liveness.observe_prompt_start()
         try:
             ok, exc = await _drive_one(session)
             # Supervisor died mid-prompt? If the pool already cold-recovered
@@ -2133,7 +2183,13 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
                         session.session_id, rpc_id,
                     )
                     text_buf.clear(); think_buf.clear()
+                    # Move the in-flight marker onto the session the pool now
+                    # owns so each session's counter balances independently
+                    # (old: +1 at top then -1 here; new: +1 here then -1 in
+                    # the finally).
+                    session.liveness.observe_prompt_end()
                     session = replacement  # downstream writes use the new one
+                    session.liveness.observe_prompt_start()
                     ok, exc = await _drive_one(replacement)
             if not ok:
                 e = exc if exc is not None else RuntimeError(
@@ -2168,6 +2224,12 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
                     },
                 })
         finally:
+            # Release the in-flight marker on whichever session is current
+            # (the original, or the replacement after a recovery swap) so
+            # the reaper can hibernate it once it goes idle. The counter is
+            # floored at 0, so this is safe even on the unbalanced error
+            # paths.
+            session.liveness.observe_prompt_end()
             # Hard-cancel path: ``CancelledError`` is a ``BaseException``
             # in Python 3.8+ and bypasses ``except Exception``. Without
             # this finally an asyncio Task cancellation (server shutdown,
@@ -2594,31 +2656,37 @@ async def session_set_config(session_id: str, request: Request):
 
 @app.post("/sessions/{session_id}/reload")
 async def session_reload(session_id: str, request: Request):
-    """Hot-reload skills / MCP servers / CLI tools on a live session.
+    """Hot-reload skills / MCP servers / CLI tools / pre-start on a live session.
 
     Body (PATCH-shaped — omit fields you don't want to change)::
 
         {
-          "skills":     [...] | {...},
-          "mcp_servers": {...},
-          "cli_tools":  [...] | {...},
-          "secrets":    {...}
+          "skills":             [...] | {...},
+          "mcp_servers":        {...},
+          "cli_tools":          [...] | {...},
+          "secrets":            {...},
+          "pre_start_commands": [...]
         }
 
     Steps:
       1. Update ``agents.config.{skills, mcp_servers, cli_tools}`` —
          persistent across cold-recovery. Update ``sessions.secrets``
-         (session-scoped) via the existing PATCH path so the next
-         supervisor spawn picks up new env values.
+         and ``sessions.pre_start_commands`` (both session-scoped) so
+         the next supervisor spawn picks up new env values and the
+         next Type-2 cold-recovery runs the new install set.
       2. Re-derive the merged ``pre_start_commands`` =
          ``_cli_install_commands(cli_tools)`` +
          ``_skills_install_commands(skills)`` +
-         ``sessions.pre_start_commands`` (raw user portion)
+         ``sessions.pre_start_commands`` (raw user portion — either
+         the value just passed in, or the existing stored value)
          and overwrite ``sandbox_state.recipe.pre_start_commands`` so
          the next Type-2 recovery re-runs the new install set.
-      3. Exec the install commands on the LIVE sandbox so they land
-         on disk now — release+resume below is Type-1 and Type-1 does
-         NOT re-run ``pre_start_commands``.
+      3. Exec the install commands AND any newly-supplied user
+         pre-start commands on the LIVE sandbox so they land on disk
+         now — release+resume below is Type-1 and Type-1 does NOT
+         re-run ``pre_start_commands``. User commands are NOT assumed
+         idempotent: they only hot-exec when freshly supplied in this
+         request, never on every reload.
       4. ``release`` only. Returns immediately. The NEXT user
          message cold-recovers the supervisor with the updated
          secrets in ``spawn_env``; ACP re-attaches with the new MCP
@@ -2634,17 +2702,24 @@ async def session_reload(session_id: str, request: Request):
     disk until the volume is wiped. Removal is a follow-up.
     """
     data = await _json_body(request)
-    mutable = {"skills", "mcp_servers", "cli_tools", "secrets"}
+    mutable = {"skills", "mcp_servers", "cli_tools", "secrets", "pre_start_commands"}
     if not (mutable & data.keys()):
         raise HTTPException(
             400, f"body must include at least one of {sorted(mutable)}",
         )
 
-    # ``secrets`` is session-scoped (lives on the sessions row, not
-    # agents.config). Pop it before _require_session_row so it doesn't
-    # accidentally collide with the row's existing secrets field on
-    # the response shape.
+    # ``secrets`` and ``pre_start_commands`` are session-scoped (live on
+    # the sessions row, not agents.config). Pop them before persisting
+    # the agent so they don't accidentally flow into ``AgentConfig``.
     new_secrets = data.pop("secrets", None)
+    new_pre_start = data.pop("pre_start_commands", None)
+    if new_pre_start is not None:
+        if not isinstance(new_pre_start, list) or not all(
+            isinstance(c, str) for c in new_pre_start
+        ):
+            raise HTTPException(
+                400, "reload body 'pre_start_commands' must be a list of strings",
+            )
     session_row = await _require_session_row(session_id)
     agent_id = session_row["agent_id"]
     agent = await _require_agent(agent_id)
@@ -2664,12 +2739,21 @@ async def session_reload(session_id: str, request: Request):
     if new_secrets is not None:
         coerced = _coerce_env_dict(new_secrets, "reload body 'secrets'")
         await update_session_secrets(session_id, coerced)
+    # 1c. Persist pre_start_commands (raw user portion) on the session row.
+    #     PATCH-shaped: ``[]`` clears, ``[...]`` replaces. Matches the
+    #     contract documented at ``upsert_session`` — column stores raw
+    #     user commands, never the merged skill+cli+user result.
+    if new_pre_start is not None:
+        await update_session_pre_start_commands(session_id, list(new_pre_start))
 
     # 2. Re-derive merged pre_start, write to recipe in sandbox_state.
     #    Column stores raw user commands (post-2026-05 contract); skill +
     #    cli installs are layered in at use time. Order matches
     #    ``_build_pre_start_commands``: cli + skills + user.
-    user_pre_start = list(session_row.get("pre_start_commands") or [])
+    user_pre_start = (
+        list(new_pre_start) if new_pre_start is not None
+        else list(session_row.get("pre_start_commands") or [])
+    )
     cli_install_cmds = (
         _cli_install_commands(agent.config.cli_tools)
         if agent.config.cli_tools else []
@@ -2691,6 +2775,11 @@ async def session_reload(session_id: str, request: Request):
     #    on already-installed sources, so running the full set (not just
     #    the delta) keeps the code simple. ``mkdir -p
     #    $HOME/.claude/skills`` mirrors the daytona pre-start wrapper.
+    #    Newly-supplied user pre-start commands are appended LAST (same
+    #    order as ``_build_pre_start_commands``: cli + skills + user) and
+    #    only when the caller passed ``pre_start_commands`` in this
+    #    request — user commands aren't assumed idempotent, so re-running
+    #    them on every reload would be unsafe.
     #    Best-effort: a single failed exec doesn't abort the reload —
     #    release+resume below still runs.
     live_cmds = (
@@ -2698,6 +2787,8 @@ async def session_reload(session_id: str, request: Request):
         cli_install_cmds
         # Skills install, with the mkdir guard.
         + [f"mkdir -p $HOME/.claude/skills && {c}" for c in skill_install_cmds]
+        # User pre-start (only when explicitly supplied this request).
+        + (list(new_pre_start) if new_pre_start is not None else [])
     )
     for cmd in live_cmds:
         try:
@@ -2734,6 +2825,10 @@ async def session_reload(session_id: str, request: Request):
         # secrets are session-scoped + sensitive — surface only the key
         # set in the response (mirrors ``GET /sessions/{id}``'s redaction).
         "secret_keys": sorted(new_secrets.keys()) if new_secrets else None,
+        # User portion (raw) — what's stored on the session row.
+        "user_pre_start_commands": user_pre_start,
+        # Merged install set (cli + skills + user) — what's written to
+        # ``sandbox_state.recipe.pre_start_commands`` for Type-2 recovery.
         "pre_start_commands": merged,
     }
 

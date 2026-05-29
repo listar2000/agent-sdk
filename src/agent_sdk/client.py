@@ -556,12 +556,14 @@ class Session:
         mcp_servers: dict | None = None,
         cli_tools: list | dict | None = None,
         secrets: dict[str, str] | None = None,
+        pre_start_commands: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Hot-swap skills / MCP / CLI tools / secrets on this session.
+        """Hot-swap skills / MCP / CLI tools / secrets / pre-start on this session.
 
         ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
         clear. Updates ``agents.config`` (skills / MCP / CLI) or the
-        session row (secrets), runs new installs on the live sandbox,
+        session row (secrets, pre_start_commands), runs new installs and
+        any newly-supplied user pre-start commands on the live sandbox,
         then releases the lease — supervisor stays down. The NEXT user
         message cold-recovers it with the new state visible. Lazy on
         purpose: no 15-30s sync wait. Conversation continuity is
@@ -569,14 +571,19 @@ class Session:
 
         Writes ``skills`` / ``mcp_servers`` / ``cli_tools`` back onto
         the parent ``Agent`` so a subsequent ``clone()`` carries the
-        updated config. ``secrets`` are session-scoped and are NOT
-        mirrored onto the Agent — only the active session reflects them.
+        updated config. ``secrets`` and ``pre_start_commands`` are
+        session-scoped and are NOT mirrored onto the Agent — only the
+        active session reflects them. ``pre_start_commands`` refers to
+        the raw user portion only (skill + CLI installs are layered in
+        automatically); the new commands are NOT assumed idempotent, so
+        they only execute when freshly supplied in this call.
         """
         await self._ensure_registered()
         result = await self._agent._api.reload_session(
             self.session_id,
             skills=skills, mcp_servers=mcp_servers,
             cli_tools=cli_tools, secrets=secrets,
+            pre_start_commands=pre_start_commands,
         )
         if skills is not None:
             self._agent.skills = skills
@@ -1057,8 +1064,9 @@ class Agent:
         mcp_servers: dict | None = None,
         cli_tools: list | dict | None = None,
         secrets: dict[str, str] | None = None,
+        pre_start_commands: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Hot-swap skills / MCP / CLI tools / secrets on the default session.
+        """Hot-swap skills / MCP / CLI tools / secrets / pre-start on the default session.
 
         Per-field PATCH semantics: ``None`` (default) = leave alone;
         ``[]`` / ``{}`` = clear; a value = replace just that field.
@@ -1068,6 +1076,7 @@ class Agent:
         return await self._ensure_default_session().reload(
             skills=skills, mcp_servers=mcp_servers,
             cli_tools=cli_tools, secrets=secrets,
+            pre_start_commands=pre_start_commands,
         )
 
     async def cancel(self) -> None:

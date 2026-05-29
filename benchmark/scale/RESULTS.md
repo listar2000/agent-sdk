@@ -50,7 +50,7 @@ mock-ACP bench above.
 
 ## Recovery goldens — 90/90 on 4× nginx + new design
 
-`pytest tests/test_sandbox_stop_delete_recovery.py -n auto`:
+`pytest tests/test_golden.py -n auto`:
 
 ```
 90 passed, 30 skipped, 0 failed in 4m 46s
@@ -109,7 +109,7 @@ no failover.
 AGENT_SDK_REPLICAS=4 scripts/launch_server_test.sh
 
 # Recovery goldens under -n auto (any provider):
-.venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto
+.venv/bin/python -m pytest tests/test_golden.py -n auto
 
 # Adversarial: cross-replica 307 + takeover + claim race
 .venv/bin/python benchmark/scale/test_adversarial.py

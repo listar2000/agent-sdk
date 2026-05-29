@@ -14,7 +14,7 @@ scripts/launch_server_test.sh &     # defaults AGENT_SDK_ORIGIN=test
 #   Daytona : DAYTONA_API_KEY
 #   Modal   : `modal setup` (writes ~/.modal.toml)
 
-.venv/bin/pytest tests/test_sandbox_stop_delete_recovery.py -n auto -v
+.venv/bin/pytest tests/test_golden.py -n auto -v
 .venv/bin/pytest tests/test_attach_recovers_with_no_volume_journal.py -n auto -v
 .venv/bin/pytest tests/test_async_correctness.py -n auto -v   # mechanism-only, no server
 ```
@@ -23,7 +23,7 @@ Warm-server timing under `-n auto`: ~1 min unix_local, ~3–5 min daytona. `test
 
 End-to-end tests are parametrized over `claude` + `opencode` via `tests/_acp_runtimes.py`. Each runtime auto-skips when its credential env var (`CLAUDE_CODE_OAUTH_TOKEN` / `OPENROUTER_API_KEY`) is unset. Filter with `-k claude` / `-k opencode` to run one runtime.
 
-## Golden recovery — `test_sandbox_stop_delete_recovery.py`
+## Golden recovery — `test_golden.py`
 
 16 tests × `provider × agent_type` = **120 cases**. Each simulates an out-of-band provider event (`daytona.delete`, `docker rm -f`, `kill -9`, `pkill supervisor.js`) that bypasses the server's HTTP API; the next client request must succeed without intervention. Invariants are deterministic server-side (`inner_session_id`, `sandbox_ref`, non-empty reply) — never "agent recalls X" (LLM guardrails flake).
 

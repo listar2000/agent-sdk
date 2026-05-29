@@ -48,21 +48,43 @@ class Liveness:
     ) -> None:
         self._state: LivenessState = "unknown"
         self._last_chunk_at: float | None = None
+        # Compute-only activity clock. Advanced ONLY by signals that prove
+        # the supervisor/agent actually did work (prompt chunks + a
+        # successful health probe) — NOT by viewer traffic (open /events,
+        # status polls, file browsing). The idle reaper keys off THIS, so
+        # an attached-but-idle UI no longer pins expensive compute. Kept
+        # separate from ``_last_chunk_at`` (which still records all activity
+        # for the re-probe / staleness path) to de-conflate the two
+        # lifecycles. See ``pool._should_reap``.
+        self._last_compute_at: float | None = None
+        # Reentrant in-flight prompt counter. >0 while an ``execute_prompt``
+        # drive is running (including across a mid-prompt recovery swap), so
+        # a long chunk-silent turn — a multi-minute tool call emitting no
+        # SSE — is never reaped out from under itself even if the compute
+        # clock goes stale. Bumped by ``observe_prompt_start/end`` around the
+        # server's prompt lock.
+        self._in_flight: int = 0
         self._probe = probe
         self._unknown_after_idle_s = unknown_after_idle_s
 
     # --- Writer side (called by successful session activity) ---
 
     def observe_chunk(self) -> None:
+        now = time.monotonic()
         self._state = "alive"
-        self._last_chunk_at = time.monotonic()
+        self._last_chunk_at = now
+        # A prompt chunk is real compute work — advance the compute clock.
+        self._last_compute_at = now
 
     def observe_activity(self) -> None:
-        """Record non-prompt activity against an already-live session.
+        """Record non-prompt VIEWER activity against an already-live session.
 
-        File browsing, status checks, and persistent /events heartbeats are
-        user activity just as much as prompt chunks. They should keep the
-        pool reaper from hibernating an actively viewed sandbox.
+        File browsing, status checks, and persistent /events heartbeats keep
+        the session marked ``alive`` (so the re-probe path doesn't fire
+        needlessly), but they are NOT compute work — they deliberately do
+        NOT advance ``_last_compute_at``, so an open UI/SSE consumer can no
+        longer pin idle compute against the reaper (the reaper reads
+        ``_last_compute_at``, not ``_last_chunk_at``).
         """
         if self._state != "dead":
             self._state = "alive"
@@ -77,6 +99,22 @@ class Liveness:
         # caller probes if needed.
         if self._state == "alive":
             self._state = "unknown"
+
+    def observe_prompt_start(self) -> None:
+        """Mark a prompt drive as in flight. Reentrant: paired with
+        ``observe_prompt_end``. The reaper never hibernates a session with
+        ``in_flight`` true, so a chunk-silent long turn (e.g. a multi-minute
+        tool call) survives even if ``_last_compute_at`` goes stale."""
+        self._in_flight += 1
+
+    def observe_prompt_end(self) -> None:
+        """Pair of ``observe_prompt_start``. Floored at 0 so an unbalanced
+        end (e.g. after a recovery swap) can't drive the counter negative."""
+        self._in_flight = max(0, self._in_flight - 1)
+
+    @property
+    def in_flight(self) -> bool:
+        return self._in_flight > 0
 
     # --- Reader side (called by callers wanting to use the session) ---
 
@@ -128,6 +166,12 @@ class Liveness:
             return False
         if result:
             self._state = "alive"
+            # Refresh the staleness/re-probe debounce clock — but NOT the
+            # compute clock: a successful health probe only proves the
+            # supervisor is reachable, not that the agent did work. Counting
+            # it as compute would let a status-poller (every /status does a
+            # force_probe) re-pin idle compute against the reaper. The reaper
+            # reads ``_last_compute_at``, which only ``observe_chunk`` moves.
             self._last_chunk_at = time.monotonic()
             return True
         self._state = "dead"

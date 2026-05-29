@@ -59,7 +59,7 @@ from agent_sdk import ApiClient  # noqa: E402
 # server contract, same teardown semantics, same provider guards. The
 # fixture ``_auto_destroy_test_sandboxes`` autouse lives in that module
 # and registers anything appended to ``_CREATED_SESSIONS``.
-from tests.test_sandbox_stop_delete_recovery import (  # type: ignore[import-not-found]  # noqa: E402
+from tests.test_golden import (  # type: ignore[import-not-found]  # noqa: E402
     SERVER, OAUTH_TOKEN, DAYTONA_API_KEY, PROMPT_TIMEOUT,
     _require_provider,
     _quick_session, _ask, _send_message, _collect_reply,
