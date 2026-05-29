@@ -387,16 +387,18 @@ class ApiClient:
         mcp_servers: dict | None = None,
         cli_tools: list | dict | None = None,
         secrets: dict[str, str] | None = None,
+        pre_start_commands: list[str] | None = None,
     ) -> dict[str, Any]:
-        """``POST /sessions/{id}/reload`` — hot-swap skills / MCP / CLI / secrets.
+        """``POST /sessions/{id}/reload`` — hot-swap skills / MCP / CLI / secrets / pre-start.
 
         ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
         clear. Updates ``agents.config`` for skills/MCP/CLI and
-        ``sessions.secrets`` for secrets, re-derives the merged
-        ``pre_start_commands`` so future cold-recoveries use the new
-        install set, execs the new installs against the live sandbox,
-        then restarts the supervisor via release + resume — the new
-        secrets land in the supervisor's ``spawn_env`` on the next boot.
+        ``sessions.{secrets, pre_start_commands}`` for the session-scoped
+        fields, re-derives the merged install list so future
+        cold-recoveries use the new set, execs new installs against the
+        live sandbox, then restarts the supervisor via release + resume
+        — the new secrets land in the supervisor's ``spawn_env`` on the
+        next boot.
 
         ``cli_tools`` accepts ``list[str]`` of ``uv tool install``
         sources (PyPI packages or VCS URLs) or
@@ -404,6 +406,13 @@ class ApiClient:
 
         ``secrets`` is full-replace: ``{}`` wipes all secrets,
         ``{"FOO": "bar"}`` replaces with just that entry.
+
+        ``pre_start_commands`` is full-replace and refers to the RAW
+        USER portion only (skill + CLI installs are still layered in
+        automatically). ``[]`` clears, ``[...]`` replaces. The new
+        commands hot-exec on the live sandbox immediately AND are
+        persisted for future Type-2 cold-recoveries — they are NOT
+        assumed idempotent, so they only run when freshly supplied.
 
         Lazy: returns once installs have run on the live sandbox and
         the lease is released. The supervisor stays down until the
@@ -419,10 +428,12 @@ class ApiClient:
             body["cli_tools"] = cli_tools
         if secrets is not None:
             body["secrets"] = secrets
+        if pre_start_commands is not None:
+            body["pre_start_commands"] = pre_start_commands
         if not body:
             raise ValueError(
                 "reload_session: pass at least one of skills, mcp_servers, "
-                "cli_tools, secrets"
+                "cli_tools, secrets, pre_start_commands"
             )
         return await self._json(
             "POST", f"/sessions/{session_id}/reload",

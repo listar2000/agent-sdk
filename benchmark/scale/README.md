@@ -56,7 +56,7 @@ PROVIDER=unix_local N_SESSIONS=128 .venv/bin/python benchmark/scale/driver.py
 .venv/bin/python benchmark/scale/test_adversarial.py
 
 # Goldens against 4× LB:
-.venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto
+.venv/bin/python -m pytest tests/test_golden.py -n auto
 ```
 
 ## Daytona and Modal

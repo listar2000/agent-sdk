@@ -64,7 +64,7 @@ def _run_one(provider: str, run: int, filter_: str, timeout: int) -> tuple[bool,
     }
     cmd = [
         VENV_PY, "-m", "pytest",
-        str(REPO / "tests" / "test_sandbox_stop_delete_recovery.py"),
+        str(REPO / "tests" / "test_golden.py"),
         "-n", "auto", "-k", filter_, "--tb=long",
     ]
     t0 = time.time()
