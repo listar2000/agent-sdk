@@ -2163,6 +2163,59 @@ async def post_session_message_stream(session_id: str, request: Request):
     )
 
 
+def _sse_frame_for(item, rpc_id: str) -> str | None:
+    """Render one subscriber-queue item as an SSE frame for THIS rpc.
+
+    Two shapes share the queue: ``(rpc_tag, raw_acp_block)`` tuples from the
+    supervisor stream, and error-broadcast dicts from the persister's failure
+    path (these carry ``rpc_id`` + are JSON-encoded so per-rpc consumers can
+    dispatch them like ACP frames — without the tag they'd be yielded untagged
+    and silently dropped by tag-filtering consumers, the Task-Builder
+    silent-failure repro). Returns ``None`` to skip: other-rpc traffic (a
+    concurrent /events subscriber's prompt shares this queue) or an unknown
+    shape. Heartbeats are handled by the caller.
+    """
+    if isinstance(item, tuple) and len(item) == 2:
+        tag, block = item
+        if tag != rpc_id:
+            return None
+        return f"event: rpc:{tag}\n{block}\n\n"
+    if isinstance(item, dict):
+        if item.get("rpc_id") != rpc_id:
+            return None
+        return f"event: rpc:{rpc_id}\ndata: {json.dumps(item)}\n\n"
+    return None
+
+
+def _is_terminal_frame(item, rpc_id: str) -> bool:
+    """True iff this item ends the turn for ``rpc_id``.
+
+    For ACP blocks (tuple):
+      * ``"stopReason"`` — JSON-RPC ``result`` envelope for a clean turn-end
+        (end_turn / cancelled / max_tokens / max_turn_requests). ACP wires
+        camelCase, so the older snake_case ``"stop_reason"`` check never fired
+        on real frames — success-termination used to depend on client
+        disconnect.
+      * ``'"type":"done"'`` — canonicalized done marker.
+      * ``'"error":'`` — top-level JSON-RPC error envelope (auth failure /
+        internal error / process death). Verified with claude-agent-acp 0.31.4.
+    Tool-call failures arrive as ``session/update`` notifications with no
+    top-level ``error`` field; ``-32601`` handshake errors are filtered by
+    ``parse_acp_payload`` before broadcast, so neither reaches here.
+    For error-broadcast dicts: ``type == "error"``.
+    """
+    if isinstance(item, tuple) and len(item) == 2:
+        tag, block = item
+        return tag == rpc_id and (
+            "stopReason" in block
+            or '"type":"done"' in block
+            or '"error":' in block
+        )
+    if isinstance(item, dict):
+        return item.get("rpc_id") == rpc_id and item.get("type") == "error"
+    return False
+
+
 async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
     """Stream branch with an ALREADY-RESOLVED session.
 
@@ -2211,49 +2264,15 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
             if item is _HEARTBEAT:
                 yield ": heartbeat\n\n"
                 continue
-            if isinstance(item, tuple) and len(item) == 2:
-                tag, block = item
-                # Filter to this prompt only — concurrent /events
-                # subscribers may have triggered other prompts whose
-                # blocks share the queue.
-                if tag != rpc_id:
-                    continue
-                yield f"event: rpc:{tag}\n{block}\n\n"
-                # Terminal:
-                #   * ``"stopReason"`` — JSON-RPC ``result`` envelope
-                #     emitted by ACP for a clean turn-end (end_turn /
-                #     cancelled / max_tokens / max_turn_requests). The
-                #     existing snake_case ``"stop_reason"`` substring
-                #     was a long-standing bug — ACP wires camelCase, so
-                #     the check never fired on real frames; success-
-                #     termination depended on client disconnect.
-                #   * ``"error":`` — top-level JSON-RPC error envelope
-                #     emitted by ACP for a fatal turn-end (auth failure
-                #     / internal error / process death). Verified end-
-                #     to-end with claude-agent-acp 0.31.4.
-                # Tool-call failures arrive as ``method=session/update``
-                # notifications and never produce a top-level ``error``
-                # field; ``-32601`` handshake errors are filtered by
-                # ``parse_acp_payload`` before broadcast (see
-                # ``api/sse.py:86``) so they don't reach this check.
-                if (
-                    "stopReason" in block
-                    or '"type":"done"' in block
-                    or '"error":' in block
-                ):
-                    return
-            elif isinstance(item, dict):
-                if item.get("rpc_id") != rpc_id:
-                    continue
-                # Carry the rpc tag so per-rpc consumers (UI, tests'
-                # _PersistentSse) can dispatch error broadcasts the same
-                # way they dispatch ACP frames. Without this the error
-                # is yielded as untagged ``data:`` and silently dropped
-                # by tag-filtering consumers — the production Task
-                # Builder silent-failure repro.
-                yield f"event: rpc:{rpc_id}\ndata: {json.dumps(item)}\n\n"
-                if item.get("type") == "error":
-                    return
+            # Two item shapes share this queue (ACP-block tuples + error
+            # dicts). ``_sse_frame_for`` filters to THIS rpc and renders the
+            # frame (None = skip); ``_is_terminal_frame`` ends the turn.
+            frame = _sse_frame_for(item, rpc_id)
+            if frame is None:
+                continue
+            yield frame
+            if _is_terminal_frame(item, rpc_id):
+                return
     finally:
         # The generator returns the moment the ``done`` block reaches
         # us — but the persister (driven by execute_prompt's yield) is
