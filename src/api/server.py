@@ -2802,43 +2802,9 @@ async def session_files_download(session_id: str, path: str):
 
 
 # ---------------------------------------------------------------------------
-# Static UI
+# Static UI — routes live in api.routers.ui (refactor slice 6)
 # ---------------------------------------------------------------------------
 
-_UI_DIR = Path(__file__).parents[2] / "ui"
-_UI_CACHE: dict[str, str] = {}
+from .routers import ui as _ui_router  # noqa: E402
 
-
-def _serve_ui_file(filename: str, label: str) -> Response:
-    cached = _UI_CACHE.get(filename)
-    if cached is None:
-        try:
-            cached = (_UI_DIR / filename).read_text()
-        except FileNotFoundError:
-            return PlainTextResponse(f"{label} not found", status_code=404)
-        _UI_CACHE[filename] = cached
-    return Response(content=cached, media_type="text/html")
-
-
-@app.get("/ui")
-async def serve_ui():
-    """Serve the chat UI."""
-    return _serve_ui_file("index.html", "UI")
-
-
-@app.get("/ui/dashboard")
-async def serve_dashboard():
-    """Serve the validation dashboard."""
-    return _serve_ui_file("dashboard.html", "Dashboard")
-
-
-@app.get("/ui/files")
-async def serve_files_ui():
-    """Serve the filesystem browser UI."""
-    return _serve_ui_file("fs.html", "Files UI")
-
-
-@app.get("/ui/volumes")
-async def serve_volumes_ui():
-    """Serve the Volume Inspector UI."""
-    return _serve_ui_file("volumes.html", "Volumes UI")
+app.include_router(_ui_router.router)
