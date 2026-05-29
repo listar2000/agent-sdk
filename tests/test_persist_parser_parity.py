@@ -168,8 +168,8 @@ def _capture_log_writes(monkeypatch) -> list[tuple[str, dict]]:
     async def _fake_log_event(*, session_id, agent_id, event_type, payload):
         rows.append((event_type, payload))
 
-    from api import server as srv
-    monkeypatch.setattr(srv, "log_event", _fake_log_event)
+    from api.services import turn_runner as _tr
+    monkeypatch.setattr(_tr, "log_event", _fake_log_event)
     return rows
 
 
