@@ -14,8 +14,6 @@ Docker is structurally simpler than daytona:
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
-from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -145,81 +143,6 @@ class DockerSandboxSession(BaseSandboxSession):
     # ------------------------------------------------------------------ #
     # execute_prompt: per-prompt supervisor SSE stream                    #
     # ------------------------------------------------------------------ #
-
-    async def execute_prompt(
-        self, message: str, *, rpc_id: str | None = None,
-    ) -> AsyncIterator[Any]:
-        if self._supervisor_url is None or self._acp_session_id is None:
-            raise RuntimeError("DockerSandboxSession.execute_prompt called before start()")
-
-        # SSE pipe is identical to daytona's — supervisor.js exposes the
-        # same /v1/acp/{id} endpoint regardless of which container it
-        # runs in. Reuse the daytona module's parser.
-        from api.sse import _parse_sse_block
-        import asyncio
-
-        if rpc_id is None:
-            rpc_id = str(uuid4())
-        prompt_payload = {
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "method": "session/prompt",
-            "params": {
-                "sessionId": self._inner_session_id,
-                "prompt": [{"type": "text", "text": message}],
-            },
-        }
-
-        sse_client = httpx.AsyncClient(
-            base_url=self._supervisor_url,
-            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
-        )
-        post_client = httpx.AsyncClient(
-            base_url=self._supervisor_url,
-            timeout=httpx.Timeout(connect=10, read=_SSE_READ_TIMEOUT_S, write=10, pool=10),
-        )
-        try:
-            async with sse_client.stream(
-                "GET", f"/v1/acp/{self._acp_session_id}",
-                headers={"Accept": "text/event-stream"},
-            ) as sse:
-                sse.raise_for_status()
-
-                async def _send_prompt() -> None:
-                    try:
-                        await post_client.post(
-                            f"/v1/acp/{self._acp_session_id}", json=prompt_payload,
-                        )
-                    except Exception:
-                        log.exception("prompt POST failed for session %s", self.session_id)
-
-                send_task = asyncio.create_task(_send_prompt())
-
-                buf = ""
-                try:
-                    async for chunk in sse.aiter_text():
-                        self.liveness.observe_chunk()
-                        buf += chunk
-                        while "\n\n" in buf:
-                            block, buf = buf.split("\n\n", 1)
-                            event = _parse_sse_block(block, rpc_id)
-                            if event is None:
-                                continue
-                            self._broadcast((rpc_id, block))
-                            yield event
-                            if event.get("type") in ("done", "error"):
-                                return
-                finally:
-                    if not send_task.done():
-                        send_task.cancel()
-                        try:
-                            await send_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    self.liveness.observe_close()
-        finally:
-            await sse_client.aclose()
-            await post_client.aclose()
 
     # ------------------------------------------------------------------ #
     # stop: snapshot then container stop                                  #
