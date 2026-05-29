@@ -20,7 +20,7 @@ What's here:
 """
 from .factory import make_session, register
 from .liveness import Liveness, LivenessState
-from .pool import SessionPool
+from .pool import SessionNotFoundError, SessionPool
 from .runtime import get_pool, shutdown_pool, start_reaper, start_worker_heartbeat
 from .session import BaseSandboxSession
 from .state import (
@@ -45,6 +45,7 @@ __all__ = [
     "ModalSandboxState",
     "Recipe",
     "SandboxState",
+    "SessionNotFoundError",
     "SessionPool",
     "UnixLocalSandboxState",
     "UnknownSandboxState",
