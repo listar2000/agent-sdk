@@ -2065,6 +2065,58 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
 
     text_buf: list[str] = []
     think_buf: list[str] = []
+    event_counts: dict[str, int] = {}
+    saw_output_event = False
+    saw_error_event = False
+    terminal_stop_reason: str | None = None
+    last_usage: object | None = None
+
+    def _reset_turn_observability() -> None:
+        nonlocal saw_output_event, saw_error_event, terminal_stop_reason, last_usage
+        event_counts.clear()
+        saw_output_event = False
+        saw_error_event = False
+        terminal_stop_reason = None
+        last_usage = None
+
+    def _observe_event(event: dict) -> None:
+        nonlocal saw_output_event, saw_error_event, terminal_stop_reason, last_usage
+        etype = str(event.get("type") or "event")
+        event_counts[etype] = event_counts.get(etype, 0) + 1
+        # ``done`` / ``usage`` events from execute_prompt carry their
+        # payload under the ACP-style ``raw`` envelope until ``_write``
+        # flattens it; read both shapes so observability sees the same
+        # values the persisted row will.
+        raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+        if etype in {"text", "reasoning", "tool", "tool_result"}:
+            saw_output_event = True
+        elif etype == "error":
+            saw_error_event = True
+        elif etype == "usage":
+            last_usage = event.get("usage") or raw.get("usage")
+        elif etype == "done":
+            terminal_stop_reason = (
+                event.get("stop_reason")
+                or raw.get("stop_reason")
+                or raw.get("stopReason")
+            )
+
+    def _log_empty_turn_if_needed() -> None:
+        if saw_output_event or saw_error_event:
+            return
+        if terminal_stop_reason is None or terminal_stop_reason == "cancelled":
+            return
+        log.warning(
+            "empty prompt turn: session=%s agent=%s rpc=%s "
+            "stop_reason=%s usage=%r events=%s message_chars=%d",
+            session.session_id,
+            agent_id,
+            rpc_id,
+            terminal_stop_reason,
+            last_usage,
+            dict(sorted(event_counts.items())),
+            len(message or ""),
+        )
 
     async def _write(event: dict) -> None:
         etype = event.get("type", "event")
@@ -2131,6 +2183,7 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
             async for event in active_session.execute_prompt(message, rpc_id=rpc_id):
                 if not isinstance(event, dict):
                     continue
+                _observe_event(event)
                 t = event.get("type")
                 if t == "text":
                     if think_buf:
@@ -2183,6 +2236,7 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
                         session.session_id, rpc_id,
                     )
                     text_buf.clear(); think_buf.clear()
+                    _reset_turn_observability()
                     # Move the in-flight marker onto the session the pool now
                     # owns so each session's counter balances independently
                     # (old: +1 at top then -1 here; new: +1 here then -1 in
@@ -2223,6 +2277,8 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
                         },
                     },
                 })
+            else:
+                _log_empty_turn_if_needed()
         finally:
             # Release the in-flight marker on whichever session is current
             # (the original, or the replacement after a recovery swap) so
