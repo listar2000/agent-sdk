@@ -16,6 +16,14 @@ UT_TOOL_CALL_UPDATE = "tool_call_update"
 UT_USAGE_UPDATED = "usage_updated"
 UT_USAGE_UPDATE = "usage_update"
 
+# Read timeout for the session/prompt POST in the SSE prompt-drive
+# (``BaseSandboxSession.execute_prompt``). The SSE GET itself uses
+# ``read=None`` (the stream stays open for the whole turn); only the POST
+# that kicks off the prompt is bounded by this. Provider-agnostic — the
+# supervisor.js HTTP contract is identical across daytona/docker/modal/
+# unix_local.
+_SSE_READ_TIMEOUT_S = 60.0
+
 
 async def iter_sse_blocks(response: httpx.Response) -> AsyncIterator[str]:
     """Yield SSE blocks from an httpx streaming response."""

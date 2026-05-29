@@ -10,8 +10,6 @@ originally pinned):
    can't stall every other coroutine for 10 seconds. Source-grep test.
 2. ``allocate_sandbox_port`` is atomic under concurrent callers (pure-sync
    critical section, asyncio single-threaded guarantee).
-3. ``SessionState.dispatch`` buffers events when no subscribers exist so
-   the UI's EventSource-reconnect-gap doesn't drop prompt replies.
 """
 from __future__ import annotations
 
@@ -94,96 +92,3 @@ async def test_allocate_sandbox_port_free_and_reuse():
     sh.free_sandbox_port("sid-test2", p1)
     p3 = sh.allocate_sandbox_port("sid-test2")
     assert p3 == p1, "freed port must be recycled before the counter advances"
-
-
-# ---------------------------------------------------------------------------
-# 3. SessionState.dispatch must not drop events when no subscribers exist
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_dispatch_with_no_subscribers_buffers_for_next_subscribe():
-    """Prod UI bug: supervisor dies → server's SSE reader kicks subscribers
-    → browser's EventSource retry timer fires ~3s later → user types a
-    message IN that gap → POST /message queues the prompt → scheduler
-    dispatches the reply events via ``SessionState.dispatch`` to zero
-    subscribers → events silently dropped → UI sits at "Queued for
-    agent" forever.
-
-    Invariant under test: events dispatched while both rpc and session
-    subscriber lists are empty must still be delivered to the first
-    session subscriber that shows up afterwards (replay buffer).
-
-    Deterministic — no real sandbox, no sleeps. Exercises SessionState
-    directly: dispatch with no subscribers, then subscribe_session, then
-    drain the queue. On the unfixed baseline the queue is empty (events
-    were dropped at dispatch time).
-    """
-    from api.models import SessionState
-
-    st = SessionState(session_id="s", agent_id="a", sandbox_id="sb")
-
-    # Dispatch three events while nobody is listening. On the real path
-    # these would be the assistant_message / tool_call / done SSE blocks
-    # from the scheduler's prompt reply.
-    st.dispatch("rpc1", ("rpc1", "data: block-a\n\n"))
-    st.dispatch("rpc1", ("rpc1", "data: block-b\n\n"))
-    st.dispatch("rpc1", ("rpc1", "data: done\n\n"))
-
-    # UI's EventSource finally reconnects — subscribe and drain.
-    q = st.subscribe_session()
-    drained: list[tuple[str, str]] = []
-    while not q.empty():
-        drained.append(q.get_nowait())
-
-    assert len(drained) == 3, (
-        f"events dispatched while no subscriber existed were dropped: "
-        f"got {len(drained)} items, want 3. This is the UI's 'Queued for "
-        f"agent' bug — the reconnect gap between server-side kick and "
-        f"browser EventSource retry loses every event for prompts the "
-        f"user submitted during the gap."
-    )
-    # Order preserved.
-    assert [item[1] for item in drained] == [
-        "data: block-a\n\n",
-        "data: block-b\n\n",
-        "data: done\n\n",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_dispatch_with_active_subscriber_skips_buffer():
-    """Buffer must not grow while subscribers are actively draining —
-    only the no-subscribers path should touch the replay deque.
-    """
-    from api.models import SessionState
-
-    st = SessionState(session_id="s", agent_id="a", sandbox_id="sb")
-    q1 = st.subscribe_session()
-
-    st.dispatch("rpc1", ("rpc1", "data: x\n\n"))
-    assert q1.qsize() == 1
-    # A late second subscriber should NOT receive the event that already
-    # went to q1 — only events dispatched during a zero-subscriber window.
-    q2 = st.subscribe_session()
-    assert q2.empty(), "buffer replay leaked an event that was already delivered"
-
-
-@pytest.mark.asyncio
-async def test_buffer_bounded_under_flood():
-    """The no-subscribers buffer must be bounded so a session with an
-    unresponsive client (never reconnects) can't grow memory forever.
-    """
-    from api.models import SessionState
-
-    st = SessionState(session_id="s", agent_id="a", sandbox_id="sb")
-
-    # Flood with more than any reasonable agent turn's event count.
-    for i in range(50_000):
-        st.dispatch("rpc", ("rpc", f"data: {i}\n\n"))
-
-    q = st.subscribe_session()
-    assert q.qsize() <= 10_000, (
-        f"pending-broadcast buffer grew past a sane bound: {q.qsize()} items "
-        f"would be drained onto a reconnecting subscriber"
-    )

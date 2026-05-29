@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 from .liveness import Liveness
 from .state import SandboxState
+
+log = logging.getLogger(__name__)
 
 # Sentinel placed on a subscriber's queue to signal end-of-stream.
 _END = object()
@@ -220,14 +223,6 @@ class BaseSandboxSession(abc.ABC):
         mcp_servers = cfg.mcp_servers if cfg else None
 
         client = self._get_acp_client()
-        mcp_servers = None
-        if self._agent_id:
-            try:
-                agent = await _db.get_agent(self._agent_id)
-                if agent and agent.config and agent.config.mcp_servers:
-                    mcp_servers = agent.config.mcp_servers
-            except Exception:
-                mcp_servers = None
         await client.attach(
             self._acp_session_id,
             self.state.recipe.agent_type,
@@ -398,7 +393,6 @@ class BaseSandboxSession(abc.ABC):
         falls through to a bounded supervisor probe when state is
         ``unknown``. With ``force_probe=True`` the probe always runs."""
 
-    @abc.abstractmethod
     async def execute_prompt(
         self, message: str, *, rpc_id: str | None = None,
     ) -> AsyncIterator[Any]:
@@ -409,7 +403,101 @@ class BaseSandboxSession(abc.ABC):
         If ``rpc_id`` is supplied, the JSON-RPC envelope sent to the
         supervisor uses it (so callers can correlate events to a tag
         they returned to the user). If None, a fresh uuid is generated.
+
+        Provider-agnostic: every provider's compute runs the same
+        ``supervisor.js``, which exposes the identical ``/v1/acp/{id}``
+        endpoint over HTTP regardless of where it runs. The SSE drive is
+        therefore implemented ONCE here; concrete subclasses only differ
+        in how they bring that supervisor up (``start``) and tear it down
+        (``stop``/``shutdown``).
         """
+        import httpx
+
+        from api.sse import _SSE_READ_TIMEOUT_S, parse_acp_event
+
+        if self._supervisor_url is None or self._acp_session_id is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.execute_prompt called before start()"
+            )
+
+        if rpc_id is None:
+            rpc_id = str(uuid.uuid4())
+        prompt_payload = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": self._inner_session_id,
+                "prompt": [{"type": "text", "text": message}],
+            },
+        }
+
+        # SEPARATE httpx clients for the SSE GET and the session/prompt POST.
+        # Sharing one client serialises both on the same keep-alive
+        # connection and prematurely closes the SSE stream (~1.5s after the
+        # POST lands) on httpx 0.27+.
+        sse_client = httpx.AsyncClient(
+            base_url=self._supervisor_url,
+            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
+        )
+        post_client = httpx.AsyncClient(
+            base_url=self._supervisor_url,
+            timeout=httpx.Timeout(connect=10, read=_SSE_READ_TIMEOUT_S, write=10, pool=10),
+        )
+        try:
+            async with sse_client.stream(
+                "GET", f"/v1/acp/{self._acp_session_id}",
+                headers={"Accept": "text/event-stream"},
+            ) as sse:
+                sse.raise_for_status()
+
+                async def _send_prompt() -> None:
+                    try:
+                        await post_client.post(
+                            f"/v1/acp/{self._acp_session_id}", json=prompt_payload,
+                        )
+                    except Exception:
+                        log.exception("prompt POST failed for session %s", self.session_id)
+
+                send_task = asyncio.create_task(_send_prompt())
+
+                buf = ""
+                try:
+                    async for chunk in sse.aiter_text():
+                        self.liveness.observe_chunk()
+                        buf += chunk
+                        while "\n\n" in buf:
+                            block, buf = buf.split("\n\n", 1)
+                            event = parse_acp_event(block, rpc_id)
+                            if event is None:
+                                continue
+                            # rpc-tagged tuple so /events emits ``event: rpc:<id>``
+                            # and the legacy test/UI ``extract_sse_tag`` can
+                            # correlate per-prompt streams.
+                            self._broadcast((rpc_id, block))
+                            yield event
+                            # Both ``done`` (clean stopReason) and ``error``
+                            # (top-level JSON-RPC error envelope) signal that
+                            # ACP is finished with this rpc_id and will write
+                            # nothing else for it — stop iterating so the SSE
+                            # stream closes promptly. Tool failures are
+                            # ``session/update`` notifications (tool_result /
+                            # update events), never ``type=="error"``, so this
+                            # check can't end a turn the LLM is still recovering
+                            # from.
+                            if event.get("type") in ("done", "error"):
+                                return
+                finally:
+                    if not send_task.done():
+                        send_task.cancel()
+                        try:
+                            await send_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    self.liveness.observe_close()
+        finally:
+            await sse_client.aclose()
+            await post_client.aclose()
 
     @abc.abstractmethod
     async def stop(self) -> None:
