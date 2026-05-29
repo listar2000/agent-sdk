@@ -75,6 +75,7 @@ from .models import (
     VolumeRecord,
 )
 from . import providers as _providers_mod
+from .sandbox import SessionNotFoundError
 from .providers import (
     VolumeFileExistsError,
     default_cwd_for_provider,
@@ -350,6 +351,19 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
     if isinstance(detail, dict):
         return JSONResponse(detail, status_code=exc.status_code)
     return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(SessionNotFoundError)
+async def _session_not_found_handler(request: Request, exc: SessionNotFoundError):
+    """A resolved session whose ``sessions`` row is gone (deleted, swept,
+    or never existed) is a 404 — not a 500. ``pool.get_session`` raises
+    this instead of cold-bootstrapping a ghost session. Returning 404
+    lets the UI distinguish "this session is gone, stop reconnecting"
+    from a transient 5xx it should retry. Without it a stale EventSource
+    pointed at a deleted session_id hammers /events every 2s forever and
+    each tick dumps a RuntimeError stack into the logs.
+    """
+    return JSONResponse({"error": f"session {exc} not found"}, status_code=404)
 
 
 # No NotOwner handler. The per-session lease was retired in favor of

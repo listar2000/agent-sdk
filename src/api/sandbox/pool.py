@@ -32,6 +32,17 @@ from .state import Recipe, SandboxState, deserialize, serialize, state_for_provi
 log = logging.getLogger(__name__)
 
 
+class SessionNotFoundError(LookupError):
+    """Raised by ``SessionPool.get_session`` when the ``sessions`` row is
+    gone (deleted, swept, or never existed). Distinguishes "this session
+    has been removed" from "we can't reach the supervisor right now" so
+    the HTTP layer can return 404 instead of 500 — without that, every
+    UI EventSource pointed at a deleted session_id retries every 2s
+    forever and the supervisor's RuntimeError stack ends up in Railway
+    logs on each tick.
+    """
+
+
 # Type for the factory that turns a session_id + deserialised state into
 # the appropriate concrete SandboxSession subclass. Phase 2 exposes a
 # default implementation in factory.py keyed on state.type.
@@ -183,6 +194,16 @@ class SessionPool:
             if initial_state is not None:
                 state: SandboxState = initial_state
             else:
+                # Confirm the session row still exists before cold-recovering.
+                # Without this, a stale UI EventSource pointed at a deleted
+                # session_id drives ``read_sandbox_state -> None ->
+                # deserialize -> state.type=unknown`` and then ``start()``
+                # raises ``RuntimeError("session ... not found in DB")``
+                # which surfaces as 500. The browser's auto-reconnect loop
+                # then hammers /events every 2s. Make the gone state
+                # explicit so the HTTP layer can translate to 404.
+                if await db.get_session(session_id) is None:
+                    raise SessionNotFoundError(session_id)
                 state = deserialize(await db.read_sandbox_state(session_id))
             session = self._factory(session_id, state)
             log.info("[pool.get_session] session=%s creating new state.type=%s sandbox_ref=%s",
