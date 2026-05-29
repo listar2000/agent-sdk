@@ -139,6 +139,18 @@ def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
 # subscribers see after canonicalization.
 # ---------------------------------------------------------------------------
 
+class _NoopLiveness:
+    """No-op stand-in for ``Liveness`` so fake sessions satisfy the prompt
+    drive's in-flight gate (``observe_prompt_start/end``) and any other
+    liveness signal it pokes. The parity suite only exercises persistence/
+    coalescing, not reaper behavior, so these can all be no-ops."""
+
+    def observe_prompt_start(self) -> None: ...
+    def observe_prompt_end(self) -> None: ...
+    def observe_chunk(self) -> None: ...
+    def observe_activity(self) -> None: ...
+
+
 class _FakeSession:
     """Minimal stand-in: ``execute_prompt`` yields a fixed event list,
     ``_broadcast`` is a no-op, agent_id/session_id are constants. Owns
@@ -151,6 +163,7 @@ class _FakeSession:
         self._agent_id = "agent-x"
         self.session_id = "sess-x"
         self._prompt_lock = _a.Lock()
+        self.liveness = _NoopLiveness()
 
     async def execute_prompt(self, message: str, *, rpc_id: str):
         for e in self._events:
@@ -236,9 +249,9 @@ async def test_persist_serializes_concurrent_prompts_on_same_session(monkeypatch
             self._tag = tag
             self._agent_id = "agent-x"
             self.session_id = "sess-x"
+            self.liveness = _NoopLiveness()
             # Shared across both call paths in this test — the same
             # lock instance enforces serialisation.
-            pass
 
         async def execute_prompt(self, message: str, *, rpc_id: str):
             yield {"type": "text", "text": f"{self._tag}-1"}
@@ -297,6 +310,7 @@ async def test_persist_flushes_buffer_on_hard_cancel(monkeypatch):
             self._agent_id = "agent-x"
             self.session_id = "sess-x"
             self._prompt_lock = _asyncio.Lock()
+            self.liveness = _NoopLiveness()
 
         async def execute_prompt(self, message: str, *, rpc_id: str):
             yield {"type": "text", "text": "partial "}
