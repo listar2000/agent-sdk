@@ -183,13 +183,17 @@ async def _cluster_snapshot_loop() -> None:
 _BG_TASKS: set[asyncio.Task] = set()
 
 
-# Module-shared httpx client for the supervisor-proxy hot paths
-# (_proxy_from_session, _download_from_session). httpx pools connections
-# per-host internally, so file-browse sequences against the same session
-# reuse the existing TCP+TLS handshake instead of paying ~12ms setup per
-# call. Bench (50 concurrent /ping calls): per-request client = 80 RPS,
-# shared client = 599 RPS. Opened in lifespan, closed at shutdown.
-_HTTP_CLIENT: httpx.AsyncClient | None = None
+# Supervisor-proxy infra (shared httpx client + _proxy_from_session /
+# _download_from_session / _resolve_supervisor_url) lives in api.http_client
+# — cycle-free so the session_files router can proxy too. The client is
+# created/closed in the lifespan below (set_client / aclose). Re-exported here
+# so the in-server routes (exec, reload, ...) keep resolving.
+from . import http_client as _http_client_mod  # noqa: E402
+from .http_client import (  # noqa: E402,F401
+    _download_from_session,
+    _proxy_from_session,
+    _resolve_supervisor_url,
+)
 
 
 
@@ -234,11 +238,10 @@ async def lifespan(app):
     _p0 = time.perf_counter(); await init_pool(); _phases["pool"] = (time.perf_counter() - _p0) * 1000
     _p0 = time.perf_counter(); await start_batcher(); _phases["batcher"] = (time.perf_counter() - _p0) * 1000
 
-    global _HTTP_CLIENT
-    _HTTP_CLIENT = httpx.AsyncClient(
+    _http_client_mod.set_client(httpx.AsyncClient(
         timeout=60,
         limits=httpx.Limits(max_keepalive_connections=200, max_connections=400),
-    )
+    ))
 
     # Startup reconciliation: kill orphan containers labeled with a
     # sandbox_ref whose DB row is gone or marked deleted. Per-provider in
@@ -284,8 +287,7 @@ async def lifespan(app):
     except Exception as e:
         log.warning("stop_batcher failed: %s", e)
     await close_pool()
-    if _HTTP_CLIENT is not None:
-        await _HTTP_CLIENT.aclose()
+    await _http_client_mod.aclose()
 
 
 app = FastAPI(title="Agent Orchestration API", lifespan=lifespan)
@@ -2204,117 +2206,13 @@ async def session_sandbox_exec(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_supervisor_url(session_id: str) -> str:
-    """Resolve a session_id to its supervisor URL via the SessionPool.
-    ``pool.get_session()`` brings the compute up if needed;
-    ``supervisor_url`` is set as part of ``SandboxSession.start()``."""
-    from api.sandbox import get_pool
-    return (await get_pool().get_session(session_id)).supervisor_url or ""
-
-
-async def _proxy_from_session(
-    session_id: str, method: str, path: str, *,
-    params: dict | None = None, json: dict | None = None,
-    timeout: int = 30,
-) -> Response:
-    """Forward a request to the session's supervisor (resolved through
-    the SessionPool) and return its JSON response. Used by every
-    session-scoped file proxy. Uses the module-shared ``_HTTP_CLIENT`` so
-    repeat calls reuse the keep-alive connection to that supervisor."""
-    url = await _resolve_supervisor_url(session_id)
-    if _HTTP_CLIENT is None:
-        raise HTTPException(503, "server not yet initialised")
-    try:
-        r = await _HTTP_CLIENT.request(
-            method, f"{url}{path}", params=params, json=json, timeout=timeout,
-        )
-        return Response(
-            content=r.content,
-            status_code=r.status_code,
-            media_type="application/json",
-        )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
-
-
-async def _download_from_session(session_id: str, path: str) -> Response:
-    """Stream a download from the session's supervisor."""
-    url = await _resolve_supervisor_url(session_id)
-    if _HTTP_CLIENT is None:
-        raise HTTPException(503, "server not yet initialised")
-    try:
-        r = await _HTTP_CLIENT.get(
-            f"{url}/v1/files/download", params={"path": path}, timeout=60,
-        )
-        return Response(
-            content=r.content,
-            status_code=r.status_code,
-            media_type=r.headers.get("content-type", "application/octet-stream"),
-            headers={"content-disposition": r.headers.get("content-disposition", "attachment")},
-        )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"supervisor unreachable: {e}")
-
-
 # ---------------------------------------------------------------------------
-# Session-scoped filesystem browsing (sandbox identity hidden from callers)
+# Session-scoped filesystem browsing -> api.routers.session_files (slice 6f)
 # ---------------------------------------------------------------------------
 
+from .routers import session_files as _session_files_router  # noqa: E402
 
-@app.get("/sessions/{session_id}/files/tree")
-async def session_files_tree(session_id: str):
-    """Return the recursive directory tree of the session's sandbox."""
-    return await _proxy_from_session(session_id, "GET", "/v1/files/tree")
-
-
-@app.get("/sessions/{session_id}/files/read")
-async def session_files_read(session_id: str, path: str):
-    """Read a single file from the session's sandbox."""
-    return await _proxy_from_session(
-        session_id, "GET", "/v1/files/read", params={"path": path},
-    )
-
-
-@app.post("/sessions/{session_id}/files/edit")
-async def session_files_edit(session_id: str, request: Request):
-    """Edit or create a file. Body: same shape as ``/sandboxes/{id}/files/edit``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/edit",
-        json=await _json_body(request),
-    )
-
-
-@app.post("/sessions/{session_id}/files/upload")
-async def session_files_upload(session_id: str, request: Request):
-    """Upload a file. Body: ``{"path": ..., "content": "<base64>"}``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/upload",
-        json=await _json_body(request), timeout=60,
-    )
-
-
-@app.post("/sessions/{session_id}/files/delete")
-async def session_files_delete(session_id: str, request: Request):
-    """Delete a file or directory. Body: ``{"path": ...}``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/delete",
-        json=await _json_body(request),
-    )
-
-
-@app.post("/sessions/{session_id}/files/rename")
-async def session_files_rename(session_id: str, request: Request):
-    """Rename/move a file or directory. Body: ``{"path": ..., "new_path": ...}``."""
-    return await _proxy_from_session(
-        session_id, "POST", "/v1/files/rename",
-        json=await _json_body(request),
-    )
-
-
-@app.get("/sessions/{session_id}/files/download")
-async def session_files_download(session_id: str, path: str):
-    """Download a file as raw bytes from the session's sandbox."""
-    return await _download_from_session(session_id, path)
+app.include_router(_session_files_router.router)
 
 
 # ---------------------------------------------------------------------------
