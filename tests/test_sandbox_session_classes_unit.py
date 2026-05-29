@@ -192,8 +192,10 @@ class TestSessionPoolReaper:
         daytona = _FakePoolSession(DaytonaSandboxState(recipe=Recipe()))
         modal = _FakePoolSession(ModalSandboxState(recipe=Recipe()))
         for sess in (daytona, modal):
-            sess.liveness.observe_activity()
-            sess.liveness._last_chunk_at -= 10
+            # Seed the COMPUTE clock (what the reaper reads). observe_chunk
+            # sets both clocks; age _last_compute_at to make it stale.
+            sess.liveness.observe_chunk()
+            sess.liveness._last_compute_at -= 10
         pool._active = {"daytona": daytona, "modal": modal}
 
         released = []
@@ -212,15 +214,32 @@ class TestSessionPoolReaper:
         assert released == ["daytona"]
 
     @pytest.mark.asyncio
-    async def test_reap_idle_keeps_active_event_subscribers_warm(self, monkeypatch):
+    async def test_reap_idle_reaps_idle_subscriber_but_not_inflight(self, monkeypatch):
+        """Subscriber/compute de-conflation contract:
+
+          * an idle session with an open /events subscriber (no prompt in
+            flight, stale compute clock) IS reaped — subscriber presence no
+            longer pins compute (the Bug B fix); and
+          * a session with a prompt in flight is NOT reaped even with a
+            stale compute clock (the long chunk-silent command case).
+        """
         from api.sandbox.pool import SessionPool
 
         pool = SessionPool(factory=lambda _sid, _state: None)
-        modal = _FakePoolSession(ModalSandboxState(recipe=Recipe()))
-        modal.liveness.observe_activity()
-        modal.liveness._last_chunk_at -= 10
-        modal._subscribers["ui"] = asyncio.Queue()
-        pool._active = {"modal": modal}
+
+        # (a) idle + open subscriber + stale compute -> MUST be reaped.
+        watched = _FakePoolSession(ModalSandboxState(recipe=Recipe()))
+        watched.liveness.observe_chunk()
+        watched.liveness._last_compute_at -= 10
+        watched._subscribers["ui"] = asyncio.Queue()
+
+        # (b) prompt in flight + stale compute -> MUST NOT be reaped.
+        busy = _FakePoolSession(ModalSandboxState(recipe=Recipe()))
+        busy.liveness.observe_chunk()
+        busy.liveness._last_compute_at -= 10
+        busy.liveness.observe_prompt_start()
+
+        pool._active = {"watched": watched, "busy": busy}
 
         released = []
 
@@ -231,8 +250,8 @@ class TestSessionPoolReaper:
 
         count = await pool.reap_idle(5)
 
-        assert count == 0
-        assert released == []
+        assert count == 1
+        assert released == ["watched"]
 
 
 class _MiniSession(BaseSandboxSession):
@@ -351,8 +370,9 @@ class TestSubscriberHandoffCleanup:
             released.append(session_id)
 
         monkeypatch.setattr(pool, "release", _release)
-        replacement.liveness.observe_activity()
-        replacement.liveness._last_chunk_at -= 10_000
+        # Seed the COMPUTE clock (what the reaper reads) and age it.
+        replacement.liveness.observe_chunk()
+        replacement.liveness._last_compute_at -= 10_000
         count = await pool.reap_idle(5)
         assert count == 1
         assert released == ["sess"]

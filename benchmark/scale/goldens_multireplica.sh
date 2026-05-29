@@ -3,7 +3,7 @@
 #
 # Validates that the Wave-3 lease + 307 + Wave-1 coalescing/batching
 # don't break the recovery semantics that
-# ``tests/test_sandbox_stop_delete_recovery.py`` pins. The SDK is
+# ``tests/test_golden.py`` pins. The SDK is
 # pointed at the LB (a single URL) so its existing test machinery
 # doesn't need to know about the multi-replica topology.
 #
@@ -155,7 +155,7 @@ TEST_DATABASE_URL="${DB}" \
 PYTHONPATH="${REPO}/src" \
 AGENT_API_URL="${LB_URL}" \
 AGENT_SERVER_URL="${LB_URL}" \
-  "${VENV_PY}" -m pytest "${REPO}/tests/test_sandbox_stop_delete_recovery.py" \
+  "${VENV_PY}" -m pytest "${REPO}/tests/test_golden.py" \
     -n auto -k "${provider_filter}" --tb=line 2>&1 | tee "${REPO}/logs/golden-results.log" | tail -40
 
 echo ""

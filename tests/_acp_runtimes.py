@@ -78,7 +78,7 @@ acp_runtime_param = pytest.mark.parametrize("acp_runtime", _PARAMS)
 
 
 # Lightweight variant that yields just the ``agent_type`` string for tests
-# (e.g. ``test_sandbox_stop_delete_recovery``) that build their own body
+# (e.g. ``test_golden``) that build their own body
 # via a helper rather than spreading ``acp_runtime`` into ``Agent(...)``.
 # Same skip-on-missing-cred behaviour as ``acp_runtime_param``.
 _AT_PARAMS: list = []

@@ -104,7 +104,7 @@ POST /sessions/{id}/cancel    — best-effort `session/cancel`. No active lease 
 
 `/message`, `/message+stream`, `/events`, `/cancel`, `/config`, `/files/*`, `/sandbox/exec`, `/acp/call` all auto-recover via the pool — no need to call `/resume` first. Row reads (`/sessions`, `GET /sessions/{id}`) do NOT trigger recovery; `/sessions/{id}/status` and `/sessions/{id}/sandbox` DO.
 
-`DELETE`'s destructive contract is pinned by `tests/test_sandbox_stop_delete_recovery.py::test_delete_session_destroys_sandbox`. For paused-on-release residue (idle reaper / explicit `/release`), `scripts/cleanup_orphans.py` reclaims compute later — defaults to `--origin test`, `--provider all`.
+`DELETE`'s destructive contract is pinned by `tests/test_golden.py::test_delete_session_destroys_sandbox`. For paused-on-release residue (idle reaper / explicit `/release`), `scripts/cleanup_orphans.py` reclaims compute later — defaults to `--origin test`, `--provider all`.
 
 ### `POST /sessions/{id}/config`
 

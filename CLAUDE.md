@@ -4,9 +4,9 @@ Run pytest with `-n auto` (pytest-xdist). Sequential daytona/docker
 goldens are 8–15+ min; xdist parallel is mandatory. `-n auto` is fine
 with `-k` filters — xdist negotiates worker count down.
 
-    .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto
-    .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k claude
-    .venv/bin/python -m pytest tests/test_sandbox_stop_delete_recovery.py -n auto -k opencode
+    .venv/bin/python -m pytest tests/test_golden.py -n auto
+    .venv/bin/python -m pytest tests/test_golden.py -n auto -k claude
+    .venv/bin/python -m pytest tests/test_golden.py -n auto -k opencode
 
 End-to-end tests are parametrized over `claude` + `opencode` via
 `tests/_acp_runtimes.py`. Each runtime auto-skips on missing

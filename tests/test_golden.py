@@ -1,9 +1,10 @@
-"""E2E: sandbox stop/delete recovery and session resume.
+"""E2E: sandbox stop/delete recovery and session resume. THE golden suite.
 
-All tests require a live server on localhost:7778. 15 tests, most
+This is the canonical golden file — run it ALONE with ``-n auto`` (see
+CLAUDE.md). All tests require a live server on localhost:7778, most
 parameterized over ``{daytona, docker, unix_local, modal}`` (a few omit
 a provider where the failure mode doesn't apply). See tests/README.md
-for per-test invariants. Five thematic groups:
+for per-test invariants. Six thematic groups:
 
   1. stop — external sandbox stop → server restarts same sandbox →
             same ``sandbox_ref``, files at /tmp survive.
@@ -28,6 +29,19 @@ for per-test invariants. Five thematic groups:
               delete (daytona dashboard / docker rm / kill -9), plus
               supervisor-killed-in-place and reconnect-gap replay.
 
+  6. subscriber-leak — mid-prompt sandbox death triggers the recovery
+              hand-off; once the rpc terminates with no client attached,
+              the session's subscriber count MUST settle to 0. A stuck
+              count is the zombie-subscriber leak that pins the session
+              against the idle reaper (merged from the former
+              ``test_subscriber_leak_recovery.py``).
+
+  7. reaper-subscriber-decouple — an idle session (no prompt in flight)
+              with a LEGITIMATELY open /events consumer MUST still
+              hibernate when the reaper decision runs. A refusal means
+              subscriber-presence is being counted as compute activity
+              (the Bug B pin). Drives POST /sessions/{id}/reap?idle_s=0.
+
 Skipped when the provider is unavailable (no docker daemon, no
 DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN, no modal profile, or no
 server on localhost:7778).
@@ -35,6 +49,7 @@ server on localhost:7778).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re as _re
@@ -1805,3 +1820,245 @@ async def test_no_silent_failure_concurrent_stop_and_message(provider, agent_typ
 
         print(f"[test:{provider}] turn 2 terminal_kind={terminal_kind}")
         assert terminal_kind in ("text+done", "done", "error"), terminal_kind
+
+
+# ===========================================================================
+# Zombie-subscriber leak after mid-prompt recovery (merged from the former
+# test_subscriber_leak_recovery.py — same golden harness, HTTP-only).
+# ===========================================================================
+#
+# The bug: when a sandbox dies *mid-prompt*, ``_persist_prompt_events``
+# recovers by calling ``pool.get_session``, which hands the in-flight SSE
+# subscriber queue off from the dead session object (A) to a freshly
+# provisioned replacement (B). But the consumer's cleanup
+# (``iterate_subscriber``'s ``finally: self._subscribers.pop(sid)``) is
+# closure-bound to A, so it pops A's already-cleared dict and leaves a
+# permanent ZOMBIE entry in B's ``_subscribers``. Symptom: the session is
+# pinned in the pool's in-memory ``_active`` forever (``reap_idle`` skips
+# any session whose ``_subscribers`` is non-empty), so the dashboard shows
+# it leased/busy forever and the backing sandbox leaks until its own time
+# limit.
+#
+# Observable contract (HTTP only, no white-box pool access):
+#   * ``POST /sessions/{id}/message`` runs the SAME
+#     ``_execute_and_stream_sse_for`` generator in a background drain, so it
+#     registers a subscriber on session A even with no client on /events.
+#   * ``GET /sessions/{id}/status`` carries the session id in the path, so
+#     the LB consistent-hashes it to the OWNING replica, and returns
+#     ``session_subscriber_count`` in ``peek`` mode (no cold-recovery side
+#     effect). With no client connected, that count MUST settle back to 0
+#     once the prompt's rpc terminates. A stuck non-zero count is the zombie.
+#
+# Pre-fix this FAILS (count stuck >= 1); post-fix it PASSES. Verified by
+# toggling ``iterate_subscriber``'s finally between ``self`` and ``owner``.
+
+# How many mid-prompt-death cycles to try. The hand-off window is the
+# whole duration of execute_prompt, but a too-fast turn can finish before
+# the stop lands; a few attempts make the repro reliable on buggy code.
+_ATTEMPTS = 3
+# Delay after POST returns rpc_id before stopping — long enough for the
+# background drain to register its subscriber and start execute_prompt.
+_KILL_DELAY_S = 0.6
+_TERMINAL_TIMEOUT_S = 180.0
+_SETTLE_TIMEOUT_S = 15.0
+# A turn long enough to still be running when the stop lands.
+_LONG_PROMPT = "Count from 1 to 40, one number per line. Do not stop early."
+
+
+# --- leak-specific helpers (HTTP-only observables) -------------------------
+
+async def _wait_terminal(sdk: ApiClient, sid: str, rpc: str, timeout: float) -> str | None:
+    """Poll /log until a turn_end / error row for ``rpc`` appears."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = await sdk._http.get(f"/sessions/{sid}/log?limit=300", timeout=10)
+        if resp.status_code == 200:
+            for e in resp.json():
+                if (e.get("payload") or {}).get("prompt_id") == rpc and \
+                        e.get("event_type") in ("turn_end", "error"):
+                    return e["event_type"]
+        await asyncio.sleep(1.0)
+    return None
+
+
+async def _subscriber_count(sdk: ApiClient, sid: str) -> int:
+    resp = await sdk._http.get(f"/sessions/{sid}/status", timeout=10)
+    resp.raise_for_status()
+    return int(resp.json().get("session_subscriber_count") or 0)
+
+
+async def _wait_count(sdk: ApiClient, sid: str, target: int, timeout: float) -> bool:
+    """True if the subscriber count reaches ``target`` within ``timeout``."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if await _subscriber_count(sdk, sid) == target:
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _post_and_wait(sdk: ApiClient, sid: str, msg: str) -> None:
+    rpc = await _send_message(sdk, sid, msg)
+    term = await _wait_terminal(sdk, sid, rpc, _TERMINAL_TIMEOUT_S)
+    assert term is not None, f"warm turn never terminated (rpc={rpc[:8]})"
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(900)
+async def test_midprompt_recovery_does_not_leak_subscriber(provider, agent_type):
+    """A mid-prompt sandbox death triggers the recovery hand-off; once the
+    prompt's rpc terminates and no client is connected, the session must
+    have ZERO subscribers. A stuck count is the zombie-subscriber leak
+    that pins the session against the idle reaper (the sandbox leak)."""
+    _require_provider(provider)
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        sid = sess["session_id"]
+
+        # Warm turn: supervisor up + a finished turn (session/load
+        # contract) so recovery resumes rather than restarts cold.
+        await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+        assert await _wait_count(sdk, sid, 0, 15.0), (
+            "baseline broken: an idle session with no client should have 0 "
+            f"subscribers, got {await _subscriber_count(sdk, sid)}"
+        )
+
+        leaked_at: int | None = None
+        for attempt in range(_ATTEMPTS):
+            sandbox = await _get_sandbox(sdk, sid)
+
+            # Fire a multi-second turn, then kill the sandbox while
+            # execute_prompt is in flight — the recovery hand-off window.
+            rpc = await _send_message(sdk, sid, _LONG_PROMPT)
+            await asyncio.sleep(_KILL_DELAY_S)
+            stop_task = asyncio.create_task(_external_stop(sandbox))
+            try:
+                # Recovery + retry runs in the background drain; wait for
+                # the rpc to terminate (turn_end on success, error on
+                # give-up).
+                term = await _wait_terminal(sdk, sid, rpc, _TERMINAL_TIMEOUT_S)
+            finally:
+                try:
+                    await stop_task
+                except Exception:
+                    pass
+            assert term is not None, (
+                f"recovery never produced a terminal for rpc={rpc[:8]} "
+                f"(provider={provider} attempt={attempt}) — prompt dropped"
+            )
+
+            # rpc done + no client connected => count MUST return to 0.
+            # If it stays >=1, the handed-off subscriber leaked onto the
+            # replacement session = the zombie.
+            if not await _wait_count(sdk, sid, 0, _SETTLE_TIMEOUT_S):
+                leaked_at = attempt
+                break
+
+            # Clean recovery — re-warm and try again to hit the window.
+            await _post_and_wait(sdk, sid, "Reply with the single word: ok.")
+
+        assert leaked_at is None, (
+            "ZOMBIE SUBSCRIBER LEAK reproduced "
+            f"(provider={provider} agent_type={agent_type} attempt={leaked_at}): "
+            f"session_subscriber_count is stuck at {await _subscriber_count(sdk, sid)} "
+            "with no client connected. The handed-off SSE queue's cleanup popped "
+            "the OLD session, leaving a permanent entry on the replacement — "
+            "reap_idle now skips this session forever and the sandbox leaks."
+        )
+
+
+# ===========================================================================
+# Reaper / subscriber de-conflation (Bug B — merged from the former
+# test_golden_reaper_subscriber.py once green across providers).
+# ===========================================================================
+#
+# Distinct from the zombie leak above: there the subscriber count is stuck
+# >0 with NO client (a leak); here a real client IS connected and the
+# question is whether idle compute still reaps despite it. Before the fix
+# (``pool._should_reap``/``reap_idle`` treating any non-empty ``_subscribers``
+# as compute activity) an open /events consumer — a dashboard, a monitor, an
+# idle chat UI — pinned the sandbox indefinitely past the idle window.
+#
+# Observable contract (HTTP only): finish a turn so compute is idle, open a
+# persistent /events consumer, confirm ``session_subscriber_count == 1``,
+# then ``POST /sessions/{id}/reap?idle_s=0`` (the SAME decision the
+# background reaper uses, run per-session so it's deterministic + -n-auto
+# safe — the global reaper's timing can't be exercised per session). With no
+# prompt in flight it MUST hibernate. The fix keys the decision off
+# compute-only activity (``_last_compute_at``) + an in-flight gate, not
+# ``_subscribers`` membership.
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(900)
+async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type):
+    """An idle session (no prompt in flight) with an open /events consumer
+    MUST hibernate when the reaper decision runs. A refusal means
+    subscriber-presence is being counted as compute activity — the pin."""
+    _require_provider(provider)
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        sid = sess["session_id"]
+
+        # Finish a turn so the sandbox is up, the compute clock is set, and
+        # no prompt is in flight. With no client attached the count is 0.
+        await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+        assert await _wait_count(sdk, sid, 0, 15.0), (
+            "baseline broken: an idle session with no client should have 0 "
+            f"subscribers, got {await _subscriber_count(sdk, sid)}"
+        )
+
+        # Open a PERSISTENT /events consumer and keep it draining in the
+        # background — this is the dashboard/monitor that used to pin compute.
+        ended = asyncio.Event()
+
+        async def _drain() -> None:
+            try:
+                async for _chunk in sdk.stream_events(sid):
+                    pass
+            except Exception:
+                pass
+            finally:
+                ended.set()
+
+        drain = asyncio.create_task(_drain())
+        try:
+            assert await _wait_count(sdk, sid, 1, 15.0), (
+                "open GET /events did not register a subscriber on the session"
+            )
+
+            # Run the reaper's decision for THIS session with an explicit
+            # idle_s=0 (authoritative — overrides per-provider windows incl.
+            # modal's 30 min). The only thing keeping it 'busy' is the open
+            # subscriber, so it MUST still hibernate.
+            r = await sdk._http.post(
+                f"/sessions/{sid}/reap", params={"idle_s": 0}, timeout=30,
+            )
+            r.raise_for_status()
+            body = r.json()
+            assert body.get("hibernated") is True, (
+                "BUG B — COMPUTE PINNED BY SUBSCRIBER "
+                f"(provider={provider} agent_type={agent_type}): an idle "
+                "session with no prompt in flight but an open /events consumer "
+                f"was NOT hibernated (reason={body.get('reason')!r}). The reap "
+                "decision must key off compute-only activity (+ an in-flight "
+                "gate), not _subscribers membership."
+            )
+        finally:
+            drain.cancel()
+            with contextlib.suppress(BaseException):
+                await drain
+
+        # Continuity: the session was hibernated, not destroyed. The next
+        # turn cold-resumes the sandbox and answers — conversation preserved
+        # via session/load.
+        reply = await _ask(sdk, sid, "Reply with the single word: again.")
+        assert "again" in reply.lower(), (
+            f"session unusable after reap (cold-resume failed): {reply!r}"
+        )

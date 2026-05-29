@@ -433,6 +433,22 @@ async def update_session_secrets(session_id: str, secrets: dict[str, str]) -> No
         )
 
 
+async def update_session_pre_start_commands(
+    session_id: str, pre_start_commands: list[str],
+) -> None:
+    """Replace stored session pre_start_commands (raw user portion).
+
+    Used by ``POST /sessions/{id}/reload`` when caller overrides the
+    user-supplied pre-start list. Column stores the raw user commands
+    only — skill + CLI install commands are layered in at use time
+    (matches the contract documented at ``upsert_session``)."""
+    async with get_db() as conn:
+        await conn.execute(
+            "UPDATE sessions SET pre_start_commands = %s WHERE id = %s",
+            (Json(pre_start_commands), session_id),
+        )
+
+
 async def get_session(session_id: str) -> dict | None:
     async with get_db() as conn:
         row = await (await conn.execute(
