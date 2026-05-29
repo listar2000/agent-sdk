@@ -220,14 +220,6 @@ class BaseSandboxSession(abc.ABC):
         mcp_servers = cfg.mcp_servers if cfg else None
 
         client = self._get_acp_client()
-        mcp_servers = None
-        if self._agent_id:
-            try:
-                agent = await _db.get_agent(self._agent_id)
-                if agent and agent.config and agent.config.mcp_servers:
-                    mcp_servers = agent.config.mcp_servers
-            except Exception:
-                mcp_servers = None
         await client.attach(
             self._acp_session_id,
             self.state.recipe.agent_type,
