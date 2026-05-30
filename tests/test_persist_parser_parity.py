@@ -1,9 +1,10 @@
 """Pin the persist-side SSE parser to the canonical ``parse_acp_event``.
 
 The persist path (``_persist_prompt_events`` → ``execute_prompt`` →
-``_parse_sse_block``) and the SDK path (``Agent.astream`` →
+``parse_acp_event``) and the SDK path (``Agent.astream`` →
 ``parse_acp_event``) MUST emit the same event taxonomy or the SSE/log
-parity tests in ``tests/test_interrupt_integration.py`` fail.
+parity tests in ``tests/test_interrupt_integration.py`` fail. Both now
+share the single ``api.sse.parse_acp_event`` entry point.
 
 Three previously-leaked bugs that this pins:
 
@@ -20,7 +21,11 @@ import json
 
 import pytest
 
-from api.providers.daytona.session import _parse_sse_block
+# The persist-side parser is now the single canonical ``parse_acp_event``
+# (the old ``_parse_sse_block`` pass-through wrapper was deleted). Alias it
+# here so the parity assertions below read against the same entry point the
+# SSE prompt-drive uses.
+from api.sse import parse_acp_event as _parse_sse_block
 
 
 def _wrap(update: dict) -> str:
@@ -147,6 +152,21 @@ class _NoopLiveness:
 # subscribers see after canonicalization.
 # ---------------------------------------------------------------------------
 
+class _NoopLiveness:
+    """Stand-in for ``Liveness`` on the test fakes. ``_persist_prompt_events``
+    drives the in-flight gate (``observe_prompt_start``/``observe_prompt_end``)
+    and the idle reaper reads ``_last_compute_at``; the fakes run no real
+    compute, so these are no-ops over a static clock."""
+
+    _last_compute_at = None
+
+    def observe_prompt_start(self) -> None: ...
+    def observe_prompt_end(self) -> None: ...
+    def observe_chunk(self) -> None: ...
+    def observe_activity(self) -> None: ...
+    def observe_close(self) -> None: ...
+
+
 class _FakeSession:
     """Minimal stand-in: ``execute_prompt`` yields a fixed event list,
     ``_broadcast`` is a no-op, agent_id/session_id are constants. Owns
@@ -265,6 +285,7 @@ async def test_persist_serializes_concurrent_prompts_on_same_session(monkeypatch
             self._tag = tag
             self._agent_id = "agent-x"
             self.session_id = "sess-x"
+            self.liveness = _NoopLiveness()
             # Shared across both call paths in this test — the same
             # lock instance enforces serialisation.
             pass
