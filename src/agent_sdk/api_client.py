@@ -446,7 +446,12 @@ class ApiClient:
     # ------------------------------------------------------------------
 
     async def send_message(
-        self, session_id: str, text: str, *, interrupt: bool = False
+        self,
+        session_id: str,
+        text: str,
+        *,
+        interrupt: bool = False,
+        attachments: list[dict] | None = None,
     ) -> dict[str, Any]:
         """``POST /sessions/{id}/message`` — fire-and-forget.
 
@@ -455,14 +460,24 @@ class ApiClient:
         Use when the caller doesn't need to read the reply (e.g.
         background orchestration that polls ``get_session_log`` later).
 
+        ``attachments`` (optional) is an opaque list of metadata dicts
+        persisted on the resulting ``user_message`` event payload. Used
+        by hivespace to round-trip file metadata (id, url, sandbox_path,
+        …) so cold-loads can re-render the chat UI without a parallel
+        backend store. Server treats the list as opaque — no schema
+        enforcement — but it must be JSON-serializable.
+
         For "submit + read reply in one call," use
         :meth:`send_message_stream`. For "subscribe to all events on
         the session" (multi-subscriber, dashboard pattern), use
         :meth:`stream_events`.
         """
+        body: dict[str, Any] = {"message": text, "interrupt": interrupt}
+        if attachments is not None:
+            body["attachments"] = attachments
         return await self._json(
             "POST", f"/sessions/{session_id}/message",
-            json={"message": text, "interrupt": interrupt},
+            json=body,
         )
 
     async def cancel_session(self, session_id: str) -> dict[str, Any]:
