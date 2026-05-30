@@ -138,6 +138,14 @@ def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
     )
 
 
+class _NoopLiveness:
+    def observe_prompt_start(self) -> None:
+        pass
+
+    def observe_prompt_end(self) -> None:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Persist coalescing — one row per logical block, not per ACP chunk.
 # Mirrors what the SDK's ``astream`` accumulates and what ``/events``
@@ -192,6 +200,26 @@ def _capture_log_writes(monkeypatch) -> list[tuple[str, dict]]:
     from api import server as srv
     monkeypatch.setattr(srv, "log_event", _fake_log_event)
     return rows
+
+
+@pytest.mark.asyncio
+async def test_persist_logs_empty_done_turn_for_rca(monkeypatch, caplog):
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "usage", "usage": {"amount": 1.25, "currency": "USD"}},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    from api.server import _persist_prompt_events
+
+    with caplog.at_level("WARNING", logger="api.server"):
+        await _persist_prompt_events(sess, "hi", "rpc-empty")
+
+    assert [r[0] for r in rows if r[0] != "user_message"] == [
+        "usage", "turn_end",
+    ]
+    messages = [r.message for r in caplog.records]
+    assert any("empty prompt turn" in m for m in messages)
+    assert any("rpc-empty" in m and "message_chars=2" in m for m in messages)
 
 
 @pytest.mark.asyncio
@@ -277,6 +305,8 @@ async def test_persist_serializes_concurrent_prompts_on_same_session(monkeypatch
     shared_lock = _a.Lock()
     sess_a._prompt_lock = shared_lock
     sess_b._prompt_lock = shared_lock
+    sess_a.liveness = _NoopLiveness()
+    sess_b.liveness = _NoopLiveness()
 
     from api.server import _persist_prompt_events
     # Fire two concurrent persist tasks against the shared lock.
