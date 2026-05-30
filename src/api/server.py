@@ -2011,7 +2011,12 @@ async def _forward_session_config(
             )
 
 
-async def _persist_user_message(session, message: str, rpc_id: str) -> None:
+async def _persist_user_message(
+    session,
+    message: str,
+    rpc_id: str,
+    attachments: list[dict] | None = None,
+) -> None:
     """Write the EVT_USER_MESSAGE row for a freshly-submitted prompt.
 
     Best-effort — a DB hiccup must not block the prompt from being sent
@@ -2022,8 +2027,16 @@ async def _persist_user_message(session, message: str, rpc_id: str) -> None:
     (the production path under lifespan); falls back to a direct INSERT
     in test contexts that bypass ``start_batcher`` so unit tests keep
     seeing user_message rows synchronously.
+
+    ``attachments`` is an opaque list of dicts the caller wants to
+    persist alongside the prompt text — used by hivespace to round-trip
+    file metadata (id, url, sandbox_path, filename, …) so the chat UI
+    can re-render images / file chips on cold-load without consulting a
+    parallel DB. Treated as opaque here; no schema enforcement.
     """
-    payload = {"text": redact_secrets(message), "prompt_id": rpc_id}
+    payload: dict = {"text": redact_secrets(message), "prompt_id": rpc_id}
+    if attachments:
+        payload["attachments"] = list(attachments)
     try:
         batcher = get_batcher()
         if batcher is not None:
@@ -2060,7 +2073,12 @@ _EVENT_TYPE_TO_LOG = {
 }
 
 
-async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
+async def _persist_prompt_events(
+    session,
+    message: str,
+    rpc_id: str,
+    attachments: list[dict] | None = None,
+) -> None:
     """Drive ``execute_prompt`` and write coalesced rows to ``session_log``.
 
     Consecutive ``text`` and ``reasoning`` chunks are buffered and written
@@ -2222,7 +2240,7 @@ async def _persist_prompt_events(session, message: str, rpc_id: str) -> None:
     async with session._prompt_lock:
         # Log the user_message INSIDE the lock so log row order tracks
         # actual execution order.
-        await _persist_user_message(session, message, rpc_id)
+        await _persist_user_message(session, message, rpc_id, attachments)
         # Mark the prompt in flight so the idle reaper never hibernates this
         # session mid-turn — covers a long, chunk-silent tool call whose
         # compute clock would otherwise go stale. Balanced across the
@@ -2337,6 +2355,12 @@ async def post_session_message(session_id: str, request: Request):
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
+    # Opaque list of attachment metadata dicts. Persisted on the
+    # ``user_message`` event so cold-loads can re-render the chat
+    # without a parallel hivespace fetch.
+    attachments = data.get("attachments")
+    if attachments is not None and not isinstance(attachments, list):
+        raise HTTPException(400, "attachments must be a list")
 
     rpc_id = str(uuid.uuid4())
 
@@ -2355,7 +2379,7 @@ async def post_session_message(session_id: str, request: Request):
             log.exception("interrupt cancel failed for session %s", session_id)
 
     async def _drain() -> None:
-        async for _ in _execute_and_stream_sse_for(pool_session, message, rpc_id):
+        async for _ in _execute_and_stream_sse_for(pool_session, message, rpc_id, attachments):
             pass
 
     task = asyncio.create_task(_drain())
@@ -2460,6 +2484,9 @@ async def post_session_message_stream(session_id: str, request: Request):
     message = data.get("message")
     if not message:
         raise HTTPException(400, "message required")
+    attachments = data.get("attachments")
+    if attachments is not None and not isinstance(attachments, list):
+        raise HTTPException(400, "attachments must be a list")
 
     rpc_id = str(uuid.uuid4())
 
@@ -2467,7 +2494,7 @@ async def post_session_message_stream(session_id: str, request: Request):
     session = await get_pool().get_session(session_id)
 
     return StreamingResponse(
-        _execute_and_stream_sse_for(session, message, rpc_id),
+        _execute_and_stream_sse_for(session, message, rpc_id, attachments),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -2476,7 +2503,12 @@ async def post_session_message_stream(session_id: str, request: Request):
     )
 
 
-async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
+async def _execute_and_stream_sse_for(
+    session,
+    message: str,
+    rpc_id: str,
+    attachments: list[dict] | None = None,
+):
     """Stream branch with an ALREADY-RESOLVED session.
 
     Used by ``POST /message+stream`` so session resolution (cold-recover
@@ -2511,7 +2543,7 @@ async def _execute_and_stream_sse_for(session, message: str, rpc_id: str):
         log.warning("set_session_busy(True) failed for %s", session.session_id)
 
     async def _drive():
-        await _persist_prompt_events(session, message, rpc_id)
+        await _persist_prompt_events(session, message, rpc_id, attachments)
 
     drive_task = asyncio.create_task(_drive())
     # Wrap the full turn so we get one log line per prompt with the
