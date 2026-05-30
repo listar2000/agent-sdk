@@ -382,6 +382,42 @@ async def test_send_message_interrupt_true():
 
 
 @pytest.mark.asyncio
+async def test_send_message_attachments_omitted_when_absent():
+    """``attachments`` defaults to None and is NOT included in the body
+    so existing callers stay byte-for-byte compatible with the old
+    ``{"message", "interrupt"}`` payload."""
+    rec = _Recorder({"rpc_id": "r3"})
+    async with _make_client(rec) as sc:
+        await sc.send_message("s1", "plain prompt")
+    body = json.loads(rec.last.content)
+    assert "attachments" not in body
+    assert body == {"message": "plain prompt", "interrupt": False}
+
+
+@pytest.mark.asyncio
+async def test_send_message_attachments_round_trip():
+    """An attachments list is passed through to the server payload
+    untouched. Server treats it as opaque metadata persisted on the
+    ``user_message`` event."""
+    rec = _Recorder({"rpc_id": "r4"})
+    attachments = [
+        {
+            "id": "abc123def4567890",
+            "filename": "shot.png",
+            "url": "/api/agents/42/attachments/abc123def4567890/shot.png",
+            "sandbox_path": "/vol/.dm-attachments/abc123def4567890_shot.png",
+            "size": 4242,
+            "is_image": True,
+            "mime_type": "image/png",
+        }
+    ]
+    async with _make_client(rec) as sc:
+        await sc.send_message("s1", "look at this", attachments=attachments)
+    body = json.loads(rec.last.content)
+    assert body["attachments"] == attachments
+
+
+@pytest.mark.asyncio
 async def test_cancel_session():
     rec = _Recorder({"ok": True})
     async with _make_client(rec) as sc:
