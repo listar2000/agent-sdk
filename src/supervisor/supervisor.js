@@ -115,6 +115,7 @@ function parseArgs(argv) {
     host: "0.0.0.0",
     root: "/tmp",
     snapshotPath: null,
+    skipRestore: false,
     acpArgs: [],
   };
   for (let i = 2; i < argv.length; i++) {
@@ -124,6 +125,10 @@ function parseArgs(argv) {
     else if (a === "--acp") out.acp = argv[++i];
     else if (a === "--root" || a === "--cwd") out.root = argv[++i];
     else if (a === "--snapshot-path") out.snapshotPath = argv[++i];
+    // First cold-create: nothing on the volume to restore, so skip the
+    // boot-time restore poll. ``--snapshot-path`` is still passed (per-turn
+    // agent_memory.tar writes depend on it), only the read tier is skipped.
+    else if (a === "--skip-restore") out.skipRestore = true;
     else if (a === "--acp-arg") out.acpArgs.push(argv[++i]);
   }
   if (!out.acp) {
@@ -212,6 +217,13 @@ if (args.snapshotPath && isWarmRestart) {
   // the previous supervisor in this VM. Skip both restore tiers; they would
   // re-extract the exact same state we already have on disk.
   log(`Type 1 boot detected (sentinel ${SUPERVISOR_BOOT_MARKER} present); skipping snapshot restore`);
+} else if (args.snapshotPath && args.skipRestore) {
+  // First cold-create — the session has never run a turn, so there is no
+  // tarball on the volume yet. Skip the 2×15s FUSE-visibility poll that
+  // would otherwise wait for files that can't exist. Per-turn writes below
+  // are unaffected (they key off snapshotPath, which is still set), so the
+  // NEXT boot on a fresh VM (recovery) restores normally.
+  log(`first cold-create (--skip-restore); skipping snapshot restore`);
 } else if (args.snapshotPath) {
   // Type 2 boot — blank /home/daytona on a fresh VM. The volume tarballs
   // are the only way to repopulate state.
