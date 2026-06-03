@@ -15,6 +15,7 @@ No "Type 1 vs Type 2" branching outside this class — recovery just calls
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -63,23 +64,56 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # daytona SDK at module-load time.
         from api.providers import daytona as dt_provider
 
+        # Per-phase cold-create timing. Three coarse segments mirror the
+        # three remote round-trips: (A) sandbox create+mount or reattach,
+        # (B) supervisor boot, (C) ACP attach (session/new|load). Emitted as
+        # grep-able ``[BENCH] daytona.cold_create`` lines so a timing
+        # harness (scripts/bench_cold_create.py) can decompose the
+        # ``POST /sessions`` wall-clock without per-step client probes. The
+        # finer B sub-phases are still emitted by start_supervisor_in_sandbox.
+        sid8 = self.session_id[:8]
+        _t_total = time.monotonic()
+
+        def _bench(phase: str, t0: float) -> None:
+            log.info(
+                "[BENCH] daytona.cold_create session=%s phase=%s s=%.3f",
+                sid8, phase, time.monotonic() - t0,
+            )
+
         await self._bootstrap_session()
 
-        # Resolve the daytona sandbox handle: reattach, restart, or create.
+        # A volume snapshot only exists to restore when this session has run
+        # before — i.e. we entered holding a sandbox_ref (paused/hibernated,
+        # or a now-dead ref we'll recover from). A first cold-create has no
+        # ref and nothing on the volume, so the supervisor skips its 2×15s
+        # boot restore poll (it still writes per-turn snapshots, so the next
+        # boot on a fresh VM restores normally). Captured before
+        # _resolve_or_create_sandbox, which mutates sandbox_ref below.
+        had_prior_sandbox = bool(self.state.sandbox_ref)
+
+        # (A) Resolve the daytona sandbox handle: reattach, restart, or
+        #     create. Cold-create pays VM allocation + 3-volume mount here.
+        _t = time.monotonic()
         sandbox = await self._resolve_or_create_sandbox(dt_provider)
+        _bench("resolve_or_create_sandbox", _t)
         self._daytona_sandbox = sandbox
         self.state.sandbox_ref = sandbox.id
 
-        # Bring the supervisor up. ``start_supervisor_in_sandbox`` is
+        # (B) Bring the supervisor up. ``start_supervisor_in_sandbox`` is
         # idempotent (skips re-spawning when one is already healthy on
         # this port); reused across reattach / restart / cold-create.
+        _t = time.monotonic()
         url = await dt_provider.start_supervisor_in_sandbox(
             sandbox,
             self.state.recipe.agent_type,
             _SUPERVISOR_PORT,
             root=self.state.recipe.root or "/home/daytona",
             spawn_env=self._spawn_env,
+            # First cold-create has no prior tarball — skip the boot restore
+            # poll (writes still happen). Recovery (had a sandbox) restores.
+            restore_snapshot=had_prior_sandbox,
         )
+        _bench("start_supervisor", _t)
         self._supervisor_url = url
         self.state.listen_port = _SUPERVISOR_PORT
 
@@ -98,7 +132,11 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # one ACP child.
         if self._acp_session_id is None:
             self._acp_session_id = str(uuid4())
+        # (C) ACP handshake + session/new (cold) or session/load (recovery).
+        _t = time.monotonic()
         await self._attach_acp()
+        _bench("acp_attach", _t)
+        _bench("TOTAL", _t_total)
 
         log.info(
             "DaytonaSandboxSession started: session=%s sandbox=%s url=%s",

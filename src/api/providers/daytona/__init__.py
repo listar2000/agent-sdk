@@ -151,6 +151,7 @@ async def _get_async_daytona_client():
 async def start_supervisor_in_sandbox(
     sandbox, agent_type: str, port: int, root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
+    restore_snapshot: bool = True,
 ) -> str:
     """Start a NEW supervisor on a specific port inside an existing sandbox.
 
@@ -236,11 +237,17 @@ async def start_supervisor_in_sandbox(
 
     env_prefix = _build_env_prefix(spawn_env)
     log_file = f"{sup_dir}/sup-{port}.log"
+    # ``--snapshot-path`` is ALWAYS passed (per-turn agent_memory.tar writes
+    # key off it). ``restore_snapshot=False`` (first cold-create) only adds
+    # ``--skip-restore`` so the supervisor skips its 2×15s boot restore poll
+    # for tarballs that can't exist yet — writes, and future recovery, are
+    # unaffected. See DaytonaSandboxSession.start.
     supervisor_argv = build_supervisor_argv(
         supervisor_js="supervisor.js", acp_bin=acp_bin,
         acp_launch_args=_acp_launch_args(agent_type),
         port=port, root=root,
-        snapshot_path=_SNAPSHOT_PATH, quote_paths=False,
+        snapshot_path=_SNAPSHOT_PATH, skip_restore=not restore_snapshot,
+        quote_paths=False,
     )
     # Ensure the agent's HOME (``root``) exists inside the sandbox before
     # the supervisor spawns the ACP child with ``cwd=root``. If the volume

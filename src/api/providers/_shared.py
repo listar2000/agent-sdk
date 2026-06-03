@@ -380,6 +380,7 @@ def build_supervisor_argv(
     root: str,
     host: str = "0.0.0.0",
     snapshot_path: str | None = None,
+    skip_restore: bool = False,
     quote_paths: bool = True,
 ) -> str:
     """Return the ``node supervisor.js ...`` argv string shared by every
@@ -392,6 +393,12 @@ def build_supervisor_argv(
     after each turn-end. Docker and local providers leave this unset —
     their volumes are POSIX-real and don't need the snapshot round-trip.
 
+    ``skip_restore`` (Daytona-only) emits ``--skip-restore`` so the
+    supervisor skips its boot-time restore poll while STILL writing
+    per-turn snapshots (the write keys off ``snapshot_path``, which stays
+    set). Used on a first cold-create, where the volume has no tarball
+    yet and the poll would just wait 2×15s for files that can't exist.
+
     ``quote_paths=False`` is for Daytona, whose paths are constants
     controlled by this package (no shell-metacharacter risk) and which
     built its command without quoting before the helper existed.
@@ -399,11 +406,12 @@ def build_supervisor_argv(
     q = shlex.quote if quote_paths else (lambda s: s)
     acp_flags = "".join(f" --acp-arg {shlex.quote(a)}" for a in acp_launch_args)
     snapshot_flag = f" --snapshot-path {q(snapshot_path)}" if snapshot_path else ""
+    skip_restore_flag = " --skip-restore" if skip_restore else ""
     return (
         f"node {q(supervisor_js)} "
         f"--host {host} --port {port} "
         f"--acp {q(acp_bin)}{acp_flags} "
-        f"--root {q(root)}{snapshot_flag}"
+        f"--root {q(root)}{snapshot_flag}{skip_restore_flag}"
     )
 
 
