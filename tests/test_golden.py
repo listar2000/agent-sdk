@@ -340,6 +340,39 @@ def _local_supervisor_pid(sandbox: dict) -> int | None:
     return None
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if ``pid`` is still a live process. ``os.kill(pid, 0)`` sends no
+    signal — it's the portable liveness probe (raises ProcessLookupError when
+    the process is gone). NOTE: a SIGKILL'd-but-unreaped ZOMBIE still answers
+    as alive here, so this is only safe for best-effort cleanup, not as a
+    'compute is gone' oracle (use ``_port_has_listener`` for that)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    return True
+
+
+def _port_has_listener(port: int) -> bool:
+    """True if some process is LISTENING on ``port`` — i.e. a supervisor is
+    still SERVING. This is the correct 'compute alive' oracle: a SIGKILL'd
+    supervisor releases its socket immediately even if it lingers as an
+    unreaped zombie (which fools ``os.kill(pid, 0)``). Cross-replica teardown
+    can leave a zombie when the killing replica isn't the one that spawned the
+    process, so the port — not the pid — is what distinguishes a live sandbox
+    from a torn-down one."""
+    try:
+        r = subprocess.run(
+            ["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return bool(r.stdout.strip())
+
+
 async def _external_stop(sandbox: dict) -> None:
     provider = sandbox["provider"]
     ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
@@ -2631,3 +2664,106 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# ===========================================================================
+# DELETE /agents/{id} must tear down the compute of every session it
+# cascade-deletes.
+# ===========================================================================
+#
+# ``sessions.agent_id`` is ``ON DELETE CASCADE`` (db.py:43) and ``delete_agent``
+# is a bare ``DELETE FROM agents`` (db.py:301). ``delete_agent_route`` only
+# calls ``delete_agent`` — so deleting an agent drops its session rows but never
+# releases/destroys their sandboxes. The compute leaks with NO session row left
+# to reap it (the session-scoped DELETE path can no longer find it). Distinct
+# from the per-session DELETE route, which DOES release + destroy.
+#
+# Observable (unix_local): the supervisor IS the compute. Proper teardown
+# (pool.release -> stop -> kill) ends the process; the bug leaves it running.
+# A cascade mechanism-check (the session row is 404 after the agent delete)
+# guards against a false-green where the agent-delete path didn't actually run.
+
+
+@pytest.mark.parametrize("provider", ["unix_local"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_delete_agent_tears_down_session_sandboxes(provider, agent_type):
+    """Deleting an agent must not orphan its sessions' compute."""
+    _require_provider(provider)
+
+    leaked_pid: int | None = None
+    try:
+        async with ApiClient(SERVER) as sdk:
+            sess = await _quick_session(sdk, provider, agent_type=agent_type)
+            sid = sess["session_id"]
+            agent_id = sess.get("agent_id")
+            assert agent_id, "create response missing agent_id"
+
+            # Finish a turn so the supervisor is up and discoverable.
+            await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+
+            sandbox = await _get_sandbox(sdk, sid)
+            pid = _local_supervisor_pid(sandbox)
+            # Supervisor port — the 'is the compute still serving' oracle.
+            # ``os.kill(pid, 0)`` can't be used: cross-replica teardown SIGKILLs
+            # the supervisor but its spawning replica never reaps it, so it
+            # lingers as a zombie that fools a pid liveness check. The listening
+            # socket, by contrast, is released the instant the process dies.
+            url = (sandbox.get("url") or "")
+            try:
+                port = int(url.rsplit(":", 1)[-1].split("/", 1)[0])
+            except (ValueError, IndexError):
+                port = 0
+            assert port and _port_has_listener(port), (
+                f"supervisor not listening on its port before delete "
+                f"(url={url!r} port={port})"
+            )
+            leaked_pid = pid
+
+            # Delete the AGENT (not the session). The FK cascade drops the
+            # session row; the route must still tear the sandbox down first.
+            resp = await sdk._http.delete(f"/agents/{agent_id}", timeout=30)
+            assert resp.status_code in (200, 204), (
+                f"agent delete failed: {resp.status_code}"
+            )
+
+            # Mechanism check: the cascade actually removed the session row, so
+            # we know the agent-delete path ran (not some unrelated cleanup).
+            srow = await sdk._http.get(f"/sessions/{sid}", timeout=10)
+            assert srow.status_code == 404, (
+                "session row was not cascade-deleted by the agent delete "
+                f"(status={srow.status_code}); the agent-delete path did not "
+                "run as expected — leak not exercised"
+            )
+
+            # Leak observable: a correct teardown stops the supervisor serving.
+            # Poll until nothing listens on its port; the buggy build keeps it
+            # serving indefinitely. The window is generous (60s) because the
+            # agent-delete teardown is synchronous and contends with DB +
+            # snapshot work under -n auto load — but the LEAK keeps the
+            # supervisor serving forever, so a wide window never weakens the RED
+            # detection, it only de-flakes GREEN.
+            stopped = False
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                if not _port_has_listener(port):
+                    stopped = True
+                    break
+                await asyncio.sleep(0.5)
+
+            assert stopped, (
+                "AGENT-DELETE COMPUTE LEAK reproduced "
+                f"(provider={provider} agent_type={agent_type}): a supervisor is "
+                f"STILL serving on port {port} 60s after DELETE /agents/"
+                f"{agent_id[:8]}. delete_agent cascade-dropped the session row "
+                "but never released/destroyed its sandbox, so the compute leaks "
+                "with no session row left to reap it."
+            )
+            leaked_pid = None  # teardown stopped it (fixed build)
+    finally:
+        # If the bug leaked the supervisor (RED run), reap it so the test does
+        # not pollute the host with an orphaned process.
+        if leaked_pid is not None and _pid_alive(leaked_pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(leaked_pid, 9)

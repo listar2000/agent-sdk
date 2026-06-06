@@ -301,6 +301,18 @@ async def delete_agent(agent_id: str) -> None:
         await conn.execute("DELETE FROM agents WHERE id = %s", (agent_id,))
 
 
+async def get_session_ids_for_agent(agent_id: str) -> list[str]:
+    """All session ids owned by ``agent_id``. Used by the agent-delete route to
+    tear down each session's compute BEFORE the ``sessions.agent_id`` FK's
+    ``ON DELETE CASCADE`` drops the rows — otherwise the sandboxes leak with no
+    session row left to reap them."""
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT id FROM sessions WHERE agent_id = %s", (agent_id,)
+        )).fetchall()
+    return [r["id"] for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Volume CRUD
 # ---------------------------------------------------------------------------
