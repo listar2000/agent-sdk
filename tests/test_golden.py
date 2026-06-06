@@ -403,12 +403,25 @@ async def _external_stop(sandbox: dict) -> None:
     print(f"\n[test] externally stopped {provider} sandbox {ref[:20]}")
 
 
+# The runtime image ships NO procps (no pkill/pgrep/ps) — ``pkill`` silently
+# no-ops, so the old ``pkill -9 -f supervisor.js`` never killed anything inside
+# daytona/modal/docker, and the supervisor-killed goldens "passed" without ever
+# killing the supervisor. Match supervisor.js in each /proc cmdline and kill the
+# pid with the shell builtin (``tr``/``grep``/``kill`` ARE present).
+_PROC_KILL_SUPERVISOR = (
+    'for d in /proc/[0-9]*; do '
+    'if tr "\\0" " " < "$d/cmdline" 2>/dev/null | grep -q "supervisor.js"; then '
+    'kill -9 "${d##*/}" 2>/dev/null; fi; done; true'
+)
+
+
 async def _kill_supervisor_in_sandbox(sandbox: dict) -> None:
-    """Kill ONLY the supervisor.js process inside the sandbox — the sandbox
-    itself stays alive. Mimics prod's '502 Bad Gateway' scenario where the
-    daytona proxy forwards to port 9100 but no process listens there
-    (supervisor OOM'd, crashed, or was killed by the runtime). The server's
-    DB still thinks the sandbox is fine; only the supervisor is gone.
+    """Kill the supervisor.js process so the server observes it as unreachable
+    (prod's '502 / OOM' scenario). For daytona/modal the supervisor is a child
+    process inside the still-alive sandbox; for docker the supervisor IS the
+    container's PID 1, so "kill the supervisor" necessarily stops the container
+    (a kill from inside is blocked by init-protection anyway) — SIGKILL it from
+    the host. unix_local's supervisor IS the host process.
     """
     provider = sandbox["provider"]
     ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
@@ -419,11 +432,7 @@ async def _kill_supervisor_in_sandbox(sandbox: dict) -> None:
         daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
         sb = await loop.run_in_executor(None, lambda: daytona.get(ref))
         await loop.run_in_executor(
-            None,
-            lambda: sb.process.exec(
-                "pkill -9 -f supervisor.js || pkill -9 -f 'node.*supervisor'",
-                timeout=10,
-            ),
+            None, lambda: sb.process.exec(_PROC_KILL_SUPERVISOR, timeout=15),
         )
 
     elif provider == "unix_local":
@@ -437,25 +446,20 @@ async def _kill_supervisor_in_sandbox(sandbox: dict) -> None:
                 pass
 
     elif provider == "docker":
-        # docker exec into the container and kill the supervisor PID 1.
-        # Without pid 1 the container exits; use pkill within the container.
+        # The supervisor is the container's PID 1; killing it from inside is
+        # blocked by init-protection (and the image has no pkill). SIGKILL from
+        # the host — this stops the container, which is exactly "the supervisor
+        # died" for docker (recovery then revives it via ``docker start``).
         await loop.run_in_executor(None, lambda: subprocess.run(
-            ["docker", "exec", ref, "pkill", "-9", "-f", "supervisor.js"],
-            capture_output=True, timeout=10,
+            ["docker", "kill", ref], capture_output=True, timeout=15,
         ))
 
     elif provider == "modal":
-        # ``sb.exec`` runs a command in the live modal sandbox. We pkill the
-        # supervisor.js so the sandbox object stays alive but its tunnel
-        # target stops responding — same scenario as docker/daytona above.
+        # /proc-based kill inside the live modal sandbox (no procps in image).
         import modal
         sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
         proc = await loop.run_in_executor(
-            None,
-            lambda: sb.exec(
-                "bash", "-c",
-                "pkill -9 -f supervisor.js || pkill -9 -f 'node.*supervisor'",
-            ),
+            None, lambda: sb.exec("bash", "-c", _PROC_KILL_SUPERVISOR),
         )
         await loop.run_in_executor(None, proc.wait)
 
@@ -1000,6 +1004,214 @@ async def test_failed_create_health_check_destroys_daytona_vm():
             with contextlib.suppress(Exception):
                 await _external_delete(sandbox)
             raise
+
+
+# ---------------------------------------------------------------------------
+# daytona: an UNRECOVERABLE recovery must DESTROY the old VM, not abandon it.
+#
+# The production-incident leak. Inject a failure the supervisor cannot recover
+# from, drive a recovery, and assert the old VM is gone. daytona's reattach
+# (``restart_daytona_supervisor``) fails → ``_resolve_or_create_sandbox``
+# cold-creates a FRESH VM while the OLD errored VM still exists (daytona VMs
+# persist in errored/paused billable states). Fix 1 destroys the old VM before
+# cold-creating → old GONE; pre-fix it is abandoned and leaks against quota.
+#
+# daytona-only: docker/modal/unix_local reattach/restart the existing compute
+# and only cold-create when it is already MISSING (gone) — so they never
+# abandon a still-existing compute (verified live + by their ``start()``
+# branches). docker's separate loop-on-wedged-container gap is covered by
+# ``test_docker_recovers_from_wedged_container``.
+# ---------------------------------------------------------------------------
+
+# Truncate supervisor.js itself (NOT just the ACP). Breaking the ACP only fails
+# at CREATE — on reattach ``start_supervisor_in_sandbox`` either takes the
+# idempotency fast-path or tolerates the lazily-spawned ACP, so the supervisor
+# comes back and the pool reattaches in place (no leak). Truncating supervisor.js
+# makes every ``node supervisor.js`` exit immediately → ``/v1/health`` never
+# answers → ``_wait_for_health`` fails → the reattach genuinely fails. The ACP is
+# truncated too for belt-and-suspenders. daytona / docker / modal all run the
+# pinned runtime image, so the paths are identical.
+_SUPERVISOR_BREAK_CMD = (
+    # 1) truncate supervisor.js (+ ACP) so any RESTART of the supervisor exits
+    #    immediately → /v1/health never answers → _wait_for_health fails.
+    'for f in /opt/agent-sdk/runtime/supervisor.js '
+    '/opt/agent-sdk/runtime/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js; do '
+    'chmod u+w "$f" 2>/dev/null; : > "$f" 2>/dev/null; done; '
+    # 2) kill the running supervisor so the NEXT request triggers recovery. The
+    #    runtime image ships no procps (no pkill/pgrep/ps), so match supervisor.js
+    #    in each /proc cmdline and kill the pid with the shell builtin.
+    'for d in /proc/[0-9]*; do '
+    'if tr "\\0" " " < "$d/cmdline" 2>/dev/null | grep -q "supervisor.js"; then '
+    'kill -9 "${d##*/}" 2>/dev/null; fi; done; true'
+)
+
+
+async def _inject_unrecoverable_supervisor(sandbox: dict) -> None:
+    """Truncate supervisor.js inside the live compute (so it can NEVER restart)
+    and kill the running supervisor, forcing a doomed recovery on the next
+    request. One exec — no dependency on procps (absent from the runtime image,
+    which is why ``_kill_supervisor_in_sandbox``'s ``pkill`` silently no-ops on
+    daytona)."""
+    provider = sandbox["provider"]
+    ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+    loop = asyncio.get_event_loop()
+
+    if provider == "daytona":
+        from daytona_sdk import Daytona, DaytonaConfig
+        daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
+        sb = await loop.run_in_executor(None, lambda: daytona.get(ref))
+        await loop.run_in_executor(None, lambda: sb.process.exec(_SUPERVISOR_BREAK_CMD, timeout=20))
+    elif provider == "docker":
+        # The supervisor IS the container's PID 1, so SIGKILL would EXIT the
+        # container (status `exited`) and recovery just reattaches to it. To hit
+        # the abandon path we need the container to stay RUNNING with an
+        # unreachable supervisor: SIGSTOP PID 1 from the host (cgroup-frozen,
+        # holds its port) → status==running + /health fails → the reattach path
+        # nulls sandbox_ref and cold-creates, abandoning this running container.
+        await loop.run_in_executor(None, lambda: subprocess.run(
+            ["docker", "kill", "--signal=STOP", ref], capture_output=True, timeout=20,
+        ))
+    elif provider == "modal":
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        proc = await loop.run_in_executor(None, lambda: sb.exec("bash", "-c", _SUPERVISOR_BREAK_CMD))
+        await loop.run_in_executor(None, proc.wait)
+    else:
+        raise RuntimeError(f"supervisor-break unsupported for {provider}")
+
+    print(f"[test:{provider}] injected unrecoverable supervisor failure on {ref[:24]}")
+
+
+@pytest.mark.parametrize("provider", ["daytona"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(420)
+async def test_unrecoverable_recovery_destroys_old_compute(provider, agent_type):
+    """daytona: a recovery whose supervisor restart is UNRECOVERABLE must
+    DESTROY the old VM (Fix 1), not abandon it.
+
+    BEHAVIOURAL golden, live daytona, no mocks. Inject an unrecoverable
+    supervisor failure (truncate supervisor.js + kill it), drive a recovery
+    that cold-creates a fresh VM, then assert the OLD errored VM is GONE.
+    Validated: old_ref != new_ref (reprovisioned) and the old VM destroyed by
+    Fix 1; pre-fix the old VM is abandoned → ``_assert_sandbox_gone`` times out
+    → this FAILS.
+
+    daytona-only by design. docker/modal/unix_local were verified — live and by
+    reading their ``start()`` branches — NOT to have this leak: they reattach a
+    running compute or restart a stopped one and only cold-create when it is
+    already MISSING (gone), so they never cold-create a replacement while the
+    old compute still exists. docker's separate "loops on a wedged container"
+    gap is covered by ``test_docker_recovers_from_wedged_container``.
+    """
+    _require_provider(provider)
+
+    async with ApiClient(SERVER, timeout=180) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        session_id = sess["session_id"]
+        assert (await _ask(sdk, session_id, "Reply with the single word: one.")).strip()
+        sandbox = await _get_sandbox(sdk, session_id)
+        old_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+        assert old_ref, f"no sandbox_ref for {provider}: {sandbox}"
+        print(f"\n[test:{provider}] session={session_id[:8]} old_ref={old_ref[:24]}")
+
+        await _inject_unrecoverable_supervisor(sandbox)
+
+        # Drive the recovery — its restart fails on the broken ACP. The turn
+        # itself may error; the invariant is about the OLD compute.
+        with contextlib.suppress(Exception):
+            await _ask(sdk, session_id, "Reply with the single word: two.")
+
+        new_sandbox = None
+        with contextlib.suppress(Exception):
+            new_sandbox = await _get_sandbox(sdk, session_id)
+        new_ref = (new_sandbox or {}).get("sandbox_ref") or (new_sandbox or {}).get("provider_ref", "")
+        print(f"[test:{provider}] new_ref={new_ref[:24] if new_ref else None}")
+
+        if new_ref and new_ref == old_ref:
+            # Reattached/restarted in place — the old ref IS the live session's
+            # compute, not a leak (daytona's reattach model). The session may be
+            # broken downstream, but no compute is orphaned. No-leak → pass.
+            print(f"[test:{provider}] reattached in place (same ref) — no leak")
+            return
+
+        # Reprovisioned, or recovery raised without a replacement (docker/modal
+        # PATH B). The old, now-unreferenced compute MUST be GONE. Pre-fix it is
+        # abandoned (still present at the provider) → _assert_sandbox_gone times
+        # out → FAILS, catching the leak.
+        old_sb = dict(sandbox)
+        old_sb["sandbox_ref"] = old_ref
+        try:
+            await _assert_sandbox_gone(provider, old_sb, timeout_s=90.0)
+        except AssertionError:
+            with contextlib.suppress(Exception):
+                await _external_delete(old_sb)
+            raise
+
+
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_docker_recovers_from_wedged_container(agent_type):
+    """fix #2: docker must RECOVER from a wedged (running-but-unreachable)
+    container — destroy it and cold-create a fresh one — not loop on it forever.
+
+    SIGSTOP the supervisor (the container's PID 1) so the container stays
+    ``running`` but ``/v1/health`` hangs. Pre-fix, every recovery reattaches to
+    the same wedged container (it nulls only the in-memory ref; the DB row keeps
+    the old ref) and never cold-creates → the session never recovers. With the
+    fix, the first recovery DESTROYS the wedged container so the next cold-creates
+    a fresh one and a follow-up prompt succeeds on a NEW container.
+    """
+    _require_provider("docker")
+
+    async with ApiClient(SERVER, timeout=120) as sdk:
+        sess = await _quick_session(sdk, "docker", agent_type=agent_type)
+        session_id = sess["session_id"]
+        assert (await _ask(sdk, session_id, "Reply with the single word: one.")).strip()
+        old_ref = (await _get_sandbox(sdk, session_id)).get("sandbox_ref")
+        assert old_ref, "fresh docker session has no sandbox_ref"
+
+        # Wedge: freeze the supervisor (PID 1) so the container stays running
+        # but its /health hangs — the loop trigger.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: subprocess.run(
+            ["docker", "kill", "--signal=STOP", old_ref], capture_output=True, timeout=20,
+        ))
+        print(f"\n[test:docker] froze supervisor (PID1) in container {old_ref[:16]}")
+
+        # Recovery must cold-create a fresh container and answer WITHIN a bound.
+        # Pre-fix, recovery loops on the wedged container and never answers, so
+        # the wait_for fires and the test fails fast instead of hanging (the
+        # ``@pytest.mark.timeout`` marker is a no-op without pytest-timeout).
+        async def _drive_recovery() -> str:
+            while True:
+                try:
+                    r = await _ask(sdk, session_id, "Reply with the single word: two.")
+                    if r.strip():
+                        return r
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+        reply = ""
+        with contextlib.suppress(asyncio.TimeoutError):
+            reply = await asyncio.wait_for(_drive_recovery(), timeout=120)
+        assert reply.strip(), (
+            "docker did not recover from the wedged container within 120s — "
+            "recovery looped on the same unreachable container instead of "
+            "cold-creating a fresh one"
+        )
+        new_ref = (await _get_sandbox(sdk, session_id)).get("sandbox_ref")
+        assert new_ref and new_ref != old_ref, (
+            f"expected a fresh container after recovery, still on {new_ref!r}"
+        )
+        print(f"[test:docker] recovered on fresh container {new_ref[:16]}")
+
+        # The fix destroyed the old wedged container; reap defensively if not
+        # (e.g. when this runs against unfixed code).
+        with contextlib.suppress(Exception):
+            await _external_delete({"provider": "docker", "sandbox_ref": old_ref})
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
