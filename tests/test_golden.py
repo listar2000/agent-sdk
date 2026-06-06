@@ -824,6 +824,184 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
     )
 
 
+# ---------------------------------------------------------------------------
+# Post-provision CREATE failure must DESTROY the daytona VM, not pause it.
+#
+# This is the production flood class: provisioning SUCCEEDS (the sandbox
+# exists, sandbox_ref is set), then ``start_supervisor_in_sandbox`` /
+# ``_attach_acp`` fails the eager create's health check. daytona ``stop()``
+# PAUSES (snapshot + keeps disk), so the unfixed create-failure path left the
+# VM paused-with-no-session-row — an orphan billing against the 2000 GiB
+# account quota with no automatic reclaim. ``pool._safe_destroy_compute`` +
+# the daytona session ``destroy()`` (Fix 2) must delete it instead.
+#
+# The ONLY way to reach this path on a real VM is to let provisioning succeed
+# and then break the supervisor — a pre_start *failure* is cleaned by
+# ``provision_daytona_sandbox``'s own ``except: daytona.delete`` and never
+# reaches Fix 2 (which is exactly why the pool-level companion in
+# tests/test_pool_releases_compute_on_start_failure.py is a unit test). We
+# truncate the bundled claude-agent-acp entrypoint via ``pre_start``: the
+# supervisor boots, its ACP child exits immediately (supervisor.js:
+# ``acp.on("exit", c => process.exit(c || 1))``), the supervisor dies, and the
+# create 502s on the health check — the exact prod signature.
+#
+# Brittle (hardcodes the runtime acp dist path baked into the snapshot) and
+# slow (~60s create-to-502 + up to ~90s delete-confirm); accepted because it's
+# the only live reproduction of the post-provision failure. daytona+claude
+# only: the sabotage targets the claude-agent-acp path and the pause-not-delete
+# leak is unique to daytona's ``stop()``.
+_ACP_TRUNCATE_PRE_START = (
+    "f=/opt/agent-sdk/runtime/node_modules/@agentclientprotocol/"
+    'claude-agent-acp/dist/index.js; chmod u+w "$f" 2>/dev/null; '
+    ': > "$f" 2>/dev/null; exit 0'
+)
+
+# daytona pause = the leak signature. A post-provision failure runs
+# ``session.stop()`` (pool.py), which PAUSES the daytona VM → ``stopped``. The
+# fix then hard-destroys it; without the fix it stays paused.
+_LEAK_STATES = {"stopped", "paused"}
+
+
+async def _daytona_orphans(sdk: ApiClient) -> dict[str, str]:
+    """``{sandbox_ref: state}`` for daytona VMs with NO live session row, read
+    from this PR's own ``GET /admin/orphans`` monitor.
+
+    This is how the test DISCOVERS the leaked VM — structurally, from the
+    monitor — instead of scraping the prose health-check error for a UUID. A
+    failed create's VM has no session row (``write_sandbox_state`` only runs
+    after ``start()`` succeeds), so it shows up here; a healthy create's VM has
+    a row and is excluded.
+    """
+    resp = await sdk._http.get(
+        "/admin/orphans", params={"provider": "daytona"}, timeout=30,
+    )
+    resp.raise_for_status()
+    return {
+        o["id"]: (o.get("state") or "").lower()
+        for o in resp.json().get("orphans", [])
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(360)
+async def test_failed_create_health_check_destroys_daytona_vm():
+    """Post-provision create failure must DESTROY the daytona VM (Fix 2).
+
+    BEHAVIOURAL golden — live daytona, NO mocks, and no scraping of the failure
+    message. Sabotages the supervisor with an acp-truncate ``pre_start`` so the
+    sandbox provisions fine and the eager create then 502s on the health check.
+
+    The leaked VM is identified STRUCTURALLY from this PR's ``/admin/orphans``
+    monitor (a daytona VM with no session row, paused → ``stopped``), not by
+    parsing a UUID out of the error string. We then assert the OBSERVABLE
+    OUTCOME against the live provider: that VM is gone from daytona
+    (``_assert_sandbox_gone`` polls ``daytona.get(ref)`` until it raises /
+    reports destroyed). NOT an interaction test — it never checks "was
+    destroy() called", only whether the VM still exists.
+
+    Under ``-n auto`` the only no-session-row *stopped* daytona VM is this
+    test's: healthy concurrent creates are ``running``, and hibernated sessions
+    keep their row (so they're not orphans). Post-fix the VM is destroyed →
+    PASSES. Pre-fix it stays paused → ``_assert_sandbox_gone`` times out → this
+    test FAILS, catching the >1000-VM production leak regression. See the
+    module-level comment above for why this is the only live path that
+    exercises Fix 2.
+    """
+    _require_provider("daytona")
+    if not OAUTH_TOKEN:
+        pytest.skip("CLAUDE_CODE_OAUTH_TOKEN required")
+
+    import uuid as _uuid
+    sid = str(_uuid.uuid4())
+    # Defence-in-depth: register the id so the autouse fixture DELETEs any
+    # partial session row at teardown (idempotent 204 if the failed create left
+    # none). The leaked VM itself is reaped explicitly below — a failed create
+    # leaves no resumable session row, so DELETE alone can't reach the orphan.
+    _CREATED_SESSIONS.append(sid)
+
+    # The failure path (health-check retries) takes ~60s; the default 30s
+    # ApiClient timeout would abort client-side before the server's 502.
+    async with ApiClient(SERVER, timeout=180) as sdk:
+        # Pre-existing orphans (from a prior aborted run / env churn) to ignore
+        # so we only attribute a leak to THIS create.
+        before = set(await _daytona_orphans(sdk))
+
+        body = {
+            "id": sid,
+            "provider": "daytona",
+            "agent_type": "claude",
+            "model": _RUNTIME_DEFAULTS["claude"]["model"],
+            "secrets": {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH_TOKEN},
+            "pre_start_commands": [_ACP_TRUNCATE_PRE_START],
+        }
+        created = None
+        try:
+            created = await sdk.create_session(**body)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            text = e.response.text or str(e)
+        else:
+            pytest.fail(
+                "sabotaged create unexpectedly SUCCEEDED — the acp-truncate "
+                "pre_start did not break the supervisor (the runtime acp dist "
+                "path may have moved in the snapshot). The test cannot validate "
+                f"the leak invariant. session={created.get('session_id')}"
+            )
+
+        # Post-provision failure signature: a supervisor health-check 502 (the
+        # leak path), NOT a provision/pre_start failure (cleaned by provision
+        # itself, never reaches Fix 2). Asserted on the message, but the leak
+        # itself is detected structurally below — this is only a guard that we
+        # exercised the right failure path.
+        assert status >= 500, f"expected 5xx create failure, got {status}: {text[:300]}"
+        assert "health check" in text, (
+            "create failed but not via the supervisor health check — wrong "
+            f"failure path, would not exercise Fix 2: {text[:400]}"
+        )
+        print(f"\n[test] post-provision create 502'd (status={status})")
+
+        # Discover the leaked VM from the orphan monitor. ``session.stop()``
+        # runs BEFORE the 502 is returned, so on the unfixed path the paused
+        # VM is a stopped orphan within seconds; poll a short grace window for
+        # daytona's state to settle. On the fixed path it may be destroyed
+        # before it's ever listed — then there is simply nothing to leak.
+        leaked: set[str] = set()
+        grace_deadline = asyncio.get_event_loop().time() + 30.0
+        while asyncio.get_event_loop().time() < grace_deadline:
+            now_orphans = await _daytona_orphans(sdk)
+            leaked |= {
+                ref for ref, st in now_orphans.items()
+                if ref not in before and st in _LEAK_STATES
+            }
+            if leaked:
+                break
+            await asyncio.sleep(3.0)
+
+    if not leaked:
+        # No new stopped orphan ever surfaced → Fix 2 destroyed the VM before
+        # it could be listed (a regression would have left it paused and
+        # visible within the grace window, since stop() precedes the 502).
+        print("[test] no new stopped daytona orphan after failed create — VM destroyed")
+        return
+
+    # BEHAVIOURAL INVARIANT: every VM the monitor flagged as a new stopped
+    # orphan must be GONE from the provider (destroyed), not left paused.
+    # Generous timeout — fire-and-forget destroy + daytona's up-to-60s
+    # delete-confirm. Pre-fix the VM is paused forever, so the timeout IS the
+    # regression signal.
+    print(f"[test] new stopped daytona orphan(s) after failed create: {sorted(leaked)}")
+    for ref in sorted(leaked):
+        sandbox = {"provider": "daytona", "sandbox_ref": ref}
+        try:
+            await _assert_sandbox_gone("daytona", sandbox, timeout_s=120.0)
+        except AssertionError:
+            # The test must not leak the VM it created — reap best-effort before
+            # re-raising so a real regression doesn't also flood the account.
+            with contextlib.suppress(Exception):
+                await _external_delete(sandbox)
+            raise
+
+
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
