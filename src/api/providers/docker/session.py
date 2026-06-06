@@ -104,10 +104,21 @@ class DockerSandboxSession(BaseSandboxSession):
         ok = await _wait_for_health(instance.url, max_retries=10, interval=0.3)
         if not ok:
             if reattached:
-                # We reattached to an existing container but its supervisor
-                # is unreachable. Abandon the ref so the next get_session
-                # cold-creates a fresh container instead of looping on the
-                # same wedged one.
+                # We reattached to an existing container but its supervisor is
+                # unreachable and couldn't be revived in place. DESTROY the
+                # wedged container so the NEXT get_session sees it as missing
+                # and cold-creates a fresh one. Merely nulling the in-memory
+                # ref is not enough: the DB row still carries the old ref, so
+                # the next recovery reattaches to the same wedged container and
+                # loops forever. The volume (and its per-turn snapshot) survive
+                # the rm, so the fresh container restores conversation state.
+                try:
+                    await dk_provider.destroy_sandbox(instance)
+                except Exception:
+                    log.exception(
+                        "failed to destroy wedged container %s; next recovery "
+                        "may reattach to it", (self._container_id or "")[:16],
+                    )
                 self.state.sandbox_ref = None
             raise RuntimeError(
                 f"Supervisor not responding at {instance.url} after create_sandbox"
