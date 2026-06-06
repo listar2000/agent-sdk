@@ -31,6 +31,7 @@ Run::
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -144,3 +145,81 @@ async def test_get_session_releases_compute_when_start_fails(monkeypatch):
     assert "leaky-sess" not in pool._active, (
         "failed session must not remain in _active"
     )
+
+
+class _LeakyDaytonaSession(_LeakySession):
+    """``_LeakySession`` + a ``destroy()`` method — the daytona shape.
+
+    For daytona, ``stop()`` only PAUSEs the VM (snapshot + ``daytona.stop``),
+    which keeps billing the account disk quota with no automatic reclaim. A
+    failed cold-create has no conversation to resume, so the create-failure
+    path must additionally hard-DELETE via ``destroy()`` (Fix 2). docker /
+    modal / unix_local expose no ``destroy()`` (their ``stop()`` already
+    deletes), so the pool's getattr-gate skips them — exactly what the
+    existing ``_LeakySession`` test above asserts stays unchanged.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.destroyed = False
+
+    async def destroy(self) -> None:
+        self.destroyed = True
+
+
+@pytest.mark.asyncio
+async def test_get_session_destroys_daytona_vm_on_start_failure(monkeypatch):
+    """Fix 2: a daytona session whose ``start()`` raises AFTER provisioning the
+    VM must have that VM hard-DELETED, not merely ``stop()``=PAUSED. A paused
+    daytona VM still bills the disk quota with no automatic reclaim — the
+    production flood. Pre-fix this FAILS (``destroy()`` never called); post-fix
+    PASSES.
+    """
+    from api import db as db_mod
+    from api.sandbox.pool import SessionPool
+
+    created: list[_LeakyDaytonaSession] = []
+
+    def _factory(sid, state):
+        s = _LeakyDaytonaSession(session_id=sid, state=state)
+        created.append(s)
+        return s
+
+    pool = SessionPool(factory=_factory)
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(pool, "_publish_state", _noop)
+    monkeypatch.setattr(db_mod, "write_sandbox_state", _noop)
+
+    state = ModalSandboxState(recipe=Recipe())
+    with pytest.raises(RuntimeError, match="session/new returned no sessionId"):
+        await pool.get_session("leaky-daytona", initial_state=state)
+
+    sess = created[0]
+    assert sess.acquired is True, (
+        "precondition: start() must acquire compute (set sandbox_ref) before raising"
+    )
+    # stop() is still expected — it is the correct teardown for the other
+    # providers and writes the daytona snapshot; the FIX is the ADDITIONAL
+    # hard-delete on top of it.
+    assert sess.stopped is True
+
+    # The destroy is fire-and-forget (``asyncio.create_task`` in the
+    # create-failure handler) so it never blocks the re-raise — yield to the
+    # loop so the scheduled task runs before we assert.
+    for _ in range(50):
+        if sess.destroyed:
+            break
+        await asyncio.sleep(0.01)
+
+    assert sess.destroyed is True, (
+        "FIX 2 — DAYTONA VM LEAK: start() raised after acquiring the sandbox, "
+        "but pool.get_session only PAUSED it (stop()) and never hard-DELETED "
+        "(destroy()). A paused daytona VM keeps billing the disk quota with no "
+        "automatic reclaim. Fix: in the create-failure handler, fire-and-forget "
+        "session.destroy() for sessions that expose it (daytona)."
+    )
+
+    assert "leaky-daytona" not in pool._active

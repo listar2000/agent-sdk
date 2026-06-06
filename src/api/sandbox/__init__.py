@@ -20,6 +20,7 @@ What's here:
 """
 from .factory import make_session, register
 from .liveness import Liveness, LivenessState
+from .orphan_monitor import start_orphan_monitor, stop_orphan_monitor
 from .pool import SessionNotFoundError, SessionPool
 from .runtime import get_pool, shutdown_pool, start_reaper, start_worker_heartbeat
 from .session import BaseSandboxSession
@@ -55,7 +56,9 @@ __all__ = [
     "register",
     "serialize",
     "shutdown_pool",
+    "start_orphan_monitor",
     "start_reaper",
     "start_worker_heartbeat",
     "state_for_provider",
+    "stop_orphan_monitor",
 ]
