@@ -56,7 +56,9 @@ import re as _re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -2452,3 +2454,180 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         assert "again" in reply.lower(), (
             f"session unusable after reap (cold-resume failed): {reply!r}"
         )
+
+
+# ===========================================================================
+# Credential-refresh task leak on cold-recovery (stale-teardown).
+# ===========================================================================
+#
+# get_session spawns one ``_credential_refresh_loop`` task per active session
+# when the recipe carries a ``credential_refresh_url`` (pool.py:269-277). The
+# loop is an infinite ``while True`` that POSTs to the URL every >=60s (the
+# delay is clamped ``max(60.0, ...)``). The ONLY site that cancels it is
+# ``pool.release()`` (pool.py:321-325). But the cold-recovery stale-teardown
+# branch — taken when a cached session is found dead on force_probe
+# (pool.py:178-181) — fires ``_safe_shutdown(cached)`` + ``_active.pop`` and
+# never cancels ``cached._credential_refresh_task``; no provider ``shutdown()``
+# touches it either. So every recovery orphans an infinite POST loop that
+# outlives its session: one leaked task per recovery, unbounded on a long
+# lived replica.
+#
+# Observable contract (HTTP-only, no mocks): point credential_refresh_url at a
+# local counting webhook. After a full DELETE, ``release()`` has cancelled the
+# REPLACEMENT session's refresh task, so NO task should ever POST again. The
+# orphaned task keeps ticking at its >=60s cadence — any POST after the delete
+# boundary is the leak. A mechanism check (a fresh supervisor pid after the
+# recovery turn) guards against a false-green where the stale-teardown branch
+# never ran.
+
+
+@pytest.mark.parametrize("provider", ["unix_local"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(600)
+async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agent_type):
+    """A cold-recovery must CANCEL the dead session's credential-refresh task.
+
+    Bug (pool.py:178-181): only ``release()`` cancels
+    ``_credential_refresh_task``; the stale-teardown branch orphans it, so an
+    infinite POST loop keeps hitting ``credential_refresh_url`` after the
+    session is gone. Caught here by asserting NO refresh POST lands after the
+    session is DELETEd.
+    """
+    _require_provider(provider)
+
+    posts: list[float] = []
+    posts_lock = threading.Lock()
+
+    class _CountingCreds(BaseHTTPRequestHandler):
+        # Records the arrival time of every credential-refresh POST and
+        # answers with an empty (no-op) credential payload so the loop never
+        # writes into the sandbox — we only care that it ticks.
+        def do_POST(self):  # noqa: N802 (http.server contract)
+            with posts_lock:
+                posts.append(time.monotonic())
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            payload = json.dumps(
+                {"contents": {}, "next_refresh_at": time.time()}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_a):  # keep pytest output clean
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _CountingCreds)
+    refresh_url = f"http://127.0.0.1:{httpd.server_address[1]}/refresh"
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    def _posts_after(boundary: float) -> int:
+        with posts_lock:
+            return sum(1 for t in posts if t > boundary)
+
+    async def _wait_posts(target: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with posts_lock:
+                if len(posts) >= target:
+                    return True
+            await asyncio.sleep(0.5)
+        return False
+
+    try:
+        async with ApiClient(SERVER) as sdk:
+            defaults = _RUNTIME_DEFAULTS[agent_type]
+            body: dict = {
+                "provider": provider,
+                "agent_type": agent_type,
+                "model": defaults["model"],
+                "credential_refresh_url": refresh_url,
+                "credential_refresh_token": "golden-cred-token",
+            }
+            secret_val = os.environ.get(defaults["secret_env"])
+            if secret_val:
+                body["secrets"] = {defaults["secret_env"]: secret_val}
+            sess = await sdk.create_session(**body)
+            sid = sess["session_id"]
+            _CREATED_SESSIONS.append(sid)
+
+            # The loop POSTs immediately on spawn — confirms task A is live and
+            # the webhook is reachable from the server. Without this the leak
+            # can't be exercised, so fail loudly rather than false-green.
+            assert await _wait_posts(1, 30.0), (
+                "credential-refresh task never POSTed after create — webhook "
+                "unreachable from the server or the loop never spawned"
+            )
+
+            # Finished turn so the cold-recovery RESUMES (session/load needs a
+            # prior turn's JSONL) rather than failing to start.
+            await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+
+            # Capture + kill the live supervisor.
+            sandbox_before = await _get_sandbox(sdk, sid)
+            pid_before = _local_supervisor_pid(sandbox_before)
+            assert pid_before is not None, (
+                "could not locate the unix_local supervisor pid — test setup "
+                "broken (lsof/pgrep unavailable?)"
+            )
+            await _external_stop(sandbox_before)
+
+            # Second prompt -> get_session force_probe sees dead -> stale-
+            # teardown (orphans task A) -> replacement resume -> spawns task B.
+            rpc = await _send_message(sdk, sid, "Reply with the single word: ok.")
+            term = await _wait_terminal(sdk, sid, rpc, _TERMINAL_TIMEOUT_S)
+            assert term is not None, (
+                f"recovery turn never produced a terminal (rpc={rpc[:8]})"
+            )
+
+            # Mechanism check — a fresh supervisor must have replaced the killed
+            # one, proving the stale-teardown branch actually ran. Otherwise the
+            # leak path was never taken and a pass would be meaningless.
+            sandbox_after = await _get_sandbox(sdk, sid)
+            pid_after = _local_supervisor_pid(sandbox_after)
+            assert pid_after is not None and pid_after != pid_before, (
+                "recovery did not start a NEW supervisor "
+                f"(pid_before={pid_before} pid_after={pid_after}); the stale-"
+                "teardown branch never ran — leak not exercised"
+            )
+
+            # DELETE -> the route awaits pool.release(), which cancels AND
+            # awaits the REPLACEMENT's refresh task. After this boundary the
+            # only thing that can POST is the orphaned task A.
+            resp = await sdk._http.delete(f"/sessions/{sid}", timeout=30)
+            assert resp.status_code in (200, 204), (
+                f"delete failed: {resp.status_code}"
+            )
+            with contextlib.suppress(ValueError):
+                _CREATED_SESSIONS.remove(sid)
+            boundary = time.monotonic()
+
+            # Watch >60s (the loop's hard cadence floor is max(60, ...)). Buggy
+            # build: the orphaned task ticks -> a POST after the boundary.
+            # Fixed build: zero. Break early on the first leak signal.
+            leaked = False
+            deadline = time.monotonic() + 75.0
+            while time.monotonic() < deadline:
+                if _posts_after(boundary + 0.5):
+                    leaked = True
+                    break
+                await asyncio.sleep(2.0)
+
+            assert not leaked, (
+                "CREDENTIAL-REFRESH TASK LEAK reproduced "
+                f"(provider={provider} agent_type={agent_type}): "
+                f"{_posts_after(boundary + 0.5)} refresh POST(s) landed AFTER "
+                "the session was DELETEd. The cold-recovery stale-teardown "
+                "(pool.py:178-181) orphaned the dead session's "
+                "_credential_refresh_task instead of cancelling it (only "
+                "release() cancels it), so an infinite POST loop outlives the "
+                "session — one leaked task per recovery."
+            )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
