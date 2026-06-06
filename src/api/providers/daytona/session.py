@@ -14,6 +14,7 @@ No "Type 1 vs Type 2" branching outside this class — recovery just calls
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -45,6 +46,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
         super().__init__(session_id=session_id, state=state)
         # Filled in by start(); cleared by shutdown().
         self._daytona_sandbox: Any | None = None
+        # Best-effort destroy of an unreachable old VM on reattach failure;
+        # kept on a strong ref so the fire-and-forget task isn't GC'd.
+        self._reattach_destroy_task: asyncio.Task | None = None
         self._cwd = "/home/daytona"  # provider-specific default
 
     # ------------------------------------------------------------------ #
@@ -177,9 +181,26 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 # fall-through, a wedged sandbox locks the session
                 # forever — every retry hits the same dead reattach.
                 log.warning(
-                    "DaytonaSandboxSession: reattach to %s failed (%s); abandoning + cold-creating",
+                    "DaytonaSandboxSession: reattach to %s failed (%s); destroying + cold-creating",
                     (self.state.sandbox_ref or "")[:16], e,
                 )
+                # Destroy the unreachable old VM instead of abandoning it — an
+                # abandoned ref leaks against the account disk quota (no
+                # automated prod reclaim: reconcile is boot-only, cleanup_orphans
+                # defaults to origin=test). Fire-and-forget so the up-to-60s
+                # delete-confirm poll never blocks the hot recovery path; state
+                # lives on the /vol snapshot and is restored on the cold-create
+                # below, so a redundant recreate is the worst case.
+                from api.providers import ProviderInstance
+                dead_ref = self.state.sandbox_ref
+                if dead_ref:
+                    self._reattach_destroy_task = asyncio.create_task(
+                        dt_provider.destroy_daytona(ProviderInstance(
+                            provider="daytona", url="",
+                            root=self.state.recipe.root or "/home/daytona",
+                            sandbox_ref=dead_ref,
+                        ))
+                    )
                 self.state.sandbox_ref = None
 
         # ``_bootstrap_session`` (in ``BaseSandboxSession``) ran from
@@ -336,6 +357,29 @@ class DaytonaSandboxSession(BaseSandboxSession):
             ))
         except Exception:
             log.exception("daytona.stop failed for session %s", self.session_id)
+
+    # ------------------------------------------------------------------ #
+    # destroy: hard-delete (vs stop() which pauses)                       #
+    # ------------------------------------------------------------------ #
+
+    async def destroy(self) -> None:
+        """Hard-delete the daytona VM (vs ``stop()`` which PAUSEs it). Used by
+        the create-failure teardown — a failed cold-create has no conversation
+        to resume, so pausing would just leak the VM against the disk quota.
+        The 60s delete-confirm poll lives in ``_daytona_sandbox_op``; callers
+        fire-and-forget. Idempotent / no-op without a ref."""
+        if not self.state.sandbox_ref:
+            return
+        from api.providers import ProviderInstance
+        from api.providers import daytona as dt_provider
+        try:
+            await dt_provider.destroy_daytona(ProviderInstance(
+                provider="daytona", url=self._supervisor_url or "",
+                root=self.state.recipe.root or "/home/daytona",
+                sandbox_ref=self.state.sandbox_ref,
+            ))
+        except Exception:
+            log.exception("daytona.destroy failed for session %s", self.session_id)
 
     # ------------------------------------------------------------------ #
     # shutdown: in-memory cleanup                                         #
