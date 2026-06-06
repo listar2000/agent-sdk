@@ -13,7 +13,11 @@ dependencies = [
     "uvicorn[standard]",
     "psycopg[binary]>=3.1",
     "psycopg_pool>=3.1",
-    "daytona-sdk",
+    # Pinned: 0.184 changed AsyncDaytona.list into an async generator taking a
+    # ListSandboxesQuery (was an awaitable list(labels=, page=)). Leaving this
+    # unpinned let a fresh prod image silently pull the breaking API and dark the
+    # daytona reconcile + orphan monitor. Bump deliberately.
+    "daytona-sdk==0.184.0",
     "modal>=1.4.2",
 ]
 

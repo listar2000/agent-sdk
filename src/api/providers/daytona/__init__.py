@@ -126,11 +126,12 @@ _DAYTONA_CLIENT_ASYNC: "Any | None" = None
 _DAYTONA_ASYNC_INIT_LOCK = asyncio.Lock()
 _DAYTONA_ASYNC_POOL_MAX = int(os.environ.get("AGENT_SDK_DAYTONA_POOL_MAX", "300"))
 
-# Daytona rejects deep pagination (offset >= 1000 -> HTTP 400). With the
-# default page_size of 100 that is page 11, so pages 1..10 (offsets 0..999)
-# are the safe window; past it the orphan scan reports ``capped=True`` and its
+# daytona-sdk >=0.184 made ``AsyncDaytona.list`` an auto-paginating async
+# generator, so we iterate sandboxes rather than page-walk (the old offset>=1000
+# hard limit is handled inside the SDK now). Cap the scan at this many sandboxes
+# as a runaway guard; past it the orphan scan reports ``capped=True`` and its
 # count is a lower bound.
-_DAYTONA_MAX_PAGES = int(os.environ.get("AGENT_SDK_DAYTONA_MAX_PAGES", "10"))
+_DAYTONA_MAX_ITEMS = int(os.environ.get("AGENT_SDK_DAYTONA_MAX_ITEMS", "5000"))
 
 
 async def _get_async_daytona_client():
@@ -1429,8 +1430,7 @@ async def reconcile_on_startup() -> None:
 
     labels = _sandbox_labels()
     try:
-        page = await daytona.list(labels=labels)
-        items = list(getattr(page, "items", None) or page)
+        items, _capped = await _list_labeled_sandboxes(daytona, labels)
     except Exception as e:
         log.warning("daytona reconcile: list failed: %s", e)
         return
@@ -1453,30 +1453,26 @@ async def reconcile_on_startup() -> None:
 
 
 async def _list_labeled_sandboxes(daytona, labels: dict[str, str]) -> tuple[list, bool]:
-    """Page-walk ``daytona.list(labels=, page=)`` up to the deep-pagination cap.
+    """Collect labelled daytona sandboxes via the SDK's async-iterator ``list``.
 
-    Returns ``(items, capped)``; ``capped`` is True when more pages exist than
-    we walked (the caller's result is then a lower bound). See
-    ``_DAYTONA_MAX_PAGES``.
+    daytona-sdk >=0.184 made ``AsyncDaytona.list`` an async generator that takes
+    a ``ListSandboxesQuery`` and auto-paginates, yielding ``AsyncSandbox`` objects
+    (older builds returned an awaitable page object via ``list(labels=, page=)``
+    — ``await``-ing the new generator raises "async_generator can't be used in
+    'await' expression", which is what broke the reconcile + orphan monitor).
+    We iterate the generator and stop at ``_DAYTONA_MAX_ITEMS`` as a runaway
+    guard. Returns ``(items, capped)``; ``capped`` is True when we hit that cap
+    (the caller's result is then a lower bound).
     """
+    from daytona_sdk import ListSandboxesQuery
+
     out: list = []
     capped = False
-    page = 1
-    while True:
-        result = await daytona.list(labels=labels, page=page)
-        # Normalize both SDK shapes: a page object with ``.items``, or a bare
-        # iterable (older SDK) which only carries the first page.
-        items = list(getattr(result, "items", None) or (result if page == 1 else []))
-        total_pages = getattr(result, "total_pages", None)
-        if not items:
-            break
-        out.extend(items)
-        if total_pages is None or page >= total_pages:
-            break
-        if page >= _DAYTONA_MAX_PAGES:
+    async for sb in daytona.list(ListSandboxesQuery(labels=labels)):
+        out.append(sb)
+        if len(out) >= _DAYTONA_MAX_ITEMS:
             capped = True
             break
-        page += 1
     return out, capped
 
 
