@@ -257,9 +257,13 @@ async def lifespan(app):
 
     # SessionPool owns idle eviction now (per
     # ).
-    from api.sandbox import shutdown_pool, start_reaper, start_worker_heartbeat
+    from api.sandbox import (
+        shutdown_pool, start_orphan_monitor, start_reaper,
+        start_worker_heartbeat, stop_orphan_monitor,
+    )
     _p0 = time.perf_counter(); await start_reaper(); _phases["reaper"] = (time.perf_counter() - _p0) * 1000
     _p0 = time.perf_counter(); await start_worker_heartbeat(); _phases["worker_hb"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await start_orphan_monitor(); _phases["orphan_mon"] = (time.perf_counter() - _p0) * 1000
     _phase_str = " ".join(f"{k}={v:.0f}ms" for k, v in _phases.items())
     log.info(
         "[%s] startup ready in %.0fms: %s",
@@ -276,6 +280,10 @@ async def lifespan(app):
     _snapshot_task.add_done_callback(_BG_TASKS.discard)
 
     yield
+    try:
+        await stop_orphan_monitor()
+    except Exception as e:
+        log.warning("stop_orphan_monitor failed: %s", e)
     try:
         await shutdown_pool()
     except Exception as e:
