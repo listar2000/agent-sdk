@@ -45,6 +45,7 @@ from .db import (
     get_agent,
     get_session,
     get_session_ids_for_agent,
+    get_session_ids_for_volume,
     get_session_log,
     get_volume,
     get_volume_by_name,
@@ -934,6 +935,12 @@ async def delete_volume_route(id_or_name: str, force: bool = False):
             f"Use ?force=true to cascade.",
         )
     if force and session_count > 0:
+        # Tear down each session's compute BEFORE the cascade row-delete — the
+        # volume FK is ON DELETE RESTRICT so we hard-delete the rows, and
+        # without this the sandboxes leak with no session row left to reap them
+        # (same release+destroy path as DELETE /sessions and DELETE /agents).
+        for sid in await get_session_ids_for_volume(vol.id):
+            await _destroy_session_compute(sid)
         # FK RESTRICT on volume blocks the final delete otherwise.
         await delete_sessions_by_volume(vol.id)
 

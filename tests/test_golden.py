@@ -2767,3 +2767,117 @@ async def test_delete_agent_tears_down_session_sandboxes(provider, agent_type):
         if leaked_pid is not None and _pid_alive(leaked_pid):
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.kill(leaked_pid, 9)
+
+
+# ===========================================================================
+# DELETE /volumes/{id}?force=true must tear down the compute of every session
+# it cascade-deletes.
+# ===========================================================================
+#
+# The volume's ON DELETE RESTRICT FK (sessions.volume_id, db.py:47) blocks a
+# delete while sessions exist, so the force path hard-deletes the session ROWS
+# first via delete_sessions_by_volume (a raw `DELETE FROM sessions`, db.py:561).
+# Like the DELETE /agents bug, that never releases the pool lease or destroys the
+# provider sandbox — every session on the volume leaks its compute with no row
+# left to reap it. Same port-listener oracle + mechanism check as the agent
+# golden (see that block for why the socket, not os.kill(pid,0), is the oracle).
+
+
+@pytest.mark.parametrize("provider", ["unix_local"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_type):
+    """Force-deleting a volume must not orphan its sessions' compute."""
+    _require_provider(provider)
+    import uuid as _uuid
+
+    leaked_pid: int | None = None
+    vol_id: str | None = None
+    try:
+        async with ApiClient(SERVER) as sdk:
+            # A DEDICATED volume — never the shared default (force-deleting that
+            # would cascade every other -n auto unix_local session).
+            vol = await sdk.create_volume(
+                name=f"leaktest-voldel-{_uuid.uuid4().hex[:12]}", provider=provider,
+            )
+            vol_id = vol["id"]
+
+            defaults = _RUNTIME_DEFAULTS[agent_type]
+            body: dict = {
+                "provider": provider,
+                "agent_type": agent_type,
+                "model": defaults["model"],
+                "volume_id": vol_id,
+            }
+            secret_val = os.environ.get(defaults["secret_env"])
+            if secret_val:
+                body["secrets"] = {defaults["secret_env"]: secret_val}
+            sess = await sdk.create_session(**body)
+            sid = sess["session_id"]
+            _CREATED_SESSIONS.append(sid)
+
+            # Finish a turn so the supervisor is up and serving.
+            await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+
+            sandbox = await _get_sandbox(sdk, sid)
+            pid = _local_supervisor_pid(sandbox)
+            url = (sandbox.get("url") or "")
+            try:
+                port = int(url.rsplit(":", 1)[-1].split("/", 1)[0])
+            except (ValueError, IndexError):
+                port = 0
+            assert port and _port_has_listener(port), (
+                f"supervisor not listening on its port before delete "
+                f"(url={url!r} port={port})"
+            )
+            leaked_pid = pid
+
+            # Force-delete the VOLUME (not the session). The cascade drops the
+            # session row; the route must tear the sandbox down first.
+            resp = await sdk._http.delete(
+                f"/volumes/{vol_id}", params={"force": "true"}, timeout=30,
+            )
+            assert resp.status_code in (200, 204), (
+                f"volume force-delete failed: {resp.status_code}"
+            )
+            vol_id = None  # deleted
+
+            # Mechanism check: the cascade actually removed the session row.
+            srow = await sdk._http.get(f"/sessions/{sid}", timeout=10)
+            assert srow.status_code == 404, (
+                "session row was not cascade-deleted by the volume force-delete "
+                f"(status={srow.status_code}); the cascade path did not run — "
+                "leak not exercised"
+            )
+            with contextlib.suppress(ValueError):
+                _CREATED_SESSIONS.remove(sid)
+
+            # Leak observable: a correct teardown stops the supervisor serving.
+            stopped = False
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                if not _port_has_listener(port):
+                    stopped = True
+                    break
+                await asyncio.sleep(0.5)
+
+            assert stopped, (
+                "FORCE-DELETE-VOLUME COMPUTE LEAK reproduced "
+                f"(provider={provider} agent_type={agent_type}): a supervisor is "
+                f"STILL serving on port {port} 60s after force-deleting the "
+                "volume. delete_sessions_by_volume cascade-dropped the session "
+                "row but the route never released/destroyed its sandbox."
+            )
+            leaked_pid = None  # teardown stopped it (fixed build)
+    finally:
+        if leaked_pid is not None and _pid_alive(leaked_pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(leaked_pid, 9)
+        # Drop the volume if the test bailed before deleting it.
+        if vol_id is not None:
+            with contextlib.suppress(Exception):
+                async with ApiClient(SERVER) as _sdk2:
+                    await _sdk2._http.delete(
+                        f"/volumes/{vol_id}", params={"force": "true"}, timeout=20,
+                    )

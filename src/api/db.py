@@ -558,6 +558,18 @@ async def count_sessions_by_volume(volume_id: str) -> int:
     return int(row["n"])
 
 
+async def get_session_ids_for_volume(volume_id: str) -> list[str]:
+    """All session ids bound to ``volume_id``. Used by the force-delete-volume
+    route to tear down each session's compute BEFORE the cascade row-delete —
+    otherwise the sandboxes leak with no session row left to reap them (the
+    volume FK is ON DELETE RESTRICT, so the route hard-deletes the rows)."""
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT id FROM sessions WHERE volume_id = %s", (volume_id,)
+        )).fetchall()
+    return [r["id"] for r in rows]
+
+
 async def delete_sessions_by_volume(volume_id: str) -> None:
     async with get_db() as conn:
         await conn.execute(
