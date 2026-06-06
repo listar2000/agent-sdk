@@ -126,6 +126,12 @@ _DAYTONA_CLIENT_ASYNC: "Any | None" = None
 _DAYTONA_ASYNC_INIT_LOCK = asyncio.Lock()
 _DAYTONA_ASYNC_POOL_MAX = int(os.environ.get("AGENT_SDK_DAYTONA_POOL_MAX", "300"))
 
+# Daytona rejects deep pagination (offset >= 1000 -> HTTP 400). With the
+# default page_size of 100 that is page 11, so pages 1..10 (offsets 0..999)
+# are the safe window; past it the orphan scan reports ``capped=True`` and its
+# count is a lower bound.
+_DAYTONA_MAX_PAGES = int(os.environ.get("AGENT_SDK_DAYTONA_MAX_PAGES", "10"))
+
 
 async def _get_async_daytona_client():
     """Process-shared AsyncDaytona client. Lazy-init under a lock."""
@@ -1444,3 +1450,68 @@ async def reconcile_on_startup() -> None:
             await daytona.delete(sb)
         except Exception as e:
             log.warning("daytona reconcile: delete %s: %s", sid[:16], e)
+
+
+async def _list_labeled_sandboxes(daytona, labels: dict[str, str]) -> tuple[list, bool]:
+    """Page-walk ``daytona.list(labels=, page=)`` up to the deep-pagination cap.
+
+    Returns ``(items, capped)``; ``capped`` is True when more pages exist than
+    we walked (the caller's result is then a lower bound). See
+    ``_DAYTONA_MAX_PAGES``.
+    """
+    out: list = []
+    capped = False
+    page = 1
+    while True:
+        result = await daytona.list(labels=labels, page=page)
+        # Normalize both SDK shapes: a page object with ``.items``, or a bare
+        # iterable (older SDK) which only carries the first page.
+        items = list(getattr(result, "items", None) or (result if page == 1 else []))
+        total_pages = getattr(result, "total_pages", None)
+        if not items:
+            break
+        out.extend(items)
+        if total_pages is None or page >= total_pages:
+            break
+        if page >= _DAYTONA_MAX_PAGES:
+            capped = True
+            break
+        page += 1
+    return out, capped
+
+
+async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> dict:
+    """List labelled daytona sandboxes and diff them against the live session
+    refs. Pure DETECTION — never deletes.
+
+    ``origin`` defaults to ``AGENT_SDK_ORIGIN`` (via ``_sandbox_labels``);
+    ``live_refs`` defaults to ``db.live_sandbox_refs()``. A sandbox whose id is
+    not in ``live_refs`` has no session row, i.e. leaked compute.
+
+    Returns ``{"total_seen": int, "orphans": [(id, state)],
+    "state_hist": {state: count}, "capped": bool}``.
+    """
+    from collections import Counter
+
+    labels = {_LABEL_ORIGIN: origin} if origin else _sandbox_labels()
+    daytona = await _get_async_daytona_client()
+    items, capped = await _list_labeled_sandboxes(daytona, labels)
+    if live_refs is None:
+        from ... import db as dbmod
+        live_refs = await dbmod.live_sandbox_refs()
+    orphans: list[tuple[str, str]] = []
+    state_hist: Counter = Counter()
+    for sb in items:
+        sid = getattr(sb, "id", None)
+        if not sid or sid in live_refs:
+            continue
+        raw = getattr(sb, "state", None) or ""
+        st = (raw.value if hasattr(raw, "value") else str(raw)).lower()
+        orphans.append((sid, st))
+        state_hist[st] += 1
+    return {
+        "total_seen": len(items),
+        "orphans": orphans,
+        "state_hist": dict(state_hist),
+        "capped": capped,
+    }

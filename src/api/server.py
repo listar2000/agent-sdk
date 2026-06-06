@@ -257,9 +257,13 @@ async def lifespan(app):
 
     # SessionPool owns idle eviction now (per
     # ).
-    from api.sandbox import shutdown_pool, start_reaper, start_worker_heartbeat
+    from api.sandbox import (
+        shutdown_pool, start_orphan_monitor, start_reaper,
+        start_worker_heartbeat, stop_orphan_monitor,
+    )
     _p0 = time.perf_counter(); await start_reaper(); _phases["reaper"] = (time.perf_counter() - _p0) * 1000
     _p0 = time.perf_counter(); await start_worker_heartbeat(); _phases["worker_hb"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await start_orphan_monitor(); _phases["orphan_mon"] = (time.perf_counter() - _p0) * 1000
     _phase_str = " ".join(f"{k}={v:.0f}ms" for k, v in _phases.items())
     log.info(
         "[%s] startup ready in %.0fms: %s",
@@ -276,6 +280,10 @@ async def lifespan(app):
     _snapshot_task.add_done_callback(_BG_TASKS.discard)
 
     yield
+    try:
+        await stop_orphan_monitor()
+    except Exception as e:
+        log.warning("stop_orphan_monitor failed: %s", e)
     try:
         await shutdown_pool()
     except Exception as e:
@@ -1262,6 +1270,28 @@ async def admin_list_sessions():
                 "process_alive": is_mine and cached.supervisor_url is not None,
             })
     return {"sessions": sessions_out, "instances": instances_out, "this_replica": my_addr}
+
+
+@app.get("/admin/orphans")
+async def admin_orphans(provider: str = Query(default="daytona")):
+    """On-demand orphan-sandbox report: provider sandboxes (origin-labelled)
+    whose id matches no live session row. Same diff the background orphan
+    monitor logs every ``AGENT_SDK_ORPHAN_MONITOR_INTERVAL_S`` — exposed here
+    for ad-hoc debugging and the leak-regression golden. Daytona-only today
+    (the only provider whose release PAUSEs rather than deletes)."""
+    if provider != "daytona":
+        return {"provider": provider, "orphan_count": 0, "orphans": [],
+                "total_seen": 0, "state_hist": {}, "capped": False}
+    from api.providers.daytona import detect_orphan_sandboxes
+    report = await detect_orphan_sandboxes()
+    return {
+        "provider": "daytona",
+        "orphan_count": len(report["orphans"]),
+        "orphans": [{"id": sid, "state": st} for sid, st in report["orphans"]],
+        "total_seen": report["total_seen"],
+        "state_hist": report["state_hist"],
+        "capped": report["capped"],
+    }
 
 
 @app.get("/admin/sessions/inactive")

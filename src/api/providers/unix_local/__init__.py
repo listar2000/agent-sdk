@@ -28,6 +28,7 @@ from .._shared import (
     _ACP_NPM_SPECS,
     _acp_bin_name,
     _acp_launch_args,
+    _auth_vars_to_unset,
     _find_free_port,
     _get_sandbox_env_vars,
     _runtime_acp_bin,
@@ -302,12 +303,18 @@ async def create_sandbox(
         os.makedirs(home_dir / ".claude", exist_ok=True)
     await asyncio.to_thread(_mkhome)
 
-    # Build the supervisor env. Local provider is by definition single-tenant
-    # on the user's own host — inherit the host's AUTH_KEYS (CLAUDE_CODE_OAUTH_TOKEN,
-    # ANTHROPIC_API_KEY, etc.) so the user's locally-configured Claude credentials
-    # flow naturally without the SDK having to re-forward them. Caller-supplied
-    # env in ``effective_env`` can still override.
+    # Build the supervisor env. The local provider runs the agent as a child of
+    # THIS server process, so ``os.environ`` carries the server's own ambient
+    # credentials. Honor the AUTH_KEYS no-leak contract (see providers/_shared.py,
+    # which daytona/docker enforce via ``_build_env_prefix``'s ``env -u``): strip
+    # every auth key the caller didn't explicitly provide so a stale server-side
+    # ``ANTHROPIC_API_KEY`` can't shadow a caller-supplied ``CLAUDE_CODE_OAUTH_TOKEN``
+    # (or vice-versa) and break the agent with "Invalid API key". The per-sandbox
+    # ``.credentials.json`` bridge below still carries a host ``claude setup-token``
+    # login for the no-secrets local-dev case, so that UX is preserved.
     base_env = dict(os.environ)
+    for _auth_key in _auth_vars_to_unset(effective_env):
+        base_env.pop(_auth_key, None)
     base_env.update(_get_sandbox_env_vars(effective_env))
     base_env["HOME"] = str(home_dir)
     base_env["CLAUDE_CONFIG_DIR"] = str(home_dir / ".claude")
