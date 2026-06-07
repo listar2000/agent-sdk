@@ -244,17 +244,15 @@ class SessionPool:
                 # which we still hold here, so it would deadlock.
                 with contextlib.suppress(Exception):
                     await session.stop()
-                # Daytona ``stop()`` only PAUSES (Bug A: leaks the VM against
-                # the disk quota for a session that never entered ``_active``
-                # and has no conversation to resume). ``stop()`` for
-                # docker/modal/unix_local already deletes, so this is a
-                # daytona-only hard-DELETE, getattr-gated → a byte-for-byte
-                # no-op for the other providers. Fire-and-forget so the 60s
-                # delete-confirm never blocks the re-raise while we hold
-                # ``_lock(session_id)``.
-                if getattr(session, "destroy", None) is not None and getattr(
-                    session.state, "sandbox_ref", None
-                ):
+                # A failed start has no conversation to resume, so HARD-DELETE
+                # the acquired compute (Bug A). ``stop()`` alone is not enough:
+                # daytona ``stop`` only PAUSES and docker ``stop`` keeps the
+                # container — both would leak. ``destroy()`` is now uniform
+                # across providers (modal/unix_local ``destroy`` == their
+                # already-destructive ``stop``, so it's a harmless no-op there).
+                # Fire-and-forget so the up-to-60s delete-confirm never blocks
+                # the re-raise while we hold ``_lock(session_id)``.
+                if getattr(session.state, "sandbox_ref", None):
                     asyncio.create_task(_safe_destroy_compute(session))
                 await _safe_shutdown(session)
                 raise
@@ -498,7 +496,9 @@ async def _safe_shutdown(session: BaseSandboxSession) -> None:
 
 async def _safe_destroy_compute(session: BaseSandboxSession) -> None:
     """Best-effort hard-DELETE of compute for a session whose ``start()``
-    failed after acquiring a pause-only VM (daytona). Never raises."""
+    failed after acquiring it. Never raises. Uniform across providers via
+    ``session.destroy()`` (daytona deletes the paused VM, docker rm -f's the
+    stopped container, modal/unix_local terminate)."""
     try:
         await session.destroy()
     except Exception:

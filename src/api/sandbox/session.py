@@ -536,7 +536,27 @@ class BaseSandboxSession(abc.ABC):
         then call ``daytona.stop()`` (pause). Never deletes the sandbox
         — explicit deletion is only triggered from
         ``DELETE /sessions/{id}`` or admin paths. Persists state to
-        the caller (the pool persists it to DB)."""
+        the caller (the pool persists it to DB).
+
+        NOTE the stop-vs-destroy split is provider-specific: daytona ``stop``
+        PAUSES (resumable) and docker ``stop`` keeps the container, so for
+        those ``stop != destroy``; modal/unix_local have no real pause, so
+        their ``stop`` already terminates the compute (``stop == destroy``)."""
+
+    async def destroy(self) -> None:
+        """Hard-DELETE the compute — terminal, no resume (vs ``stop()``).
+        Uniform across providers via the module's ``destroy_sandbox``: daytona
+        deletes the paused VM, docker ``rm -f``s the (merely stopped)
+        container, modal/unix_local terminate. Idempotent / no-op without a
+        ``sandbox_ref``. Lets exceptions propagate — callers
+        (``_safe_destroy_compute`` / the DELETE routes) wrap it."""
+        ref = getattr(self.state, "sandbox_ref", None)
+        if not ref:
+            return
+        from api.providers import destroy_instance
+        await destroy_instance(self._provider_instance(
+            url=self._supervisor_url or "", sandbox_ref=ref,
+        ))
 
     async def shutdown(self) -> None:
         """Final teardown of in-memory tasks/state. Cancels the session's
