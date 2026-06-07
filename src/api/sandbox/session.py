@@ -1,19 +1,21 @@
 """Abstract base class for SandboxSession — one per running compute.
 
 Concrete provider classes (DaytonaSandboxSession, DockerSandboxSession,
-UnixLocalSandboxSession, ModalSandboxSession) implement the 5 lifecycle
-methods.
+UnixLocalSandboxSession, ModalSandboxSession) implement the 3 abstract
+lifecycle methods (``start``/``running``/``stop``); ``execute_prompt``,
+``destroy``, and ``shutdown`` are concrete in this base.
 
 Decision: ``stop()`` and ``shutdown()`` are split. ``stop()`` is the
 data-preserving operation (snapshot + pause compute). ``shutdown()`` is
-the in-memory cleanup (cancel tasks, drop subscribers). The pool calls
-both in sequence on graceful release; a truly-dead session gets only
-``shutdown()``.
+the in-memory cleanup (cancel the credential-refresh task, drop
+subscribers, close the ACP client). The pool calls both in sequence on
+graceful release; a truly-dead session gets only ``shutdown()``.
 """
 from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -50,9 +52,8 @@ class _Subscriber:
     splices subscribers onto a replacement session. Without it the
     generator — whose ``self`` is permanently the original (now-dead)
     session — would pop ``sid`` from the original's already-cleared dict
-    and leave a zombie entry on the replacement, which pins that session
-    against the idle reaper forever (``reap_idle`` treats any non-empty
-    ``_subscribers`` as live activity)."""
+    and leave a zombie entry on the replacement (a never-cleaned-up
+    subscriber whose consumer has long since exited)."""
 
     __slots__ = ("queue", "owner")
 
@@ -69,16 +70,21 @@ class BaseSandboxSession(abc.ABC):
     serialised prompts, the subscriber fan-out for ``GET /events``, and
     the liveness oracle.
 
-    Subclass contract: implement ``start()``, ``running()``,
-    ``execute_prompt()``, ``stop()``, ``shutdown()``. The base class
-    provides subscriber multiplex (``subscribe()``, ``_broadcast()``)
-    and the liveness oracle wiring.
+    Subclass contract: implement ``start()``, ``running()``, ``stop()``.
+    The base class provides ``execute_prompt()``, ``destroy()``,
+    ``shutdown()``, subscriber multiplex (``subscribe()``,
+    ``_broadcast()``), the ``ProviderInstance`` builder, and the liveness
+    oracle wiring.
     """
 
     # Provider-side discriminator: used by ``_bootstrap_session()`` to
     # validate the session's volume.provider matches what this concrete
-    # class expects. Subclass overrides.
+    # class expects, AND as the ``provider`` field of every ProviderInstance
+    # this session builds. Subclass overrides.
     volume_provider: str = ""
+    # Default sandbox root when the recipe doesn't pin one. Subclass overrides
+    # (daytona /home/daytona, docker /home/agent, modal /v, local /tmp).
+    _default_root: str = "/tmp"
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         self.session_id = session_id
@@ -121,6 +127,31 @@ class BaseSandboxSession(abc.ABC):
         from api.acp_client import AcpClient as _AcpClient  # type-only-ish
         self._acp_client_cls = _AcpClient
         self._acp_client: _AcpClient | None = None
+        # Long-lived background task the session owns: the credential-refresh
+        # loop (spawned by the pool when the recipe has a credential_refresh_url).
+        # Cancelled by ``shutdown()`` so no teardown path can leak it.
+        self._credential_refresh_task: asyncio.Task | None = None
+
+    def _provider_instance(
+        self,
+        *,
+        url: str = "",
+        sandbox_ref: str | None = None,
+        port: int | None = None,
+    ) -> "ProviderInstance":
+        """Build the ``ProviderInstance`` handle this session passes to its
+        provider module (stop/destroy/reattach). Centralises the two fields
+        every call needs — ``provider`` (the class discriminator) and ``root``
+        (recipe root or the provider default) — which were otherwise rebuilt
+        inline at every provider op."""
+        from api.providers import ProviderInstance
+        return ProviderInstance(
+            provider=self.volume_provider,
+            url=url,
+            root=self.state.recipe.root or self._default_root,
+            sandbox_ref=sandbox_ref,
+            port=port,
+        )
 
     async def _bootstrap_session(self) -> str:
         """Idempotent: load the session row + volume from DB, install the
@@ -294,11 +325,6 @@ class BaseSandboxSession(abc.ABC):
         return self._supervisor_url
 
     @property
-    def acp_session_id(self) -> str | None:
-        """Public read of the ACP session id minted on first attach."""
-        return self._acp_session_id
-
-    @property
     def inner_session_id(self) -> str | None:
         """Public read of the agent-native inner session id (used for
         ``session/load`` on cold-recovery)."""
@@ -339,7 +365,7 @@ class BaseSandboxSession(abc.ABC):
 
     async def _aclose_acp_client(self) -> None:
         """Close the cached AcpClient if any. Safe to call multiple times.
-        Concrete shutdown() impls call this so the underlying httpx pool
+        The base ``shutdown()`` calls this so the underlying httpx pool
         gets cleaned up alongside subscribers."""
         if self._acp_client is not None:
             try:
@@ -506,12 +532,54 @@ class BaseSandboxSession(abc.ABC):
         then call ``daytona.stop()`` (pause). Never deletes the sandbox
         — explicit deletion is only triggered from
         ``DELETE /sessions/{id}`` or admin paths. Persists state to
-        the caller (the pool persists it to DB)."""
+        the caller (the pool persists it to DB).
 
-    @abc.abstractmethod
+        NOTE the stop-vs-destroy split is provider-specific: daytona ``stop``
+        PAUSES (resumable) and docker ``stop`` keeps the container, so for
+        those ``stop != destroy``; modal/unix_local have no real pause, so
+        their ``stop`` already terminates the compute (``stop == destroy``)."""
+
+    async def destroy(self) -> None:
+        """Hard-DELETE the compute — terminal, no resume (vs ``stop()``).
+        Uniform across providers via the module's ``destroy_sandbox``: daytona
+        deletes the paused VM, docker ``rm -f``s the (merely stopped)
+        container, modal/unix_local terminate. Idempotent / no-op without a
+        ``sandbox_ref``. Lets exceptions propagate — callers
+        (``_safe_destroy_compute`` / the DELETE routes) wrap it."""
+        ref = getattr(self.state, "sandbox_ref", None)
+        if not ref:
+            return
+        from api.providers import destroy_instance
+        await destroy_instance(self._provider_instance(
+            url=self._supervisor_url or "", sandbox_ref=ref,
+        ))
+
     async def shutdown(self) -> None:
-        """Final teardown of in-memory tasks. Doesn't touch the daytona
-        side. Idempotent."""
+        """Final teardown of in-memory tasks/state. Cancels the session's
+        background tasks (the credential-refresh loop), drops the supervisor
+        URL, and closes the subscribers + ACP client. Doesn't touch provider
+        compute. Idempotent.
+
+        Concrete in the base because every provider does the same in-memory
+        cleanup; subclasses override ONLY to null provider-specific handles
+        and must call ``await super().shutdown()``.
+        """
+        await self._cancel_background_tasks()
+        self._supervisor_url = None
+        self._close_subscribers()
+        await self._aclose_acp_client()
+
+    async def _cancel_background_tasks(self) -> None:
+        """Cancel every long-lived task the session owns (today: the
+        credential-refresh loop). Idempotent; never raises. Centralising it
+        in ``shutdown()`` means no teardown path can forget it — every path
+        ends in ``shutdown()``."""
+        task = self._credential_refresh_task
+        if task is not None:
+            self._credential_refresh_task = None
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
 
     # --- Cancel: best-effort interrupt of an in-flight execute_prompt ---
 
@@ -624,7 +692,7 @@ class BaseSandboxSession(abc.ABC):
         # prompt cold-recovery the pool hands this queue off to a
         # replacement session and rebinds ``owner``; popping from ``self``
         # (the original, now-dead session) would miss the replacement and
-        # leak a zombie entry that pins it against the idle reaper. See
+        # leak a never-cleaned-up zombie subscriber entry. See
         # ``_Subscriber``.
         sub = self._subscribers.get(sid)
         try:

@@ -55,6 +55,8 @@ async def _run_sandbox_exec_async(sandbox, cmd: str, timeout: int = 120) -> "_Ex
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
 from .._shared import (
+    ExecResult,
+    _MAX_OUTPUT_BYTES,
     _acp_launch_args,
     _build_env_prefix,
     _build_volume_mounts,
@@ -62,6 +64,7 @@ from .._shared import (
     _read_runtime_image_tag,
     _read_runtime_snapshot_tag,
     _safe_path,
+    _truncate,
     _wait_for_health,
     build_supervisor_argv,
     ProviderInstance,
@@ -162,12 +165,9 @@ async def start_supervisor_in_sandbox(
 ) -> str:
     """Start a NEW supervisor on a specific port inside an existing sandbox.
 
-    If the volume has a cached deps.tar.gz (Phase 2+), extract it to a local
-    ephemeral directory and run supervisor from there.  Extraction from a
-    single archive read is fast; writing thousands of node_modules to the
-    network volume at install time is avoided entirely.
-
-    Falls back to the legacy /tmp install path when no volume cache exists.
+    The supervisor + every ACP binary are baked into the sandbox image at
+    ``/opt/agent-sdk/runtime/`` — nothing is installed onto the volume at
+    runtime. We just spawn ``node supervisor.js`` from that directory.
     Returns the signed preview URL for this supervisor.
 
     Emits ``[BENCH] daytona.start_supervisor phase=<name> s=<seconds>`` log
@@ -300,16 +300,6 @@ async def start_supervisor_in_sandbox(
     return url
 
 
-async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
-    """Kill a supervisor process by port inside a Daytona sandbox."""
-    try:
-        await _run_sandbox_exec_async(
-            sandbox, f"fuser -k {port}/tcp 2>/dev/null || true", timeout=10,
-        )
-    except Exception as e:
-        log.warning("kill_supervisor_in_sandbox port=%d failed: %s", port, e)
-
-
 async def provision_daytona_sandbox(
     agent_type: str = "opencode",
     dockerfile: str | None = None,
@@ -320,14 +310,13 @@ async def provision_daytona_sandbox(
     shared_mounts: list[str] | None = None,
     resources: Any = None,
 ) -> ProviderInstance:
-    """Create a Daytona sandbox with 3 volume mounts, but do NOT install deps
-    or start a supervisor (those are handled by ensure_volume_supervisor and
-    ensure_supervisor_url respectively).
+    """Create a Daytona sandbox with its volume mounts, but do NOT start a
+    supervisor (that is handled later by ensure_supervisor_url).
 
     Returns a ProviderInstance with sandbox_ref but no usable supervisor URL.
     Supervisors are started per-session via start_supervisor_in_sandbox().
-    The supervisor binary + ACP package are expected to already be installed on
-    the volume at system/supervisor/ (mounted at /opt/supervisor).
+    The supervisor binary + ACP packages are baked into the sandbox image at
+    /opt/agent-sdk/runtime/ — the volume carries only user data.
     """
     try:
         from daytona_sdk import (
@@ -481,10 +470,8 @@ async def restart_daytona_supervisor(
     sandbox filesystem, so claude-agent-acp's persisted session state is
     available for session/load.
 
-    Routes through ``start_supervisor_in_sandbox`` which reads from the
-    per-volume deps.tar.gz cache installed by ``install_supervisor``. Any
-    post-volume-refactor sandbox has that cache; sandboxes old enough to
-    lack it are no longer supported (pre-2026-04).
+    Routes through ``start_supervisor_in_sandbox`` which spawns the
+    supervisor from the image-baked runtime at ``/opt/agent-sdk/runtime/``.
     """
     daytona = await _get_async_daytona_client()
     # Wait for a stable (non-transitional) state before attempting start.
@@ -892,6 +879,26 @@ async def stop_sandbox(*args, **kwargs):
     return await stop_daytona(*args, **kwargs)
 
 
+async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
+    """Run ``cmd`` inside the daytona sandbox via the SDK process channel."""
+    if not inst.sandbox_ref:
+        raise RuntimeError("no sandbox_ref for daytona exec")
+    daytona = await _get_async_daytona_client()
+    sandbox = await daytona.get(inst.sandbox_ref)
+    try:
+        r = await asyncio.wait_for(
+            sandbox.process.exec(cmd, timeout=timeout),
+            timeout=timeout + 5,
+        )
+    except asyncio.TimeoutError:
+        return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
+    out = (r.result if hasattr(r, "result") else str(r)) or ""
+    err = (r.stderr if hasattr(r, "stderr") else "") or ""
+    code = r.exit_code if hasattr(r, "exit_code") else None
+    out, trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
+    return ExecResult(stdout=out, stderr=err, exit_code=code, stdout_truncated=trunc)
+
+
 async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
                                 root: str = "/tmp",
                                 spawn_env: dict | None = None,
@@ -965,8 +972,8 @@ async def create_sandbox(
     """Uniform ``create_sandbox`` for the Daytona provider.
 
     Delegates to ``provision_daytona_sandbox`` which creates the sandbox with
-    the volume mounts (per-agent subpath + supervisor cache + any opt-in
-    shared mounts) but does NOT start a supervisor; the caller must run
+    the volume mounts (per-agent subpath at /vol + any opt-in shared mounts)
+    but does NOT start a supervisor; the caller must run
     ``ensure_supervisor_url`` before talking to the supervisor.
 
     ``spawn_env`` / ``port`` / `sandbox_ref` are accepted for parity with

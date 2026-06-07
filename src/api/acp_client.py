@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -103,12 +102,6 @@ def _mcp_dict_to_acp_array(mcp_servers: dict) -> list[dict]:
     return result
 
 
-@dataclass
-class PromptResponse:
-    stop_reason: str | None = None
-    usage: dict = field(default_factory=dict)
-
-
 class AcpClient:
     """Async client for a single ACP supervisor instance."""
 
@@ -123,11 +116,6 @@ class AcpClient:
 
     def get_inner_session_id(self, session_id: str) -> str | None:
         return self._inner_session_ids.get(session_id)
-
-    async def health(self) -> dict:
-        resp = await self._client.get("/v1/health")
-        resp.raise_for_status()
-        return resp.json()
 
     async def health_probe(self, timeout: float = 2.0) -> tuple[bool, int | None]:
         """Liveness probe: GET /v1/health using the cached httpx pool.
@@ -352,27 +340,6 @@ class AcpClient:
         except Exception:
             pass
         return result
-
-    async def prompt(self, session_id: str, message: str, rpc_id: str | None = None) -> tuple[str, PromptResponse]:
-        """Send a prompt and wait for the response. Returns (rpc_id, response)."""
-        if session_id not in self._inner_session_ids:
-            raise RuntimeError(f"Session {session_id} not initialized. Call initialize() first.")
-
-        if rpc_id is None:
-            rpc_id = str(uuid.uuid4())
-
-        params: dict[str, Any] = {
-            "prompt": [{"type": "text", "text": message}],
-        }
-        inner_sid = self._inner_session_ids.get(session_id)
-        if inner_sid:
-            params["sessionId"] = inner_sid
-
-        result = await self._send_rpc(session_id, "session/prompt", params, rpc_id=rpc_id)
-        return rpc_id, PromptResponse(
-            stop_reason=result.get("stopReason"),
-            usage=result.get("usage", {}),
-        )
 
     async def list_sessions(self, session_id: str) -> list[dict]:
         """List agent sessions within this ACP connection."""

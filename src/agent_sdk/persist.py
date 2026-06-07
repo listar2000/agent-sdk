@@ -9,7 +9,6 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 
 @dataclass
@@ -22,13 +21,9 @@ class SessionRecord:
     updated_at: float = 0.0
 
 
-class SessionPersistDriver(Protocol):
-    def get_session(self, id: str) -> SessionRecord | None: ...
-    def update_session(self, session: SessionRecord) -> None: ...
-
-
 class SqliteSessionDriver:
-    """SQLite implementation of SessionPersistDriver."""
+    """SQLite session-persistence driver: get_session / update_session
+    backed by a local SQLite file so agents resume across processes."""
 
     def __init__(self, db_path: str):
         self._db_path = Path(db_path).expanduser()
