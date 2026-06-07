@@ -340,39 +340,6 @@ def _local_supervisor_pid(sandbox: dict) -> int | None:
     return None
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if ``pid`` is still a live process. ``os.kill(pid, 0)`` sends no
-    signal — it's the portable liveness probe (raises ProcessLookupError when
-    the process is gone). NOTE: a SIGKILL'd-but-unreaped ZOMBIE still answers
-    as alive here, so this is only safe for best-effort cleanup, not as a
-    'compute is gone' oracle (use ``_port_has_listener`` for that)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    return True
-
-
-def _port_has_listener(port: int) -> bool:
-    """True if some process is LISTENING on ``port`` — i.e. a supervisor is
-    still SERVING. This is the correct 'compute alive' oracle: a SIGKILL'd
-    supervisor releases its socket immediately even if it lingers as an
-    unreaped zombie (which fools ``os.kill(pid, 0)``). Cross-replica teardown
-    can leave a zombie when the killing replica isn't the one that spawned the
-    process, so the port — not the pid — is what distinguishes a live sandbox
-    from a torn-down one."""
-    try:
-        r = subprocess.run(
-            ["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return False
-    return bool(r.stdout.strip())
-
-
 async def _external_stop(sandbox: dict) -> None:
     provider = sandbox["provider"]
     ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
@@ -2490,42 +2457,27 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
 
 
 # ===========================================================================
-# Credential-refresh task leak on cold-recovery (stale-teardown).
+# Teardown-route compute-leak goldens (cred-refresh task, agent delete, volume
+# force-delete). The leaks live in provider-agnostic code (pool.py teardown,
+# server.py delete routes), so all three parametrize over providers. Compute
+# liveness is the provider-aware _assert_sandbox_gone oracle (same one the
+# canonical test_delete_session_destroys_sandbox uses); modal is excluded
+# because _assert_sandbox_gone has no modal branch.
 # ===========================================================================
-#
-# get_session spawns one ``_credential_refresh_loop`` task per active session
-# when the recipe carries a ``credential_refresh_url`` (pool.py:269-277). The
-# loop is an infinite ``while True`` that POSTs to the URL every >=60s (the
-# delay is clamped ``max(60.0, ...)``). The ONLY site that cancels it is
-# ``pool.release()`` (pool.py:321-325). But the cold-recovery stale-teardown
-# branch — taken when a cached session is found dead on force_probe
-# (pool.py:178-181) — fires ``_safe_shutdown(cached)`` + ``_active.pop`` and
-# never cancels ``cached._credential_refresh_task``; no provider ``shutdown()``
-# touches it either. So every recovery orphans an infinite POST loop that
-# outlives its session: one leaked task per recovery, unbounded on a long
-# lived replica.
-#
-# Observable contract (HTTP-only, no mocks): point credential_refresh_url at a
-# local counting webhook. After a full DELETE, ``release()`` has cancelled the
-# REPLACEMENT session's refresh task, so NO task should ever POST again. The
-# orphaned task keeps ticking at its >=60s cadence — any POST after the delete
-# boundary is the leak. A mechanism check (a fresh supervisor pid after the
-# recovery turn) guards against a false-green where the stale-teardown branch
-# never ran.
 
 
-@pytest.mark.parametrize("provider", ["unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
 @agent_type_param
 @pytest.mark.asyncio
-@pytest.mark.timeout(600)
+@pytest.mark.timeout(900)
 async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agent_type):
     """A cold-recovery must CANCEL the dead session's credential-refresh task.
 
-    Bug (pool.py:178-181): only ``release()`` cancels
-    ``_credential_refresh_task``; the stale-teardown branch orphans it, so an
-    infinite POST loop keeps hitting ``credential_refresh_url`` after the
-    session is gone. Caught here by asserting NO refresh POST lands after the
-    session is DELETEd.
+    Bug (pool.py stale-teardown branch): only ``release()`` cancelled
+    ``_credential_refresh_task``; cold-recovery orphaned it, so an infinite POST
+    loop kept hitting ``credential_refresh_url`` after the session was gone.
+    Provider-agnostic: the loop runs server-side in the pool, so the webhook +
+    "no POST after DELETE" oracle works for every provider.
     """
     _require_provider(provider)
 
@@ -2533,9 +2485,6 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
     posts_lock = threading.Lock()
 
     class _CountingCreds(BaseHTTPRequestHandler):
-        # Records the arrival time of every credential-refresh POST and
-        # answers with an empty (no-op) credential payload so the loop never
-        # writes into the sandbox — we only care that it ticks.
         def do_POST(self):  # noqa: N802 (http.server contract)
             with posts_lock:
                 posts.append(time.monotonic())
@@ -2556,8 +2505,7 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _CountingCreds)
     refresh_url = f"http://127.0.0.1:{httpd.server_address[1]}/refresh"
-    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    server_thread.start()
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     def _posts_after(boundary: float) -> int:
         with posts_lock:
@@ -2589,49 +2537,36 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
             sid = sess["session_id"]
             _CREATED_SESSIONS.append(sid)
 
-            # The loop POSTs immediately on spawn — confirms task A is live and
-            # the webhook is reachable from the server. Without this the leak
-            # can't be exercised, so fail loudly rather than false-green.
-            assert await _wait_posts(1, 30.0), (
+            # The loop POSTs immediately on spawn — confirms the task is live and
+            # the webhook is reachable from the server (else the leak can't be
+            # exercised, so fail loudly rather than false-green).
+            assert await _wait_posts(1, 60.0), (
                 "credential-refresh task never POSTed after create — webhook "
                 "unreachable from the server or the loop never spawned"
             )
 
-            # Finished turn so the cold-recovery RESUMES (session/load needs a
-            # prior turn's JSONL) rather than failing to start.
+            # Finished turn so the cold-recovery RESUMES (session/load contract).
             await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
 
-            # Capture + kill the live supervisor.
-            sandbox_before = await _get_sandbox(sdk, sid)
-            pid_before = _local_supervisor_pid(sandbox_before)
-            assert pid_before is not None, (
-                "could not locate the unix_local supervisor pid — test setup "
-                "broken (lsof/pgrep unavailable?)"
-            )
-            await _external_stop(sandbox_before)
+            # Kill the sandbox so the next get_session force_probe sees it dead
+            # and takes the stale-teardown branch (orphaning the old task).
+            sandbox = await _get_sandbox(sdk, sid)
+            await _external_stop(sandbox)
 
-            # Second prompt -> get_session force_probe sees dead -> stale-
-            # teardown (orphans task A) -> replacement resume -> spawns task B.
+            # Recovery prompt: a terminal here means get_session served the
+            # prompt AFTER the kill — i.e. the stale-teardown + replacement ran
+            # (the only way to serve a prompt once the sandbox was externally
+            # stopped). Same recovery-happened evidence the midprompt-recovery
+            # golden relies on across all providers.
             rpc = await _send_message(sdk, sid, "Reply with the single word: ok.")
             term = await _wait_terminal(sdk, sid, rpc, _TERMINAL_TIMEOUT_S)
             assert term is not None, (
                 f"recovery turn never produced a terminal (rpc={rpc[:8]})"
             )
 
-            # Mechanism check — a fresh supervisor must have replaced the killed
-            # one, proving the stale-teardown branch actually ran. Otherwise the
-            # leak path was never taken and a pass would be meaningless.
-            sandbox_after = await _get_sandbox(sdk, sid)
-            pid_after = _local_supervisor_pid(sandbox_after)
-            assert pid_after is not None and pid_after != pid_before, (
-                "recovery did not start a NEW supervisor "
-                f"(pid_before={pid_before} pid_after={pid_after}); the stale-"
-                "teardown branch never ran — leak not exercised"
-            )
-
-            # DELETE -> the route awaits pool.release(), which cancels AND
-            # awaits the REPLACEMENT's refresh task. After this boundary the
-            # only thing that can POST is the orphaned task A.
+            # DELETE -> the route awaits pool.release(), which cancels AND awaits
+            # the REPLACEMENT's refresh task. After this boundary the only thing
+            # that can POST is the orphaned task (if the bug is present).
             resp = await sdk._http.delete(f"/sessions/{sid}", timeout=30)
             assert resp.status_code in (200, 204), (
                 f"delete failed: {resp.status_code}"
@@ -2641,8 +2576,8 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
             boundary = time.monotonic()
 
             # Watch >60s (the loop's hard cadence floor is max(60, ...)). Buggy
-            # build: the orphaned task ticks -> a POST after the boundary.
-            # Fixed build: zero. Break early on the first leak signal.
+            # build: the orphaned task ticks -> a POST after the boundary. Fixed
+            # build: zero. Break early on the first leak signal.
             leaked = False
             deadline = time.monotonic() + 75.0
             while time.monotonic() < deadline:
@@ -2654,150 +2589,94 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
             assert not leaked, (
                 "CREDENTIAL-REFRESH TASK LEAK reproduced "
                 f"(provider={provider} agent_type={agent_type}): "
-                f"{_posts_after(boundary + 0.5)} refresh POST(s) landed AFTER "
-                "the session was DELETEd. The cold-recovery stale-teardown "
-                "(pool.py:178-181) orphaned the dead session's "
-                "_credential_refresh_task instead of cancelling it (only "
-                "release() cancels it), so an infinite POST loop outlives the "
-                "session — one leaked task per recovery."
+                f"{_posts_after(boundary + 0.5)} refresh POST(s) landed AFTER the "
+                "session was DELETEd. The cold-recovery stale-teardown orphaned "
+                "the dead session's _credential_refresh_task instead of "
+                "cancelling it (only release() cancels it) — an infinite POST "
+                "loop outlives the session, one leaked task per recovery."
             )
     finally:
         httpd.shutdown()
         httpd.server_close()
 
 
-# ===========================================================================
-# DELETE /agents/{id} must tear down the compute of every session it
-# cascade-deletes.
-# ===========================================================================
-#
-# ``sessions.agent_id`` is ``ON DELETE CASCADE`` (db.py:43) and ``delete_agent``
-# is a bare ``DELETE FROM agents`` (db.py:301). ``delete_agent_route`` only
-# calls ``delete_agent`` — so deleting an agent drops its session rows but never
-# releases/destroys their sandboxes. The compute leaks with NO session row left
-# to reap it (the session-scoped DELETE path can no longer find it). Distinct
-# from the per-session DELETE route, which DOES release + destroy.
-#
-# Observable (unix_local): the supervisor IS the compute. Proper teardown
-# (pool.release -> stop -> kill) ends the process; the bug leaves it running.
-# A cascade mechanism-check (the session row is 404 after the agent delete)
-# guards against a false-green where the agent-delete path didn't actually run.
-
-
-@pytest.mark.parametrize("provider", ["unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(300)
 async def test_delete_agent_tears_down_session_sandboxes(provider, agent_type):
-    """Deleting an agent must not orphan its sessions' compute."""
+    """DELETE /agents/{id} must DESTROY the compute of every session it
+    cascade-deletes.
+
+    ``sessions.agent_id`` is ON DELETE CASCADE and ``delete_agent`` is a bare
+    row delete, so deleting an agent dropped its session rows but never
+    released/destroyed their sandboxes — the compute leaked with no row left to
+    reap it. Mirror of ``test_delete_session_destroys_sandbox`` via the AGENT
+    route; same provider-aware ``_assert_sandbox_gone`` oracle.
+    """
     _require_provider(provider)
 
-    leaked_pid: int | None = None
-    try:
-        async with ApiClient(SERVER) as sdk:
-            sess = await _quick_session(sdk, provider, agent_type=agent_type)
-            sid = sess["session_id"]
-            agent_id = sess.get("agent_id")
-            assert agent_id, "create response missing agent_id"
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        sid = sess["session_id"]
+        agent_id = sess.get("agent_id")
+        assert agent_id, "create response missing agent_id"
 
-            # Finish a turn so the supervisor is up and discoverable.
-            await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+        await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+        sandbox = await _get_sandbox(sdk, sid)
+        sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+        assert sandbox_ref, f"fresh session has no sandbox_ref: {sandbox}"
 
-            sandbox = await _get_sandbox(sdk, sid)
-            pid = _local_supervisor_pid(sandbox)
-            # Supervisor port — the 'is the compute still serving' oracle.
-            # ``os.kill(pid, 0)`` can't be used: cross-replica teardown SIGKILLs
-            # the supervisor but its spawning replica never reaps it, so it
-            # lingers as a zombie that fools a pid liveness check. The listening
-            # socket, by contrast, is released the instant the process dies.
-            url = (sandbox.get("url") or "")
-            try:
-                port = int(url.rsplit(":", 1)[-1].split("/", 1)[0])
-            except (ValueError, IndexError):
-                port = 0
-            assert port and _port_has_listener(port), (
-                f"supervisor not listening on its port before delete "
-                f"(url={url!r} port={port})"
-            )
-            leaked_pid = pid
+        # We assert on the DELETE post-condition, so bypass the autouse cleanup.
+        if sid in _CREATED_SESSIONS:
+            _CREATED_SESSIONS.remove(sid)
 
-            # Delete the AGENT (not the session). The FK cascade drops the
-            # session row; the route must still tear the sandbox down first.
-            resp = await sdk._http.delete(f"/agents/{agent_id}", timeout=30)
-            assert resp.status_code in (200, 204), (
-                f"agent delete failed: {resp.status_code}"
-            )
+        # Delete the AGENT (not the session). The cascade drops the session row;
+        # the route must tear the sandbox down first.
+        resp = await sdk._http.delete(f"/agents/{agent_id}", timeout=30)
+        assert resp.status_code in (200, 204), (
+            f"agent delete failed: {resp.status_code}"
+        )
 
-            # Mechanism check: the cascade actually removed the session row, so
-            # we know the agent-delete path ran (not some unrelated cleanup).
-            srow = await sdk._http.get(f"/sessions/{sid}", timeout=10)
-            assert srow.status_code == 404, (
-                "session row was not cascade-deleted by the agent delete "
-                f"(status={srow.status_code}); the agent-delete path did not "
-                "run as expected — leak not exercised"
-            )
+        # Mechanism check: the cascade actually removed the session row, so we
+        # know the agent-delete path ran (not some unrelated cleanup).
+        srow = await sdk._http.get(f"/sessions/{sid}", timeout=10)
+        assert srow.status_code == 404, (
+            "session row was not cascade-deleted by the agent delete "
+            f"(status={srow.status_code}); the agent-delete path did not run — "
+            "leak not exercised"
+        )
 
-            # Leak observable: a correct teardown stops the supervisor serving.
-            # Poll until nothing listens on its port; the buggy build keeps it
-            # serving indefinitely. The window is generous (60s) because the
-            # agent-delete teardown is synchronous and contends with DB +
-            # snapshot work under -n auto load — but the LEAK keeps the
-            # supervisor serving forever, so a wide window never weakens the RED
-            # detection, it only de-flakes GREEN.
-            stopped = False
-            deadline = time.monotonic() + 60.0
-            while time.monotonic() < deadline:
-                if not _port_has_listener(port):
-                    stopped = True
-                    break
-                await asyncio.sleep(0.5)
-
-            assert stopped, (
-                "AGENT-DELETE COMPUTE LEAK reproduced "
-                f"(provider={provider} agent_type={agent_type}): a supervisor is "
-                f"STILL serving on port {port} 60s after DELETE /agents/"
-                f"{agent_id[:8]}. delete_agent cascade-dropped the session row "
-                "but never released/destroyed its sandbox, so the compute leaks "
-                "with no session row left to reap it."
-            )
-            leaked_pid = None  # teardown stopped it (fixed build)
-    finally:
-        # If the bug leaked the supervisor (RED run), reap it so the test does
-        # not pollute the host with an orphaned process.
-        if leaked_pid is not None and _pid_alive(leaked_pid):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(leaked_pid, 9)
+        try:
+            await _assert_sandbox_gone(provider, sandbox, timeout_s=60.0)
+        except AssertionError:
+            with contextlib.suppress(Exception):
+                await _external_delete(sandbox)  # don't leak from the test itself
+            raise
 
 
-# ===========================================================================
-# DELETE /volumes/{id}?force=true must tear down the compute of every session
-# it cascade-deletes.
-# ===========================================================================
-#
-# The volume's ON DELETE RESTRICT FK (sessions.volume_id, db.py:47) blocks a
-# delete while sessions exist, so the force path hard-deletes the session ROWS
-# first via delete_sessions_by_volume (a raw `DELETE FROM sessions`, db.py:561).
-# Like the DELETE /agents bug, that never releases the pool lease or destroys the
-# provider sandbox — every session on the volume leaks its compute with no row
-# left to reap it. Same port-listener oracle + mechanism check as the agent
-# golden (see that block for why the socket, not os.kill(pid,0), is the oracle).
-
-
-@pytest.mark.parametrize("provider", ["unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(300)
 async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_type):
-    """Force-deleting a volume must not orphan its sessions' compute."""
+    """DELETE /volumes/{id}?force=true must DESTROY the compute of every session
+    it cascade-deletes.
+
+    The volume FK is ON DELETE RESTRICT, so the force path hard-deletes the
+    session rows first (delete_sessions_by_volume, a raw DELETE) — and like the
+    agent route it never released/destroyed the sandboxes. Mirror of
+    ``test_delete_session_destroys_sandbox`` via the VOLUME route.
+    """
     _require_provider(provider)
     import uuid as _uuid
 
-    leaked_pid: int | None = None
     vol_id: str | None = None
+    sandbox: dict | None = None
     try:
         async with ApiClient(SERVER) as sdk:
             # A DEDICATED volume — never the shared default (force-deleting that
-            # would cascade every other -n auto unix_local session).
+            # would cascade every other -n auto session on this provider).
             vol = await sdk.create_volume(
                 name=f"leaktest-voldel-{_uuid.uuid4().hex[:12]}", provider=provider,
             )
@@ -2817,21 +2696,13 @@ async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_
             sid = sess["session_id"]
             _CREATED_SESSIONS.append(sid)
 
-            # Finish a turn so the supervisor is up and serving.
             await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
-
             sandbox = await _get_sandbox(sdk, sid)
-            pid = _local_supervisor_pid(sandbox)
-            url = (sandbox.get("url") or "")
-            try:
-                port = int(url.rsplit(":", 1)[-1].split("/", 1)[0])
-            except (ValueError, IndexError):
-                port = 0
-            assert port and _port_has_listener(port), (
-                f"supervisor not listening on its port before delete "
-                f"(url={url!r} port={port})"
-            )
-            leaked_pid = pid
+            sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+            assert sandbox_ref, f"fresh session has no sandbox_ref: {sandbox}"
+
+            if sid in _CREATED_SESSIONS:
+                _CREATED_SESSIONS.remove(sid)
 
             # Force-delete the VOLUME (not the session). The cascade drops the
             # session row; the route must tear the sandbox down first.
@@ -2843,37 +2714,20 @@ async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_
             )
             vol_id = None  # deleted
 
-            # Mechanism check: the cascade actually removed the session row.
             srow = await sdk._http.get(f"/sessions/{sid}", timeout=10)
             assert srow.status_code == 404, (
                 "session row was not cascade-deleted by the volume force-delete "
                 f"(status={srow.status_code}); the cascade path did not run — "
                 "leak not exercised"
             )
-            with contextlib.suppress(ValueError):
-                _CREATED_SESSIONS.remove(sid)
 
-            # Leak observable: a correct teardown stops the supervisor serving.
-            stopped = False
-            deadline = time.monotonic() + 60.0
-            while time.monotonic() < deadline:
-                if not _port_has_listener(port):
-                    stopped = True
-                    break
-                await asyncio.sleep(0.5)
-
-            assert stopped, (
-                "FORCE-DELETE-VOLUME COMPUTE LEAK reproduced "
-                f"(provider={provider} agent_type={agent_type}): a supervisor is "
-                f"STILL serving on port {port} 60s after force-deleting the "
-                "volume. delete_sessions_by_volume cascade-dropped the session "
-                "row but the route never released/destroyed its sandbox."
-            )
-            leaked_pid = None  # teardown stopped it (fixed build)
+            try:
+                await _assert_sandbox_gone(provider, sandbox, timeout_s=60.0)
+            except AssertionError:
+                with contextlib.suppress(Exception):
+                    await _external_delete(sandbox)
+                raise
     finally:
-        if leaked_pid is not None and _pid_alive(leaked_pid):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(leaked_pid, 9)
         # Drop the volume if the test bailed before deleting it.
         if vol_id is not None:
             with contextlib.suppress(Exception):
