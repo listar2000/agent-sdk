@@ -37,6 +37,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
     """One running Daytona sandbox + the supervisor + ACP child inside it."""
 
     volume_provider = "daytona"
+    _default_root = "/home/daytona"
     state: DaytonaSandboxState  # narrow the base's SandboxState union
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -191,15 +192,12 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 # delete-confirm poll never blocks the hot recovery path; state
                 # lives on the /vol snapshot and is restored on the cold-create
                 # below, so a redundant recreate is the worst case.
-                from api.providers import ProviderInstance
                 dead_ref = self.state.sandbox_ref
                 if dead_ref:
                     self._reattach_destroy_task = asyncio.create_task(
-                        dt_provider.destroy_daytona(ProviderInstance(
-                            provider="daytona", url="",
-                            root=self.state.recipe.root or "/home/daytona",
-                            sandbox_ref=dead_ref,
-                        ))
+                        dt_provider.destroy_daytona(
+                            self._provider_instance(sandbox_ref=dead_ref)
+                        )
                     )
                 self.state.sandbox_ref = None
 
@@ -348,11 +346,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
         # Always-pause policy (docs §15.3).
         from api.providers import daytona as dt_provider
-        from api.providers import ProviderInstance
         try:
-            await dt_provider.stop_daytona(ProviderInstance(
-                provider="daytona", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/home/daytona",
+            await dt_provider.stop_daytona(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref or "",
             ))
         except Exception:
@@ -370,12 +366,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
         fire-and-forget. Idempotent / no-op without a ref."""
         if not self.state.sandbox_ref:
             return
-        from api.providers import ProviderInstance
         from api.providers import daytona as dt_provider
         try:
-            await dt_provider.destroy_daytona(ProviderInstance(
-                provider="daytona", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/home/daytona",
+            await dt_provider.destroy_daytona(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref,
             ))
         except Exception:
@@ -386,8 +380,5 @@ class DaytonaSandboxSession(BaseSandboxSession):
     # ------------------------------------------------------------------ #
 
     async def shutdown(self) -> None:
-        """Final teardown of in-memory state. Idempotent."""
-        self._daytona_sandbox = None
-        self._supervisor_url = None
-        self._close_subscribers()
-        await self._aclose_acp_client()
+        self._daytona_sandbox = None  # provider-specific handle; rest is base
+        await super().shutdown()

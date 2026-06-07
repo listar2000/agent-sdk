@@ -28,6 +28,7 @@ class DockerSandboxSession(BaseSandboxSession):
     """One running Docker container + supervisor + ACP child."""
 
     volume_provider = "docker"
+    _default_root = "/home/agent"
     state: DockerSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -57,12 +58,9 @@ class DockerSandboxSession(BaseSandboxSession):
         if self.state.sandbox_ref:
             try:
                 status = await dk_provider.get_sandbox_status(self.state.sandbox_ref)
-                from api.providers import ProviderInstance
                 if status == "running":
-                    instance = ProviderInstance(
-                        provider="docker",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/home/agent",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -71,10 +69,8 @@ class DockerSandboxSession(BaseSandboxSession):
                     # Container exists but stopped (`docker stop` w/o --rm).
                     # `docker start` revives it on the same image+volume.
                     await dk_provider.start_sandbox(self.state.sandbox_ref)
-                    instance = ProviderInstance(
-                        provider="docker",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/home/agent",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -173,11 +169,9 @@ class DockerSandboxSession(BaseSandboxSession):
         # means: stop, but keep volume; next start creates a fresh container
         # against the same volume subpath, restoring from snapshot.
         from api.providers import docker as dk_provider
-        from api.providers import ProviderInstance
         try:
-            await dk_provider.stop_sandbox(ProviderInstance(
-                provider="docker", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/home/agent",
+            await dk_provider.stop_sandbox(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
@@ -192,7 +186,5 @@ class DockerSandboxSession(BaseSandboxSession):
     # ------------------------------------------------------------------ #
 
     async def shutdown(self) -> None:
-        self._container_id = None
-        self._supervisor_url = None
-        self._close_subscribers()
-        await self._aclose_acp_client()
+        self._container_id = None  # provider-specific handle; rest is base
+        await super().shutdown()

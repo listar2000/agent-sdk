@@ -46,12 +46,9 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         if self.state.sandbox_ref:
             try:
                 status = await lc_provider.get_sandbox_status(self.state.sandbox_ref)
-                from api.providers import ProviderInstance
                 if status == "running":
-                    instance = ProviderInstance(
-                        provider="unix_local",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/tmp",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -62,10 +59,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     # pre_start commands) — preserves the contract that the
                     # sandbox identity survives external stops.
                     await lc_provider.start_sandbox(self.state.sandbox_ref)
-                    instance = ProviderInstance(
-                        provider="unix_local",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/tmp",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -134,11 +129,9 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                 log.exception("snapshot request failed for session %s", self.session_id)
 
         from api.providers import unix_local as lc_provider
-        from api.providers import ProviderInstance
         try:
-            await lc_provider.stop_sandbox(ProviderInstance(
-                provider="unix_local", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/tmp",
+            await lc_provider.stop_sandbox(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
@@ -148,7 +141,5 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         self.state.sandbox_ref = None
         self.state.listen_port = None
 
-    async def shutdown(self) -> None:
-        self._supervisor_url = None
-        self._close_subscribers()
-        await self._aclose_acp_client()
+    # shutdown() inherited from BaseSandboxSession (no provider-specific
+    # handles to null beyond the base's _supervisor_url).

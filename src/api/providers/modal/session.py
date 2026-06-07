@@ -25,6 +25,7 @@ class ModalSandboxSession(BaseSandboxSession):
     """One running Modal sandbox + supervisor + ACP child."""
 
     volume_provider = "modal"
+    _default_root = "/v"
     state: ModalSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -87,11 +88,8 @@ class ModalSandboxSession(BaseSandboxSession):
                         self.state.sandbox_ref
                     )
                     if url:
-                        from api.providers import ProviderInstance
-                        instance = ProviderInstance(
-                            provider="modal",
+                        instance = self._provider_instance(
                             url=url,
-                            root=self.state.recipe.root or "/v",
                             sandbox_ref=self.state.sandbox_ref,
                             port=self.state.listen_port,
                         )
@@ -139,11 +137,8 @@ class ModalSandboxSession(BaseSandboxSession):
             # failure so we do not leak "created but unregistered" sandboxes.
             if created_fresh and self.state.sandbox_ref:
                 try:
-                    from api.providers import ProviderInstance
-                    await md_provider.stop_sandbox(ProviderInstance(
-                        provider="modal",
+                    await md_provider.stop_sandbox(self._provider_instance(
                         url=self._supervisor_url or "",
-                        root=self.state.recipe.root or "/v",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     ))
@@ -190,11 +185,9 @@ class ModalSandboxSession(BaseSandboxSession):
         # still call stop_sandbox; the persisted snapshot lets the next
         # start() restore from it.
         from api.providers import modal as md_provider
-        from api.providers import ProviderInstance
         try:
-            await md_provider.stop_sandbox(ProviderInstance(
-                provider="modal", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/v",
+            await md_provider.stop_sandbox(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
@@ -204,7 +197,5 @@ class ModalSandboxSession(BaseSandboxSession):
         self.state.sandbox_ref = None
         self.state.listen_port = None
 
-    async def shutdown(self) -> None:
-        self._supervisor_url = None
-        self._close_subscribers()
-        await self._aclose_acp_client()
+    # shutdown() inherited from BaseSandboxSession (no provider-specific
+    # handles to null beyond the base's _supervisor_url).

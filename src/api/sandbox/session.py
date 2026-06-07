@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -70,15 +71,19 @@ class BaseSandboxSession(abc.ABC):
     the liveness oracle.
 
     Subclass contract: implement ``start()``, ``running()``,
-    ``execute_prompt()``, ``stop()``, ``shutdown()``. The base class
-    provides subscriber multiplex (``subscribe()``, ``_broadcast()``)
-    and the liveness oracle wiring.
+    ``execute_prompt()``, ``stop()``. The base class provides ``shutdown()``,
+    subscriber multiplex (``subscribe()``, ``_broadcast()``), the
+    ``ProviderInstance`` builder, and the liveness oracle wiring.
     """
 
     # Provider-side discriminator: used by ``_bootstrap_session()`` to
     # validate the session's volume.provider matches what this concrete
-    # class expects. Subclass overrides.
+    # class expects, AND as the ``provider`` field of every ProviderInstance
+    # this session builds. Subclass overrides.
     volume_provider: str = ""
+    # Default sandbox root when the recipe doesn't pin one. Subclass overrides
+    # (daytona /home/daytona, docker /home/agent, modal /v, local /tmp).
+    _default_root: str = "/tmp"
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         self.session_id = session_id
@@ -121,6 +126,31 @@ class BaseSandboxSession(abc.ABC):
         from api.acp_client import AcpClient as _AcpClient  # type-only-ish
         self._acp_client_cls = _AcpClient
         self._acp_client: _AcpClient | None = None
+        # Long-lived background task the session owns: the credential-refresh
+        # loop (spawned by the pool when the recipe has a credential_refresh_url).
+        # Cancelled by ``shutdown()`` so no teardown path can leak it.
+        self._credential_refresh_task: asyncio.Task | None = None
+
+    def _provider_instance(
+        self,
+        *,
+        url: str = "",
+        sandbox_ref: str | None = None,
+        port: int | None = None,
+    ) -> "ProviderInstance":
+        """Build the ``ProviderInstance`` handle this session passes to its
+        provider module (stop/destroy/reattach). Centralises the two fields
+        every call needs — ``provider`` (the class discriminator) and ``root``
+        (recipe root or the provider default) — which were otherwise rebuilt
+        inline at every provider op."""
+        from api.providers import ProviderInstance
+        return ProviderInstance(
+            provider=self.volume_provider,
+            url=url,
+            root=self.state.recipe.root or self._default_root,
+            sandbox_ref=sandbox_ref,
+            port=port,
+        )
 
     async def _bootstrap_session(self) -> str:
         """Idempotent: load the session row + volume from DB, install the
@@ -508,10 +538,32 @@ class BaseSandboxSession(abc.ABC):
         ``DELETE /sessions/{id}`` or admin paths. Persists state to
         the caller (the pool persists it to DB)."""
 
-    @abc.abstractmethod
     async def shutdown(self) -> None:
-        """Final teardown of in-memory tasks. Doesn't touch the daytona
-        side. Idempotent."""
+        """Final teardown of in-memory tasks/state. Cancels the session's
+        background tasks (the credential-refresh loop), drops the supervisor
+        URL, and closes the subscribers + ACP client. Doesn't touch provider
+        compute. Idempotent.
+
+        Concrete in the base because every provider does the same in-memory
+        cleanup; subclasses override ONLY to null provider-specific handles
+        and must call ``await super().shutdown()``.
+        """
+        await self._cancel_background_tasks()
+        self._supervisor_url = None
+        self._close_subscribers()
+        await self._aclose_acp_client()
+
+    async def _cancel_background_tasks(self) -> None:
+        """Cancel every long-lived task the session owns (today: the
+        credential-refresh loop). Idempotent; never raises. Centralising it
+        in ``shutdown()`` means no teardown path can forget it — every path
+        ends in ``shutdown()``."""
+        task = self._credential_refresh_task
+        if task is not None:
+            self._credential_refresh_task = None
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
 
     # --- Cancel: best-effort interrupt of an in-flight execute_prompt ---
 
