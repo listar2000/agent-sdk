@@ -301,6 +301,18 @@ async def delete_agent(agent_id: str) -> None:
         await conn.execute("DELETE FROM agents WHERE id = %s", (agent_id,))
 
 
+async def get_session_ids_for_agent(agent_id: str) -> list[str]:
+    """All session ids owned by ``agent_id``. Used by the agent-delete route to
+    tear down each session's compute BEFORE the ``sessions.agent_id`` FK's
+    ``ON DELETE CASCADE`` drops the rows — otherwise the sandboxes leak with no
+    session row left to reap them."""
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT id FROM sessions WHERE agent_id = %s", (agent_id,)
+        )).fetchall()
+    return [r["id"] for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Volume CRUD
 # ---------------------------------------------------------------------------
@@ -544,6 +556,18 @@ async def count_sessions_by_volume(volume_id: str) -> int:
             "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (volume_id,)
         )).fetchone()
     return int(row["n"])
+
+
+async def get_session_ids_for_volume(volume_id: str) -> list[str]:
+    """All session ids bound to ``volume_id``. Used by the force-delete-volume
+    route to tear down each session's compute BEFORE the cascade row-delete —
+    otherwise the sandboxes leak with no session row left to reap them (the
+    volume FK is ON DELETE RESTRICT, so the route hard-deletes the rows)."""
+    async with get_db() as conn:
+        rows = await (await conn.execute(
+            "SELECT id FROM sessions WHERE volume_id = %s", (volume_id,)
+        )).fetchall()
+    return [r["id"] for r in rows]
 
 
 async def delete_sessions_by_volume(volume_id: str) -> None:

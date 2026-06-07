@@ -56,7 +56,9 @@ import re as _re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -2452,3 +2454,284 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         assert "again" in reply.lower(), (
             f"session unusable after reap (cold-resume failed): {reply!r}"
         )
+
+
+# ===========================================================================
+# Teardown-route compute-leak goldens (cred-refresh task, agent delete, volume
+# force-delete). The leaks live in provider-agnostic code (pool.py teardown,
+# server.py delete routes), so all three parametrize over providers. Compute
+# liveness is the provider-aware _assert_sandbox_gone oracle (same one the
+# canonical test_delete_session_destroys_sandbox uses); modal is excluded
+# because _assert_sandbox_gone has no modal branch.
+# ===========================================================================
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(900)
+async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agent_type):
+    """A cold-recovery must CANCEL the dead session's credential-refresh task.
+
+    Bug (pool.py stale-teardown branch): only ``release()`` cancelled
+    ``_credential_refresh_task``; cold-recovery orphaned it, so an infinite POST
+    loop kept hitting ``credential_refresh_url`` after the session was gone.
+    Provider-agnostic: the loop runs server-side in the pool, so the webhook +
+    "no POST after DELETE" oracle works for every provider.
+    """
+    _require_provider(provider)
+
+    posts: list[float] = []
+    posts_lock = threading.Lock()
+
+    class _CountingCreds(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 (http.server contract)
+            with posts_lock:
+                posts.append(time.monotonic())
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            payload = json.dumps(
+                {"contents": {}, "next_refresh_at": time.time()}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_a):  # keep pytest output clean
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _CountingCreds)
+    refresh_url = f"http://127.0.0.1:{httpd.server_address[1]}/refresh"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def _posts_after(boundary: float) -> int:
+        with posts_lock:
+            return sum(1 for t in posts if t > boundary)
+
+    async def _wait_posts(target: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with posts_lock:
+                if len(posts) >= target:
+                    return True
+            await asyncio.sleep(0.5)
+        return False
+
+    try:
+        async with ApiClient(SERVER) as sdk:
+            defaults = _RUNTIME_DEFAULTS[agent_type]
+            body: dict = {
+                "provider": provider,
+                "agent_type": agent_type,
+                "model": defaults["model"],
+                "credential_refresh_url": refresh_url,
+                "credential_refresh_token": "golden-cred-token",
+            }
+            secret_val = os.environ.get(defaults["secret_env"])
+            if secret_val:
+                body["secrets"] = {defaults["secret_env"]: secret_val}
+            sess = await sdk.create_session(**body)
+            sid = sess["session_id"]
+            _CREATED_SESSIONS.append(sid)
+
+            # The loop POSTs immediately on spawn — confirms the task is live and
+            # the webhook is reachable from the server (else the leak can't be
+            # exercised, so fail loudly rather than false-green).
+            assert await _wait_posts(1, 60.0), (
+                "credential-refresh task never POSTed after create — webhook "
+                "unreachable from the server or the loop never spawned"
+            )
+
+            # Finished turn so the cold-recovery RESUMES (session/load contract).
+            await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+
+            # Kill the sandbox so the next get_session force_probe sees it dead
+            # and takes the stale-teardown branch (orphaning the old task).
+            sandbox = await _get_sandbox(sdk, sid)
+            await _external_stop(sandbox)
+
+            # Recovery prompt: a terminal here means get_session served the
+            # prompt AFTER the kill — i.e. the stale-teardown + replacement ran
+            # (the only way to serve a prompt once the sandbox was externally
+            # stopped). Same recovery-happened evidence the midprompt-recovery
+            # golden relies on across all providers.
+            rpc = await _send_message(sdk, sid, "Reply with the single word: ok.")
+            term = await _wait_terminal(sdk, sid, rpc, _TERMINAL_TIMEOUT_S)
+            assert term is not None, (
+                f"recovery turn never produced a terminal (rpc={rpc[:8]})"
+            )
+
+            # DELETE -> the route awaits pool.release(), which cancels AND awaits
+            # the REPLACEMENT's refresh task. After this boundary the only thing
+            # that can POST is the orphaned task (if the bug is present).
+            resp = await sdk._http.delete(f"/sessions/{sid}", timeout=30)
+            assert resp.status_code in (200, 204), (
+                f"delete failed: {resp.status_code}"
+            )
+            with contextlib.suppress(ValueError):
+                _CREATED_SESSIONS.remove(sid)
+            boundary = time.monotonic()
+
+            # Watch >60s (the loop's hard cadence floor is max(60, ...)). Buggy
+            # build: the orphaned task ticks -> a POST after the boundary. Fixed
+            # build: zero. Break early on the first leak signal.
+            leaked = False
+            deadline = time.monotonic() + 75.0
+            while time.monotonic() < deadline:
+                if _posts_after(boundary + 0.5):
+                    leaked = True
+                    break
+                await asyncio.sleep(2.0)
+
+            assert not leaked, (
+                "CREDENTIAL-REFRESH TASK LEAK reproduced "
+                f"(provider={provider} agent_type={agent_type}): "
+                f"{_posts_after(boundary + 0.5)} refresh POST(s) landed AFTER the "
+                "session was DELETEd. The cold-recovery stale-teardown orphaned "
+                "the dead session's _credential_refresh_task instead of "
+                "cancelling it (only release() cancels it) — an infinite POST "
+                "loop outlives the session, one leaked task per recovery."
+            )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_delete_agent_tears_down_session_sandboxes(provider, agent_type):
+    """DELETE /agents/{id} must DESTROY the compute of every session it
+    cascade-deletes.
+
+    ``sessions.agent_id`` is ON DELETE CASCADE and ``delete_agent`` is a bare
+    row delete, so deleting an agent dropped its session rows but never
+    released/destroyed their sandboxes — the compute leaked with no row left to
+    reap it. Mirror of ``test_delete_session_destroys_sandbox`` via the AGENT
+    route; same provider-aware ``_assert_sandbox_gone`` oracle.
+    """
+    _require_provider(provider)
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        sid = sess["session_id"]
+        agent_id = sess.get("agent_id")
+        assert agent_id, "create response missing agent_id"
+
+        await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+        sandbox = await _get_sandbox(sdk, sid)
+        sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+        assert sandbox_ref, f"fresh session has no sandbox_ref: {sandbox}"
+
+        # We assert on the DELETE post-condition, so bypass the autouse cleanup.
+        if sid in _CREATED_SESSIONS:
+            _CREATED_SESSIONS.remove(sid)
+
+        # Delete the AGENT (not the session). The cascade drops the session row;
+        # the route must tear the sandbox down first.
+        resp = await sdk._http.delete(f"/agents/{agent_id}", timeout=30)
+        assert resp.status_code in (200, 204), (
+            f"agent delete failed: {resp.status_code}"
+        )
+
+        # Mechanism check: the cascade actually removed the session row, so we
+        # know the agent-delete path ran (not some unrelated cleanup).
+        srow = await sdk._http.get(f"/sessions/{sid}", timeout=10)
+        assert srow.status_code == 404, (
+            "session row was not cascade-deleted by the agent delete "
+            f"(status={srow.status_code}); the agent-delete path did not run — "
+            "leak not exercised"
+        )
+
+        try:
+            await _assert_sandbox_gone(provider, sandbox, timeout_s=60.0)
+        except AssertionError:
+            with contextlib.suppress(Exception):
+                await _external_delete(sandbox)  # don't leak from the test itself
+            raise
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_type):
+    """DELETE /volumes/{id}?force=true must DESTROY the compute of every session
+    it cascade-deletes.
+
+    The volume FK is ON DELETE RESTRICT, so the force path hard-deletes the
+    session rows first (delete_sessions_by_volume, a raw DELETE) — and like the
+    agent route it never released/destroyed the sandboxes. Mirror of
+    ``test_delete_session_destroys_sandbox`` via the VOLUME route.
+    """
+    _require_provider(provider)
+    import uuid as _uuid
+
+    vol_id: str | None = None
+    sandbox: dict | None = None
+    try:
+        async with ApiClient(SERVER) as sdk:
+            # A DEDICATED volume — never the shared default (force-deleting that
+            # would cascade every other -n auto session on this provider).
+            vol = await sdk.create_volume(
+                name=f"leaktest-voldel-{_uuid.uuid4().hex[:12]}", provider=provider,
+            )
+            vol_id = vol["id"]
+
+            defaults = _RUNTIME_DEFAULTS[agent_type]
+            body: dict = {
+                "provider": provider,
+                "agent_type": agent_type,
+                "model": defaults["model"],
+                "volume_id": vol_id,
+            }
+            secret_val = os.environ.get(defaults["secret_env"])
+            if secret_val:
+                body["secrets"] = {defaults["secret_env"]: secret_val}
+            sess = await sdk.create_session(**body)
+            sid = sess["session_id"]
+            _CREATED_SESSIONS.append(sid)
+
+            await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+            sandbox = await _get_sandbox(sdk, sid)
+            sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+            assert sandbox_ref, f"fresh session has no sandbox_ref: {sandbox}"
+
+            if sid in _CREATED_SESSIONS:
+                _CREATED_SESSIONS.remove(sid)
+
+            # Force-delete the VOLUME (not the session). The cascade drops the
+            # session row; the route must tear the sandbox down first.
+            resp = await sdk._http.delete(
+                f"/volumes/{vol_id}", params={"force": "true"}, timeout=30,
+            )
+            assert resp.status_code in (200, 204), (
+                f"volume force-delete failed: {resp.status_code}"
+            )
+            vol_id = None  # deleted
+
+            srow = await sdk._http.get(f"/sessions/{sid}", timeout=10)
+            assert srow.status_code == 404, (
+                "session row was not cascade-deleted by the volume force-delete "
+                f"(status={srow.status_code}); the cascade path did not run — "
+                "leak not exercised"
+            )
+
+            try:
+                await _assert_sandbox_gone(provider, sandbox, timeout_s=60.0)
+            except AssertionError:
+                with contextlib.suppress(Exception):
+                    await _external_delete(sandbox)
+                raise
+    finally:
+        # Drop the volume if the test bailed before deleting it.
+        if vol_id is not None:
+            with contextlib.suppress(Exception):
+                async with ApiClient(SERVER) as _sdk2:
+                    await _sdk2._http.delete(
+                        f"/volumes/{vol_id}", params={"force": "true"}, timeout=20,
+                    )
