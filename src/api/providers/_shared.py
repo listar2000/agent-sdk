@@ -81,11 +81,14 @@ _ACP_BIN_NAMES = {
 }
 _ACP_NPM_SPECS = {
     "claude": "@agentclientprotocol/claude-agent-acp@^0.27.0",
-    "codex": "@zed-industries/codex-acp@^0.11.1",
     "opencode": "opencode-ai@^1.4.3",
-    "gemini": "@google/gemini-cli@^0.37.2",
-    "cline": "cline-acp@^0.1.6",
-    "deepagents": "deepagents-acp@^0.1.8",
+    # Only claude + opencode are used. The runtimes below are commented out to
+    # keep the baked agent image small (the supervisor package.json mirrors
+    # this in _disabledDependencies). Uncomment to re-enable the agent_type.
+    # "codex": "@zed-industries/codex-acp@^0.11.1",
+    # "gemini": "@google/gemini-cli@^0.37.2",
+    # "cline": "cline-acp@^0.1.6",
+    # "deepagents": "deepagents-acp@^0.1.8",
 }
 _ACP_LAUNCH_ARGS: dict[str, list[str]] = {
     "opencode": ["acp"],
