@@ -1,10 +1,10 @@
 """ACP supervisor provider management — daytona, docker, unix_local, modal.
 
 This package splits provider-specific code into sub-modules:
-  - daytona.py     — Daytona sandbox management
-  - docker.py      — Docker container management
-  - unix_local.py  — Host-subprocess management
-  - modal.py       — Modal sandbox management
+  - daytona/       — Daytona sandbox management
+  - docker/        — Docker container management
+  - unix_local/    — Host-subprocess management
+  - modal/         — Modal sandbox management
   - _shared.py     — Shared types, constants, helpers
 
 providers/__init__.py:
@@ -155,9 +155,8 @@ def get_volume_adapter(provider: str, provider_ref: str) -> BaseVolumeAdapter:
     """Construct a per-volume adapter bound to ``provider_ref``.
 
     Raises ``ValueError`` for unknown providers (same shape as
-    ``_dispatch_mod``). During Phase 2 rollout, only providers with a
-    registered adapter are wired here; others still go through the
-    legacy ``_providers_mod.volume_*`` dispatch.
+    ``_dispatch_mod``). All four providers have a registered adapter, so
+    this is the single path for per-volume file ops.
     """
     _register_volume_adapters()
     cls = _VOLUME_ADAPTERS.get(provider)

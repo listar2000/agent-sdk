@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 
 # Supervisor inside every Daytona sandbox listens on this fixed port; the
 # Daytona signed preview URL maps host URL to container port. Matches
-# ``_SUPERVISOR_REMOTE_PORT`` in src/api/providers/daytona.py.
+# ``_SUPERVISOR_REMOTE_PORT`` in src/api/providers/daytona/__init__.py.
 _SUPERVISOR_PORT = 9100
 
 
@@ -213,7 +213,8 @@ class DaytonaSandboxSession(BaseSandboxSession):
         volume_ref = self._volume_ref
 
         # Cold create. create_sandbox passes the session volume/subpath so
-        # /opt/supervisor is mounted for start_supervisor_in_sandbox().
+        # /vol is mounted; the supervisor itself is image-baked at
+        # /opt/agent-sdk/runtime/ for start_supervisor_in_sandbox().
         instance = await dt_provider.create_sandbox(
             volume_ref=volume_ref,
             subpath=self._subpath or f"sessions/{self.session_id}",

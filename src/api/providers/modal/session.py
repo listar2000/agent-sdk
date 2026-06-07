@@ -1,6 +1,6 @@
 """ModalSandboxSession — concrete SandboxSession for the modal provider.
 
-Wraps existing primitives in ``src/api/providers/modal.py``. Modal's
+Wraps existing primitives in ``src/api/providers/modal/__init__.py``. Modal's
 shape sits between docker (no native pause) and daytona (remote
 provider with managed compute lifecycle).
 """
@@ -193,7 +193,7 @@ class ModalSandboxSession(BaseSandboxSession):
             ))
         except Exception:
             log.exception("modal.stop_sandbox failed for session %s", self.session_id)
-        # Modal sandbox is gone; clear sandbox_id so next start cold-creates.
+        # Modal sandbox is gone; clear sandbox_ref so next start cold-creates.
         self.state.sandbox_ref = None
         self.state.listen_port = None
 

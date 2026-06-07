@@ -246,9 +246,9 @@ async def create_sandbox(
 ) -> ProviderInstance:
     """Launch a supervisor subprocess rooted at ``<vol>/<subpath>``.
 
-    Returns a ProviderInstance whose ``sandbox_ref`` is the stringified pid
-    of the supervisor process; the live ``Popen`` is also kept in
-    ``_PROCESSES`` for later status/destroy lookups by pid.
+    Returns a ProviderInstance whose ``sandbox_ref`` is a stable
+    ``local-<hex>`` ref that outlives the PID; the live ``Popen`` is also kept
+    in ``_PROCESSES`` (keyed by that ref) for later status/destroy lookups.
     """
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}")

@@ -222,8 +222,8 @@ class SessionPool:
                 # Rebind each subscriber's ``owner`` to this replacement
                 # session so the consumer's ``iterate_subscriber`` finally
                 # pops from HERE, not from the dead session it was created
-                # on. Without this the entry leaks onto ``session`` and the
-                # idle reaper skips it forever (zombie subscriber).
+                # on. Without this the entry leaks onto ``session`` as a
+                # never-cleaned-up zombie subscriber.
                 for sub in handed_off_subscribers.values():
                     sub.owner = session
                 session._subscribers.update(handed_off_subscribers)
@@ -266,7 +266,8 @@ class SessionPool:
             # Spawn the credential-refresh loop if the recipe asks for
             # one. Fires on every wake — cold create AND resume from
             # hibernation — so the agent always has fresh credentials.
-            # Cancelled in ``release()`` before shutdown.
+            # Cancelled inside ``session.shutdown()`` (every teardown
+            # path ends there), so no path can leak it.
             recipe = session.state.recipe
             if recipe.credential_refresh_url:
                 session._credential_refresh_task = asyncio.create_task(

@@ -1,14 +1,15 @@
 """Abstract base class for SandboxSession — one per running compute.
 
 Concrete provider classes (DaytonaSandboxSession, DockerSandboxSession,
-UnixLocalSandboxSession, ModalSandboxSession) implement the 5 lifecycle
-methods.
+UnixLocalSandboxSession, ModalSandboxSession) implement the 3 abstract
+lifecycle methods (``start``/``running``/``stop``); ``execute_prompt``,
+``destroy``, and ``shutdown`` are concrete in this base.
 
 Decision: ``stop()`` and ``shutdown()`` are split. ``stop()`` is the
 data-preserving operation (snapshot + pause compute). ``shutdown()`` is
-the in-memory cleanup (cancel tasks, drop subscribers). The pool calls
-both in sequence on graceful release; a truly-dead session gets only
-``shutdown()``.
+the in-memory cleanup (cancel the credential-refresh task, drop
+subscribers, close the ACP client). The pool calls both in sequence on
+graceful release; a truly-dead session gets only ``shutdown()``.
 """
 from __future__ import annotations
 
@@ -51,9 +52,8 @@ class _Subscriber:
     splices subscribers onto a replacement session. Without it the
     generator — whose ``self`` is permanently the original (now-dead)
     session — would pop ``sid`` from the original's already-cleared dict
-    and leave a zombie entry on the replacement, which pins that session
-    against the idle reaper forever (``reap_idle`` treats any non-empty
-    ``_subscribers`` as live activity)."""
+    and leave a zombie entry on the replacement (a never-cleaned-up
+    subscriber whose consumer has long since exited)."""
 
     __slots__ = ("queue", "owner")
 
@@ -70,10 +70,11 @@ class BaseSandboxSession(abc.ABC):
     serialised prompts, the subscriber fan-out for ``GET /events``, and
     the liveness oracle.
 
-    Subclass contract: implement ``start()``, ``running()``,
-    ``execute_prompt()``, ``stop()``. The base class provides ``shutdown()``,
-    subscriber multiplex (``subscribe()``, ``_broadcast()``), the
-    ``ProviderInstance`` builder, and the liveness oracle wiring.
+    Subclass contract: implement ``start()``, ``running()``, ``stop()``.
+    The base class provides ``execute_prompt()``, ``destroy()``,
+    ``shutdown()``, subscriber multiplex (``subscribe()``,
+    ``_broadcast()``), the ``ProviderInstance`` builder, and the liveness
+    oracle wiring.
     """
 
     # Provider-side discriminator: used by ``_bootstrap_session()`` to
@@ -364,7 +365,7 @@ class BaseSandboxSession(abc.ABC):
 
     async def _aclose_acp_client(self) -> None:
         """Close the cached AcpClient if any. Safe to call multiple times.
-        Concrete shutdown() impls call this so the underlying httpx pool
+        The base ``shutdown()`` calls this so the underlying httpx pool
         gets cleaned up alongside subscribers."""
         if self._acp_client is not None:
             try:
@@ -691,7 +692,7 @@ class BaseSandboxSession(abc.ABC):
         # prompt cold-recovery the pool hands this queue off to a
         # replacement session and rebinds ``owner``; popping from ``self``
         # (the original, now-dead session) would miss the replacement and
-        # leak a zombie entry that pins it against the idle reaper. See
+        # leak a never-cleaned-up zombie subscriber entry. See
         # ``_Subscriber``.
         sub = self._subscribers.get(sid)
         try:

@@ -30,7 +30,7 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Provider constants
 # ---------------------------------------------------------------------------
 
-# Providers whose recovery model is "reprovision via provision_sandbox" rather
+# Providers whose recovery model is "reprovision via create_sandbox" rather
 # than "restart supervisor inside an existing sandbox" (daytona's model).
 # local/docker reach the supervisor on localhost:<port>; modal reaches it via
 # an HTTPS tunnel; all three are recreated from scratch on miss.
@@ -556,8 +556,11 @@ def _build_volume_mounts(
 
     Per-session sandbox layout (subpath is a non-empty string like ``agents/<id>``):
       - /vol              → volume subpath (S3-backed; snapshot tarball lives here)
-      - /opt/supervisor   → volume system/supervisor/ (pre-installed supervisor)
       - /mnt/<name>       → volume shared/<name>/ (one per entry in shared_mounts)
+
+    The supervisor + ACP binaries are baked into the image at
+    ``/opt/agent-sdk/runtime/`` and are NOT mounted from the volume — the
+    volume carries only user data.
 
     The agent's HOME is ``/home/daytona`` — a local ext4 directory created
     by the supervisor at boot — NOT the volume mount. The supervisor
@@ -574,8 +577,8 @@ def _build_volume_mounts(
     <volume>/shared/datasets respectively.
 
     Utility sandboxes (subpath is None or empty string) get a single
-    whole-volume mount at /v. This avoids the supervisor mount failing
-    before system/supervisor/ has been created.
+    whole-volume mount at /v so the init step can mkdir the volume's
+    directory structure (shared/ and system/supervisor/).
 
     NOTE: Daytona SDK 0.168 does not support read_only on VolumeMount, so
     every shared mount is read-write today. Scope per-mount permissions

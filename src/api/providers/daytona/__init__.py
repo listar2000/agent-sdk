@@ -165,12 +165,9 @@ async def start_supervisor_in_sandbox(
 ) -> str:
     """Start a NEW supervisor on a specific port inside an existing sandbox.
 
-    If the volume has a cached deps.tar.gz (Phase 2+), extract it to a local
-    ephemeral directory and run supervisor from there.  Extraction from a
-    single archive read is fast; writing thousands of node_modules to the
-    network volume at install time is avoided entirely.
-
-    Falls back to the legacy /tmp install path when no volume cache exists.
+    The supervisor + every ACP binary are baked into the sandbox image at
+    ``/opt/agent-sdk/runtime/`` — nothing is installed onto the volume at
+    runtime. We just spawn ``node supervisor.js`` from that directory.
     Returns the signed preview URL for this supervisor.
 
     Emits ``[BENCH] daytona.start_supervisor phase=<name> s=<seconds>`` log
@@ -313,14 +310,13 @@ async def provision_daytona_sandbox(
     shared_mounts: list[str] | None = None,
     resources: Any = None,
 ) -> ProviderInstance:
-    """Create a Daytona sandbox with 3 volume mounts, but do NOT install deps
-    or start a supervisor (those are handled by ensure_volume_supervisor and
-    ensure_supervisor_url respectively).
+    """Create a Daytona sandbox with its volume mounts, but do NOT start a
+    supervisor (that is handled later by ensure_supervisor_url).
 
     Returns a ProviderInstance with sandbox_ref but no usable supervisor URL.
     Supervisors are started per-session via start_supervisor_in_sandbox().
-    The supervisor binary + ACP package are expected to already be installed on
-    the volume at system/supervisor/ (mounted at /opt/supervisor).
+    The supervisor binary + ACP packages are baked into the sandbox image at
+    /opt/agent-sdk/runtime/ — the volume carries only user data.
     """
     try:
         from daytona_sdk import (
@@ -474,10 +470,8 @@ async def restart_daytona_supervisor(
     sandbox filesystem, so claude-agent-acp's persisted session state is
     available for session/load.
 
-    Routes through ``start_supervisor_in_sandbox`` which reads from the
-    per-volume deps.tar.gz cache installed by ``install_supervisor``. Any
-    post-volume-refactor sandbox has that cache; sandboxes old enough to
-    lack it are no longer supported (pre-2026-04).
+    Routes through ``start_supervisor_in_sandbox`` which spawns the
+    supervisor from the image-baked runtime at ``/opt/agent-sdk/runtime/``.
     """
     daytona = await _get_async_daytona_client()
     # Wait for a stable (non-transitional) state before attempting start.
@@ -978,8 +972,8 @@ async def create_sandbox(
     """Uniform ``create_sandbox`` for the Daytona provider.
 
     Delegates to ``provision_daytona_sandbox`` which creates the sandbox with
-    the volume mounts (per-agent subpath + supervisor cache + any opt-in
-    shared mounts) but does NOT start a supervisor; the caller must run
+    the volume mounts (per-agent subpath at /vol + any opt-in shared mounts)
+    but does NOT start a supervisor; the caller must run
     ``ensure_supervisor_url`` before talking to the supervisor.
 
     ``spawn_env`` / ``port`` / `sandbox_ref` are accepted for parity with

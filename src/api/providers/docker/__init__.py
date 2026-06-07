@@ -5,13 +5,15 @@ using ``docker`` subprocess calls.  Volumes are Docker named volumes; the
 standard layout ({shared/, system/supervisor/, agents/<id>/home/}) is created
 by mounting the volume into a short-lived ``alpine`` utility container.
 
-Sandboxes are long-lived ``node:20-slim`` containers (NOT ``--rm``) that mount:
+Sandboxes are long-lived containers (NOT ``--rm``) booted from the agent-sdk
+runtime image (resolved from DOCKER_IMAGE / AGENT_SDK_IMAGE / .runtime-image-tag)
+that mount:
   - /home/agent      ← volume subpath ``agents/<id>`` (per-agent HOME)
-  - /opt/supervisor  ← volume subpath ``system/supervisor`` (supervisor deps)
   - /mnt/<name>      ← volume subpath ``shared/<name>`` (one per entry in the
                        agent's ``shared_mounts``; zero by default)
-The supervisor.js + ACP binary come from the volume's ``system/supervisor/``
-dir, which is populated lazily by ``install_supervisor``.
+The supervisor.js + ACP binary come from the runtime image's
+``/opt/agent-sdk/runtime/`` dir, baked at Docker build time — no per-volume
+install.
 """
 from __future__ import annotations
 
@@ -473,7 +475,7 @@ async def reconcile_on_startup() -> None:
     Failures on individual containers are logged but never raised so a
     single bad container can't prevent the server from starting.
     """
-    # Local imports to avoid a hard cycle: docker.py is imported at module
+    # Local imports to avoid a hard cycle: this module is imported at package
     # init but api.db is initialized later in the lifespan.
     try:
         from ... import db as dbmod

@@ -1,7 +1,8 @@
 """UnixLocalSandboxSession — concrete SandboxSession for the local provider.
 
-Wraps existing primitives in ``src/api/providers/local.py`` into the
-five-method ``BaseSandboxSession`` contract. The simplest provider
+Wraps existing primitives in ``src/api/providers/unix_local/__init__.py`` into
+the three-method (``start``/``running``/``stop``) ``BaseSandboxSession``
+contract. The simplest provider
 shape: just a local subprocess running supervisor.js + ACP, no
 container, no remote URL.
 """
@@ -40,7 +41,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         instance = None
         reattached = False
-        # sandbox_id here is the local provider's stable ref (local-XXXX).
+        # sandbox_ref here is the local provider's stable ref (local-XXXX).
         # On second start() we try to restart the SAME sandbox in place so
         # the test_stop_sandbox_same_sandbox_after_restart invariant holds.
         if self.state.sandbox_ref:
@@ -137,7 +138,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             ))
         except Exception:
             log.exception("local.stop_sandbox failed for session %s", self.session_id)
-        # Process is gone; clear sandbox_id so next start cold-creates.
+        # Process is gone; clear sandbox_ref so next start cold-creates.
         self.state.sandbox_ref = None
         self.state.listen_port = None
 
