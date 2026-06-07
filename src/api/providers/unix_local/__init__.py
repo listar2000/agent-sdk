@@ -177,6 +177,17 @@ def _kill_pid(pid: int) -> None:
         pass
 
 
+def _kill_proc(proc: subprocess.Popen) -> None:
+    """SIGTERM→SIGKILL a freshly-spawned supervisor ``Popen`` and reap it, so a
+    failed create/health attempt doesn't leave a zombie. Call sites pass the
+    ``Popen`` from ``create_sandbox``; ``_kill_pid`` does the signal escalation."""
+    _kill_pid(proc.pid)
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
 _PROCESSES: dict[str, subprocess.Popen] = {}
 _PROCESSES_LOCK = asyncio.Lock()
 
