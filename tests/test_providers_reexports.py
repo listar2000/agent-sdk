@@ -193,12 +193,10 @@ def test_well_known_reexports_stay_on_api_providers():
     ]
     # Universal dispatch surface the server reaches for.
     dispatch_names = [
-        "create_instance",
         "destroy_instance",
         "exec_in_instance",
         "create_volume",
         "delete_volume",
-        "provision_sandbox",
         "ensure_supervisor_url",
         "reconcile_sandboxes",
     ]

@@ -10,10 +10,9 @@ This package splits provider-specific code into sub-modules:
 providers/__init__.py:
   - Re-exports the ``_shared`` and ``.daytona`` symbols that server.py
     (and tests) import from ``api.providers``.
-  - Provides universal dispatch wrappers (create_instance, destroy_instance,
-    exec_in_instance).
-  - Provides uniform-API dispatch helpers (create_volume, delete_volume,
-    provision_sandbox, reconcile_sandboxes, ensure_supervisor_url, etc.).
+  - Provides universal dispatch wrappers (destroy_instance, exec_in_instance,
+    create_volume, delete_volume, reconcile_sandboxes, ensure_supervisor_url)
+    that route to the per-provider module of the same name.
 """
 
 import asyncio
@@ -96,50 +95,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Universal dispatch
 # ---------------------------------------------------------------------------
-
-async def create_instance(
-    provider: str,
-    agent_type: str = "opencode",
-    dockerfile: str | None = None,
-    pre_start_commands: list[str] | None = None,
-    root: str = "/tmp",
-    spawn_env: dict[str, str] | None = None,
-    volume_id: str | None = None,
-    subpath: str | None = None,
-    sandbox_ref: str | None = None,
-    shared_mounts: list[str] | None = None,
-) -> ProviderInstance:
-    """Create an ACP supervisor instance using the specified provider.
-
-    pre_start_commands are shell commands to run inside the sandbox BEFORE
-    the supervisor process starts (used for skill installation).
-
-    spawn_env is the merged env that should land in the supervisor process:
-    {IS_SANDBOX:1} ∪ agent.env ∪ session.env ∪ secrets. The server never
-    injects its own API keys — if spawn_env is empty, the supervisor runs
-    with no credentials.
-
-    volume_id + subpath are forwarded to providers that support volume
-    mounts.
-
-    sandbox_ref, when provided, is attached as a label/tag on providers
-    that support it (Docker label, Modal tag) so ``reconcile_on_startup``
-    can cross-reference live containers with the live SessionPool's
-    ``sandbox_state.sandbox_ref`` set. Daytona and local ignore it.
-    """
-    if agent_type not in _ACP_BIN_NAMES:
-        raise ValueError(f"unsupported agent_type: {agent_type!r}. Supported: {sorted(_ACP_BIN_NAMES)}")
-    # All three provider modules accept the same kwargs (they ignore what
-    # they don't use — local/docker/daytona all declare ``dockerfile``,
-    # ``pre_start_commands``, ``shared_mounts`` for parity). Dispatch is a
-    # single call; _dispatch_mod raises a readable error for unknown providers.
-    return await _dispatch_mod(provider).create_sandbox(
-        volume_ref=volume_id, subpath=subpath or "",
-        agent_type=agent_type, root=root, spawn_env=spawn_env,
-        dockerfile=dockerfile, pre_start_commands=pre_start_commands,
-        sandbox_ref=sandbox_ref, shared_mounts=shared_mounts,
-    )
-
 
 async def destroy_instance(instance: ProviderInstance) -> None:
     """Destroy a supervisor instance."""
@@ -232,42 +187,3 @@ async def reconcile_sandboxes(provider: str) -> None:
     await fn()
 
 
-async def provision_sandbox(
-    provider: str,
-    *,
-    volume_ref: str,
-    subpath: str,
-    agent_type: str = "opencode",
-    spawn_env: dict | None = None,
-    port: int | None = None,
-    root: str | None = None,
-    dockerfile: str | None = None,
-    pre_start_commands: list[str] | None = None,
-    shared_mounts: list[str] | None = None,
-    **kwargs,
-) -> ProviderInstance:
-    """Uniform sandbox provisioning across providers.
-
-    Each provider exposes ``create_sandbox(volume_ref, subpath, agent_type, ...)``
-    and returns a fresh ``ProviderInstance``. For Daytona, the returned instance
-    has ``url=""`` (no supervisor yet) and the caller must invoke
-    ``ensure_supervisor_url`` before talking to the supervisor. For Docker/Local
-    the supervisor is already started at create-time and ``inst.url`` is live.
-    """
-    mod = _dispatch_mod(provider)
-    kw: dict = dict(kwargs)
-    if root is not None:
-        kw["root"] = root
-    if dockerfile is not None:
-        kw["dockerfile"] = dockerfile
-    if pre_start_commands is not None:
-        kw["pre_start_commands"] = pre_start_commands
-    return await mod.create_sandbox(
-        volume_ref=volume_ref,
-        subpath=subpath,
-        agent_type=agent_type,
-        spawn_env=spawn_env,
-        port=port,
-        shared_mounts=shared_mounts,
-        **kw,
-    )
