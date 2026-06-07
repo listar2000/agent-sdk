@@ -810,9 +810,10 @@ async def _resolve_or_default_volume(
 ) -> "VolumeRecord":
     """Resolve an explicit volume id/name or fall back to the per-provider default.
 
-    Three endpoints share this contract (``POST /sandboxes``, ``/sessions``,
-    ``/sessions``). Raises ``HTTPException(404)`` for an unknown
-    id/name and ``HTTPException(502)`` if default-volume provisioning fails.
+    Both session-create paths (``_sessions_create_lazy`` and
+    ``_sessions_create_eager``, behind the single ``POST /sessions``) share
+    this contract. Raises ``HTTPException(404)`` for an unknown id/name and
+    ``HTTPException(502)`` if default-volume provisioning fails.
     """
     if volume_id and isinstance(volume_id, str):
         return await _resolve_volume(volume_id)
@@ -1495,12 +1496,11 @@ async def session_sandbox_info(session_id: str):
     session. Falls back to a DB read of ``sessions.sandbox_state`` JSONB
     when the session isn't in the live pool.
 
-    Returns the same shape as ``GET /sandboxes/{id}`` (provider,
-    sandbox_ref, status, root, url for port-based providers,
-    marker_path for local) so test helpers and admin UIs that need
-    sandbox info can stay in session-id space and avoid the
-    sandbox-row-id round trip. ``url`` is omitted when the session
-    isn't live (no supervisor running)."""
+    Returns provider, sandbox_ref, status, root, url (for port-based
+    providers) and marker_path (for unix_local) so test helpers and
+    admin UIs that need sandbox info can stay in session-id space.
+    ``url`` is omitted when the session isn't live (no supervisor
+    running)."""
     from api.sandbox import deserialize, get_pool
     try:
         pool_session = await get_pool().get_session(session_id, peek=True)
@@ -1701,8 +1701,9 @@ async def sessions_create(request: Request):
         ``config``, ``env``, ``secrets``, ``cwd``, ``root``, ``dockerfile``,
         ``shared_mounts``) — see the dispatched-to helper for details.
 
-    Collapses the old ``POST /sessions`` (lazy) and ``POST /sessions``
-    (eager) into one endpoint with consistent naming.
+    Dispatches on ``provision`` to the lazy (``_sessions_create_lazy``)
+    or eager (``_sessions_create_eager``) path — a single endpoint for
+    both modes.
     """
     data = await _json_body(request)
     # Client-supplied session_id. The SDK generates a UUID up front and
@@ -2433,11 +2434,6 @@ async def post_session_message(session_id: str, request: Request):
     return {"rpc_id": rpc_id, "status": "ok"}
 
 
-
-# Track in-flight POST /message background drains so asyncio doesn't GC them.
-_BG_TASKS: set[asyncio.Task] = set()
-
-
 @app.get("/sessions/{session_id}/events")
 async def session_events(session_id: str):
     """SSE stream for a session. Multi-subscriber: many concurrent
@@ -2681,9 +2677,10 @@ async def session_cancel(session_id: str):
 
     Best-effort: sends ``session/cancel`` (JSON-RPC notification) to
     the supervisor's ACP child. Looks the session up via
-    ``pool.get_session`` so cancel requests against a session owned by
-    a peer replica route there (307 from the global exception handler)
-    rather than no-oping on this replica's empty local cache.
+    ``pool.get_session`` (which cold-recovers if needed) rather than
+    no-oping on this replica's empty local cache. Cross-replica routing
+    is the LB's consistent-hash job now — the per-session lease + 307
+    redirect were retired (see the no-NotOwner-handler note above).
     """
     from api.sandbox import get_pool
 
@@ -3138,7 +3135,7 @@ async def session_files_read(session_id: str, path: str):
 
 @app.post("/sessions/{session_id}/files/edit")
 async def session_files_edit(session_id: str, request: Request):
-    """Edit or create a file. Body: same shape as ``/sandboxes/{id}/files/edit``."""
+    """Edit or create a file. Body: same shape as the supervisor's ``/v1/files/edit``."""
     return await _proxy_from_session(
         session_id, "POST", "/v1/files/edit",
         json=await _json_body(request),

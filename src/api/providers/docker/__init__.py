@@ -5,13 +5,15 @@ using ``docker`` subprocess calls.  Volumes are Docker named volumes; the
 standard layout ({shared/, system/supervisor/, agents/<id>/home/}) is created
 by mounting the volume into a short-lived ``alpine`` utility container.
 
-Sandboxes are long-lived ``node:20-slim`` containers (NOT ``--rm``) that mount:
+Sandboxes are long-lived containers (NOT ``--rm``) booted from the agent-sdk
+runtime image (resolved from DOCKER_IMAGE / AGENT_SDK_IMAGE / .runtime-image-tag)
+that mount:
   - /home/agent      ← volume subpath ``agents/<id>`` (per-agent HOME)
-  - /opt/supervisor  ← volume subpath ``system/supervisor`` (supervisor deps)
   - /mnt/<name>      ← volume subpath ``shared/<name>`` (one per entry in the
                        agent's ``shared_mounts``; zero by default)
-The supervisor.js + ACP binary come from the volume's ``system/supervisor/``
-dir, which is populated lazily by ``install_supervisor``.
+The supervisor.js + ACP binary come from the runtime image's
+``/opt/agent-sdk/runtime/`` dir, baked at Docker build time — no per-volume
+install.
 """
 from __future__ import annotations
 
@@ -24,10 +26,12 @@ import shutil
 from typing import Any
 
 from .._shared import (
+    ExecResult,
     ProviderInstance,
     VolumeFileExistsError,
     _acp_launch_args,
     _build_env_prefix,
+    _exec_subprocess,
     _find_free_port,
     _read_runtime_image_tag,
     _safe_path,
@@ -392,6 +396,20 @@ async def start_sandbox(ref: str) -> None:
     log.info("docker sandbox started (resumed): %s", ref[:12])
 
 
+async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
+    """Run ``cmd`` via ``docker exec ... sh -c`` inside the container."""
+    docker = shutil.which("docker")
+    container_id = inst.container_id or inst.sandbox_ref
+    if not docker or not container_id:
+        raise RuntimeError("docker not available or no container_id")
+    proc = await asyncio.create_subprocess_exec(
+        docker, "exec", container_id, "sh", "-c", cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    return await _exec_subprocess(proc, timeout)
+
+
 async def stop_sandbox(inst: ProviderInstance) -> None:
     """Stop the container (container row remains, can be started again)."""
     cid = inst.container_id or inst.sandbox_ref
@@ -457,7 +475,7 @@ async def reconcile_on_startup() -> None:
     Failures on individual containers are logged but never raised so a
     single bad container can't prevent the server from starting.
     """
-    # Local imports to avoid a hard cycle: docker.py is imported at module
+    # Local imports to avoid a hard cycle: this module is imported at package
     # init but api.db is initialized later in the lifespan.
     try:
         from ... import db as dbmod

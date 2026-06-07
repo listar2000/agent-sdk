@@ -2,8 +2,7 @@
 
 Sandbox identity is not modelled here — it lives in ``sessions.sandbox_state``
 JSONB and is owned by ``api.sandbox.SessionPool`` (see
-``api.sandbox.state.SandboxState`` for the discriminated union, and
- for the model)."""
+``api.sandbox.state.SandboxState`` for the discriminated union)."""
 
 from __future__ import annotations
 
@@ -21,8 +20,8 @@ Provider = Literal["unix_local", "docker", "daytona", "modal"]
 @dataclass
 class AgentConfig:
     """Pure agent identity. No per-invocation or provisioning knobs — those
-    live on the session (cwd, env, secrets) or sandbox (dockerfile,
-    shared_mounts, root) rows.
+    live on the session row (cwd, env, secrets) or its ``sandbox_state``
+    recipe (dockerfile, shared_mounts, root).
     """
     agent_type: str = "opencode"
     model: str | None = None
@@ -88,8 +87,8 @@ class VolumeRecord:
     provider_ref: str
     status: str = "ready"
     # ``supervisor_agent_types`` field deleted in Phase E of
-    # the runtime-image-unification refactor. The DB column stays (now unused)
-    # until the column-drop migration ships.
+    # the runtime-image-unification refactor. The DB column-drop migration
+    # has since shipped (see db.py's ``DROP COLUMN ... supervisor_agent_types``).
 
 
 @dataclass

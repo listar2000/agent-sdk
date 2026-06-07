@@ -1,10 +1,13 @@
-"""Per-worker-process identity for the lease protocol.
+"""Per-worker-process identity for the per-worker lease protocol.
 
-Wave-3 plumbing: each uvicorn worker needs a stable owner_id (claims the
-lease) and an addressable owner_addr (where to 307 redirect peers).
+Each uvicorn worker needs a stable owner_id (its PK in the ``workers``
+table) and an addressable owner_addr (recorded for the dashboard /
+operators). The per-session lease + 307-redirect scheme this once fed was
+retired — routing is the LB's consistent-hash job; these ids now serve
+worker liveness + the dashboard's "what's leased and where" JOIN.
 
-  owner_id   = "<replica>-<pid>"   stable per-process across reboots are not
-                                   needed — a restart claims a fresh lease.
+  owner_id   = "<replica>-<pid>"   stable per-process; a restart claims a
+                                   fresh ``workers`` row.
   owner_addr = "<host>:<port>"     reachable from peer replicas.
 
 Resolution order:
@@ -13,8 +16,7 @@ Resolution order:
   - port:     PORT | AGENT_SDK_PORT | 7778
 
 Local dev (Railway env vars absent) collapses to ``"<uuid8>-<pid>"`` and
-``127.0.0.1:7778`` which is correct for a single-host multi-worker bench:
-the 307 target *is* the same loopback the LB hits.
+``127.0.0.1:7778`` which is correct for a single-host multi-worker bench.
 """
 from __future__ import annotations
 
@@ -40,16 +42,15 @@ _OWNER_ADDR = f"{_HOST}:{_PORT}"
 
 
 def owner_id() -> str:
-    """Stable owner identifier for this Python process. Used by the
-    Postgres lease as ``sessions.lease_owner_id``."""
+    """Stable owner identifier for this Python process. Used as the
+    ``workers.owner_id`` primary key in the per-worker lease."""
     return _OWNER_ID
 
 
 def owner_addr() -> str:
     """Reachable address (``host:port``) for this Python process from
-    peer replicas. Used by the Postgres lease as
-    ``sessions.lease_owner_addr`` and surfaced in 307 ``Location``
-    headers when a non-owner replica receives a session-scoped request."""
+    peer replicas. Recorded as the ``workers.owner_addr`` column so the
+    dashboard can show which replica holds each session."""
     return _OWNER_ADDR
 
 

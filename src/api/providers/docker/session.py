@@ -1,15 +1,17 @@
 """DockerSandboxSession — concrete SandboxSession for the docker provider.
 
-Wraps existing primitives in ``src/api/providers/docker.py`` into the
-five-method ``BaseSandboxSession`` contract — adding a provider is one
-file + one factory line in ``api/sandbox/factory.py``.
+Wraps existing primitives in ``src/api/providers/docker/__init__.py`` into the
+three-method (``start``/``running``/``stop``) ``BaseSandboxSession`` contract
+— adding a provider is one file + one factory line in
+``api/sandbox/factory.py``.
 
 Docker is structurally simpler than daytona:
   * No S3-FUSE bridge — local volume mounts are POSIX
   * No signed-URL minting — supervisor URL is stable for the container's
     lifetime
-  * No pause/resume — ``stop`` removes the container; ``start`` creates
-    a fresh one against the same volume subpath
+  * No pause — ``stop`` stops the container (the container row persists and
+    is restartable); ``start`` revives it in place via ``docker start``, or
+    cold-creates a fresh one against the same volume subpath if it's gone
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ class DockerSandboxSession(BaseSandboxSession):
     """One running Docker container + supervisor + ACP child."""
 
     volume_provider = "docker"
+    _default_root = "/home/agent"
     state: DockerSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -57,12 +60,9 @@ class DockerSandboxSession(BaseSandboxSession):
         if self.state.sandbox_ref:
             try:
                 status = await dk_provider.get_sandbox_status(self.state.sandbox_ref)
-                from api.providers import ProviderInstance
                 if status == "running":
-                    instance = ProviderInstance(
-                        provider="docker",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/home/agent",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -71,10 +71,8 @@ class DockerSandboxSession(BaseSandboxSession):
                     # Container exists but stopped (`docker stop` w/o --rm).
                     # `docker start` revives it on the same image+volume.
                     await dk_provider.start_sandbox(self.state.sandbox_ref)
-                    instance = ProviderInstance(
-                        provider="docker",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/home/agent",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -168,22 +166,23 @@ class DockerSandboxSession(BaseSandboxSession):
             except Exception:
                 log.exception("snapshot request failed for session %s", self.session_id)
 
-        # Docker doesn't have a "pause" — stop_sandbox removes the container.
-        # Per docs §15.3 we still want pause-like semantics; on docker that
-        # means: stop, but keep volume; next start creates a fresh container
-        # against the same volume subpath, restoring from snapshot.
+        # Docker doesn't have a "pause" — stop_sandbox stops the container
+        # (the container row persists and is restartable). Per docs §15.3 we
+        # still want pause-like semantics; on docker that means: stop, but keep
+        # the volume. We then clear sandbox_ref below, so the next start on this
+        # session cold-creates a fresh container against the same volume
+        # subpath, restoring from snapshot.
         from api.providers import docker as dk_provider
-        from api.providers import ProviderInstance
         try:
-            await dk_provider.stop_sandbox(ProviderInstance(
-                provider="docker", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/home/agent",
+            await dk_provider.stop_sandbox(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
         except Exception:
             log.exception("docker.stop_sandbox failed for session %s", self.session_id)
-        # Container is gone; clear sandbox_id so next start cold-creates.
+        # Container row persists (docker stop, not rm); clear sandbox_ref so
+        # next start cold-creates instead of reattaching to the stopped one.
         self.state.sandbox_ref = None
         self.state.listen_port = None
 
@@ -192,7 +191,5 @@ class DockerSandboxSession(BaseSandboxSession):
     # ------------------------------------------------------------------ #
 
     async def shutdown(self) -> None:
-        self._container_id = None
-        self._supervisor_url = None
-        self._close_subscribers()
-        await self._aclose_acp_client()
+        self._container_id = None  # provider-specific handle; rest is base
+        await super().shutdown()

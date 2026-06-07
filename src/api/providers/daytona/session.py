@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 
 # Supervisor inside every Daytona sandbox listens on this fixed port; the
 # Daytona signed preview URL maps host URL to container port. Matches
-# ``_SUPERVISOR_REMOTE_PORT`` in src/api/providers/daytona.py.
+# ``_SUPERVISOR_REMOTE_PORT`` in src/api/providers/daytona/__init__.py.
 _SUPERVISOR_PORT = 9100
 
 
@@ -37,6 +37,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
     """One running Daytona sandbox + the supervisor + ACP child inside it."""
 
     volume_provider = "daytona"
+    _default_root = "/home/daytona"
     state: DaytonaSandboxState  # narrow the base's SandboxState union
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -191,15 +192,12 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 # delete-confirm poll never blocks the hot recovery path; state
                 # lives on the /vol snapshot and is restored on the cold-create
                 # below, so a redundant recreate is the worst case.
-                from api.providers import ProviderInstance
                 dead_ref = self.state.sandbox_ref
                 if dead_ref:
                     self._reattach_destroy_task = asyncio.create_task(
-                        dt_provider.destroy_daytona(ProviderInstance(
-                            provider="daytona", url="",
-                            root=self.state.recipe.root or "/home/daytona",
-                            sandbox_ref=dead_ref,
-                        ))
+                        dt_provider.destroy_daytona(
+                            self._provider_instance(sandbox_ref=dead_ref)
+                        )
                     )
                 self.state.sandbox_ref = None
 
@@ -215,7 +213,8 @@ class DaytonaSandboxSession(BaseSandboxSession):
         volume_ref = self._volume_ref
 
         # Cold create. create_sandbox passes the session volume/subpath so
-        # /opt/supervisor is mounted for start_supervisor_in_sandbox().
+        # /vol is mounted; the supervisor itself is image-baked at
+        # /opt/agent-sdk/runtime/ for start_supervisor_in_sandbox().
         instance = await dt_provider.create_sandbox(
             volume_ref=volume_ref,
             subpath=self._subpath or f"sessions/{self.session_id}",
@@ -348,46 +347,21 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
         # Always-pause policy (docs §15.3).
         from api.providers import daytona as dt_provider
-        from api.providers import ProviderInstance
         try:
-            await dt_provider.stop_daytona(ProviderInstance(
-                provider="daytona", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/home/daytona",
+            await dt_provider.stop_daytona(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref or "",
             ))
         except Exception:
             log.exception("daytona.stop failed for session %s", self.session_id)
 
-    # ------------------------------------------------------------------ #
-    # destroy: hard-delete (vs stop() which pauses)                       #
-    # ------------------------------------------------------------------ #
-
-    async def destroy(self) -> None:
-        """Hard-delete the daytona VM (vs ``stop()`` which PAUSEs it). Used by
-        the create-failure teardown — a failed cold-create has no conversation
-        to resume, so pausing would just leak the VM against the disk quota.
-        The 60s delete-confirm poll lives in ``_daytona_sandbox_op``; callers
-        fire-and-forget. Idempotent / no-op without a ref."""
-        if not self.state.sandbox_ref:
-            return
-        from api.providers import ProviderInstance
-        from api.providers import daytona as dt_provider
-        try:
-            await dt_provider.destroy_daytona(ProviderInstance(
-                provider="daytona", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/home/daytona",
-                sandbox_ref=self.state.sandbox_ref,
-            ))
-        except Exception:
-            log.exception("daytona.destroy failed for session %s", self.session_id)
+    # destroy() inherited from BaseSandboxSession (module destroy_sandbox →
+    # destroy_daytona; daytona's distinctness is in stop() = PAUSE, not destroy).
 
     # ------------------------------------------------------------------ #
     # shutdown: in-memory cleanup                                         #
     # ------------------------------------------------------------------ #
 
     async def shutdown(self) -> None:
-        """Final teardown of in-memory state. Idempotent."""
-        self._daytona_sandbox = None
-        self._supervisor_url = None
-        self._close_subscribers()
-        await self._aclose_acp_client()
+        self._daytona_sandbox = None  # provider-specific handle; rest is base
+        await super().shutdown()
