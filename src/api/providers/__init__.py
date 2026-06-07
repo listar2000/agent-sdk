@@ -18,7 +18,6 @@ providers/__init__.py:
 
 import asyncio
 import logging
-import shutil
 
 from .. import load_dotenv
 
@@ -44,8 +43,6 @@ from ._shared import (
     _wait_for_health,
     allocate_sandbox_port,
     free_sandbox_port,
-    _MAX_OUTPUT_BYTES,
-    _truncate,
     _exec_subprocess,
     _normalize_workspace,
 )
@@ -150,57 +147,13 @@ async def destroy_instance(instance: ProviderInstance) -> None:
 
 
 async def exec_in_instance(instance: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
-    """Run a shell command in the sandbox environment."""
-    if instance.provider == "unix_local":
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=instance.root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        return await _exec_subprocess(proc, timeout)
-
-    elif instance.provider == "docker":
-        docker = shutil.which("docker")
-        container_id = instance.container_id or instance.sandbox_ref
-        if not docker or not container_id:
-            raise RuntimeError("docker not available or no container_id")
-        proc = await asyncio.create_subprocess_exec(
-            docker, "exec", container_id, "sh", "-c", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        return await _exec_subprocess(proc, timeout)
-
-    elif instance.provider == "daytona":
-        if not instance.sandbox_ref:
-            raise RuntimeError("no sandbox_ref for daytona exec")
-        from .daytona import _get_async_daytona_client
-        daytona = await _get_async_daytona_client()
-        sandbox = await daytona.get(instance.sandbox_ref)
-        try:
-            r = await asyncio.wait_for(
-                sandbox.process.exec(cmd, timeout=timeout),
-                timeout=timeout + 5,
-            )
-            out = (r.result if hasattr(r, "result") else str(r)) or ""
-            err = (r.stderr if hasattr(r, "stderr") else "") or ""
-            code = r.exit_code if hasattr(r, "exit_code") else None
-            out, trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
-            return ExecResult(
-                stdout=out,
-                stderr=err,
-                exit_code=code,
-                stdout_truncated=trunc,
-            )
-        except asyncio.TimeoutError:
-            return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
-
-    elif instance.provider == "modal":
-        return await _modal_mod.exec_in_sandbox(instance, cmd, timeout=timeout)
-
-    else:
-        raise ValueError(f"exec_in_instance: unsupported provider {instance.provider!r}")
+    """Run a shell command in the sandbox environment. Dispatches to the
+    provider module's ``exec_in_sandbox`` — provider-specific exec (host
+    subprocess / ``docker exec`` / daytona SDK / modal tunnel) lives WITH the
+    provider, not inline here."""
+    return await _dispatch_mod(instance.provider).exec_in_sandbox(
+        instance, cmd, timeout=timeout,
+    )
 
 
 # ---------------------------------------------------------------------------

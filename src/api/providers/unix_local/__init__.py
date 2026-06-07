@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .._shared import (
+    ExecResult,
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_BIN_NAMES,
@@ -29,6 +30,7 @@ from .._shared import (
     _acp_bin_name,
     _acp_launch_args,
     _auth_vars_to_unset,
+    _exec_subprocess,
     _find_free_port,
     _get_sandbox_env_vars,
     _runtime_acp_bin,
@@ -552,6 +554,17 @@ async def _kill_and_reap(ref: str, record: _SandboxRecord | None) -> None:
             await asyncio.to_thread(proc.wait, 2)
         except subprocess.TimeoutExpired:
             pass
+
+
+async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
+    """Run ``cmd`` via ``sh -c`` on the host (local provider = host process)."""
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        cwd=inst.root,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    return await _exec_subprocess(proc, timeout)
 
 
 async def stop_sandbox(inst: ProviderInstance) -> None:

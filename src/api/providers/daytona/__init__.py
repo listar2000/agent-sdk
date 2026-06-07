@@ -55,6 +55,8 @@ async def _run_sandbox_exec_async(sandbox, cmd: str, timeout: int = 120) -> "_Ex
 # Re-import shared helpers from __init__ to avoid circular imports.
 # These are defined here inline or imported lazily.
 from .._shared import (
+    ExecResult,
+    _MAX_OUTPUT_BYTES,
     _acp_launch_args,
     _build_env_prefix,
     _build_volume_mounts,
@@ -62,6 +64,7 @@ from .._shared import (
     _read_runtime_image_tag,
     _read_runtime_snapshot_tag,
     _safe_path,
+    _truncate,
     _wait_for_health,
     build_supervisor_argv,
     ProviderInstance,
@@ -890,6 +893,26 @@ async def destroy_sandbox(*args, **kwargs):
 
 async def stop_sandbox(*args, **kwargs):
     return await stop_daytona(*args, **kwargs)
+
+
+async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
+    """Run ``cmd`` inside the daytona sandbox via the SDK process channel."""
+    if not inst.sandbox_ref:
+        raise RuntimeError("no sandbox_ref for daytona exec")
+    daytona = await _get_async_daytona_client()
+    sandbox = await daytona.get(inst.sandbox_ref)
+    try:
+        r = await asyncio.wait_for(
+            sandbox.process.exec(cmd, timeout=timeout),
+            timeout=timeout + 5,
+        )
+    except asyncio.TimeoutError:
+        return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
+    out = (r.result if hasattr(r, "result") else str(r)) or ""
+    err = (r.stderr if hasattr(r, "stderr") else "") or ""
+    code = r.exit_code if hasattr(r, "exit_code") else None
+    out, trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
+    return ExecResult(stdout=out, stderr=err, exit_code=code, stdout_truncated=trunc)
 
 
 async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,

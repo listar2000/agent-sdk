@@ -24,10 +24,12 @@ import shutil
 from typing import Any
 
 from .._shared import (
+    ExecResult,
     ProviderInstance,
     VolumeFileExistsError,
     _acp_launch_args,
     _build_env_prefix,
+    _exec_subprocess,
     _find_free_port,
     _read_runtime_image_tag,
     _safe_path,
@@ -390,6 +392,20 @@ async def start_sandbox(ref: str) -> None:
         return
     await _run_docker_checked("start", ref, timeout=60)
     log.info("docker sandbox started (resumed): %s", ref[:12])
+
+
+async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
+    """Run ``cmd`` via ``docker exec ... sh -c`` inside the container."""
+    docker = shutil.which("docker")
+    container_id = inst.container_id or inst.sandbox_ref
+    if not docker or not container_id:
+        raise RuntimeError("docker not available or no container_id")
+    proc = await asyncio.create_subprocess_exec(
+        docker, "exec", container_id, "sh", "-c", cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    return await _exec_subprocess(proc, timeout)
 
 
 async def stop_sandbox(inst: ProviderInstance) -> None:
