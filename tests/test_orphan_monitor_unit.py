@@ -3,6 +3,11 @@
 Mirrors the other daytona unit tests: a mocked async client + mocked
 ``db.live_sandbox_refs``, no live daytona. Asserts the orphan set, the state
 histogram, the capped flag, and that detection mode deletes NOTHING.
+
+The latest daytona SDK returns an ASYNC ITERATOR from ``client.list(query)``
+(``detect_orphan_sandboxes`` does ``async for sb in daytona.list(...)`` and
+stops at ``_DAYTONA_MAX_ITEMS``), so the mock's ``list`` is an async-generator
+function yielding sandbox objects — not an ``AsyncMock`` coroutine.
 """
 from __future__ import annotations
 
@@ -22,15 +27,23 @@ def _sb(sid, state="started"):
     return SimpleNamespace(id=sid, state=state)
 
 
-def _wire(monkeypatch, *, list_obj=None, list_fn=None, live_refs=()):
+def _alist(items):
+    """Build an async-generator factory yielding ``items`` — the shape
+    ``client.list(query)`` returns in the current daytona SDK."""
+    async def _gen(*_args, **_kwargs):
+        for sb in items:
+            yield sb
+    return _gen
+
+
+def _wire(monkeypatch, *, items=(), live_refs=()):
     """Patch the async daytona client (.list + .delete) and db.live_sandbox_refs.
     Returns the .delete AsyncMock so a test can assert it was never called."""
     from api.providers import daytona
     import api.db as dbmod
 
     delete = AsyncMock()
-    _list = AsyncMock(side_effect=list_fn) if list_fn else AsyncMock(return_value=list_obj)
-    client = SimpleNamespace(list=_list, delete=delete)
+    client = SimpleNamespace(list=_alist(items), delete=delete)
     monkeypatch.setattr(daytona, "_get_async_daytona_client", AsyncMock(return_value=client))
     monkeypatch.setattr(dbmod, "live_sandbox_refs", AsyncMock(return_value=set(live_refs)))
     return daytona, delete
@@ -38,11 +51,8 @@ def _wire(monkeypatch, *, list_obj=None, list_fn=None, live_refs=()):
 
 @pytest.mark.asyncio
 async def test_orphans_are_refs_with_no_session_row(monkeypatch):
-    page = SimpleNamespace(
-        items=[_sb("live-1"), _sb("orphan-1", "stopped"), _sb("orphan-2", "error")],
-        total_pages=1,
-    )
-    daytona, delete = _wire(monkeypatch, list_obj=page, live_refs={"live-1"})
+    items = [_sb("live-1"), _sb("orphan-1", "stopped"), _sb("orphan-2", "error")]
+    daytona, delete = _wire(monkeypatch, items=items, live_refs={"live-1"})
 
     report = await daytona.detect_orphan_sandboxes()
 
@@ -55,11 +65,8 @@ async def test_orphans_are_refs_with_no_session_row(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_skips_null_id_and_normalizes_enum_state(monkeypatch):
-    page = SimpleNamespace(
-        items=[_sb(None), SimpleNamespace(id="o-1", state=SimpleNamespace(value="STOPPED"))],
-        total_pages=1,
-    )
-    daytona, delete = _wire(monkeypatch, list_obj=page, live_refs=set())
+    items = [_sb(None), SimpleNamespace(id="o-1", state=SimpleNamespace(value="STOPPED"))]
+    daytona, delete = _wire(monkeypatch, items=items, live_refs=set())
 
     report = await daytona.detect_orphan_sandboxes()
 
@@ -69,19 +76,18 @@ async def test_skips_null_id_and_normalizes_enum_state(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pagination_cap_sets_capped(monkeypatch):
+async def test_item_cap_sets_capped(monkeypatch):
     from api.providers import daytona as d
-    monkeypatch.setattr(d, "_DAYTONA_MAX_PAGES", 2)
+    monkeypatch.setattr(d, "_DAYTONA_MAX_ITEMS", 2)
 
-    def _page(labels=None, page=1):
-        return SimpleNamespace(items=[_sb(f"o-{page}")], total_pages=5)
-
-    daytona, delete = _wire(monkeypatch, list_fn=_page, live_refs=set())
+    # 3 items, cap 2 -> iteration stops after the 2nd, capped flag set.
+    items = [_sb("o-1"), _sb("o-2"), _sb("o-3")]
+    daytona, delete = _wire(monkeypatch, items=items, live_refs=set())
 
     report = await daytona.detect_orphan_sandboxes()
 
     assert report["capped"] is True
-    assert report["total_seen"] == 2  # only 2 pages walked
+    assert report["total_seen"] == 2  # only 2 items walked before the cap
     delete.assert_not_called()
 
 
@@ -89,10 +95,10 @@ async def test_pagination_cap_sets_capped(monkeypatch):
 async def test_explicit_live_refs_skips_db(monkeypatch):
     from api.providers import daytona
     import api.db as dbmod
-    page = SimpleNamespace(items=[_sb("o-1")], total_pages=1)
+
     monkeypatch.setattr(
         daytona, "_get_async_daytona_client",
-        AsyncMock(return_value=SimpleNamespace(list=AsyncMock(return_value=page), delete=AsyncMock())),
+        AsyncMock(return_value=SimpleNamespace(list=_alist([_sb("o-1")]), delete=AsyncMock())),
     )
     db_spy = AsyncMock(return_value=set())
     monkeypatch.setattr(dbmod, "live_sandbox_refs", db_spy)
