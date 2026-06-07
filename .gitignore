@@ -22,3 +22,5 @@ logs/
 benchmark/scale/results.jsonl
 benchmark/scale/tune_results.jsonl
 benchmark/scale/flame-*.svg
+hive_build_credentials.tmp
+.Dockerfile.agent.build

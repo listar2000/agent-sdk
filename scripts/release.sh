@@ -90,7 +90,32 @@ fi
 
 LOCAL_TAG="agent-sdk:${SHA}${DIRTY_SUFFIX}"
 SNAPSHOT_NAME="agent-sdk-${SHA}${DIRTY_SUFFIX}"
-DOCKERFILE="${REPO_ROOT}/Dockerfile"
+
+# Slim agent SANDBOX image (daytona + modal snapshots build from THIS, not the
+# full server Dockerfile): drops the FastAPI server, keeps node+uv+supervisor,
+# and bakes the hivespace CLI + default skills. See scripts/Dockerfile.agent.
+DOCKERFILE_AGENT="${REPO_ROOT}/scripts/Dockerfile.agent"
+HIVE_TOKEN="${GH_TOKEN:-${HIVESPACE_INSTALL_TOKEN:-}}"
+_AGENT_CRED="${REPO_ROOT}/hive_build_credentials.tmp"
+_AGENT_DF_TMP="${REPO_ROOT}/.Dockerfile.agent.build"
+
+# Stage the slim agent Dockerfile for a context-correct build: its hivecli stage
+# COPYs hive_build_credentials.tmp (the GitHub token — kept out of the Dockerfile
+# text / snapshot build_info), and ``COPY src/supervisor`` needs the repo-root
+# build context, so we drop a temp copy at the repo root. The token never enters
+# the Dockerfile text or the published image (multi-stage; cred file is rm'd in
+# the throwaway builder + deleted here after the build).
+prepare_agent_build() {
+  if [[ -z "${HIVE_TOKEN}" ]]; then
+    echo "[release] ERROR: set GH_TOKEN (or HIVESPACE_INSTALL_TOKEN) — required to" >&2
+    echo "[release]   bake the private hivespace CLI into scripts/Dockerfile.agent." >&2
+    return 1
+  fi
+  printf 'https://x-access-token:%s@github.com\n' "${HIVE_TOKEN}" > "${_AGENT_CRED}"
+  chmod 600 "${_AGENT_CRED}"
+  cp "${DOCKERFILE_AGENT}" "${_AGENT_DF_TMP}"
+}
+cleanup_agent_build() { rm -f "${_AGENT_CRED}" "${_AGENT_DF_TMP}"; }
 VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
 
 want() {
@@ -119,14 +144,21 @@ build_docker() {
     export DOCKER_CONFIG="${docker_config_dir}"
   fi
 
-  echo "[release] building $LOCAL_TAG"
+  echo "[release] building $LOCAL_TAG from scripts/Dockerfile.agent"
+  # All providers build the SLIM agent image (scripts/Dockerfile.agent) — the
+  # same image agents run in. prepare_agent_build writes the hive-token cred
+  # file; ``-f`` points at the agent Dockerfile with repo-root context so
+  # ``COPY src/supervisor`` + the cred-file COPY resolve.
+  prepare_agent_build || return 1
   # Don't take the whole script down if docker build fails — daytona/modal
   # snapshots build remotely and don't need the local image.
-  if ! docker build -t "$LOCAL_TAG" .; then
+  if ! docker build -f "$DOCKERFILE_AGENT" -t "$LOCAL_TAG" .; then
+    cleanup_agent_build
     echo "[release] docker build failed — continuing without a local image" >&2
     [[ -n "$docker_config_dir" ]] && rm -rf "$docker_config_dir"
     return 0
   fi
+  cleanup_agent_build
   echo "$LOCAL_TAG" > "$REPO_ROOT/.runtime-image-tag"
   echo "[release] wrote .runtime-image-tag := $LOCAL_TAG"
 
@@ -155,8 +187,9 @@ build_daytona() {
     echo "[release] ${VENV_PYTHON} missing — run scripts/launch_server_test.sh once to bootstrap, then re-run." >&2
     return 1
   fi
-  echo "[release] registering Daytona snapshot $SNAPSHOT_NAME (remote build, ~5 min)"
-  SNAPSHOT_NAME="$SNAPSHOT_NAME" DOCKERFILE="$DOCKERFILE" "${VENV_PYTHON}" - <<'PYEOF'
+  prepare_agent_build || return 1
+  echo "[release] registering Daytona snapshot $SNAPSHOT_NAME from scripts/Dockerfile.agent (remote build, ~5 min)"
+  if ! SNAPSHOT_NAME="$SNAPSHOT_NAME" DOCKERFILE="$_AGENT_DF_TMP" "${VENV_PYTHON}" - <<'PYEOF'
 import os, sys, time
 from daytona_sdk import Daytona, DaytonaConfig, CreateSnapshotParams, Image, Resources
 
@@ -180,6 +213,12 @@ result = client.snapshot.create(
 print(f"[release] daytona snapshot {result.name} state={result.state} elapsed={time.time() - t0:.1f}s",
       file=sys.stderr)
 PYEOF
+  then
+    cleanup_agent_build
+    echo "[release] daytona snapshot build FAILED" >&2
+    return 1
+  fi
+  cleanup_agent_build
   echo "$SNAPSHOT_NAME" > "$REPO_ROOT/.runtime-snapshot-tag"
   echo "[release] wrote .runtime-snapshot-tag := $SNAPSHOT_NAME"
 }
@@ -198,8 +237,9 @@ build_modal() {
     echo "[release] modal SDK not installed in venv — skipping Modal snapshot"
     return 0
   fi
-  echo "[release] building Modal filesystem snapshot (warm sandbox + snapshot_filesystem, ~3-5 min)"
-  DOCKERFILE="$DOCKERFILE" "${VENV_PYTHON}" - <<'PYEOF'
+  prepare_agent_build || return 1
+  echo "[release] building Modal filesystem snapshot from scripts/Dockerfile.agent (warm sandbox + snapshot_filesystem, ~3-5 min)"
+  if ! DOCKERFILE="$_AGENT_DF_TMP" "${VENV_PYTHON}" - <<'PYEOF'
 import os
 import sys
 import time
@@ -254,6 +294,12 @@ with open(tag_file, "w") as f:
     f.write(snap_id + "\n")
 print(f"  wrote: {snap_id}")
 PYEOF
+  then
+    cleanup_agent_build
+    echo "[release] modal snapshot build FAILED" >&2
+    return 1
+  fi
+  cleanup_agent_build
 }
 
 # ── Dispatch ────────────────────────────────────────────────────────────
