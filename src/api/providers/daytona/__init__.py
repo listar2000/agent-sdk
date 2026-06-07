@@ -303,16 +303,6 @@ async def start_supervisor_in_sandbox(
     return url
 
 
-async def kill_supervisor_in_sandbox(sandbox, port: int) -> None:
-    """Kill a supervisor process by port inside a Daytona sandbox."""
-    try:
-        await _run_sandbox_exec_async(
-            sandbox, f"fuser -k {port}/tcp 2>/dev/null || true", timeout=10,
-        )
-    except Exception as e:
-        log.warning("kill_supervisor_in_sandbox port=%d failed: %s", port, e)
-
-
 async def provision_daytona_sandbox(
     agent_type: str = "opencode",
     dockerfile: str | None = None,

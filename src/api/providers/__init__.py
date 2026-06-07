@@ -49,14 +49,11 @@ from ._shared import (
 # Re-export Daytona-specific symbols for server.py + tests.
 from .daytona import (
     destroy_daytona,
-    stop_daytona,
     create_daytona_volume,
     delete_daytona_volume,
     provision_daytona_sandbox,
     restart_daytona_supervisor,
-    kill_supervisor_in_sandbox,
     _get_async_daytona_client,
-    _daytona_sandbox_op,
 )
 
 # Provider module dispatch table

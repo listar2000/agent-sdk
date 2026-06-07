@@ -324,11 +324,6 @@ class BaseSandboxSession(abc.ABC):
         return self._supervisor_url
 
     @property
-    def acp_session_id(self) -> str | None:
-        """Public read of the ACP session id minted on first attach."""
-        return self._acp_session_id
-
-    @property
     def inner_session_id(self) -> str | None:
         """Public read of the agent-native inner session id (used for
         ``session/load`` on cold-recovery)."""

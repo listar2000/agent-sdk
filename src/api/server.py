@@ -2433,11 +2433,6 @@ async def post_session_message(session_id: str, request: Request):
     return {"rpc_id": rpc_id, "status": "ok"}
 
 
-
-# Track in-flight POST /message background drains so asyncio doesn't GC them.
-_BG_TASKS: set[asyncio.Task] = set()
-
-
 @app.get("/sessions/{session_id}/events")
 async def session_events(session_id: str):
     """SSE stream for a session. Multi-subscriber: many concurrent
