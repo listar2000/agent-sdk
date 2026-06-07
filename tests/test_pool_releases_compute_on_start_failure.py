@@ -63,6 +63,7 @@ class _LeakySession(BaseSandboxSession):
         super().__init__(*args, **kwargs)
         self.acquired = False
         self.stopped = False
+        self.destroyed = False
         self.did_shutdown = False
 
     async def start(self) -> None:
@@ -85,6 +86,12 @@ class _LeakySession(BaseSandboxSession):
     async def stop(self) -> None:
         # Real sessions route stop() -> provider.destroy/stop -> compute freed.
         self.stopped = True
+
+    async def destroy(self) -> None:
+        # Every session now exposes destroy() (terminal hard-delete). Override
+        # the base — which would dispatch to a real provider module — since this
+        # mock's ``provider="test"`` isn't a registered provider.
+        self.destroyed = True
 
     async def shutdown(self) -> None:
         self.did_shutdown = True

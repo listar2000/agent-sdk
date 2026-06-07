@@ -3,8 +3,9 @@
 See ````.
 
 What's here:
-  * ``BaseSandboxSession`` — abstract: start / running / execute_prompt
-    / stop / shutdown, plus shared subscriber fan-out + bootstrap.
+  * ``BaseSandboxSession`` — abstract lifecycle methods start / running
+    / stop; concrete execute_prompt / destroy / shutdown, plus shared
+    subscriber fan-out + bootstrap.
   * ``DaytonaSandboxSession`` / ``DockerSandboxSession`` /
     ``UnixLocalSandboxSession`` / ``ModalSandboxSession`` — concrete
     impls, one file per provider.

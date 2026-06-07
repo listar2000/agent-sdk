@@ -130,8 +130,11 @@ async def test_exec_in_instance_docker_uses_sandbox_id_as_container_fallback(mon
         captured["kwargs"] = kwargs
         return _FakeProc()
 
-    monkeypatch.setattr(providers.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
-    monkeypatch.setattr(providers.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    # exec lives in the docker provider module now (uniform dispatch), so patch
+    # there — not on the central api.providers package.
+    from api.providers import docker as _dkprov
+    monkeypatch.setattr(_dkprov.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+    monkeypatch.setattr(_dkprov.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
     result = await providers.exec_in_instance(instance, "echo ok")
 

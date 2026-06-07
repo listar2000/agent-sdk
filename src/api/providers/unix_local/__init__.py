@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .._shared import (
+    ExecResult,
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_BIN_NAMES,
@@ -29,6 +30,7 @@ from .._shared import (
     _acp_bin_name,
     _acp_launch_args,
     _auth_vars_to_unset,
+    _exec_subprocess,
     _find_free_port,
     _get_sandbox_env_vars,
     _runtime_acp_bin,
@@ -175,6 +177,17 @@ def _kill_pid(pid: int) -> None:
         pass
 
 
+def _kill_proc(proc: subprocess.Popen) -> None:
+    """SIGTERM→SIGKILL a freshly-spawned supervisor ``Popen`` and reap it, so a
+    failed create/health attempt doesn't leave a zombie. Call sites pass the
+    ``Popen`` from ``create_sandbox``; ``_kill_pid`` does the signal escalation."""
+    _kill_pid(proc.pid)
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
 _PROCESSES: dict[str, subprocess.Popen] = {}
 _PROCESSES_LOCK = asyncio.Lock()
 
@@ -244,9 +257,9 @@ async def create_sandbox(
 ) -> ProviderInstance:
     """Launch a supervisor subprocess rooted at ``<vol>/<subpath>``.
 
-    Returns a ProviderInstance whose ``sandbox_ref`` is the stringified pid
-    of the supervisor process; the live ``Popen`` is also kept in
-    ``_PROCESSES`` for later status/destroy lookups by pid.
+    Returns a ProviderInstance whose ``sandbox_ref`` is a stable
+    ``local-<hex>`` ref that outlives the PID; the live ``Popen`` is also kept
+    in ``_PROCESSES`` (keyed by that ref) for later status/destroy lookups.
     """
     if agent_type not in _ACP_BIN_NAMES:
         raise ValueError(f"unsupported agent_type: {agent_type!r}")
@@ -552,6 +565,17 @@ async def _kill_and_reap(ref: str, record: _SandboxRecord | None) -> None:
             await asyncio.to_thread(proc.wait, 2)
         except subprocess.TimeoutExpired:
             pass
+
+
+async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
+    """Run ``cmd`` via ``sh -c`` on the host (local provider = host process)."""
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        cwd=inst.root,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    return await _exec_subprocess(proc, timeout)
 
 
 async def stop_sandbox(inst: ProviderInstance) -> None:

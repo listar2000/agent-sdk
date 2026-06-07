@@ -177,13 +177,11 @@ class SessionPool:
                 # a no-op so subscribers see no spurious _END.
                 handed_off_subscribers = dict(cached._subscribers)
                 cached._subscribers.clear()
-                # Cancel the dead session's credential-refresh loop as part of
-                # the teardown. This branch bypasses ``release`` (it can't
-                # snapshot dead compute), and ``shutdown()`` doesn't touch the
-                # task, so without this the loop is orphaned and POSTs to
-                # ``credential_refresh_url`` forever — one leaked task per
-                # recovery.
-                asyncio.create_task(_teardown_stale(cached))
+                # Tear the dead session down in the background. ``shutdown()``
+                # cancels its credential-refresh loop, so this branch — which
+                # bypasses ``release`` (it can't snapshot dead compute) — no
+                # longer leaks the loop (one leaked task per recovery before).
+                asyncio.create_task(_safe_shutdown(cached))
                 self._active.pop(session_id, None)
 
             if peek:
@@ -224,8 +222,8 @@ class SessionPool:
                 # Rebind each subscriber's ``owner`` to this replacement
                 # session so the consumer's ``iterate_subscriber`` finally
                 # pops from HERE, not from the dead session it was created
-                # on. Without this the entry leaks onto ``session`` and the
-                # idle reaper skips it forever (zombie subscriber).
+                # on. Without this the entry leaks onto ``session`` as a
+                # never-cleaned-up zombie subscriber.
                 for sub in handed_off_subscribers.values():
                     sub.owner = session
                 session._subscribers.update(handed_off_subscribers)
@@ -246,17 +244,15 @@ class SessionPool:
                 # which we still hold here, so it would deadlock.
                 with contextlib.suppress(Exception):
                     await session.stop()
-                # Daytona ``stop()`` only PAUSES (Bug A: leaks the VM against
-                # the disk quota for a session that never entered ``_active``
-                # and has no conversation to resume). ``stop()`` for
-                # docker/modal/unix_local already deletes, so this is a
-                # daytona-only hard-DELETE, getattr-gated → a byte-for-byte
-                # no-op for the other providers. Fire-and-forget so the 60s
-                # delete-confirm never blocks the re-raise while we hold
-                # ``_lock(session_id)``.
-                if getattr(session, "destroy", None) is not None and getattr(
-                    session.state, "sandbox_ref", None
-                ):
+                # A failed start has no conversation to resume, so HARD-DELETE
+                # the acquired compute (Bug A). ``stop()`` alone is not enough:
+                # daytona ``stop`` only PAUSES and docker ``stop`` keeps the
+                # container — both would leak. ``destroy()`` is now uniform
+                # across providers (modal/unix_local ``destroy`` == their
+                # already-destructive ``stop``, so it's a harmless no-op there).
+                # Fire-and-forget so the up-to-60s delete-confirm never blocks
+                # the re-raise while we hold ``_lock(session_id)``.
+                if getattr(session.state, "sandbox_ref", None):
                     asyncio.create_task(_safe_destroy_compute(session))
                 await _safe_shutdown(session)
                 raise
@@ -270,7 +266,8 @@ class SessionPool:
             # Spawn the credential-refresh loop if the recipe asks for
             # one. Fires on every wake — cold create AND resume from
             # hibernation — so the agent always has fresh credentials.
-            # Cancelled in ``release()`` before shutdown.
+            # Cancelled inside ``session.shutdown()`` (every teardown
+            # path ends there), so no path can leak it.
             recipe = session.state.recipe
             if recipe.credential_refresh_url:
                 session._credential_refresh_task = asyncio.create_task(
@@ -321,9 +318,6 @@ class SessionPool:
             if session is None:
                 return
             lifecycle_url = _lifecycle_url_from_recipe(session.state.recipe)
-            # Cancel the credential-refresh loop (if any) before tearing
-            # down compute.
-            await _cancel_credential_refresh(session)
             try:
                 try:
                     await session.stop()
@@ -501,33 +495,11 @@ async def _safe_shutdown(session: BaseSandboxSession) -> None:
         log.exception("shutdown() failed for session %s", session.session_id)
 
 
-async def _cancel_credential_refresh(session: BaseSandboxSession) -> None:
-    """Cancel the session's credential-refresh loop, if any. Idempotent and
-    never raises (the task may have already crashed; we just want it gone).
-    BOTH the clean hibernate/delete path (``release``) and the cold-recovery
-    stale-teardown (``_teardown_stale``) must call this — otherwise the loop
-    is orphaned and keeps POSTing to ``credential_refresh_url`` for the life
-    of the process, one leaked task per recovery."""
-    task = getattr(session, "_credential_refresh_task", None)
-    if task is not None:
-        task.cancel()
-        with contextlib.suppress(BaseException):
-            await task
-
-
-async def _teardown_stale(session: BaseSandboxSession) -> None:
-    """Background teardown of a session replaced by cold-recovery. Mirrors the
-    cancellation ``release`` does on the clean path: the stale-teardown branch
-    in ``get_session`` bypasses ``release`` (it can't snapshot dead compute),
-    so this is the only place that cancels a recovered-away session's
-    credential-refresh loop before shutting its runtime down."""
-    await _cancel_credential_refresh(session)
-    await _safe_shutdown(session)
-
-
 async def _safe_destroy_compute(session: BaseSandboxSession) -> None:
     """Best-effort hard-DELETE of compute for a session whose ``start()``
-    failed after acquiring a pause-only VM (daytona). Never raises."""
+    failed after acquiring it. Never raises. Uniform across providers via
+    ``session.destroy()`` (daytona deletes the paused VM, docker rm -f's the
+    stopped container, modal/unix_local terminate)."""
     try:
         await session.destroy()
     except Exception:
