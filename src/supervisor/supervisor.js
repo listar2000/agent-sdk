@@ -144,42 +144,23 @@ function log(...args) {
   process.stderr.write(`${t} [supervisor] ${args.join(" ")}\n`);
 }
 
-const args = parseArgs(process.argv);
-
-// Ensure args.root exists and, if a snapshot is configured, restore the
-// previous workspace before starting ACP.
+// ── Boot constants (evaluated at module load, before any helpers run) ──────
 //
-// Two boot modes (called "Type 1" / "Type 2" in server.py — see the block
-// above _type2_recover):
-//
-//   Type 1 — supervisor restart inside an EXISTING VM (daytona
-//            restart_daytona_supervisor / port-based start_sandbox).
-//            args.root on local ext4 already has the latest workspace
-//            bytes from the previous supervisor's writes; restoring from
-//            the volume tarballs is pure waste (potentially hundreds of
-//            MB of read+write on snapshot.tar) and adds 15s of FUSE-poll
-//            wait if the cold tarball isn't already visible.
-//
-//   Type 2 — fresh VM, blank args.root. The volume tarballs are the
-//            only way to repopulate session+workspace state.
-//
-// We distinguish the two with a sentinel file at SUPERVISOR_BOOT_MARKER:
-//   - /tmp survives a Type 1 boot (same VM ⇒ same /tmp)
-//   - /tmp is wiped on Type 2 (new VM ⇒ blank /tmp)
-// So the sentinel cleanly says "this VM has already been bootstrapped;
-// skip the redundant restore." Cheaper than a server-side `--fresh` arg
-// and doesn't depend on Daytona's image-level dotfile pre-population
-// (which used to make readdir-empty heuristics false-negative on Type 2).
+// Two boot modes (Type 1 / Type 2 — see server.py _type2_recover):
+//   Type 1 — supervisor restart inside an EXISTING VM. args.root on local
+//             ext4 already has the latest workspace bytes; restoring from
+//             volume tarballs is pure waste (potentially hundreds of MB) and
+//             adds 15 s of FUSE-poll wait.
+//   Type 2 — fresh VM, blank args.root. Volume tarballs are the only way to
+//             repopulate session + workspace state.
+// Sentinel at SUPERVISOR_BOOT_MARKER distinguishes them: /tmp survives
+// Type 1 (same VM), is wiped on Type 2 (new VM). Cheaper than a server-side
+// --fresh arg; doesn't rely on Daytona's image-level dotfile pre-population.
 const SUPERVISOR_BOOT_MARKER = "/tmp/agent-sdk-bootstrapped";
 const isWarmRestart = (() => {
   try { return fs.existsSync(SUPERVISOR_BOOT_MARKER); }
   catch { return false; }
 })();
-try {
-  fs.mkdirSync(args.root, { recursive: true });
-} catch (e) {
-  log(`mkdir root failed: ${e.message}`);
-}
 
 // S3-backed FUSE (Daytona) has write→read visibility lag — often 5-15s
 // under load. When a sandbox is replaced immediately after an external
@@ -213,134 +194,157 @@ function _snapshotVisible(path, timeoutMs) {
   return false;
 }
 
-if (args.snapshotPath && isWarmRestart) {
-  // Type 1 boot — local ext4 already holds the latest workspace bytes from
-  // the previous supervisor in this VM. Skip both restore tiers; they would
-  // re-extract the exact same state we already have on disk.
-  log(`Type 1 boot detected (sentinel ${SUPERVISOR_BOOT_MARKER} present); skipping snapshot restore`);
-} else if (args.snapshotPath && args.skipRestore) {
-  // First cold-create — the session has never run a turn, so there is no
-  // tarball on the volume yet. Skip the 2×15s FUSE-visibility poll that
-  // would otherwise wait for files that can't exist. Per-turn writes below
-  // are unaffected (they key off snapshotPath, which is still set), so the
-  // NEXT boot on a fresh VM (recovery) restores normally.
-  log(`first cold-create (--skip-restore); skipping snapshot restore`);
-} else if (args.snapshotPath) {
-  // Type 2 boot — blank /home/daytona on a fresh VM. The volume tarballs
-  // are the only way to repopulate state.
-  //
-  // Layer 1: cold restore (full HOME). Best-effort — fresh agents that have
-  // never been snapshotted don't have this and it's fine.
-  const coldVisible = _snapshotVisible(args.snapshotPath, 15000);
-  if (coldVisible) {
-    log(`restoring filesystem_cache from ${args.snapshotPath}`);
-    const r = spawnSync("tar", ["-xf", args.snapshotPath, "-C", args.root], {
+// ── Boot helpers ────────────────────────────────────────────────────────────
+
+function ensureRootDir(root) {
+  try {
+    fs.mkdirSync(root, { recursive: true });
+  } catch (e) {
+    log(`mkdir root failed: ${e.message}`);
+  }
+}
+
+// Extract a tarball into root. Two modes controlled by skipOnCorrupt:
+//
+//   skipOnCorrupt=false  (cold full-HOME tier): extract directly into root.
+//                        Best-effort — a non-zero rc is logged and we carry on.
+//
+//   skipOnCorrupt=true   (per-turn agent_memory overlay): extract to a staging
+//                        dir first, apply onto root ONLY on a clean (rc==0)
+//                        extract, then remove staging. A sandbox killed
+//                        mid-snapshot-write leaves a TRUNCATED agent_memory.tar
+//                        (mountpoint-s3 can't make the write atomic — rename(2)
+//                        is ENOSYS). Extracting a truncated tar straight into
+//                        $HOME lands a partial/corrupt opencode SQLite db and
+//                        the agent crash-loops on recovery (opencode db-open:
+//                        "PRAGMA journal_mode=WAL" → health-fail → reattach →
+//                        cold-create loop). Dropping the corrupt overlay boots
+//                        from filesystem_cache/fresh instead — worst case is
+//                        losing the last turn, not an infinite leaked-VM loop.
+//                        (Regression: test_corrupt_agent_memory_recovers_not_loops.)
+function _restoreTar(tarPath, root, skipOnCorrupt, label) {
+  if (!skipOnCorrupt) {
+    log(`restoring ${label} from ${tarPath}`);
+    const r = spawnSync("tar", ["-xf", tarPath, "-C", root], {
       stdio: ["ignore", "inherit", "inherit"],
     });
-    if (r.status !== 0) {
-      log(`filesystem_cache restore exited rc=${r.status}; continuing`);
-    }
+    if (r.status !== 0) log(`${label} restore exited rc=${r.status}; continuing`);
+    return;
+  }
+  // skipOnCorrupt path: stage → validate → apply
+  const stage = "/tmp/agent-memory-restore";
+  spawnSync("rm", ["-rf", stage]);
+  fs.mkdirSync(stage, { recursive: true });
+  const r = spawnSync("tar", ["-xf", tarPath, "-C", stage], {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  if (r.status === 0) {
+    log(`restoring ${label} from ${tarPath}`);
+    const cp = spawnSync("cp", ["-a", `${stage}/.`, root], {
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    if (cp.status !== 0) log(`${label} overlay apply rc=${cp.status}; continuing`);
+  } else {
+    log(`${label} ${tarPath} is corrupt (extract rc=${r.status}) — SKIPPING overlay; booting from filesystem_cache/fresh`);
+  }
+  spawnSync("rm", ["-rf", stage]);
+}
+
+// Restore the workspace tarballs onto args.root (Type 2 boot only).
+//
+// Type 1 (warm=true): local ext4 already holds the latest workspace bytes
+//   from the previous supervisor in this VM — skip both restore tiers.
+// --skip-restore (first cold-create): no tarball on the volume yet — skip
+//   the 2×15 s FUSE-visibility poll. Per-turn writes are unaffected
+//   (they key off snapshotPath), so the NEXT boot on a fresh VM restores
+//   normally.
+// Type 2 cold (warm=false, skipRestore=false):
+//   Layer 1 — full HOME (filesystem_cache.tar). Best-effort; fresh agents
+//     that have never snapshotted don't have this and it's fine.
+//   Layer 2 — agent_memory overlay (per-turn snapshot of session dirs).
+//     Carries conversation JSONLs (.claude, .codex, etc.). Written EVERY
+//     TURN vs. filesystem_cache which is only written on graceful shutdown.
+//     For the common Type 2 case (sandbox deleted between turns under
+//     concurrent load), cold is often missing while memory IS present.
+//     Polling memory is what carries the conversation forward; without it,
+//     claude-agent-acp's session/load returns -32603 forever, and the
+//     test_session_resume_after_delete/stop[daytona] invariants catch the
+//     silent context loss. 15 s budget: ``ls $parent`` invalidates
+//     mountpoint-s3's stale dentry cache so existsSync sees the file once
+//     S3 propagates (10 s was too tight under 2× concurrent load).
+//     Server-side _wait_for_health (45 s) covers worst-case
+//     15 + 15 + ACP-spawn on a fresh Type 2 boot.
+function restoreWorkspace(args, warm) {
+  if (!args.snapshotPath) return;
+  if (warm) {
+    log(`Type 1 boot detected (sentinel ${SUPERVISOR_BOOT_MARKER} present); skipping snapshot restore`);
+    return;
+  }
+  if (args.skipRestore) {
+    log(`first cold-create (--skip-restore); skipping snapshot restore`);
+    return;
+  }
+  // Layer 1: cold restore (full HOME).
+  if (_snapshotVisible(args.snapshotPath, 15000)) {
+    _restoreTar(args.snapshotPath, args.root, false, "filesystem_cache");
   } else {
     log(`filesystem_cache ${args.snapshotPath} not visible after 15s — assuming fresh sandbox`);
   }
-
-  // Layer 2: agent-memory overlay (per-turn snapshot of session dirs).
-  // This is the tier that carries conversation JSONLs (.claude, .codex,
-  // etc.). Critically, agent_memory.tar is written EVERY TURN, while
-  // the cold filesystem_cache.tar is only written on graceful shutdown
-  // (POST /v1/snapshot). For the common Type 2 case — sandbox externally
-  // deleted between turns under concurrent load — there is no graceful
-  // shutdown, so cold is often missing while memory IS present (just
-  // not yet visible on the new sandbox's S3-FUSE mount). Polling for
-  // memory is what carries the conversation forward; without it,
-  // supervisor.js skips restore, claude-agent-acp's session/load
-  // returns -32603, and the test_session_resume_after_delete[daytona]
-  // and test_session_resume_after_stop[daytona] invariants
-  // ``inner_after == inner_before`` deliberately catch the silent
-  // context loss.
-  //
-  // Use the same _snapshotVisible poll the cold tier uses, with the same
-  // 15 s budget — ``ls $parent`` invalidates mountpoint-s3's stale dentry
-  // cache so existsSync sees the file once S3 propagates. 10 s was too
-  // tight under 2x concurrent load (FUSE propagation took >10 s and the
-  // overlay was silently skipped, dropping turn-N JSONLs and forcing
-  // claude-agent-acp's session/load to return -32603 forever). Server-side
-  // _wait_for_health budget on daytona (45 s) covers worst-case
-  // 15 + 15 + ACP-spawn back-to-back on a fresh Type 2 boot.
+  // Layer 2: agent-memory overlay.
   const memPath = _agentMemoryPath(args.snapshotPath);
   if (memPath && _snapshotVisible(memPath, 15000)) {
-    // Extract the overlay to a STAGING dir first, then apply onto $HOME only on
-    // a clean (rc==0) extract. A sandbox killed mid-snapshot-write leaves a
-    // TRUNCATED agent_memory.tar (the snapshot write can't be made atomic on the
-    // mountpoint-s3 volume — see the NOTE above runAgentMemorySnapshotOnce);
-    // extracting it straight into $HOME lands a partial/corrupt opencode SQLite
-    // db there and the agent crash-loops on recovery (opencode dies at db-open:
-    // "PRAGMA journal_mode = WAL" -> port-9100 health-check fail -> reattach->
-    // cold-create loop). On a corrupt overlay we DROP it and boot from the
-    // filesystem_cache / fresh — worst case is losing the last turn, not an
-    // infinite leaked-VM loop. (Regression: test_corrupt_agent_memory_recovers_not_loops.)
-    const memStage = "/tmp/agent-memory-restore";
-    spawnSync("rm", ["-rf", memStage]);
-    fs.mkdirSync(memStage, { recursive: true });
-    const r = spawnSync("tar", ["-xf", memPath, "-C", memStage], {
-      stdio: ["ignore", "inherit", "inherit"],
-    });
-    if (r.status === 0) {
-      log(`restoring agent_memory from ${memPath}`);
-      const cp = spawnSync("cp", ["-a", `${memStage}/.`, args.root], {
-        stdio: ["ignore", "inherit", "inherit"],
-      });
-      if (cp.status !== 0) log(`agent_memory overlay apply rc=${cp.status}; continuing`);
-    } else {
-      log(`agent_memory ${memPath} is corrupt (extract rc=${r.status}) — SKIPPING overlay; booting from filesystem_cache/fresh`);
-    }
-    spawnSync("rm", ["-rf", memStage]);
+    _restoreTar(memPath, args.root, true, "agent_memory");
   } else if (memPath) {
     log(`agent_memory ${memPath} not visible after 15s — skipping overlay restore`);
   }
 }
 
-// Drop the sentinel so the next supervisor boot inside this VM can detect
-// it as a Type 1 restart. /tmp is wiped on a fresh VM (Type 2), so the
-// sentinel correctly disappears in that case.
-try {
-  fs.writeFileSync(SUPERVISOR_BOOT_MARKER, String(Date.now()));
-} catch (e) {
-  log(`failed to write boot sentinel ${SUPERVISOR_BOOT_MARKER}: ${e.message}`);
+// Write the boot sentinel so the next supervisor start inside this VM is
+// detected as Type 1 (warm restart). /tmp is wiped on a new VM (Type 2),
+// so the sentinel correctly disappears there.
+function markBooted() {
+  try {
+    fs.writeFileSync(SUPERVISOR_BOOT_MARKER, String(Date.now()));
+  } catch (e) {
+    log(`failed to write boot sentinel ${SUPERVISOR_BOOT_MARKER}: ${e.message}`);
+  }
 }
 
-// The ACP child's HOME must match args.root so Claude Code's
+// Spawn the ACP child. HOME is set to args.root so Claude Code's
 // ~/.claude/projects/... JSONLs land inside the workspace we just restored
-// (and therefore get captured by the next snapshot). Provider-agnostic —
-// local/docker already align HOME with root, Daytona previously needed a
-// force-override that this replaces.
-//
-// PATH is widened to include $HOME/.local/bin so binaries installed by
-// ``uv tool install`` (AgentConfig.cli_tools / hivespace CLI / etc.) are
-// invocable from the ACP child without a full path. Without this, the
-// agent has to know the install directory and can't ``hive submit`` etc.
-// directly. Mirrors the /v1/exec env (see handleExec below). ``path``
-// is already required at the top of the file.
-const homeLocalBin = path.join(args.root, ".local/bin");
-const _spawnPath = `${homeLocalBin}:${process.env.PATH || ""}`;
-const acp = spawn(args.acp, args.acpArgs, {
-  stdio: ["pipe", "pipe", "pipe"],
-  env: { ...process.env, HOME: args.root, PATH: _spawnPath },
-  cwd: args.root,
-});
-log("spawned acp pid=" + acp.pid);
-log(`snapshot compression: ${ZSTD_AVAILABLE
-  ? "zstd-1 (artifact ~10× smaller; restore autodetects)"
-  : "none — zstd not on PATH (safe fallback; bundle zstd in runtime image to enable)"}`);
+// (and therefore get captured by the next snapshot). PATH is widened to
+// include $HOME/.local/bin so ``uv tool install`` binaries (hivespace CLI
+// etc.) are invocable without a full path. Mirrors the /v1/exec env.
+function spawnAgent(args) {
+  const child = spawn(args.acp, args.acpArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, HOME: args.root, PATH: _spawnPath },
+    cwd: args.root,
+  });
+  log("spawned acp pid=" + child.pid);
+  log(`snapshot compression: ${ZSTD_AVAILABLE
+    ? "zstd-1 (artifact ~10× smaller; restore autodetects)"
+    : "none — zstd not on PATH (safe fallback; bundle zstd in runtime image to enable)"}`);
+  child.stderr.on("data", (chunk) => {
+    process.stderr.write("[acp-stderr] " + chunk.toString());
+  });
+  child.on("exit", (code, signal) => {
+    log(`acp exited code=${code} signal=${signal}`);
+    process.exit(code || 1);
+  });
+  return child;
+}
 
-acp.stderr.on("data", (chunk) => {
-  process.stderr.write("[acp-stderr] " + chunk.toString());
-});
-
-acp.on("exit", (code, signal) => {
-  log(`acp exited code=${code} signal=${signal}`);
-  process.exit(code || 1);
-});
+// ── Boot sequence ────────────────────────────────────────────────────────────
+const args = parseArgs(process.argv);
+// PATH widened with $HOME/.local/bin so uv-tool-installed binaries (hivespace
+// CLI etc.) are invocable without a full path. Module-level: shared by the ACP
+// child (spawnAgent) AND /v1/exec (handleExec).
+const _spawnPath = `${path.join(args.root, ".local/bin")}:${process.env.PATH || ""}`;
+ensureRootDir(args.root);
+restoreWorkspace(args, isWarmRestart);
+markBooted();
+const acp = spawnAgent(args);
 
 // Pending POST response resolvers, keyed by rpc id. POST handlers waiting
 // for a specific response register here; the stdout reader resolves them.
