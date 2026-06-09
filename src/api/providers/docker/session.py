@@ -18,8 +18,6 @@ from __future__ import annotations
 import logging
 from uuid import uuid4
 
-import httpx
-
 from api.sandbox.session import BaseSandboxSession
 from api.sandbox.state import DockerSandboxState, SandboxState
 
@@ -133,18 +131,7 @@ class DockerSandboxSession(BaseSandboxSession):
             self.session_id, (self._container_id or "")[:16], instance.url,
         )
 
-    # ------------------------------------------------------------------ #
-    # running: liveness oracle (probe via /v1/health)                     #
-    # ------------------------------------------------------------------ #
-
-    async def running(self, *, force_probe: bool = False) -> bool:
-        return await self.liveness.is_alive(force_probe=force_probe)
-
-    async def _liveness_probe(self) -> bool:
-        if self._supervisor_url is None:
-            return False
-        ok, _ = await self._get_acp_client().health_probe()
-        return ok
+    # running() and _liveness_probe() inherited from BaseSandboxSession.
 
     # ------------------------------------------------------------------ #
     # stop: snapshot then container stop                                  #
@@ -155,16 +142,7 @@ class DockerSandboxSession(BaseSandboxSession):
             return
         # Snapshot via supervisor's /v1/snapshot endpoint (same shape as
         # daytona). Local volume FS is POSIX so this is fast.
-        if self._supervisor_url is not None:
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    resp = await client.post(f"{self._supervisor_url}/v1/snapshot",
-                                             json={"path": "/v/snapshot.tar"})
-                    if resp.status_code == 200:
-                        self.state.snapshot_path = "/v/snapshot.tar"
-                        self.state.snapshot_version += 1
-            except Exception:
-                log.exception("snapshot request failed for session %s", self.session_id)
+        await self._write_snapshot("/v/snapshot.tar")
 
         # Docker doesn't have a "pause" — stop_sandbox stops the container
         # (the container row persists and is restartable). Per docs §15.3 we

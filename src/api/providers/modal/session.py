@@ -158,28 +158,12 @@ class ModalSandboxSession(BaseSandboxSession):
             self.session_id, (self.state.sandbox_ref or "")[:16], instance.url,
         )
 
-    async def running(self, *, force_probe: bool = False) -> bool:
-        return await self.liveness.is_alive(force_probe=force_probe)
-
-    async def _liveness_probe(self) -> bool:
-        if self._supervisor_url is None:
-            return False
-        ok, _ = await self._get_acp_client().health_probe()
-        return ok
+    # running() and _liveness_probe() inherited from BaseSandboxSession.
 
     async def stop(self) -> None:
         if self.state.sandbox_ref is None:
             return
-        if self._supervisor_url is not None:
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    resp = await client.post(f"{self._supervisor_url}/v1/snapshot",
-                                             json={"path": "/v/snapshot.tar"})
-                    if resp.status_code == 200:
-                        self.state.snapshot_path = "/v/snapshot.tar"
-                        self.state.snapshot_version += 1
-            except Exception:
-                log.exception("snapshot request failed for session %s", self.session_id)
+        await self._write_snapshot("/v/snapshot.tar")
 
         # Modal: terminate is destructive (no pause). Per docs §15.3 we
         # still call stop_sandbox; the persisted snapshot lets the next
