@@ -1,7 +1,8 @@
 """UnixLocalSandboxSession — concrete SandboxSession for the local provider.
 
-Wraps existing primitives in ``src/api/providers/local.py`` into the
-five-method ``BaseSandboxSession`` contract. The simplest provider
+Wraps existing primitives in ``src/api/providers/unix_local/__init__.py`` into
+the three-method (``start``/``running``/``stop``) ``BaseSandboxSession``
+contract. The simplest provider
 shape: just a local subprocess running supervisor.js + ACP, no
 container, no remote URL.
 """
@@ -40,18 +41,15 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         instance = None
         reattached = False
-        # sandbox_id here is the local provider's stable ref (local-XXXX).
+        # sandbox_ref here is the local provider's stable ref (local-XXXX).
         # On second start() we try to restart the SAME sandbox in place so
         # the test_stop_sandbox_same_sandbox_after_restart invariant holds.
         if self.state.sandbox_ref:
             try:
                 status = await lc_provider.get_sandbox_status(self.state.sandbox_ref)
-                from api.providers import ProviderInstance
                 if status == "running":
-                    instance = ProviderInstance(
-                        provider="unix_local",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/tmp",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -62,10 +60,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     # pre_start commands) — preserves the contract that the
                     # sandbox identity survives external stops.
                     await lc_provider.start_sandbox(self.state.sandbox_ref)
-                    instance = ProviderInstance(
-                        provider="unix_local",
+                    instance = self._provider_instance(
                         url=f"http://127.0.0.1:{self.state.listen_port}",
-                        root=self.state.recipe.root or "/tmp",
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
@@ -134,21 +130,17 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                 log.exception("snapshot request failed for session %s", self.session_id)
 
         from api.providers import unix_local as lc_provider
-        from api.providers import ProviderInstance
         try:
-            await lc_provider.stop_sandbox(ProviderInstance(
-                provider="unix_local", url=self._supervisor_url or "",
-                root=self.state.recipe.root or "/tmp",
+            await lc_provider.stop_sandbox(self._provider_instance(
+                url=self._supervisor_url or "",
                 sandbox_ref=self.state.sandbox_ref or "",
                 port=self.state.listen_port,
             ))
         except Exception:
             log.exception("local.stop_sandbox failed for session %s", self.session_id)
-        # Process is gone; clear sandbox_id so next start cold-creates.
+        # Process is gone; clear sandbox_ref so next start cold-creates.
         self.state.sandbox_ref = None
         self.state.listen_port = None
 
-    async def shutdown(self) -> None:
-        self._supervisor_url = None
-        self._close_subscribers()
-        await self._aclose_acp_client()
+    # shutdown() inherited from BaseSandboxSession (no provider-specific
+    # handles to null beyond the base's _supervisor_url).

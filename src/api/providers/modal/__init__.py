@@ -2,21 +2,22 @@
 
 Modal Volume v2 supports live-mount POSIX operations (append, rename, flock,
 chmod, symlinks, hardlinks, atomic replace) so we mount the volume directly as
-the agent HOME, mirroring docker.py rather than daytona.py's snapshot-tarball
-dance.
+the agent HOME, mirroring the docker provider rather than daytona's
+snapshot-tarball dance.
 
 Volume layout mirrors the Docker provider (subpaths inside a single volume):
 
     /v/shared/                  — shared mounts (one per agent shared_mount)
-    /v/system/supervisor ->     — symlink to supervisor.v<ts>.<rand>/
-        supervisor.v*/          — versioned supervisor install (lazy)
     /v/agents/<subpath>/        — per-session agent HOME
+
+The supervisor.js + ACP binary come from the runtime image's
+``/opt/agent-sdk/runtime/`` dir, baked at Docker build time — no per-volume
+install.
 
 Modal volumes only support a single mount point per mount, so we mount the
 whole volume at ``/v`` and the sandbox's entrypoint shell symlinks:
 
     /home/agent     -> /v/agents/<subpath>
-    /opt/supervisor -> /v/system/supervisor
     /mnt/<name>     -> /v/shared/<name>    (one per agent shared mount)
 
 Stop/start semantics: Modal has no Docker-style pause — ``terminate()`` is

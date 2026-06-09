@@ -334,14 +334,16 @@ class ApiClient:
         return data or []
 
     async def delete_session(self, session_id: str) -> None:
-        """``DELETE /sessions/{id}`` — release the pool lease and drop
-        the session row. Idempotent: missing session returns 204 rather
-        than 404 so this is safe as a "make sure this is gone"
-        primitive.
+        """``DELETE /sessions/{id}`` — release the pool lease, destroy
+        the underlying sandbox, and drop the session row. Idempotent:
+        missing session returns 204 rather than 404 so this is safe as a
+        "make sure this is gone" primitive.
 
-        The underlying daytona/docker/local/modal sandbox is *paused*,
-        not destroyed — label-based cleanup scripts reclaim the compute
-        later."""
+        The underlying daytona/docker/local/modal sandbox is
+        *destroyed*, not paused — the session row is gone so nothing can
+        resume it; leaving it paused would leak compute against the
+        provider quota. (Idle-reaper hibernation and ``release_session``
+        only pause, since a future prompt can resume those.)"""
         resp = await self._http.delete(f"/sessions/{session_id}")
         _raise_for_status(resp)
 
