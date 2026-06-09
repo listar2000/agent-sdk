@@ -24,6 +24,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const SSE_HEARTBEAT_MS = 25000;
+const LOG_SLICE = 400;
 // Drop an SSE subscriber once Node has buffered this many bytes for it
 // without the socket draining. Without this, a slow / paused / dead-but-
 // not-yet-RST consumer accumulates every ACP stdout line in the
@@ -403,60 +404,44 @@ let _memStageSeq = 0;
 // --ignore-failed-read so dirs not present for the active agent_type
 // are silently skipped (the same tar command works for any agent).
 // Result is written to <dir(snapshotPath)>/agent_memory.tar.
-function runAgentMemorySnapshotOnce() {
+// Shared tar→validate→cp pipeline (async). Spawns `tar tarArgs` into
+// `stage`, validates the staged archive with `tar -t`, then copies to
+// `dest`. On any failure the stage is cleaned up and the previous
+// dest is left untouched (keeps the previous overlay safe). `label`
+// prefixes all log messages (e.g. "agent_memory", "snapshot").
+function _publishTarAsync(tarArgs, stage, dest, label) {
   return new Promise((resolve) => {
-    const memPath = _agentMemoryPath(args.snapshotPath);
-    if (!memPath) { resolve(); return; }
-    const stage = `${LOCAL_MEMORY_STAGING}.${_memStageSeq++}`;
-    const tarArgs = [
-      ...TAR_COMPRESS_ARGS,
-      "-cf", stage,
-      "--ignore-failed-read",
-      "-C", args.root,
-      ...AGENT_MEMORY_DIRS,
-    ];
     const tar = spawn("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
     let tarErr = "";
     tar.stderr.on("data", (c) => { tarErr += c.toString("utf8"); });
     tar.on("error", (e) => {
-      log(`agent_memory tar spawn error: ${e.message}`);
+      log(`${label} tar spawn error: ${e.message}`);
       try { fs.unlinkSync(stage); } catch {}
       resolve();
     });
     tar.on("close", (tarCode) => {
-      // Validate the STAGED archive instead of trusting the exit code. tar
-      // rc=1 is a BENIGN "file changed as we read it" (opencode rewrites its
-      // WAL while we read it) and produces a COMPLETE archive we MUST still
-      // publish; rc=2 / a signal (disk pressure -> SIGXFSZ, an I/O error)
-      // leaves a TRUNCATED archive — publishing that partial is exactly how the
-      // truncated agent_memory.tar reached prod and crash-looped opencode on
-      // restore. `tar -t` lists a complete archive (rc 0, incl. the rc=1 case)
-      // and fails with premature-EOF on a truncated one (verified) — the right
-      // discriminator. On a bad stage SKIP the publish and keep the previous
-      // complete overlay on the volume (the agent loses at most the last turn's
-      // overlay, not its session).
       if (tarCode !== 0) {
-        log(`agent_memory tar rc=${tarCode}: ${tarErr.slice(0, 400)}`);
+        log(`${label} tar rc=${tarCode}: ${tarErr.slice(0, LOG_SLICE)}`);
       }
       const stageOk = spawnSync("tar", ["-tf", stage], { stdio: "ignore" }).status === 0;
       if (!stageOk) {
-        log(`agent_memory stage corrupt/truncated (tar rc=${tarCode}) — SKIPPING publish (keeps previous overlay)`);
+        log(`${label} stage corrupt/truncated (tar rc=${tarCode}) — SKIPPING publish (keeps previous overlay)`);
         try { fs.unlinkSync(stage); } catch {}
         resolve();
         return;
       }
-      const cp = spawn("cp", [stage, memPath], { stdio: ["ignore", "ignore", "pipe"] });
+      const cp = spawn("cp", [stage, dest], { stdio: ["ignore", "ignore", "pipe"] });
       let cpErr = "";
       cp.stderr.on("data", (c) => { cpErr += c.toString("utf8"); });
       cp.on("error", (e) => {
-        log(`agent_memory cp spawn error: ${e.message}`);
+        log(`${label} cp spawn error: ${e.message}`);
         try { fs.unlinkSync(stage); } catch {}
         resolve();
       });
       cp.on("close", (cpCode) => {
         try { fs.unlinkSync(stage); } catch {}
         if (cpCode !== 0) {
-          log(`agent_memory cp rc=${cpCode}: ${cpErr.slice(0, 400)}`);
+          log(`${label} cp rc=${cpCode}: ${cpErr.slice(0, LOG_SLICE)}`);
         }
         resolve();
       });
@@ -464,46 +449,52 @@ function runAgentMemorySnapshotOnce() {
   });
 }
 
-function runSnapshotOnce() {
-  return new Promise((resolve) => {
-    if (!args.snapshotPath) {
-      resolve();
+// Synchronous variant used by graceful shutdown.
+function _publishTarSync(tarArgs, stage, dest, label) {
+  try {
+    const tr = spawnSync("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
+    if (tr.status !== 0) {
+      log(`${label} tar rc=${tr.status}: ${String(tr.stderr || "").slice(0, LOG_SLICE)}`);
+    }
+    // Gate on archive completeness (tar -t), not the exit code — a benign rc=1
+    // ("file changed as we read it") still yields a complete archive we SHOULD
+    // publish; only a truncated archive is skipped. Matches _publishTarAsync.
+    const stageOk = spawnSync("tar", ["-tf", stage], { stdio: "ignore" }).status === 0;
+    if (!stageOk) {
+      log(`${label} stage corrupt/truncated (tar rc=${tr.status}) — SKIPPING publish (keeps previous overlay)`);
+      try { fs.unlinkSync(stage); } catch {}
       return;
     }
-    const stage = LOCAL_SNAPSHOT_STAGING;
-    const tarArgs = [...TAR_COMPRESS_ARGS, "-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
-    const tar = spawn("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
-    let tarErr = "";
-    tar.stderr.on("data", (c) => { tarErr += c.toString("utf8"); });
-    tar.on("error", (e) => {
-      log(`snapshot tar spawn error: ${e.message}`);
-      try { fs.unlinkSync(stage); } catch {}
-      resolve();
-    });
-    tar.on("close", (tarCode) => {
-      if (tarCode !== 0) {
-        log(`snapshot tar rc=${tarCode}: ${tarErr.slice(0, 400)}`);
-        try { fs.unlinkSync(stage); } catch {}
-        resolve();
-        return;
-      }
-      const cp = spawn("cp", [stage, args.snapshotPath], { stdio: ["ignore", "ignore", "pipe"] });
-      let cpErr = "";
-      cp.stderr.on("data", (c) => { cpErr += c.toString("utf8"); });
-      cp.on("error", (e) => {
-        log(`snapshot cp spawn error: ${e.message}`);
-        try { fs.unlinkSync(stage); } catch {}
-        resolve();
-      });
-      cp.on("close", (cpCode) => {
-        try { fs.unlinkSync(stage); } catch {}
-        if (cpCode !== 0) {
-          log(`snapshot cp rc=${cpCode}: ${cpErr.slice(0, 400)}`);
-        }
-        resolve();
-      });
-    });
-  });
+    const cr = spawnSync("cp", [stage, dest], { stdio: ["ignore", "ignore", "pipe"] });
+    if (cr.status !== 0) {
+      log(`${label} cp rc=${cr.status}: ${String(cr.stderr || "").slice(0, LOG_SLICE)}`);
+    }
+  } catch (e) {
+    log(`${label} snapshot failed: ${e.message}`);
+  } finally {
+    try { fs.unlinkSync(stage); } catch {}
+  }
+}
+
+function runAgentMemorySnapshotOnce() {
+  const memPath = _agentMemoryPath(args.snapshotPath);
+  if (!memPath) return Promise.resolve();
+  const stage = `${LOCAL_MEMORY_STAGING}.${_memStageSeq++}`;
+  const tarArgs = [
+    ...TAR_COMPRESS_ARGS,
+    "-cf", stage,
+    "--ignore-failed-read",
+    "-C", args.root,
+    ...AGENT_MEMORY_DIRS,
+  ];
+  return _publishTarAsync(tarArgs, stage, memPath, "agent_memory");
+}
+
+function runSnapshotOnce() {
+  if (!args.snapshotPath) return Promise.resolve();
+  const stage = LOCAL_SNAPSHOT_STAGING;
+  const tarArgs = [...TAR_COMPRESS_ARGS, "-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
+  return _publishTarAsync(tarArgs, stage, args.snapshotPath, "snapshot");
 }
 
 // Synchronous snapshot for graceful shutdown (SIGTERM/SIGINT). Caller waits
@@ -512,23 +503,8 @@ function runSnapshotOnce() {
 function runSnapshotSync() {
   if (!args.snapshotPath) return;
   const stage = LOCAL_SNAPSHOT_STAGING;
-  try {
-    const tarArgs = [...TAR_COMPRESS_ARGS, "-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
-    const tr = spawnSync("tar", tarArgs, { stdio: ["ignore", "ignore", "pipe"] });
-    if (tr.status !== 0) {
-      log(`shutdown snapshot tar rc=${tr.status}: ${String(tr.stderr || "").slice(0, 400)}`);
-      try { fs.unlinkSync(stage); } catch {}
-      return;
-    }
-    const cr = spawnSync("cp", [stage, args.snapshotPath], { stdio: ["ignore", "ignore", "pipe"] });
-    if (cr.status !== 0) {
-      log(`shutdown snapshot cp rc=${cr.status}: ${String(cr.stderr || "").slice(0, 400)}`);
-    }
-  } catch (e) {
-    log(`shutdown snapshot failed: ${e.message}`);
-  } finally {
-    try { fs.unlinkSync(stage); } catch {}
-  }
+  const tarArgs = [...TAR_COMPRESS_ARGS, "-cf", stage, ...SNAPSHOT_EXCLUDES, "-C", args.root, "."];
+  _publishTarSync(tarArgs, stage, args.snapshotPath, "snapshot");
 }
 
 // HTTP handler for POST /v1/snapshot. Wraps runSnapshotOnce so the server
@@ -539,12 +515,10 @@ function runSnapshotSync() {
 async function handleSnapshot(req, res) {
   try {
     await runSnapshotOnce();
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
+    sendJson(res, 200, { ok: true });
   } catch (e) {
     log(`snapshot endpoint error: ${e.message}`);
-    res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: String(e.message || e) }));
+    sendJson(res, 500, { error: String(e.message || e) });
   }
 }
 
@@ -734,8 +708,8 @@ function _terminalCreate(params) {
   if (!command || typeof command !== "string") {
     throw new Error("terminal/create: command is required");
   }
-  const args = Array.isArray(params.args) ? params.args : [];
-  const cwd = params.cwd || args.cwd || undefined;
+  const cmdArgs = Array.isArray(params.args) ? params.args : [];
+  const cwd = params.cwd || undefined;
   const envObj = { ...process.env };
   if (Array.isArray(params.env)) {
     for (const e of params.env) {
@@ -746,7 +720,7 @@ function _terminalCreate(params) {
     ? Math.max(1024, Math.min(params.outputByteLimit, 32 * 1024 * 1024))
     : 1024 * 1024;
   const id = `term-${++_termSeq}-${Math.random().toString(36).slice(2, 8)}`;
-  const proc = spawn(command, args, {
+  const proc = spawn(command, cmdArgs, {
     cwd,
     env: envObj,
     stdio: ["ignore", "pipe", "pipe"],
@@ -982,8 +956,7 @@ async function handlePost(req, res) {
   try {
     body = JSON.parse(raw);
   } catch (e) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid JSON body: " + e.message }));
+    sendJson(res, 400, { error: "invalid JSON body: " + e.message });
     return;
   }
 
@@ -991,8 +964,7 @@ async function handlePost(req, res) {
   try {
     acp.stdin.write(line);
   } catch (e) {
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "acp stdin write failed: " + e.message }));
+    sendJson(res, 502, { error: "acp stdin write failed: " + e.message });
     return;
   }
 
@@ -1015,8 +987,7 @@ async function handlePost(req, res) {
 
   // Notification — fire-and-forget.
   if (!("id" in body)) {
-    res.writeHead(202, { "content-type": "application/json" });
-    res.end("{}");
+    sendJson(res, 202, {});
     return;
   }
 
@@ -1058,8 +1029,7 @@ async function handlePost(req, res) {
     return;
   }
 
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify(envelope));
+  sendJson(res, 200, envelope);
 }
 
 function handleSse(req, res) {
@@ -1225,18 +1195,35 @@ async function readBodyCapped(req, res, max) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function handleFilesEdit(req, res) {
-  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
-  if (raw === null) return;
+function sendJson(res, status, obj) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
 
-  let body;
+async function readJsonBody(req, res, max) {
+  const raw = await readBodyCapped(req, res, max);
+  if (raw === null) return null;
   try {
-    body = JSON.parse(raw);
+    return JSON.parse(raw);
   } catch (e) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid JSON body: " + e.message }));
-    return;
+    sendJson(res, 400, { error: "invalid JSON body: " + e.message });
+    return null;
   }
+}
+
+function resolveUnderRoot(res, p) {
+  const resolvedRoot = path.resolve(args.root);
+  const full = path.resolve(resolvedRoot, p);
+  if (!full.startsWith(resolvedRoot + "/") && full !== resolvedRoot) {
+    sendJson(res, 403, { error: "path traversal denied" });
+    return null;
+  }
+  return full;
+}
+
+async function handleFilesEdit(req, res) {
+  const body = await readJsonBody(req, res, MAX_FILE_SIZE);
+  if (body === null) return;
 
   const filePath = body.path;
   const oldString = body.old_string;
@@ -1244,25 +1231,16 @@ async function handleFilesEdit(req, res) {
   const replaceAll = body.replace_all === true;
 
   if (typeof filePath !== "string" || !filePath) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path required" }));
+    sendJson(res, 400, { error: "path required" });
     return;
   }
   if (typeof oldString !== "string" || typeof newString !== "string") {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "old_string and new_string required" }));
+    sendJson(res, 400, { error: "old_string and new_string required" });
     return;
   }
 
-  const resolvedRoot = path.resolve(args.root);
-  const fullPath = path.resolve(resolvedRoot, filePath);
-
-  // Path traversal guard
-  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path traversal denied" }));
-    return;
-  }
+  const fullPath = resolveUnderRoot(res, filePath);
+  if (fullPath === null) return;
 
   // old_string === "" means write/create the entire file
   if (oldString === "") {
@@ -1271,8 +1249,7 @@ async function handleFilesEdit(req, res) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(fullPath, newString, "utf8");
     const stat = fs.statSync(fullPath);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, path: filePath, size: stat.size, created: true }));
+    sendJson(res, 200, { ok: true, path: filePath, size: stat.size, created: true });
     return;
   }
 
@@ -1281,14 +1258,12 @@ async function handleFilesEdit(req, res) {
   try {
     content = fs.readFileSync(fullPath, "utf8");
   } catch {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "file not found" }));
+    sendJson(res, 404, { error: "file not found" });
     return;
   }
 
   if (oldString === newString) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "old_string and new_string are identical" }));
+    sendJson(res, 400, { error: "old_string and new_string are identical" });
     return;
   }
 
@@ -1301,19 +1276,15 @@ async function handleFilesEdit(req, res) {
   }
 
   if (count === 0) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "old_string not found in file" }));
+    sendJson(res, 400, { error: "old_string not found in file" });
     return;
   }
 
   if (count > 1 && !replaceAll) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: `old_string matches ${count} locations; provide more context to make it unique, or set replace_all: true`,
-        matches: count,
-      }),
-    );
+    sendJson(res, 400, {
+      error: `old_string matches ${count} locations; provide more context to make it unique, or set replace_all: true`,
+      matches: count,
+    });
     return;
   }
 
@@ -1328,15 +1299,12 @@ async function handleFilesEdit(req, res) {
 
   fs.writeFileSync(fullPath, updated, "utf8");
   const stat = fs.statSync(fullPath);
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(
-    JSON.stringify({
-      ok: true,
-      path: filePath,
-      size: stat.size,
-      replacements: replaceAll ? count : 1,
-    }),
-  );
+  sendJson(res, 200, {
+    ok: true,
+    path: filePath,
+    size: stat.size,
+    replacements: replaceAll ? count : 1,
+  });
 }
 
 const MAX_EXEC_OUTPUT = 1 * 1024 * 1024; // 1 MB
@@ -1350,8 +1318,7 @@ async function handleExec(req, res) {
   try {
     body = JSON.parse(raw);
   } catch (e) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid JSON body: " + e.message }));
+    sendJson(res, 400, { error: "invalid JSON body: " + e.message });
     return;
   }
 
@@ -1359,8 +1326,7 @@ async function handleExec(req, res) {
   const timeout = Math.min(parseInt(body.timeout, 10) || 30, 300) * 1000;
 
   if (typeof command !== "string" || !command.trim()) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "command required" }));
+    sendJson(res, 400, { error: "command required" });
     return;
   }
 
@@ -1446,83 +1412,53 @@ async function handleExec(req, res) {
         };
         if (stdoutTruncated) result.stdout_truncated = true;
         if (stderrTruncated) result.stderr_truncated = true;
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(result));
+        sendJson(res, 200, result);
       });
     });
 
     child.on("error", (e) => {
       finish(() => {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message, stdout: "", stderr: "", exit_code: -1 }));
+        sendJson(res, 500, { error: e.message, stdout: "", stderr: "", exit_code: -1 });
       });
     });
   });
 }
 
 async function handleFilesUpload(req, res) {
-  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
-  if (raw === null) return;
-
-  let body;
-  try { body = JSON.parse(raw); } catch (e) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid JSON: " + e.message }));
-    return;
-  }
+  const body = await readJsonBody(req, res, MAX_FILE_SIZE);
+  if (body === null) return;
 
   const filePath = body.path;
   const content = body.content;
   if (typeof filePath !== "string" || !filePath || typeof content !== "string") {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path and content (base64) required" }));
+    sendJson(res, 400, { error: "path and content (base64) required" });
     return;
   }
 
-  const resolvedRoot = path.resolve(args.root);
-  const fullPath = path.resolve(resolvedRoot, filePath);
-  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path traversal denied" }));
-    return;
-  }
+  const fullPath = resolveUnderRoot(res, filePath);
+  if (fullPath === null) return;
 
   fs.mkdirSync(path.dirname(fullPath), { recursive: true });
   fs.writeFileSync(fullPath, Buffer.from(content, "base64"));
   const stat = fs.statSync(fullPath);
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ ok: true, path: filePath, size: stat.size }));
+  sendJson(res, 200, { ok: true, path: filePath, size: stat.size });
 }
 
 async function handleFilesDelete(req, res) {
-  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
-  if (raw === null) return;
-
-  let body;
-  try { body = JSON.parse(raw); } catch (e) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid JSON: " + e.message }));
-    return;
-  }
+  const body = await readJsonBody(req, res, MAX_FILE_SIZE);
+  if (body === null) return;
 
   const filePath = body.path;
   if (typeof filePath !== "string" || !filePath) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path required" }));
+    sendJson(res, 400, { error: "path required" });
     return;
   }
 
-  const resolvedRoot = path.resolve(args.root);
-  const fullPath = path.resolve(resolvedRoot, filePath);
-  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path traversal denied" }));
-    return;
-  }
+  const fullPath = resolveUnderRoot(res, filePath);
+  if (fullPath === null) return;
 
   if (!fs.existsSync(fullPath)) {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "not found" }));
+    sendJson(res, 404, { error: "not found" });
     return;
   }
 
@@ -1532,88 +1468,62 @@ async function handleFilesDelete(req, res) {
   } else {
     fs.unlinkSync(fullPath);
   }
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ ok: true }));
+  sendJson(res, 200, { ok: true });
 }
 
 async function handleFilesRename(req, res) {
-  const raw = await readBodyCapped(req, res, MAX_FILE_SIZE);
-  if (raw === null) return;
-
-  let body;
-  try { body = JSON.parse(raw); } catch (e) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid JSON: " + e.message }));
-    return;
-  }
+  const body = await readJsonBody(req, res, MAX_FILE_SIZE);
+  if (body === null) return;
 
   const filePath = body.path;
   const newPath = body.new_path;
   if (typeof filePath !== "string" || !filePath || typeof newPath !== "string" || !newPath) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path and new_path required" }));
+    sendJson(res, 400, { error: "path and new_path required" });
     return;
   }
 
+  const fullPath = resolveUnderRoot(res, filePath);
+  if (fullPath === null) return;
+
   const resolvedRoot = path.resolve(args.root);
-  const fullPath = path.resolve(resolvedRoot, filePath);
   const newFullPath = path.resolve(resolvedRoot, newPath);
-  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path traversal denied" }));
-    return;
-  }
   if (!newFullPath.startsWith(resolvedRoot + "/") && newFullPath !== resolvedRoot) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path traversal denied (new_path)" }));
+    sendJson(res, 403, { error: "path traversal denied (new_path)" });
     return;
   }
 
   if (!fs.existsSync(fullPath)) {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "not found" }));
+    sendJson(res, 404, { error: "not found" });
     return;
   }
 
   fs.mkdirSync(path.dirname(newFullPath), { recursive: true });
   fs.renameSync(fullPath, newFullPath);
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ ok: true, path: newPath }));
+  sendJson(res, 200, { ok: true, path: newPath });
 }
 
 function handleFilesDownload(req, res) {
   const u = new URL(req.url, `http://${req.headers.host}`);
   const filePath = u.searchParams.get("path");
   if (!filePath) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path query param required" }));
+    sendJson(res, 400, { error: "path query param required" });
     return;
   }
 
-  const resolvedRoot = path.resolve(args.root);
-  const fullPath = path.resolve(resolvedRoot, filePath);
-  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "path traversal denied" }));
-    return;
-  }
+  const fullPath = resolveUnderRoot(res, filePath);
+  if (fullPath === null) return;
 
   let stat;
   try { stat = fs.statSync(fullPath); } catch {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "file not found" }));
+    sendJson(res, 404, { error: "file not found" });
     return;
   }
   if (stat.isDirectory()) {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "file not found" }));
+    sendJson(res, 404, { error: "file not found" });
     return;
   }
   if (stat.size > MAX_FILE_SIZE) {
-    res.writeHead(413, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      error: `file too large: ${stat.size} bytes (max ${MAX_FILE_SIZE})`,
-    }));
+    sendJson(res, 413, { error: `file too large: ${stat.size} bytes (max ${MAX_FILE_SIZE})` });
     return;
   }
 
@@ -1630,189 +1540,141 @@ function handleFilesDownload(req, res) {
   fs.createReadStream(fullPath).pipe(res);
 }
 
-const server = http.createServer((req, res) => {
-  if (req.url === "/v1/health" || req.url === "/health") {
-    const body = JSON.stringify({
-      status: "ok",
-      acp_pid: acp.pid,
-      acp_alive: acp.exitCode === null,
-      sse_subscribers: sseSubscribers.size,
-      pending_responses: pendingResponses.size,
-      cwd: args.root,
-    });
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(body);
+function handleHealth(req, res) {
+  sendJson(res, 200, {
+    status: "ok",
+    acp_pid: acp.pid,
+    acp_alive: acp.exitCode === null,
+    sse_subscribers: sseSubscribers.size,
+    pending_responses: pendingResponses.size,
+    cwd: args.root,
+  });
+}
+
+function handleFilesTree(req, res) {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const root = u.searchParams.get("root") || args.root || "/tmp";
+  const resolved = path.resolve(root);
+  if (!fs.existsSync(resolved)) {
+    sendJson(res, 404, { error: "root path not found" });
     return;
   }
-  if (req.url && req.url.startsWith("/v1/acp/")) {
-    if (req.method === "POST") {
-      handlePost(req, res).catch((e) => {
-        log("POST handler crashed: " + e.stack);
-        try {
-          res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        } catch {}
-      });
-      return;
-    }
-    if (req.method === "GET") {
-      handleSse(req, res);
-      return;
-    }
+  const tree = walk(resolved, "", 0);
+  sendJson(res, 200, tree);
+}
+
+function handleFilesRead(req, res) {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const filePath = u.searchParams.get("path");
+  const root = u.searchParams.get("root") || args.root || "/tmp";
+  if (!filePath) {
+    sendJson(res, 400, { error: "path query param required" });
+    return;
   }
-  if (req.url === "/v1/snapshot" && req.method === "POST") {
-    handleSnapshot(req, res).catch((e) => {
-      log("snapshot handler crashed: " + e.stack);
+  const resolvedRoot = path.resolve(root);
+  const fullPath = path.resolve(resolvedRoot, filePath);
+  // Path traversal guard — resolved path must stay under root
+  if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
+    sendJson(res, 403, { error: "path traversal denied" });
+    return;
+  }
+  let stat;
+  try {
+    stat = fs.statSync(fullPath);
+  } catch {
+    sendJson(res, 404, { error: "file not found" });
+    return;
+  }
+  if (stat.isDirectory()) {
+    sendJson(res, 400, { error: "path is a directory" });
+    return;
+  }
+  if (stat.size > MAX_FILE_SIZE) {
+    sendJson(res, 413, { error: `file too large: ${stat.size} bytes (max ${MAX_FILE_SIZE})` });
+    return;
+  }
+
+  const ext = path.extname(fullPath).toLowerCase();
+  const isImage = IMAGE_EXTS.has(ext);
+  const isAudio = AUDIO_EXTS.has(ext);
+  const isVideo = VIDEO_EXTS.has(ext);
+  const isPdf = ext === ".pdf";
+  const isBinary =
+    BINARY_EXTS.has(ext) || isImage || isAudio || isVideo || isPdf;
+
+  let content;
+  if (isImage || isAudio || isVideo) {
+    const buf = fs.readFileSync(fullPath);
+    const mime = MIME_MAP[ext] || "application/octet-stream";
+    content = `data:${mime};base64,${buf.toString("base64")}`;
+  } else if (isPdf) {
+    const buf = fs.readFileSync(fullPath);
+    content = `data:application/pdf;base64,${buf.toString("base64")}`;
+  } else if (BINARY_EXTS.has(ext)) {
+    content = `[Binary file: ${stat.size} bytes]`;
+  } else {
+    content = fs.readFileSync(fullPath, "utf8");
+  }
+
+  sendJson(res, 200, {
+    content,
+    name: path.basename(fullPath),
+    size: stat.size,
+    binary: isBinary,
+    image: isImage,
+    audio: isAudio,
+    video: isVideo,
+    pdf: isPdf,
+  });
+}
+
+function runHandler(label, fn, req, res) {
+  try {
+    Promise.resolve(fn(req, res)).catch((e) => {
+      log(`${label} handler crashed: ` + e.stack);
       try {
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));
       } catch {}
     });
-    return;
-  }
-  if (req.url && req.url.startsWith("/v1/files/tree") && req.method === "GET") {
-    const u = new URL(req.url, `http://${req.headers.host}`);
-    const root = u.searchParams.get("root") || args.root || "/tmp";
-    const resolved = path.resolve(root);
-    if (!fs.existsSync(resolved)) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "root path not found" }));
-      return;
-    }
-    const tree = walk(resolved, "", 0);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(tree));
-    return;
-  }
-  if (req.url && req.url.startsWith("/v1/files/read") && req.method === "GET") {
-    const u = new URL(req.url, `http://${req.headers.host}`);
-    const filePath = u.searchParams.get("path");
-    const root = u.searchParams.get("root") || args.root || "/tmp";
-    if (!filePath) {
-      res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "path query param required" }));
-      return;
-    }
-    const resolvedRoot = path.resolve(root);
-    const fullPath = path.resolve(resolvedRoot, filePath);
-    // Path traversal guard — resolved path must stay under root
-    if (!fullPath.startsWith(resolvedRoot + "/") && fullPath !== resolvedRoot) {
-      res.writeHead(403, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "path traversal denied" }));
-      return;
-    }
-    let stat;
+  } catch (e) {
+    log(`${label} handler crashed: ` + e.stack);
     try {
-      stat = fs.statSync(fullPath);
-    } catch {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "file not found" }));
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    } catch {}
+  }
+}
+
+// Route table — matched in order (same precedence as the original if-ladder).
+// prefix:true uses startsWith; otherwise exact match. method:null matches any method.
+const ROUTES = [
+  { method: null,   path: "/v1/health",          handler: handleHealth,        label: "health" },
+  { method: null,   path: "/health",              handler: handleHealth,        label: "health" },
+  { method: "POST", path: "/v1/acp/",  prefix: true, handler: handlePost,      label: "POST" },
+  { method: "GET",  path: "/v1/acp/",  prefix: true, handler: handleSse,       label: "SSE" },
+  { method: "POST", path: "/v1/snapshot",         handler: handleSnapshot,      label: "snapshot" },
+  { method: "GET",  path: "/v1/files/tree", prefix: true, handler: handleFilesTree, label: "files/tree" },
+  { method: "GET",  path: "/v1/files/read", prefix: true, handler: handleFilesRead, label: "files/read" },
+  { method: "POST", path: "/v1/files/edit", prefix: true, handler: handleFilesEdit, label: "files/edit" },
+  { method: "POST", path: "/v1/exec",             handler: handleExec,          label: "exec" },
+  { method: "POST", path: "/v1/files/upload", prefix: true, handler: handleFilesUpload, label: "files/upload" },
+  { method: "POST", path: "/v1/files/delete", prefix: true, handler: handleFilesDelete, label: "files/delete" },
+  { method: "POST", path: "/v1/files/rename", prefix: true, handler: handleFilesRename, label: "files/rename" },
+  { method: "GET",  path: "/v1/files/download", prefix: true, handler: handleFilesDownload, label: "files/download" },
+];
+
+const server = http.createServer((req, res) => {
+  const url = req.url || "";
+  for (const route of ROUTES) {
+    if (route.method !== null && req.method !== route.method) continue;
+    const matched = route.prefix
+      ? url.startsWith(route.path)
+      : url === route.path;
+    if (matched) {
+      runHandler(route.label, route.handler, req, res);
       return;
     }
-    if (stat.isDirectory()) {
-      res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "path is a directory" }));
-      return;
-    }
-    if (stat.size > MAX_FILE_SIZE) {
-      res.writeHead(413, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: `file too large: ${stat.size} bytes (max ${MAX_FILE_SIZE})`,
-        }),
-      );
-      return;
-    }
-
-    const ext = path.extname(fullPath).toLowerCase();
-    const isImage = IMAGE_EXTS.has(ext);
-    const isAudio = AUDIO_EXTS.has(ext);
-    const isVideo = VIDEO_EXTS.has(ext);
-    const isPdf = ext === ".pdf";
-    const isBinary =
-      BINARY_EXTS.has(ext) || isImage || isAudio || isVideo || isPdf;
-
-    let content;
-    if (isImage || isAudio || isVideo) {
-      const buf = fs.readFileSync(fullPath);
-      const mime = MIME_MAP[ext] || "application/octet-stream";
-      content = `data:${mime};base64,${buf.toString("base64")}`;
-    } else if (isPdf) {
-      const buf = fs.readFileSync(fullPath);
-      content = `data:application/pdf;base64,${buf.toString("base64")}`;
-    } else if (BINARY_EXTS.has(ext)) {
-      content = `[Binary file: ${stat.size} bytes]`;
-    } else {
-      content = fs.readFileSync(fullPath, "utf8");
-    }
-
-    const result = {
-      content,
-      name: path.basename(fullPath),
-      size: stat.size,
-      binary: isBinary,
-      image: isImage,
-      audio: isAudio,
-      video: isVideo,
-      pdf: isPdf,
-    };
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(result));
-    return;
-  }
-  if (req.url && req.url.startsWith("/v1/files/edit") && req.method === "POST") {
-    handleFilesEdit(req, res).catch((e) => {
-      log("files/edit handler crashed: " + e.stack);
-      try {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      } catch {}
-    });
-    return;
-  }
-  if (req.url === "/v1/exec" && req.method === "POST") {
-    handleExec(req, res).catch((e) => {
-      log("exec handler crashed: " + e.stack);
-      try {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      } catch {}
-    });
-    return;
-  }
-  if (req.url && req.url.startsWith("/v1/files/upload") && req.method === "POST") {
-    handleFilesUpload(req, res).catch((e) => {
-      log("files/upload handler crashed: " + e.stack);
-      try {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      } catch {}
-    });
-    return;
-  }
-  if (req.url && req.url.startsWith("/v1/files/delete") && req.method === "POST") {
-    handleFilesDelete(req, res).catch((e) => {
-      log("files/delete handler crashed: " + e.stack);
-      try {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      } catch {}
-    });
-    return;
-  }
-  if (req.url && req.url.startsWith("/v1/files/rename") && req.method === "POST") {
-    handleFilesRename(req, res).catch((e) => {
-      log("files/rename handler crashed: " + e.stack);
-      try {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      } catch {}
-    });
-    return;
-  }
-  if (req.url && req.url.startsWith("/v1/files/download") && req.method === "GET") {
-    handleFilesDownload(req, res);
-    return;
   }
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("not found\n");
