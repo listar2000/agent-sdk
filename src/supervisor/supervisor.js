@@ -268,13 +268,32 @@ if (args.snapshotPath && isWarmRestart) {
   // 15 + 15 + ACP-spawn back-to-back on a fresh Type 2 boot.
   const memPath = _agentMemoryPath(args.snapshotPath);
   if (memPath && _snapshotVisible(memPath, 15000)) {
-    log(`restoring agent_memory from ${memPath}`);
-    const r = spawnSync("tar", ["-xf", memPath, "-C", args.root], {
+    // Extract the overlay to a STAGING dir first, then apply onto $HOME only on
+    // a clean (rc==0) extract. A sandbox killed mid-snapshot-write leaves a
+    // TRUNCATED agent_memory.tar (the snapshot write can't be made atomic on the
+    // mountpoint-s3 volume — see the NOTE above runAgentMemorySnapshotOnce);
+    // extracting it straight into $HOME lands a partial/corrupt opencode SQLite
+    // db there and the agent crash-loops on recovery (opencode dies at db-open:
+    // "PRAGMA journal_mode = WAL" -> port-9100 health-check fail -> reattach->
+    // cold-create loop). On a corrupt overlay we DROP it and boot from the
+    // filesystem_cache / fresh — worst case is losing the last turn, not an
+    // infinite leaked-VM loop. (Regression: test_corrupt_agent_memory_recovers_not_loops.)
+    const memStage = "/tmp/agent-memory-restore";
+    spawnSync("rm", ["-rf", memStage]);
+    fs.mkdirSync(memStage, { recursive: true });
+    const r = spawnSync("tar", ["-xf", memPath, "-C", memStage], {
       stdio: ["ignore", "inherit", "inherit"],
     });
-    if (r.status !== 0) {
-      log(`agent_memory restore exited rc=${r.status}; continuing`);
+    if (r.status === 0) {
+      log(`restoring agent_memory from ${memPath}`);
+      const cp = spawnSync("cp", ["-a", `${memStage}/.`, args.root], {
+        stdio: ["ignore", "inherit", "inherit"],
+      });
+      if (cp.status !== 0) log(`agent_memory overlay apply rc=${cp.status}; continuing`);
+    } else {
+      log(`agent_memory ${memPath} is corrupt (extract rc=${r.status}) — SKIPPING overlay; booting from filesystem_cache/fresh`);
     }
+    spawnSync("rm", ["-rf", memStage]);
   } else if (memPath) {
     log(`agent_memory ${memPath} not visible after 15s — skipping overlay restore`);
   }
@@ -355,6 +374,30 @@ const sseSubscribers = new Set();
 // the staging off-volume.
 const LOCAL_SNAPSHOT_STAGING = "/tmp/agent-sdk-snapshot.tar";
 const LOCAL_MEMORY_STAGING = "/tmp/agent-sdk-agent-memory.tar";
+// ACP lines are handled fire-and-forget (acp.stdout 'data' does not await
+// handleAcpLine), so two prompt-responses can drive two runAgentMemorySnapshotOnce
+// concurrently. A FIXED staging path would let one run's tar truncate the other's
+// cp source -> a partial tarball on the volume (and a TOCTOU hole past the tar -t
+// validation). Give every run a UNIQUE stage so concurrent runs never share one;
+// the concurrent cp's to the single volume path are each atomic on mountpoint-s3.
+let _memStageSeq = 0;
+
+// NOTE on the truncated agent_memory.tar (the prod crash-loop root cause).
+// Verified empirically on the real volume: it is NOT the cp-to-volume step.
+// The daytona volume is mountpoint-s3 (S3-FUSE), where the S3 object is
+// published all-or-nothing at close — a process-killed ``cp`` leaves the OLD
+// object intact, and ``rename(2)`` is ENOSYS so a tmp+rename publish can't be
+// atomic anyway. The truncation comes from the STAGING ``tar`` failing
+// mid-write (e.g. /tmp disk pressure -> SIGXFSZ, or an I/O error on the small
+// sandbox): it leaves a PARTIAL stage, and the publish below used to copy that
+// partial to the volume. Demonstrated: a ulimit-capped tar (rc=153) -> a 1 MB
+// partial stage -> cp -> /vol/agent_memory.tar with ``tar -tf`` rc=2
+// ("premature EOF"), exactly the prod symptom. So the WRITE-side fix VALIDATES
+// the staged archive with ``tar -t`` and publishes only a complete one (below;
+// a benign tar rc=1 "file changed as we read it" still lists fine and IS
+// published), and the RESTORE side independently SKIPS a corrupt overlay
+// (extract rc!=0) as defense-in-depth (see the Type 2 restore above +
+// test_corrupt_agent_memory_recovers_not_loops).
 
 // Per-turn snapshot: tar only AGENT_MEMORY_DIRS. Uses
 // --ignore-failed-read so dirs not present for the active agent_type
@@ -364,7 +407,7 @@ function runAgentMemorySnapshotOnce() {
   return new Promise((resolve) => {
     const memPath = _agentMemoryPath(args.snapshotPath);
     if (!memPath) { resolve(); return; }
-    const stage = LOCAL_MEMORY_STAGING;
+    const stage = `${LOCAL_MEMORY_STAGING}.${_memStageSeq++}`;
     const tarArgs = [
       ...TAR_COMPRESS_ARGS,
       "-cf", stage,
@@ -381,11 +424,26 @@ function runAgentMemorySnapshotOnce() {
       resolve();
     });
     tar.on("close", (tarCode) => {
-      // tar with --ignore-failed-read returns 0 even if dirs are missing;
-      // a non-zero rc means something real failed. Don't abort — log and
-      // try cp anyway; if stage isn't present cp will fail and we move on.
+      // Validate the STAGED archive instead of trusting the exit code. tar
+      // rc=1 is a BENIGN "file changed as we read it" (opencode rewrites its
+      // WAL while we read it) and produces a COMPLETE archive we MUST still
+      // publish; rc=2 / a signal (disk pressure -> SIGXFSZ, an I/O error)
+      // leaves a TRUNCATED archive — publishing that partial is exactly how the
+      // truncated agent_memory.tar reached prod and crash-looped opencode on
+      // restore. `tar -t` lists a complete archive (rc 0, incl. the rc=1 case)
+      // and fails with premature-EOF on a truncated one (verified) — the right
+      // discriminator. On a bad stage SKIP the publish and keep the previous
+      // complete overlay on the volume (the agent loses at most the last turn's
+      // overlay, not its session).
       if (tarCode !== 0) {
         log(`agent_memory tar rc=${tarCode}: ${tarErr.slice(0, 400)}`);
+      }
+      const stageOk = spawnSync("tar", ["-tf", stage], { stdio: "ignore" }).status === 0;
+      if (!stageOk) {
+        log(`agent_memory stage corrupt/truncated (tar rc=${tarCode}) — SKIPPING publish (keeps previous overlay)`);
+        try { fs.unlinkSync(stage); } catch {}
+        resolve();
+        return;
       }
       const cp = spawn("cp", [stage, memPath], { stdio: ["ignore", "ignore", "pipe"] });
       let cpErr = "";
