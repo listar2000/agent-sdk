@@ -49,6 +49,7 @@ server on localhost:7778).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -723,6 +724,147 @@ async def test_server_delete_persists_workspace(provider, agent_type):
         # the sandbox-ref-changed assertion was an implementation detail
         # of the legacy DELETE /sandboxes/{id} that always destroyed.
         await _get_sandbox(sdk, session_id)  # smoke-check the route
+
+
+# ---------------------------------------------------------------------------
+# Tests: corrupt agent_memory.tar must be SKIPPED on restore, not crash-looped
+# ---------------------------------------------------------------------------
+
+def _corrupt_opencode_overlay() -> bytes:
+    """Build a deterministic, corrupt ``agent_memory.tar`` whose ``opencode.db``
+    is a MALFORMED SQLite file: a real db (valid header magic) whose page-count
+    header field (offset 28) declares far more pages than the truncated file
+    contains, so SQLite reports "database disk image is malformed" / ``PRAGMA
+    journal_mode = WAL`` fails on open. The tar is then truncated so ``tar -xf``
+    returns rc!=0 — the fix's skip-the-overlay trigger.
+
+    Verified directly: restoring a malformed opencode.db kills the
+    ``opencode acp`` child at process startup -> the supervisor's port-9100
+    health check fails -> ``start()`` raises -> the prod reattach->cold-create
+    loop. No live opencode db is needed (avoids fresh-session WAL/db-size
+    flakiness), so this is fully deterministic.
+    """
+    import io
+    import sqlite3
+    import struct
+    import tarfile
+    import tempfile
+
+    fd, dbf = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        con = sqlite3.connect(dbf)
+        con.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        con.executemany(
+            "INSERT INTO t(v) VALUES (?)", [("x" * 400,) for _ in range(80)]
+        )
+        con.commit()
+        con.close()
+        db = bytearray(open(dbf, "rb").read())
+    finally:
+        os.unlink(dbf)
+    # SQLite header offset 28 (4 bytes, big-endian) = "database size in pages".
+    # Claim a huge count so the file is far shorter than declared -> malformed.
+    struct.pack_into(">I", db, 28, 0x0FFFFFFF)
+    db_bytes = bytes(db)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        ti = tarfile.TarInfo(".local/share/opencode/opencode.db")
+        ti.size = len(db_bytes)
+        tf.addfile(ti, io.BytesIO(db_bytes))
+    tar = buf.getvalue()
+    # Truncate to 70% -> ``tar -xf`` hits EOF mid-member (rc!=0) and the
+    # extracted opencode.db is even shorter than its header declares.
+    return tar[: max(1024, int(len(tar) * 0.7))]
+
+
+@pytest.mark.parametrize("provider", ["daytona"])
+@agent_type_param
+@pytest.mark.asyncio
+@pytest.mark.timeout(900)
+async def test_corrupt_agent_memory_recovers_not_loops(provider, agent_type):
+    """A TRUNCATED ``agent_memory.tar`` on the volume must NOT crash-loop the
+    agent on recovery — the restore must SKIP a corrupt overlay and recover.
+
+    Reproduces the 2026-06-08 prod incident (daytona snapshot
+    ``agent-sdk-c3229ee``): the per-turn overlay is written with a NON-ATOMIC
+    ``cp`` to the S3-backed volume (``supervisor.js`` runAgentMemorySnapshotOnce),
+    so a sandbox killed mid-write leaves a truncated tarball. On recovery the
+    partial ``tar -xf`` extracts a CORRUPT opencode SQLite db
+    (``opencode.db`` truncated, e.g. 7.8MB->174KB), opencode then fails
+    ``PRAGMA journal_mode = WAL`` -> ``Error: Unexpected error`` -> the
+    supervisor's port-9100 health check fails -> ``RuntimeError`` -> the
+    reattach->cold-create->crash infinite loop (a fresh leaked daytona VM
+    every cycle, observed for hivespace agents GTM 0.2 / a11y-worker / Jon).
+
+    Contract (the fix): the supervisor restore must treat a corrupt overlay
+    (``tar`` rc!=0) as absent — skip it and boot from the clean
+    ``snapshot.tar`` / fresh — so the agent answers the recovery turn.
+
+    RED on the unfixed runtime (opencode): the recovery turn never completes
+    (crash loop) -> the POST /message or /events 500s, or the turn times out.
+    NOTE: the supervisor change is BAKED into the daytona snapshot, so turning
+    this GREEN requires rebuilding + re-pinning the snapshot, not just a
+    server-side edit.
+    """
+    _require_provider(provider)
+    overlay_b64 = base64.b64encode(_corrupt_opencode_overlay()).decode()
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}/{agent_type}] session={session_id[:8]}")
+
+        # Plant the deterministic corrupt overlay directly on the volume — the
+        # Layer-2 restore extracts agent_memory.tar independent of snapshot.tar
+        # (supervisor.js:269-280), so no setup turn (or live opencode db) is
+        # needed. ``overlay_b64`` is a tar of a MALFORMED opencode.db, truncated
+        # so ``tar -xf`` returns rc!=0 — see ``_corrupt_opencode_overlay``.
+        AM = "/vol/agent_memory.tar"
+        plant = (
+            f"printf %s '{overlay_b64}' | base64 -d > {AM}; sync; "
+            f"echo \"planted=$(stat -c%s {AM} 2>/dev/null)B\"; "
+            f"tar -tf {AM} >/dev/null 2>&1; echo \"tarlistrc=$?\""
+        )
+        res = await sdk.session_sandbox_exec(session_id, plant, timeout=60)
+        out = res.get("stdout") or ""
+        print(f"[test] plant corrupt overlay -> {out.strip()!r} (exit={res.get('exit_code')})")
+        # Pin the MECHANISM: the overlay landed and is a truncated archive that
+        # ``tar -tf`` cannot list (else a GREEN here would be meaningless).
+        assert "planted=" in out and "planted=0B" not in out, (
+            f"failed to write corrupt overlay: {res}"
+        )
+        assert "tarlistrc=0" not in out, (
+            f"planted agent_memory.tar is NOT corrupt (tar -tf succeeded) — "
+            f"test would false-pass: {out!r}"
+        )
+
+        # Force cold-recovery: external delete -> the next prompt cold-creates a
+        # fresh VM and restores from the (now-corrupt) volume tarballs.
+        sandbox = await _get_sandbox(sdk, session_id)
+        await _external_delete(sandbox)
+
+        # The recovery turn. Observe whether the recovery SUCCEEDS, not the
+        # reply text (opencode can answer with no SSE text and that's fine).
+        # UNFIXED: restoring the corrupt overlay truncates opencode.db ->
+        # opencode crashes during session/new -> the supervisor health check /
+        # ACP attach fails -> start() raises -> the POST /message or the
+        # /events stream errors (or the reattach->cold-create loop never
+        # settles) -> _ask RAISES (RED). FIXED: the corrupt overlay is skipped,
+        # opencode boots clean, and the turn completes without raising (GREEN).
+        rec_err = None
+        try:
+            await _ask(sdk, session_id, "Reply with exactly one word: ALIVE")
+        except Exception as e:  # noqa: BLE001 — any failure == recovery broke
+            rec_err = repr(e)
+        assert rec_err is None, (
+            "recovery FAILED after restoring a corrupt agent_memory.tar — the "
+            "agent crashed (opencode could not open the truncated SQLite db) "
+            "instead of the restore SKIPPING the corrupt overlay. This is the "
+            f"prod crash-loop regression. error={rec_err}"
+        )
+        print(f"[test:{provider}/{agent_type}] recovered cleanly from corrupt overlay")
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
