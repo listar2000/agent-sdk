@@ -1615,6 +1615,38 @@ async def session_resume(session_id: str, request: Request):
     }
 
 
+async def _parse_session_create_common(data: dict, provider: str):
+    """Parse the request fields shared by both session-create paths.
+
+    Performs the four steps that are byte-identical in ``_sessions_create_lazy``
+    and ``_sessions_create_eager`` AFTER ``_pop_env_and_secrets`` has been called:
+      1. Extract and validate workspace.
+      2. Resolve (or default) the volume record.
+      3. Build ``config_data`` from ``data["config"]`` and merge top-level keys.
+      4. Extract ``extra_options``, popping it from ``config_data``.
+
+    Returns ``(workspace, volume_record, config_data, extra_options)``.
+
+    NOTE: ``provider`` must already be computed by the caller because the two
+    paths use different default expressions (lazy also checks
+    ``data["config"]["provider"]``; eager uses ``data.get("provider", "unix_local")``).
+
+    NOTE: ``_pop_env_and_secrets`` must be called by the caller BEFORE this
+    helper so that the call order matches the original (security strip before
+    provider validation in the eager path).
+    """
+    workspace = _extract_workspace(data, provider)
+    volume_record = await _resolve_or_default_volume(data.get("volume_id"), provider)
+    config_data = data.get("config", {})
+    _merge_top_level_config(data, config_data)
+    extra_options = data.get("extra_options")
+    if extra_options is None:
+        extra_options = config_data.pop("extra_options", None)
+    else:
+        config_data.pop("extra_options", None)
+    return workspace, volume_record, config_data, extra_options
+
+
 def _extract_workspace(data: dict, provider: str) -> str | None:
     """Read + normalize ``workspace`` from a session-create body.
 
@@ -1740,22 +1772,14 @@ async def _sessions_create_lazy(data: dict) -> dict:
     body_env, body_secrets = _pop_env_and_secrets(data)
 
     default_provider = data.get("provider") or data.get("config", {}).get("provider") or "unix_local"
-    workspace = _extract_workspace(data, default_provider)
-    volume_record = await _resolve_or_default_volume(data.get("volume_id"), default_provider)
-    config_data = data.get("config", {})
-    _merge_top_level_config(data, config_data)
+    workspace, volume_record, config_data, extra_options = (
+        await _parse_session_create_common(data, default_provider)
+    )
     config_data.pop("dockerfile", None)
     config_data.pop("dockerfile_content", None)
     config_data.pop("shared_mounts", None)
     config_data.pop("root", None)
     config_data.pop("workspace", None)
-    # ``extra_options`` is session-scoped (matches workspace); pop out of
-    # config_data so it doesn't land in AgentConfig.
-    extra_options = data.get("extra_options")
-    if extra_options is None:
-        extra_options = config_data.pop("extra_options", None)
-    else:
-        config_data.pop("extra_options", None)
 
     agent_id = data.get("agent_id")
     if agent_id:
@@ -1833,11 +1857,10 @@ async def _sessions_create_eager(data: dict) -> dict:
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    workspace = _extract_workspace(data, provider)
-    volume_record = await _resolve_or_default_volume(data.get("volume_id"), provider)
+    workspace, volume_record, config_data, extra_options = (
+        await _parse_session_create_common(data, provider)
+    )
     agent_type = data.get("agent_type", "opencode")
-    config_data = data.get("config", {})
-    _merge_top_level_config(data, config_data)
 
     cwd = data.get("cwd", config_data.pop("cwd", None))
     root = data.get("root", config_data.pop("root", None))
@@ -1846,13 +1869,6 @@ async def _sessions_create_eager(data: dict) -> dict:
     config_data.pop("dockerfile_content", None)
     config_data.pop("dockerfile", None)
     config_data.pop("workspace", None)
-    # ``extra_options`` is session-scoped (matches workspace); pop it before
-    # building AgentConfig so it doesn't appear as agent-identity config.
-    extra_options = data.get("extra_options")
-    if extra_options is None:
-        extra_options = config_data.pop("extra_options", None)
-    else:
-        config_data.pop("extra_options", None)
     resources_data = data.get("resources")
     if resources_data is None:
         resources_data = config_data.pop("resources", None)

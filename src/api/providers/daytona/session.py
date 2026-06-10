@@ -20,8 +20,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
-import httpx
-
+from api.providers._shared import _enum_str
 from api.sandbox.session import BaseSandboxSession
 from api.sandbox.state import DaytonaSandboxState, SandboxState
 
@@ -233,13 +232,8 @@ class DaytonaSandboxSession(BaseSandboxSession):
         return sandbox
 
     # ------------------------------------------------------------------ #
-    # running: liveness oracle                                            #
+    # running: liveness oracle — inherited from BaseSandboxSession       #
     # ------------------------------------------------------------------ #
-
-    async def running(self, *, force_probe: bool = False) -> bool:
-        """The single liveness oracle. Probes /v1/health when state is
-        ``unknown``, otherwise returns last-observed."""
-        return await self.liveness.is_alive(force_probe=force_probe)
 
     async def _liveness_probe(self) -> bool:
         """Liveness probe layered for Daytona's actual semantics.
@@ -318,7 +312,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             client = await _get_async_daytona_client()
             sb = await client.get(self._daytona_sandbox.id)
             raw = sb.state
-            return (raw.value if hasattr(raw, "value") else str(raw)).lower()
+            return _enum_str(raw)
         except Exception:
             return ""
 
@@ -331,19 +325,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         sandbox. Per docs §15.3 (always pause, never delete here)."""
         if self._daytona_sandbox is None:
             return
-        # Trigger supervisor to write snapshot. The existing
-        # supervisor.js exposes ``POST /v1/snapshot`` for this — we just
-        # call it; supervisor handles the tarball + write.
-        if self._supervisor_url is not None:
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    resp = await client.post(f"{self._supervisor_url}/v1/snapshot",
-                                             json={"path": "/vol/snapshot.tar"})
-                    if resp.status_code == 200:
-                        self.state.snapshot_path = "/vol/snapshot.tar"
-                        self.state.snapshot_version += 1
-            except Exception:
-                log.exception("snapshot request failed for session %s", self.session_id)
+        await self._write_snapshot("/vol/snapshot.tar")
 
         # Always-pause policy (docs §15.3).
         from api.providers import daytona as dt_provider
