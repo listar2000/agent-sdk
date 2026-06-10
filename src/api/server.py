@@ -33,7 +33,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from .event_buffer import get_batcher, start_batcher, stop_batcher
+from .event_buffer import start_batcher, stop_batcher
 from .timing import extract_session_id, log_request, timed_phase
 from .db import (
     close_pool,
@@ -54,7 +54,6 @@ from .db import (
     list_agents,
     list_sessions,
     list_volumes,
-    log_event,
     read_sandbox_state,
     update_session_env,
     update_session_pre_start_commands,
@@ -65,13 +64,6 @@ from .db import (
     write_sandbox_state,
 )
 from .models import (
-    EVT_ASSISTANT_MESSAGE,
-    EVT_ERROR,
-    EVT_REASONING,
-    EVT_TOOL_CALL,
-    EVT_TOOL_RESULT,
-    EVT_USAGE,
-    EVT_USER_MESSAGE,
     AgentConfig,
     AgentRecord,
     VolumeRecord,
@@ -85,7 +77,8 @@ from .providers import (
     _normalize_workspace,
 )
 from .providers._shared import _safe_path as _shared_safe_path
-from .redact import redact_pre_start_commands, redact_secrets
+from .redact import redact_pre_start_commands
+from .turn import TurnRunner
 
 log = logging.getLogger(__name__)
 
@@ -2057,68 +2050,6 @@ async def _forward_session_config(
             )
 
 
-async def _persist_user_message(
-    session,
-    message: str,
-    rpc_id: str,
-    attachments: list[dict] | None = None,
-) -> None:
-    """Write the EVT_USER_MESSAGE row for a freshly-submitted prompt.
-
-    Best-effort — a DB hiccup must not block the prompt from being sent
-    to the supervisor. The matching turn-end / tool / text rows are
-    written by ``_persist_prompt_events`` as ``execute_prompt`` yields.
-
-    Routes through the per-process ``SessionLogBatcher`` when available
-    (the production path under lifespan); falls back to a direct INSERT
-    in test contexts that bypass ``start_batcher`` so unit tests keep
-    seeing user_message rows synchronously.
-
-    ``attachments`` is an opaque list of dicts the caller wants to
-    persist alongside the prompt text — used by hivespace to round-trip
-    file metadata (id, url, sandbox_path, filename, …) so the chat UI
-    can re-render images / file chips on cold-load without consulting a
-    parallel DB. Treated as opaque here; no schema enforcement.
-    """
-    payload: dict = {"text": redact_secrets(message), "prompt_id": rpc_id}
-    if attachments:
-        payload["attachments"] = list(attachments)
-    try:
-        batcher = get_batcher()
-        if batcher is not None:
-            await batcher.add(
-                session_id=session.session_id,
-                agent_id=session._agent_id or "",
-                event_type=EVT_USER_MESSAGE,
-                payload=payload,
-            )
-        else:
-            await log_event(
-                session_id=session.session_id,
-                agent_id=session._agent_id or "",
-                event_type=EVT_USER_MESSAGE,
-                payload=payload,
-            )
-    except Exception:
-        log.exception("user_message log_event failed for session %s rpc=%s",
-                      session.session_id, rpc_id)
-
-
-# execute_prompt yields events whose ``type`` matches what
-# ``api.sse.parse_acp_event`` emits — same taxonomy as the SDK
-# ``astream`` and the /events SSE consumers. Any type missing from
-# this map is logged as-is (forward-compat with new ACP update kinds).
-_EVENT_TYPE_TO_LOG = {
-    "text": EVT_ASSISTANT_MESSAGE,
-    "reasoning": EVT_REASONING,
-    "tool": EVT_TOOL_CALL,
-    "tool_result": EVT_TOOL_RESULT,
-    "usage": EVT_USAGE,
-    "error": EVT_ERROR,
-    "done": "turn_end",
-}
-
-
 async def _persist_prompt_events(
     session,
     message: str,
@@ -2127,257 +2058,10 @@ async def _persist_prompt_events(
 ) -> None:
     """Drive ``execute_prompt`` and write coalesced rows to ``session_log``.
 
-    Consecutive ``text`` and ``reasoning`` chunks are buffered and written
-    as ONE row per logical block (flush on type-change, tool call,
-    usage, error, done, or end-of-stream). Discrete events (tool, tool
-    result, usage, error, done) pass through as-is. This matches what
-    SSE consumers see after canonicalization and makes ``/sessions/{id}/log``
-    semantically equivalent to the SSE stream — neither per-chunk noise
-    nor "one fat blob per turn."
-
-    Each row carries the rpc_id so the log can be sliced by turn. Single
-    write failures are non-fatal — log and keep draining so a transient
-    DB hiccup doesn't drop the rest of the turn.
+    Delegates to :class:`api.turn.TurnRunner` — see that class for the
+    full implementation and invariant commentary.
     """
-    agent_id = session._agent_id or ""
-
-    text_buf: list[str] = []
-    think_buf: list[str] = []
-    event_counts: dict[str, int] = {}
-    saw_output_event = False
-    saw_error_event = False
-    terminal_stop_reason: str | None = None
-    last_usage: object | None = None
-
-    def _reset_turn_observability() -> None:
-        nonlocal saw_output_event, saw_error_event, terminal_stop_reason, last_usage
-        event_counts.clear()
-        saw_output_event = False
-        saw_error_event = False
-        terminal_stop_reason = None
-        last_usage = None
-
-    def _observe_event(event: dict) -> None:
-        nonlocal saw_output_event, saw_error_event, terminal_stop_reason, last_usage
-        etype = str(event.get("type") or "event")
-        event_counts[etype] = event_counts.get(etype, 0) + 1
-        # ``done`` / ``usage`` events from execute_prompt carry their
-        # payload under the ACP-style ``raw`` envelope until ``_write``
-        # flattens it; read both shapes so observability sees the same
-        # values the persisted row will.
-        raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
-        if etype in {"text", "reasoning", "tool", "tool_result"}:
-            saw_output_event = True
-        elif etype == "error":
-            saw_error_event = True
-        elif etype == "usage":
-            last_usage = event.get("usage") or raw.get("usage")
-        elif etype == "done":
-            terminal_stop_reason = (
-                event.get("stop_reason")
-                or raw.get("stop_reason")
-                or raw.get("stopReason")
-            )
-
-    def _log_empty_turn_if_needed() -> None:
-        if saw_output_event or saw_error_event:
-            return
-        if terminal_stop_reason is None or terminal_stop_reason == "cancelled":
-            return
-        log.warning(
-            "empty prompt turn: session=%s agent=%s rpc=%s "
-            "stop_reason=%s usage=%r events=%s message_chars=%d",
-            session.session_id,
-            agent_id,
-            rpc_id,
-            terminal_stop_reason,
-            last_usage,
-            dict(sorted(event_counts.items())),
-            len(message or ""),
-        )
-
-    async def _write(event: dict) -> None:
-        etype = event.get("type", "event")
-        # Flatten ``raw`` (the original ACP update payload) into the row
-        # so the dashboard's permissive renderer finds tool/result/usage
-        # fields without needing the nested ``raw`` indirection.
-        payload = {k: v for k, v in event.items() if k != "type"}
-        if isinstance(payload.get("raw"), dict):
-            payload.update(payload.pop("raw"))
-        if "text" in payload:
-            payload["text"] = redact_secrets(payload["text"])
-        payload["prompt_id"] = rpc_id
-        try:
-            batcher = get_batcher()
-            if batcher is not None:
-                await batcher.add(
-                    session_id=session.session_id,
-                    agent_id=agent_id,
-                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
-                    payload=payload,
-                )
-            else:
-                await log_event(
-                    session_id=session.session_id,
-                    agent_id=agent_id,
-                    event_type=_EVENT_TYPE_TO_LOG.get(etype, etype),
-                    payload=payload,
-                )
-        except Exception:
-            log.exception("log_event(%s) failed for session %s rpc=%s",
-                          etype, session.session_id, rpc_id)
-
-    async def _flush_buffers() -> None:
-        if text_buf:
-            await _write({"type": "text", "text": "".join(text_buf)})
-            text_buf.clear()
-        if think_buf:
-            await _write({"type": "reasoning", "text": "".join(think_buf)})
-            think_buf.clear()
-
-    # Per-session prompt serialisation: only one execute_prompt drives
-    # the supervisor at a time. Without this, two concurrent POST
-    # /message calls produce two parallel persist tasks racing on
-    # ``session_log`` writes and the row order diverges from SSE
-    # arrival order (the
-    # ``test_interrupt_mid_tool_parity ['cancelled','end_turn'] vs
-    # ['end_turn','cancelled']`` flake under -n auto). FIFO is
-    # preserved across queued prompts; ``interrupt=True`` cancels the
-    # active turn so the lock releases promptly without reordering.
-    #
-    # All cleanup paths (final flush on success, error-row write, hard-
-    # cancel buffer flush) MUST run while the lock is held — otherwise
-    # the next prompt's persist task can interleave its writes with
-    # this prompt's tail and the log row order de-syncs from SSE.
-    async def _drive_one(active_session) -> tuple[bool, Exception | None]:
-        """Drive execute_prompt on a specific session; return
-        (terminal_seen, last_exception). ``terminal_seen=True`` means we
-        consumed a ``done`` or ``error`` event — the rpc is complete and
-        no retry is appropriate. Otherwise ``False`` + exception means
-        the supervisor died mid-flight and the caller should retry on
-        the pool's current session."""
-        terminal = False
-        try:
-            async for event in active_session.execute_prompt(message, rpc_id=rpc_id):
-                if not isinstance(event, dict):
-                    continue
-                _observe_event(event)
-                t = event.get("type")
-                if t == "text":
-                    if think_buf:
-                        await _flush_buffers()
-                    text_buf.append(event.get("text", ""))
-                elif t == "reasoning":
-                    if text_buf:
-                        await _flush_buffers()
-                    think_buf.append(event.get("text", ""))
-                elif t == "usage":
-                    await _write(event)
-                else:
-                    await _flush_buffers()
-                    await _write(event)
-                    if t in ("done", "error"):
-                        terminal = True
-            await _flush_buffers()
-            return True, None
-        except Exception as e:
-            return terminal, e
-
-    async with session._prompt_lock:
-        # Log the user_message INSIDE the lock so log row order tracks
-        # actual execution order.
-        await _persist_user_message(session, message, rpc_id, attachments)
-        # Mark the prompt in flight so the idle reaper never hibernates this
-        # session mid-turn — covers a long, chunk-silent tool call whose
-        # compute clock would otherwise go stale. Balanced across the
-        # recovery swap below and released in the finally.
-        session.liveness.observe_prompt_start()
-        try:
-            ok, exc = await _drive_one(session)
-            # Supervisor died mid-prompt? If the pool already cold-recovered
-            # the session (a sibling request observed alive=False and swapped
-            # in a new SandboxSession), retry once on the fresh session —
-            # this is the race that lost ``rpc=41095a61`` events on modal
-            # ``test_message_immediately_after_stop``: the error broadcast
-            # would otherwise land on a dict that was cleared during the
-            # migration, and the SDK would time out waiting for an event
-            # that never arrives.
-            if not ok and exc is not None:
-                try:
-                    from api.sandbox import get_pool as _gp
-                    replacement = await _gp().get_session(session.session_id)
-                except Exception:
-                    replacement = None
-                if replacement is not None and replacement is not session:
-                    log.info(
-                        "execute_prompt retry: session %s recovered rpc=%s",
-                        session.session_id, rpc_id,
-                    )
-                    text_buf.clear(); think_buf.clear()
-                    _reset_turn_observability()
-                    # Move the in-flight marker onto the session the pool now
-                    # owns so each session's counter balances independently
-                    # (old: +1 at top then -1 here; new: +1 here then -1 in
-                    # the finally).
-                    session.liveness.observe_prompt_end()
-                    session = replacement  # downstream writes use the new one
-                    session.liveness.observe_prompt_start()
-                    ok, exc = await _drive_one(replacement)
-            if not ok:
-                e = exc if exc is not None else RuntimeError(
-                    "stream ended without terminal event"
-                )
-                log.exception(
-                    "execute_prompt failed for session %s rpc=%s: %s",
-                    session.session_id, rpc_id, e,
-                )
-                await _flush_buffers()
-                await _write({
-                    "type": "error",
-                    "message": str(e)[:500], "kind": type(e).__name__,
-                })
-                # Broadcast to whichever session the pool currently has —
-                # NOT necessarily the one we started with. The old session's
-                # ``_subscribers`` dict may have been migrated to the new
-                # session by ``pool.get_session``'s subscriber hand-off;
-                # broadcasting to the stale ref reaches an empty dict.
-                from api.sandbox import get_pool as _gp2
-                current = _gp2()._active.get(session.session_id, session)  # noqa: SLF001
-                current._broadcast({
-                    "type": "error", "rpc_id": rpc_id,
-                    "jsonrpc": "2.0", "id": rpc_id,
-                    "error": {
-                        "code": -32603,
-                        "message": str(e),
-                        "data": {
-                            "kind": type(e).__name__,
-                            "exception_type": type(e).__name__,
-                        },
-                    },
-                })
-            else:
-                _log_empty_turn_if_needed()
-        finally:
-            # Release the in-flight marker on whichever session is current
-            # (the original, or the replacement after a recovery swap) so
-            # the reaper can hibernate it once it goes idle. The counter is
-            # floored at 0, so this is safe even on the unbalanced error
-            # paths.
-            session.liveness.observe_prompt_end()
-            # Hard-cancel path: ``CancelledError`` is a ``BaseException``
-            # in Python 3.8+ and bypasses ``except Exception``. Without
-            # this finally an asyncio Task cancellation (server shutdown,
-            # session DELETE) drops the in-flight buffer. ``asyncio.shield``
-            # keeps the flush running even if the surrounding task is in
-            # a cancelling state.
-            if text_buf or think_buf:
-                try:
-                    await asyncio.shield(_flush_buffers())
-                except Exception:
-                    log.exception(
-                        "final flush failed for session %s rpc=%s — buffer lost",
-                        session.session_id, rpc_id,
-                    )
+    await TurnRunner(session, message, rpc_id, attachments).run()
 
 
 @app.post("/sessions/{session_id}/message")
