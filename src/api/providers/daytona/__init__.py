@@ -60,6 +60,7 @@ from .._shared import (
     _acp_launch_args,
     _build_env_prefix,
     _build_volume_mounts,
+    _enum_str,
     _get_sandbox_env_vars,
     _read_runtime_image_tag,
     _read_runtime_snapshot_tag,
@@ -587,7 +588,7 @@ async def _wait_for_stable_daytona_state(
     while True:
         sandbox = await daytona.get(sandbox_ref)
         raw = sandbox.state
-        state_str = (raw.value if hasattr(raw, "value") else str(raw)).lower()
+        state_str = _enum_str(raw)
         if state_str in STABLE or loop.time() > deadline:
             return sandbox, state_str
         await asyncio.sleep(0.5)
@@ -612,7 +613,7 @@ async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=Non
         try:
             sandbox = await daytona.get(sandbox_ref)
             raw_state = sandbox.state
-            state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
+            state_str = _enum_str(raw_state)
             if state_str != "started":
                 continue
             r = await sandbox.process.exec("echo ready", timeout=5)
@@ -689,7 +690,7 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
         while True:
             dto = await volumes_api.get_volume(vol_id)
             state = dto.state
-            state_val = state.value if hasattr(state, "value") else str(state)
+            state_val = _enum_str(state, lower=False)
             if state_val == VolumeState.READY:
                 break
             if state_val in {VolumeState.ERROR, VolumeState.DELETED, VolumeState.DELETING}:
@@ -831,7 +832,7 @@ async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
             return "missing"
         return "error"
     state = (getattr(sb, "state", None) or "")
-    state_str = (state.value if hasattr(state, "value") else str(state)).lower()
+    state_str = _enum_str(state)
     if state_str in ("started", "running", "starting",
                      "pulling_image", "creating", "resizing"):
         return "running"
@@ -937,7 +938,7 @@ async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
     # If the sandbox was stopped externally (e.g. daytona.stop()), start it
     # and wait for the container network to be ready before exec-ing.
     raw_state = sandbox.state
-    state_str = raw_state.value if hasattr(raw_state, "value") else str(raw_state)
+    state_str = _enum_str(raw_state)
     if state_str != "started":
         log.info("ensure_supervisor_url: sandbox %s is %s; starting", inst.sandbox_ref[:16], state_str)
         await sandbox.start()
@@ -1509,7 +1510,7 @@ async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> 
         if not sid or sid in live_refs:
             continue
         raw = getattr(sb, "state", None) or ""
-        st = (raw.value if hasattr(raw, "value") else str(raw)).lower()
+        st = _enum_str(raw)
         orphans.append((sid, st))
         state_hist[st] += 1
     return {

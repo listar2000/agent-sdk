@@ -413,11 +413,11 @@ class BaseSandboxSession(abc.ABC):
           * then → mount, supervisor boot, snapshot extract, ACP attach
         """
 
-    @abc.abstractmethod
     async def running(self, *, force_probe: bool = False) -> bool:
         """Single liveness oracle. Cheap fast-path via ``self.liveness``;
         falls through to a bounded supervisor probe when state is
         ``unknown``. With ``force_probe=True`` the probe always runs."""
+        return await self.liveness.is_alive(force_probe=force_probe)
 
     async def execute_prompt(
         self, message: str, *, rpc_id: str | None = None,
@@ -569,6 +569,28 @@ class BaseSandboxSession(abc.ABC):
         self._close_subscribers()
         await self._aclose_acp_client()
 
+    async def _write_snapshot(self, path: str) -> None:
+        """POST /v1/snapshot to the supervisor and update state on HTTP 200.
+
+        Shared by all providers' ``stop()`` implementations. Each provider
+        passes its own snapshot path literal so the per-provider semantics
+        (volume mount path) are preserved while the httpx wiring lives once.
+        """
+        if self._supervisor_url is None:
+            return
+        import httpx as _httpx
+        try:
+            async with _httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{self._supervisor_url}/v1/snapshot",
+                    json={"path": path},
+                )
+                if resp.status_code == 200:
+                    self.state.snapshot_path = path
+                    self.state.snapshot_version += 1
+        except Exception:
+            log.exception("snapshot request failed for session %s", self.session_id)
+
     async def _cancel_background_tasks(self) -> None:
         """Cancel every long-lived task the session owns (today: the
         credential-refresh loop). Idempotent; never raises. Centralising it
@@ -646,9 +668,17 @@ class BaseSandboxSession(abc.ABC):
     # --- Liveness probe hook (subclass overrides if it has a cheap probe) ---
 
     async def _liveness_probe(self) -> bool:
-        """Default: no probe available. Subclasses override with a
-        cheap supervisor /health call or equivalent."""
-        return False
+        """Default liveness probe: GET /v1/health via the session's ACP client.
+
+        Used by docker, unix_local, and modal (all three have a local or
+        tunnel-accessible supervisor URL and no provider control-plane
+        fallback). Daytona overrides this with a two-layer probe that falls
+        back to the control-plane when the URL fails.
+        """
+        if self._supervisor_url is None:
+            return False
+        ok, _ = await self._get_acp_client().health_probe()
+        return ok
 
     # --- Subscriber fan-out (kept here so multi-subscriber GET /events
     #     works without per-provider plumbing) ---

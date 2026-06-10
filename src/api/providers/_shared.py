@@ -118,6 +118,19 @@ _PROVIDER_VOLUME_HOME: dict[str, str] = {
 }
 
 
+def _enum_str(v, *, lower: bool = True) -> str:
+    """Coerce a Daytona SDK state value (enum or str) to a plain string.
+
+    The SDK returns either an enum instance (with a ``.value`` str attribute)
+    or a raw string depending on the SDK version and field.  This helper
+    normalizes both forms.  ``lower=True`` (default) lowercases the result so
+    callers can do case-insensitive membership tests without scattering
+    ``.lower()`` at every call site.
+    """
+    s = v.value if hasattr(v, "value") else str(v or "")
+    return s.lower() if lower else s
+
+
 def default_cwd_for_provider(provider: str) -> str:
     """Persistent default cwd / HOME for the given provider.
 
