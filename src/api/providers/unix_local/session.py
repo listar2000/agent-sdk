@@ -1,10 +1,9 @@
 """UnixLocalSandboxSession — concrete SandboxSession for the local provider.
 
 Wraps existing primitives in ``src/api/providers/unix_local/__init__.py`` into
-the three-method (``start``/``running``/``stop``) ``BaseSandboxSession``
-contract. The simplest provider
-shape: just a local subprocess running supervisor.js + ACP, no
-container, no remote URL.
+the two-method (``start``/``stop``) ``BaseSandboxSession`` contract. The
+simplest provider shape: just a local subprocess running supervisor.js + ACP,
+no container, no remote URL.
 """
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
     """One running local supervisor.js + ACP child subprocess."""
 
     volume_provider = "unix_local"
+    _snapshot_path = "/tmp/agentsdk-snapshot.tar"
     state: UnixLocalSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -109,7 +109,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
     async def stop(self) -> None:
         if self.state.sandbox_ref is None:
             return
-        await self._write_snapshot("/tmp/agentsdk-snapshot.tar")
+        await self._write_snapshot()
 
         from api.providers import unix_local as lc_provider
         try:

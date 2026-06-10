@@ -1,8 +1,8 @@
 """FakeSandboxSession — in-memory sandbox session for unit-testing the pool.
 
-Implements the three abstract lifecycle methods (``start`` / ``running`` /
-``stop``) and overrides ``execute_prompt`` so the pool's recovery/reaper
-logic can be driven without real daytona/docker/modal.
+Implements the two abstract lifecycle methods (``start`` / ``stop``) and
+overrides ``running`` / ``_liveness_probe`` / ``execute_prompt`` so the pool's
+recovery/reaper logic can be driven without real daytona/docker/modal.
 
 Design notes:
   - ``_bootstrap_session()`` (the DB read of session + volume rows) is
@@ -117,22 +117,10 @@ class FakeSandboxSession(BaseSandboxSession):
         self.state.listen_port = None
 
     async def destroy(self) -> None:
-        """Hard-delete: same as stop for the fake (no real compute).
-
-        The base class ``destroy()`` calls ``destroy_instance`` which
-        dispatches to the provider module's ``destroy_sandbox``.  That would
-        work because we registered a no-op in ``fake/__init__.py``, but
-        calling ``super()`` there requires ``self._supervisor_url`` to be
-        non-None when the sandbox_ref check passes — and on a failed start
-        it may be None.  Simpler to implement it directly here.
-        """
-        self._alive = False
-        self.state.sandbox_ref = None
-        self.state.listen_port = None
-
-    async def shutdown(self) -> None:
-        """In-memory teardown.  Delegates to base for subscriber/task cleanup."""
-        await super().shutdown()
+        """Hard-delete. For the fake there is no real compute, so a destroy is
+        indistinguishable from a stop — both just mark the in-memory backend
+        dead and clear the refs."""
+        await self.stop()
 
     # ------------------------------------------------------------------
     # execute_prompt — scripted event replay

@@ -26,6 +26,7 @@ class ModalSandboxSession(BaseSandboxSession):
 
     volume_provider = "modal"
     _default_root = "/v"
+    _snapshot_path = "/v/snapshot.tar"
     state: ModalSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -163,7 +164,7 @@ class ModalSandboxSession(BaseSandboxSession):
     async def stop(self) -> None:
         if self.state.sandbox_ref is None:
             return
-        await self._write_snapshot("/v/snapshot.tar")
+        await self._write_snapshot()
 
         # Modal: terminate is destructive (no pause). Per docs §15.3 we
         # still call stop_sandbox; the persisted snapshot lets the next

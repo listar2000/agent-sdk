@@ -1,9 +1,10 @@
 """Abstract base class for SandboxSession — one per running compute.
 
 Concrete provider classes (DaytonaSandboxSession, DockerSandboxSession,
-UnixLocalSandboxSession, ModalSandboxSession) implement the 3 abstract
-lifecycle methods (``start``/``running``/``stop``); ``execute_prompt``,
-``destroy``, and ``shutdown`` are concrete in this base.
+UnixLocalSandboxSession, ModalSandboxSession) implement the 2 abstract
+lifecycle methods (``start``/``stop``) and may override ``_liveness_probe``
+for a cheap supervisor probe; ``running``, ``execute_prompt``, ``destroy``,
+and ``shutdown`` are concrete in this base.
 
 Decision: ``stop()`` and ``shutdown()`` are split. ``stop()`` is the
 data-preserving operation (snapshot + pause compute). ``shutdown()`` is
@@ -70,8 +71,9 @@ class BaseSandboxSession(abc.ABC):
     serialised prompts, the subscriber fan-out for ``GET /events``, and
     the liveness oracle.
 
-    Subclass contract: implement ``start()``, ``running()``, ``stop()``.
-    The base class provides ``execute_prompt()``, ``destroy()``,
+    Subclass contract: implement ``start()`` and ``stop()`` (and optionally
+    override ``_liveness_probe()`` for a cheap supervisor probe). The base
+    class provides ``running()``, ``execute_prompt()``, ``destroy()``,
     ``shutdown()``, subscriber multiplex (``subscribe()``,
     ``_broadcast()``), the ``ProviderInstance`` builder, and the liveness
     oracle wiring.
@@ -85,6 +87,10 @@ class BaseSandboxSession(abc.ABC):
     # Default sandbox root when the recipe doesn't pin one. Subclass overrides
     # (daytona /home/daytona, docker /home/agent, modal /v, local /tmp).
     _default_root: str = "/tmp"
+    # Per-provider snapshot destination inside the volume mount. ``None`` means
+    # the provider takes no snapshot on stop (e.g. the in-memory fake). Subclass
+    # overrides with its volume-mount path.
+    _snapshot_path: str | None = None
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         self.session_id = session_id
@@ -569,14 +575,16 @@ class BaseSandboxSession(abc.ABC):
         self._close_subscribers()
         await self._aclose_acp_client()
 
-    async def _write_snapshot(self, path: str) -> None:
+    async def _write_snapshot(self) -> None:
         """POST /v1/snapshot to the supervisor and update state on HTTP 200.
 
-        Shared by all providers' ``stop()`` implementations. Each provider
-        passes its own snapshot path literal so the per-provider semantics
-        (volume mount path) are preserved while the httpx wiring lives once.
+        Shared by all providers' ``stop()`` implementations. The destination
+        is the provider's ``_snapshot_path`` class attribute (its volume
+        mount path), so the per-provider semantics are preserved while the
+        httpx wiring lives once.
         """
-        if self._supervisor_url is None:
+        path = self._snapshot_path
+        if self._supervisor_url is None or path is None:
             return
         import httpx as _httpx
         try:

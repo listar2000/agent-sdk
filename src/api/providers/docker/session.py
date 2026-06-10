@@ -1,9 +1,8 @@
 """DockerSandboxSession — concrete SandboxSession for the docker provider.
 
 Wraps existing primitives in ``src/api/providers/docker/__init__.py`` into the
-three-method (``start``/``running``/``stop``) ``BaseSandboxSession`` contract
-— adding a provider is one file + one factory line in
-``api/sandbox/factory.py``.
+two-method (``start``/``stop``) ``BaseSandboxSession`` contract — adding a
+provider is one file + one factory line in ``api/sandbox/factory.py``.
 
 Docker is structurally simpler than daytona:
   * No S3-FUSE bridge — local volume mounts are POSIX
@@ -29,6 +28,7 @@ class DockerSandboxSession(BaseSandboxSession):
 
     volume_provider = "docker"
     _default_root = "/home/agent"
+    _snapshot_path = "/v/snapshot.tar"
     state: DockerSandboxState
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -142,7 +142,7 @@ class DockerSandboxSession(BaseSandboxSession):
             return
         # Snapshot via supervisor's /v1/snapshot endpoint (same shape as
         # daytona). Local volume FS is POSIX so this is fast.
-        await self._write_snapshot("/v/snapshot.tar")
+        await self._write_snapshot()
 
         # Docker doesn't have a "pause" — stop_sandbox stops the container
         # (the container row persists and is restartable). Per docs §15.3 we
