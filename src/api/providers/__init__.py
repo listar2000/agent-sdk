@@ -59,12 +59,14 @@ from .daytona import (
 # Provider module dispatch table
 from . import daytona as _daytona_mod
 from . import docker as _docker_mod
+from . import fake as _fake_mod
 from . import unix_local as _unix_local_mod
 from . import modal as _modal_mod
 
 _PROVIDER_MODS = {
     "daytona": _daytona_mod,
     "docker": _docker_mod,
+    "fake": _fake_mod,
     "unix_local": _unix_local_mod,
     "modal": _modal_mod,
 }

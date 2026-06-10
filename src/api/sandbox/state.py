@@ -171,12 +171,26 @@ class ModalSandboxState(_BaseSandboxState):
     listen_port: int | None = None
 
 
+class FakeSandboxState(_BaseSandboxState):
+    """In-memory sandbox state for unit-testing the pool lifecycle.
+
+    Carries the same ``sandbox_ref`` / ``listen_port`` fields as the real
+    provider states so the pool's destroy backstop (``if sandbox_ref:``)
+    and the serialise/deserialise round-trip work without special-casing.
+    """
+
+    type: Literal["fake"] = "fake"
+    sandbox_ref: str | None = None
+    listen_port: int | None = None
+
+
 SandboxState = Annotated[
     Union[
         DaytonaSandboxState,
         DockerSandboxState,
         UnixLocalSandboxState,
         ModalSandboxState,
+        FakeSandboxState,
         UnknownSandboxState,
     ],
     Field(discriminator="type"),
@@ -186,7 +200,7 @@ SandboxState = Annotated[
 _ADAPTER: TypeAdapter[SandboxState] = TypeAdapter(SandboxState)
 
 
-_KNOWN_TYPES = {"daytona", "docker", "unix_local", "modal", "unknown"}
+_KNOWN_TYPES = {"daytona", "docker", "unix_local", "modal", "fake", "unknown"}
 
 
 # Maps API-level provider names (the ``provider`` field on POST /sessions
@@ -196,6 +210,7 @@ _PROVIDER_STATE_CLASS: dict[str, type[_BaseSandboxState]] = {
     "docker": DockerSandboxState,
     "unix_local": UnixLocalSandboxState,
     "modal": ModalSandboxState,
+    "fake": FakeSandboxState,
 }
 
 

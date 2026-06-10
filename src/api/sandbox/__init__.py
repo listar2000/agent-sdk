@@ -28,6 +28,7 @@ from .session import BaseSandboxSession
 from .state import (
     DaytonaSandboxState,
     DockerSandboxState,
+    FakeSandboxState,
     ModalSandboxState,
     Recipe,
     SandboxState,
@@ -42,6 +43,7 @@ __all__ = [
     "BaseSandboxSession",
     "DaytonaSandboxState",
     "DockerSandboxState",
+    "FakeSandboxState",
     "Liveness",
     "LivenessState",
     "ModalSandboxState",

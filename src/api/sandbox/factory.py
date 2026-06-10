@@ -78,10 +78,12 @@ def _register_default_providers() -> None:
     """
     from api.providers.daytona.session import DaytonaSandboxSession
     from api.providers.docker.session import DockerSandboxSession
+    from api.providers.fake.session import FakeSandboxSession
     from api.providers.modal.session import ModalSandboxSession
     from api.providers.unix_local.session import UnixLocalSandboxSession
     register("daytona", _adapt(DaytonaSandboxSession))
     register("docker", _adapt(DockerSandboxSession))
+    register("fake", _adapt(FakeSandboxSession))
     register("modal", _adapt(ModalSandboxSession))
     register("unix_local", _adapt(UnixLocalSandboxSession))
     register("unknown", _adapt(DaytonaSandboxSession))  # default-to-daytona
