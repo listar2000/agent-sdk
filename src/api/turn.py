@@ -2,8 +2,8 @@
 
 Extracted from server.py so the turn logic can be imported and tested
 independently without pulling in the full FastAPI app.  The public surface
-is :class:`TurnRunner` plus two thin helpers re-exported for server.py:
-``_persist_user_message`` and ``_EVENT_TYPE_TO_LOG``.
+is :class:`TurnRunner` plus two thin helpers that ``server.py`` re-exports for
+backward-compat: ``_persist_user_message`` and ``_EVENT_TYPE_TO_LOG``.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import logging
 from .event_buffer import get_batcher
 from .db import log_event
 from .redact import redact_secrets
+from .sandbox import get_pool
 from .models import (
     EVT_ASSISTANT_MESSAGE,
     EVT_ERROR,
@@ -276,8 +277,7 @@ class TurnRunner:
                 # that never arrives.
                 if not ok and exc is not None:
                     try:
-                        from api.sandbox import get_pool as _gp
-                        replacement = await _gp().get_session(self.session.session_id)
+                        replacement = await get_pool().get_session(self.session.session_id)
                     except Exception:
                         replacement = None
                     if replacement is not None and replacement is not self.session:
@@ -313,8 +313,7 @@ class TurnRunner:
                     # ``_subscribers`` dict may have been migrated to the new
                     # session by ``pool.get_session``'s subscriber hand-off;
                     # broadcasting to the stale ref reaches an empty dict.
-                    from api.sandbox import get_pool as _gp2
-                    current = _gp2()._active.get(self.session.session_id, self.session)  # noqa: SLF001
+                    current = get_pool()._active.get(self.session.session_id, self.session)  # noqa: SLF001
                     current._broadcast({
                         "type": "error", "rpc_id": self.rpc_id,
                         "jsonrpc": "2.0", "id": self.rpc_id,

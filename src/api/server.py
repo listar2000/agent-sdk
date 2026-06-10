@@ -79,6 +79,13 @@ from .providers import (
 from .providers._shared import _safe_path as _shared_safe_path
 from .redact import redact_pre_start_commands
 from .turn import TurnRunner
+# Backward-compat re-exports: these now live canonically in ``api.turn`` but
+# external callers (and the persist-parser parity test) historically import
+# them from ``api.server``.
+from .turn import (  # noqa: F401
+    _EVENT_TYPE_TO_LOG,
+    _persist_user_message,
+)
 
 log = logging.getLogger(__name__)
 

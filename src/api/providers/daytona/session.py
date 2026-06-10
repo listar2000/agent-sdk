@@ -1,7 +1,7 @@
 """DaytonaSandboxSession — concrete SandboxSession for the daytona provider.
 
 Wraps existing primitives in ``src/api/providers/daytona/__init__.py``
-into the five-method ``BaseSandboxSession`` contract.
+into the two-method (``start``/``stop``) ``BaseSandboxSession`` contract.
 
 Lifecycle decisions live inside ``start()``:
   * ``state.sandbox_ref`` set, sandbox alive on Daytona  → reattach (cheapest)
@@ -37,6 +37,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
     volume_provider = "daytona"
     _default_root = "/home/daytona"
+    _snapshot_path = "/vol/snapshot.tar"
     state: DaytonaSandboxState  # narrow the base's SandboxState union
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
@@ -325,7 +326,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         sandbox. Per docs §15.3 (always pause, never delete here)."""
         if self._daytona_sandbox is None:
             return
-        await self._write_snapshot("/vol/snapshot.tar")
+        await self._write_snapshot()
 
         # Always-pause policy (docs §15.3).
         from api.providers import daytona as dt_provider

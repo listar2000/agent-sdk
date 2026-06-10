@@ -217,9 +217,10 @@ if [[ "${AGENT_SDK_REPLICAS}" -le 1 ]]; then
 fi
 
 # Multi-replica + LB path. Spawns N single-worker uvicorn replicas on
-# AGENT_SDK_BACKEND_PORT_BASE..(BASE+N-1) and benchmark/scale/lb.py in
-# front on AGENT_SDK_PUBLIC_PORT. The LB does consistent-hash routing
-# on /sessions/{id}/...; the per-session Postgres lease + 307 redirect
+# AGENT_SDK_BACKEND_PORT_BASE..(BASE+N-1) with a load balancer in front on
+# AGENT_SDK_PUBLIC_PORT (nginx by default; benchmark/scale/lb.py when
+# AGENT_SDK_LB=python). The LB does consistent-hash routing on
+# /sessions/{id}/...; the per-session Postgres lease + 307 redirect
 # handles ownership safety so the LB itself can be dumb.
 #
 # Tear-down: trap forwards SIGINT/SIGTERM to the whole process group
@@ -397,7 +398,7 @@ fi
 echo "Stack ready:"
 echo "  client URL : http://localhost:${AGENT_SDK_PUBLIC_PORT}"
 echo "  replicas   : ${AGENT_SDK_REPLICAS} on ports ${AGENT_SDK_BACKEND_PORT_BASE}..$(( AGENT_SDK_BACKEND_PORT_BASE + AGENT_SDK_REPLICAS - 1 ))"
-echo "  LB         : benchmark/scale/lb.py (consistent-hash on session_id)"
+echo "  LB         : ${AGENT_SDK_LB} (consistent-hash on session_id)"
 echo "  logs       : logs/server-r*.log + logs/server-lb.log"
 echo
 echo "Press Ctrl-C to tear down."

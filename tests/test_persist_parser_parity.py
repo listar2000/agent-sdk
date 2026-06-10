@@ -138,14 +138,6 @@ def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
     )
 
 
-class _NoopLiveness:
-    def observe_prompt_start(self) -> None:
-        pass
-
-    def observe_prompt_end(self) -> None:
-        pass
-
-
 # ---------------------------------------------------------------------------
 # Persist coalescing — one row per logical block, not per ACP chunk.
 # Mirrors what the SDK's ``astream`` accumulates and what ``/events``
@@ -190,15 +182,20 @@ class _FakeSession:
 
 
 def _capture_log_writes(monkeypatch) -> list[tuple[str, dict]]:
-    """Patch ``api.server.log_event`` to record (event_type, payload) tuples
-    instead of touching the DB. Returns the captured list."""
+    """Patch ``api.turn.log_event`` to record (event_type, payload) tuples
+    instead of touching the DB. Returns the captured list.
+
+    The persist path lives in ``api.turn`` (``TurnRunner`` + the
+    ``_persist_user_message`` helper); ``_persist_prompt_events`` in
+    ``api.server`` is a thin delegator, so the DB write must be intercepted
+    at its real call site."""
     rows: list[tuple[str, dict]] = []
 
     async def _fake_log_event(*, session_id, agent_id, event_type, payload):
         rows.append((event_type, payload))
 
-    from api import server as srv
-    monkeypatch.setattr(srv, "log_event", _fake_log_event)
+    from api import turn as turnmod
+    monkeypatch.setattr(turnmod, "log_event", _fake_log_event)
     return rows
 
 
@@ -211,7 +208,7 @@ async def test_persist_logs_empty_done_turn_for_rca(monkeypatch, caplog):
     ])
     from api.server import _persist_prompt_events
 
-    with caplog.at_level("WARNING", logger="api.server"):
+    with caplog.at_level("WARNING", logger="api.turn"):
         await _persist_prompt_events(sess, "hi", "rpc-empty")
 
     assert [r[0] for r in rows if r[0] != "user_message"] == [
