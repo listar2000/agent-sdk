@@ -182,7 +182,6 @@ class NativeSandboxState(_BaseSandboxState):
     provider: str = "docker"
     sandbox_ref: str | None = None
     listen_port: None = None
-    last_turn_seq: int = 0
 
 
 SandboxState = Annotated[

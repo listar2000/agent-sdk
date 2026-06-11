@@ -2574,6 +2574,19 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
             f"subscribers, got {await _subscriber_count(sdk, sid)}"
         )
 
+        # Native: record the container + plant a workspace marker so we can
+        # prove at the SERVER level (not just white-box) that reap actually
+        # FREES compute (container docker-stopped, not merely dropped from the
+        # pool — the silent-leak class), that resume reattaches the SAME
+        # container, and that workspace bytes survive the hibernate.
+        ref_before = None
+        if agent_type == "native":
+            await sdk.session_sandbox_exec(
+                sid, "printf %s reap-marker-31337 > /tmp/reap_marker.txt",
+                timeout=30)
+            ref_before = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+            assert ref_before, "native session has no sandbox_ref before reap"
+
         # Open a PERSISTENT /events consumer and keep it draining in the
         # background — this is the dashboard/monitor that used to pin compute.
         ended = asyncio.Event()
@@ -2610,6 +2623,20 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
                 "decision must key off compute-only activity (+ an in-flight "
                 "gate), not _subscribers membership."
             )
+            # Native LEAK GATE: hibernated:True is a *decision*. Prove the
+            # container was actually freed (docker-stopped) — release()/stop()
+            # both swallow hibernate failures, so a reaper that drops the
+            # session but never `docker stop`s would otherwise ship green,
+            # leaking compute until quota exhaustion.
+            if agent_type == "native":
+                st = subprocess.run(
+                    ["docker", "inspect", "-f", "{{.State.Status}}", ref_before],
+                    capture_output=True, text=True, timeout=15).stdout.strip()
+                assert st in ("exited", "created"), (
+                    f"NATIVE COMPUTE LEAK: reap returned hibernated:True but "
+                    f"the container {ref_before[:12]} is still {st!r} — the "
+                    f"reaper freed the pool slot but not the compute."
+                )
         finally:
             drain.cancel()
             with contextlib.suppress(BaseException):
@@ -2622,6 +2649,19 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         assert "again" in reply.lower(), (
             f"session unusable after reap (cold-resume failed): {reply!r}"
         )
+        # Native: resume must reattach the SAME container (not cold-create a
+        # fresh one) AND the workspace bytes must survive the hibernate —
+        # lifted from white-box to the server/golden layer.
+        if agent_type == "native":
+            ref_after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+            assert ref_after == ref_before, (
+                f"resume cold-created a NEW container instead of reattaching "
+                f"the hibernated one: {ref_before[:12]} → {ref_after[:12]}"
+            )
+            marker = await _cat_exact(sdk, sid, "/tmp/reap_marker.txt")
+            assert marker == "reap-marker-31337", (
+                f"workspace did not survive hibernate/resume: {marker!r}"
+            )
 
 
 # ===========================================================================

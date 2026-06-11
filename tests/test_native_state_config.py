@@ -52,13 +52,11 @@ def test_agent_config_native_absent_stays_none():
 # ── State variant ───────────────────────────────────────────────────────────
 
 def test_native_state_serialize_roundtrip():
-    s = NativeSandboxState(provider="daytona", last_turn_seq=4,
-                           recipe={"agent_type": "native"})
+    s = NativeSandboxState(provider="daytona", recipe={"agent_type": "native"})
     back = deserialize(serialize(s))
     assert type(back) is NativeSandboxState
     assert back.provider == "daytona"
     assert back.sandbox_ref is None and back.listen_port is None
-    assert back.last_turn_seq == 4
     assert back.recipe.agent_type == "native"
 
 
