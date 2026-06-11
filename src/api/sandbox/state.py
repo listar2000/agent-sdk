@@ -171,12 +171,27 @@ class ModalSandboxState(_BaseSandboxState):
     listen_port: int | None = None
 
 
+class NativeSandboxState(_BaseSandboxState):
+    """State for the first-party native runtime (agent_type="native";
+    docs/native_runtime_design.md). The loop runs in-server; compute is
+    LAZY — ``provider`` names the target backend and ``sandbox_ref`` stays
+    None until the first tool call provisions it. ``listen_port`` is always
+    None: nothing inbound ever reaches a native sandbox (no supervisor)."""
+
+    type: Literal["native"] = "native"
+    provider: str = "docker"
+    sandbox_ref: str | None = None
+    listen_port: None = None
+    last_turn_seq: int = 0
+
+
 SandboxState = Annotated[
     Union[
         DaytonaSandboxState,
         DockerSandboxState,
         UnixLocalSandboxState,
         ModalSandboxState,
+        NativeSandboxState,
         UnknownSandboxState,
     ],
     Field(discriminator="type"),
@@ -186,7 +201,7 @@ SandboxState = Annotated[
 _ADAPTER: TypeAdapter[SandboxState] = TypeAdapter(SandboxState)
 
 
-_KNOWN_TYPES = {"daytona", "docker", "unix_local", "modal", "unknown"}
+_KNOWN_TYPES = {"daytona", "docker", "unix_local", "modal", "native", "unknown"}
 
 
 # Maps API-level provider names (the ``provider`` field on POST /sessions

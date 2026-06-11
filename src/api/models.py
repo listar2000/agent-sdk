@@ -35,6 +35,14 @@ class AgentConfig:
     mode: str | None = None              # "default" | "plan" | "bypassPermissions" | "acceptEdits" | ...
     thought_level: str | None = None     # "low" | "medium" | "high" — Claude's "thinking" config_id
 
+    # Native-runtime spec passthrough (agent_type="native" only): the loop's
+    # own knobs — instructions, max_turns, temperature, max_tokens,
+    # tool_names. Opaque dict by design: ``from_dict`` filters unknown
+    # TOP-LEVEL fields at the API boundary, and the native loop versions its
+    # own spec parsing (api/native/loop.py) without an AgentConfig migration
+    # per knob. ``model`` stays on the shared field above (set_model replay).
+    native: dict | None = None
+
     # Vendor-specific ACP ``extra_options`` is NOT here — it's session-scoped
     # (claude-agent-acp only reads ``_meta.<vendor>.options`` on session/new,
     # see ``acp_client._VENDOR_META_NAMESPACE``). Stored on the ``sessions``
