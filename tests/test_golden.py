@@ -151,6 +151,10 @@ _RUNTIME_DEFAULTS: dict[str, dict] = {
     "claude": {"model": "haiku", "secret_env": "CLAUDE_CODE_OAUTH_TOKEN"},
     "opencode": {"model": "openrouter/anthropic/claude-3.5-haiku",
                  "secret_env": "OPENROUTER_API_KEY"},
+    # Native: first-party in-server loop, any LiteLLM model. Pinned to a
+    # cheap tool-calling model on openrouter.
+    "native": {"model": "openrouter/openai/gpt-4o-mini",
+               "secret_env": "OPENROUTER_API_KEY"},
 }
 
 
@@ -2975,3 +2979,59 @@ async def test_tool_effects_matrix(provider, agent_type):
             "word beta with DELTA. Change nothing else."
         ))
         assert await _cat_exact(sdk, sid, "editme.txt") == "alpha DELTA gamma"
+
+
+# ---------------------------------------------------------------------------
+# Native runtime (agent_type="native") — docker only in P0. The first-party
+# in-server LiteLLM loop with sandbox-RPC tools. Exercises the full stack:
+# create (lazy) → /message+stream (real LLM turn) → tool effects land in the
+# sandbox → /sandbox/exec verifies exact contents. daytona/modal native
+# arrive in P1.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_native_tool_effects_docker():
+    if not _has_docker():
+        pytest.skip("docker not available")
+    if not _OPENROUTER_KEY:
+        pytest.skip("OPENROUTER_API_KEY required for native runtime")
+    uid = os.urandom(4).hex()
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, "docker", agent_type="native")
+        sid = sess["session_id"]
+        # native is always lazy — no compute until the first tool call
+        assert sess.get("sandbox_ref") is None
+        print(f"\n[test:native:docker] session={sid[:8]}")
+
+        # write inside cwd + a bash effect, exact-content verified
+        await _ask(sdk, sid, (
+            f"Create a file named note_{uid}.txt in the current directory "
+            f"containing exactly: native-in-{uid} . Then run a shell command: "
+            f"echo native-bash-{uid} > /tmp/nb_{uid}.txt . Confirm both done."
+        ))
+        assert await _cat_exact(sdk, sid, f"note_{uid}.txt") == f"native-in-{uid}"
+        assert await _cat_exact(sdk, sid, f"/tmp/nb_{uid}.txt") == f"native-bash-{uid}"
+
+        # read round-trip: plant a seed, have the agent echo it into a new file
+        res = await sdk.session_sandbox_exec(
+            sid, f"printf %s seed-{uid} > seed_{uid}.txt && echo planted",
+            timeout=30)
+        assert "planted" in (res.get("stdout") or ""), res
+        await _ask(sdk, sid, (
+            f"Read the file seed_{uid}.txt in the current directory and create "
+            f"echo_{uid}.txt whose content is exactly what you read, nothing else."
+        ))
+        assert await _cat_exact(sdk, sid, f"echo_{uid}.txt") == f"seed-{uid}"
+
+        # edit: modify an existing file precisely
+        res = await sdk.session_sandbox_exec(
+            sid, f"printf %s 'alpha beta gamma' > edit_{uid}.txt && echo ok",
+            timeout=30)
+        assert "ok" in (res.get("stdout") or "")
+        await _ask(sdk, sid, (
+            f"Edit the file edit_{uid}.txt in the current directory: replace the "
+            f"word beta with DELTA. Change nothing else."
+        ))
+        assert await _cat_exact(sdk, sid, f"edit_{uid}.txt") == "alpha DELTA gamma"

@@ -58,8 +58,18 @@ class DockerTransport:
 
     provider = "docker"
 
-    def __init__(self, container_id: str | None = None):
+    def __init__(self, container_id: str | None = None, workdir: str = "/"):
         self.container_id = container_id
+        # Default working directory for exec and the anchor for relative
+        # file paths, so a tool's ``note.txt`` and a later ``cat note.txt``
+        # resolve to the same place regardless of which path was used.
+        self.workdir = workdir
+
+    def _resolve(self, path: str) -> str:
+        if path.startswith("/"):
+            return path
+        base = self.workdir.rstrip("/") or ""
+        return f"{base}/{path}"
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -136,8 +146,7 @@ class DockerTransport:
         )
         wrapped = inner
         args = ["exec"]
-        if cwd:
-            args += ["-w", cwd]
+        args += ["-w", cwd or self.workdir]
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
         args += [self.container_id, "sh", "-c", wrapped]
@@ -161,6 +170,7 @@ class DockerTransport:
         """Stream base64 over stdin — safe for payloads beyond the ~96KiB
         argv ceiling that base64-in-argv hits (Linux MAX_ARG_STRLEN)."""
         self._require_sandbox()
+        path = self._resolve(path)
         q = shlex.quote(path)
         qdir = shlex.quote(_dirname(path))
         from api.providers.docker import _require_docker
@@ -180,7 +190,7 @@ class DockerTransport:
 
     async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
         self._require_sandbox()
-        q = shlex.quote(path)
+        q = shlex.quote(self._resolve(path))
         res = await self.exec(f"base64 < {q}", timeout_s=120)
         if res.exit_code != 0:
             raise FileNotFoundError(

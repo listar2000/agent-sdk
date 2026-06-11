@@ -87,12 +87,24 @@ def test_factory_dispatches_native_to_registered_class():
             built["session_id"] = session_id
             built["state"] = state
 
+    # Trigger default registration, then swap in the stub and RESTORE it
+    # after — clobbering the global registry would break sibling tests that
+    # build real NativeSessions via the same factory.
+    # Force default registration (sets _REGISTRY_INITIALIZED so make_session
+    # below won't re-run it and clobber our stub), then swap + RESTORE.
+    factory._register_default_providers()
+    factory._REGISTRY_INITIALIZED = True
+    saved = factory._REGISTRY.get("native")
     factory.register("native", factory._adapt(_StubNativeSession))
-    s = NativeSandboxState(provider="docker")
-    out = factory.make_session("sess-native-1", s)
-    assert isinstance(out, _StubNativeSession)
-    assert built["session_id"] == "sess-native-1"
-    assert built["state"] is s
+    try:
+        s = NativeSandboxState(provider="docker")
+        out = factory.make_session("sess-native-1", s)
+        assert isinstance(out, _StubNativeSession)
+        assert built["session_id"] == "sess-native-1"
+        assert built["state"] is s
+    finally:
+        if saved is not None:
+            factory.register("native", saved)
 
 
 # ── native_transcripts accessors (Postgres required; skips if absent) ──────

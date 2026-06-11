@@ -602,6 +602,7 @@ _CONFIG_KEYS = (
     "agent_type",
     "mode",
     "thought_level",
+    "native",  # native-runtime spec passthrough (agent_type="native")
 )
 
 # Keys that were once inside AgentConfig but now live on session / sandbox
@@ -1846,6 +1847,7 @@ async def _sessions_create_lazy(data: dict, *, native: bool = False) -> dict:
 
     return {
         "id": session_id,
+        "session_id": session_id,  # alias — matches the eager path's key
         "agent_id": agent_id,
         "volume_id": volume_record.id,
         "workspace": workspace,

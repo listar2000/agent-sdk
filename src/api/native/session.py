@@ -260,13 +260,13 @@ class NativeSession(BaseSandboxSession):
                         f"native provider {provider!r} not wired in P0 "
                         f"(docker only)")
                 from .transport import DockerTransport
-                t = DockerTransport()
+                t = DockerTransport(workdir=self._cwd)
                 await t.create(image=_native_image(),
                                labels={"agent_sdk_origin": _origin(),
                                        "native_session": self.session_id})
                 # Make the cwd exist so relative paths in tools resolve.
                 import shlex
-                await t.exec(f"mkdir -p {shlex.quote(self._cwd)}")
+                await t.exec(f"mkdir -p {shlex.quote(self._cwd)}", cwd="/")
             self._transport = t
             self.state.sandbox_ref = getattr(t, "container_id", None)
             await self._persist_state()
