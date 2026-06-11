@@ -2630,13 +2630,11 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
             # session but never `docker stop`s would otherwise ship green,
             # leaking compute until quota exhaustion.
             if agent_type == "native":
-                st = subprocess.run(
-                    ["docker", "inspect", "-f", "{{.State.Status}}", ref_before],
-                    capture_output=True, text=True, timeout=15).stdout.strip()
-                assert st in ("exited", "created"), (
+                st = await _native_compute_state(provider, ref_before)
+                assert st in ("stopped", "exited", "created"), (
                     f"NATIVE COMPUTE LEAK: reap returned hibernated:True but "
-                    f"the container {ref_before[:12]} is still {st!r} — the "
-                    f"reaper freed the pool slot but not the compute."
+                    f"the {provider} sandbox {ref_before[:12]} is still {st!r} "
+                    f"— the reaper freed the pool slot but not the compute."
                 )
         finally:
             drain.cancel()
@@ -2957,6 +2955,28 @@ async def _cat_exact(sdk: ApiClient, session_id: str, path: str) -> str:
     res = await sdk.session_sandbox_exec(session_id, f"cat {path}", timeout=60)
     assert res.get("exit_code") == 0, f"cat {path} failed: {res}"
     return (res.get("stdout") or "").strip()
+
+
+async def _native_compute_state(provider: str, ref: str) -> str:
+    """Provider-aware introspection of whether a native sandbox's COMPUTE is
+    freed (vs the pool merely evicting the session). Normalized vocabulary:
+    'running' | 'stopped' | 'missing' | 'error'. Used by the reap leak-gate so
+    it works across docker (inspect) and daytona (control-plane status)."""
+    if provider == "docker":
+        st = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", ref],
+            capture_output=True, text=True, timeout=15).stdout.strip()
+        if st == "running":
+            return "running"
+        if st in ("exited", "created", "paused", "dead"):
+            return "stopped"
+        return "missing" if st == "" else "error"
+    if provider == "daytona":
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+        from api.providers.daytona import get_daytona_sandbox_status
+        return await get_daytona_sandbox_status(ref)
+    raise AssertionError(f"_native_compute_state: provider {provider!r} unsupported")
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
