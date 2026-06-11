@@ -439,9 +439,13 @@ class ModalTransport:
 
     async def create(self, *, volume_ref: str, subpath: str,
                      root: str | None = None) -> str:
-        from api.providers.modal import create_sandbox
-        inst = await create_sandbox(volume_ref=volume_ref, subpath=subpath,
-                                    agent_type="native", root=root or self.workdir)
+        # NATIVE flavor: a bare `sleep infinity` sandbox (no supervisor/ACP/
+        # tunnel), volume mounted at /v so the workspace survives terminate→
+        # recreate. Mirrors DockerTransport's bare container; leaner than the
+        # supervisor create (no tunnel + health poll).
+        from api.providers.modal import create_bare_sandbox
+        inst = await create_bare_sandbox(volume_ref=volume_ref, subpath=subpath,
+                                         root=root or self.workdir)
         if not inst.sandbox_ref:
             raise RuntimeError("modal create returned no sandbox_ref")
         self.sandbox_ref = inst.sandbox_ref

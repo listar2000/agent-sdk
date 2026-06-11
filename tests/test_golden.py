@@ -127,11 +127,12 @@ def _require_provider(provider: str, agent_type: str = "claude") -> None:
     """Call pytest.skip() if the provider isn't available. Call at test start."""
     if not _has_server():
         pytest.skip("server not running on localhost:7778")
-    # Native transports: docker (P0) + daytona (P1, live-verified). unix_local
-    # and modal native transports aren't built yet, so skip those cells so the
-    # native-inclusive goldens collect cleanly across the provider matrix.
-    if agent_type == "native" and provider not in ("docker", "daytona"):
-        pytest.skip("native runtime supports docker + daytona; "
+    # Native transports: docker (P0) + daytona (P1) + modal (P1, recreate-on-
+    # missing), all live-verified. unix_local native transport isn't built yet,
+    # so skip that cell so the native-inclusive goldens collect cleanly across
+    # the provider matrix.
+    if agent_type == "native" and provider not in ("docker", "daytona", "modal"):
+        pytest.skip("native runtime supports docker + daytona + modal; "
                     f"{provider} transport not yet built")
     if provider == "daytona" and not _has_daytona():
         pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
@@ -2581,9 +2582,14 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         # pool — the silent-leak class), that resume reattaches the SAME
         # container, and that workspace bytes survive the hibernate.
         ref_before = None
+        # Modal hibernate=terminate loses the sandbox FS, so the marker must
+        # live on the mounted Volume (/v) to survive the recreate; docker
+        # (stop) and daytona (pause) keep the FS, so /tmp persists for them.
+        marker_path = ("/v/reap_marker.txt" if provider == "modal"
+                       else "/tmp/reap_marker.txt")
         if agent_type == "native":
             await sdk.session_sandbox_exec(
-                sid, "printf %s reap-marker-31337 > /tmp/reap_marker.txt",
+                sid, f"printf %s reap-marker-31337 > {marker_path}",
                 timeout=30)
             ref_before = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
             assert ref_before, "native session has no sandbox_ref before reap"
@@ -2630,8 +2636,20 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
             # session but never `docker stop`s would otherwise ship green,
             # leaking compute until quota exhaustion.
             if agent_type == "native":
+                # docker/daytona free compute synchronously to 'stopped'. Modal
+                # frees by DELETING the sandbox (status 'missing') and its
+                # terminate is async, so poll a short window before asserting.
+                freed = {"stopped", "exited", "created"}
+                if provider == "modal":
+                    freed = freed | {"missing"}
                 st = await _native_compute_state(provider, ref_before)
-                assert st in ("stopped", "exited", "created"), (
+                if provider == "modal":
+                    for _ in range(20):
+                        if st in freed:
+                            break
+                        await asyncio.sleep(1.5)
+                        st = await _native_compute_state(provider, ref_before)
+                assert st in freed, (
                     f"NATIVE COMPUTE LEAK: reap returned hibernated:True but "
                     f"the {provider} sandbox {ref_before[:12]} is still {st!r} "
                     f"— the reaper freed the pool slot but not the compute."
@@ -2652,15 +2670,31 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         # fresh one) AND the workspace bytes must survive the hibernate —
         # lifted from white-box to the server/golden layer.
         if agent_type == "native":
-            ref_after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
-            assert ref_after == ref_before, (
-                f"resume cold-created a NEW container instead of reattaching "
-                f"the hibernated one: {ref_before[:12]} → {ref_after[:12]}"
-            )
-            marker = await _cat_exact(sdk, sid, "/tmp/reap_marker.txt")
-            assert marker == "reap-marker-31337", (
-                f"workspace did not survive hibernate/resume: {marker!r}"
-            )
+            if provider == "modal":
+                # Recreate-on-missing: reading the marker triggers the cold
+                # recreate (terminate destroyed the sandbox). Workspace bytes
+                # survive via the Volume; the sandbox ref CHANGES (fresh one).
+                marker = await _cat_exact(sdk, sid, marker_path)
+                assert marker == "reap-marker-31337", (
+                    f"workspace did not survive terminate/recreate: {marker!r}"
+                )
+                ref_after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+                assert ref_after and ref_after != ref_before, (
+                    f"modal native should recreate-on-missing (fresh ref) after "
+                    f"reap, got {ref_before[:12]} → {ref_after}"
+                )
+            else:
+                # docker (stop) / daytona (pause): resume reattaches the SAME
+                # sandbox, workspace intact.
+                ref_after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+                assert ref_after == ref_before, (
+                    f"resume cold-created a NEW container instead of reattaching "
+                    f"the hibernated one: {ref_before[:12]} → {ref_after[:12]}"
+                )
+                marker = await _cat_exact(sdk, sid, marker_path)
+                assert marker == "reap-marker-31337", (
+                    f"workspace did not survive hibernate/resume: {marker!r}"
+                )
 
 
 # ===========================================================================
@@ -2976,6 +3010,14 @@ async def _native_compute_state(provider: str, ref: str) -> str:
         _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
         from api.providers.daytona import get_daytona_sandbox_status
         return await get_daytona_sandbox_status(ref)
+    if provider == "modal":
+        # Modal hibernate=terminate, so a freed sandbox reports 'missing' (the
+        # record is gone). 'running' means the terminate hasn't propagated yet
+        # (it's async) — the caller polls.
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+        from api.providers.modal import get_sandbox_status
+        return await get_sandbox_status(ref)
     raise AssertionError(f"_native_compute_state: provider {provider!r} unsupported")
 
 

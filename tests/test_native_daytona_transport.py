@@ -194,7 +194,8 @@ async def test_modal_transport_interface(monkeypatch):
     async def _stop(inst):
         stopped.append(inst.sandbox_ref)
 
-    monkeypatch.setattr(md, "create_sandbox", _create)
+    # Native modal uses the BARE (no-supervisor) create, not create_sandbox.
+    monkeypatch.setattr(md, "create_bare_sandbox", _create)
     monkeypatch.setattr(md, "exec_in_sandbox", _exec)
     monkeypatch.setattr(md, "get_sandbox_status", _status)
     monkeypatch.setattr(md, "stop_sandbox", _stop)

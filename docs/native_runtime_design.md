@@ -322,7 +322,21 @@ calls carry real timeouts).
   interrupt parity goldens green with `agent_type="native"` on docker.
 - **P1**: daytona + modal transports (incl. M5 recreate-on-missing), lazy
   provision under lock, hibernate/resume via checkpoints, secrets split.
-  Gate: recovery goldens green on all three providers.
+  Gate: recovery goldens green on all three providers. **DONE — all three
+  live-verified + golden-integrated** (`test_idle_session_with_open_subscriber_is_reaped`
+  with `agent_type="native"` × {docker, daytona, modal}).
+  - Modal is recreate-on-missing: native uses a NEW `create_bare_sandbox`
+    (no supervisor / ACP / tunnel / health-poll — a bare `sleep infinity`
+    with the volume at `/v`, the modal analogue of DockerTransport's bare
+    container). hibernate=terminate (status→`missing`, async), resume is the
+    session's recreate path on the same Volume (fresh ref, workspace bytes
+    survive via the Volume — proven live). The reaper golden's leak-gate
+    accepts `missing` as freed and asserts a fresh ref + surviving marker for
+    modal, vs same-ref reattach for docker/daytona.
+  - Fixed a latent shared bug surfaced by this work: `create_volume` returned
+    a LAZY `Volume.from_name` handle that never issued the create RPC, so the
+    volume wasn't actually persisted (a later mount 404s). Now hydrates — also
+    corrects the supervisor modal path (verified: modal×claude reaper green).
 - **P2**: daytona workspace tar persist; `bash_background` (daytona process
   sessions); compaction; parallel tool calls; custom user tools.
 
