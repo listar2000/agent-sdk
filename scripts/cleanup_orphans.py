@@ -87,43 +87,28 @@ def _reap_daytona(origin: str, *, dry_run: bool) -> int:
     return len(items) - failed
 
 
-def _daytona_list_all(daytona, *, labels: dict[str, str]) -> list:
-    """Walk all pages of ``daytona.list(labels=...)``.
+_DAYTONA_MAX_ITEMS = int(os.environ.get("AGENT_SDK_DAYTONA_MAX_ITEMS", "5000"))
 
-    Returns a flat list of Sandbox objects. The daytona-sdk's ``list``
-    returns a ``PaginatedSandboxes`` whose ``items`` field is just the
-    first page (default 100); without pagination, ``cleanup_orphans``
-    silently leaves later pages behind and the "Reaped 100 resource(s)"
-    counter looks complete even when there are 200+ orphans against
-    the account quota. Walk pages explicitly until items < page_size
-    or we see total_pages exhausted.
+
+def _daytona_list_all(daytona, *, labels: dict[str, str]) -> list:
+    """List labelled sandboxes via the daytona-sdk >=0.184 query API.
+
+    The SDK made ``Daytona.list`` an auto-paginating iterator taking a
+    ``ListSandboxesQuery`` — the old ``list(labels=, page=)`` kwargs were
+    removed (``TypeError: list() got an unexpected keyword argument
+    'labels'``), which is what broke this reaper. Mirrors the provider's
+    ``_list_labeled_sandboxes`` (daytona/__init__.py). Capped at
+    ``_DAYTONA_MAX_ITEMS`` as a runaway guard.
     """
+    from daytona_sdk import ListSandboxesQuery
+
     out: list = []
-    page = 1
-    while True:
-        result = daytona.list(labels=labels, page=page)
-        # PaginatedSandboxes exposes ``items`` plus ``total`` / ``total_pages``
-        # via attributes or as tuple entries on older SDK versions. Probe
-        # both shapes so a daytona-sdk bump doesn't silently regress.
-        items: list = []
-        total_pages: int | None = None
-        if hasattr(result, "items"):
-            items = list(result.items)
-            total_pages = getattr(result, "total_pages", None)
-        else:
-            for tup in result:
-                if not isinstance(tup, tuple) or len(tup) != 2:
-                    continue
-                if tup[0] == "items":
-                    items = list(tup[1])
-                elif tup[0] == "total_pages":
-                    total_pages = tup[1]
-        if not items:
+    for sb in daytona.list(ListSandboxesQuery(labels=labels)):
+        out.append(sb)
+        if len(out) >= _DAYTONA_MAX_ITEMS:
+            print(f"[daytona] WARNING: hit {_DAYTONA_MAX_ITEMS}-sandbox scan "
+                  f"cap; count is a lower bound")
             break
-        out.extend(items)
-        if total_pages is None or page >= total_pages:
-            break
-        page += 1
     return out
 
 
