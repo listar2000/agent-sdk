@@ -34,6 +34,7 @@ from fastapi.responses import (
 )
 
 from .event_buffer import start_batcher, stop_batcher
+from .sse import is_terminal_block
 from .timing import extract_session_id, log_request, timed_phase
 from .db import (
     close_pool,
@@ -2305,28 +2306,22 @@ async def _execute_and_stream_sse_for(
                 if tag != rpc_id:
                     continue
                 yield f"event: rpc:{tag}\n{block}\n\n"
-                # Terminal:
-                #   * ``"stopReason"`` — JSON-RPC ``result`` envelope
-                #     emitted by ACP for a clean turn-end (end_turn /
-                #     cancelled / max_tokens / max_turn_requests). The
-                #     existing snake_case ``"stop_reason"`` substring
-                #     was a long-standing bug — ACP wires camelCase, so
-                #     the check never fired on real frames; success-
-                #     termination depended on client disconnect.
-                #   * ``"error":`` — top-level JSON-RPC error envelope
-                #     emitted by ACP for a fatal turn-end (auth failure
-                #     / internal error / process death). Verified end-
-                #     to-end with claude-agent-acp 0.31.4.
-                # Tool-call failures arrive as ``method=session/update``
-                # notifications and never produce a top-level ``error``
-                # field; ``-32601`` handshake errors are filtered by
-                # ``parse_acp_payload`` before broadcast (see
-                # ``api/sse.py:86``) so they don't reach this check.
-                if (
-                    "stopReason" in block
-                    or '"type":"done"' in block
-                    or '"error":' in block
-                ):
+                # Terminal = a CONFIRMED JSON-RPC envelope for this rpc:
+                # ``result.stopReason`` (clean turn-end: end_turn /
+                # cancelled / max_tokens / max_turn_requests) or a
+                # top-level ``error`` (fatal turn-end). The previous
+                # bare-substring check matched inside CONTENT too — an
+                # agent whose streamed text or tool output contained the
+                # characters ``stopReason`` (e.g. an agent reading
+                # api/sse.py) truncated its own stream mid-turn.
+                # ``is_terminal_block`` keeps the substrings as a cheap
+                # prefilter and JSON-parses candidates to confirm the
+                # envelope (id must match this rpc). Tool-call failures
+                # arrive as ``method=session/update`` notifications and
+                # never produce a top-level ``error`` field; ``-32601``
+                # handshake errors are filtered by ``parse_acp_payload``
+                # before broadcast so they don't reach this check.
+                if is_terminal_block(block, rpc_id):
                     return
             elif isinstance(item, dict):
                 if item.get("rpc_id") != rpc_id:
