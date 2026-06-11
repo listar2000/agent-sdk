@@ -167,6 +167,77 @@ async def test_dispatch_resume_is_provider_uniform(monkeypatch):
     assert events == ["status", "resume"] and t.ref == "dt-existing"
 
 
+# ── Modal native bare-sandbox entrypoint (pure-function safety) ─────────────
+
+def test_bare_entrypoint_symlinks_agent_home_onto_volume():
+    """The normal native-modal root (/home/agent) is symlinked onto the volume
+    so workspace bytes survive terminate→recreate."""
+    from api.providers.modal import _build_bare_entrypoint
+    script = _build_bare_entrypoint(subpath="agents/a1", root="/home/agent")
+    assert "mkdir -p /v/agents/a1" in script
+    assert "ln -s /v/agents/a1 /home/agent" in script
+    assert "rm -rf /home/agent" in script
+    assert script.strip().endswith("exec sleep infinity")
+
+
+def test_bare_entrypoint_refuses_to_clobber_critical_dirs():
+    """A misconfigured root must NEVER `rm -rf` a system dir. For /tmp, /, etc.
+    the convenience symlink is skipped (absolute /v paths still persist)."""
+    from api.providers.modal import _build_bare_entrypoint
+    for danger in ("/tmp", "/", "/usr", "/home", "/var", "/v"):
+        script = _build_bare_entrypoint(subpath="agents/a1", root=danger)
+        assert f"rm -rf {danger}" not in script, f"clobbers {danger}!"
+        assert "ln -s" not in script, f"symlinked over {danger}!"
+        # still ensures the volume workspace dir exists + stays alive
+        assert "mkdir -p /v/agents/a1" in script
+        assert script.strip().endswith("exec sleep infinity")
+
+
+def test_bare_entrypoint_skips_symlink_when_root_already_on_volume():
+    from api.providers.modal import _build_bare_entrypoint
+    script = _build_bare_entrypoint(subpath="agents/a1", root="/v/agents/a1")
+    assert "ln -s" not in script and "rm -rf" not in script
+
+
+@pytest.mark.asyncio
+async def test_bare_sandbox_always_tags_for_reconcile(monkeypatch):
+    """create_bare_sandbox must tag the sandbox with its object_id even when
+    no sandbox_ref is passed, so reconcile_on_startup can reap orphans."""
+    import api.providers.modal as md
+
+    tagged = {}
+
+    class _SB:
+        object_id = "sb-bare-1"
+        def set_tags(self, t):
+            tagged.update(t)
+        def terminate(self):
+            pass
+
+    async def _app():
+        return type("A", (), {"app_id": "ap-1"})()
+
+    async def _img():
+        return object()
+
+    async def _vol(ref):
+        return object()
+
+    monkeypatch.setattr(md, "_get_app", _app)
+    monkeypatch.setattr(md, "_get_image", _img)
+    monkeypatch.setattr(md, "_get_volume", _vol)
+    monkeypatch.setattr(md, "_to_modal_resources", lambda r: {})
+    monkeypatch.setattr(md, "_require_modal",
+                        lambda: (type("M", (), {"Sandbox": type(
+                            "S", (), {"create": staticmethod(lambda *a, **k: _SB())})})(),
+                            None))
+    # Sandbox.create is called via asyncio.to_thread(lambda: modal.Sandbox.create(...))
+    inst = await md.create_bare_sandbox(volume_ref="vol-1", subpath="agents/a1")
+    assert inst.sandbox_ref == "sb-bare-1"
+    assert tagged.get("agent-sdk.sandbox-id") == "sb-bare-1", (
+        "bare sandbox not tagged with object_id — reconcile can't reap orphans")
+
+
 # ── ModalTransport (mocked — recreate-on-missing lifecycle) ─────────────────
 
 @pytest.mark.asyncio

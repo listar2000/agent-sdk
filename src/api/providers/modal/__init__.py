@@ -493,9 +493,17 @@ def _build_bare_entrypoint(*, subpath: str, root: str | None) -> str:
     lines = ["set -e", f"mkdir -p {shlex.quote(vol_workspace)}"]
     # Symlink the session root onto the volume so workspace bytes persist on
     # the Volume, not the ephemeral sandbox FS (lost on terminate). Skip when
-    # root is already under the volume mount or unset.
+    # root is already under the volume mount, unset, or a critical system dir.
+    # The symlink does ``rm -rf root`` first, so REFUSE to clobber paths like
+    # /tmp, /, /usr, /home (a misconfigured cwd must never wipe a system dir);
+    # for those we leave the FS alone — absolute /v paths still persist, only
+    # the root-relative convenience symlink is skipped.
+    _CRITICAL = {"/", "/tmp", "/usr", "/etc", "/var", "/bin", "/sbin",
+                 "/lib", "/lib64", "/dev", "/proc", "/sys", "/root",
+                 "/home", "/opt", _VOLUME_MOUNT}
+    norm = (root or "").rstrip("/") or root
     if root and root != vol_workspace and not root.startswith(_VOLUME_MOUNT + "/") \
-            and root != _VOLUME_MOUNT:
+            and root != _VOLUME_MOUNT and norm not in _CRITICAL:
         parent = root.rsplit("/", 1)[0] or "/"
         lines += [
             f"mkdir -p {shlex.quote(parent)}",
@@ -549,8 +557,15 @@ async def create_bare_sandbox(
         )
     )
     try:
-        if sandbox_ref:
-            await asyncio.to_thread(sb.set_tags, {_TAG_KEY: sandbox_ref})
+        # ALWAYS tag with the sandbox id so reconcile_on_startup can reclaim
+        # this sandbox if it's ever orphaned (crash between create and the
+        # session persisting state.sandbox_ref, or a deleted session row).
+        # Untagged sandboxes are skipped by the reconciler — without this a
+        # native-modal orphan would leak until the 1h timeout ceiling. The
+        # tag value matches what the session persists as state.sandbox_ref
+        # (the object_id), so live sandboxes are never mis-reaped.
+        await asyncio.to_thread(sb.set_tags,
+                                {_TAG_KEY: sandbox_ref or sb.object_id})
         # No health gate: a bare `sleep infinity` PID-1 is "running" the
         # moment Modal schedules it. The transport's create does one
         # `exec true`/`mkdir` as the readiness probe.
