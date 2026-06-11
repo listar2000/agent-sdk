@@ -882,7 +882,7 @@ async def test_corrupt_agent_memory_recovers_not_loops(provider, agent_type):
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
-@agent_type_param
+@agent_type_param_with_native
 @pytest.mark.asyncio
 async def test_delete_session_destroys_sandbox(provider, agent_type):
     """``DELETE /sessions/{id}`` must destroy the underlying sandbox, not
@@ -899,14 +899,20 @@ async def test_delete_session_destroys_sandbox(provider, agent_type):
     left 6 paused-with-no-session-row daytona sandboxes against the
     2000 GiB account quota.
     """
-    _require_provider(provider)
+    _require_provider(provider, agent_type)
 
     async with ApiClient(SERVER) as sdk:
         sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
+        # Native is lazy — no sandbox until the first tool call. Provision it
+        # with a one-shot exec so there's a real container to assert-destroyed.
+        # CLI runtimes already have a sandbox, so this is a cheap no-op probe.
         sandbox = await _get_sandbox(sdk, session_id)
+        if not (sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")):
+            await _ask(sdk, session_id, "Run the shell command `true` and reply OK.")
+            sandbox = await _get_sandbox(sdk, session_id)
         sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
-        assert sandbox_ref, f"fresh session has no sandbox_ref: {sandbox}"
+        assert sandbox_ref, f"session has no sandbox_ref after provision: {sandbox}"
         print(f"\n[test:{provider}] session={session_id[:8]} sandbox={sandbox_ref[:24]}")
 
         # Skip the autouse cleanup fixture's DELETE — we're calling
@@ -2541,14 +2547,20 @@ async def test_midprompt_recovery_does_not_leak_subscriber(provider, agent_type)
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
-@agent_type_param
+@agent_type_param_with_native
 @pytest.mark.asyncio
 @pytest.mark.timeout(900)
 async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type):
     """An idle session (no prompt in flight) with an open /events consumer
     MUST hibernate when the reaper decision runs. A refusal means
-    subscriber-presence is being counted as compute activity — the pin."""
-    _require_provider(provider)
+    subscriber-presence is being counted as compute activity — the pin.
+
+    Includes ``native`` (docker-only): the reap→hibernate→cold-resume path is
+    the native resource-management contract — reap docker-stops the container,
+    the next turn docker-starts the SAME container and answers, conversation
+    preserved via the checkpoint. Behavioral oracle (hibernated flag + reply),
+    no inner_session_id dependency."""
+    _require_provider(provider, agent_type)
 
     async with ApiClient(SERVER) as sdk:
         sess = await _quick_session(sdk, provider, agent_type=agent_type)
