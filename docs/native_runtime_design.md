@@ -152,10 +152,30 @@ check, session.py:181), subscriber fan-out, `_prompt_lock`.
   2s probe budget, liveness.py:163).
 - **start()**: load latest checkpoint (or none) — no compute. The pool's
   start-failure cleanup is guarded on `sandbox_ref` so no-compute sessions
-  skip destroy (pool.py:255-256). **stop()**: write checkpoint; daytona →
-  provider pause; else no-op. Must complete fast — `shutdown_all` bounds each
-  release at 10s (pool.py:460-483), so workspace tar persist (§5) never runs
-  there.
+  skip destroy (pool.py:255-256).
+- **Lifecycle (implemented) — hibernate ≠ destroy, so compute is reclaimed
+  without leaking and resume is cheap.** The pool's `release()` (reaper or
+  explicit) calls `stop()` then `shutdown()`:
+  - **`stop()` = hibernate**: `docker stop` the container — frees CPU/RAM,
+    KEEPS the container + its writable layer (workspace files survive).
+    `sandbox_ref` is preserved on `state` (pool persists it after).
+  - **`shutdown()` = in-memory teardown only**: cancels the loop task,
+    drops the transport handle — does NOT touch compute (putting destroy
+    here would make every reap a hard delete; the P0 bug this fixes).
+  - **runtime hibernate is automatic**: `release()` pops the NativeSession
+    from `pool._active`, so the in-memory `_messages` are GC'd; the next
+    prompt cold-paths a fresh NativeSession whose `start()` reloads the
+    checkpoint.
+  - **resume**: `_ensure_sandbox` is reattach-or-create — if `sandbox_ref`
+    is set and the container still exists, `docker start` it (workspace
+    intact, fast); a stale ref (container gone) falls through to a fresh
+    create.
+  - **destroy()** (DELETE /sessions): `docker rm -f` by ref — the only path
+    that actually removes the container. `_destroy_session_compute` routes
+    native through `state.provider` (docker) since `state.type=="native"`
+    has no provider module. Verified end-to-end: turn → release (container
+    `exited`) → next turn reattaches the SAME container with the file
+    intact AND recalls a checkpointed fact → delete removes it.
 - **Lazy compute (S7)**: first tool call provisions via the provider's
   native-flavor create (§4), **then immediately `db.write_sandbox_state`**
   with the new sandbox_ref and the standard origin labels — otherwise a crash

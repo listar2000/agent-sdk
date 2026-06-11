@@ -110,6 +110,28 @@ class DockerTransport:
             "inspect", "-f", "{{.State.Running}}", self.container_id, timeout=15)
         return rc == 0 and out.decode().strip() == "true"
 
+    async def exists(self) -> bool:
+        """True if the container is present (running OR stopped) — the
+        resume check distinguishing a hibernated sandbox from a gone one."""
+        if not self.container_id:
+            return False
+        rc, _, _ = await _run_docker(
+            "inspect", "-f", "{{.Id}}", self.container_id, timeout=15)
+        return rc == 0
+
+    async def hibernate(self) -> None:
+        """``docker stop`` — free CPU/RAM, KEEP the container and its
+        writable layer (workspace files survive). Resume = ``start()``."""
+        if not self.container_id:
+            return
+        await _run_docker("stop", "-t", "2", self.container_id, timeout=30)
+
+    async def resume(self) -> None:
+        """``docker start`` a hibernated container — files intact, cheap."""
+        if not self.container_id:
+            return
+        await _run_docker("start", self.container_id, timeout=30)
+
     async def destroy(self) -> None:
         if not self.container_id:
             return

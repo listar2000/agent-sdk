@@ -120,22 +120,42 @@ class NativeSession(BaseSandboxSession):
         self._started = True
 
     async def stop(self) -> None:
-        """Persist-on-release. Checkpoints are already written per turn, so
-        this is a no-op for the in-server state; provider pause for a live
-        sandbox is a P1 concern (docker/modal volumes are POSIX-real;
-        daytona pause lands with the daytona transport)."""
-        return None
-
-    async def shutdown(self) -> None:
-        await self._cancel_active()
+        """HIBERNATE (reaper / release): free the sandbox's CPU+RAM but KEEP
+        the container so a future prompt resumes it with workspace intact.
+        Conversation state is already checkpointed per turn. ``sandbox_ref``
+        is preserved on ``state`` (the pool persists it after this returns)
+        so the next provision reattaches instead of creating fresh."""
         if self._transport is not None:
             try:
-                await self._transport.destroy()
+                await self._transport.hibernate()
             except Exception:
-                log.exception("native: transport destroy failed for %s",
-                              self.session_id)
-            self._transport = None
+                log.exception("native: hibernate failed for %s", self.session_id)
+
+    async def shutdown(self) -> None:
+        """In-memory teardown only — must NOT destroy compute (release()
+        calls stop()+shutdown(); destroying here would make every reap a
+        hard delete). The container is freed by ``destroy()`` on session
+        delete, or left hibernated by ``stop()`` on reap."""
+        await self._cancel_active()
+        self._transport = None
         await super().shutdown()
+
+    async def destroy(self) -> None:
+        """Hard-delete the sandbox compute (DELETE /sessions). Idempotent;
+        works by ``sandbox_ref`` even when this instance never provisioned
+        the container (the post-hibernate cold path)."""
+        ref = getattr(self.state, "sandbox_ref", None)
+        if not ref:
+            return
+        from .transport import DockerTransport
+        provider = getattr(self.state, "provider", "docker")
+        if provider == "docker":
+            try:
+                await DockerTransport(container_id=ref).destroy()
+            except Exception:
+                log.exception("native: destroy failed for %s ref=%s",
+                              self.session_id, ref)
+        self._transport = None
 
     # ── liveness: the session object is the runtime ─────────────────────────
 
@@ -253,22 +273,40 @@ class NativeSession(BaseSandboxSession):
                 await self.start()
             if self._transport_factory is not None:
                 t = await self._transport_factory()
-            else:
-                provider = getattr(self.state, "provider", "docker")
-                if provider != "docker":
-                    raise RuntimeError(
-                        f"native provider {provider!r} not wired in P0 "
-                        f"(docker only)")
-                from .transport import DockerTransport
-                t = DockerTransport(workdir=self._cwd)
-                await t.create(image=_native_image(),
-                               labels={"agent_sdk_origin": _origin(),
-                                       "native_session": self.session_id})
-                # Make the cwd exist so relative paths in tools resolve.
-                import shlex
-                await t.exec(f"mkdir -p {shlex.quote(self._cwd)}", cwd="/")
+                self._transport = t
+                self.state.sandbox_ref = getattr(t, "container_id", None)
+                await self._persist_state()
+                return t
+
+            provider = getattr(self.state, "provider", "docker")
+            if provider != "docker":
+                raise RuntimeError(
+                    f"native provider {provider!r} not wired in P0 "
+                    f"(docker only)")
+            from .transport import DockerTransport
+            import shlex
+
+            # RESUME: a prior provision left a hibernated (stopped) or
+            # still-running container. Reattach + start it — workspace files
+            # intact — instead of creating a fresh sandbox. Falls through to
+            # create if the ref is stale (container was destroyed).
+            ref = getattr(self.state, "sandbox_ref", None)
+            if ref:
+                t = DockerTransport(container_id=ref, workdir=self._cwd)
+                if await t.exists():
+                    if not await t.is_alive():
+                        await t.resume()
+                    self._transport = t
+                    return t
+
+            t = DockerTransport(workdir=self._cwd)
+            await t.create(image=_native_image(),
+                           labels={"agent_sdk_origin": _origin(),
+                                   "native_session": self.session_id})
+            # Make the cwd exist so relative paths in tools resolve.
+            await t.exec(f"mkdir -p {shlex.quote(self._cwd)}", cwd="/")
             self._transport = t
-            self.state.sandbox_ref = getattr(t, "container_id", None)
+            self.state.sandbox_ref = t.container_id
             await self._persist_state()
             return t
 

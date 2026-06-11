@@ -2457,8 +2457,14 @@ async def _destroy_session_compute(session_id: str) -> None:
             # ``state.type`` is the Pydantic discriminator
             # (``"unix_local"`` / ``"docker"`` / ``"daytona"`` /
             # ``"modal"``) — same key space as ``_PROVIDER_MODS``,
-            # so this is a direct lookup.
+            # so this is a direct lookup. Native is the exception: its
+            # ``type`` is ``"native"`` (no provider module) but its compute
+            # lives on ``state.provider`` (docker in P0), so route the
+            # destroy through that — the docker module ``rm -f``s the
+            # container by ref.
             provider_type = getattr(state, "type", None)
+            if provider_type == "native":
+                provider_type = getattr(state, "provider", None)
     except Exception as e:
         log.warning("teardown %s: read state failed: %s", session_id, e)
 
