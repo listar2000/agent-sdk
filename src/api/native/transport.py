@@ -363,7 +363,21 @@ class DaytonaTransport:
         # wrap with cd + env -- so relative paths and per-call env still work.
         prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
         full = f"cd {shlex.quote(wd)} && {prefix}{command}"
-        res = await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
+
+        async def _run():
+            return await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
+
+        # Self-heal an externally-paused sandbox (the reaper, an ops pause):
+        # exec against a stopped daytona VM raises; resume the SAME VM and
+        # retry once — keeps the session warm, mirrors DockerTransport.exec.
+        try:
+            res = await _run()
+        except Exception:
+            if await self.status() == "stopped":
+                await self.resume()
+                res = await _run()
+            else:
+                raise
         return TransportExecResult(res.stdout or "", res.stderr or "",
                                    res.exit_code if res.exit_code is not None else -1,
                                    bool(getattr(res, "timed_out", False)))

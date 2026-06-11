@@ -127,11 +127,12 @@ def _require_provider(provider: str, agent_type: str = "claude") -> None:
     """Call pytest.skip() if the provider isn't available. Call at test start."""
     if not _has_server():
         pytest.skip("server not running on localhost:7778")
-    # Native runtime is docker-only in P0 — skip native×{daytona,unix_local,
-    # modal} so the native-inclusive recovery goldens collect cleanly across
-    # the existing provider matrix without running unwired cells.
-    if agent_type == "native" and provider != "docker":
-        pytest.skip("native runtime is docker-only in P0")
+    # Native transports: docker (P0) + daytona (P1, live-verified). unix_local
+    # and modal native transports aren't built yet, so skip those cells so the
+    # native-inclusive goldens collect cleanly across the provider matrix.
+    if agent_type == "native" and provider not in ("docker", "daytona"):
+        pytest.skip("native runtime supports docker + daytona; "
+                    f"{provider} transport not yet built")
     if provider == "daytona" and not _has_daytona():
         pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
     if provider == "docker" and not _has_docker():
