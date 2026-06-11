@@ -232,10 +232,13 @@ async def test_bare_sandbox_always_tags_for_reconcile(monkeypatch):
                             "S", (), {"create": staticmethod(lambda *a, **k: _SB())})})(),
                             None))
     # Sandbox.create is called via asyncio.to_thread(lambda: modal.Sandbox.create(...))
+    monkeypatch.setenv("AGENT_SDK_ORIGIN", "test")
     inst = await md.create_bare_sandbox(volume_ref="vol-1", subpath="agents/a1")
     assert inst.sandbox_ref == "sb-bare-1"
     assert tagged.get("agent-sdk.sandbox-id") == "sb-bare-1", (
         "bare sandbox not tagged with object_id — reconcile can't reap orphans")
+    assert tagged.get("agent_sdk_origin") == "test", (
+        "bare sandbox not tagged with origin — cleanup_orphans can't isolate it")
 
 
 # ── ModalTransport (mocked — recreate-on-missing lifecycle) ─────────────────

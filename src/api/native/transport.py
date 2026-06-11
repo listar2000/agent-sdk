@@ -449,7 +449,17 @@ class ModalTransport:
         if not inst.sandbox_ref:
             raise RuntimeError("modal create returned no sandbox_ref")
         self.sandbox_ref = inst.sandbox_ref
-        await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+        # Readiness gate. If it fails the sandbox is live but unusable — destroy
+        # it before propagating so we don't leak it until modal's timeout
+        # ceiling (mirrors DockerTransport.create's destroy-before-raise).
+        try:
+            await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+        except BaseException:
+            try:
+                await self.destroy()
+            except Exception:
+                log.exception("modal native: cleanup after readiness failure")
+            raise
         return self.sandbox_ref
 
     async def status(self) -> str:

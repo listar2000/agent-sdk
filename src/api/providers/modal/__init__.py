@@ -84,6 +84,10 @@ _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
 _TAG_KEY = "agent-sdk.sandbox-id"
 
+# Origin tag (test|production), analogous to the docker/daytona
+# ``agent_sdk_origin`` label, so cleanup_orphans.py can isolate test residue.
+_ORIGIN_TAG = "agent_sdk_origin"
+
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
 
@@ -552,20 +556,32 @@ async def create_bare_sandbox(
             image=image,
             volumes={_VOLUME_MOUNT: vol},
             timeout=_SANDBOX_TIMEOUT_SEC,
-            idle_timeout=_SANDBOX_IDLE_TIMEOUT_SEC,
+            # idle_timeout == hard timeout (not the supervisor's shorter
+            # _SANDBOX_IDLE_TIMEOUT_SEC): the bare path has NO tunnel, so
+            # modal's idle clock — documented to key off tunnel HTTP traffic —
+            # has no signal to reset and could reap an ACTIVE native session
+            # mid-tool-call. Native idle lifecycle is owned by the server's
+            # SessionPool reaper (which tracks exec activity and hibernates),
+            # so we disable modal's separate idle timer and keep only the hard
+            # ceiling as a backstop.
+            idle_timeout=_SANDBOX_TIMEOUT_SEC,
             **res_kw,
         )
     )
+    origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
     try:
-        # ALWAYS tag with the sandbox id so reconcile_on_startup can reclaim
-        # this sandbox if it's ever orphaned (crash between create and the
-        # session persisting state.sandbox_ref, or a deleted session row).
-        # Untagged sandboxes are skipped by the reconciler — without this a
-        # native-modal orphan would leak until the 1h timeout ceiling. The
-        # tag value matches what the session persists as state.sandbox_ref
-        # (the object_id), so live sandboxes are never mis-reaped.
-        await asyncio.to_thread(sb.set_tags,
-                                {_TAG_KEY: sandbox_ref or sb.object_id})
+        # ALWAYS tag so out-of-band reclaim can find this sandbox:
+        #  - _TAG_KEY (=object_id): reconcile_on_startup reaps it if orphaned
+        #    (crash between create and the session persisting state.sandbox_ref,
+        #    or a deleted session row). Untagged sandboxes are skipped by the
+        #    reconciler. The value matches state.sandbox_ref so live sandboxes
+        #    are never mis-reaped.
+        #  - agent_sdk_origin: lets cleanup_orphans.py (_reap_modal) isolate
+        #    test residue from production, matching the docker/daytona label.
+        await asyncio.to_thread(sb.set_tags, {
+            _TAG_KEY: sandbox_ref or sb.object_id,
+            _ORIGIN_TAG: origin,
+        })
         # No health gate: a bare `sleep infinity` PID-1 is "running" the
         # moment Modal schedules it. The transport's create does one
         # `exec true`/`mkdir` as the readiness probe.
