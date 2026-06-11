@@ -80,8 +80,10 @@ def _register_default_providers() -> None:
     from api.providers.docker.session import DockerSandboxSession
     from api.providers.modal.session import ModalSandboxSession
     from api.providers.unix_local.session import UnixLocalSandboxSession
+    from api.native.session import NativeSession
     register("daytona", _adapt(DaytonaSandboxSession))
     register("docker", _adapt(DockerSandboxSession))
     register("modal", _adapt(ModalSandboxSession))
     register("unix_local", _adapt(UnixLocalSandboxSession))
+    register("native", _adapt(NativeSession))
     register("unknown", _adapt(DaytonaSandboxSession))  # default-to-daytona
