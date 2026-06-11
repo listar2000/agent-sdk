@@ -1,0 +1,205 @@
+"""Sandbox transports for the native runtime — tool effects over provider
+primitives, no supervisor anywhere.
+
+A transport owns ONE sandbox for ONE session: create it (native flavor — a
+no-op PID-1, nothing listening, nothing inbound), run commands in it, move
+file bytes in and out, destroy it. The loop's tools (api/native/tools.py)
+call only this surface, so adding daytona/modal in P1 is a new subclass,
+not a tool change.
+
+P0 ships DockerTransport. Verified provider-audit constraints baked in:
+- the docker CLI's exec timeout kills the CLIENT, not the in-container
+  process — commands are wrapped with coreutils/busybox ``timeout`` inside
+  the container, with the asyncio wait as a backstop only;
+- ``docker exec <args>`` embeds argv in one execve — base64-in-argv caps
+  file payloads at ~96KiB (MAX_ARG_STRLEN), so writes stream base64 over
+  STDIN instead (no practical size limit);
+- env/cwd ride ``-e``/``-w`` flags per call (the native create passes no
+  secrets into the container environment at all — the session's non-LLM
+  secrets are injected per-exec by the caller, and LLM keys never reach
+  the transport, see design §6).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import shlex
+from dataclasses import dataclass
+
+from api.providers._shared import _MAX_OUTPUT_BYTES, _truncate
+from api.providers.docker import _run_docker, _run_docker_checked
+
+log = logging.getLogger(__name__)
+
+#: in-container wall-clock cap for one tool exec when the caller passes none.
+DEFAULT_EXEC_TIMEOUT_S = 300
+#: extra slack for the host-side backstop over the in-container timeout.
+_BACKSTOP_SLACK_S = 10
+#: exit statuses indicating the watchdog (or backstop) killed the command:
+#: 137 = 128+KILL from the in-container group kill; 124 = host backstop.
+#: Signal statuses are ambiguous (any KILLed command shares them), so
+#: timed_out additionally requires the wall clock to have reached the
+#: budget.
+_TIMEOUT_RCS = frozenset({124, 137})
+
+
+@dataclass
+class TransportExecResult:
+    stdout: str
+    stderr: str
+    exit_code: int
+    timed_out: bool
+
+
+class DockerTransport:
+    """One docker container per session, ``sleep infinity`` as PID-1."""
+
+    provider = "docker"
+
+    def __init__(self, container_id: str | None = None):
+        self.container_id = container_id
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+
+    async def create(self, *, image: str, labels: dict[str, str] | None = None,
+                     mounts: list[str] | None = None) -> str:
+        """Create + start the sandbox. Returns the container id.
+
+        Native flavor: PID-1 is ``sleep infinity`` — no supervisor, no
+        published ports, nothing listening. Readiness is one ``exec true``
+        (replaces the supervisor health gate the provider create uses).
+        ``mounts`` are raw ``--mount`` values (the P0-G wiring passes the
+        same volume-subpath mounts the docker provider builds today).
+        """
+        args = ["run", "-d"]
+        for m in mounts or []:
+            args += ["--mount", m]
+        for k, v in (labels or {}).items():
+            args += ["--label", f"{k}={v}"]
+        args += ["--entrypoint", "sleep", image, "infinity"]
+        out = await _run_docker_checked(*args, timeout=120)
+        cid = out.decode().strip()
+        if not cid:
+            raise RuntimeError("docker run returned empty container id")
+        self.container_id = cid
+        # Readiness gate — fail loud now rather than on the first tool call.
+        rc, _, err = await _run_docker("exec", cid, "true", timeout=30)
+        if rc != 0:
+            await self.destroy()
+            raise RuntimeError(
+                f"native sandbox readiness exec failed (rc={rc}): "
+                f"{err.decode(errors='replace')[:300]}")
+        return cid
+
+    async def is_alive(self) -> bool:
+        if not self.container_id:
+            return False
+        rc, out, _ = await _run_docker(
+            "inspect", "-f", "{{.State.Running}}", self.container_id, timeout=15)
+        return rc == 0 and out.decode().strip() == "true"
+
+    async def destroy(self) -> None:
+        if not self.container_id:
+            return
+        await _run_docker("rm", "-f", self.container_id, timeout=60)
+
+    # ── exec ───────────────────────────────────────────────────────────────
+
+    async def exec(self, command: str, *, cwd: str | None = None,
+                   env: dict[str, str] | None = None,
+                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S) -> TransportExecResult:
+        """Run one shell command inside the sandbox.
+
+        The in-container ``timeout`` is the real enforcement: killing the
+        ``docker exec`` client (what an asyncio timeout alone would do)
+        leaves the process running inside the container. Exit code 124 from
+        the wrapper maps to ``timed_out=True``.
+        """
+        self._require_sandbox()
+        t = max(1, int(timeout_s))
+        # In-container timeout that reliably reaps the WHOLE command tree.
+        # Neither busybox ``timeout`` nor a TERM trap works here: busybox
+        # TERMs only its direct child (orphaning grandchildren), and POSIX
+        # shells defer signal traps until the foreground child exits — the
+        # trap never fires while ``sleep 30`` runs. Instead: ``setsid``
+        # makes the user command lead its OWN process group, a detached
+        # watchdog ``kill -9``s that group at the deadline, and ``wait``
+        # preserves the natural exit code. The watchdog's fds are detached
+        # so docker exec's stream EOFs the moment the wrapper exits instead
+        # of waiting out the full deadline.
+        inner = (
+            f"setsid sh -c {shlex.quote(command)} & c=$!; "
+            f"( sleep {t} && kill -9 -$c 2>/dev/null ) >/dev/null 2>&1 </dev/null & w=$!; "
+            "wait $c; rc=$?; kill -9 $w 2>/dev/null; exit $rc"
+        )
+        wrapped = inner
+        args = ["exec"]
+        if cwd:
+            args += ["-w", cwd]
+        for k, v in (env or {}).items():
+            args += ["-e", f"{k}={v}"]
+        args += [self.container_id, "sh", "-c", wrapped]
+        started = asyncio.get_event_loop().time()
+        try:
+            rc, out, err = await _run_docker(*args, timeout=t + _BACKSTOP_SLACK_S)
+        except RuntimeError:
+            # Host-side backstop fired — the in-container wrapper should
+            # have ended it first; report as timeout either way.
+            return TransportExecResult("", "host-side exec backstop fired",
+                                       124, True)
+        elapsed = asyncio.get_event_loop().time() - started
+        stdout, _ = _truncate(out, _MAX_OUTPUT_BYTES)
+        stderr, _ = _truncate(err, _MAX_OUTPUT_BYTES)
+        timed_out = rc in _TIMEOUT_RCS and elapsed >= t * 0.9
+        return TransportExecResult(stdout, stderr, rc, timed_out)
+
+    # ── files ──────────────────────────────────────────────────────────────
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        """Stream base64 over stdin — safe for payloads beyond the ~96KiB
+        argv ceiling that base64-in-argv hits (Linux MAX_ARG_STRLEN)."""
+        self._require_sandbox()
+        q = shlex.quote(path)
+        qdir = shlex.quote(_dirname(path))
+        from api.providers.docker import _require_docker
+        proc = await asyncio.create_subprocess_exec(
+            _require_docker(), "exec", "-i", self.container_id, "sh", "-c",
+            f"mkdir -p {qdir} && base64 -d > {q}",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(
+            proc.communicate(base64.b64encode(data)), timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"write_file({path}) failed (rc={proc.returncode}): "
+                f"{(err or b'').decode(errors='replace')[:300]}")
+
+    async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
+        self._require_sandbox()
+        q = shlex.quote(path)
+        res = await self.exec(f"base64 < {q}", timeout_s=120)
+        if res.exit_code != 0:
+            raise FileNotFoundError(
+                f"read_file({path}) failed (rc={res.exit_code}): "
+                f"{res.stderr[:300]}")
+        data = base64.b64decode(res.stdout)
+        if len(data) > max_bytes:
+            raise ValueError(f"read_file({path}): {len(data)}B exceeds "
+                             f"max_bytes={max_bytes}")
+        return data
+
+    # ── internal ───────────────────────────────────────────────────────────
+
+    def _require_sandbox(self) -> None:
+        if not self.container_id:
+            raise RuntimeError("transport has no sandbox (lazy compute not "
+                               "yet provisioned)")
+
+
+def _dirname(path: str) -> str:
+    i = path.rfind("/")
+    return path[:i] if i > 0 else "/"
