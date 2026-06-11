@@ -193,6 +193,16 @@ class DockerTransport:
             # have ended it first; report as timeout either way.
             return TransportExecResult("", "host-side exec backstop fired",
                                        124, True)
+        # Self-heal an externally-stopped sandbox: if the container was
+        # hibernated/stopped out from under a live session (the reaper, an
+        # ops `docker stop`, a host suspend), docker exec fails with "is not
+        # running". Resume the SAME container and retry once — keeps the
+        # session warm (no cold-recovery / checkpoint reload) and pays
+        # nothing on the happy path. A genuinely-removed container can't
+        # resume; that error propagates to the normal recovery path.
+        if rc != 0 and _container_not_running(err):
+            await self.resume()
+            rc, out, err = await _run_docker(*args, timeout=t + _BACKSTOP_SLACK_S)
         elapsed = asyncio.get_event_loop().time() - started
         stdout, _ = _truncate(out, _MAX_OUTPUT_BYTES)
         stderr, _ = _truncate(err, _MAX_OUTPUT_BYTES)
@@ -203,25 +213,35 @@ class DockerTransport:
 
     async def write_file(self, path: str, data: bytes) -> None:
         """Stream base64 over stdin — safe for payloads beyond the ~96KiB
-        argv ceiling that base64-in-argv hits (Linux MAX_ARG_STRLEN)."""
+        argv ceiling that base64-in-argv hits (Linux MAX_ARG_STRLEN).
+        Self-heals an externally-stopped container (resume + retry once),
+        same as exec()."""
         self._require_sandbox()
         path = self._resolve(path)
         q = shlex.quote(path)
         qdir = shlex.quote(_dirname(path))
-        from api.providers.docker import _require_docker
-        proc = await asyncio.create_subprocess_exec(
-            _require_docker(), "exec", "-i", self.container_id, "sh", "-c",
-            f"mkdir -p {qdir} && base64 -d > {q}",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, err = await asyncio.wait_for(
-            proc.communicate(base64.b64encode(data)), timeout=120)
-        if proc.returncode != 0:
+        payload = base64.b64encode(data)
+
+        async def _attempt() -> tuple[int, bytes]:
+            from api.providers.docker import _require_docker
+            proc = await asyncio.create_subprocess_exec(
+                _require_docker(), "exec", "-i", self.container_id, "sh", "-c",
+                f"mkdir -p {qdir} && base64 -d > {q}",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, e = await asyncio.wait_for(proc.communicate(payload), timeout=120)
+            return proc.returncode or 0, e or b""
+
+        rc, err = await _attempt()
+        if rc != 0 and _container_not_running(err):
+            await self.resume()
+            rc, err = await _attempt()
+        if rc != 0:
             raise RuntimeError(
-                f"write_file({path}) failed (rc={proc.returncode}): "
-                f"{(err or b'').decode(errors='replace')[:300]}")
+                f"write_file({path}) failed (rc={rc}): "
+                f"{err.decode(errors='replace')[:300]}")
 
     async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
         self._require_sandbox()
@@ -243,6 +263,13 @@ class DockerTransport:
         if not self.container_id:
             raise RuntimeError("transport has no sandbox (lazy compute not "
                                "yet provisioned)")
+
+
+def _container_not_running(err: bytes) -> bool:
+    """True if a docker exec error means the target container is stopped
+    (recoverable via resume) — not removed (which says 'no such container')."""
+    msg = (err or b"").decode(errors="replace").lower()
+    return "is not running" in msg or "is not paused" in msg
 
 
 def _dirname(path: str) -> str:

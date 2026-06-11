@@ -1505,7 +1505,11 @@ async def session_sandbox_info(session_id: str):
         if sb_payload is None:
             raise HTTPException(404, f"Session {session_id} not found")
         state = deserialize(sb_payload)
-        provider = getattr(state, "type", "unknown")
+        # Report the COMPUTE backend. For native the runtime is in-server but
+        # the sandbox lives on state.provider (docker/...); reporting that
+        # lets sandbox tooling (external stop/delete, dashboards) act on the
+        # real container instead of the "native" runtime discriminator.
+        provider = getattr(state, "provider", None) or getattr(state, "type", "unknown")
         sandbox_ref = getattr(state, "sandbox_ref", None)
         result: dict = {
             "session_id": session_id,
@@ -1523,8 +1527,9 @@ async def session_sandbox_info(session_id: str):
     state = pool_session.state
     # Provider name is the canonical ``state.type`` discriminator —
     # ``"unix_local"`` for the unix subprocess provider; no legacy
-    # ``"local"`` alias.
-    provider = getattr(state, "type", "unknown")
+    # ``"local"`` alias. Native reports its compute backend (state.provider)
+    # so sandbox tooling acts on the real container, not the runtime tag.
+    provider = getattr(state, "provider", None) or getattr(state, "type", "unknown")
     sandbox_ref = getattr(state, "sandbox_ref", None)
     result: dict = {
         "session_id": session_id,

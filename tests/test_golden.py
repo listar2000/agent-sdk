@@ -73,7 +73,7 @@ load_dotenv(os.path.expanduser("~/.env"), override=False)
 
 from agent_sdk import ApiClient  # noqa: E402
 from api.sse import extract_sse_tag, parse_acp_event  # noqa: E402
-from tests._acp_runtimes import agent_type_param  # noqa: E402
+from tests._acp_runtimes import agent_type_param, agent_type_param_with_native  # noqa: E402
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY")
@@ -123,10 +123,15 @@ def _has_server() -> bool:
         return False
 
 
-def _require_provider(provider: str) -> None:
+def _require_provider(provider: str, agent_type: str = "claude") -> None:
     """Call pytest.skip() if the provider isn't available. Call at test start."""
     if not _has_server():
         pytest.skip("server not running on localhost:7778")
+    # Native runtime is docker-only in P0 — skip native×{daytona,unix_local,
+    # modal} so the native-inclusive recovery goldens collect cleanly across
+    # the existing provider matrix without running unwired cells.
+    if agent_type == "native" and provider != "docker":
+        pytest.skip("native runtime is docker-only in P0")
     if provider == "daytona" and not _has_daytona():
         pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
     if provider == "docker" and not _has_docker():
@@ -559,7 +564,7 @@ def _extract_kv(text: str, key: str) -> str | None:
 # simply doesn't apply. Session continuity is covered by
 # ``test_session_resume_after_stop[modal]`` instead.
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
-@agent_type_param
+@agent_type_param_with_native
 @pytest.mark.asyncio
 async def test_stop_sandbox_same_sandbox_after_restart(provider, agent_type):
     """Stop sandbox externally → server restarts it → same sandbox_ref, sandbox responds.
@@ -567,9 +572,14 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider, agent_type):
     Parameterised over ``agent_type`` because the recovery path goes
     through ACP ``session/load`` and the per-runtime ``set_model``
     replay — both of which had opencode-specific bugs that this test
-    catches when run with ``agent_type="opencode"``.
+    catches when run with ``agent_type="opencode"``. Includes ``native``
+    (docker-only): the SAME-sandbox-after-external-stop invariant is
+    exactly native's hibernate→resume contract (docker stop → docker
+    start the same container), and it keys off ``sandbox_ref`` not
+    ``inner_session_id`` (which native never populates), so it's a clean
+    cross-runtime golden standard.
     """
-    _require_provider(provider)
+    _require_provider(provider, agent_type)
 
     async with ApiClient(SERVER) as sdk:
         sess = await _quick_session(sdk, provider, agent_type=agent_type)

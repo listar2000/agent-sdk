@@ -206,3 +206,31 @@ async def test_inspect_error_does_not_cold_create(monkeypatch):
     with pytest.raises(RuntimeError, match="transient"):
         await s._ensure_sandbox()
     assert created["n"] == 0, "must not cold-create on transient inspect error"
+
+
+@pytest.mark.asyncio
+async def test_exec_self_heals_externally_stopped_container():
+    """Live: an external `docker stop` of a live session's container is
+    transparently recovered — exec resumes the SAME container and retries,
+    keeping the session warm (no cold-recovery)."""
+    s = _session()
+    try:
+        t = await s._ensure_sandbox()
+        cid = t.container_id
+        await t.write_file("m.txt", b"warm")
+        # external stop out from under the live transport
+        subprocess.run(["docker", "stop", "-t", "1", cid], capture_output=True, timeout=30)
+        assert _container_state(cid) == "exited"
+        # exec must self-heal: resume same container + run the command
+        r = await t.exec("cat m.txt")
+        assert r.exit_code == 0 and r.stdout.strip() == "warm"
+        assert _container_state(cid) == "running"
+        assert t.container_id == cid, "must resume the SAME container, not replace it"
+        # write_file self-heals too
+        subprocess.run(["docker", "stop", "-t", "1", cid], capture_output=True, timeout=30)
+        await t.write_file("m2.txt", b"after-stop")
+        assert (await t.read_file("m2.txt")) == b"after-stop"
+    finally:
+        if s.state.sandbox_ref:
+            subprocess.run(["docker", "rm", "-f", s.state.sandbox_ref],
+                           capture_output=True)
