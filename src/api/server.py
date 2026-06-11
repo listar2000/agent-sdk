@@ -2779,10 +2779,14 @@ async def session_sandbox_exec(session_id: str, request: Request):
     if getattr(pool_session.state, "type", None) == "native":
         return await pool_session.sandbox_exec(command, timeout)
 
+    # Reuse the session we just resolved — pass its supervisor URL so the
+    # proxy doesn't re-run get_session() (it brings compute up, idempotent
+    # but a redundant pool round-trip on every CLI exec).
     response = await _proxy_from_session(
         session_id, "POST", "/v1/exec",
         json={"command": command, "timeout": timeout},
         timeout=timeout + 5,
+        supervisor_url=pool_session.supervisor_url or "",
     )
     if response.status_code >= 400:
         return response
@@ -2814,13 +2818,16 @@ async def _resolve_supervisor_url(session_id: str) -> str:
 async def _proxy_from_session(
     session_id: str, method: str, path: str, *,
     params: dict | None = None, json: dict | None = None,
-    timeout: int = 30,
+    timeout: int = 30, supervisor_url: str | None = None,
 ) -> Response:
     """Forward a request to the session's supervisor (resolved through
     the SessionPool) and return its JSON response. Used by every
     session-scoped file proxy. Uses the module-shared ``_HTTP_CLIENT`` so
-    repeat calls reuse the keep-alive connection to that supervisor."""
-    url = await _resolve_supervisor_url(session_id)
+    repeat calls reuse the keep-alive connection to that supervisor.
+
+    ``supervisor_url`` lets a caller that already resolved the session pass
+    its URL to skip a redundant ``get_session`` pool round-trip."""
+    url = supervisor_url if supervisor_url is not None else await _resolve_supervisor_url(session_id)
     if _HTTP_CLIENT is None:
         raise HTTPException(503, "server not yet initialised")
     try:
