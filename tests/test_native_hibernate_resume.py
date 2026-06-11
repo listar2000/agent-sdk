@@ -134,3 +134,75 @@ async def test_stale_ref_falls_through_to_create():
         if s.state.sandbox_ref and s.state.sandbox_ref != "deadbeefgone":
             subprocess.run(["docker", "rm", "-f", s.state.sandbox_ref],
                            capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_resume_issues_single_inspect(monkeypatch):
+    """B1: warm resume of a running container costs exactly ONE docker
+    inspect (status), not exists()+is_alive() = 2-3 calls."""
+    from api.native import transport as _t
+
+    calls = []
+    real = _t._run_docker
+
+    async def _counting(*args, **kw):
+        calls.append(args[0])
+        return await real(*args, **kw)
+
+    s = _session()
+    try:
+        t = await s._ensure_sandbox()
+        cid = t.container_id
+        # fresh session, container running; monkeypatch only the resume path
+        monkeypatch.setattr(_t, "_run_docker", _counting)
+        s2 = NativeSession(session_id="sess-hib2",
+                           state=NativeSandboxState(provider="docker",
+                                                    sandbox_ref=cid))
+        s2._started = True
+        s2._cwd = "/work"
+        async def _noop():
+            return None
+        s2._persist_state = _noop  # type: ignore
+        await s2._ensure_sandbox()
+        assert calls.count("inspect") == 1, f"resume used {calls.count('inspect')} inspects: {calls}"
+        # running container → no start needed
+        assert "start" not in calls
+    finally:
+        if s.state.sandbox_ref:
+            subprocess.run(["docker", "rm", "-f", s.state.sandbox_ref],
+                           capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_inspect_error_does_not_cold_create(monkeypatch):
+    """B2 fail-closed: a transient inspect failure must NOT create a fresh
+    sandbox over a possibly-live container (native has no volume — a spurious
+    create silently loses the workspace)."""
+    from api.native import transport as _t
+
+    created = {"n": 0}
+    real_create = _t.DockerTransport.create
+
+    async def _track_create(self, **kw):
+        created["n"] += 1
+        return await real_create(self, **kw)
+
+    async def _error_status(self):
+        return "error"
+
+    monkeypatch.setattr(_t.DockerTransport, "status", _error_status)
+    monkeypatch.setattr(_t.DockerTransport, "create", _track_create)
+
+    s = NativeSession(session_id="sess-err",
+                      state=NativeSandboxState(provider="docker",
+                                               sandbox_ref="someref",
+                                               recipe=Recipe(agent_type="native")))
+    s._started = True
+    s._cwd = "/work"
+    async def _noop():
+        return None
+    s._persist_state = _noop  # type: ignore
+
+    with pytest.raises(RuntimeError, match="transient"):
+        await s._ensure_sandbox()
+    assert created["n"] == 0, "must not cold-create on transient inspect error"

@@ -2766,10 +2766,12 @@ async def session_sandbox_exec(session_id: str, request: Request):
     timeout = min(data.get("timeout", 30), 300)
 
     # Native sessions have no supervisor — run through the session's
-    # transport (provisions the sandbox lazily on first exec).
+    # transport (provisions the sandbox lazily on first exec). Keyed off the
+    # state discriminator the factory already dispatches on, so no extra
+    # capability flag on the base class.
     from api.sandbox import get_pool
     pool_session = await get_pool().get_session(session_id)
-    if getattr(pool_session, "is_native", False):
+    if getattr(pool_session.state, "type", None) == "native":
         return await pool_session.sandbox_exec(command, timeout)
 
     response = await _proxy_from_session(

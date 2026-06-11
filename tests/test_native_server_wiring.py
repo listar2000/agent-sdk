@@ -130,7 +130,7 @@ async def test_sandbox_exec_routes_through_transport_and_provisions(app_client):
     fake = _FakeTransport()
     from api.sandbox import get_pool
     sess = await get_pool().get_session(sid)
-    assert sess.is_native
+    assert sess.state.type == "native"
     sess._transport_factory = lambda: _ret(fake)
 
     r = await client.post(f"/sessions/{sid}/sandbox/exec",

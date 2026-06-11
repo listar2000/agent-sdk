@@ -373,7 +373,12 @@ class SessionPool:
             # but hasn't had a prompt yet. Seed the idle window from now.
             sess.liveness._last_compute_at = now
             return False, "no_activity_yet"
-        provider = getattr(sess.state, "type", "")
+        # Key the idle window off the COMPUTE backend. For native sessions
+        # ``state.type`` is "native" but the sandbox lives on ``state.provider``
+        # (docker/daytona/modal), so a native-on-modal session inherits modal's
+        # window (modal stop is destructive — needless churn at the docker
+        # default). No-op for CLI sessions where provider isn't set.
+        provider = getattr(sess.state, "provider", None) or getattr(sess.state, "type", "")
         limit = (provider_idle_s or {}).get(provider, idle_s)
         if (now - last) > limit:
             return True, "idle"

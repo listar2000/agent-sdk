@@ -62,7 +62,6 @@ class NativeSession(BaseSandboxSession):
     # Native's volume can live on any backend (docker/daytona/modal), so the
     # base's volume.provider == volume_provider check must be skipped.
     volume_provider = ""
-    is_native = True
 
     def __init__(self, *, session_id: str, state: NativeSandboxState) -> None:
         super().__init__(session_id=session_id, state=state)
@@ -287,17 +286,35 @@ class NativeSession(BaseSandboxSession):
             import shlex
 
             # RESUME: a prior provision left a hibernated (stopped) or
-            # still-running container. Reattach + start it — workspace files
-            # intact — instead of creating a fresh sandbox. Falls through to
-            # create if the ref is stale (container was destroyed).
+            # still-running container. ONE inspect classifies it — reattach +
+            # start (workspace intact) rather than create a fresh sandbox.
             ref = getattr(self.state, "sandbox_ref", None)
             if ref:
                 t = DockerTransport(container_id=ref, workdir=self._cwd)
-                if await t.exists():
-                    if not await t.is_alive():
-                        await t.resume()
+                st = await t.status()
+                if st == "running":
                     self._transport = t
                     return t
+                if st == "stopped":
+                    await t.resume()
+                    self._transport = t
+                    return t
+                if st == "error":
+                    # Transient daemon failure — do NOT cold-create over a
+                    # container that may still be alive (native has no volume
+                    # backing in P0, so a spurious create silently loses the
+                    # workspace). Fail-closed: surface the error, retry later.
+                    raise RuntimeError(
+                        f"native: sandbox {ref[:12]} inspect failed "
+                        f"(transient); not creating over a possibly-live "
+                        f"container")
+                # st == "missing": the container is genuinely gone. Best-effort
+                # rm the stale ref (defends against a half-deleted container
+                # leaking) before creating fresh.
+                try:
+                    await t.destroy()
+                except Exception:
+                    pass
 
             t = DockerTransport(workdir=self._cwd)
             await t.create(image=_native_image(),

@@ -110,14 +110,27 @@ class DockerTransport:
             "inspect", "-f", "{{.State.Running}}", self.container_id, timeout=15)
         return rc == 0 and out.decode().strip() == "true"
 
-    async def exists(self) -> bool:
-        """True if the container is present (running OR stopped) — the
-        resume check distinguishing a hibernated sandbox from a gone one."""
+    async def status(self) -> str:
+        """One inspect → ``running`` | ``stopped`` | ``missing`` | ``error``.
+        Same vocabulary as the docker-CLI provider's ``get_sandbox_status``
+        so resume costs ONE round-trip (vs separate exists()+is_alive()).
+        ``error`` is a transient daemon failure — caller must NOT treat it as
+        ``missing`` and cold-create over a live container."""
         if not self.container_id:
-            return False
-        rc, _, _ = await _run_docker(
-            "inspect", "-f", "{{.Id}}", self.container_id, timeout=15)
-        return rc == 0
+            return "missing"
+        rc, out, err = await _run_docker(
+            "inspect", "-f", "{{.State.Status}}", self.container_id, timeout=15)
+        if rc != 0:
+            msg = (err or b"").decode(errors="replace").lower()
+            if "no such" in msg:
+                return "missing"
+            return "error"
+        state = out.decode(errors="replace").strip().lower()
+        if state == "running":
+            return "running"
+        if state in {"exited", "created", "paused", "dead"}:
+            return "stopped"
+        return "error"
 
     async def hibernate(self) -> None:
         """``docker stop`` — free CPU/RAM, KEEP the container and its

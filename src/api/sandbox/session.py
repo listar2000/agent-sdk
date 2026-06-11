@@ -85,9 +85,6 @@ class BaseSandboxSession(abc.ABC):
     # Default sandbox root when the recipe doesn't pin one. Subclass overrides
     # (daytona /home/daytona, docker /home/agent, modal /v, local /tmp).
     _default_root: str = "/tmp"
-    # True only for NativeSession — server routes sandbox exec/file ops
-    # through the session's transport instead of supervisor HTTP.
-    is_native: bool = False
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         self.session_id = session_id
