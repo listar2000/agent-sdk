@@ -42,10 +42,27 @@ log = logging.getLogger(__name__)
 _SENTINEL = object()
 
 
+def _origin() -> str:
+    import os
+    return os.environ.get("AGENT_SDK_ORIGIN", "production")
+
+
+def _native_image() -> str:
+    """Image for native sandboxes — needs only a shell + coreutils/base64.
+    The baked runtime image qualifies and is already pulled; override with
+    ``AGENT_SDK_NATIVE_IMAGE`` (e.g. a leaner base in P1)."""
+    import os
+    from api.providers.docker import _read_runtime_image_tag
+    return (os.environ.get("AGENT_SDK_NATIVE_IMAGE")
+            or _read_runtime_image_tag()
+            or "python:3.12-slim")
+
+
 class NativeSession(BaseSandboxSession):
     # Native's volume can live on any backend (docker/daytona/modal), so the
     # base's volume.provider == volume_provider check must be skipped.
     volume_provider = ""
+    is_native = True
 
     def __init__(self, *, session_id: str, state: NativeSandboxState) -> None:
         super().__init__(session_id=session_id, state=state)
@@ -58,8 +75,11 @@ class NativeSession(BaseSandboxSession):
         self._sandbox_env: dict[str, str] = {}
         self._active_task: asyncio.Task | None = None
         self._started = False
+        self._provision_lock = asyncio.Lock()
         # Test seam: when set, passed to run_turn in place of litellm.acompletion.
         self._completion = None
+        # Test seam: when set, used in place of provisioning a real container.
+        self._transport_factory = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -73,13 +93,14 @@ class NativeSession(BaseSandboxSession):
 
         await self._bootstrap_session()  # hydrates _agent_id, _spawn_env, _cwd
 
-        agent_cfg: dict = {}
+        model = None
+        native_cfg = None
         if self._agent_id:
             agent = await _db.get_agent(self._agent_id)
-            if agent:
-                agent_cfg = agent.get("config") or {}
-        self._spec = NativeAgentSpec.from_config(
-            model=agent_cfg.get("model"), native=agent_cfg.get("native"))
+            if agent is not None:
+                model = agent.config.model
+                native_cfg = agent.config.native
+        self._spec = NativeAgentSpec.from_config(model=model, native=native_cfg)
         self._tools = build_toolset(self._spec.tool_names)
 
         # Secrets split: AUTH_KEYS stay server-side (LLM); the rest are
@@ -213,12 +234,65 @@ class NativeSession(BaseSandboxSession):
             log.exception("native checkpoint write failed for %s",
                           self.session_id)
 
+    # ── sandbox: lazy provisioning + server exec/file routing ───────────────
+
     async def _ensure_sandbox(self):
-        """Lazy provision on first tool call. The transport + state-persist
-        wiring lands in P0-G (server); for now a transport injected by the
-        server/test is reused, and a missing one is a clear error."""
+        """Provision the sandbox on first need (tool call or /sandbox/exec).
+
+        Under a lock so concurrent tool calls in one turn provision once.
+        Persists ``state.sandbox_ref`` immediately so a crash can't strand a
+        container the boot reconciler would later orphan. P0 ships docker;
+        daytona/modal transports land in P1.
+        """
         if self._transport is not None:
             return self._transport
-        raise RuntimeError(
-            "native: no sandbox transport bound (lazy provisioning is wired "
-            "in P0-G server integration)")
+        async with self._provision_lock:
+            if self._transport is not None:
+                return self._transport
+            if not self._started:
+                await self.start()
+            if self._transport_factory is not None:
+                t = await self._transport_factory()
+            else:
+                provider = getattr(self.state, "provider", "docker")
+                if provider != "docker":
+                    raise RuntimeError(
+                        f"native provider {provider!r} not wired in P0 "
+                        f"(docker only)")
+                from .transport import DockerTransport
+                t = DockerTransport()
+                await t.create(image=_native_image(),
+                               labels={"agent_sdk_origin": _origin(),
+                                       "native_session": self.session_id})
+                # Make the cwd exist so relative paths in tools resolve.
+                import shlex
+                await t.exec(f"mkdir -p {shlex.quote(self._cwd)}")
+            self._transport = t
+            self.state.sandbox_ref = getattr(t, "container_id", None)
+            await self._persist_state()
+            return t
+
+    async def _persist_state(self) -> None:
+        from api import db as _db
+        from api.sandbox.state import serialize
+        try:
+            await _db.write_sandbox_state(self.session_id, serialize(self.state))
+        except Exception:
+            log.exception("native: persist sandbox_state failed for %s",
+                          self.session_id)
+
+    async def sandbox_exec(self, command: str, timeout: int = 30) -> dict:
+        """Back the server's /sandbox/exec route for native sessions. Same
+        response shape the supervisor's /v1/exec returns."""
+        transport = await self._ensure_sandbox()
+        res = await transport.exec(command, cwd=self._cwd,
+                                   env=self._sandbox_env or None,
+                                   timeout_s=timeout)
+        return {
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+            "exit_code": res.exit_code,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "timed_out": res.timed_out,
+        }

@@ -1756,23 +1756,36 @@ async def sessions_create(request: Request):
         if existing is not None:
             raise HTTPException(409, f"session id {supplied_id} already exists")
         data["id"] = supplied_id
+    # Native sessions are ALWAYS lazy: the runtime is the server-side loop,
+    # compute is provisioned on the first tool call. Eager provisioning would
+    # route a native session into a provider cold-create + ACP attach (which
+    # rejects agent_type="native"). Force lazy and persist an initial
+    # NativeSandboxState so recovery dispatches to NativeSession rather than
+    # the daytona default for a NULL state.
+    if data.get("agent_type") == "native":
+        return await _sessions_create_lazy(data, native=True)
     if data.get("provision", True):
         return await _sessions_create_eager(data)
     return await _sessions_create_lazy(data)
 
 
-async def _sessions_create_lazy(data: dict) -> dict:
+async def _sessions_create_lazy(data: dict, *, native: bool = False) -> dict:
     """Create a session row only — no sandbox, no ACP, no scheduler.
 
     Used when the UI wants to render a session shell before paying the
     provisioning cost (daytona: ~15-30 s; local: ~2-3 s). The sandbox
     appears on the first ``POST /sessions/{id}/message`` (the pool
     cold-creates on demand).
+
+    ``native=True`` additionally persists an initial ``NativeSandboxState``
+    so the factory dispatches recovery to NativeSession (a NULL state would
+    default to daytona). The native compute backend is the requested
+    ``provider`` (docker in P0).
     """
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
-    default_provider = data.get("provider") or data.get("config", {}).get("provider") or "unix_local"
+    default_provider = data.get("provider") or data.get("config", {}).get("provider") or ("docker" if native else "unix_local")
     workspace, volume_record, config_data, extra_options = (
         await _parse_session_create_common(data, default_provider)
     )
@@ -1819,6 +1832,17 @@ async def _sessions_create_lazy(data: dict) -> dict:
         workspace=workspace,
         extra_options=extra_options,
     )
+
+    if native:
+        from api.sandbox.state import NativeSandboxState, serialize
+        from api.sandbox.state import Recipe
+        state = NativeSandboxState(
+            provider=default_provider,
+            recipe=Recipe(agent_type="native",
+                          pre_start_commands=list(lazy_user_pre_start),
+                          root=cwd if cwd != "/tmp" else None),
+        )
+        await write_sandbox_state(session_id, serialize(state))
 
     return {
         "id": session_id,
@@ -2732,6 +2756,13 @@ async def session_sandbox_exec(session_id: str, request: Request):
     if not command:
         raise HTTPException(400, "command required")
     timeout = min(data.get("timeout", 30), 300)
+
+    # Native sessions have no supervisor — run through the session's
+    # transport (provisions the sandbox lazily on first exec).
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+    if getattr(pool_session, "is_native", False):
+        return await pool_session.sandbox_exec(command, timeout)
 
     response = await _proxy_from_session(
         session_id, "POST", "/v1/exec",
