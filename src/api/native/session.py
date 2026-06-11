@@ -316,11 +316,13 @@ class NativeSession(BaseSandboxSession):
 
     def _reattach_transport(self, provider: str, ref: str):
         """Build a transport bound to an existing sandbox ref (resume path)."""
-        from .transport import DaytonaTransport, DockerTransport
+        from .transport import DaytonaTransport, DockerTransport, ModalTransport
         if provider == "docker":
             return DockerTransport(container_id=ref, workdir=self._cwd)
         if provider == "daytona":
             return DaytonaTransport(sandbox_ref=ref, workdir=self._cwd)
+        if provider == "modal":
+            return ModalTransport(sandbox_ref=ref, workdir=self._cwd)
         raise RuntimeError(f"native provider {provider!r} not wired")
 
     async def _create_transport(self, provider: str):
@@ -328,7 +330,7 @@ class NativeSession(BaseSandboxSession):
         transport. docker: a sleep-infinity container; daytona: a paused-
         capable VM on the session volume."""
         import shlex
-        from .transport import DaytonaTransport, DockerTransport
+        from .transport import DaytonaTransport, DockerTransport, ModalTransport
         if provider == "docker":
             t = DockerTransport(workdir=self._cwd)
             await t.create(image=_native_image(),
@@ -340,6 +342,13 @@ class NativeSession(BaseSandboxSession):
             t = DaytonaTransport(workdir=self._cwd)
             await t.create(root=self._cwd, volume_id=self._volume_ref,
                            subpath=self._subpath)
+            return t
+        if provider == "modal":
+            # Modal is always volume-backed (recreate-on-missing keeps the
+            # workspace on the Volume, not the terminated sandbox FS).
+            t = ModalTransport(workdir=self._cwd)
+            await t.create(volume_ref=self._volume_ref, subpath=self._subpath,
+                           root=self._cwd)
             return t
         raise RuntimeError(f"native provider {provider!r} not wired")
 

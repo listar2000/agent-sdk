@@ -165,3 +165,96 @@ async def test_dispatch_resume_is_provider_uniform(monkeypatch):
     s.state.sandbox_ref = "dt-existing"
     t = await s._ensure_sandbox()
     assert events == ["status", "resume"] and t.ref == "dt-existing"
+
+
+# ── ModalTransport (mocked — recreate-on-missing lifecycle) ─────────────────
+
+@pytest.mark.asyncio
+async def test_modal_transport_interface(monkeypatch):
+    import api.providers.modal as md
+
+    class _Inst:
+        sandbox_ref = "modal-sb-1"
+
+    async def _create(**kw):
+        return _Inst()
+
+    async def _exec(inst, cmd, timeout=30):
+        if "base64 < " in cmd:
+            return ExecResult(stdout="aGk=", stderr="", exit_code=0)  # "hi"
+        return ExecResult(stdout=f"ran:{cmd}", stderr="", exit_code=0)
+
+    seq = iter(["running", "missing"])
+
+    async def _status(ref):
+        return next(seq, "missing")
+
+    stopped = []
+
+    async def _stop(inst):
+        stopped.append(inst.sandbox_ref)
+
+    monkeypatch.setattr(md, "create_sandbox", _create)
+    monkeypatch.setattr(md, "exec_in_sandbox", _exec)
+    monkeypatch.setattr(md, "get_sandbox_status", _status)
+    monkeypatch.setattr(md, "stop_sandbox", _stop)
+
+    t = T.ModalTransport(workdir="/v")
+    ref = await t.create(volume_ref="vol-1", subpath="agents/a1")
+    assert ref == "modal-sb-1" and t.ref == "modal-sb-1"
+
+    r = await t.exec("echo hi")
+    assert r.exit_code == 0 and "ran:" in r.stdout
+
+    # status: running then missing (modal terminate → missing, NOT stopped)
+    assert await t.status() == "running"
+    assert await t.status() == "missing"
+
+    # hibernate = terminate; resume is a no-op (session recreates on missing);
+    # destroy = terminate
+    await t.hibernate(); assert "modal-sb-1" in stopped
+    assert await t.resume() is None
+    await t.destroy()
+
+    await t.write_file("note.txt", b"hi")
+    assert await t.read_file("note.txt") == b"hi"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_modal_recreate_on_missing(monkeypatch):
+    """Modal hibernate→resume: status=='missing' drives the session's
+    missing-branch (destroy stale + create fresh on the same volume), since
+    modal can't pause/resume. New ref, workspace persists via the Volume."""
+    events = []
+
+    class _FakeModal:
+        def __init__(self, sandbox_ref=None, workdir="/v"):
+            self.sandbox_ref = sandbox_ref
+        @property
+        def ref(self):
+            return self.sandbox_ref
+        async def status(self):
+            events.append("status"); return "missing"
+        async def destroy(self):
+            events.append("destroy")
+        async def create(self, *, volume_ref=None, subpath=None, root=None):
+            events.append(("create", volume_ref, subpath))
+            self.sandbox_ref = "modal-new"; return "modal-new"
+
+    monkeypatch.setattr(T, "ModalTransport", _FakeModal)
+    s = NativeSession(session_id="s-modal",
+                      state=NativeSandboxState(provider="modal",
+                                               sandbox_ref="modal-old",
+                                               recipe=Recipe(agent_type="native")))
+    s._started = True
+    s._cwd = "/v"
+    s._volume_ref = "vol-9"
+    s._subpath = "agents/a9"
+    async def _noop():
+        return None
+    s._persist_state = _noop  # type: ignore
+
+    t = await s._ensure_sandbox()
+    # missing → destroy stale → create fresh on same volume+subpath
+    assert events == ["status", "destroy", ("create", "vol-9", "agents/a9")]
+    assert t.ref == "modal-new" and s.state.sandbox_ref == "modal-new"

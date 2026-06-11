@@ -402,3 +402,102 @@ class DaytonaTransport:
         if res.exit_code != 0:
             raise FileNotFoundError(f"daytona read_file({path}): {res.stderr[:300]}")
         return _b64.b64decode(res.stdout)
+
+
+# ===========================================================================
+# ModalTransport — native transport over Modal (P1). Modal's lifecycle is
+# fundamentally RECREATE-ON-MISSING, not pause/resume: stop terminates the
+# sandbox (start raises), so status reports 'missing' after hibernate and the
+# NativeSession's _ensure_sandbox missing-branch recreates a fresh sandbox on
+# the SAME volume+subpath (workspace persists on the Modal Volume, not the
+# sandbox FS). Modal is therefore ALWAYS volume-backed. Unlike docker/daytona
+# it cannot warm-self-heal an externally-terminated sandbox at the transport
+# layer (recreate needs the session's volume context), so resume() is a no-op
+# here — continuity is the session's recreate-on-missing path.
+# ===========================================================================
+
+class ModalTransport:
+    provider = "modal"
+
+    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/v"):
+        self.sandbox_ref = sandbox_ref
+        self.workdir = workdir
+
+    @property
+    def ref(self) -> str | None:
+        return self.sandbox_ref
+
+    def _inst(self):
+        from api.providers import ProviderInstance
+        return ProviderInstance(provider="modal", url="", root=self.workdir,
+                                sandbox_ref=self.sandbox_ref)
+
+    def _resolve(self, path: str) -> str:
+        if path.startswith("/"):
+            return path
+        return f"{self.workdir.rstrip('/')}/{path}"
+
+    async def create(self, *, volume_ref: str, subpath: str,
+                     root: str | None = None) -> str:
+        from api.providers.modal import create_sandbox
+        inst = await create_sandbox(volume_ref=volume_ref, subpath=subpath,
+                                    agent_type="native", root=root or self.workdir)
+        if not inst.sandbox_ref:
+            raise RuntimeError("modal create returned no sandbox_ref")
+        self.sandbox_ref = inst.sandbox_ref
+        await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+        return self.sandbox_ref
+
+    async def status(self) -> str:
+        from api.providers.modal import get_sandbox_status
+        if not self.sandbox_ref:
+            return "missing"
+        return await get_sandbox_status(self.sandbox_ref)
+
+    async def hibernate(self) -> None:
+        from api.providers.modal import stop_sandbox
+        if self.sandbox_ref:
+            await stop_sandbox(self._inst())
+
+    async def resume(self) -> None:
+        # Modal can't resume — the session recreates on missing. No-op so the
+        # uniform _ensure_sandbox flow never calls a raising start.
+        return None
+
+    async def destroy(self) -> None:
+        from api.providers.modal import stop_sandbox  # terminate == destroy
+        if self.sandbox_ref:
+            await stop_sandbox(self._inst())
+
+    async def exec(self, command: str, *, cwd: str | None = None,
+                   env: dict[str, str] | None = None,
+                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S) -> TransportExecResult:
+        if not self.sandbox_ref:
+            raise RuntimeError("modal transport has no sandbox")
+        from api.providers.modal import exec_in_sandbox
+        wd = cwd or self.workdir
+        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
+        full = f"cd {shlex.quote(wd)} && {prefix}{command}"
+        res = await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
+        return TransportExecResult(res.stdout or "", res.stderr or "",
+                                   res.exit_code if res.exit_code is not None else -1,
+                                   bool(getattr(res, "timed_out", False)))
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        import base64 as _b64
+        q = shlex.quote(self._resolve(path))
+        qdir = shlex.quote(_dirname(self._resolve(path)))
+        b64 = _b64.b64encode(data).decode()
+        res = await self.exec(
+            f"mkdir -p {qdir} && printf %s {shlex.quote(b64)} | base64 -d > {q}",
+            cwd="/")
+        if res.exit_code != 0:
+            raise RuntimeError(f"modal write_file({path}) failed: {res.stderr[:300]}")
+
+    async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
+        import base64 as _b64
+        q = shlex.quote(self._resolve(path))
+        res = await self.exec(f"base64 < {q}", cwd="/")
+        if res.exit_code != 0:
+            raise FileNotFoundError(f"modal read_file({path}): {res.stderr[:300]}")
+        return _b64.b64decode(res.stdout)
