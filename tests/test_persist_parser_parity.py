@@ -131,7 +131,7 @@ def test_heartbeat_returns_none():
     ("done", "turn_end"),
 ])
 def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
-    from api.server import _EVENT_TYPE_TO_LOG
+    from api.turn import _EVENT_TYPE_TO_LOG
     assert _EVENT_TYPE_TO_LOG.get(etype) == expected_log_type, (
         f"_EVENT_TYPE_TO_LOG must map parser output {etype!r} to "
         f"{expected_log_type!r} so persist and SSE produce the same canonical log"
@@ -197,9 +197,18 @@ def _capture_log_writes(monkeypatch) -> list[tuple[str, dict]]:
     async def _fake_log_event(*, session_id, agent_id, event_type, payload):
         rows.append((event_type, payload))
 
-    from api import server as srv
-    monkeypatch.setattr(srv, "log_event", _fake_log_event)
+    from api import turn as _turn
+    monkeypatch.setattr(_turn, "log_event", _fake_log_event)
     return rows
+
+
+async def _persist_prompt_events(sess, message: str, rpc_id: str) -> None:
+    """Compat shim: the free function moved into ``api.turn.TurnRunner``
+    (same lock/coalescing/flush semantics). Tests drive the runner the
+    way server.py does."""
+    from api.turn import TurnRunner
+    await TurnRunner(sess, message, rpc_id).run()
+
 
 
 @pytest.mark.asyncio
@@ -209,9 +218,8 @@ async def test_persist_logs_empty_done_turn_for_rca(monkeypatch, caplog):
         {"type": "usage", "usage": {"amount": 1.25, "currency": "USD"}},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
 
-    with caplog.at_level("WARNING", logger="api.server"):
+    with caplog.at_level("WARNING", logger="api.turn"):
         await _persist_prompt_events(sess, "hi", "rpc-empty")
 
     assert [r[0] for r in rows if r[0] != "user_message"] == [
@@ -231,7 +239,6 @@ async def test_persist_coalesces_consecutive_reasoning_chunks(monkeypatch):
         {"type": "reasoning", "text": "step 3"},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -251,7 +258,6 @@ async def test_persist_coalesces_consecutive_text_chunks(monkeypatch):
         {"type": "usage", "usage": {"in": 10, "out": 5}},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -308,7 +314,6 @@ async def test_persist_serializes_concurrent_prompts_on_same_session(monkeypatch
     sess_a.liveness = _NoopLiveness()
     sess_b.liveness = _NoopLiveness()
 
-    from api.server import _persist_prompt_events
     # Fire two concurrent persist tasks against the shared lock.
     t_a = _a.create_task(_persist_prompt_events(sess_a, "msg-a", "rpc-a"))
     t_b = _a.create_task(_persist_prompt_events(sess_b, "msg-b", "rpc-b"))
@@ -361,7 +366,6 @@ async def test_persist_flushes_buffer_on_hard_cancel(monkeypatch):
         def _broadcast(self, _evt: dict) -> None:
             pass
 
-    from api.server import _persist_prompt_events
     task = _asyncio.create_task(
         _persist_prompt_events(_SlowEvents(), "hi", "rpc-cancel"),
     )
@@ -396,7 +400,6 @@ async def test_persist_usage_mid_reasoning_does_not_split_block(monkeypatch):
         {"type": "text", "text": "answer"},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -415,7 +418,6 @@ async def test_persist_flushes_on_type_change(monkeypatch):
         {"type": "text", "text": "final"},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -436,7 +438,6 @@ async def test_persist_flushes_before_tool(monkeypatch):
         {"type": "usage", "usage": {}},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]

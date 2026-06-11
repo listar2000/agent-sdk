@@ -180,22 +180,22 @@ class AcpClient:
     async def handshake(self, session_id: str, agent: str) -> dict:
         """ACP protocol handshake only. Does NOT create a session.
 
-        Advertises the client capabilities our supervisor.js implements:
-        ``fs.read_text_file``, ``fs.write_text_file``, and ``terminal``.
-        Without these, opencode falls back to its internal filesystem layer
-        which has stricter per-path permission checks (denies writes outside
-        cwd even after we auto-allow the ACP permission gate). With them
-        declared, opencode delegates fs/terminal ops to the supervisor —
-        which executes them directly in-sandbox. Claude ignores the fields.
+        Advertises NO optional client capabilities. Verified empirically
+        (2026-06, pinned opencode 1.14.30 + claude-agent-acp 0.27.0): both
+        runtimes execute every tool locally in the ACP child process
+        regardless of advertised capabilities — fs/terminal flags change
+        nothing about tool routing, and writes outside cwd behave
+        identically with or without them (the earlier claim here that
+        opencode "falls back to a stricter internal filesystem layer"
+        without fs capabilities was re-tested and is false on 1.14.30).
+        The one client-side method runtimes do call is
+        ``session/request_permission``, auto-allowed by supervisor.js.
         """
         return await self._send_rpc(
             session_id, "initialize",
             {
                 "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": True, "writeTextFile": True},
-                    "terminal": True,
-                },
+                "clientCapabilities": {},
             },
             agent=agent,
         )

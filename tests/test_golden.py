@@ -2877,3 +2877,101 @@ async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_
                     await _sdk2._http.delete(
                         f"/volumes/{vol_id}", params={"force": "true"}, timeout=20,
                     )
+
+
+# ---------------------------------------------------------------------------
+# Tool-effects matrix: exec / write / read / edit — inside AND outside cwd —
+# with exact file-content verification for every effect.
+# ---------------------------------------------------------------------------
+
+
+async def _cat_exact(sdk: ApiClient, session_id: str, path: str) -> str:
+    """Read a sandbox file via the exec proxy; assert it exists."""
+    res = await sdk.session_sandbox_exec(session_id, f"cat {path}", timeout=60)
+    assert res.get("exit_code") == 0, f"cat {path} failed: {res}"
+    return (res.get("stdout") or "").strip()
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@agent_type_param
+@pytest.mark.asyncio
+async def test_tool_effects_matrix(provider, agent_type):
+    """Exec / write / read / edit — inside and outside cwd — exact contents.
+
+    Pins both halves of the verified ACP mechanism (2026-06):
+
+    * Tool EXECUTION is always local to the ACP child (co-located with the
+      sandbox) — every effect must land in the sandbox filesystem with
+      exactly the requested bytes, for both runtimes.
+    * Tool APPROVAL is the only ACP client-side traffic. opencode raises
+      ``session/request_permission`` (kind ``external_directory``) for any
+      path outside the session cwd even on default-allow config; the
+      supervisor's auto-allow is all that stands between that and an
+      infinite per-turn hang (the #105 failure mode). The outside-cwd cases
+      here HANG (bounded by PROMPT_TIMEOUT), not fail, if that handler
+      regresses.
+    """
+    _require_provider(provider)
+    uid = os.urandom(4).hex()
+    out_bash = f"/tmp/golden-bash-{uid}.txt"
+    out_note = f"/tmp/golden-note-{uid}.txt"
+    out_seed = f"/tmp/golden-seed-{uid}.txt"
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        sid = sess["session_id"]
+        print(f"\n[test:{provider}:{agent_type}] session={sid[:8]}")
+
+        # -- bash: inside cwd, outside cwd, cwd sanity, failing command ----
+        await _ask(sdk, sid, (
+            "Run this exact shell command as ONE single command, then report "
+            "done: "
+            f"echo bash-in-$((6*7)) > bash_in.txt && "
+            f"echo bash-out-$((6*7)) > {out_bash} && "
+            "pwd > pwd_out.txt && "
+            "(ls /nonexistent-golden-xyz || echo fail-ok > fail_note.txt)"
+        ))
+        assert await _cat_exact(sdk, sid, "bash_in.txt") == "bash-in-42"
+        assert await _cat_exact(sdk, sid, out_bash) == "bash-out-42"
+        assert (await _cat_exact(sdk, sid, "pwd_out.txt")).startswith("/")
+        assert await _cat_exact(sdk, sid, "fail_note.txt") == "fail-ok"
+
+        # -- write: inside + outside cwd, exact contents -------------------
+        await _ask(sdk, sid, (
+            "Create two files. First: a file named note_in.txt in the "
+            "current directory containing exactly: golden-in-7261 . Second: "
+            f"a file at the absolute path {out_note} containing exactly: "
+            "golden-out-9483 . Nothing else inside either file."
+        ))
+        assert await _cat_exact(sdk, sid, "note_in.txt") == "golden-in-7261"
+        assert await _cat_exact(sdk, sid, out_note) == "golden-out-9483"
+
+        # -- read: round-trip planted seeds back through new files ---------
+        res = await sdk.session_sandbox_exec(
+            sid,
+            f"printf %s seed-in-5520 > seed_in.txt && "
+            f"printf %s seed-out-8847 > {out_seed} && echo planted",
+            timeout=60,
+        )
+        assert "planted" in (res.get("stdout") or ""), f"seed plant failed: {res}"
+        await _ask(sdk, sid, (
+            "Read the file seed_in.txt in the current directory and the file "
+            f"{out_seed}. Then create echo_in.txt in the current directory "
+            "whose content is exactly the contents of seed_in.txt, and "
+            f"echo_out.txt whose content is exactly the contents of {out_seed}. "
+            "Nothing else in either file."
+        ))
+        assert await _cat_exact(sdk, sid, "echo_in.txt") == "seed-in-5520"
+        assert await _cat_exact(sdk, sid, "echo_out.txt") == "seed-out-8847"
+
+        # -- edit: modify an existing file precisely -----------------------
+        res = await sdk.session_sandbox_exec(
+            sid, "printf %s 'alpha beta gamma' > editme.txt && echo planted",
+            timeout=60,
+        )
+        assert "planted" in (res.get("stdout") or "")
+        await _ask(sdk, sid, (
+            "Edit the file editme.txt in the current directory: replace the "
+            "word beta with DELTA. Change nothing else."
+        ))
+        assert await _cat_exact(sdk, sid, "editme.txt") == "alpha DELTA gamma"

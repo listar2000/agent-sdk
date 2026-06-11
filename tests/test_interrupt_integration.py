@@ -412,10 +412,13 @@ _OPENCODE_MODEL = "openrouter/anthropic/claude-3.5-haiku"
     reason="OPENROUTER_API_KEY required for OpenCode (uses openrouter/* models)",
 )
 class TestOpenCodeIntegration:
-    """OpenCode delegates fs/terminal access to the client. Tests confirm the
-    full ACP loop (handshake → session/new → session/prompt → tool calls →
-    stopReason) works with the supervisor's session/request_permission +
-    fs/* + terminal/* handlers."""
+    """OpenCode executes tools locally in the ACP child (verified 2026-06:
+    no fs/terminal client delegation on the pinned 1.14.30). The only
+    client-side ACP traffic is ``session/request_permission`` — auto-allowed
+    by supervisor.js, and load-bearing: unanswered, every gated tool call
+    hangs the turn. Tests confirm the full ACP loop (handshake →
+    session/new → session/prompt → tool calls → stopReason) through that
+    wiring."""
 
     @pytest.mark.asyncio
     async def test_opencode_basic_prompt(self):
@@ -864,8 +867,11 @@ class TestSSELogParity:
 
             await asyncio.wait_for(listener, timeout=120)
 
+            # 3 queued prompts -> 3 turns. Waiting on just 1 turn_end races
+            # the log batcher (SSE leads persist; see helper docstring) and
+            # intermittently snapshots the log before turns 2-3 flush.
             log_entries = _fetch_log_after_n_turn_ends(
-                agent.session_id, 1, limit=30, deadline_s=10.0,
+                agent.session_id, 3, limit=40, deadline_s=10.0,
             )
 
             user_msgs = [e for e in log_entries if e["event_type"] == "user_message"]

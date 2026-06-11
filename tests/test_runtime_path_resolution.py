@@ -107,7 +107,9 @@ def test_runtime_acp_bin_format(monkeypatch):
     ``<runtime-path>/node_modules/.bin/<bin>``."""
     monkeypatch.setenv("AGENT_SDK_RUNTIME_PATH", "/x")
     assert _runtime_acp_bin("claude") == "/x/node_modules/.bin/claude-agent-acp"
-    assert _runtime_acp_bin("codex") == "/x/node_modules/.bin/codex-acp"
+    # codex is a disabled runtime (_ACP_NPM_SPECS keeps the baked image
+    # small); resolve a second ENABLED type instead.
+    assert _runtime_acp_bin("opencode") == "/x/node_modules/.bin/opencode"
 
 
 def test_runtime_acp_bin_rejects_unknown_agent_type(monkeypatch):
