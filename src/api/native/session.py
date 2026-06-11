@@ -146,14 +146,12 @@ class NativeSession(BaseSandboxSession):
         ref = getattr(self.state, "sandbox_ref", None)
         if not ref:
             return
-        from .transport import DockerTransport
         provider = getattr(self.state, "provider", "docker")
-        if provider == "docker":
-            try:
-                await DockerTransport(container_id=ref).destroy()
-            except Exception:
-                log.exception("native: destroy failed for %s ref=%s",
-                              self.session_id, ref)
+        try:
+            await self._reattach_transport(provider, ref).destroy()
+        except Exception:
+            log.exception("native: destroy failed for %s ref=%s",
+                          self.session_id, ref)
         self._transport = None
 
     # ── liveness: the session object is the runtime ─────────────────────────
@@ -273,24 +271,20 @@ class NativeSession(BaseSandboxSession):
             if self._transport_factory is not None:
                 t = await self._transport_factory()
                 self._transport = t
-                self.state.sandbox_ref = getattr(t, "container_id", None)
+                self.state.sandbox_ref = t.ref
                 await self._persist_state()
                 return t
 
             provider = getattr(self.state, "provider", "docker")
-            if provider != "docker":
-                raise RuntimeError(
-                    f"native provider {provider!r} not wired in P0 "
-                    f"(docker only)")
-            from .transport import DockerTransport
-            import shlex
+            ref = getattr(self.state, "sandbox_ref", None)
 
             # RESUME: a prior provision left a hibernated (stopped) or
-            # still-running container. ONE inspect classifies it — reattach +
-            # start (workspace intact) rather than create a fresh sandbox.
-            ref = getattr(self.state, "sandbox_ref", None)
+            # still-running sandbox. ONE status() classifies it — reattach +
+            # resume (workspace intact) rather than create fresh. The flow is
+            # provider-uniform over the transport interface; only the class
+            # and the cold-create args differ.
             if ref:
-                t = DockerTransport(container_id=ref, workdir=self._cwd)
+                t = self._reattach_transport(provider, ref)
                 st = await t.status()
                 if st == "running":
                     self._transport = t
@@ -300,32 +294,54 @@ class NativeSession(BaseSandboxSession):
                     self._transport = t
                     return t
                 if st == "error":
-                    # Transient daemon failure — do NOT cold-create over a
-                    # container that may still be alive (native has no volume
-                    # backing in P0, so a spurious create silently loses the
-                    # workspace). Fail-closed: surface the error, retry later.
+                    # Transient control-plane/daemon failure — do NOT
+                    # cold-create over a possibly-live sandbox (a spurious
+                    # create silently loses the workspace). Fail-closed.
                     raise RuntimeError(
-                        f"native: sandbox {ref[:12]} inspect failed "
+                        f"native: sandbox {ref[:12]} status failed "
                         f"(transient); not creating over a possibly-live "
-                        f"container")
-                # st == "missing": the container is genuinely gone. Best-effort
-                # rm the stale ref (defends against a half-deleted container
-                # leaking) before creating fresh.
+                        f"sandbox")
+                # st == "missing": genuinely gone — best-effort clean the
+                # stale ref before creating fresh (no orphan).
                 try:
                     await t.destroy()
                 except Exception:
                     pass
 
+            t = await self._create_transport(provider)
+            self._transport = t
+            self.state.sandbox_ref = t.ref
+            await self._persist_state()
+            return t
+
+    def _reattach_transport(self, provider: str, ref: str):
+        """Build a transport bound to an existing sandbox ref (resume path)."""
+        from .transport import DaytonaTransport, DockerTransport
+        if provider == "docker":
+            return DockerTransport(container_id=ref, workdir=self._cwd)
+        if provider == "daytona":
+            return DaytonaTransport(sandbox_ref=ref, workdir=self._cwd)
+        raise RuntimeError(f"native provider {provider!r} not wired")
+
+    async def _create_transport(self, provider: str):
+        """Cold-create a fresh sandbox for ``provider`` and return its
+        transport. docker: a sleep-infinity container; daytona: a paused-
+        capable VM on the session volume."""
+        import shlex
+        from .transport import DaytonaTransport, DockerTransport
+        if provider == "docker":
             t = DockerTransport(workdir=self._cwd)
             await t.create(image=_native_image(),
                            labels={"agent_sdk_origin": _origin(),
                                    "native_session": self.session_id})
-            # Make the cwd exist so relative paths in tools resolve.
             await t.exec(f"mkdir -p {shlex.quote(self._cwd)}", cwd="/")
-            self._transport = t
-            self.state.sandbox_ref = t.container_id
-            await self._persist_state()
             return t
+        if provider == "daytona":
+            t = DaytonaTransport(workdir=self._cwd)
+            await t.create(root=self._cwd, volume_id=self._volume_ref,
+                           subpath=self._subpath)
+            return t
+        raise RuntimeError(f"native provider {provider!r} not wired")
 
     async def _persist_state(self) -> None:
         from api import db as _db

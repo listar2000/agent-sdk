@@ -65,6 +65,11 @@ class DockerTransport:
         # resolve to the same place regardless of which path was used.
         self.workdir = workdir
 
+    @property
+    def ref(self) -> str | None:
+        """Provider-agnostic sandbox id (the NativeSession persists this)."""
+        return self.container_id
+
     def _resolve(self, path: str) -> str:
         if path.startswith("/"):
             return path
@@ -275,3 +280,111 @@ def _container_not_running(err: bytes) -> bool:
 def _dirname(path: str) -> str:
     i = path.rfind("/")
     return path[:i] if i > 0 else "/"
+
+
+# ===========================================================================
+# DaytonaTransport — the native transport over Daytona's SDK (P1).
+# Wraps the existing daytona provider primitives so the NativeSession's
+# uniform status/resume/hibernate/destroy flow works unchanged. Daytona
+# sandboxes are persistent VMs: hibernate = pause (stop_daytona), resume =
+# start_daytona — no container writable-layer semantics, the sandbox FS just
+# persists across the pause. Exec/files go over the SDK process + fs channels
+# (no supervisor, no ACP). Status vocabulary already matches DockerTransport
+# (running|stopped|missing|error) via get_daytona_sandbox_status.
+# ===========================================================================
+
+class DaytonaTransport:
+    provider = "daytona"
+
+    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/home/daytona"):
+        self.sandbox_ref = sandbox_ref
+        self.workdir = workdir
+
+    @property
+    def ref(self) -> str | None:
+        return self.sandbox_ref
+
+    def _inst(self):
+        from api.providers import ProviderInstance
+        return ProviderInstance(provider="daytona", url="", root=self.workdir,
+                                sandbox_ref=self.sandbox_ref)
+
+    def _resolve(self, path: str) -> str:
+        if path.startswith("/"):
+            return path
+        base = self.workdir.rstrip("/") or ""
+        return f"{base}/{path}"
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+
+    async def create(self, *, root: str | None = None,
+                     volume_id: str | None = None, subpath: str | None = None) -> str:
+        from api.providers.daytona import provision_daytona_sandbox
+        inst = await provision_daytona_sandbox(
+            agent_type="native", root=root or self.workdir,
+            volume_id=volume_id, subpath=subpath)
+        if not inst.sandbox_ref:
+            raise RuntimeError("daytona provision returned no sandbox_ref")
+        self.sandbox_ref = inst.sandbox_ref
+        await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+        return self.sandbox_ref
+
+    async def status(self) -> str:
+        from api.providers.daytona import get_daytona_sandbox_status
+        if not self.sandbox_ref:
+            return "missing"
+        return await get_daytona_sandbox_status(self.sandbox_ref)
+
+    async def hibernate(self) -> None:
+        from api.providers.daytona import stop_daytona
+        if self.sandbox_ref:
+            await stop_daytona(self._inst())
+
+    async def resume(self) -> None:
+        from api.providers.daytona import start_daytona
+        if self.sandbox_ref:
+            await start_daytona(self.sandbox_ref)
+
+    async def destroy(self) -> None:
+        from api.providers.daytona import destroy_daytona
+        if self.sandbox_ref:
+            await destroy_daytona(self._inst())
+
+    # ── exec / files ─────────────────────────────────────────────────────────
+
+    async def exec(self, command: str, *, cwd: str | None = None,
+                   env: dict[str, str] | None = None,
+                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S) -> TransportExecResult:
+        if not self.sandbox_ref:
+            raise RuntimeError("daytona transport has no sandbox")
+        from api.providers.daytona import exec_in_sandbox
+        wd = cwd or self.workdir
+        # Daytona's process.exec has no cwd/env params plumbed in the helper;
+        # wrap with cd + env -- so relative paths and per-call env still work.
+        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
+        full = f"cd {shlex.quote(wd)} && {prefix}{command}"
+        res = await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
+        return TransportExecResult(res.stdout or "", res.stderr or "",
+                                   res.exit_code if res.exit_code is not None else -1,
+                                   bool(getattr(res, "timed_out", False)))
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        import base64 as _b64
+        q = shlex.quote(self._resolve(path))
+        qdir = shlex.quote(_dirname(self._resolve(path)))
+        b64 = _b64.b64encode(data).decode()
+        # base64-over-exec keeps it on the same SDK channel; daytona's exec
+        # arg limit is generous, but chunk-free is fine for tool-sized writes.
+        res = await self.exec(
+            f"mkdir -p {qdir} && printf %s {shlex.quote(b64)} | base64 -d > {q}",
+            cwd="/")
+        if res.exit_code != 0:
+            raise RuntimeError(f"daytona write_file({path}) failed: {res.stderr[:300]}")
+
+    async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
+        import base64 as _b64
+        q = shlex.quote(self._resolve(path))
+        res = await self.exec(f"base64 < {q}", cwd="/")
+        if res.exit_code != 0:
+            raise FileNotFoundError(f"daytona read_file({path}): {res.stderr[:300]}")
+        return _b64.b64decode(res.stdout)
