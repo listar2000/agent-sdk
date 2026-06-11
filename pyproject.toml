@@ -19,6 +19,9 @@ dependencies = [
     # daytona reconcile + orphan monitor. Bump deliberately.
     "daytona-sdk==0.184.0",
     "modal>=1.4.2",
+    # Native runtime: one call signature across providers (anthropic /
+    # openai / openrouter / bedrock / …), streaming + tool-calls included.
+    "litellm>=1.51",
 ]
 
 [tool.hatch.build.targets.wheel]
