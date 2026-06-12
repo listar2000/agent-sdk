@@ -2594,10 +2594,16 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         # pool — the silent-leak class), that resume reattaches the SAME
         # container, and that workspace bytes survive the hibernate.
         ref_before = None
-        # Modal hibernate=terminate loses the sandbox FS, so the marker must
-        # live on the mounted Volume (/v) to survive the recreate; docker
-        # (stop) and daytona (pause) keep the FS, so /tmp persists for them.
-        marker_path = ("/v/reap_marker.txt" if provider == "modal"
+        # docker (stop) / daytona (pause) keep the whole sandbox FS, so an
+        # absolute /tmp marker survives the hibernate. Modal hibernate=terminate
+        # LOSES the sandbox FS — only the Volume persists. Write the modal
+        # marker through the agent's CWD (/home/agent, symlinked onto the
+        # Volume by the bare entrypoint) rather than an absolute /v path: this
+        # proves the REAL workspace survives terminate→recreate. A hand-placed
+        # /v/reap_marker.txt would survive even if the cwd→Volume symlink were
+        # broken, silently hiding that regression (agent workspaces all live
+        # under cwd, not at /v root).
+        marker_path = ("reap_marker.txt" if provider == "modal"
                        else "/tmp/reap_marker.txt")
         if agent_type == "native":
             await sdk.session_sandbox_exec(
