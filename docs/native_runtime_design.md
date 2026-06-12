@@ -225,6 +225,31 @@ the v2 volume, so: the transport treats `SandboxMissingError` mid-turn as
 **recreate on same volume+subpath, retry the tool call once**. Sandboxes are
 cattle; the volume is truth.
 
+### 4b. Reap/resume efficiency vs the supervisor path (measured)
+
+Native's reap→resume is **strictly cheaper than the supervisor (agent-in-
+sandbox) path on every provider** — it reattaches compute with no
+supervisor reboot, no ACP re-attach, and no health poll:
+
+| provider | native resume | supervisor resume |
+|---|---|---|
+| docker | `status()` = 1 `docker inspect` + `resume()` = 1 `docker start` | stop() **clears** `sandbox_ref` → resume **cold-creates** a container + `_wait_for_health` (10×) + ACP attach |
+| daytona | 1 status get + `start_daytona` (stable-wait + start + ready-poll) | + supervisor respawn (idempotency probe, detached spawn, signed-URL mint), `_wait_for_health` (45×), 2nd get, ACP attach |
+| modal | `create_bare_sandbox` — no tunnel, no health gate | `create_sandbox` pays `sb.tunnels(60)` + `_wait_for_health` (120×) |
+
+Empirically (docker, `test_native_resume_at_least_as_efficient_as_supervisor`):
+**native ≈ 0.3s vs supervisor ≈ 2.7s resume (~8–9× faster)**. The golden pins
+`native_resume ≤ supervisor_resume` so native can't regress to supervisor-like
+latency; the structural docker count is also pinned by
+`test_resume_issues_single_inspect` (resume = exactly one inspect).
+
+Known micro-optimization (not a parity issue): on the **daytona** warm-resume
+path `_ensure_sandbox` calls `status()` (a control-plane get) to classify
+`stopped`, then `start_daytona` re-reads the same `state` field via
+`_wait_for_stable_daytona_state` — one redundant ~100ms remote get. Left as-is:
+fixing it cleanly needs a shared `start_daytona` change for a daytona-only
+saving while native already beats the supervisor path by ~8×.
+
 ## 5. State & checkpoints — dedicated table (v1 open question 1: RESOLVED)
 
 The review killed the session_log option (Q1): the batcher is lossy **by

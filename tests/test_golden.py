@@ -2487,6 +2487,67 @@ async def _post_and_wait(sdk: ApiClient, sid: str, msg: str) -> None:
     assert term is not None, f"warm turn never terminated (rpc={rpc[:8]})"
 
 
+async def _measure_resume_median(sdk: ApiClient, agent_type: str, cycles: int = 3) -> float:
+    """Median reap→resume RESOURCE-MANAGEMENT latency (seconds) for one runtime
+    on docker: turn (sets the activity clock) → reap (hibernate) → time a
+    trivial sandbox_exec, which triggers the resume. The exec is ``true`` so
+    the measured time is the resume cost (docker start [+ supervisor reboot +
+    ACP + health poll for the supervisor path]), NOT model latency."""
+    import statistics
+    import time as _time
+    sess = await _quick_session(sdk, "docker", agent_type=agent_type)
+    sid = sess["session_id"]
+    samples: list[float] = []
+    await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+    for _ in range(cycles):
+        await _post_and_wait(sdk, sid, "Reply with the single word: ok.")
+        r = await sdk._http.post(f"/sessions/{sid}/reap",
+                                 params={"idle_s": 0}, timeout=30)
+        r.raise_for_status()
+        if r.json().get("hibernated") is not True:
+            continue  # activity not settled yet; skip this cycle
+        t0 = _time.monotonic()
+        res = await sdk.session_sandbox_exec(sid, "true", timeout=120)
+        dt = _time.monotonic() - t0
+        assert res.get("exit_code") == 0, f"{agent_type}: post-resume exec failed: {res}"
+        samples.append(dt)
+    assert samples, f"{agent_type}: no successful reap→resume cycle measured"
+    return statistics.median(samples)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(420)
+async def test_native_resume_at_least_as_efficient_as_supervisor():
+    """RESOURCE-MANAGEMENT efficiency standard: native's reap→resume must be at
+    least as fast as the supervisor (agent-in-sandbox) path.
+
+    Native resumes with ``docker start`` + one ``docker inspect`` + exec; the
+    supervisor path's docker stop() clears sandbox_ref, so its resume always
+    cold-creates a container + a supervisor.js reboot + ACP re-attach + health
+    poll. Measured ~8x faster in practice — this golden pins that native can't
+    regress to supervisor-like resume latency. Relative (same host) so it's
+    hardware-independent; the large headroom keeps it off the flaky edge.
+    """
+    if not _has_docker():
+        pytest.skip("docker not available")
+    if not OAUTH_TOKEN or not _OPENROUTER_KEY:
+        pytest.skip("needs CLAUDE_CODE_OAUTH_TOKEN (supervisor) + "
+                    "OPENROUTER_API_KEY (native)")
+
+    async with ApiClient(SERVER) as sdk:
+        native_med = await _measure_resume_median(sdk, "native")
+        supervisor_med = await _measure_resume_median(sdk, "claude")
+        print(f"\n[resume-efficiency] native={native_med*1000:.0f}ms "
+              f"supervisor={supervisor_med*1000:.0f}ms "
+              f"ratio={native_med/supervisor_med:.2f}x")
+        assert native_med <= supervisor_med, (
+            f"NATIVE RESUME REGRESSED: native reap→resume ({native_med*1000:.0f}ms) "
+            f"is SLOWER than the supervisor path ({supervisor_med*1000:.0f}ms). "
+            f"Native must resume with docker start + 1 inspect (no supervisor "
+            f"reboot / ACP / health poll) — something added round-trips to the "
+            f"native resume hot path.")
+
+
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
