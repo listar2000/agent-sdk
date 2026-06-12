@@ -44,6 +44,12 @@ class _FakeTransport:
         self.container_id = "fake-cid-" + uuid.uuid4().hex[:8]
         self.fs: dict[str, bytes] = {}
 
+    @property
+    def ref(self):
+        # Mirror DockerTransport.ref (the provider-agnostic id NativeSession
+        # persists as sandbox_ref) — for docker that is the container_id.
+        return self.container_id
+
     async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
         from api.native.transport import TransportExecResult
         # support the golden's write/read shapes minimally
