@@ -259,9 +259,14 @@ async def test_reconcile_reaps_native_docker_orphan(monkeypatch):
     await orphan.create(image=IMAGE, labels={"agent_sdk_origin": "test",
                                              "native_session": "sess-recon-orphan"})
     try:
-        # reconcile is GLOBAL: protect every OTHER agent-sdk container (parallel
-        # -n auto workers, the live container) by treating them all as live —
-        # live_refs = every present agent-sdk container EXCEPT our orphan.
+        # reconcile is GLOBAL and origin-blind: protect every OTHER agent-sdk
+        # container (parallel -n auto workers, the live container) by treating
+        # them all as live. CRITICAL: reconcile enumerates (ps) BEFORE it calls
+        # live_sandbox_refs(), so the mock RE-ENUMERATES at call time — every
+        # container reconcile saw (incl. any a concurrent worker just created)
+        # is captured and protected; only our orphan is excluded. A pre-snapshot
+        # set would leave a window where a sibling test's fresh container is
+        # mis-classified as an orphan and force-removed.
         def _present_full_ids() -> set[str]:
             ids: set[str] = set()
             for lk in ("agent-sdk.sandbox-id", "native_session"):
@@ -270,10 +275,9 @@ async def test_reconcile_reaps_native_docker_orphan(monkeypatch):
                     capture_output=True, text=True)
                 ids |= {x for x in r.stdout.split() if x}
             return ids
-        protected = _present_full_ids() - {orphan.container_id}
 
         async def _live_refs():
-            return protected
+            return _present_full_ids() - {orphan.container_id}
         monkeypatch.setattr(dbmod, "live_sandbox_refs", _live_refs)
 
         await dockermod.reconcile_on_startup()

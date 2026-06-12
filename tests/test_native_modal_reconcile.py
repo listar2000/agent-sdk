@@ -67,10 +67,14 @@ async def test_reconcile_reaps_native_modal_orphan(monkeypatch):
     live_ref = await live.create(volume_ref=vol, subpath="agents/live")
     orphan_ref = await orphan.create(volume_ref=vol, subpath="agents/orphan")
     try:
-        # reconcile is GLOBAL over the shared app: protect every OTHER sandbox
-        # (parallel workers, other devs) by treating all present-except-orphan
-        # as live. Snapshot immediately before the call to minimise the race
-        # window where a brand-new sandbox could appear unprotected.
+        # reconcile is GLOBAL over the shared app and origin-blind: protect
+        # every OTHER sandbox (parallel workers, other devs) by treating all
+        # present-except-orphan as live. CRITICAL: reconcile lists sandboxes
+        # BEFORE it calls live_sandbox_refs(), so the mock RE-ENUMERATES at call
+        # time — every sandbox reconcile saw (incl. any created concurrently) is
+        # captured and protected; only our orphan is excluded. A pre-snapshot
+        # set would leave a window where a sibling test's fresh sandbox is
+        # mis-classified as an orphan and terminated.
         modal, _ = _require_modal()
         app = await _get_app()
 
@@ -78,11 +82,11 @@ async def test_reconcile_reaps_native_modal_orphan(monkeypatch):
             return {sb.object_id
                     for sb in modal.Sandbox.list(app_id=app.app_id)}
 
-        protected = (await asyncio.to_thread(_present_ids)) - {orphan_ref}
-        assert live_ref in protected, "live sandbox must be in the protected set"
+        assert live_ref in await asyncio.to_thread(_present_ids), (
+            "live sandbox must be enumerable before reconcile")
 
         async def _live_refs():
-            return protected
+            return (await asyncio.to_thread(_present_ids)) - {orphan_ref}
         monkeypatch.setattr(dbmod, "live_sandbox_refs", _live_refs)
 
         await modalmod.reconcile_on_startup()
