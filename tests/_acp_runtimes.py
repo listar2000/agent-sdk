@@ -104,8 +104,9 @@ agent_type_param = pytest.mark.parametrize("agent_type", _AT_PARAMS)
 # depend on a supervisor (hibernate/resume/delete/reap/workspace). Native is
 # the first-party in-server loop — it has no ACP child, so it's deliberately
 # absent from supervisor-specific goldens (wedged-container, supervisor-
-# killed, agent-memory-tar). docker-only in P0 (the golden's _require_provider
-# skips native×{daytona,unix_local,modal}).
+# killed, agent-memory-tar). Live-verified on docker + daytona + modal; the
+# golden's _require_provider skips only native×unix_local (transport not
+# built yet).
 _AT_PARAMS_NATIVE = list(_AT_PARAMS)
 _AT_PARAMS_NATIVE.append(
     pytest.param(

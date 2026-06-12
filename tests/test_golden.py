@@ -2831,23 +2831,26 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
             # session but never `docker stop`s would otherwise ship green,
             # leaking compute until quota exhaustion.
             if agent_type == "native":
-                # docker/daytona free compute synchronously to 'stopped'. Modal
-                # frees by DELETING the sandbox (status 'missing') and its
-                # terminate is async, so poll a short window before asserting.
+                # The freed-state transition is ASYNC on every control plane:
+                # docker settles in ms, daytona passes through 'stopping' for
+                # seconds (longer under parallel suite load), and modal frees
+                # by DELETING the sandbox (terminate → status 'missing').
+                # Poll the same 30s budget for all three — fast providers exit
+                # on the first iteration, a genuine leak still fails loudly.
                 freed = {"stopped", "exited", "created"}
                 if provider == "modal":
                     freed = freed | {"missing"}
                 st = await _native_compute_state(provider, ref_before)
-                if provider == "modal":
-                    for _ in range(20):
-                        if st in freed:
-                            break
-                        await asyncio.sleep(1.5)
-                        st = await _native_compute_state(provider, ref_before)
+                for _ in range(20):
+                    if st in freed:
+                        break
+                    await asyncio.sleep(1.5)
+                    st = await _native_compute_state(provider, ref_before)
                 assert st in freed, (
                     f"NATIVE COMPUTE LEAK: reap returned hibernated:True but "
                     f"the {provider} sandbox {ref_before[:12]} is still {st!r} "
-                    f"— the reaper freed the pool slot but not the compute."
+                    f"after 30s — the reaper freed the pool slot but not the "
+                    f"compute."
                 )
         finally:
             drain.cancel()
