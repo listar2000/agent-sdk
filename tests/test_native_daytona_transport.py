@@ -170,6 +170,45 @@ async def test_dispatch_resume_is_provider_uniform(monkeypatch):
     assert events == ["status", "resume", "status"] and t.ref == "dt-existing"
 
 
+@pytest.mark.asyncio
+async def test_dispatch_resume_that_raises_falls_through_to_recreate(monkeypatch):
+    """daytona's resume() (start_daytona) RE-RAISES on a failed start (502
+    retries exhausted / readiness timeout) — unlike docker's best-effort
+    `docker start`. The session-level resume MUST catch that and fall through to
+    destroy+recreate (volume-safe) — not propagate out of _ensure_sandbox and
+    wedge the session forever while leaking the dead VM."""
+    events = []
+
+    class _FakeDaytona:
+        def __init__(self, sandbox_ref=None, workdir="/home/daytona"):
+            self.sandbox_ref = sandbox_ref
+
+        @property
+        def ref(self):
+            return self.sandbox_ref
+
+        async def status(self):
+            events.append("status"); return "stopped"
+
+        async def resume(self):
+            events.append("resume")
+            raise RuntimeError("start_daytona: 502 retries exhausted")
+
+        async def destroy(self):
+            events.append("destroy")
+
+        async def create(self, *, root=None, volume_id=None, subpath=None):
+            events.append("create"); self.sandbox_ref = "dt-new"; return "dt-new"
+
+    monkeypatch.setattr(T, "DaytonaTransport", _FakeDaytona)
+    s = _native_session("daytona")
+    s.state.sandbox_ref = "dt-dead"
+    t = await s._ensure_sandbox()
+    # caught the raise → destroyed the dead VM → recreated on the volume
+    assert events == ["status", "resume", "destroy", "create"]
+    assert t.ref == "dt-new" and s.state.sandbox_ref == "dt-new"
+
+
 # ── Modal native bare-sandbox entrypoint (pure-function safety) ─────────────
 
 def test_bare_entrypoint_symlinks_agent_home_onto_volume():

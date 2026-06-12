@@ -263,6 +263,37 @@ async def test_recover_adopts_concurrent_replacement_no_double_create():
         f"concurrent recovery double-created: {[c.ref for c in created]}")
 
 
+def _pin_session(provider, cwd, subpath="agents/abc"):
+    s = NativeSession(session_id="s",
+                      state=NativeSandboxState(provider=provider))
+    s._cwd = cwd
+    s._subpath = subpath
+    s._pin_modal_workspace_to_volume()
+    return s._cwd
+
+
+def test_modal_native_default_tmp_cwd_pinned_to_volume():
+    """A default modal native session (cwd falls back to /tmp) must run on the
+    /v Volume, not the ephemeral FS — else its workspace is lost on modal's
+    routine terminate→recreate (the entrypoint won't symlink the critical /tmp)."""
+    assert _pin_session("modal", "/tmp", "agents/abc") == "/v/agents/abc"
+    assert _pin_session("modal", "/tmp/", "sessions/s1") == "/v/sessions/s1"
+
+
+def test_modal_native_custom_cwd_left_for_symlink():
+    """A non-critical custom cwd is symlinked onto the volume by the entrypoint,
+    so the pin leaves it alone (no surprise cwd change)."""
+    assert _pin_session("modal", "/workspace") == "/workspace"
+    assert _pin_session("modal", "/home/agent") == "/home/agent"
+
+
+def test_docker_native_tmp_cwd_not_redirected():
+    """docker/daytona keep their FS across resume (and recreate is cold for
+    docker anyway), so /tmp is fine there — the pin is modal-only."""
+    assert _pin_session("docker", "/tmp") == "/tmp"
+    assert _pin_session("daytona", "/tmp") == "/tmp"
+
+
 @pytest.mark.asyncio
 async def test_secrets_split_keeps_llm_key_server_side():
     """start()'s split: AUTH_KEYS → server-side api_key; rest → sandbox env.

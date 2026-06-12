@@ -91,6 +91,7 @@ class NativeSession(BaseSandboxSession):
         from api import db as _db
 
         await self._bootstrap_session()  # hydrates _agent_id, _spawn_env, _cwd
+        self._pin_modal_workspace_to_volume()
 
         model = None
         native_cfg = None
@@ -253,6 +254,22 @@ class NativeSession(BaseSandboxSession):
 
     # ── sandbox: lazy provisioning + server exec/file routing ───────────────
 
+    def _pin_modal_workspace_to_volume(self) -> None:
+        """Modal is volume-backed: the workspace persists on the ``/v`` Volume
+        across modal's routine terminate→recreate (its only "hibernate"). But
+        the base cwd fallback is ``/tmp`` (sandbox/session.py — ``cwd or
+        recipe.root or "/tmp"``; the server even special-cases ``cwd != "/tmp"``
+        to leave root unset), and the bare-sandbox entrypoint REFUSES to symlink
+        a critical dir like ``/tmp`` onto the volume. So a DEFAULT modal native
+        session would run in ``/tmp`` on the EPHEMERAL sandbox FS and silently
+        lose its whole workspace on recreate — defeating modal's volume-backing.
+        Pin the default workspace directly onto the volume. A non-critical
+        custom cwd is symlinked onto the volume by the entrypoint (left as-is);
+        docker/daytona keep their FS across resume, so this is modal-only."""
+        if getattr(self.state, "provider", None) == "modal" \
+                and (self._cwd or "").rstrip("/") == "/tmp":
+            self._cwd = f"/v/{self._subpath.strip('/')}"
+
     async def _ensure_sandbox(self, *, refresh: bool = False, replace=None):
         """Provision the sandbox on first need (tool call or /sandbox/exec).
 
@@ -312,18 +329,29 @@ class NativeSession(BaseSandboxSession):
                     self._transport = t
                     return t
                 if st == "stopped":
-                    await t.resume()
                     # A 'dead' sandbox maps to "stopped" but resume() can't
-                    # restore it (docker: a kernel/storage-faulted container —
-                    # `docker start` is a silent no-op; daytona: an
-                    # unrecoverable VM). Verify it actually came up; only then
-                    # keep the warm sandbox. Otherwise fall through to
-                    # destroy+recreate below — WITHOUT this, the session resumes
-                    # a corpse and wedges forever (and leaks the dead sandbox),
-                    # defeating the transport-level SandboxGoneError escalation.
-                    if await t.status() == "running":
-                        self._transport = t
-                        return t
+                    # restore it. Two failure shapes, both must fall through to
+                    # destroy+recreate below — NOT wedge+leak:
+                    #  - docker: resume() (`docker start`) is best-effort and
+                    #    SWALLOWS the error on a corpse, so it returns and the
+                    #    status() re-check catches the still-not-running case.
+                    #  - daytona: resume() (start_daytona) RE-RAISES on a failed
+                    #    start (502 retries exhausted / readiness timeout /
+                    #    stopped→error). Without this guard that raise propagates
+                    #    out of _ensure_sandbox, skips the destroy+recreate, and
+                    #    wedges the session (every later prompt re-raises) while
+                    #    LEAKING the dead VM. Catch it and fall through.
+                    try:
+                        await t.resume()
+                    except Exception:
+                        log.warning("native: resume failed for sandbox %s; "
+                                    "destroying + recreating", ref[:12])
+                    else:
+                        # resume returned — verify it actually came up; only
+                        # then keep the warm sandbox.
+                        if await t.status() == "running":
+                            self._transport = t
+                            return t
                 elif st == "error":
                     # Transient control-plane/daemon failure — do NOT
                     # cold-create over a possibly-live sandbox (a spurious
