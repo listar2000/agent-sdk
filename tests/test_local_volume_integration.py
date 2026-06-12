@@ -257,29 +257,6 @@ async def test_sandbox_create_health_destroy(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ensure_supervisor_url_returns_same_url(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import unix_local as local
-
-    name = _vol_name()
-    ref = await local.create_volume(name)
-    # Phase E: supervisor lives in the image runtime path, no per-volume install.
-
-    inst = await local.create_sandbox(
-        volume_ref=ref, subpath="agents/e/home", agent_type="claude",
-    )
-    try:
-        got = await local.ensure_supervisor_url(inst, agent_type="claude")
-        assert got == inst.url
-    finally:
-        await local.destroy_sandbox(inst)
-
-
-# ---------------------------------------------------------------------------
-# Volume file ops
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
 async def test_volume_read_write_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
     from api.providers import unix_local as local

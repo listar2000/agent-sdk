@@ -30,11 +30,6 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Provider constants
 # ---------------------------------------------------------------------------
 
-# Providers whose recovery model is "reprovision via create_sandbox" rather
-# than "restart supervisor inside an existing sandbox" (daytona's model).
-# local/docker reach the supervisor on localhost:<port>; modal reaches it via
-# an HTTPS tunnel; all three are recreated from scratch on miss.
-PORT_BASED_PROVIDERS = frozenset({"unix_local", "docker", "modal"})
 
 # Auth/credential env vars that the server MUST NOT leak into sandboxes via
 # its own environment. When a sandbox spawns a supervisor, any of these keys
@@ -513,8 +508,6 @@ async def _wait_for_health(url: str, max_retries: int = 150, interval: float = 0
 # ---------------------------------------------------------------------------
 
 _port_lock = asyncio.Lock()
-_sandbox_port_counters: dict[str, int] = {}
-_sandbox_freed_ports: dict[str, list[int]] = {}
 
 
 async def _find_free_port() -> int:
@@ -542,21 +535,6 @@ async def _find_free_port() -> int:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
-
-
-def allocate_sandbox_port(sandbox_id: str) -> int:
-    """Allocate a port for a new supervisor inside an existing sandbox."""
-    freed = _sandbox_freed_ports.get(sandbox_id)
-    if freed:
-        return freed.pop()
-    port = _sandbox_port_counters.get(sandbox_id, _SUPERVISOR_REMOTE_PORT)
-    _sandbox_port_counters[sandbox_id] = port + 1
-    return port
-
-
-def free_sandbox_port(sandbox_id: str, port: int) -> None:
-    """Return a port to the pool when a supervisor is shut down."""
-    _sandbox_freed_ports.setdefault(sandbox_id, []).append(port)
 
 
 # ---------------------------------------------------------------------------

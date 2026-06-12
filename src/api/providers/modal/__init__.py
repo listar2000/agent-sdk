@@ -370,7 +370,7 @@ async def create_sandbox(
 
     Returns a ``ProviderInstance`` with ``sandbox_ref`` set to Modal's
     ``object_id`` and ``url`` set to the HTTPS tunnel URL. Supervisor is
-    already started — ``ensure_supervisor_url`` is a no-op.
+    already started — no separate supervisor-start phase is needed.
     """
     if not subpath:
         raise ValueError("modal create_sandbox requires a non-empty subpath")
@@ -692,19 +692,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
     await stop_sandbox(inst)
     inst.sandbox_ref = None
     inst.container_id = None
-
-
-async def ensure_supervisor_url(
-    inst: ProviderInstance,
-    *, agent_type: str = "opencode", root: str = "/tmp",
-    spawn_env: dict | None = None, port: int | None = None,
-) -> str:
-    """Modal supervisor is started at ``create_sandbox`` time — URL is stable.
-
-    Signature matches the other providers so mis-spelled kwargs surface as
-    ``TypeError`` instead of being silently swallowed.
-    """
-    return inst.url
 
 
 async def resolve_supervisor_url(sandbox_ref: str) -> str | None:

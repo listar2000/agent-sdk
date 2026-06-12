@@ -607,20 +607,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
 # Supervisor URL
 # ---------------------------------------------------------------------------
 
-async def ensure_supervisor_url(
-    inst: ProviderInstance,
-    *, agent_type: str = "opencode", root: str = "/tmp",
-    spawn_env: dict | None = None, port: int | None = None,
-) -> str:
-    """Local: the supervisor started at create_sandbox time. No-op, return
-    the URL already on the instance.
-
-    Signature matches Daytona's ``ensure_supervisor_url`` exactly so
-    mis-spelled kwargs surface as TypeError instead of being silently
-    swallowed by a ``**_kw`` catch-all."""
-    return inst.url
-
-
 # ---------------------------------------------------------------------------
 # Volume file ops (direct FS in-process, with realpath containment)
 # ---------------------------------------------------------------------------
