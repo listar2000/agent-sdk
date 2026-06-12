@@ -50,7 +50,6 @@ import httpx
 from api.sse import iter_sse_blocks, parse_acp_event
 from agent_sdk.api_client import ApiClient, _raise_for_status
 from agent_sdk.errors import StreamError, PromptError
-from agent_sdk.persist import SessionRecord, SqliteSessionDriver
 
 log = logging.getLogger(__name__)
 
@@ -348,19 +347,6 @@ class Session:
 
             self._registered = True
 
-            if agent._persist and self.session_id:
-                try:
-                    now = time.time()
-                    agent._persist.update_session(SessionRecord(
-                        id=self.session_id,
-                        agent_id=agent.id or agent.name,
-                        sandbox_ref=self.sandbox_ref,
-                        inner_session_id=self.inner_session_id,
-                        created_at=now,
-                        updated_at=now,
-                    ))
-                except Exception as e:
-                    log.warning("session persist failed: %s", e)
 
     # ── Wire-level helpers ──
 
@@ -682,7 +668,6 @@ class Agent:
         mcp_servers: dict[str, dict] | None = None,  # name -> config dict
         skills: list[str] | dict[str, dict] | None = None,  # npx skills sources
         cli_tools: list[str] | dict[str, dict] | None = None,  # uv tool install sources
-        db: str | None = None,
         session_id: str | None = None,
         sandbox_ref: str | None = None,
         dockerfile: str | None = None,
@@ -730,7 +715,6 @@ class Agent:
         # session/new, immutable for that session's lifetime.
         self.extra_options = dict(extra_options) if extra_options else None
         self._user_secrets: dict[str, str] = dict(secrets) if secrets else {}
-        self._persist: SqliteSessionDriver | None = SqliteSessionDriver(db) if db else None
 
         if api_url is None:
             api_url = os.environ.get("AGENT_API_URL", "https://agent-sdk-server-production.up.railway.app")
@@ -811,7 +795,6 @@ class Agent:
         kwargs: dict[str, Any] = {f: getattr(self, f) for f in self._CLONABLE_FIELDS}
         kwargs.update({
             "api_url": self._api_url,
-            "db": None,  # don't share persistence
             "oauth_token": self._oauth_token,
             "api_key": self._api_key,
             "secrets": dict(self._user_secrets) if self._user_secrets else None,
