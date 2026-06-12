@@ -2450,48 +2450,60 @@ async def _destroy_session_compute(session_id: str) -> None:
     from api import providers as _prov
     from api.sandbox import deserialize, get_pool
 
-    # Capture sandbox ref + provider type from the DB BEFORE pool.release
-    # wipes the in-memory state.
-    sandbox_ref: str | None = None
+    # Collect the sandbox ref(s) to destroy + the provider type, reading the DB
+    # BOTH before AND after pool.release(). Why twice: a native session whose
+    # in-flight turn hits SandboxGoneError RECREATES its sandbox (a NEW ref)
+    # out-from-under a concurrent DELETE. release() cancels AND awaits that turn
+    # (NativeSession.shutdown → _cancel_active awaits the task), so the
+    # post-release state is final — re-reading then catches a just-recreated
+    # ref. Destroying the UNION means neither the original nor the recreated
+    # sandbox leaks as an orphan. (``state.type`` is the Pydantic discriminator
+    # — ``unix_local``/``docker``/``daytona``/``modal``, the ``_PROVIDER_MODS``
+    # key space; native is the exception: ``type=="native"`` but its compute
+    # lives on ``state.provider``, so route the destroy through that.)
+    refs: set[str] = set()
     provider_type: str | None = None
-    try:
-        payload = await read_sandbox_state(session_id)
-        if payload is not None:
-            state = deserialize(payload)
-            sandbox_ref = getattr(state, "sandbox_ref", None)
-            # ``state.type`` is the Pydantic discriminator
-            # (``"unix_local"`` / ``"docker"`` / ``"daytona"`` /
-            # ``"modal"``) — same key space as ``_PROVIDER_MODS``,
-            # so this is a direct lookup. Native is the exception: its
-            # ``type`` is ``"native"`` (no provider module) but its compute
-            # lives on ``state.provider`` (docker in P0), so route the
-            # destroy through that — the docker module ``rm -f``s the
-            # container by ref.
-            provider_type = getattr(state, "type", None)
-            if provider_type == "native":
-                provider_type = getattr(state, "provider", None)
-    except Exception as e:
-        log.warning("teardown %s: read state failed: %s", session_id, e)
 
+    async def _collect() -> None:
+        nonlocal provider_type
+        try:
+            payload = await read_sandbox_state(session_id)
+        except Exception as e:
+            log.warning("teardown %s: read state failed: %s", session_id, e)
+            return
+        if payload is None:
+            return
+        state = deserialize(payload)
+        pt = getattr(state, "type", None)
+        if pt == "native":
+            pt = getattr(state, "provider", None)
+        if pt:
+            provider_type = pt
+        ref = getattr(state, "sandbox_ref", None)
+        if ref:
+            refs.add(ref)
+
+    await _collect()                       # before release
     try:
         await get_pool().release(session_id)
     except Exception as e:
         log.warning("teardown %s: pool.release failed: %s", session_id, e)
+    await _collect()                       # after release — catches a recreate
 
-    # Destroy the sandbox via the provider's uniform ``destroy_sandbox`` entry
-    # point. Best-effort — if the provider can't reach the sandbox (already
-    # gone, network blip), the caller still drops the row(s).
-    if provider_type and sandbox_ref:
-        try:
-            mod = _prov._PROVIDER_MODS.get(provider_type)
-            if mod is not None:
+    # Destroy via the provider's uniform ``destroy_sandbox``. Best-effort — if
+    # the provider can't reach the sandbox (already gone, network blip), the
+    # caller still drops the row(s).
+    mod = _prov._PROVIDER_MODS.get(provider_type) if provider_type else None
+    if mod is not None:
+        for sandbox_ref in refs:
+            try:
                 await mod.destroy_sandbox(_prov.ProviderInstance(
                     provider=provider_type, url="", root="",
                     sandbox_ref=sandbox_ref,
                 ))
-        except Exception as e:
-            log.warning("teardown %s: provider destroy failed (%s %s): %s",
-                        session_id, provider_type, sandbox_ref[:16], e)
+            except Exception as e:
+                log.warning("teardown %s: provider destroy failed (%s %s): %s",
+                            session_id, provider_type, sandbox_ref[:16], e)
 
 
 @app.delete("/sessions/{session_id}", status_code=204)

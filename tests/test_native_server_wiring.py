@@ -153,3 +153,50 @@ async def test_sandbox_exec_routes_through_transport_and_provisions(app_client):
 
 async def _ret(v):
     return v
+
+
+@pytest.mark.asyncio
+async def test_delete_destroys_recreated_ref_not_just_pre_release(app_client, monkeypatch):
+    """#3 (DELETE racing a mid-turn recreate): if a native session recreates its
+    sandbox (a NEW ref) concurrently with DELETE, teardown must destroy BOTH the
+    original and the recreated ref — not only the ref snapshotted BEFORE release
+    — so the recreated sandbox isn't orphaned. _destroy_session_compute re-reads
+    the ref AFTER pool.release() (which cancels+awaits the in-flight turn, so the
+    post-release state is final) and destroys the union."""
+    client, srv, dbmod = app_client
+    sid = str(uuid.uuid4())
+    r = await client.post("/sessions", json={
+        "id": sid, "agent_type": "native", "provider": "docker", "model": "x"})
+    assert r.status_code == 200, r.text
+
+    # seed the pre-release ref
+    payload = await dbmod.read_sandbox_state(sid)
+    payload["sandbox_ref"] = "ref0-original"
+    await dbmod.write_sandbox_state(sid, payload)
+
+    # simulate the in-flight turn recreating + persisting a NEW ref during the
+    # window release() covers (release cancels+awaits the turn, so the DB ref is
+    # final once it returns)
+    from api.sandbox import get_pool
+    pool = get_pool()
+
+    async def _release_with_recreate(session_id):
+        p = await dbmod.read_sandbox_state(session_id)
+        p["sandbox_ref"] = "ref1-recreated"
+        await dbmod.write_sandbox_state(session_id, p)
+    monkeypatch.setattr(pool, "release", _release_with_recreate)
+
+    # native docker routes destroy through the docker provider module
+    from api import providers as _prov
+    dockermod = _prov._PROVIDER_MODS["docker"]
+    destroyed = []
+
+    async def _fake_destroy(inst):
+        destroyed.append(inst.sandbox_ref)
+    monkeypatch.setattr(dockermod, "destroy_sandbox", _fake_destroy)
+
+    await srv._destroy_session_compute(sid)
+    assert set(destroyed) == {"ref0-original", "ref1-recreated"}, (
+        f"teardown must destroy BOTH the pre-release and recreated refs "
+        f"(no orphan); got {destroyed}")
+    await _cleanup(dbmod, sid)
