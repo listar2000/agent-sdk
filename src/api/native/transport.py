@@ -434,22 +434,23 @@ class DaytonaTransport:
             st = await self.status()
             if st == "stopped":
                 await self.resume()
-                # Mirror DockerTransport.exec's post-resume escalation: if resume
-                # did NOT restore a usable VM — an unrecoverable/broken daytona
-                # sandbox that stays non-running, or the retry still raises —
-                # don't wedge the session re-running against a corpse (the
-                # generic exception would be treated as tool-error DATA and the
-                # session would never recreate). Signal recreate; daytona's
-                # recreate is volume-safe, so _ensure_sandbox's missing→recreate
-                # path recovers the workspace cleanly.
+                # Mirror DockerTransport.exec's post-resume escalation
+                # (`rc!=0 AND status!=running`): a SUCCESSFUL retry is itself
+                # proof the VM is up — return it, never second-guess with a
+                # status() that may briefly lag to non-running right after
+                # resume (that lag would wrongly recreate a working VM). Only
+                # when the retry FAILS do we ask why: if the VM isn't running,
+                # resume couldn't restore it (an unrecoverable/broken sandbox)
+                # → recreate (volume-safe); if it IS running, the command itself
+                # failed on a live VM → propagate as an ordinary error.
                 try:
                     res = await _run()
                 except Exception:
-                    res = None
-                if res is None or await self.status() != "running":
-                    raise SandboxGoneError(
-                        f"daytona sandbox {self.sandbox_ref} not runnable "
-                        f"after resume")
+                    if await self.status() != "running":
+                        raise SandboxGoneError(
+                            f"daytona sandbox {self.sandbox_ref} not runnable "
+                            f"after resume")
+                    raise
             elif st == "missing":
                 raise SandboxGoneError(f"daytona sandbox {self.sandbox_ref} gone")
             else:

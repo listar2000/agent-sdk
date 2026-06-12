@@ -457,7 +457,8 @@ async def test_daytona_exec_escalates_when_resume_cannot_restore(monkeypatch):
     async def _exec(inst, cmd, timeout=30):
         raise RuntimeError("VM unrecoverable")
 
-    statuses = iter(["stopped"])   # classify=stopped; res is None short-circuits
+    # classify=stopped, then the failed-retry status() re-check also non-running
+    statuses = iter(["stopped", "stopped"])
 
     async def _status(ref):
         return next(statuses, "stopped")
@@ -470,6 +471,38 @@ async def test_daytona_exec_escalates_when_resume_cannot_restore(monkeypatch):
     t = T.DaytonaTransport(sandbox_ref="dt-x", workdir="/home/daytona")
     with pytest.raises(T.SandboxGoneError):
         await t.exec("echo hi")
+
+
+@pytest.mark.asyncio
+async def test_daytona_exec_successful_retry_not_escalated_on_status_lag(monkeypatch):
+    """A SUCCESSFUL post-resume retry must be RETURNED — never escalated to
+    SandboxGoneError — even if status() briefly lags to non-'running' right
+    after resume. The successful exec is itself proof the VM is up; a status()
+    second-guess would wrongly recreate a perfectly healthy VM (regression guard
+    for the efb50fd `res is None OR status!=running` over-eager escalation)."""
+    import api.providers.daytona as dt
+    calls = {"exec": 0}
+
+    async def _exec(inst, cmd, timeout=30):
+        calls["exec"] += 1
+        if calls["exec"] == 1:
+            raise RuntimeError("sandbox is paused")
+        return ExecResult(stdout="ok", stderr="", exit_code=0)
+
+    async def _status(ref):
+        # always reports 'stopped' — if the code wrongly re-checks status after
+        # a SUCCESSFUL retry it would see this lag and spuriously escalate
+        return "stopped"
+
+    async def _start(ref):
+        return None
+    monkeypatch.setattr(dt, "exec_in_sandbox", _exec)
+    monkeypatch.setattr(dt, "get_daytona_sandbox_status", _status)
+    monkeypatch.setattr(dt, "start_daytona", _start)
+    t = T.DaytonaTransport(sandbox_ref="dt-x", workdir="/home/daytona")
+    r = await t.exec("echo hi")   # must NOT raise SandboxGoneError
+    assert r.exit_code == 0 and "ok" in r.stdout
+    assert calls["exec"] == 2
 
 
 @pytest.mark.asyncio
