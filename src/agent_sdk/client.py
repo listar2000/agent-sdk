@@ -15,7 +15,7 @@ Layering: ``Agent`` is the spec/factory + ``ApiClient`` owner. A
 one sandbox, one ACP child). For backwards compat, ``Agent`` exposes a
 default ``Session`` that all the legacy runtime methods (``arun``,
 ``astream``, ``send``, ``events``, ``cancel``, ``configure``,
-``reset_session``, ``aclose``, ``run``) delegate to. New: call
+``reset_session``, ``aclose``) delegate to. New: call
 ``agent.create_session()`` to get an additional ``Session`` bound to the
 same agent — multiple sessions of the same agent share the volume
 subpath ``agents/<agent_id>/`` (and therefore Claude's JSONL history)
@@ -36,7 +36,6 @@ import json
 import logging
 import os
 import shlex
-import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -47,8 +46,8 @@ from urllib.parse import urlparse
 
 import httpx
 
-from api.sse import iter_sse_blocks, parse_acp_event
-from agent_sdk.api_client import ApiClient, _raise_for_status
+from api.sse import parse_acp_event
+from agent_sdk.api_client import ApiClient
 from agent_sdk.errors import StreamError, PromptError
 
 log = logging.getLogger(__name__)
@@ -347,7 +346,6 @@ class Session:
 
             self._registered = True
 
-
     # ── Wire-level helpers ──
 
     async def _post_message(self, message: str, *, interrupt: bool = False) -> str:
@@ -370,23 +368,6 @@ class Session:
         return await self._post_message(message, interrupt=interrupt)
 
     @asynccontextmanager
-    async def _open_sse(self):
-        """Open SSE GET /events on the underlying httpx client. Yields the
-        response object so iter_sse_blocks can consume it directly.
-
-        Reaches into ``self._agent._api._http`` for the raw stream context
-        manager — SSE parsing has cancellation semantics tied to the
-        response, and ApiClient's bytes-yielding ``stream_events`` would
-        lose that. Documented escape hatch."""
-        async with self._agent._api._http.stream(
-            "GET",
-            f"/sessions/{self.session_id}/events",
-            headers={"Accept": "text/event-stream"},
-            timeout=httpx.Timeout(30.0, read=90.0),
-        ) as sse:
-            yield sse
-
-    @asynccontextmanager
     async def events(self):
         """Open a long-lived SSE stream and yield an async iterator of parsed events.
 
@@ -394,17 +375,17 @@ class Session:
         """
         await self._ensure_registered()
 
-        async def _iter(sse):
+        async def _iter(blocks):
             try:
-                async for block in iter_sse_blocks(sse):
+                async for block in blocks:
                     ev = parse_acp_event(block, None)
                     if ev is not None:
                         yield ev
             except httpx.ReadTimeout:
                 raise StreamError(f"[{self._agent.name}] events() connection lost (no heartbeat)")
 
-        async with self._open_sse() as sse:
-            yield _iter(sse)
+        async with self._agent._api.open_events(self.session_id) as blocks:
+            yield _iter(blocks)
 
     # ── Core: astream ──
 
@@ -433,21 +414,12 @@ class Session:
         connection loss.
         """
         await self._ensure_registered()
-        body = {"message": message, "interrupt": interrupt}
         try:
             async with self._prompt_lock:
-                # Same escape-hatch reasoning as _open_sse: iter_sse_blocks
-                # needs the raw response object, and the per-prompt SSE
-                # cancellation must be tied to the context manager.
-                async with self._agent._api._http.stream(
-                    "POST",
-                    f"/sessions/{self.session_id}/message+stream",
-                    json=body,
-                    headers={"Accept": "text/event-stream"},
-                    timeout=httpx.Timeout(30.0, read=None),
-                ) as sse:
-                    _raise_for_status(sse)
-                    async for block in iter_sse_blocks(sse):
+                async with self._agent._api.open_message_stream(
+                    self.session_id, message, interrupt=interrupt,
+                ) as blocks:
+                    async for block in blocks:
                         # /message+stream scopes blocks to this prompt
                         # already, so no rpc-tag filtering needed here.
                         raw = parse_acp_event(block, None)
@@ -478,6 +450,20 @@ class Session:
 
     # ── Core: arun ──
 
+    def run(self, message: str, timeout: float | None = None, *,
+            interrupt: bool = False) -> str:
+        """Sync wrapper with CONVERSATION CONTINUITY across repeated calls.
+
+        Runs on the Agent's persistent background event loop (one daemon
+        thread per Agent), so every async object stays bound to a single
+        loop — repeated ``run()`` calls share the session, and it works
+        inside Jupyter (no ``asyncio.run`` on the caller's loop). Don't mix
+        sync ``run()`` and ``await``-style calls on the SAME Agent: pick one
+        style per Agent instance.
+        """
+        return self._agent._sync_submit(
+            self.arun(message, interrupt=interrupt), timeout)
+
     async def arun(self, message: str, *, interrupt: bool = False) -> str:
         """Send a message and return the full response text."""
         parts = []
@@ -487,47 +473,6 @@ class Session:
         self.usage.call_count += 1
         return "".join(parts)
 
-    # ── Sync wrapper ──
-
-    def _reset_async_state(self) -> None:
-        """Recreate event-loop-bound objects for a fresh ``asyncio.run``.
-
-        Called by ``run()`` to make the next sync invocation work even
-        if a previous one ran (and closed) a different event loop. The
-        Agent's ApiClient gets a fresh httpx client; this Session's
-        locks are recreated; the agent-level register lock is also
-        recreated since it lives on the same loop axis.
-        """
-        agent = self._agent
-        agent._api = ApiClient(
-            agent._api_url,
-            http_client=httpx.AsyncClient(
-                base_url=agent._api_url,
-                timeout=httpx.Timeout(30.0, read=120.0),
-                follow_redirects=True,
-            ),
-        )
-        agent._agent_register_lock = asyncio.Lock()
-        self._register_lock = asyncio.Lock()
-        self._prompt_lock = asyncio.Lock()
-
-    def _sync_call(self, coro_factory):
-        self._reset_async_state()
-        async def _run():
-            try:
-                return await coro_factory()
-            finally:
-                await self._agent._api.close()
-        return asyncio.run(_run())
-
-    def run(self, message: str, timeout: float | None = None, *, interrupt: bool = False) -> str:
-        """Sync wrapper: send message and return response."""
-        def _factory():
-            coro = self.arun(message, interrupt=interrupt)
-            if timeout is not None:
-                coro = asyncio.wait_for(coro, timeout=timeout)
-            return coro
-        return self._sync_call(_factory)
 
     # ── Session config ──
 
@@ -627,9 +572,6 @@ class Agent:
         text = await agent.arun("say hello")
         async for chunk in agent.astream("analyze this"):
             print(chunk, end="")
-
-        # sync
-        text = agent.run("say hello")
 
         # Multiple sessions for one agent (share volume + JSONL history)
         s1 = agent.create_session()
@@ -840,6 +782,30 @@ class Agent:
 
     # ── Session factory ──
 
+    def _sync_submit(self, coro, timeout: float | None = None):
+        """Run a coroutine on this Agent's persistent background loop.
+
+        The old sync pathway rebuilt the shared httpx client + locks per
+        call (corrupting sibling sessions and leaking clients — deleted in
+        58e9033). This one keeps a single long-lived loop in a daemon
+        thread, so loop-bound objects bind once and stay valid across
+        calls."""
+        import threading
+        loop = getattr(self, "_sync_loop", None)
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, daemon=True,
+                             name=f"agent-sync-{self.name}").start()
+            self._sync_loop = loop
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+
+    def run(self, message: str, timeout: float | None = None, *,
+            interrupt: bool = False) -> str:
+        """Sync wrapper around the default session's ``arun`` — see
+        ``Session.run`` for the continuity/loop semantics."""
+        return self._ensure_default_session().run(
+            message, timeout, interrupt=interrupt)
+
     def _ensure_default_session(self) -> Session:
         """Lazily materialise the default ``Session``. Called from every
         legacy entry point (``agent.arun``, ``agent.send``, ``agent.events``,
@@ -1020,22 +986,6 @@ class Agent:
         """Send a message on the default session and return the full response text."""
         return await self._ensure_default_session().arun(message, interrupt=interrupt)
 
-    def run(self, message: str, timeout: float | None = None, *, interrupt: bool = False) -> str:
-        """Sync wrapper around the default session's ``arun``."""
-        return self._ensure_default_session().run(message, timeout=timeout, interrupt=interrupt)
-
-    def _reset_async_state(self) -> None:
-        """Recreate event-loop-bound objects on the default session.
-
-        Kept for backwards-compatibility — the legacy sync-call pathway
-        called ``_reset_async_state`` on the Agent before each
-        ``asyncio.run``. Now delegated to the default session so the
-        same behaviour applies.
-        """
-        self._ensure_default_session()._reset_async_state()
-
-    def _sync_call(self, coro_factory):
-        return self._ensure_default_session()._sync_call(coro_factory)
 
     async def configure(self, **kwargs) -> None:
         """Set default-session config dynamically. Accepts: mode, model, thought_level."""

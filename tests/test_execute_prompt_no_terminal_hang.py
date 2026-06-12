@@ -171,7 +171,7 @@ class _StubSession(BaseSandboxSession):
     async def start(self) -> None:  # pragma: no cover - not exercised
         pass
 
-    async def running(self, *, force_probe: bool = False) -> bool:
+    async def running(self) -> bool:
         return True
 
     async def _liveness_probe(self) -> bool:

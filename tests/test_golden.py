@@ -3012,7 +3012,7 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
             # Finished turn so the cold-recovery RESUMES (session/load contract).
             await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
 
-            # Kill the sandbox so the next get_session force_probe sees it dead
+            # Kill the sandbox so the next get_session probe sees it dead
             # and takes the stale-teardown branch (orphaning the old task).
             sandbox = await _get_sandbox(sdk, sid)
             await _external_stop(sandbox)

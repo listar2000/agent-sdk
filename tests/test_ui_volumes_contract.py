@@ -9,6 +9,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 import pytest_asyncio
+from api.providers.unix_local import UnixLocalVolumeAdapter
 
 _DB = os.environ.get("TEST_DATABASE_URL")
 pytestmark = [pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"), pytest.mark.xdist_group("db")]
@@ -48,7 +49,7 @@ async def test_tree_is_newline_string(client):
     """UI parses tree as newline-separated string; dirs end with '/', files don't."""
     with patch("api.providers.unix_local.create_volume",
                new=AsyncMock(return_value="local-ui-tree")), \
-         patch("api.providers.unix_local.volume_tree",
+         patch.object(UnixLocalVolumeAdapter, "tree",
                new=AsyncMock(return_value="a.txt\nsub/\nsub/b.txt")):
         r = await client.post("/volumes", json={"name": "ui-tree-vol", "provider": "unix_local"})
         assert r.status_code == 200
@@ -69,7 +70,7 @@ async def test_file_read_content_or_content_base64(client):
     """UI reads either {content} (text) or {content_base64} (binary)."""
     with patch("api.providers.unix_local.create_volume",
                new=AsyncMock(return_value="local-ui-read")), \
-         patch("api.providers.unix_local.volume_read",
+         patch.object(UnixLocalVolumeAdapter, "read",
                new=AsyncMock(return_value=b"hello\nworld")):
         r = await client.post("/volumes", json={"name": "ui-read-vol", "provider": "unix_local"})
         assert r.status_code == 200

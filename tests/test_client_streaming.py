@@ -783,14 +783,14 @@ class TestRaiseForStatus:
 
     def test_200_does_not_raise(self):
         """2xx status codes do not raise."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 200
         _raise_for_status(resp)  # must not raise
 
     def test_404_raises_with_error_detail(self):
         """4xx raises HTTPStatusError with extracted 'error' field."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 404
         resp.json = MagicMock(return_value={"error": "not found"})
@@ -802,7 +802,7 @@ class TestRaiseForStatus:
 
     def test_4xx_raises_with_detail_field_fallback(self):
         """If no 'error' key, falls back to 'detail'."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 422
         resp.json = MagicMock(return_value={"detail": "validation error"})
@@ -814,7 +814,7 @@ class TestRaiseForStatus:
 
     def test_raises_even_when_json_fails(self):
         """If response body is not JSON, still raises with text fallback."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 500
         resp.json = MagicMock(side_effect=ValueError("not json"))
