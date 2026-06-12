@@ -55,6 +55,29 @@ if not os.environ.get("TEST_DATABASE_URL"):
 _DB_TABLES = ("session_log", "sessions", "volumes", "agents")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _prefer_oauth_over_api_key():
+    """Drop ANTHROPIC_API_KEY from the test process when the OAuth token is
+    available — OAuth is the repo's blessed claude credential (CLAUDE.md).
+
+    Why this exists: several test modules call ``load_dotenv(~/.env)`` at
+    IMPORT time, and xdist workers import every module during collection —
+    so a stale/revoked ANTHROPIC_API_KEY in ~/.env lands in ``os.environ``
+    of every worker regardless of what the launching shell unset. The SDK
+    auto-forwards it into session secrets (client._secrets_payload) and the
+    claude CLI PREFERS an API key over the OAuth token, so one dead key
+    401s every claude live test ("Invalid API key · Fix external API key")
+    while the goldens — which pass the OAuth secret explicitly — stay
+    green. This fixture runs after collection imports and before the first
+    test, which is exactly the window that matters (the SDK reads environ
+    at Agent construction, not at import). To test WITH a real API key:
+    export it in the shell and unset CLAUDE_CODE_OAUTH_TOKEN.
+    """
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and os.environ.get("ANTHROPIC_API_KEY"):
+        os.environ.pop("ANTHROPIC_API_KEY")
+    yield
+
+
 @pytest_asyncio.fixture
 async def db_pool():
     """Open the connection pool for this test and tear it down after.
