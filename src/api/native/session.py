@@ -371,11 +371,21 @@ class NativeSession(BaseSandboxSession):
 
     async def sandbox_exec(self, command: str, timeout: int = 30) -> dict:
         """Back the server's /sandbox/exec route for native sessions. Same
-        response shape the supervisor's /v1/exec returns."""
+        response shape the supervisor's /v1/exec returns. Recovers a sandbox
+        that died under the live session (SandboxGoneError) ONCE — mirrors the
+        loop's _invoke_tool so /sandbox/exec doesn't 500 on a routine modal
+        hard-timeout reap or a docker prune."""
+        from .transport import SandboxGoneError
+
+        async def _run(t):
+            return await t.exec(command, cwd=self._cwd,
+                                env=self._sandbox_env or None, timeout_s=timeout)
+
         transport = await self._ensure_sandbox()
-        res = await transport.exec(command, cwd=self._cwd,
-                                   env=self._sandbox_env or None,
-                                   timeout_s=timeout)
+        try:
+            res = await _run(transport)
+        except SandboxGoneError:
+            res = await _run(await self._ensure_sandbox(refresh=True))
         return {
             "stdout": res.stdout,
             "stderr": res.stderr,

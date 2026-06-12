@@ -326,3 +326,26 @@ async def test_removed_container_under_live_session_recreates():
         for ref in {s.state.sandbox_ref, extra}:
             if ref:
                 subprocess.run(["docker", "rm", "-f", ref], capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_exec_recovers_when_container_removed():
+    """The /sandbox/exec route (NativeSession.sandbox_exec) must ALSO recover a
+    sandbox removed under the live session — not 500 with SandboxGoneError —
+    mirroring the loop's _invoke_tool recover-and-retry."""
+    s = _session()
+    extra = None
+    try:
+        t = await s._ensure_sandbox()
+        cid = t.container_id
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=30)
+        assert _container_state(cid) == ""
+        # must recreate + succeed, not raise
+        res = await s.sandbox_exec("echo back", timeout=30)
+        assert res["exit_code"] == 0 and "back" in res["stdout"]
+        extra = s._transport.container_id
+        assert extra and extra != cid
+    finally:
+        for ref in {s.state.sandbox_ref, extra}:
+            if ref:
+                subprocess.run(["docker", "rm", "-f", ref], capture_output=True)
