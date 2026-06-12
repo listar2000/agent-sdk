@@ -89,9 +89,15 @@ def _has_docker() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
+# Live-server suites are SERIAL-BY-DESIGN (one shared stack, real
+# sandboxes/LLM quota): xdist_group("live") pins them to one worker so
+# `-n auto tests/` cannot run them concurrently (pyproject --dist loadgroup).
+pytestmark = [
+    pytest.mark.skipif(
     not _has_server(), reason="needs live server on localhost:7778",
-)
+),
+    pytest.mark.xdist_group("live"),
+]
 
 
 # ---------------------------------------------------------------------------

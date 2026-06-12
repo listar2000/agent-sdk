@@ -47,6 +47,11 @@ import sys
 import httpx
 import pytest
 
+# Live-server suite — SERIAL-BY-DESIGN (one shared stack, real sandboxes/
+# LLM quota): xdist_group("live") pins it to one worker so `-n auto tests/`
+# cannot run live tests concurrently (pyproject --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("live")
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from dotenv import load_dotenv
