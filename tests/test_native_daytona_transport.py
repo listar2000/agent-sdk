@@ -524,3 +524,39 @@ async def test_daytona_exec_error_status_fails_closed(monkeypatch):
     with pytest.raises(RuntimeError, match="transient status-api blip"):
         await t.exec("echo hi")
     assert not isinstance(RuntimeError, T.SandboxGoneError)
+
+
+@pytest.mark.asyncio
+async def test_daytona_create_destroys_on_readiness_failure(monkeypatch):
+    """Parity with docker/modal create(): if the post-provision readiness mkdir
+    fails, create() must DESTROY the freshly-provisioned VM before propagating —
+    else a PAID idle daytona sandbox leaks until the next boot reconcile (its ref
+    is never persisted, so nothing else would tear it down)."""
+    import api.providers.daytona as dt
+
+    class _Inst:
+        sandbox_ref = "dt-fresh"
+
+    async def _provision(**kw):
+        return _Inst()
+
+    async def _exec(inst, cmd, timeout=30):
+        raise RuntimeError("control-plane blip during mkdir")
+
+    async def _status(ref):
+        return "running"   # fresh VM is up; exec recovery re-raises the error
+
+    destroyed = []
+
+    async def _destroy(inst):
+        destroyed.append(inst.sandbox_ref)
+    monkeypatch.setattr(dt, "provision_daytona_sandbox", _provision)
+    monkeypatch.setattr(dt, "exec_in_sandbox", _exec)
+    monkeypatch.setattr(dt, "get_daytona_sandbox_status", _status)
+    monkeypatch.setattr(dt, "destroy_daytona", _destroy)
+
+    t = T.DaytonaTransport(workdir="/home/daytona")
+    with pytest.raises(RuntimeError, match="control-plane blip"):
+        await t.create(root="/home/daytona", volume_id="v1", subpath="agents/a1")
+    assert destroyed == ["dt-fresh"], (
+        "create() must destroy the leaked VM when readiness fails")

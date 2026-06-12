@@ -382,7 +382,19 @@ class DaytonaTransport:
         if not inst.sandbox_ref:
             raise RuntimeError("daytona provision returned no sandbox_ref")
         self.sandbox_ref = inst.sandbox_ref
-        await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+        # Readiness gate. If it fails the VM is live but unusable — destroy it
+        # before propagating so we don't leak a PAID idle daytona sandbox until
+        # the next boot reconcile (mirrors Docker/ModalTransport.create's
+        # destroy-before-raise; the ref isn't persisted until create returns, so
+        # nothing else would tear it down).
+        try:
+            await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+        except BaseException:
+            try:
+                await self.destroy()
+            except Exception:
+                log.exception("daytona native: cleanup after readiness failure")
+            raise
         return self.sandbox_ref
 
     async def status(self) -> str:
