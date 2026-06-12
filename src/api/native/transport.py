@@ -152,11 +152,22 @@ class DockerTransport:
         return "error"
 
     async def hibernate(self) -> None:
-        """``docker stop`` — free CPU/RAM, KEEP the container and its
-        writable layer (workspace files survive). Resume = ``start()``."""
+        """``docker stop -t 0`` — free CPU/RAM, KEEP the container and its
+        writable layer (workspace files survive). Resume = ``start()``.
+
+        ``-t 0`` (immediate SIGKILL, no grace) because the native PID-1 is a
+        bare ``sleep infinity`` with NO SIGTERM disposition — as PID-1 the
+        kernel IGNORES the default SIGTERM ``docker stop`` sends, so any grace
+        period is dead time docker waits out before SIGKILLing anyway (~2s with
+        ``-t 2``). Native never snapshots-on-stop (conversation state is
+        checkpointed per turn; the workspace lives in the writable layer/volume,
+        both of which survive a SIGKILL), and ``sleep`` holds no flushable
+        state, so skipping the grace is loss-free — and brings reap latency from
+        ~2.1s to ~0.13s, at/under the supervisor hibernate (whose supervisor.js
+        PID-1 traps SIGTERM and exits in ~0.2s)."""
         if not self.container_id:
             return
-        await _run_docker("stop", "-t", "2", self.container_id, timeout=30)
+        await _run_docker("stop", "-t", "0", self.container_id, timeout=30)
 
     async def resume(self) -> None:
         """``docker start`` a hibernated container — files intact, cheap."""

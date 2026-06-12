@@ -2515,6 +2515,69 @@ async def _measure_resume_median(sdk: ApiClient, agent_type: str, cycles: int = 
     return statistics.median(samples)
 
 
+async def _measure_reap_median(sdk: ApiClient, agent_type: str, cycles: int = 3) -> float:
+    """Median REAP/hibernate latency (seconds) for one runtime on docker: warm
+    the session with a turn (sets the activity clock), then time the
+    ``POST /reap`` that hibernates it (``docker stop``). Native's sleep-infinity
+    PID-1 ignores SIGTERM, so a grace period is pure dead time — native must use
+    ``-t 0`` (immediate SIGKILL) to match the supervisor, whose supervisor.js
+    PID-1 traps SIGTERM and exits promptly. A trivial ``true`` exec resumes the
+    sandbox between cycles."""
+    import statistics
+    import time as _time
+    sess = await _quick_session(sdk, "docker", agent_type=agent_type)
+    sid = sess["session_id"]
+    samples: list[float] = []
+    await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+    for _ in range(cycles):
+        await _post_and_wait(sdk, sid, "Reply with the single word: ok.")
+        t0 = _time.monotonic()
+        r = await sdk._http.post(f"/sessions/{sid}/reap",
+                                 params={"idle_s": 0}, timeout=30)
+        dt = _time.monotonic() - t0
+        r.raise_for_status()
+        if r.json().get("hibernated") is not True:
+            continue  # activity not settled yet; skip this cycle
+        samples.append(dt)
+        # resume for the next cycle so we re-measure a stop, not a no-op
+        res = await sdk.session_sandbox_exec(sid, "true", timeout=120)
+        assert res.get("exit_code") == 0, f"{agent_type}: post-reap resume failed: {res}"
+    assert samples, f"{agent_type}: no successful reap cycle measured"
+    return statistics.median(samples)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(420)
+async def test_native_reap_at_least_as_efficient_as_supervisor():
+    """RESOURCE-MANAGEMENT efficiency standard (the REAP/stop side): native's
+    reap (hibernate) must be at least as fast as the supervisor path.
+
+    Native ``docker stop -t 0`` SIGKILLs the sleep-infinity PID-1 immediately
+    (~0.1s); the prior ``-t 2`` waited out the full grace (~2s) because that
+    PID-1 ignores SIGTERM. The supervisor's supervisor.js traps SIGTERM and
+    exits in ~0.2s. This pins that native reap can't silently regress to
+    grace-bound latency — the resume-efficiency golden times only the START
+    side, leaving the STOP side unguarded. Relative (same host) + generous
+    tolerance keeps it off the flaky edge while still catching the ~2s
+    regression."""
+    if not _has_docker():
+        pytest.skip("docker not available")
+    if not OAUTH_TOKEN or not _OPENROUTER_KEY:
+        pytest.skip("needs CLAUDE_CODE_OAUTH_TOKEN (supervisor) + "
+                    "OPENROUTER_API_KEY (native)")
+
+    async with ApiClient(SERVER) as sdk:
+        native_med = await _measure_reap_median(sdk, "native")
+        supervisor_med = await _measure_reap_median(sdk, "claude")
+        print(f"\n[reap-efficiency] native={native_med*1000:.0f}ms "
+              f"supervisor={supervisor_med*1000:.0f}ms")
+        assert native_med <= supervisor_med + 0.5, (
+            f"NATIVE REAP REGRESSED: native hibernate ({native_med*1000:.0f}ms) "
+            f"is slower than the supervisor path ({supervisor_med*1000:.0f}ms). "
+            f"Native must `docker stop -t 0` (the sleep-infinity PID-1 ignores "
+            f"SIGTERM, so any grace is dead time) — a grace period regressed in.")
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(420)
 async def test_native_resume_at_least_as_efficient_as_supervisor():

@@ -116,6 +116,32 @@ async def test_hibernate_keeps_container_resume_reattaches_with_files():
 
 
 @pytest.mark.asyncio
+async def test_hibernate_is_immediate_not_grace_bound():
+    """Native hibernate must SIGKILL immediately (`docker stop -t 0`): the
+    sleep-infinity PID-1 ignores SIGTERM (no default disposition for PID-1), so
+    any grace period is pure dead time docker waits out before SIGKILLing (~2s
+    with `-t 2`) — slower than the supervisor hibernate. The huge gap (~0.1s vs
+    ~2s) keeps this off the flaky edge. Workspace survival is covered by
+    test_hibernate_keeps_container_resume_reattaches_with_files."""
+    import time as _time
+    s = _session()
+    cid = None
+    try:
+        t = await s._ensure_sandbox()
+        cid = t.container_id
+        t0 = _time.monotonic()
+        await t.hibernate()
+        dt = _time.monotonic() - t0
+        assert _container_state(cid) == "exited"
+        assert dt < 1.0, (
+            f"native hibernate took {dt:.2f}s — grace not skipped? `sleep "
+            f"infinity` ignores SIGTERM, so `docker stop` must use -t 0")
+    finally:
+        if cid:
+            subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+
+
+@pytest.mark.asyncio
 async def test_stale_ref_falls_through_to_create():
     """A sandbox_ref to a gone container must not wedge resume — create fresh."""
     s = NativeSession(session_id="sess-stale",
