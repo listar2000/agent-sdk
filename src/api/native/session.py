@@ -396,7 +396,12 @@ class NativeSession(BaseSandboxSession):
         see the same GITHUB_TOKEN/etc that /sandbox/exec injects explicitly —
         parity with the supervisor runtime, where the agent's shell inherits
         spawn_env."""
-        from .transport import DaytonaTransport, DockerTransport, ModalTransport
+        from .transport import (
+            DaytonaTransport,
+            DockerTransport,
+            ModalTransport,
+            UnixLocalTransport,
+        )
         env = self._sandbox_env
         if provider == "docker":
             return DockerTransport(container_id=ref, workdir=self._cwd, env=env)
@@ -404,14 +409,27 @@ class NativeSession(BaseSandboxSession):
             return DaytonaTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
         if provider == "modal":
             return ModalTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
+        if provider == "unix_local":
+            return UnixLocalTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
         raise RuntimeError(f"native provider {provider!r} not wired")
 
     async def _create_transport(self, provider: str):
         """Cold-create a fresh sandbox for ``provider`` and return its
         transport. docker: a sleep-infinity container; daytona: a paused-
         capable VM on the session volume."""
-        from .transport import DaytonaTransport, DockerTransport, ModalTransport
+        from .transport import (
+            DaytonaTransport,
+            DockerTransport,
+            ModalTransport,
+            UnixLocalTransport,
+        )
         env = self._sandbox_env  # default exec env — see _reattach_transport
+        if provider == "unix_local":
+            # Record-only sandbox on the host: workspace dir + provider-index
+            # record, no resident compute (hibernate/resume are no-ops).
+            t = UnixLocalTransport(workdir=self._cwd, env=env)
+            await t.create(root=self._cwd)
+            return t
         if provider == "docker":
             t = DockerTransport(workdir=self._cwd, env=env)
             # create() does the workdir mkdir as its readiness step, so no

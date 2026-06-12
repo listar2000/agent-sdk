@@ -715,3 +715,174 @@ class ModalTransport:
         if res.exit_code != 0:
             raise FileNotFoundError(f"modal read_file({path}): {res.stderr[:300]}")
         return _b64.b64decode(res.stdout)
+
+
+# ===========================================================================
+# UnixLocalTransport — native transport over host processes (dev provider).
+# unix_local has NO compute object at rest: native execs are per-call host
+# subprocesses that exit when done, so between turns a session holds nothing
+# a hibernate could free. The lifecycle is therefore RECORD-ONLY — a json
+# record in the unix_local provider's existing _SandboxRecord index (the
+# same registry the supervisor path uses; supervisor_js="native", pid=0 as
+# the discriminator) carries identity (stable sandbox_ref), the workspace
+# path, and destroyed-out-of-band detection:
+#   status     record exists → 'running'; gone → 'missing'. NEVER 'stopped'.
+#   hibernate  no-op — the pool evicting the session already frees the only
+#              resource (server memory). Reap cost ~0ms: trivially at least
+#              as efficient as the supervisor path (which kills a node
+#              supervisor + ACP child it keeps resident).
+#   resume     no-op (nothing was stopped); unreachable from _ensure_sandbox
+#              since status never reads 'stopped'.
+#   destroy    clear the record → 'missing'; exec on a cleared record raises
+#              SandboxGoneError so the session recreates (workspace files
+#              persist on disk — destroy never deletes user data).
+# ===========================================================================
+
+
+class UnixLocalTransport:
+    provider = "unix_local"
+
+    #: resume() is an unfailable no-op (and unreachable: status() never
+    #: returns 'stopped'), so the post-resume re-check would be meaningless.
+    resume_is_authoritative = True
+
+    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/tmp",
+                 env: dict[str, str] | None = None):
+        self.sandbox_ref = sandbox_ref
+        self.workdir = workdir
+        # Session env injected into every exec (see DockerTransport.default_env).
+        self.default_env = dict(env or {})
+
+    @property
+    def ref(self) -> str | None:
+        return self.sandbox_ref
+
+    def _resolve(self, path: str) -> str:
+        if path.startswith("/"):
+            return path
+        base = self.workdir.rstrip("/") or ""
+        return f"{base}/{path}"
+
+    @staticmethod
+    def _load(ref: str):
+        from api.providers.unix_local import _load_record
+        return _load_record(ref)
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+
+    async def create(self, *, root: str | None = None, **_kw) -> str:
+        import os as _os
+        import uuid as _uuid
+        from pathlib import Path as _Path
+
+        from api.providers.unix_local import (
+            _index_dir,
+            _SandboxRecord,
+            _write_record,
+        )
+        workspace = root or self.workdir
+        ref = f"native-local-{_uuid.uuid4().hex[:12]}"
+        record = _SandboxRecord(
+            ref=ref, pid=0, port=0, node="", supervisor_js="native",
+            acp_bin="", effective_root=workspace,
+            base_env={"AGENT_SDK_ORIGIN":
+                      _os.environ.get("AGENT_SDK_ORIGIN", "production")},
+        )
+
+        def _provision() -> None:
+            _Path(workspace).mkdir(parents=True, exist_ok=True)
+            # marker == index path: native has no per-volume marker dir, so
+            # both _write_record targets coincide (idempotent double write).
+            _write_record(_index_dir() / f"{ref}.json", record)
+        await asyncio.to_thread(_provision)
+        self.sandbox_ref = ref
+        return ref
+
+    async def status(self) -> str:
+        if not self.sandbox_ref:
+            return "missing"
+        _, record = await asyncio.to_thread(self._load, self.sandbox_ref)
+        return "running" if record is not None else "missing"
+
+    async def hibernate(self) -> None:
+        """No-op: nothing runs between execs, so there is nothing to free.
+        The reap's real effect is the POOL evicting the session object."""
+        return None
+
+    async def resume(self) -> None:
+        """No-op: nothing was stopped. Unreachable in practice — status()
+        never returns 'stopped' for a record-only sandbox."""
+        return None
+
+    async def destroy(self) -> None:
+        from api.providers.unix_local import _clear_record
+        if not self.sandbox_ref:
+            return
+        marker, record = await asyncio.to_thread(self._load, self.sandbox_ref)
+        await asyncio.to_thread(_clear_record, self.sandbox_ref, marker, record)
+
+    # ── exec / files ────────────────────────────────────────────────────────
+
+    async def exec(self, command: str, *, cwd: str | None = None,
+                   env: dict[str, str] | None = None,
+                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S,
+                   use_default_env: bool = True) -> TransportExecResult:
+        """Run the command as a host subprocess. A missing RECORD means the
+        sandbox was destroyed out-of-band → SandboxGoneError (the session
+        recreates on the same workspace)."""
+        import os as _os
+        import signal as _signal
+        if not self.sandbox_ref:
+            raise RuntimeError("local transport has no sandbox")
+        _, record = await asyncio.to_thread(self._load, self.sandbox_ref)
+        if record is None:
+            raise SandboxGoneError(
+                f"local native sandbox {self.sandbox_ref} record gone")
+        merged = {**(self.default_env if use_default_env else {}),
+                  **(env or {})}
+        # Env rides execve directly (no shell preamble needed): /bin/sh is
+        # resolved by absolute path, so even a PATH-class session env cannot
+        # break the spawn — it only alters lookup INSIDE the user command,
+        # the same semantics the container transports get via the preamble.
+        t = max(1, int(timeout_s))
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", command,
+            cwd=cwd or record.effective_root or self.workdir,
+            env={**_os.environ, **merged},
+            start_new_session=True,   # own pgroup → timeout kill reaps the tree
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=t)
+        except asyncio.TimeoutError:
+            try:
+                _os.killpg(proc.pid, _signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return TransportExecResult("", f"timed out after {t}s", 124, True)
+        stdout, _tr = _truncate(out or b"", _MAX_OUTPUT_BYTES)
+        stderr, _tr = _truncate(err or b"", _MAX_OUTPUT_BYTES)
+        return TransportExecResult(stdout, stderr, proc.returncode or 0, False)
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        from pathlib import Path as _Path
+        p = _Path(self._resolve(path))
+
+        def _write() -> None:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        await asyncio.to_thread(_write)
+
+    async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
+        from pathlib import Path as _Path
+        p = _Path(self._resolve(path))
+        data = await asyncio.to_thread(p.read_bytes)   # FileNotFoundError as-is
+        if len(data) > max_bytes:
+            raise ValueError(f"read_file({path}): {len(data)}B exceeds "
+                             f"max_bytes={max_bytes}")
+        return data

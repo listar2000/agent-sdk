@@ -19,7 +19,6 @@ import sys
 import pytest
 import pytest_asyncio
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.native.transport import DockerTransport  # noqa: E402
 

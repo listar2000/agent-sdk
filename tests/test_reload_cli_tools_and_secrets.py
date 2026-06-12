@@ -36,20 +36,20 @@ import uuid
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from agent_sdk import Agent, ApiClient  # noqa: E402
 
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY")
 OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 
-pytestmark = pytest.mark.skipif(
+# Live-server suite — serialize onto the "live" xdist worker (see pyproject).
+pytestmark = [
+    pytest.mark.skipif(
     not OAUTH_TOKEN,
     reason="CLAUDE_CODE_OAUTH_TOKEN required",
-)
+),
+    pytest.mark.xdist_group("live"),
+]
 
 # These tests use ``provider="unix_local"`` so they can iterate without
 # rebuilding the daytona / modal snapshot. ``uv`` lives on the host

@@ -19,7 +19,6 @@ import httpx
 import pytest
 import pytest_asyncio
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 _DB_URL = os.environ.get("DATABASE_URL",
                          "postgresql://postgres@localhost:5433/agent_sdk_server")

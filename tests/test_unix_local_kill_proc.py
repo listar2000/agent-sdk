@@ -13,8 +13,6 @@ import os
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
 
 def test_kill_proc_is_defined_and_kills_and_reaps():
     # Pre-fix this import raises ImportError (the name the create-failure

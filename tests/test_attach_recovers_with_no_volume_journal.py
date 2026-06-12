@@ -52,7 +52,6 @@ import pytest
 # cannot run live tests concurrently (pyproject --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("live")
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))

@@ -3,10 +3,6 @@ from __future__ import annotations
 import os, sys
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from httpx import ASGITransport, AsyncClient
 from api import server as srv
 

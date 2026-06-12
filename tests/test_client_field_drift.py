@@ -21,11 +21,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
-
 def _fake_response(status_code: int, json_body=None):
     r = MagicMock()
     r.status_code = status_code

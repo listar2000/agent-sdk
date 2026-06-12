@@ -27,10 +27,6 @@ import sys
 import pytest
 import pytest_asyncio
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 # DB URL resolution. The launch scripts (``scripts/launch_server_*.sh``)
 # start a project-local Postgres at port 5433 with database ``agent_sdk_server``;
 # tests share that same DB so we don't need a separate ``TEST_DATABASE_URL``.

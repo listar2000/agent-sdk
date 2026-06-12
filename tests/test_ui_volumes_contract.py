@@ -10,10 +10,6 @@ from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 import pytest_asyncio
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 _DB = os.environ.get("TEST_DATABASE_URL")
 pytestmark = [pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"), pytest.mark.xdist_group("db")]
 if _DB:

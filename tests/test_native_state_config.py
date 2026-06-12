@@ -18,7 +18,6 @@ import pytest
 # onto the single DB xdist worker (pyproject --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("db")
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.models import AgentConfig  # noqa: E402
 from api.sandbox import factory  # noqa: E402

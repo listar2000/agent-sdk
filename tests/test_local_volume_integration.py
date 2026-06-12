@@ -22,10 +22,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 pytestmark = pytest.mark.skipif(
     shutil.which("npm") is None or shutil.which("node") is None,
     reason="npm and node required for Local provider integration tests",

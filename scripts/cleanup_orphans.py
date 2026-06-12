@@ -178,8 +178,6 @@ def _reap_modal(origin: str, *, dry_run: bool) -> int:
     modal SDK / credentials are absent.
     """
     src = os.path.join(os.path.dirname(__file__), "..", "src")
-    if src not in sys.path:
-        sys.path.insert(0, src)
     try:
         import asyncio
 

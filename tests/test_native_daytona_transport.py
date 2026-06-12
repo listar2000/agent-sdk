@@ -13,7 +13,6 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.native import transport as T  # noqa: E402
 from api.native.session import NativeSession  # noqa: E402

@@ -631,7 +631,6 @@ async def t5_parallel_prompts_across_replicas(a: Replica, b: Replica) -> None:
 async def main() -> int:
     # Ensure the schema is in place (idempotent).
     os.environ["DATABASE_URL"] = DB_URL
-    sys.path.insert(0, str(REPO_ROOT / "src"))
     from api.db import init_db
     init_db()
 

@@ -75,7 +75,6 @@ import httpx
 import pytest
 import pytest_asyncio
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk import ApiClient
 from agent_sdk.client import Agent
 
@@ -458,7 +457,6 @@ class TestUniversalInvariants:
             f"usage_update at {latest_uu_time:.2f}s fired AFTER terminal "
             f"at {earliest_term_time:.2f}s — invariant violated"
         )
-
 
 
 # ---------------------------------------------------------------------------

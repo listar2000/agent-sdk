@@ -64,7 +64,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Load env in order: project .env first (wins), then ~/.env as fallback
 from dotenv import load_dotenv
@@ -127,13 +126,13 @@ def _require_provider(provider: str, agent_type: str = "claude") -> None:
     """Call pytest.skip() if the provider isn't available. Call at test start."""
     if not _has_server():
         pytest.skip("server not running on localhost:7778")
-    # Native transports: docker (P0) + daytona (P1) + modal (P1, recreate-on-
-    # missing), all live-verified. unix_local native transport isn't built yet,
-    # so skip that cell so the native-inclusive goldens collect cleanly across
-    # the provider matrix.
-    if agent_type == "native" and provider not in ("docker", "daytona", "modal"):
-        pytest.skip("native runtime supports docker + daytona + modal; "
-                    f"{provider} transport not yet built")
+    # Native transports: docker (P0) + daytona/modal (P1) + unix_local
+    # (record-only: no resident compute, hibernate/resume are no-ops) — all
+    # live-verified. Tests whose contract needs EXTERNAL compute to stop
+    # (same-sandbox-after-restart) skip native×unix_local at the test level.
+    if agent_type == "native" and provider not in (
+            "docker", "daytona", "modal", "unix_local"):
+        pytest.skip(f"native runtime: {provider} transport not built")
     if provider == "daytona" and not _has_daytona():
         pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
     if provider == "docker" and not _has_docker():
@@ -582,6 +581,10 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider, agent_type):
     cross-runtime golden standard.
     """
     _require_provider(provider, agent_type)
+    if agent_type == "native" and provider == "unix_local":
+        pytest.skip("native unix_local is record-only (no resident compute) — "
+                    "nothing external exists to stop; its lifecycle is "
+                    "covered by the reap + delete goldens")
 
     async with ApiClient(SERVER) as sdk:
         sess = await _quick_session(sdk, provider, agent_type=agent_type)
@@ -983,11 +986,22 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
             # so poll until the record is gone (the freed signal). 'running'
             # means it hasn't propagated yet; 'error' is transient.
             import sys as _sys
-            _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
             from api.providers.modal import get_sandbox_status
             last_state = await get_sandbox_status(ref)
             if last_state == "missing":
                 return
+
+        elif provider == "unix_local" and ref.startswith("native-local-"):
+            # Native record-only sandbox: "destroyed" = the provider-index
+            # record is cleared. (The generic pid/marker checks below would
+            # FALSE-PASS here — native has no supervisor pid and no
+            # marker_path on the sandbox row.)
+            import sys as _sys
+            from api.providers.unix_local import _load_record
+            _, record = _load_record(ref)
+            if record is None:
+                return
+            last_state = "record_present"
 
         elif provider == "unix_local":
             # Local "delete" = supervisor process gone AND the sandbox
@@ -1453,7 +1467,6 @@ async def test_external_delete_preserves_agent_memory(provider, agent_type):
 
 # Neutral ticket-ID framing avoids Claude's "secret code = social engineering"
 # guardrail. The agent will freely echo/recall TKT-<digits> tokens.
-
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
@@ -2169,7 +2182,6 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider, agen
             )
 
 
-
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
@@ -2830,7 +2842,18 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
             # both swallow hibernate failures, so a reaper that drops the
             # session but never `docker stop`s would otherwise ship green,
             # leaking compute until quota exhaustion.
-            if agent_type == "native":
+            if agent_type == "native" and provider == "unix_local":
+                # Record-only sandbox: no resident compute exists, so there
+                # is nothing for reap to free — the leak-gate is vacuous.
+                # The load-bearing assertion is the inverse: reap must KEEP
+                # the record ('running'), else the resume below would
+                # cold-create a new ref instead of reattaching.
+                st = await _native_compute_state(provider, ref_before)
+                assert st == "running", (
+                    f"reap DESTROYED the record-only local sandbox "
+                    f"{ref_before[:24]} (state={st!r}) — reap is hibernate, "
+                    f"not delete; resume needs the record")
+            elif agent_type == "native":
                 # The freed-state transition is ASYNC on every control plane:
                 # docker settles in ms, daytona passes through 'stopping' for
                 # seconds (longer under parallel suite load), and modal frees
@@ -3207,15 +3230,20 @@ async def _native_compute_state(provider: str, ref: str) -> str:
         return "missing" if st == "" else "error"
     if provider == "daytona":
         import sys as _sys
-        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
         from api.providers.daytona import get_daytona_sandbox_status
         return await get_daytona_sandbox_status(ref)
+    if provider == "unix_local":
+        # Record-only native sandbox: 'running' while the provider-index
+        # record exists, 'missing' once cleared. Never 'stopped'.
+        import sys as _sys
+        from api.providers.unix_local import _load_record
+        _, record = _load_record(ref)
+        return "running" if record is not None else "missing"
     if provider == "modal":
         # Modal hibernate=terminate, so a freed sandbox reports 'missing' (the
         # record is gone). 'running' means the terminate hasn't propagated yet
         # (it's async) — the caller polls.
         import sys as _sys
-        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
         from api.providers.modal import get_sandbox_status
         return await get_sandbox_status(ref)
     raise AssertionError(f"_native_compute_state: provider {provider!r} unsupported")

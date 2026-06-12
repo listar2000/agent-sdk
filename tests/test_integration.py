@@ -14,7 +14,6 @@ import time
 import httpx
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk.client import Agent
 from tests._acp_runtimes import acp_runtime_param
 

@@ -21,8 +21,6 @@ import uuid
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
 
 def _modal_ok() -> bool:
     if not os.path.exists(os.path.expanduser("~/.modal.toml")):

@@ -10,7 +10,6 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.native.loop import NativeAgentSpec, initial_messages, run_turn  # noqa: E402
 from api.native.tools import build_toolset  # noqa: E402

@@ -20,10 +20,6 @@ from typing import Any
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from agent_sdk import VolumeFileExistsError  # noqa: E402
 from agent_sdk.api_client import ApiClient  # noqa: E402
 

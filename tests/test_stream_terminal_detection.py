@@ -14,7 +14,6 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.sse import is_terminal_block  # noqa: E402
 from api.native import frames  # noqa: E402

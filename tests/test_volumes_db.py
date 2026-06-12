@@ -4,10 +4,6 @@ from __future__ import annotations
 import os, sys
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 # Use a per-test Postgres DB URL if set; otherwise skip.
 _DB = os.environ.get("TEST_DATABASE_URL")
 pytestmark = [pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"), pytest.mark.xdist_group("db")]

@@ -15,7 +15,6 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.native.transport import ModalTransport, SandboxGoneError  # noqa: E402
 from api.providers._shared import ExecResult, SandboxMissingError  # noqa: E402

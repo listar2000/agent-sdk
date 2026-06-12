@@ -26,10 +26,6 @@ import sys
 import time
 import traceback
 
-# Path-resolve so this script works from any cwd.
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if os.path.join(_ROOT, "src") not in sys.path:
-    sys.path.insert(0, os.path.join(_ROOT, "src"))
 
 import modal
 

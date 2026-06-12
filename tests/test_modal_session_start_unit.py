@@ -3,7 +3,6 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.providers import ProviderInstance
 from api.providers.modal.session import ModalSandboxSession
