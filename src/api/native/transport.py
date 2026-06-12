@@ -232,6 +232,17 @@ class DockerTransport:
         if rc != 0 and _container_not_running(err) and await self.status() == "stopped":
             await self.resume()
             rc, out, err = await _run_docker(*args, timeout=t + _BACKSTOP_SLACK_S)
+            # If resume did NOT restore a runnable container, do not wedge the
+            # session re-trying a corpse: a `dead` container (kernel/storage
+            # fault) maps to "stopped" but can't `docker start`, so resume()
+            # fails silently and every retry keeps hitting "is not running"
+            # without ever matching the removed-marker. Re-check the
+            # authoritative state — still-not-running ⇒ unrecoverable by resume,
+            # so signal the session to recreate. status()=="running" means the
+            # command itself just failed (container fine) → return it as data.
+            if rc != 0 and await self.status() != "running":
+                raise SandboxGoneError(
+                    f"docker container {self.container_id[:12]} not runnable after resume")
         # The container was REMOVED (pruned/OOM-reaped) out from under the live
         # session — resume can't bring it back. Signal the session to recreate.
         if rc != 0 and _container_removed(err) and await self.status() == "missing":
@@ -274,6 +285,11 @@ class DockerTransport:
         if rc != 0 and _container_not_running(err) and await self.status() == "stopped":
             await self.resume()
             rc, err = await _attempt()
+            # resume couldn't restore a runnable container (e.g. a 'dead'
+            # container) — recreate rather than wedge (mirrors exec()).
+            if rc != 0 and await self.status() != "running":
+                raise SandboxGoneError(
+                    f"docker container {self.container_id[:12]} not runnable after resume")
         if rc != 0 and _container_removed(err) and await self.status() == "missing":
             raise SandboxGoneError(f"docker container {self.container_id[:12]} removed")
         if rc != 0:

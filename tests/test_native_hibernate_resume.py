@@ -352,6 +352,42 @@ async def test_sandbox_exec_recovers_when_container_removed():
 
 
 @pytest.mark.asyncio
+async def test_exec_escalates_to_recreate_when_resume_cannot_restore(monkeypatch):
+    """A 'dead' container (kernel/storage fault) maps to status()=="stopped"
+    but cannot `docker start` — resume() is a silent no-op, so without an
+    escape hatch exec would wedge forever re-hitting "is not running" (which
+    never matches the removed-marker, so the recreate gate never fires). exec
+    must instead escalate to SandboxGoneError once resume fails to restore a
+    runnable container, so the session recreates. Reproduced realistically with
+    a genuinely-stopped container whose resume() is neutered to stand in for an
+    unrestartable/dead container."""
+    from api.native.transport import SandboxGoneError
+    s = _session()
+    try:
+        t = await s._ensure_sandbox()
+        cid = t.container_id
+        subprocess.run(["docker", "stop", "-t", "1", cid], capture_output=True, timeout=30)
+        assert _container_state(cid) == "exited"
+
+        async def _dead_resume():   # docker start is a silent no-op on a corpse
+            return None
+        monkeypatch.setattr(t, "resume", _dead_resume)
+
+        # exec must NOT wedge returning "is not running" forever — it escalates.
+        with pytest.raises(SandboxGoneError):
+            await t.exec("echo should-not-wedge")
+        # and the session can then recreate a fresh, working container
+        t2 = await s._ensure_sandbox(refresh=True)
+        assert t2.container_id and t2.container_id != cid
+        r = await t2.exec("echo recovered")
+        assert r.exit_code == 0 and "recovered" in r.stdout
+    finally:
+        for ref in {s.state.sandbox_ref, cid}:
+            if ref:
+                subprocess.run(["docker", "rm", "-f", ref], capture_output=True)
+
+
+@pytest.mark.asyncio
 async def test_exec_marker_in_command_stderr_does_not_false_trip_recovery():
     """A HEALTHY container's own command may legitimately print "no such
     container" / "is not running" to stderr (e.g. an agent running
