@@ -312,7 +312,8 @@ async def provision_daytona_sandbox(
     resources: Any = None,
 ) -> ProviderInstance:
     """Create a Daytona sandbox with its volume mounts, but do NOT start a
-    supervisor (that is handled later by ensure_supervisor_url).
+    supervisor (that is handled later by start_supervisor_in_sandbox
+    via DaytonaSandboxSession.start).
 
     Returns a ProviderInstance with sandbox_ref but no usable supervisor URL.
     Supervisors are started per-session via start_supervisor_in_sandbox().
@@ -900,62 +901,6 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     return ExecResult(stdout=out, stderr=err, exit_code=code, stdout_truncated=trunc)
 
 
-async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
-                                root: str = "/tmp",
-                                spawn_env: dict | None = None,
-                                port: int | None = None) -> str:
-    """Daytona: start a supervisor in the sandbox referenced by ``inst`` and
-    return its URL.
-
-    Daytona follows a 2-phase "create the sandbox, then start the
-    supervisor" model — ``create_sandbox`` returns an instance with
-    ``url=""``, and the server calls this helper later to spawn the
-    supervisor process and mint a signed preview URL.
-
-    Docker and local providers collapse these two steps: their
-    ``create_sandbox`` already has ``url`` set when it returns, so the
-    corresponding ``ensure_supervisor_url`` is effectively a no-op that
-    just echoes ``inst.url``.  The dispatcher in
-    ``providers.__init__.ensure_supervisor_url`` routes transparently to
-    whichever provider the instance belongs to.
-
-    Mi3: the ``**_kw`` catch-all was removed so a mis-spelled kwarg
-    surfaces as TypeError instead of being silently swallowed — matching
-    the docker + local signatures."""
-    daytona_client = await _get_async_daytona_client()
-    try:
-        sandbox = await daytona_client.get(inst.sandbox_ref)
-    except Exception as e:
-        # Daytona raises a plain Exception with "not found" in the message when
-        # the sandbox has been deleted out-of-band. Surface this as a typed
-        # error so the server can re-provision on the same volume.
-        if "not found" in str(e).lower():
-            from .._shared import SandboxMissingError
-            raise SandboxMissingError(
-                f"Daytona sandbox {inst.sandbox_ref} not found (deleted externally)"
-            ) from e
-        raise
-    # If the sandbox was stopped externally (e.g. daytona.stop()), start it
-    # and wait for the container network to be ready before exec-ing.
-    raw_state = sandbox.state
-    state_str = _enum_str(raw_state)
-    if state_str != "started":
-        log.info("ensure_supervisor_url: sandbox %s is %s; starting", inst.sandbox_ref[:16], state_str)
-        await sandbox.start()
-        await _wait_for_daytona_sandbox_ready(daytona_client, inst.sandbox_ref)
-        sandbox = await daytona_client.get(inst.sandbox_ref)
-    # The agent's HOME is /home/daytona — a local ext4 dir the supervisor
-    # creates and populates from the volume snapshot on boot. supervisor.js
-    # sets HOME=root when spawning the ACP child so Claude Code's session
-    # JSONLs land in the restored workspace. No env-level HOME override
-    # needed here anymore.
-    return await start_supervisor_in_sandbox(
-        sandbox, agent_type, port, root=_DAYTONA_AGENT_HOME, spawn_env=spawn_env,
-    )
-
-
-
-
 async def create_sandbox(
     *,
     volume_ref: str,
@@ -975,7 +920,8 @@ async def create_sandbox(
     Delegates to ``provision_daytona_sandbox`` which creates the sandbox with
     the volume mounts (per-agent subpath at /vol + any opt-in shared mounts)
     but does NOT start a supervisor; the caller must run
-    ``ensure_supervisor_url`` before talking to the supervisor.
+    ``DaytonaSandboxSession.start`` (start_supervisor_in_sandbox) before
+    talking to the supervisor.
 
     ``spawn_env`` / ``port`` / `sandbox_ref` are accepted for parity with
     docker/local but are unused here — the supervisor is started later with

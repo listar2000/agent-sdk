@@ -7,14 +7,20 @@ from typing import Any
 import httpx
 
 # ACP session update type constants
-UT_MESSAGE_DELTA = "agent_message_delta"
 UT_MESSAGE_CHUNK = "agent_message_chunk"
+# LEGACY-COMPAT parse acceptance (do NOT delete): these shapes are no longer
+# emitted by the PINNED adapters, but (a) session_log rows persisted in the
+# delta era (see 0c813e8 — the supervisor coalesced agent_message_delta) are
+# re-parsed by this parser on /log reads, and (b) the adapter is baked INSIDE
+# sandbox snapshots, so an older hibernated sandbox resumed by this server
+# still emits them. Accept-on-parse forever; never emit.
+UT_MESSAGE_DELTA = "agent_message_delta"
 UT_THOUGHT_CHUNK = "agent_thought_chunk"
-UT_TOOL_STARTED = "execute_tool_started"
 UT_TOOL_CALL = "tool_call"
+UT_TOOL_STARTED = "execute_tool_started"   # legacy-compat, see above
 UT_TOOL_CALL_UPDATE = "tool_call_update"
-UT_USAGE_UPDATED = "usage_updated"
 UT_USAGE_UPDATE = "usage_update"
+UT_USAGE_UPDATED = "usage_updated"        # legacy-compat, see above
 
 # Read timeout for the session/prompt POST in the SSE prompt-drive
 # (``BaseSandboxSession.execute_prompt``). The SSE GET itself uses
@@ -209,14 +215,6 @@ def extract_tool_name(update: dict) -> str:
             if isinstance(value, str) and value:
                 return value
 
-        parsed_cmd = raw_input.get("parsed_cmd")
-        if isinstance(parsed_cmd, list) and parsed_cmd:
-            first_cmd = parsed_cmd[0]
-            if isinstance(first_cmd, dict):
-                parsed_type = first_cmd.get("type")
-                if isinstance(parsed_type, str) and parsed_type and parsed_type != "unknown":
-                    return parsed_type
-
     title = update.get("title")
     if isinstance(title, str) and title:
         if title.startswith("Run "):
@@ -261,7 +259,7 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     # kind == "update"
     ut = data.get("sessionUpdate", "")
 
-    if ut in (UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK):
+    if ut in (UT_MESSAGE_CHUNK, UT_MESSAGE_DELTA):
         classified = classify_message_content(data.get("content"))
         if classified is not None:
             return {"type": classified[0], "text": classified[1]}
@@ -292,7 +290,7 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
                 "raw": data,
             }
 
-    if ut in (UT_USAGE_UPDATED, UT_USAGE_UPDATE):
+    if ut in (UT_USAGE_UPDATE, UT_USAGE_UPDATED):
         return {"type": "usage", "usage": data.get("cost", data)}
 
     return None

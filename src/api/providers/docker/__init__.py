@@ -209,7 +209,7 @@ async def create_sandbox(
     """Create a Docker container with three volume-subpath mounts + supervisor.
 
     Returns a ``ProviderInstance`` with ``container_id`` set; supervisor is
-    already started (``ensure_supervisor_url`` will be a no-op).
+    already started (no separate supervisor-start phase is needed).
 
     If `sandbox_ref` is provided it is attached as the
     ``agent-sdk.sandbox-id`` label so ``reconcile_on_startup`` can
@@ -445,19 +445,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
     inst.container_id = None
     if port is not None:
         log.info("docker sandbox destroyed: %s (port %d freed)", cid[:12], port)
-
-
-async def ensure_supervisor_url(
-    inst: ProviderInstance,
-    *, agent_type: str = "opencode", root: str = "/tmp",
-    spawn_env: dict | None = None, port: int | None = None,
-) -> str:
-    """Docker supervisor is started at create_sandbox time — URL is stable.
-
-    Signature matches Daytona's ``ensure_supervisor_url`` exactly so
-    mis-spelled kwargs surface as TypeError instead of being silently
-    swallowed by a ``**_kw`` catch-all."""
-    return inst.url
 
 
 # ---------------------------------------------------------------------------

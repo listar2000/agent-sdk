@@ -22,7 +22,6 @@ from .errors import (
     SandboxError, VolumeFileExistsError, AgentBusyError, AgentTimeoutError,
     PromptError, StreamError,
 )
-from .persist import SessionRecord, SqliteSessionDriver
 from .api_client import ApiClient
 
 __all__ = [
@@ -36,7 +35,5 @@ __all__ = [
     "UNIX_LOCAL", "DOCKER", "DAYTONA", "MODAL", "PROVIDERS",
     "AgentSDKError", "AgentConnectionError", "AgentNotRegisteredError",
     "SandboxError", "VolumeFileExistsError", "AgentBusyError", "AgentTimeoutError", "PromptError", "StreamError",
-    "SessionRecord",
-    "SqliteSessionDriver",
     "ApiClient",
 ]

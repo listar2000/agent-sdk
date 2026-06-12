@@ -1967,7 +1967,7 @@ async def test_persistent_sse_external_delete_then_message(provider, agent_type)
 
     Individual timeout bumped to 240 s. The daytona path does a full
     provision-replacement-sandbox + start-supervisor dance on turn 2
-    (see ``_type2_recover`` + ``ensure_supervisor_url``), and
+    (see ``_type2_recover`` + the daytona session start phase), and
     with daytona-side latency variance the critical path (turn 1 LLM +
     external-delete poll + SSE retry ladder + fresh provisioning +
     session/load + turn 2 LLM) can hit ~100 s on a slow day. 120 s was

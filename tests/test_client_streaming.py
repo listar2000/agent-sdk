@@ -50,7 +50,7 @@ def _text_block(rpc_id: str, text: str) -> str:
     payload = {
         "method": "session/update",
         "params": {"update": {
-            "sessionUpdate": "agent_message_delta",
+            "sessionUpdate": "agent_message_delta",  # legacy shape — compat pinned
             "content": {"type": "text", "text": text},
         }},
     }
@@ -113,7 +113,7 @@ class TestAstreamEventsTypes:
 
     @pytest.mark.asyncio
     async def test_yields_text_event(self):
-        """astream yields a text event for an agent_message_delta block."""
+        """astream yields a text event for an agent_message_chunk block."""
         agent = _patched_agent()
         rpc_id = "rpc-text-1"
         blocks = [_text_block(rpc_id, "Hello world"), _done_block(rpc_id)]
@@ -423,7 +423,7 @@ class TestSseReadTimeout:
             async def aiter_text(self):
                 yield "event: rpc:rpc-t\ndata: " + json.dumps({
                     "method": "session/update",
-                    "params": {"update": {"sessionUpdate": "agent_message_delta",
+                    "params": {"update": {"sessionUpdate": "agent_message_chunk",
                                           "content": {"type": "text", "text": "partial"}}},
                 }) + "\n\n"
                 raise httpx.ReadTimeout("mock timeout")

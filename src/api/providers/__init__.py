@@ -11,7 +11,7 @@ providers/__init__.py:
   - Re-exports the ``_shared`` and ``.daytona`` symbols that server.py
     (and tests) import from ``api.providers``.
   - Provides universal dispatch wrappers (destroy_instance, exec_in_instance,
-    create_volume, delete_volume, reconcile_sandboxes, ensure_supervisor_url)
+    create_volume, delete_volume, reconcile_sandboxes)
     that route to the per-provider module of the same name.
 """
 
@@ -27,7 +27,6 @@ load_dotenv()
 # ``._shared`` and are imported by provider modules directly — no need to
 # expose them at the package level too.
 from ._shared import (
-    PORT_BASED_PROVIDERS,
     AUTH_KEYS,
     ProviderInstance,
     ExecResult,
@@ -40,8 +39,6 @@ from ._shared import (
     _acp_launch_args,
     _get_sandbox_env_vars,
     _wait_for_health,
-    allocate_sandbox_port,
-    free_sandbox_port,
     _exec_subprocess,
     _normalize_workspace,
 )
@@ -120,8 +117,6 @@ async def create_volume(provider: str, *args, **kwargs):
 async def delete_volume(provider: str, *args, **kwargs):
     return await _dispatch_mod(provider).delete_volume(*args, **kwargs)
 
-async def ensure_supervisor_url(provider: str, *args, **kwargs):
-    return await _dispatch_mod(provider).ensure_supervisor_url(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
