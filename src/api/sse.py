@@ -7,13 +7,10 @@ from typing import Any
 import httpx
 
 # ACP session update type constants
-UT_MESSAGE_DELTA = "agent_message_delta"
 UT_MESSAGE_CHUNK = "agent_message_chunk"
 UT_THOUGHT_CHUNK = "agent_thought_chunk"
-UT_TOOL_STARTED = "execute_tool_started"
 UT_TOOL_CALL = "tool_call"
 UT_TOOL_CALL_UPDATE = "tool_call_update"
-UT_USAGE_UPDATED = "usage_updated"
 UT_USAGE_UPDATE = "usage_update"
 
 # Read timeout for the session/prompt POST in the SSE prompt-drive
@@ -209,14 +206,6 @@ def extract_tool_name(update: dict) -> str:
             if isinstance(value, str) and value:
                 return value
 
-        parsed_cmd = raw_input.get("parsed_cmd")
-        if isinstance(parsed_cmd, list) and parsed_cmd:
-            first_cmd = parsed_cmd[0]
-            if isinstance(first_cmd, dict):
-                parsed_type = first_cmd.get("type")
-                if isinstance(parsed_type, str) and parsed_type and parsed_type != "unknown":
-                    return parsed_type
-
     title = update.get("title")
     if isinstance(title, str) and title:
         if title.startswith("Run "):
@@ -261,7 +250,7 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     # kind == "update"
     ut = data.get("sessionUpdate", "")
 
-    if ut in (UT_MESSAGE_DELTA, UT_MESSAGE_CHUNK):
+    if ut == UT_MESSAGE_CHUNK:
         classified = classify_message_content(data.get("content"))
         if classified is not None:
             return {"type": classified[0], "text": classified[1]}
@@ -272,7 +261,7 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
         if text:
             return {"type": "reasoning", "text": text}
 
-    if ut in (UT_TOOL_CALL, UT_TOOL_STARTED):
+    if ut == UT_TOOL_CALL:
         return {
             "type": "tool",
             "tool_name": extract_tool_name(data),
@@ -292,7 +281,7 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
                 "raw": data,
             }
 
-    if ut in (UT_USAGE_UPDATED, UT_USAGE_UPDATE):
+    if ut == UT_USAGE_UPDATE:
         return {"type": "usage", "usage": data.get("cost", data)}
 
     return None

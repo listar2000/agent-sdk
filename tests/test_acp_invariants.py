@@ -181,7 +181,7 @@ def update_type(p: Any) -> str | None:
 
 
 def is_usage_update(p: Any) -> bool:
-    return update_type(p) in ("usage_update", "usage_updated")
+    return update_type(p) == "usage_update"
 
 
 def extract_text(p: Any) -> str:

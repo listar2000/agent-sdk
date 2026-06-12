@@ -235,14 +235,10 @@ class AcpClient:
                     last_exc = None
                     break
                 except RuntimeError as e:
-                    if "Authentication required" in str(e):
-                        log.info("%s requires authenticate; retrying with env-var auth", agent)
-                        await self._send_rpc(session_id, "authenticate",
-                                             {"methodId": "openai-api-key"})
-                        new_result = await self._send_rpc(session_id, "session/new",
-                                                          base_params)
-                        last_exc = None
-                        break
+                    # NOTE: no authenticate retry — neither enabled runtime
+                    # (claude-agent-acp 'gateway'-only, opencode no-auth)
+                    # accepts an env-var methodId; auth failures are terminal
+                    # like any other session/new error.
                     last_exc = e
                     if attempt < len(backoffs):
                         log.info(
@@ -261,18 +257,13 @@ class AcpClient:
                 except Exception:
                     pass
         except Exception as e:
-            log.warning("session/new failed for %s, trying session/list: %s", session_id, e)
-            try:
-                sessions = await self.list_sessions(session_id)
-                if sessions:
-                    inner = sessions[0].get("sessionId")
-                    if inner:
-                        self._inner_session_ids[session_id] = inner
-            except Exception as e2:
-                raise RuntimeError(
-                    f"Failed to initialize session {session_id}: "
-                    f"session/new failed ({e}), session/list failed ({e2})"
-                ) from e2
+            # No session/list adoption fallback: neither enabled runtime
+            # exposes a useful session/list on a fresh child (a brand-new
+            # supervisor has nothing to adopt), so the rescue could never
+            # produce a usable inner session — fail plainly instead.
+            raise RuntimeError(
+                f"Failed to initialize session {session_id}: session/new failed ({e})"
+            ) from e
 
         if session_id not in self._inner_session_ids:
             raise RuntimeError(
@@ -340,11 +331,6 @@ class AcpClient:
         except Exception:
             pass
         return result
-
-    async def list_sessions(self, session_id: str) -> list[dict]:
-        """List agent sessions within this ACP connection."""
-        result = await self._send_rpc(session_id, "session/list", {})
-        return result.get("sessions", [])
 
     async def call(
         self,
