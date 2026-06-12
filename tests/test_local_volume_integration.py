@@ -21,6 +21,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from api.providers.unix_local import UnixLocalVolumeAdapter
 
 pytestmark = pytest.mark.skipif(
     shutil.which("npm") is None or shutil.which("node") is None,
@@ -263,9 +264,10 @@ async def test_volume_read_write_roundtrip(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
-    await local.volume_write(ref, "shared/greeting.txt", b"hello\n")
-    got = await local.volume_read(ref, "shared/greeting.txt")
+    await a.write("shared/greeting.txt", b"hello\n")
+    got = await a.read("shared/greeting.txt")
     assert got == b"hello\n"
 
 
@@ -276,10 +278,12 @@ async def test_volume_tree_lists_entries(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
-    await local.volume_write(ref, "shared/a.txt", b"A")
-    await local.volume_write(ref, "shared/sub/b.txt", b"B")
+    a = UnixLocalVolumeAdapter(ref)
 
-    tree = await local.volume_tree(ref, "shared")
+    await a.write("shared/a.txt", b"A")
+    await a.write("shared/sub/b.txt", b"B")
+
+    tree = await a.tree("shared")
     entries = set(tree.splitlines())
     assert "shared/a.txt" in entries
     assert "shared/sub/" in entries
@@ -293,26 +297,27 @@ async def test_volume_mkdir_upload_rename_delete(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
-    await local.volume_mkdir(ref, "shared/docs")
+    await a.mkdir("shared/docs")
     assert (Path(ref) / "shared" / "docs").is_dir()
 
-    await local.volume_upload(ref, "shared/docs/a.txt", b"hello")
+    await a.upload("shared/docs/a.txt", b"hello")
     assert (Path(ref) / "shared" / "docs" / "a.txt").read_bytes() == b"hello"
 
-    await local.volume_rename(ref, "shared/docs/a.txt", "shared/docs/b.txt")
+    await a.rename("shared/docs/a.txt", "shared/docs/b.txt")
     assert not (Path(ref) / "shared" / "docs" / "a.txt").exists()
     assert (Path(ref) / "shared" / "docs" / "b.txt").read_bytes() == b"hello"
 
-    await local.volume_upload(ref, "shared/docs/c.txt", b"new")
-    await local.volume_rename(ref, "shared/docs/c.txt", "shared/docs/b.txt")
+    await a.upload("shared/docs/c.txt", b"new")
+    await a.rename("shared/docs/c.txt", "shared/docs/b.txt")
     assert not (Path(ref) / "shared" / "docs" / "c.txt").exists()
     assert (Path(ref) / "shared" / "docs" / "b.txt").read_bytes() == b"new"
 
-    await local.volume_delete(ref, "shared/docs/b.txt")
+    await a.delete("shared/docs/b.txt")
     assert not (Path(ref) / "shared" / "docs" / "b.txt").exists()
 
-    await local.volume_delete(ref, "shared/docs")
+    await a.delete("shared/docs")
     assert not (Path(ref) / "shared" / "docs").exists()
 
 
@@ -324,15 +329,16 @@ async def test_volume_rename_no_overwrite_success_and_collision(tmp_path, monkey
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
-    await local.volume_upload(ref, "shared/a.txt", b"A")
-    await local.volume_rename(ref, "shared/a.txt", "shared/example/a.txt", overwrite=False)
+    await a.upload("shared/a.txt", b"A")
+    await a.rename("shared/a.txt", "shared/example/a.txt", overwrite=False)
     assert not (Path(ref) / "shared" / "a.txt").exists()
     assert (Path(ref) / "shared" / "example" / "a.txt").read_bytes() == b"A"
 
-    await local.volume_upload(ref, "shared/b.txt", b"B")
+    await a.upload("shared/b.txt", b"B")
     with pytest.raises(VolumeFileExistsError):
-        await local.volume_rename(ref, "shared/b.txt", "shared/example/a.txt", overwrite=False)
+        await a.rename("shared/b.txt", "shared/example/a.txt", overwrite=False)
     assert (Path(ref) / "shared" / "b.txt").read_bytes() == b"B"
     assert (Path(ref) / "shared" / "example" / "a.txt").read_bytes() == b"A"
 
@@ -345,12 +351,13 @@ async def test_concurrent_volume_rename_no_overwrite_one_wins(tmp_path, monkeypa
 
     name = _vol_name()
     ref = await local.create_volume(name)
-    await local.volume_upload(ref, "shared/src1.txt", b"one")
-    await local.volume_upload(ref, "shared/src2.txt", b"two")
+    a = UnixLocalVolumeAdapter(ref)
+    await a.upload("shared/src1.txt", b"one")
+    await a.upload("shared/src2.txt", b"two")
 
     results = await asyncio.gather(
-        local.volume_rename(ref, "shared/src1.txt", "shared/dst.txt", overwrite=False),
-        local.volume_rename(ref, "shared/src2.txt", "shared/dst.txt", overwrite=False),
+        a.rename("shared/src1.txt", "shared/dst.txt", overwrite=False),
+        a.rename("shared/src2.txt", "shared/dst.txt", overwrite=False),
         return_exceptions=True,
     )
 
@@ -374,10 +381,11 @@ async def test_volume_exists(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
-    await local.volume_upload(ref, "shared/exists.txt", b"yes")
+    a = UnixLocalVolumeAdapter(ref)
+    await a.upload("shared/exists.txt", b"yes")
 
-    assert await local.volume_exists(ref, "shared/exists.txt") is True
-    assert await local.volume_exists(ref, "shared/missing.txt") is False
+    assert await a.exists("shared/exists.txt") is True
+    assert await a.exists("shared/missing.txt") is False
 
 
 @pytest.mark.asyncio
@@ -389,12 +397,13 @@ async def test_volume_read_rejects_symlink_escape(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
     evil = Path(ref) / "shared" / "evil"
     os.symlink("/etc/passwd", evil)
 
     with pytest.raises(ValueError, match="escapes volume root"):
-        await local.volume_read(ref, "shared/evil")
+        await a.read("shared/evil")
 
 
 @pytest.mark.asyncio
@@ -405,6 +414,7 @@ async def test_volume_write_rejects_symlink_escape(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
     outside = tmp_path / "outside.txt"
     outside.write_text("original")
@@ -413,7 +423,7 @@ async def test_volume_write_rejects_symlink_escape(tmp_path, monkeypatch):
     os.symlink(str(outside), link)
 
     with pytest.raises(ValueError, match="escapes volume root"):
-        await local.volume_write(ref, "shared/escape", b"pwned")
+        await a.write("shared/escape", b"pwned")
 
     # Outside file must be untouched.
     assert outside.read_text() == "original"
@@ -426,9 +436,10 @@ async def test_volume_read_rejects_dotdot(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
     with pytest.raises(ValueError, match="escapes volume root"):
-        await local.volume_read(ref, "../../../../etc/passwd")
+        await a.read("../../../../etc/passwd")
 
 
 # ---------------------------------------------------------------------------
@@ -447,9 +458,10 @@ async def test_volume_read_missing_file_raises_filenotfound(tmp_path, monkeypatc
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
     with pytest.raises(FileNotFoundError):
-        await local.volume_read(ref, "shared/does-not-exist.txt")
+        await a.read("shared/does-not-exist.txt")
 
 
 @pytest.mark.asyncio
@@ -457,13 +469,13 @@ async def test_volume_read_missing_volume_root_raises(tmp_path, monkeypatch):
     """Reading from a volume ref that doesn't exist on disk raises a
     filesystem error — not a silent empty string."""
     monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path))
-    from api.providers import unix_local as local
 
     bogus = str(tmp_path / "no-such-volume-dir")
+    a = UnixLocalVolumeAdapter(bogus)
     # _safe_join resolves the realpath of <bogus>/<path>; since bogus doesn't
     # exist, os.path.realpath returns it unchanged. The subsequent open fails.
     with pytest.raises((FileNotFoundError, OSError)):
-        await local.volume_read(bogus, "any/file")
+        await a.read("any/file")
 
 
 @pytest.mark.asyncio
@@ -477,10 +489,11 @@ async def test_volume_read_on_directory_raises(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
     # "shared" is a directory created by create_volume.
     with pytest.raises((IsADirectoryError, OSError)):
-        await local.volume_read(ref, "shared")
+        await a.read("shared")
 
 
 @pytest.mark.asyncio
@@ -491,11 +504,12 @@ async def test_volume_read_empty_path_raises(tmp_path, monkeypatch):
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
     # Empty path → _safe_join returns the volume root. _read raises
     # IsADirectoryError because basename is empty OR the open returns EISDIR.
     with pytest.raises((IsADirectoryError, OSError, ValueError)):
-        await local.volume_read(ref, "")
+        await a.read("")
 
 
 @pytest.mark.asyncio
@@ -507,8 +521,9 @@ async def test_volume_write_parent_path_through_file_fails(tmp_path, monkeypatch
 
     name = _vol_name()
     ref = await local.create_volume(name)
+    a = UnixLocalVolumeAdapter(ref)
 
     # Create a plain file, then try to write "through" it.
-    await local.volume_write(ref, "shared/plain.txt", b"plain")
+    await a.write("shared/plain.txt", b"plain")
     with pytest.raises((NotADirectoryError, OSError, FileExistsError)):
-        await local.volume_write(ref, "shared/plain.txt/child", b"should fail")
+        await a.write("shared/plain.txt/child", b"should fail")

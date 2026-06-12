@@ -20,7 +20,7 @@ What's here:
     ``sessions.sandbox_state`` directly via ``api.db``.
 """
 from .factory import make_session, register
-from .liveness import Liveness, LivenessState
+from .liveness import Liveness
 from .orphan_monitor import start_orphan_monitor, stop_orphan_monitor
 from .pool import SessionNotFoundError, SessionPool
 from .runtime import get_pool, shutdown_pool, start_reaper, start_worker_heartbeat
@@ -43,7 +43,6 @@ __all__ = [
     "DaytonaSandboxState",
     "DockerSandboxState",
     "Liveness",
-    "LivenessState",
     "ModalSandboxState",
     "Recipe",
     "SandboxState",

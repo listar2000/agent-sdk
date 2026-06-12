@@ -206,8 +206,8 @@ GET /admin/sessions   — pool snapshot for the dashboard
 
 ```python
 agent.arun(message, *, interrupt=False) -> str            # full response
+agent.run(message, timeout=None, *, interrupt=False) -> str  # sync wrapper (persistent background loop; repeated calls share the session)
 agent.astream(message, *, interrupt=False) -> AsyncIterator[Event]   # POST /message+stream
-agent.run(message, timeout=None, *, interrupt=False) -> str          # sync wrapper
 agent.send(message, *, interrupt=False) -> str            # fire-and-forget; returns rpc_id
 agent.cancel()                                            # best-effort
 agent.configure(**kwargs)                                 # mode / model / thought_level

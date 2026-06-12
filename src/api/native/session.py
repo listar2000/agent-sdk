@@ -162,7 +162,7 @@ class NativeSession(BaseSandboxSession):
 
     # ── liveness: the session object is the runtime ─────────────────────────
 
-    async def running(self, *, force_probe: bool = False) -> bool:
+    async def running(self) -> bool:
         return True
 
     async def _liveness_probe(self) -> bool:

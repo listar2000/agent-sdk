@@ -187,7 +187,7 @@ async def test_cancel_produces_cancelled_terminal_and_checkpoint():
 async def test_always_alive_liveness():
     s = NativeSession(session_id="x", state=NativeSandboxState(provider="docker"))
     assert await s.running() is True
-    assert await s.running(force_probe=True) is True
+    assert await s.running() is True   # native is always-alive
     assert await s._liveness_probe() is True
 
 

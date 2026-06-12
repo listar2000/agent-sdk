@@ -277,24 +277,37 @@ async def get_db():
             raise
 
 
+async def _exec(sql: str, params: tuple = ()) -> None:
+    async with get_db() as conn:
+        await conn.execute(sql, params)
+
+
+async def _one(sql: str, params: tuple = ()):
+    async with get_db() as conn:
+        cur = await conn.execute(sql, params)
+        return await cur.fetchone()
+
+
+async def _all(sql: str, params: tuple = ()):
+    async with get_db() as conn:
+        cur = await conn.execute(sql, params)
+        return await cur.fetchall()
+
+
 # ---------------------------------------------------------------------------
 # Agent CRUD
 # ---------------------------------------------------------------------------
 
 async def upsert_agent(agent: AgentRecord) -> None:
-    async with get_db() as conn:
-        await conn.execute(
-            "INSERT INTO agents (id, name, config) VALUES (%s, %s, %s)"
-            " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, config=EXCLUDED.config",
-            (agent.id, agent.name, Json(agent.config.to_dict())),
-        )
+    await _exec(
+        "INSERT INTO agents (id, name, config) VALUES (%s, %s, %s)"
+        " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, config=EXCLUDED.config",
+        (agent.id, agent.name, Json(agent.config.to_dict())),
+    )
 
 
 async def get_agent(agent_id: str) -> AgentRecord | None:
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT * FROM agents WHERE id = %s", (agent_id,)
-        )).fetchone()
+    row = await _one("SELECT * FROM agents WHERE id = %s", (agent_id,))
     if row is None:
         return None
     config_data = row["config"] if row["config"] else {}
@@ -302,8 +315,7 @@ async def get_agent(agent_id: str) -> AgentRecord | None:
 
 
 async def list_agents() -> list[AgentRecord]:
-    async with get_db() as conn:
-        rows = await (await conn.execute("SELECT * FROM agents")).fetchall()
+    rows = await _all("SELECT * FROM agents")
     return [
         AgentRecord(
             id=r["id"], name=r["name"],
@@ -314,8 +326,7 @@ async def list_agents() -> list[AgentRecord]:
 
 
 async def delete_agent(agent_id: str) -> None:
-    async with get_db() as conn:
-        await conn.execute("DELETE FROM agents WHERE id = %s", (agent_id,))
+    await _exec("DELETE FROM agents WHERE id = %s", (agent_id,))
 
 
 async def get_session_ids_for_agent(agent_id: str) -> list[str]:
@@ -323,10 +334,7 @@ async def get_session_ids_for_agent(agent_id: str) -> list[str]:
     tear down each session's compute BEFORE the ``sessions.agent_id`` FK's
     ``ON DELETE CASCADE`` drops the rows — otherwise the sandboxes leak with no
     session row left to reap them."""
-    async with get_db() as conn:
-        rows = await (await conn.execute(
-            "SELECT id FROM sessions WHERE agent_id = %s", (agent_id,)
-        )).fetchall()
+    rows = await _all("SELECT id FROM sessions WHERE agent_id = %s", (agent_id,))
     return [r["id"] for r in rows]
 
 
@@ -335,15 +343,14 @@ async def get_session_ids_for_agent(agent_id: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 async def upsert_volume(volume: VolumeRecord) -> None:
-    async with get_db() as conn:
-        await conn.execute(
-            "INSERT INTO volumes (id, name, provider, provider_ref, status)"
-            " VALUES (%s, %s, %s, %s, %s)"
-            " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,"
-            " provider=EXCLUDED.provider, provider_ref=EXCLUDED.provider_ref,"
-            " status=EXCLUDED.status",
-            (volume.id, volume.name, volume.provider, volume.provider_ref, volume.status),
-        )
+    await _exec(
+        "INSERT INTO volumes (id, name, provider, provider_ref, status)"
+        " VALUES (%s, %s, %s, %s, %s)"
+        " ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,"
+        " provider=EXCLUDED.provider, provider_ref=EXCLUDED.provider_ref,"
+        " status=EXCLUDED.status",
+        (volume.id, volume.name, volume.provider, volume.provider_ref, volume.status),
+    )
 
 
 def _row_to_volume(row: dict) -> VolumeRecord:
@@ -354,20 +361,14 @@ def _row_to_volume(row: dict) -> VolumeRecord:
 
 
 async def get_volume(volume_id: str) -> VolumeRecord | None:
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT * FROM volumes WHERE id = %s", (volume_id,)
-        )).fetchone()
+    row = await _one("SELECT * FROM volumes WHERE id = %s", (volume_id,))
     if row is None:
         return None
     return _row_to_volume(row)
 
 
 async def get_volume_by_name(name: str) -> VolumeRecord | None:
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT * FROM volumes WHERE name = %s", (name,)
-        )).fetchone()
+    row = await _one("SELECT * FROM volumes WHERE name = %s", (name,))
     if row is None:
         return None
     return _row_to_volume(row)
@@ -385,8 +386,7 @@ async def list_volumes(provider: str | None = None) -> list[VolumeRecord]:
 
 
 async def delete_volume(volume_id: str) -> None:
-    async with get_db() as conn:
-        await conn.execute("DELETE FROM volumes WHERE id = %s", (volume_id,))
+    await _exec("DELETE FROM volumes WHERE id = %s", (volume_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -446,20 +446,12 @@ async def upsert_session(session_id: str, agent_id: str,
 
 async def update_session_env(session_id: str, env: dict[str, str]) -> None:
     """Replace stored session env. Used on resume when caller sends explicit env."""
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET env = %s WHERE id = %s",
-            (Json(env), session_id),
-        )
+    await _exec("UPDATE sessions SET env = %s WHERE id = %s", (Json(env), session_id))
 
 
 async def update_session_secrets(session_id: str, secrets: dict[str, str]) -> None:
     """Replace stored session secrets. Used on resume when caller sends explicit secrets."""
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET secrets = %s WHERE id = %s",
-            (Json(secrets), session_id),
-        )
+    await _exec("UPDATE sessions SET secrets = %s WHERE id = %s", (Json(secrets), session_id))
 
 
 async def update_session_pre_start_commands(
@@ -471,18 +463,14 @@ async def update_session_pre_start_commands(
     user-supplied pre-start list. Column stores the raw user commands
     only — skill + CLI install commands are layered in at use time
     (matches the contract documented at ``upsert_session``)."""
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET pre_start_commands = %s WHERE id = %s",
-            (Json(pre_start_commands), session_id),
-        )
+    await _exec(
+        "UPDATE sessions SET pre_start_commands = %s WHERE id = %s",
+        (Json(pre_start_commands), session_id),
+    )
 
 
 async def get_session(session_id: str) -> dict | None:
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT * FROM sessions WHERE id = %s", (session_id,)
-        )).fetchone()
+    row = await _one("SELECT * FROM sessions WHERE id = %s", (session_id,))
     if row is None:
         return None
     return dict(row)
@@ -537,41 +525,32 @@ async def list_sessions(q: str | None = None, limit: int = 100) -> list[dict]:
 
 async def read_sandbox_state(session_id: str) -> dict | None:
     """Read ``sessions.sandbox_state`` JSONB. None if the row is missing."""
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT sandbox_state FROM sessions WHERE id = %s", (session_id,)
-        )).fetchone()
+    row = await _one("SELECT sandbox_state FROM sessions WHERE id = %s", (session_id,))
     return None if row is None else row["sandbox_state"]
 
 
 async def write_sandbox_state(session_id: str, payload: dict) -> None:
     """Sole writer of ``sessions.sandbox_state``. Pool calls this after
     ``session.start()`` and ``session.stop()`` to checkpoint."""
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
-            (Json(payload), session_id),
-        )
+    await _exec(
+        "UPDATE sessions SET sandbox_state = %s WHERE id = %s",
+        (Json(payload), session_id),
+    )
 
 
 async def update_session_inner_session_id(session_id: str, inner_session_id: str) -> None:
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE sessions SET inner_session_id = %s WHERE id = %s",
-            (inner_session_id, session_id),
-        )
+    await _exec(
+        "UPDATE sessions SET inner_session_id = %s WHERE id = %s",
+        (inner_session_id, session_id),
+    )
 
 
 async def delete_session(session_id: str) -> None:
-    async with get_db() as conn:
-        await conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+    await _exec("DELETE FROM sessions WHERE id = %s", (session_id,))
 
 
 async def count_sessions_by_volume(volume_id: str) -> int:
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (volume_id,)
-        )).fetchone()
+    row = await _one("SELECT count(*) AS n FROM sessions WHERE volume_id = %s", (volume_id,))
     return int(row["n"])
 
 
@@ -580,18 +559,12 @@ async def get_session_ids_for_volume(volume_id: str) -> list[str]:
     route to tear down each session's compute BEFORE the cascade row-delete —
     otherwise the sandboxes leak with no session row left to reap them (the
     volume FK is ON DELETE RESTRICT, so the route hard-deletes the rows)."""
-    async with get_db() as conn:
-        rows = await (await conn.execute(
-            "SELECT id FROM sessions WHERE volume_id = %s", (volume_id,)
-        )).fetchall()
+    rows = await _all("SELECT id FROM sessions WHERE volume_id = %s", (volume_id,))
     return [r["id"] for r in rows]
 
 
 async def delete_sessions_by_volume(volume_id: str) -> None:
-    async with get_db() as conn:
-        await conn.execute(
-            "DELETE FROM sessions WHERE volume_id = %s", (volume_id,),
-        )
+    await _exec("DELETE FROM sessions WHERE volume_id = %s", (volume_id,))
 
 
 async def update_worker_state(
@@ -612,24 +585,22 @@ async def update_worker_state(
     ``AGENT_SDK_WORKER_HEARTBEAT_S``) and immediately whenever the
     pool's active-session set mutates, so the dashboard never lags
     further than one tick behind reality."""
-    async with get_db() as conn:
-        await conn.execute(
-            "INSERT INTO workers (owner_id, owner_addr, lease_expires_at, session_ids)"
-            " VALUES (%s, %s, now() + (interval '1 second' * %s), %s::jsonb)"
-            " ON CONFLICT (owner_id) DO UPDATE"
-            "    SET owner_addr = EXCLUDED.owner_addr,"
-            "        lease_expires_at = EXCLUDED.lease_expires_at,"
-            "        session_ids = EXCLUDED.session_ids",
-            (owner_id, owner_addr, ttl_seconds, json.dumps(list(session_ids))),
-        )
+    await _exec(
+        "INSERT INTO workers (owner_id, owner_addr, lease_expires_at, session_ids)"
+        " VALUES (%s, %s, now() + (interval '1 second' * %s), %s::jsonb)"
+        " ON CONFLICT (owner_id) DO UPDATE"
+        "    SET owner_addr = EXCLUDED.owner_addr,"
+        "        lease_expires_at = EXCLUDED.lease_expires_at,"
+        "        session_ids = EXCLUDED.session_ids",
+        (owner_id, owner_addr, ttl_seconds, json.dumps(list(session_ids))),
+    )
 
 
 async def unregister_worker(*, owner_id: str) -> None:
     """Drop our row on graceful shutdown. The next dashboard refresh
     will see this worker's sessions as inactive immediately, rather
     than waiting for the lease to expire. Idempotent."""
-    async with get_db() as conn:
-        await conn.execute("DELETE FROM workers WHERE owner_id = %s", (owner_id,))
+    await _exec("DELETE FROM workers WHERE owner_id = %s", (owner_id,))
 
 
 async def set_session_busy(session_id: str, *, busy: bool) -> None:
@@ -652,12 +623,11 @@ async def set_session_busy(session_id: str, *, busy: bool) -> None:
 async def live_sandbox_refs() -> set[str]:
     """Distinct ``sandbox_state.sandbox_ref`` values across all sessions.
     Used by provider reconcilers to identify orphaned compute."""
-    async with get_db() as conn:
-        rows = await (await conn.execute(
-            "SELECT DISTINCT sandbox_state->>'sandbox_ref' AS sid"
-            " FROM sessions"
-            " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
-        )).fetchall()
+    rows = await _all(
+        "SELECT DISTINCT sandbox_state->>'sandbox_ref' AS sid"
+        " FROM sessions"
+        " WHERE sandbox_state->>'sandbox_ref' IS NOT NULL",
+    )
     return {r["sid"] for r in rows}
 
 
@@ -673,37 +643,35 @@ def _row_to_log_entry(r: dict) -> LogEntry:
 
 async def log_event(*, session_id: str, agent_id: str,
                     event_type: str, payload: dict) -> None:
-    async with get_db() as conn:
-        await conn.execute(
-            "INSERT INTO session_log (session_id, agent_id, event_type, payload)"
-            " VALUES (%s, %s, %s, %s)",
-            (session_id, agent_id, event_type, Json(payload)),
-        )
+    await _exec(
+        "INSERT INTO session_log (session_id, agent_id, event_type, payload)"
+        " VALUES (%s, %s, %s, %s)",
+        (session_id, agent_id, event_type, Json(payload)),
+    )
 
 
 async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
-    async with get_db() as conn:
-        # Return the *tail* N events (most recent) in chronological order.
-        # ORDER BY id (BIGSERIAL) — strictly monotonic by insertion order.
-        # ``ORDER BY created_at`` ties when two INSERTs land within the same
-        # microsecond (Postgres's ``now()`` resolves to transaction start
-        # time at us precision); the per-session prompt_lock makes writes
-        # sequential within a single prompt, but consecutive
-        # ``await log_event`` calls can still tie because each starts its
-        # own one-statement transaction.
-        #
-        # The inner ``ORDER BY id DESC LIMIT`` keeps the latest events when
-        # the session has more than ``limit`` rows; the outer ``ORDER BY id
-        # ASC`` restores chronological order so callers can replay them
-        # straight through. Sessions shorter than ``limit`` are unaffected.
-        rows = await (await conn.execute(
-            "SELECT id, session_id, agent_id, event_type, payload, created_at"
-            " FROM ("
-            "   SELECT id, session_id, agent_id, event_type, payload, created_at"
-            "   FROM session_log WHERE session_id = %s ORDER BY id DESC LIMIT %s"
-            " ) AS t ORDER BY id ASC",
-            (session_id, limit),
-        )).fetchall()
+    # Return the *tail* N events (most recent) in chronological order.
+    # ORDER BY id (BIGSERIAL) — strictly monotonic by insertion order.
+    # ``ORDER BY created_at`` ties when two INSERTs land within the same
+    # microsecond (Postgres's ``now()`` resolves to transaction start
+    # time at us precision); the per-session prompt_lock makes writes
+    # sequential within a single prompt, but consecutive
+    # ``await log_event`` calls can still tie because each starts its
+    # own one-statement transaction.
+    #
+    # The inner ``ORDER BY id DESC LIMIT`` keeps the latest events when
+    # the session has more than ``limit`` rows; the outer ``ORDER BY id
+    # ASC`` restores chronological order so callers can replay them
+    # straight through. Sessions shorter than ``limit`` are unaffected.
+    rows = await _all(
+        "SELECT id, session_id, agent_id, event_type, payload, created_at"
+        " FROM ("
+        "   SELECT id, session_id, agent_id, event_type, payload, created_at"
+        "   FROM session_log WHERE session_id = %s ORDER BY id DESC LIMIT %s"
+        " ) AS t ORDER BY id ASC",
+        (session_id, limit),
+    )
     return [_row_to_log_entry(r) for r in rows]
 
 
@@ -735,10 +703,9 @@ async def write_native_checkpoint(*, session_id: str, turn_seq: int,
 
 async def read_native_checkpoint(session_id: str) -> dict | None:
     """Newest checkpoint for a session, or None. Resume reads exactly this."""
-    async with get_db() as conn:
-        row = await (await conn.execute(
-            "SELECT turn_seq, messages, usage FROM native_transcripts"
-            " WHERE session_id = %s ORDER BY turn_seq DESC LIMIT 1",
-            (session_id,),
-        )).fetchone()
+    row = await _one(
+        "SELECT turn_seq, messages, usage FROM native_transcripts"
+        " WHERE session_id = %s ORDER BY turn_seq DESC LIMIT 1",
+        (session_id,),
+    )
     return dict(row) if row else None

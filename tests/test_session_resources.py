@@ -365,6 +365,7 @@ async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
 @pytest.mark.asyncio
 async def test_modal_volume_tree_missing_path_returns_empty(monkeypatch):
     from api.providers import modal as modal_provider
+    from api.providers.modal import ModalVolumeAdapter
 
     captured = {}
 
@@ -374,8 +375,12 @@ async def test_modal_volume_tree_missing_path_returns_empty(monkeypatch):
 
     monkeypatch.setattr(modal_provider, "_run_volume_shell", fake_run_volume_shell)
 
-    assert await modal_provider.volume_tree("modal-prod", "shared/123") == ""
-    assert "if [ ! -e /v/shared/123 ]; then exit 0; fi;" in captured["shell"]
+    adapter = ModalVolumeAdapter("modal-prod")
+    assert await adapter.tree("shared/123") == ""
+    # Guard: a missing OR non-directory subpath exits 0 with no output →
+    # empty tree string (-d: listing a file is also "" — the documented
+    # cross-provider unification).
+    assert "if [ ! -d /v/shared/123 ]; then exit 0; fi;" in captured["shell"]
 
 
 def test_docker_resource_flags_translates():

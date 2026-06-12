@@ -28,7 +28,6 @@ recovery path (recreate a new sandbox against the same volume + subpath).
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import os
 import shlex
@@ -39,16 +38,14 @@ from .._shared import (
     ExecResult,
     ProviderInstance,
     SandboxMissingError,
-    VolumeFileExistsError,
     _MAX_OUTPUT_BYTES,
     _acp_launch_args,
     _build_env_prefix,
-    _safe_path,
     _truncate,
     _wait_for_health,
     build_supervisor_argv,
-    normalize_find_output,
 )
+from .._volume import ShellVolumeAdapter
 
 log = logging.getLogger(__name__)
 
@@ -839,11 +836,6 @@ async def reconcile_on_startup() -> None:
 # Volume file-ops (per-call utility sandbox)
 # ---------------------------------------------------------------------------
 
-def _safe_rel(path: str) -> str:
-    """Normalize + validate a volume-relative path (no realpath check)."""
-    return _safe_path(None, path)
-
-
 async def _run_volume_shell(
     ref: str, shell: str, *, timeout: int = 60, vol=None,
 ) -> tuple[int, bytes, bytes]:
@@ -892,172 +884,16 @@ async def _run_volume_shell(
     )
 
 
-async def volume_tree(ref: str, path: str) -> str:
-    """Tree listing of ``<volume>/<path>`` in the unified format.
+class ModalVolumeAdapter(ShellVolumeAdapter):
+    """Volume ops inside a short-lived modal sandbox (volume at /v)."""
 
-    Output: one entry per line, paths relative to the volume root,
-    directories end with ``/``, files do not, sorted.
-    """
-    rel = _safe_rel(path)
-    target = f"/v/{rel}" if rel else "/v"
-    quoted_target = shlex.quote(target)
-    shell = (
-        f"if [ ! -e {quoted_target} ]; then exit 0; fi; "
-        f"find {quoted_target} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        raise RuntimeError(
-            f"modal volume_tree failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-    normalized = normalize_find_output(out.decode(errors="replace"))
-    if not rel or not normalized:
-        return normalized
-    lines = [f"{rel.rstrip('/')}/{ln}" for ln in normalized.splitlines()]
-    return "\n".join(sorted(lines))
+    provider = "modal"
+    tree_find_gnu = True   # debian image — single-pass find -printf
+
+    async def _run_shell(self, shell: str, *, timeout: int) -> tuple[int, bytes, bytes]:
+        return await _run_volume_shell(self.provider_ref, shell, timeout=timeout)
 
 
-async def volume_read(ref: str, path: str) -> bytes:
-    """Return the bytes of ``<volume>/<path>`` (base64 over the wire)."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_read: path required")
-    target = f"/v/{rel}"
-    shell = (
-        f"if [ ! -f {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"base64 -w0 {shlex.quote(target)} 2>/dev/null || base64 {shlex.quote(target)}"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(
-            f"modal volume_read failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-    try:
-        return base64.b64decode(out.strip())
-    except Exception as exc:
-        raise RuntimeError(f"modal volume_read: malformed base64 output: {exc}") from exc
-
-
-async def volume_exists(ref: str, path: str) -> bool:
-    """Return whether ``<volume>/<path>`` exists."""
-    rel = _safe_rel(path)
-    target = f"/v/{rel}" if rel else "/v"
-    rc, _out, err = await _run_volume_shell(
-        ref, f"test -e {shlex.quote(target)}", timeout=60,
-    )
-    if rc == 0:
-        return True
-    if rc == 1:
-        return False
-    raise RuntimeError(
-        f"modal volume_exists failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-    )
-
-
-async def volume_write(ref: str, path: str, content: bytes) -> None:
-    """Write ``content`` to ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_write: path required")
-    target = f"/v/{rel}"
-    parent = "/v/" + "/".join(rel.split("/")[:-1])
-    b64 = base64.b64encode(content).decode()
-    shell = (
-        f"mkdir -p {shlex.quote(parent)} && "
-        f"printf %s {shlex.quote(b64)} | base64 -d > {shlex.quote(target)}"
-    )
-    rc, _out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        raise RuntimeError(
-            f"modal volume_write failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_upload(ref: str, path: str, content: bytes) -> None:
-    """Upload bytes to ``<volume>/<path>``."""
-    await volume_write(ref, path, content)
-
-
-async def volume_mkdir(ref: str, path: str) -> None:
-    """Create a directory at ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("modal volume_mkdir: path required")
-    target = f"/v/{rel}"
-    rc, _out, err = await _run_volume_shell(
-        ref, f"mkdir -p {shlex.quote(target)}", timeout=60,
-    )
-    if rc != 0:
-        raise RuntimeError(
-            f"modal volume_mkdir failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_delete(ref: str, path: str) -> None:
-    """Delete a file or directory at ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("modal volume_delete: path required")
-    target = f"/v/{rel}"
-    shell = (
-        f"if [ ! -e {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"rm -rf -- {shlex.quote(target)}"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(
-            f"modal volume_delete failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
-    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
-    src_rel = _safe_rel(path)
-    dst_rel = _safe_rel(new_path)
-    if not src_rel or not dst_rel:
-        raise ValueError("modal volume_rename: path and new_path required")
-    src = f"/v/{src_rel}"
-    dst = f"/v/{dst_rel}"
-    dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
-    settle_check = (
-        f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
-        f"if [ -e {shlex.quote(dst)} ] && [ ! -e {shlex.quote(src)} ]; then exit 0; fi; "
-        f"sleep 0.1; "
-        f"done; "
-        f"echo __RENAME_NOT_VISIBLE__; exit 98"
-    )
-    if overwrite:
-        shell = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} && "
-            f"mv -- {shlex.quote(src)} {shlex.quote(dst)} && "
-            f"{settle_check}"
-        )
-    else:
-        shell = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
-            f"if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; fi; "
-            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi; "
-            f"ln {shlex.quote(src)} {shlex.quote(dst)} || "
-            f"{{ if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; else exit 1; fi; }}; "
-            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}; "
-            f"{settle_check}"
-        )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        if b"__EXISTS__" in out:
-            raise VolumeFileExistsError(new_path)
-        if b"__UNSUPPORTED_DIR__" in out:
-            raise NotImplementedError("atomic no-overwrite directory rename is not supported")
-        if b"__RENAME_NOT_VISIBLE__" in out:
-            raise RuntimeError("volume_rename postcondition failed: destination not visible")
-        raise RuntimeError(
-            f"modal volume_rename failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
+#: uniform per-provider adapter handle — ``get_volume_adapter`` dispatches
+#: via ``_dispatch_mod(provider).VolumeAdapter`` (one registry for everything).
+VolumeAdapter = ModalVolumeAdapter
