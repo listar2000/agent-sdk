@@ -388,6 +388,60 @@ async def test_exec_escalates_to_recreate_when_resume_cannot_restore(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_ensure_sandbox_recreates_dead_container_on_reattach(monkeypatch):
+    """PRODUCTION reattach path (no _transport_factory): a session whose
+    persisted docker sandbox is 'dead' (maps to status()=="stopped" but resume
+    cannot restart it) must DESTROY the corpse and recreate fresh — not
+    resume-and-return it. Resuming-and-returning would wedge the session forever
+    (every turn re-execs the dead container → SandboxGoneError → reattach →
+    resume → dead → ...) and leak the dead container. This is the session-level
+    half of dead-container recovery that the transport-level SandboxGoneError
+    escalation depends on (the unit dead-wedge test takes the factory shortcut
+    and never exercised this path)."""
+    s = NativeSession(session_id="sess-dead-reattach",
+                      state=NativeSandboxState(provider="docker",
+                                               recipe=Recipe(agent_type="native")))
+    s._started = True
+    s._cwd = "/work"
+
+    async def _noop():
+        return None
+    s._persist_state = _noop  # type: ignore
+    # deliberately NO _transport_factory → exercise the real reattach path
+
+    seed = DockerTransport(workdir="/work")
+    await seed.create(image=IMAGE, labels={"agent_sdk_origin": "test",
+                                           "native_session": "sess-dead-reattach"})
+    cid = seed.container_id
+    s.state.sandbox_ref = cid
+    subprocess.run(["docker", "stop", "-t", "1", cid], capture_output=True, timeout=30)
+    assert _container_state(cid) == "exited"
+
+    # neuter resume on ALL DockerTransport instances so the REATTACHED transport
+    # also cannot restart the corpse — a faithful 'dead container' (docker start
+    # is a silent no-op). _create_transport/destroy are untouched.
+    async def _dead_resume(self):
+        return None
+    monkeypatch.setattr(DockerTransport, "resume", _dead_resume)
+
+    t2 = None
+    try:
+        t2 = await s._ensure_sandbox()
+        assert t2.container_id and t2.container_id != cid, (
+            "must recreate a fresh sandbox, not resume-and-return the corpse")
+        assert _container_state(t2.container_id) == "running"
+        assert _container_state(cid) == "", (
+            "the dead container must be destroyed on recreate (no orphan leak)")
+        r = await t2.exec("echo recovered")
+        assert r.exit_code == 0 and "recovered" in r.stdout
+    finally:
+        for ref in {cid, s.state.sandbox_ref,
+                    getattr(t2, "container_id", None)}:
+            if ref:
+                subprocess.run(["docker", "rm", "-f", ref], capture_output=True)
+
+
+@pytest.mark.asyncio
 async def test_exec_marker_in_command_stderr_does_not_false_trip_recovery():
     """A HEALTHY container's own command may legitimately print "no such
     container" / "is not running" to stderr (e.g. an agent running

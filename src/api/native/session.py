@@ -313,9 +313,18 @@ class NativeSession(BaseSandboxSession):
                     return t
                 if st == "stopped":
                     await t.resume()
-                    self._transport = t
-                    return t
-                if st == "error":
+                    # A 'dead' sandbox maps to "stopped" but resume() can't
+                    # restore it (docker: a kernel/storage-faulted container —
+                    # `docker start` is a silent no-op; daytona: an
+                    # unrecoverable VM). Verify it actually came up; only then
+                    # keep the warm sandbox. Otherwise fall through to
+                    # destroy+recreate below — WITHOUT this, the session resumes
+                    # a corpse and wedges forever (and leaks the dead sandbox),
+                    # defeating the transport-level SandboxGoneError escalation.
+                    if await t.status() == "running":
+                        self._transport = t
+                        return t
+                elif st == "error":
                     # Transient control-plane/daemon failure — do NOT
                     # cold-create over a possibly-live sandbox (a spurious
                     # create silently loses the workspace). Fail-closed.
@@ -323,8 +332,10 @@ class NativeSession(BaseSandboxSession):
                         f"native: sandbox {ref[:12]} status failed "
                         f"(transient); not creating over a possibly-live "
                         f"sandbox")
-                # st == "missing": genuinely gone — best-effort clean the
-                # stale ref before creating fresh (no orphan).
+                # st == "missing", OR "stopped" that resume could not restore
+                # (dead) — best-effort destroy the stale/dead sandbox before
+                # creating fresh, so we never orphan it (no leak), then recreate
+                # (volume-backed providers recover the workspace).
                 try:
                     await t.destroy()
                 except Exception:
