@@ -434,7 +434,22 @@ class DaytonaTransport:
             st = await self.status()
             if st == "stopped":
                 await self.resume()
-                res = await _run()
+                # Mirror DockerTransport.exec's post-resume escalation: if resume
+                # did NOT restore a usable VM — an unrecoverable/broken daytona
+                # sandbox that stays non-running, or the retry still raises —
+                # don't wedge the session re-running against a corpse (the
+                # generic exception would be treated as tool-error DATA and the
+                # session would never recreate). Signal recreate; daytona's
+                # recreate is volume-safe, so _ensure_sandbox's missing→recreate
+                # path recovers the workspace cleanly.
+                try:
+                    res = await _run()
+                except Exception:
+                    res = None
+                if res is None or await self.status() != "running":
+                    raise SandboxGoneError(
+                        f"daytona sandbox {self.sandbox_ref} not runnable "
+                        f"after resume")
             elif st == "missing":
                 raise SandboxGoneError(f"daytona sandbox {self.sandbox_ref} gone")
             else:

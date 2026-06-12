@@ -144,17 +144,20 @@ async def test_dispatch_creates_daytona_transport(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dispatch_resume_is_provider_uniform(monkeypatch):
-    """A pre-existing daytona ref → status()=='stopped' → resume(), no create."""
+    """A pre-existing daytona ref → status()=='stopped' → resume() → verify it
+    came up ('running') → reuse, NO create. (The post-resume status() re-check
+    is what lets a 'dead' sandbox that can't resume fall through to recreate.)"""
     events = []
 
     class _FakeDaytona:
         def __init__(self, sandbox_ref=None, workdir="/home/daytona"):
             self.sandbox_ref = sandbox_ref
+            self._statuses = iter(["stopped", "running"])
         @property
         def ref(self):
             return self.sandbox_ref
         async def status(self):
-            events.append("status"); return "stopped"
+            events.append("status"); return next(self._statuses, "running")
         async def resume(self):
             events.append("resume")
         async def create(self, **kw):
@@ -164,7 +167,7 @@ async def test_dispatch_resume_is_provider_uniform(monkeypatch):
     s = _native_session("daytona")
     s.state.sandbox_ref = "dt-existing"
     t = await s._ensure_sandbox()
-    assert events == ["status", "resume"] and t.ref == "dt-existing"
+    assert events == ["status", "resume", "status"] and t.ref == "dt-existing"
 
 
 # ── Modal native bare-sandbox entrypoint (pure-function safety) ─────────────
@@ -387,3 +390,104 @@ async def test_invoke_tool_normal_failure_is_data():
     result, transport = await _invoke_tool(_Tool(), "t", {}, "bash", _ensure)
     assert "error: ValueError: boom" in result
     assert transport == "t" and refreshed["n"] == 0
+
+
+# ── DaytonaTransport.exec recovery mapping (the SandboxGoneError contract) ───
+# Previously untested: the docker live-recovery golden cited these as covered,
+# but no test exercised the daytona exec-raises → status() → resume/SandboxGone
+# branches at any level.
+
+@pytest.mark.asyncio
+async def test_daytona_exec_missing_raises_sandbox_gone(monkeypatch):
+    """A daytona VM hard-killed under a live session: exec raises →
+    status()=='missing' → SandboxGoneError, so the session recreates on the
+    volume (workspace survives) rather than surfacing a generic error."""
+    import api.providers.daytona as dt
+
+    async def _exec(inst, cmd, timeout=30):
+        raise RuntimeError("daytona 404 not found")
+
+    async def _status(ref):
+        return "missing"
+    monkeypatch.setattr(dt, "exec_in_sandbox", _exec)
+    monkeypatch.setattr(dt, "get_daytona_sandbox_status", _status)
+    t = T.DaytonaTransport(sandbox_ref="dt-x", workdir="/home/daytona")
+    with pytest.raises(T.SandboxGoneError):
+        await t.exec("echo hi")
+
+
+@pytest.mark.asyncio
+async def test_daytona_exec_self_heals_on_stopped(monkeypatch):
+    """Externally-paused daytona VM: exec raises → status()=='stopped' →
+    resume() → retry succeeds → status()=='running' → result returned warm."""
+    import api.providers.daytona as dt
+    calls = {"exec": 0, "start": 0}
+
+    async def _exec(inst, cmd, timeout=30):
+        calls["exec"] += 1
+        if calls["exec"] == 1:
+            raise RuntimeError("sandbox is paused")
+        return ExecResult(stdout="ran", stderr="", exit_code=0)
+
+    statuses = iter(["stopped", "running"])
+
+    async def _status(ref):
+        return next(statuses, "running")
+
+    async def _start(ref):
+        calls["start"] += 1
+    monkeypatch.setattr(dt, "exec_in_sandbox", _exec)
+    monkeypatch.setattr(dt, "get_daytona_sandbox_status", _status)
+    monkeypatch.setattr(dt, "start_daytona", _start)
+    t = T.DaytonaTransport(sandbox_ref="dt-x", workdir="/home/daytona")
+    r = await t.exec("echo hi")
+    assert r.exit_code == 0 and "ran" in r.stdout
+    assert calls["start"] == 1 and calls["exec"] == 2
+
+
+@pytest.mark.asyncio
+async def test_daytona_exec_escalates_when_resume_cannot_restore(monkeypatch):
+    """Parity with DockerTransport.exec: a daytona VM that resume() cannot
+    restore (the retry still fails / it never reports 'running') must escalate
+    to SandboxGoneError — so the session recreates on the volume — instead of
+    leaking a generic exception that _invoke_tool treats as tool-error DATA,
+    wedging the session forever on a dead VM."""
+    import api.providers.daytona as dt
+
+    async def _exec(inst, cmd, timeout=30):
+        raise RuntimeError("VM unrecoverable")
+
+    statuses = iter(["stopped"])   # classify=stopped; res is None short-circuits
+
+    async def _status(ref):
+        return next(statuses, "stopped")
+
+    async def _start(ref):
+        return None
+    monkeypatch.setattr(dt, "exec_in_sandbox", _exec)
+    monkeypatch.setattr(dt, "get_daytona_sandbox_status", _status)
+    monkeypatch.setattr(dt, "start_daytona", _start)
+    t = T.DaytonaTransport(sandbox_ref="dt-x", workdir="/home/daytona")
+    with pytest.raises(T.SandboxGoneError):
+        await t.exec("echo hi")
+
+
+@pytest.mark.asyncio
+async def test_daytona_exec_error_status_fails_closed(monkeypatch):
+    """A transient daytona status 'error' must NOT be read as gone: exec
+    re-raises the ORIGINAL error (fail-closed), never SandboxGoneError, so the
+    session won't cold-create over a possibly-live VM and lose the volume
+    workspace. (Deliberately asymmetric with the 'stopped'/'missing' branches.)"""
+    import api.providers.daytona as dt
+
+    async def _exec(inst, cmd, timeout=30):
+        raise RuntimeError("transient status-api blip")
+
+    async def _status(ref):
+        return "error"
+    monkeypatch.setattr(dt, "exec_in_sandbox", _exec)
+    monkeypatch.setattr(dt, "get_daytona_sandbox_status", _status)
+    t = T.DaytonaTransport(sandbox_ref="dt-x", workdir="/home/daytona")
+    with pytest.raises(RuntimeError, match="transient status-api blip"):
+        await t.exec("echo hi")
+    assert not isinstance(RuntimeError, T.SandboxGoneError)
