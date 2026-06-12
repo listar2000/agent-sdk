@@ -101,6 +101,9 @@ def test_normalize_workspace_rejects_non_string():
 
 _DB = os.environ.get("TEST_DATABASE_URL")
 _db_required = pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+# DB-backed tests in this file share the single test postgres — serialize
+# them onto one xdist worker (see pyproject addopts --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("db")
 if _DB:
     os.environ["DATABASE_URL"] = _DB
 

@@ -10,7 +10,7 @@ if _SRC not in sys.path:
 
 # Use a per-test Postgres DB URL if set; otherwise skip.
 _DB = os.environ.get("TEST_DATABASE_URL")
-pytestmark = pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+pytestmark = [pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"), pytest.mark.xdist_group("db")]
 
 if _DB:
     os.environ["DATABASE_URL"] = _DB

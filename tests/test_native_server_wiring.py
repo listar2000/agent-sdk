@@ -34,7 +34,7 @@ def _pg_ok() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _pg_ok(), reason="postgres unavailable")
+pytestmark = [pytest.mark.skipif(not _pg_ok(), reason="postgres unavailable"), pytest.mark.xdist_group("db")]
 
 
 class _FakeTransport:

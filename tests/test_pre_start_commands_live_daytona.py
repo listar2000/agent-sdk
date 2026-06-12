@@ -34,10 +34,13 @@ DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY")
 OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
 _DB = os.environ.get("TEST_DATABASE_URL")
 
-pytestmark = pytest.mark.skipif(
-    not (DAYTONA_API_KEY and OAUTH_TOKEN and _DB),
-    reason="DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN + TEST_DATABASE_URL required",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not (DAYTONA_API_KEY and OAUTH_TOKEN and _DB),
+        reason="DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN + TEST_DATABASE_URL required",
+    ),
+    pytest.mark.xdist_group("db"),
+]
 if _DB:
     os.environ["DATABASE_URL"] = _DB
 

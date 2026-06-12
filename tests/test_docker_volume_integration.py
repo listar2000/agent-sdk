@@ -39,10 +39,13 @@ def _docker_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _docker_available(),
-    reason="docker CLI not available / daemon unreachable",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _docker_available(),
+        reason="docker CLI not available / daemon unreachable",
+    ),
+    pytest.mark.xdist_group("db"),
+]
 
 
 def _vol_name() -> str:
