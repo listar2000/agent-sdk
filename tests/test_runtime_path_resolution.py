@@ -15,10 +15,6 @@ import sys
 
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from api.providers import _shared  # noqa: E402
 from api.providers._shared import (  # noqa: E402
     _detect_runtime_path,

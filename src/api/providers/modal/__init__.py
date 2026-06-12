@@ -84,6 +84,10 @@ _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
 _TAG_KEY = "agent-sdk.sandbox-id"
 
+# Origin tag (test|production), analogous to the docker/daytona
+# ``agent_sdk_origin`` label, so cleanup_orphans.py can isolate test residue.
+_ORIGIN_TAG = "agent_sdk_origin"
+
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
 
@@ -246,12 +250,17 @@ async def create_volume(name: str) -> str:
     support the append semantics the agent filesystem needs.
     """
     modal, api_pb2 = _require_modal()
-    await asyncio.to_thread(
+    vol = await asyncio.to_thread(
         modal.Volume.from_name,
         name,
         create_if_missing=True,
         version=api_pb2.VolumeFsVersion.VOLUME_FS_VERSION_V2,
     )
+    # ``from_name`` returns a LAZY handle — without hydrating it the
+    # create-or-get RPC never fires and the volume isn't actually persisted
+    # (a later ``Sandbox.create`` mount with create_if_missing=False then
+    # 404s). Force the round-trip so the name is real before we return it.
+    await asyncio.to_thread(vol.hydrate)
     log.info("modal volume %s created or adopted", name)
     return name
 
@@ -466,6 +475,126 @@ async def create_sandbox(
         )
     except BaseException:
         # Best-effort cleanup on any failure path.
+        try:
+            await asyncio.to_thread(sb.terminate)
+        except Exception:
+            pass
+        raise
+
+
+def _build_bare_entrypoint(*, subpath: str, root: str | None) -> str:
+    """PID-1 script for a NATIVE (no-supervisor) modal sandbox.
+
+    Mirrors ``_build_entrypoint_cmd`` minus the supervisor: it ensures the
+    workspace dir exists ON THE VOLUME (``/v/<subpath>``) and symlinks the
+    native session's ``root`` to it, so files the native loop writes survive
+    a terminate→recreate (modal's only "hibernate"). Then it execs
+    ``sleep infinity`` as PID 1 — nothing listening, no tunnel, no health
+    gate. Readiness is the caller's one ``exec true`` (like DockerTransport).
+    """
+    safe_sub = subpath.strip("/")
+    vol_workspace = f"{_VOLUME_MOUNT}/{safe_sub}"
+    lines = ["set -e", f"mkdir -p {shlex.quote(vol_workspace)}"]
+    # Symlink the session root onto the volume so workspace bytes persist on
+    # the Volume, not the ephemeral sandbox FS (lost on terminate). Skip when
+    # root is already under the volume mount, unset, or a critical system dir.
+    # The symlink does ``rm -rf root`` first, so REFUSE to clobber paths like
+    # /tmp, /, /usr, /home (a misconfigured cwd must never wipe a system dir);
+    # for those we leave the FS alone — absolute /v paths still persist, only
+    # the root-relative convenience symlink is skipped.
+    _CRITICAL = {"/", "/tmp", "/usr", "/etc", "/var", "/bin", "/sbin",
+                 "/lib", "/lib64", "/dev", "/proc", "/sys", "/root",
+                 "/home", "/opt", _VOLUME_MOUNT}
+    norm = (root or "").rstrip("/") or root
+    if root and root != vol_workspace and not root.startswith(_VOLUME_MOUNT + "/") \
+            and root != _VOLUME_MOUNT and norm not in _CRITICAL:
+        parent = root.rsplit("/", 1)[0] or "/"
+        lines += [
+            f"mkdir -p {shlex.quote(parent)}",
+            f"rm -rf {shlex.quote(root)}",
+            f"ln -s {shlex.quote(vol_workspace)} {shlex.quote(root)}",
+        ]
+    lines.append("exec sleep infinity")
+    return "\n".join(lines)
+
+
+async def create_bare_sandbox(
+    *,
+    volume_ref: str,
+    subpath: str,
+    root: str | None = None,
+    sandbox_ref: str | None = None,
+    resources: Any = None,
+    **_kw,
+) -> ProviderInstance:
+    """Create a NATIVE modal sandbox: volume mounted at ``/v``, ``sleep
+    infinity`` as PID 1, NO supervisor / ACP / tunnel / health check.
+
+    The native runtime owns its own loop in-server and only needs exec+files
+    over the volume-backed sandbox — this is the modal analogue of
+    DockerTransport's bare ``sleep infinity`` container. Cheaper than
+    ``create_sandbox`` (no tunnel setup, no 120-retry supervisor health
+    poll), which is the point: native resource lifecycle stays lean.
+
+    Returns a ``ProviderInstance`` whose ``sandbox_ref`` is the Modal
+    ``object_id`` (resolved by ``Sandbox.from_id`` in exec/status/stop).
+    """
+    if not subpath:
+        raise ValueError("modal create_bare_sandbox requires a non-empty subpath")
+    modal, _ = _require_modal()
+    app = await _get_app()
+    image = await _get_image()
+    vol = await _get_volume(volume_ref)
+    entrypoint = _build_bare_entrypoint(subpath=subpath, root=root)
+    log.info("modal create_bare_sandbox (native): volume=%s subpath=%s root=%s",
+             volume_ref, subpath, root)
+    res_kw = _to_modal_resources(resources)
+    sb = await asyncio.to_thread(
+        lambda: modal.Sandbox.create(
+            "sh", "-c", entrypoint,
+            app=app,
+            image=image,
+            volumes={_VOLUME_MOUNT: vol},
+            timeout=_SANDBOX_TIMEOUT_SEC,
+            # idle_timeout == hard timeout (not the supervisor's shorter
+            # _SANDBOX_IDLE_TIMEOUT_SEC): the bare path has NO tunnel, so
+            # modal's idle clock — documented to key off tunnel HTTP traffic —
+            # has no signal to reset and could reap an ACTIVE native session
+            # mid-tool-call. Native idle lifecycle is owned by the server's
+            # SessionPool reaper (which tracks exec activity and hibernates),
+            # so we disable modal's separate idle timer and keep only the hard
+            # ceiling as a backstop.
+            idle_timeout=_SANDBOX_TIMEOUT_SEC,
+            **res_kw,
+        )
+    )
+    origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+    try:
+        # ALWAYS tag so out-of-band reclaim can find this sandbox:
+        #  - _TAG_KEY (=object_id): reconcile_on_startup reaps it if orphaned
+        #    (crash between create and the session persisting state.sandbox_ref,
+        #    or a deleted session row). Untagged sandboxes are skipped by the
+        #    reconciler. The value matches state.sandbox_ref so live sandboxes
+        #    are never mis-reaped.
+        #  - agent_sdk_origin: lets cleanup_orphans.py (_reap_modal) isolate
+        #    test residue from production, matching the docker/daytona label.
+        await asyncio.to_thread(sb.set_tags, {
+            _TAG_KEY: sandbox_ref or sb.object_id,
+            _ORIGIN_TAG: origin,
+        })
+        # No health gate: a bare `sleep infinity` PID-1 is "running" the
+        # moment Modal schedules it. The transport's create does one
+        # `exec true`/`mkdir` as the readiness probe.
+        log.info("modal bare sandbox started: id=%s volume=%s subpath=%s",
+                 sb.object_id, volume_ref, subpath)
+        return ProviderInstance(
+            provider="modal",
+            url="",
+            root=root or f"{_VOLUME_MOUNT}/{subpath.strip('/')}",
+            sandbox_ref=sb.object_id,
+            container_id=sb.object_id,
+        )
+    except BaseException:
         try:
             await asyncio.to_thread(sb.terminate)
         except Exception:

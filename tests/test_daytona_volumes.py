@@ -4,10 +4,6 @@ import os, sys
 import uuid
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DAYTONA_API_KEY"),
     reason="DAYTONA_API_KEY not set",

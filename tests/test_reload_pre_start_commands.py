@@ -47,19 +47,19 @@ import uuid
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from agent_sdk import Agent, ApiClient  # noqa: E402
 
 OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 
-pytestmark = pytest.mark.skipif(
+# Live-server suite — serialize onto the "live" xdist worker (see pyproject).
+pytestmark = [
+    pytest.mark.skipif(
     not OAUTH_TOKEN,
     reason="CLAUDE_CODE_OAUTH_TOKEN required",
-)
+),
+    pytest.mark.xdist_group("live"),
+]
 
 
 async def _server_up() -> bool:

@@ -11,11 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
-
 @pytest.mark.asyncio
 async def test_volume_mkdir_uses_mkdir_p(monkeypatch):
     from api.providers import daytona

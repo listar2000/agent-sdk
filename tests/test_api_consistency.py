@@ -23,12 +23,8 @@ import pytest_asyncio
 from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 _DB = os.environ.get("TEST_DATABASE_URL")
-pytestmark = pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+pytestmark = [pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"), pytest.mark.xdist_group("db")]
 if _DB:
     os.environ["DATABASE_URL"] = _DB
 
@@ -36,7 +32,9 @@ from api import db as dbmod, server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def client(db_pool):
+async def client(clean_db):
+    # clean_db (not bare db_pool): rows created by name in other test files
+    # collide with this file's fixtures and make it order-dependent.
     transport = ASGITransport(app=srv.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -107,8 +105,9 @@ async def test_post_non_object_body_returns_400(client, path, body):
 @pytest.mark.asyncio
 async def test_duplicate_volume_name_returns_409(client):
     import uuid
-    # Unique name per run — the test DB isn't reset between tests, and
-    # other suites create volumes at module-load time.
+    # clean_db truncates before each test now, so a fixed name would work —
+    # the uuid suffix stays as cheap belt-and-braces against any future
+    # fixture change reintroducing shared rows.
     name = f"dup-api-{uuid.uuid4().hex[:8]}"
     with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-dup")):

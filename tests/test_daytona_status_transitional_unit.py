@@ -16,11 +16,6 @@ from types import SimpleNamespace
 
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
-
 def _patch_client_to_return_state(monkeypatch, state_value: str):
     """Make ``await daytona._get_async_daytona_client(); await client.get(ref)``
     return a sandbox whose ``state`` is ``state_value``."""

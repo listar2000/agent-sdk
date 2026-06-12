@@ -150,6 +150,11 @@ async def _ensure_subpath_dir(volume_ref: str, subpath: str) -> None:
 
 _LABEL_KEY = "agent-sdk.sandbox-id"
 _ORIGIN_LABEL_KEY = "agent_sdk_origin"
+# Native runtime containers carry this label (session_id) instead of
+# _LABEL_KEY — they're bare `sleep infinity` containers whose sandbox_ref is
+# the container id (assigned post-create), so reconcile enumerates them by
+# this label and matches their container_id against live_sandbox_refs.
+_NATIVE_LABEL_KEY = "native_session"
 
 
 def _agent_sdk_origin() -> str:
@@ -483,28 +488,38 @@ async def reconcile_on_startup() -> None:
         log.warning("docker reconcile: cannot import api.db: %s", e)
         return
 
-    try:
-        out = await _run_docker_checked(
-            "ps", "-a",
-            "--filter", f"label={_LABEL_KEY}",
-            "--format", "{{.ID}} {{.State}} {{.Label \"" + _LABEL_KEY + "\"}}",
-            timeout=30,
-        )
-    except Exception as e:
-        log.warning("docker reconcile: ps failed: %s", e)
-        return
+    # Enumerate BOTH supervisor containers (labeled agent-sdk.sandbox-id) AND
+    # native-runtime containers (labeled native_session). Native bare
+    # containers never carry the sandbox-id label, so the supervisor filter
+    # alone left crash-orphaned native containers un-reclaimable at boot (they
+    # leaked across restarts until manual cleanup_orphans). Each filter uses
+    # its own label in the format so the third field is always present.
+    lines: list[str] = []
+    for label_key in (_LABEL_KEY, _NATIVE_LABEL_KEY):
+        try:
+            out = await _run_docker_checked(
+                "ps", "-a", "--no-trunc",
+                "--filter", f"label={label_key}",
+                "--format", "{{.ID}} {{.State}} {{.Label \"" + label_key + "\"}}",
+                timeout=30,
+            )
+        except Exception as e:
+            log.warning("docker reconcile: ps (label=%s) failed: %s", label_key, e)
+            continue
+        lines += out.decode(errors="replace").splitlines()
 
-    # Reconcile only does orphan cleanup now: any container whose labeled
-    # sandbox-id (= the docker container id) doesn't appear in any live
-    # session's ``sandbox_state.sandbox_ref`` gets force-removed. The
-    # SessionPool's sandbox_state JSONB on ``sessions`` is the single
-    # source of truth for "what sandboxes belong to live sessions."
+    # Reconcile only does orphan cleanup now: any container whose
+    # container_id (= sandbox_ref for native; also the post-d5 supervisor ref)
+    # doesn't appear in any live session's ``sandbox_state.sandbox_ref`` gets
+    # force-removed. The SessionPool's sandbox_state JSONB on ``sessions`` is
+    # the single source of truth for "what sandboxes belong to live sessions."
     try:
         live_refs = await dbmod.live_sandbox_refs()
     except Exception as e:
         log.warning("docker reconcile: live-session query failed: %s", e)
         return
-    for line in out.decode(errors="replace").splitlines():
+    seen: set[str] = set()
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -512,6 +527,9 @@ async def reconcile_on_startup() -> None:
         if len(parts) < 3:
             continue
         container_id, state, sandbox_ref_label = parts[0], parts[1].lower(), parts[2]
+        if container_id in seen:
+            continue
+        seen.add(container_id)
         # "stopped" containers are NOT orphans if a live session still
         # references them — they're resumable. The label may be the
         # legacy sb_<hex> PK (pre-d5) or the container_id (post-d5);

@@ -334,13 +334,20 @@ async def test_modal_create_sandbox_reports_pre_start_failure(monkeypatch):
 async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
     from api.providers import modal as modal_provider
 
+    class _FakeVolHandle:
+        # create_volume now hydrates the lazy handle to force the create RPC
+        # (Volume.from_name alone is lazy and never persists the volume). The
+        # fake exposes a no-op hydrate; it must still NOT spawn a sandbox.
+        def hydrate(self):
+            return None
+
     class FakeVolume:
         @staticmethod
         def from_name(name, *, create_if_missing, version):
             assert name == "modal-prod"
             assert create_if_missing is True
             assert version == "v2"
-            return object()
+            return _FakeVolHandle()
 
     class FakeApiPb2:
         class VolumeFsVersion:

@@ -36,20 +36,22 @@ import uuid
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from agent_sdk import ApiClient, Agent  # noqa: E402
 
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY")
 OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 
-pytestmark = pytest.mark.skipif(
+# Live-server suites are SERIAL-BY-DESIGN (one shared stack, real
+# sandboxes/LLM quota): xdist_group("live") pins them to one worker so
+# `-n auto tests/` cannot run them concurrently (pyproject --dist loadgroup).
+pytestmark = [
+    pytest.mark.skipif(
     not (DAYTONA_API_KEY and OAUTH_TOKEN),
     reason="DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required",
-)
+),
+    pytest.mark.xdist_group("live"),
+]
 
 
 async def _server_up() -> bool:

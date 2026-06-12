@@ -16,10 +16,6 @@ from pathlib import Path
 
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from api.providers import docker as dprov  # noqa: E402
 from api.providers._shared import ProviderInstance  # noqa: E402
 
@@ -39,10 +35,13 @@ def _docker_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _docker_available(),
-    reason="docker CLI not available / daemon unreachable",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _docker_available(),
+        reason="docker CLI not available / daemon unreachable",
+    ),
+    pytest.mark.xdist_group("db"),
+]
 
 
 def _vol_name() -> str:
@@ -351,7 +350,6 @@ async def test_label_propagation_provider_create_sandbox():
             except Exception:
                 pass
         await dprov.delete_volume(name)
-
 
 
 @pytest.mark.asyncio

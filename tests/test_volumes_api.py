@@ -6,12 +6,8 @@ import pytest_asyncio
 from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 _DB = os.environ.get("TEST_DATABASE_URL")
-pytestmark = pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+pytestmark = [pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"), pytest.mark.xdist_group("db")]
 if _DB:
     os.environ["DATABASE_URL"] = _DB
 
@@ -19,7 +15,10 @@ from api import db as dbmod, server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def client(db_pool):
+async def client(clean_db):
+    # clean_db (not bare db_pool): these tests create volumes/agents by NAME,
+    # so leftover rows from another test file (or a prior aborted run) collide
+    # and make the file order-dependent — pass solo, fail in a batch run.
     transport = ASGITransport(app=srv.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -69,7 +68,7 @@ async def test_get_and_list_volumes(client):
 async def test_delete_volume(client):
     with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-del")), \
-         patch("api.providers.delete_daytona_volume",
+         patch("api.providers.daytona.delete_daytona_volume",
                new=AsyncMock(return_value=None)):
         await client.post("/volumes", json={"name": "to-delete", "provider": "daytona"})
         r = await client.delete("/volumes/to-delete")
@@ -160,7 +159,7 @@ async def test_delete_volume_conflict_if_session_exists(client):
     assert r.status_code == 409
 
     # With force=true the referenced session is deleted and the volume too.
-    with patch("api.providers.delete_daytona_volume",
+    with patch("api.providers.daytona.delete_daytona_volume",
                new=AsyncMock(return_value=None)):
         r = await client.delete("/volumes/conflict?force=true")
     assert r.status_code == 204

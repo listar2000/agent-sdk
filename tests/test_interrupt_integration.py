@@ -1,8 +1,8 @@
 """Integration test: interrupt flow against a real claude-agent-acp with Haiku.
 
 Requires:
-  - Server running at localhost:7778 (docker compose up -d --build)
-  - ANTHROPIC_API_KEY set (or in ~/.env)
+  - Server running at localhost:7778 (scripts/launch_server_test.sh)
+  - CLAUDE_CODE_OAUTH_TOKEN set (or in ~/.env)
 
 Run:
   .venv/bin/pytest tests/test_interrupt_integration.py -v -s
@@ -14,13 +14,20 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# Live-server suite — SERIAL-BY-DESIGN (one shared stack, real sandboxes/
+# LLM quota): xdist_group("live") pins it to one worker so `-n auto tests/`
+# cannot run live tests concurrently (pyproject --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("live")
+
 
 from agent_sdk.client import Agent
 
-# Load API keys from ~/.env if not already set
+# Load API keys from ~/.env if not already set. ANTHROPIC_API_KEY is
+# deliberately NOT loaded: the claude CLI prefers it over the OAuth token
+# when both are present, so a stale/revoked key in ~/.env would 401 every
+# claude session even though CLAUDE_CODE_OAUTH_TOKEN (the repo's blessed
+# credential — see CLAUDE.md) is valid. Export it explicitly to use it.
 _KEY_PREFIXES = (
-    "ANTHROPIC_API_KEY=",
     "GEMINI_API_KEY=",
     "GOOGLE_API_KEY=",
     "OPENROUTER_API_KEY=",
@@ -37,7 +44,7 @@ if os.path.exists(env_path):
                     if not os.environ.get(key):
                         os.environ[key] = val
 
-API_URL = "http://localhost:7778"
+API_URL = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 MODEL = "claude-haiku-4-5-20251001"
 
 

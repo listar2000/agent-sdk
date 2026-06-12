@@ -57,6 +57,23 @@ _PG_SCHEMA = [
         payload     JSONB NOT NULL,
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
+    # Native-runtime conversation checkpoints (agent_type="native").
+    # Written SYNCHRONOUSLY at turn end (never via the lossy event batcher:
+    # a dropped checkpoint silently rewinds the conversation on resume) and
+    # NEVER served by /sessions/{id}/log (content round-trips to the model,
+    # so it must stay unredacted; session_log is the redacted human-facing
+    # record). Keep-last-N pruning happens on write.
+    """CREATE TABLE IF NOT EXISTS native_transcripts (
+        id          BIGSERIAL PRIMARY KEY,
+        session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn_seq    INTEGER NOT NULL,
+        messages    JSONB NOT NULL,
+        usage       JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (session_id, turn_seq)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_native_transcripts_session"
+    " ON native_transcripts(session_id, turn_seq DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_session ON session_log(session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_agent ON session_log(agent_id, created_at DESC)",
@@ -688,3 +705,40 @@ async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
             (session_id, limit),
         )).fetchall()
     return [_row_to_log_entry(r) for r in rows]
+
+
+async def write_native_checkpoint(*, session_id: str, turn_seq: int,
+                                  messages: list, usage: dict | None = None,
+                                  keep_last: int = 2) -> None:
+    """Persist the native loop's full message array for one completed turn.
+
+    Direct synchronous INSERT — deliberately NOT the SessionLogBatcher,
+    whose drops are silent-by-contract; checkpoint durability is resume
+    correctness. Upsert on (session_id, turn_seq) makes the retry path
+    after a recovery swap idempotent. Prunes rows older than ``keep_last``
+    turns in the same call so storage stays O(keep_last) per session.
+    """
+    async with get_db() as conn:
+        await conn.execute(
+            "INSERT INTO native_transcripts (session_id, turn_seq, messages, usage)"
+            " VALUES (%s, %s, %s, %s)"
+            " ON CONFLICT (session_id, turn_seq)"
+            " DO UPDATE SET messages = EXCLUDED.messages, usage = EXCLUDED.usage",
+            (session_id, turn_seq, Json(messages), Json(usage or {})),
+        )
+        await conn.execute(
+            "DELETE FROM native_transcripts"
+            " WHERE session_id = %s AND turn_seq <= %s",
+            (session_id, turn_seq - keep_last),
+        )
+
+
+async def read_native_checkpoint(session_id: str) -> dict | None:
+    """Newest checkpoint for a session, or None. Resume reads exactly this."""
+    async with get_db() as conn:
+        row = await (await conn.execute(
+            "SELECT turn_seq, messages, usage FROM native_transcripts"
+            " WHERE session_id = %s ORDER BY turn_seq DESC LIMIT 1",
+            (session_id,),
+        )).fetchone()
+    return dict(row) if row else None

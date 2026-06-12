@@ -27,7 +27,6 @@ from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.providers.daytona.session import DaytonaSandboxSession  # noqa: E402
 from api.sandbox.state import DaytonaSandboxState, Recipe  # noqa: E402

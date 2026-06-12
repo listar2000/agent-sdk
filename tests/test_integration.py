@@ -14,11 +14,10 @@ import time
 import httpx
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_sdk.client import Agent
 from tests._acp_runtimes import acp_runtime_param
 
-BASE_URL = "http://localhost:7778"
+BASE_URL = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 
 
 def _server_reachable() -> bool:
@@ -30,7 +29,13 @@ def _server_reachable() -> bool:
         return False
 
 
-pytestmark = pytest.mark.integration
+# Live-server suites are SERIAL-BY-DESIGN (one shared stack, real
+# sandboxes/LLM quota): xdist_group("live") pins them to one worker so
+# `-n auto tests/` cannot run them concurrently (pyproject --dist loadgroup).
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.xdist_group("live"),
+]
 
 skip_if_no_server = pytest.mark.skipif(
     not _server_reachable(),

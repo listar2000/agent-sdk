@@ -63,8 +63,9 @@ CLINE = "cline"
 DEEPAGENTS = "deepagents"
 OPENHANDS = "openhands"
 GOOSE = "goose"
+NATIVE = "native"  # first-party in-server loop (not an ACP CLI)
 
-AGENT_TYPES = frozenset({CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE})
+AGENT_TYPES = frozenset({CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE, NATIVE})
 
 # ── Provider constants ──
 UNIX_LOCAL = "unix_local"

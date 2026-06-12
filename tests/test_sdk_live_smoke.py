@@ -27,7 +27,13 @@ from tests._acp_runtimes import acp_runtime_param
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 
-pytestmark = pytest.mark.asyncio
+# Live-server suites are SERIAL-BY-DESIGN (one shared stack, real
+# sandboxes/LLM quota): xdist_group("live") pins them to one worker so
+# `-n auto tests/` cannot run them concurrently (pyproject --dist loadgroup).
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.xdist_group("live"),
+]
 
 
 async def _server_up() -> bool:

@@ -24,10 +24,6 @@ import time
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from agent_sdk import ApiClient  # noqa: E402
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
@@ -35,7 +31,8 @@ SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 # Skip the whole module if no test server is reachable. Keeps the suite
 # green in environments without a live local server (e.g. CI lanes that
 # only run unit tests).
-pytestmark = pytest.mark.asyncio
+# Live-server suite — serialize onto the "live" xdist worker (see pyproject).
+pytestmark = [pytest.mark.asyncio, pytest.mark.xdist_group("live")]
 
 
 async def _server_up() -> bool:

@@ -15,7 +15,9 @@ falls back to ``"production"``.
 Daytona pauses-not-deletes on session release, so paused-but-not-deleted
 sandboxes pile up against the account's disk quota across CI runs. Docker
 containers stop on release; their rootfs sticks around until ``docker rm``.
-This script handles both.
+Modal native sandboxes carry the same origin tag and are terminated here
+(modal has no pause — terminate is the only reclaim). This script handles
+all of them.
 
 Usage:
 
@@ -33,6 +35,7 @@ Usage:
 
 Environment:
   DAYTONA_API_KEY  required for the daytona path (skipped silently if absent)
+  modal SDK + ~/.modal.toml  required for the modal path (skipped if absent)
   AGENT_SDK_ORIGIN read by the script's default --origin if --origin not given
                    (matches what the server stamped at create time)
 """
@@ -87,43 +90,28 @@ def _reap_daytona(origin: str, *, dry_run: bool) -> int:
     return len(items) - failed
 
 
-def _daytona_list_all(daytona, *, labels: dict[str, str]) -> list:
-    """Walk all pages of ``daytona.list(labels=...)``.
+_DAYTONA_MAX_ITEMS = int(os.environ.get("AGENT_SDK_DAYTONA_MAX_ITEMS", "5000"))
 
-    Returns a flat list of Sandbox objects. The daytona-sdk's ``list``
-    returns a ``PaginatedSandboxes`` whose ``items`` field is just the
-    first page (default 100); without pagination, ``cleanup_orphans``
-    silently leaves later pages behind and the "Reaped 100 resource(s)"
-    counter looks complete even when there are 200+ orphans against
-    the account quota. Walk pages explicitly until items < page_size
-    or we see total_pages exhausted.
+
+def _daytona_list_all(daytona, *, labels: dict[str, str]) -> list:
+    """List labelled sandboxes via the daytona-sdk >=0.184 query API.
+
+    The SDK made ``Daytona.list`` an auto-paginating iterator taking a
+    ``ListSandboxesQuery`` — the old ``list(labels=, page=)`` kwargs were
+    removed (``TypeError: list() got an unexpected keyword argument
+    'labels'``), which is what broke this reaper. Mirrors the provider's
+    ``_list_labeled_sandboxes`` (daytona/__init__.py). Capped at
+    ``_DAYTONA_MAX_ITEMS`` as a runaway guard.
     """
+    from daytona_sdk import ListSandboxesQuery
+
     out: list = []
-    page = 1
-    while True:
-        result = daytona.list(labels=labels, page=page)
-        # PaginatedSandboxes exposes ``items`` plus ``total`` / ``total_pages``
-        # via attributes or as tuple entries on older SDK versions. Probe
-        # both shapes so a daytona-sdk bump doesn't silently regress.
-        items: list = []
-        total_pages: int | None = None
-        if hasattr(result, "items"):
-            items = list(result.items)
-            total_pages = getattr(result, "total_pages", None)
-        else:
-            for tup in result:
-                if not isinstance(tup, tuple) or len(tup) != 2:
-                    continue
-                if tup[0] == "items":
-                    items = list(tup[1])
-                elif tup[0] == "total_pages":
-                    total_pages = tup[1]
-        if not items:
+    for sb in daytona.list(ListSandboxesQuery(labels=labels)):
+        out.append(sb)
+        if len(out) >= _DAYTONA_MAX_ITEMS:
+            print(f"[daytona] WARNING: hit {_DAYTONA_MAX_ITEMS}-sandbox scan "
+                  f"cap; count is a lower bound")
             break
-        out.extend(items)
-        if total_pages is None or page >= total_pages:
-            break
-        page += 1
     return out
 
 
@@ -176,6 +164,84 @@ def _reap_docker(origin: str, *, dry_run: bool) -> int:
     if failed:
         print(f"[docker] {failed} delete(s) failed")
     return len(ids) - failed
+
+
+def _reap_modal(origin: str, *, dry_run: bool) -> int:
+    """Terminate Modal sandboxes tagged ``agent_sdk_origin=<origin>``.
+
+    Native-modal bare sandboxes (and any future origin-tagged modal sandbox)
+    carry this tag at create time. Modal has no pause — terminate is the only
+    reclaim. The boot reconciler (reconcile_on_startup) already reaps orphans
+    of a LIVE server via the DB; this is the out-of-band sweep used after a
+    crashed/SIGKILLed test run, matching _reap_docker/_reap_daytona semantics
+    (reap everything carrying the test origin tag). Skips silently when the
+    modal SDK / credentials are absent.
+    """
+    src = os.path.join(os.path.dirname(__file__), "..", "src")
+    try:
+        import asyncio
+
+        from api.providers.modal import _ORIGIN_TAG, _get_app, _require_modal
+    except Exception as e:  # missing SDK / creds / import error
+        print(f"[modal] unavailable — skipping ({type(e).__name__})")
+        return 0
+
+    async def _collect() -> list:
+        try:
+            modal, _ = _require_modal()
+            app = await _get_app()
+        except Exception as e:
+            print(f"[modal] modal unavailable — skipping ({e})")
+            return []
+
+        def _list():
+            return list(modal.Sandbox.list(app_id=app.app_id))
+
+        try:
+            sandboxes = await asyncio.to_thread(_list)
+        except Exception as e:
+            print(f"[modal] list failed: {e}")
+            return []
+
+        matched = []
+        for sb in sandboxes:
+            try:
+                tags = await asyncio.to_thread(sb.get_tags)
+            except Exception:
+                continue
+            if isinstance(tags, dict) and tags.get(_ORIGIN_TAG) == origin:
+                matched.append(sb)
+        return matched
+
+    items = asyncio.run(_collect())
+    if not items:
+        print(f"[modal] no sandboxes with agent_sdk_origin={origin!r}")
+        return 0
+
+    print(f"[modal] found {len(items)} sandbox(es) with agent_sdk_origin={origin!r}:")
+    for sb in items:
+        print(f"  {sb.object_id}")
+
+    if dry_run:
+        return len(items)
+
+    import asyncio as _aio
+
+    async def _terminate_all() -> int:
+        failed = 0
+        for sb in items:
+            try:
+                await _aio.to_thread(sb.terminate)
+                print(f"[modal]   terminated {sb.object_id}")
+            except Exception as e:
+                failed += 1
+                print(f"[modal]   FAILED  {sb.object_id}: {e}")
+        return failed
+
+    failed = _aio.run(_terminate_all())
+    if failed:
+        print(f"[modal] {failed} terminate(s) failed")
+    return len(items) - failed
 
 
 def _reap_local(*, dry_run: bool) -> int:
@@ -262,7 +328,7 @@ def main() -> None:
         help="agent_sdk_origin label to match (default: $AGENT_SDK_ORIGIN or 'test')",
     )
     p.add_argument(
-        "--provider", choices=("daytona", "docker", "unix_local", "all"),
+        "--provider", choices=("daytona", "docker", "unix_local", "modal", "all"),
         default="all",
         help="restrict to one provider (default: all)",
     )
@@ -278,6 +344,8 @@ def main() -> None:
         total += _reap_daytona(args.origin, dry_run=dry)
     if args.provider in ("docker", "all"):
         total += _reap_docker(args.origin, dry_run=dry)
+    if args.provider in ("modal", "all"):
+        total += _reap_modal(args.origin, dry_run=dry)
     if args.provider in ("unix_local", "all"):
         total += _reap_local(dry_run=dry)
 

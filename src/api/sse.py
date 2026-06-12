@@ -296,3 +296,30 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
         return {"type": "usage", "usage": data.get("cost", data)}
 
     return None
+
+
+def is_terminal_block(block: str, rpc_id: str) -> bool:
+    """True iff ``block`` is a genuine turn-terminal envelope for ``rpc_id``:
+    a JSON-RPC result carrying ``stopReason``, or a top-level JSON-RPC error.
+
+    Replaces bare-substring sniffing (``"stopReason" in block``): substrings
+    match inside CONTENT too — an agent whose streamed text or tool output
+    contains the characters ``stopReason`` (e.g. an agent reading this very
+    file) would terminate its own /message+stream mid-turn. JSON escaping
+    protects quoted patterns like ``'"error":'`` but cannot protect a bare
+    word. The substring check is kept only as a cheap prefilter so the
+    overwhelmingly common content frames skip the JSON parse.
+    """
+    if (
+        "stopReason" not in block
+        and '"type":"done"' not in block
+        and '"error":' not in block
+    ):
+        return False
+    payload = parse_sse_data(block)
+    if not isinstance(payload, dict) or payload.get("id") != rpc_id:
+        return False
+    result = payload.get("result")
+    if isinstance(result, dict) and "stopReason" in result:
+        return True
+    return "error" in payload

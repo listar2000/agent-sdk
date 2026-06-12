@@ -38,14 +38,12 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-_SRC = Path(__file__).resolve().parents[1] / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
 
 _DB = os.environ.get("TEST_DATABASE_URL")
 pytestmark = [
     pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"),
     pytest.mark.timeout(20),
+    pytest.mark.xdist_group("db"),
 ]
 if _DB and not os.environ.get("DATABASE_URL"):
     os.environ["DATABASE_URL"] = _DB
