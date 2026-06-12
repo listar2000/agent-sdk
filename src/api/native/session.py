@@ -329,14 +329,14 @@ class NativeSession(BaseSandboxSession):
         """Cold-create a fresh sandbox for ``provider`` and return its
         transport. docker: a sleep-infinity container; daytona: a paused-
         capable VM on the session volume."""
-        import shlex
         from .transport import DaytonaTransport, DockerTransport, ModalTransport
         if provider == "docker":
             t = DockerTransport(workdir=self._cwd)
+            # create() does the workdir mkdir as its readiness step, so no
+            # second exec round-trip here (matches daytona/modal below).
             await t.create(image=_native_image(),
                            labels={"agent_sdk_origin": _origin(),
                                    "native_session": self.session_id})
-            await t.exec(f"mkdir -p {shlex.quote(self._cwd)}", cwd="/")
             return t
         if provider == "daytona":
             t = DaytonaTransport(workdir=self._cwd)

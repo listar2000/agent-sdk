@@ -99,12 +99,17 @@ class DockerTransport:
         if not cid:
             raise RuntimeError("docker run returned empty container id")
         self.container_id = cid
-        # Readiness gate — fail loud now rather than on the first tool call.
-        rc, _, err = await _run_docker("exec", cid, "true", timeout=30)
+        # Readiness gate that ALSO creates the working directory in the SAME
+        # exec: a successful `mkdir -p <workdir>` is an equally-loud readiness
+        # proof, so the caller needs no second `exec mkdir` round-trip. Mirrors
+        # how the daytona/modal transports fold the mkdir into create() — keeps
+        # native cold-create at one post-run exec across all three providers.
+        rc, _, err = await _run_docker(
+            "exec", cid, "mkdir", "-p", self.workdir, timeout=30)
         if rc != 0:
             await self.destroy()
             raise RuntimeError(
-                f"native sandbox readiness exec failed (rc={rc}): "
+                f"native sandbox readiness/mkdir failed (rc={rc}): "
                 f"{err.decode(errors='replace')[:300]}")
         return cid
 
