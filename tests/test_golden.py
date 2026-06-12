@@ -2548,6 +2548,43 @@ async def test_native_resume_at_least_as_efficient_as_supervisor():
             f"native resume hot path.")
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+async def test_native_session_recovers_when_sandbox_removed_out_of_band():
+    """RESOURCE-MANAGEMENT golden: a native session whose sandbox is destroyed
+    out-of-band (docker prune / OOM-reap / — on modal, the routine hard-timeout
+    ceiling) must AUTO-RECOVER through the live ``/sandbox/exec`` route —
+    recreate a fresh sandbox and succeed, NOT 500 or wedge.
+
+    Pins the SandboxGoneError recover-and-retry END-TO-END at the server level.
+    The transport unit tests prove exec() raises SandboxGoneError and
+    _ensure_sandbox(refresh=True) recreates; this golden proves the WIRED route
+    (server → NativeSession.sandbox_exec → recover-and-retry) survives a real
+    sandbox vanishing under a live session. Docker is the cheap live provider;
+    the modal/daytona recreate is volume-backed and additionally covered by
+    test_native_modal_reconcile + the transport unit tests."""
+    if not _has_docker():
+        pytest.skip("docker not available")
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, "docker", agent_type="native")
+        sid = sess["session_id"]
+        # provision the sandbox via the very route under test
+        r1 = await sdk.session_sandbox_exec(sid, "echo up", timeout=60)
+        assert r1.get("exit_code") == 0, f"provision exec failed: {r1}"
+        before = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+        assert before, "no sandbox_ref after provision"
+        # destroy the container out-of-band, under the live session
+        subprocess.run(["docker", "rm", "-f", before], capture_output=True, timeout=30)
+        # the NEXT exec on the same session must recover, not 500/wedge
+        r2 = await sdk.session_sandbox_exec(sid, "echo recovered", timeout=120)
+        assert r2.get("exit_code") == 0 and "recovered" in r2.get("stdout", ""), (
+            f"native session did not auto-recover after its sandbox was "
+            f"removed under it: {r2}")
+        after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+        assert after and after != before, (
+            f"recovery did not provision a FRESH sandbox: {before!r} → {after!r}")
+
+
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
