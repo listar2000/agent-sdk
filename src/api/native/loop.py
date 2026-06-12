@@ -193,7 +193,8 @@ async def run_turn(
 async def _invoke_tool(tool, transport, args, name, ensure_sandbox):
     """Run one tool. A tool failure is data (returned as an ``error:`` string),
     NOT a turn error. The one exception is ``SandboxGoneError`` — the sandbox
-    died out from under the live session; recreate it (``refresh=True``) and
+    died out from under the live session; recreate it (``replace=`` the dead
+    transport, so a concurrent recovery is adopted rather than duplicated) and
     retry the tool ONCE so a routine modal hard-timeout (or docker prune /
     daytona hard-kill) doesn't permanently wedge the session. Returns
     ``(result_str, transport)`` — the transport may be a fresh one."""
@@ -204,7 +205,9 @@ async def _invoke_tool(tool, transport, args, name, ensure_sandbox):
         if ensure_sandbox is None:
             return "error: sandbox gone and no recreate path available", transport
         log.warning("native sandbox gone mid-turn — recreating and retrying %s", name)
-        transport = await ensure_sandbox(refresh=True)
+        # pass the DEAD transport so a concurrent recovery that already
+        # recreated is adopted, not duplicated (no orphaned sandbox).
+        transport = await ensure_sandbox(replace=transport)
         try:
             return await tool.invoke(transport, args), transport
         except Exception as e:

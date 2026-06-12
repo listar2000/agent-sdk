@@ -354,8 +354,10 @@ async def test_invoke_tool_recreates_on_sandbox_gone():
 
     refreshed = {"n": 0}
 
-    async def _ensure(*, refresh=False):
-        if refresh:
+    async def _ensure(*, refresh=False, replace=None):
+        # the loop now passes the DEAD transport via replace= (concurrency-safe
+        # recreate); count either spelling as a recovery
+        if refresh or replace is not None:
             refreshed["n"] += 1
         return "fresh-transport"
 
@@ -378,7 +380,7 @@ async def test_invoke_tool_normal_failure_is_data():
 
     refreshed = {"n": 0}
 
-    async def _ensure(*, refresh=False):
+    async def _ensure(*, refresh=False, replace=None):
         refreshed["n"] += 1
         return "x"
 

@@ -199,6 +199,71 @@ def test_factory_routes_native():
 
 
 @pytest.mark.asyncio
+async def test_recover_adopts_concurrent_replacement_no_double_create():
+    """Concurrency-safety of recovery: two recoveries from the SAME dead
+    transport must create exactly ONE replacement sandbox.
+
+    A streaming turn's tool call and a /sandbox/exec on one session are NOT
+    serialized above _provision_lock, so both can hit SandboxGoneError on the
+    same dead transport. _ensure_sandbox(replace=dead) re-provisions only while
+    `dead` is still cached; once a concurrent recovery has swapped in a fresh
+    transport, a later recovery that still names the OLD dead one must ADOPT the
+    fresh transport — not null it and create a SECOND sandbox (an orphan the
+    reaper/boot-reconcile would have to reclaim, and a paid idle VM on
+    daytona/modal until then)."""
+    s = NativeSession(session_id="sess-recover-race",
+                      state=NativeSandboxState(provider="docker"))
+    s._started = True
+
+    async def _noop_persist():   # pure unit test — no DB pool
+        return None
+    s._persist_state = _noop_persist  # type: ignore
+
+    created: list = []
+
+    class _T:
+        def __init__(self, tag):
+            self.ref = f"cid-{tag}"
+            self.container_id = self.ref
+
+        async def destroy(self):
+            pass
+
+    async def _factory():
+        t = _T(len(created))
+        created.append(t)
+        return t
+
+    s._transport_factory = _factory
+    dead = _T("dead")
+    s._transport = dead
+
+    # first recovery: `dead` is still cached → provision exactly one fresh one
+    t1 = await s._ensure_sandbox(replace=dead)
+    assert len(created) == 1 and t1 is created[0]
+    assert s._transport is t1
+
+    # second recovery STILL naming the old dead transport: the fresh one is
+    # cached now (≠ dead) → adopt it, do NOT double-create (no orphan/leak).
+    t2 = await s._ensure_sandbox(replace=dead)
+    assert t2 is t1
+    assert len(created) == 1, (
+        f"double-created a sandbox (orphan leak): {[c.ref for c in created]}")
+
+    # and genuine concurrency: gather two recoveries from one fresh-dead
+    # transport — the lock + replace-check still yields exactly one creation.
+    dead2 = t1
+    s._transport = dead2
+    created.clear()
+    g1, g2 = await asyncio.gather(
+        s._ensure_sandbox(replace=dead2),
+        s._ensure_sandbox(replace=dead2),
+    )
+    assert g1 is g2 and len(created) == 1, (
+        f"concurrent recovery double-created: {[c.ref for c in created]}")
+
+
+@pytest.mark.asyncio
 async def test_secrets_split_keeps_llm_key_server_side():
     """start()'s split: AUTH_KEYS → server-side api_key; rest → sandbox env.
     Verified directly on the split logic without a DB round-trip."""

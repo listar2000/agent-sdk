@@ -253,7 +253,7 @@ class NativeSession(BaseSandboxSession):
 
     # ── sandbox: lazy provisioning + server exec/file routing ───────────────
 
-    async def _ensure_sandbox(self, *, refresh: bool = False):
+    async def _ensure_sandbox(self, *, refresh: bool = False, replace=None):
         """Provision the sandbox on first need (tool call or /sandbox/exec).
 
         Under a lock so concurrent tool calls in one turn provision once.
@@ -267,13 +267,27 @@ class NativeSession(BaseSandboxSession):
         forever. The recreate recovers the workspace on modal/daytona volumes;
         docker cold-creates fresh (its writable layer is gone with the container).
         """
-        if refresh:
-            self._transport = None
-        if self._transport is not None:
-            return self._transport
+        # ``replace`` names the EXACT transport a caller found dead
+        # (SandboxGoneError). Re-provision ONLY if it is still the cached one:
+        # if a CONCURRENT recovery (a second tool call, or /sandbox/exec racing
+        # a streaming turn — neither is serialized above _provision_lock) has
+        # already swapped in a fresh transport, adopt it instead of creating a
+        # SECOND sandbox and orphaning one — a leak the reaper/boot-reconcile
+        # would otherwise have to reclaim (and a paid-for idle VM until then on
+        # daytona/modal). ``refresh=True`` is shorthand for "replace whatever is
+        # cached right now" (forced recreate; the tests use it).
+        if refresh and replace is None:
+            replace = self._transport
+        cached = self._transport
+        if cached is not None and cached is not replace:
+            return cached
         async with self._provision_lock:
-            if self._transport is not None:
+            # Re-check under the lock: a concurrent recovery may have already
+            # provisioned a fresh transport (a different object than the dead
+            # ``replace``) while we waited — adopt it rather than duplicate.
+            if self._transport is not None and self._transport is not replace:
                 return self._transport
+            self._transport = None
             if not self._started:
                 await self.start()
             if self._transport_factory is not None:
@@ -385,7 +399,7 @@ class NativeSession(BaseSandboxSession):
         try:
             res = await _run(transport)
         except SandboxGoneError:
-            res = await _run(await self._ensure_sandbox(refresh=True))
+            res = await _run(await self._ensure_sandbox(replace=transport))
         return {
             "stdout": res.stdout,
             "stderr": res.stderr,
