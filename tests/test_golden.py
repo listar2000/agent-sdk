@@ -927,7 +927,13 @@ async def test_delete_session_destroys_sandbox(provider, agent_type):
         assert resp.status_code == 204, f"DELETE returned {resp.status_code}: {resp.text}"
 
         try:
-            await _assert_sandbox_gone(provider, sandbox, timeout_s=20.0)
+            # Modal terminate is async (sb.terminate(wait=False)), so the exit
+            # status can take longer than docker/daytona to propagate to
+            # 'missing'; give it the same generous budget the sibling teardown
+            # goldens use (60s) to avoid a flaky-fail on a correctly-destroyed
+            # sandbox. docker/daytona/local settle fast, so 20s is plenty.
+            deadline_s = 60.0 if provider == "modal" else 20.0
+            await _assert_sandbox_gone(provider, sandbox, timeout_s=deadline_s)
         except AssertionError:
             # Best-effort cleanup so we don't leak from this test itself.
             try:
@@ -997,6 +1003,16 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
 
         await asyncio.sleep(0.5)
 
+    # A persistent 'error' state means we could NOT verify destruction (transient
+    # provider/control-plane failure), which is distinct from observing the
+    # sandbox still alive ('running'/'exited'/pid). Say so rather than claim a
+    # leak on what may be an introspection failure.
+    if last_state == "error":
+        raise AssertionError(
+            f"could not verify {provider} sandbox {ref!r} was destroyed within "
+            f"the deadline: provider status kept returning 'error' (transient "
+            f"introspection failure, not necessarily a leak)."
+        )
     raise AssertionError(
         f"DELETE /sessions/{{id}} did not destroy {provider} sandbox "
         f"{ref!r}; last observed state: {last_state}. "
@@ -2718,14 +2734,16 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
 # ===========================================================================
 # Teardown-route compute-leak goldens (cred-refresh task, agent delete, volume
 # force-delete). The leaks live in provider-agnostic code (pool.py teardown,
-# server.py delete routes), so all three parametrize over providers. Compute
-# liveness is the provider-aware _assert_sandbox_gone oracle (same one the
-# canonical test_delete_session_destroys_sandbox uses); modal is excluded
-# because _assert_sandbox_gone has no modal branch.
+# server.py delete routes), so all three parametrize over every provider
+# INCLUDING modal. Compute liveness is the provider-aware _assert_sandbox_gone
+# oracle (same one the canonical test_delete_session_destroys_sandbox uses),
+# which now has a modal branch (terminate → 'missing'); _external_stop and
+# _external_delete are likewise modal-capable, so the modal teardown paths are
+# covered here, not just on docker/daytona.
 # ===========================================================================
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(900)
@@ -2859,7 +2877,7 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
         httpd.server_close()
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(300)
@@ -2914,7 +2932,7 @@ async def test_delete_agent_tears_down_session_sandboxes(provider, agent_type):
             raise
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(300)
