@@ -34,7 +34,12 @@ from api.sandbox.session import BaseSandboxSession
 from api.sandbox.state import NativeSandboxState
 
 from . import frames
-from .loop import NativeAgentSpec, initial_messages, run_turn
+from .loop import (
+    NativeAgentSpec,
+    heal_dangling_tool_calls,
+    initial_messages,
+    run_turn,
+)
 from .tools import build_toolset
 
 log = logging.getLogger(__name__)
@@ -210,7 +215,11 @@ class NativeSession(BaseSandboxSession):
             except asyncio.CancelledError:
                 # Interrupt: surface a clean cancelled terminal, persist the
                 # partial transcript, and DON'T re-raise (the cancellation's
-                # job — stop the loop, emit cancelled — is done).
+                # job — stop the loop, emit cancelled — is done). Heal any
+                # assistant tool_calls left unanswered by the interrupted
+                # tool-loop BEFORE checkpointing — persisting that dangling
+                # shape would 400 every future prompt (durable session wedge).
+                heal_dangling_tool_calls(self._messages)
                 await emit({"type": "done", "stop_reason": "cancelled"})
                 self._turn_seq += 1
                 await self._checkpoint({})
@@ -347,9 +356,14 @@ class NativeSession(BaseSandboxSession):
                         log.warning("native: resume failed for sandbox %s; "
                                     "destroying + recreating", ref[:12])
                     else:
-                        # resume returned — verify it actually came up; only
-                        # then keep the warm sandbox.
-                        if await t.status() == "running":
+                        # resume returned — keep the warm sandbox if it's up.
+                        # daytona's resume is AUTHORITATIVE (blocks-ready +
+                        # re-raises), so a clean return already proves running —
+                        # skip the redundant control-plane status() round-trip.
+                        # docker/modal resume can return on a still-dead sandbox,
+                        # so they need the re-check.
+                        if (getattr(t, "resume_is_authoritative", False)
+                                or await t.status() == "running"):
                             self._transport = t
                             return t
                 elif st == "error":
@@ -376,14 +390,20 @@ class NativeSession(BaseSandboxSession):
             return t
 
     def _reattach_transport(self, provider: str, ref: str):
-        """Build a transport bound to an existing sandbox ref (resume path)."""
+        """Build a transport bound to an existing sandbox ref (resume path).
+        ``env=`` binds the session's sandbox secrets as the transport's default
+        exec env so the LOOP's tools (bash/read/write/edit, which pass no env)
+        see the same GITHUB_TOKEN/etc that /sandbox/exec injects explicitly —
+        parity with the supervisor runtime, where the agent's shell inherits
+        spawn_env."""
         from .transport import DaytonaTransport, DockerTransport, ModalTransport
+        env = self._sandbox_env
         if provider == "docker":
-            return DockerTransport(container_id=ref, workdir=self._cwd)
+            return DockerTransport(container_id=ref, workdir=self._cwd, env=env)
         if provider == "daytona":
-            return DaytonaTransport(sandbox_ref=ref, workdir=self._cwd)
+            return DaytonaTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
         if provider == "modal":
-            return ModalTransport(sandbox_ref=ref, workdir=self._cwd)
+            return ModalTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
         raise RuntimeError(f"native provider {provider!r} not wired")
 
     async def _create_transport(self, provider: str):
@@ -391,8 +411,9 @@ class NativeSession(BaseSandboxSession):
         transport. docker: a sleep-infinity container; daytona: a paused-
         capable VM on the session volume."""
         from .transport import DaytonaTransport, DockerTransport, ModalTransport
+        env = self._sandbox_env  # default exec env — see _reattach_transport
         if provider == "docker":
-            t = DockerTransport(workdir=self._cwd)
+            t = DockerTransport(workdir=self._cwd, env=env)
             # create() does the workdir mkdir as its readiness step, so no
             # second exec round-trip here (matches daytona/modal below).
             await t.create(image=_native_image(),
@@ -400,14 +421,14 @@ class NativeSession(BaseSandboxSession):
                                    "native_session": self.session_id})
             return t
         if provider == "daytona":
-            t = DaytonaTransport(workdir=self._cwd)
+            t = DaytonaTransport(workdir=self._cwd, env=env)
             await t.create(root=self._cwd, volume_id=self._volume_ref,
                            subpath=self._subpath)
             return t
         if provider == "modal":
             # Modal is always volume-backed (recreate-on-missing keeps the
             # workspace on the Volume, not the terminated sandbox FS).
-            t = ModalTransport(workdir=self._cwd)
+            t = ModalTransport(workdir=self._cwd, env=env)
             await t.create(volume_ref=self._volume_ref, subpath=self._subpath,
                            root=self._cwd)
             return t
@@ -434,11 +455,27 @@ class NativeSession(BaseSandboxSession):
             return await t.exec(command, cwd=self._cwd,
                                 env=self._sandbox_env or None, timeout_s=timeout)
 
-        transport = await self._ensure_sandbox()
+        # Pin in_flight for the whole exec — /sandbox/exec runs no turn loop, so
+        # without this the reaper's in_flight gate (pool._should_reap) doesn't
+        # protect a long exec: a session idle past its provider window could be
+        # hibernated (docker stop -t 0 / modal terminate) out from under a
+        # multi-second command. Same bracket TurnRunner puts around a turn.
+        self.liveness.observe_prompt_start()
         try:
-            res = await _run(transport)
-        except SandboxGoneError:
-            res = await _run(await self._ensure_sandbox(replace=transport))
+            transport = await self._ensure_sandbox()
+            try:
+                res = await _run(transport)
+            except SandboxGoneError:
+                res = await _run(await self._ensure_sandbox(replace=transport))
+        finally:
+            # Exec IS compute activity (the modal-create design notes the pool
+            # reaper "tracks exec activity and hibernates") — advance the
+            # compute clock like a turn's emit does, so a completed exec buys
+            # one idle window instead of leaving the session reap-eligible the
+            # moment it returns (back-to-back execs would otherwise pay a
+            # resume/cold-create each).
+            self.liveness.observe_chunk()
+            self.liveness.observe_prompt_end()
         return {
             "stdout": res.stdout,
             "stderr": res.stderr,

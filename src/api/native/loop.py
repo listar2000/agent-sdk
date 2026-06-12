@@ -75,6 +75,42 @@ def initial_messages(spec: NativeAgentSpec, prior: list[dict] | None) -> list[di
     return msgs
 
 
+def heal_dangling_tool_calls(messages: list[dict]) -> None:
+    """Make the transcript valid for the next completion: every assistant
+    ``tool_calls`` id must be answered by a following ``tool`` message before
+    the next user/assistant turn.
+
+    An interrupt (CancelledError is a BaseException, so it bypasses the loop's
+    ``except Exception`` tool guard) or a turn error landing mid-tool-loop —
+    after the assistant ``tool_calls`` message is appended (loop.py) but before
+    every tool result is — leaves an assistant message with missing tool
+    results. Providers (Anthropic/OpenAI via LiteLLM) reject that with a 400,
+    so once such a transcript is checkpointed the session is durably wedged:
+    every later prompt re-raises across hibernate/resume/restart. Mutates
+    ``messages`` in place, inserting an ``interrupted`` stub for each unanswered
+    id right after the assistant's existing results. Idempotent — a clean
+    transcript is left unchanged."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+            # the contiguous run of tool results immediately after this message
+            j = i + 1
+            answered: set = set()
+            while j < len(messages) and messages[j].get("role") == "tool":
+                answered.add(messages[j].get("tool_call_id"))
+                j += 1
+            missing = [cid for cid in call_ids if cid not in answered]
+            if missing:
+                stubs = [{"role": "tool", "tool_call_id": cid,
+                          "content": "error: interrupted"} for cid in missing]
+                messages[j:j] = stubs   # after existing results, before next turn
+                i = j + len(stubs)
+                continue
+        i += 1
+
+
 async def run_turn(
     spec: NativeAgentSpec,
     messages: list[dict],
@@ -91,6 +127,12 @@ async def run_turn(
     if completion is None:
         import litellm
         completion = litellm.acompletion
+
+    # Defensive: a checkpoint persisted mid-tool-loop (interrupt/error) or an
+    # in-memory transcript from a prior errored turn can carry an assistant
+    # tool_calls with unanswered ids — a provider 400 on the very first call.
+    # Self-heal before we touch the model so a poisoned session recovers.
+    heal_dangling_tool_calls(messages)
 
     tool_schemas = [t.schema for t in tools.values()] or None
     total_usage: dict[str, Any] = {}

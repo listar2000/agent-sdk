@@ -50,16 +50,29 @@ async def _post_exec(command: str = "pwd"):
 
 @pytest.mark.asyncio
 async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
-    """The route delegates to ``_proxy_from_session``, which itself
-    resolves the session's supervisor URL via the SessionPool."""
+    """The route resolves the session ONCE via the SessionPool (to dispatch
+    native vs supervisor and reuse the supervisor URL), then delegates to
+    ``_proxy_from_session`` with that URL — no redundant pool round-trip."""
     calls: list[dict] = []
 
+    pool_session = SimpleNamespace(
+        state=SimpleNamespace(type="docker"),
+        supervisor_url="http://sup-1:8088",
+    )
+
+    class _FakePool:
+        async def get_session(self, session_id):
+            calls.append({"kind": "pool", "session_id": session_id})
+            return pool_session
+
     async def fake_proxy_from_session(session_id, method, path, *,
-                                      params=None, json=None, timeout=30):
+                                      params=None, json=None, timeout=30,
+                                      supervisor_url=""):
         calls.append({
             "kind": "proxy", "session_id": session_id,
             "method": method, "path": path,
             "params": params, "json": json, "timeout": timeout,
+            "supervisor_url": supervisor_url,
         })
         return Response(
             content=b'{"stdout":"ok\\n","stderr":"","exit_code":0}',
@@ -67,6 +80,8 @@ async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
             media_type="application/json",
         )
 
+    import api.sandbox as sandbox_mod
+    monkeypatch.setattr(sandbox_mod, "get_pool", lambda: _FakePool())
     monkeypatch.setattr(srv, "_proxy_from_session", fake_proxy_from_session)
 
     r = await _post_exec("echo ok")
@@ -76,15 +91,19 @@ async def test_session_sandbox_exec_proxies_to_session_supervisor(monkeypatch):
     assert r.json()["stdout_truncated"] is False
     assert r.json()["stderr_truncated"] is False
     assert r.json()["timed_out"] is False
-    assert calls == [{
-        "kind": "proxy",
-        "session_id": "sess-1",
-        "method": "POST",
-        "path": "/v1/exec",
-        "params": None,
-        "json": {"command": "echo ok", "timeout": 5},
-        "timeout": 10,
-    }]
+    assert calls == [
+        {"kind": "pool", "session_id": "sess-1"},
+        {
+            "kind": "proxy",
+            "session_id": "sess-1",
+            "method": "POST",
+            "path": "/v1/exec",
+            "params": None,
+            "json": {"command": "echo ok", "timeout": 5},
+            "timeout": 10,
+            "supervisor_url": "http://sup-1:8088",
+        },
+    ]
 
 
 # test_resolve_session_instance_uses_session_agent_type_and_spawn_env

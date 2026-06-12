@@ -123,7 +123,7 @@ async def test_dispatch_creates_daytona_transport(monkeypatch):
 
     class _FakeDaytona:
         provider = "daytona"
-        def __init__(self, sandbox_ref=None, workdir="/home/daytona"):
+        def __init__(self, sandbox_ref=None, workdir="/home/daytona", env=None):
             self.sandbox_ref = sandbox_ref; self.workdir = workdir
         @property
         def ref(self):
@@ -150,7 +150,7 @@ async def test_dispatch_resume_is_provider_uniform(monkeypatch):
     events = []
 
     class _FakeDaytona:
-        def __init__(self, sandbox_ref=None, workdir="/home/daytona"):
+        def __init__(self, sandbox_ref=None, workdir="/home/daytona", env=None):
             self.sandbox_ref = sandbox_ref
             self._statuses = iter(["stopped", "running"])
         @property
@@ -180,7 +180,7 @@ async def test_dispatch_resume_that_raises_falls_through_to_recreate(monkeypatch
     events = []
 
     class _FakeDaytona:
-        def __init__(self, sandbox_ref=None, workdir="/home/daytona"):
+        def __init__(self, sandbox_ref=None, workdir="/home/daytona", env=None):
             self.sandbox_ref = sandbox_ref
 
         @property
@@ -345,7 +345,7 @@ async def test_dispatch_modal_recreate_on_missing(monkeypatch):
     events = []
 
     class _FakeModal:
-        def __init__(self, sandbox_ref=None, workdir="/v"):
+        def __init__(self, sandbox_ref=None, workdir="/v", env=None):
             self.sandbox_ref = sandbox_ref
         @property
         def ref(self):
@@ -599,3 +599,85 @@ async def test_daytona_create_destroys_on_readiness_failure(monkeypatch):
         await t.create(root="/home/daytona", volume_id="v1", subpath="agents/a1")
     assert destroyed == ["dt-fresh"], (
         "create() must destroy the leaked VM when readiness fails")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_authoritative_resume_skips_redundant_status(monkeypatch):
+    """daytona's resume (start_daytona) BLOCKS until the VM is ready and
+    re-raises on failure, so a clean return already proves running —
+    _ensure_sandbox must not spend a second control-plane round-trip
+    re-checking status() (reap→resume efficiency parity with the supervisor
+    path, which does a single start call)."""
+    events = []
+
+    class _FakeDaytona:
+        resume_is_authoritative = True
+
+        def __init__(self, sandbox_ref=None, workdir="/home/daytona", env=None):
+            self.sandbox_ref = sandbox_ref
+
+        @property
+        def ref(self):
+            return self.sandbox_ref
+
+        async def status(self):
+            events.append("status"); return "stopped"
+
+        async def resume(self):
+            events.append("resume")   # start_daytona already waited-ready
+
+        async def destroy(self):
+            events.append("destroy")
+
+    monkeypatch.setattr(T, "DaytonaTransport", _FakeDaytona)
+    s = _native_session("daytona")
+    s.state.sandbox_ref = "dt-hib"
+    t = await s._ensure_sandbox()
+    assert t.ref == "dt-hib"
+    assert events == ["status", "resume"], (
+        f"authoritative resume must skip the post-resume status() "
+        f"round-trip, got {events}")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_nonauthoritative_resume_still_verifies(monkeypatch):
+    """PIN: docker/modal resume can return on a still-dead sandbox — their
+    post-resume status() re-check is load-bearing and must be preserved
+    (resume_is_authoritative=False)."""
+    events = []
+    statuses = iter(["stopped", "running"])
+
+    class _FakeDocker:
+        resume_is_authoritative = False
+
+        def __init__(self, container_id=None, workdir="/", env=None):
+            self.container_id = container_id
+
+        @property
+        def ref(self):
+            return self.container_id
+
+        async def status(self):
+            events.append("status"); return next(statuses)
+
+        async def resume(self):
+            events.append("resume")
+
+        async def destroy(self):
+            events.append("destroy")
+
+    monkeypatch.setattr(T, "DockerTransport", _FakeDocker)
+    s = _native_session("docker")
+    s.state.sandbox_ref = "cid-hib"
+    t = await s._ensure_sandbox()
+    assert t.ref == "cid-hib"
+    assert events == ["status", "resume", "status"]
+
+
+def test_real_transport_resume_authority_flags():
+    """The flags encode each provider's actual resume contract — drift here
+    silently reintroduces either the daytona double round-trip or a docker
+    dead-container false-positive resume."""
+    assert T.DaytonaTransport.resume_is_authoritative is True
+    assert T.DockerTransport.resume_is_authoritative is False
+    assert T.ModalTransport.resume_is_authoritative is False

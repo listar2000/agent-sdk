@@ -311,3 +311,170 @@ async def test_secrets_split_keeps_llm_key_server_side():
     assert s._llm_api_key == "sk-secret"
     assert "OPENROUTER_API_KEY" not in s._sandbox_env
     assert s._sandbox_env == {"GITHUB_TOKEN": "ghp_x", "FOO": "bar"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_tool_heals_checkpoint_no_dangling_tool_calls():
+    """Interrupt while a tool EXECUTES (not while the model streams): the
+    assistant tool_calls message is already in the array but its results are
+    not. The cancel handler must NOT checkpoint that dangling shape verbatim —
+    providers 400 on it, so the session would be durably wedged (every later
+    prompt fails, surviving hibernate/resume and server restart)."""
+    started = asyncio.Event()
+
+    class _BlockingTransport(_FakeTransport):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            started.set()
+            await asyncio.sleep(3600)   # parked until cancelled
+
+    ckpts = []
+    s = _make_session(
+        [[_Chunk(_Delta(tool_calls=[
+            _TCDelta(0, id="c1", name="bash",
+                     arguments='{"command":"sleep 60"}')]))]],
+        tools=build_toolset(["bash"]), transport=_BlockingTransport(),
+        capture_checkpoints=ckpts)
+    s._broadcast = lambda item: None
+
+    seen = []
+
+    async def _consume():
+        async for ev in s.execute_prompt("run", rpc_id="rX"):
+            seen.append(ev)
+
+    consumer = asyncio.create_task(_consume())
+    await asyncio.wait_for(started.wait(), timeout=5)   # tool is executing
+    await s.cancel_active_prompt()
+    await asyncio.wait_for(consumer, timeout=5)
+
+    assert seen[-1] == {"type": "done", "stop_reason": "cancelled"}
+    assert len(ckpts) == 1
+    msgs = ckpts[0]["messages"]
+    for i, m in enumerate(msgs):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {tc["id"] for tc in m["tool_calls"]}
+            answered = {r.get("tool_call_id") for r in msgs[i + 1:]
+                        if r.get("role") == "tool"}
+            assert ids <= answered, (
+                f"checkpoint kept dangling tool_calls {ids - answered} — "
+                f"the next prompt would 400 (durably wedged session)")
+
+
+@pytest.mark.asyncio
+async def test_sandbox_exec_pins_in_flight_against_reaper():
+    """/sandbox/exec runs no turn loop, so TurnRunner's observe_prompt bracket
+    never fires for it. Without its own bracket, in_flight stays False for the
+    whole exec — a session idle past its provider window could be hibernated
+    (docker stop -t 0 / modal terminate) out from under a long-running command
+    by the reaper's idle decision (pool._should_reap gates on in_flight)."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _ParkedTransport(_FakeTransport):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            started.set()
+            await release.wait()
+            return await super().exec(command, cwd=cwd, env=env,
+                                      timeout_s=timeout_s)
+
+    s = _make_session([[]], transport=_ParkedTransport())
+    s._cwd = "/work"
+    assert s.liveness.in_flight is False
+
+    task = asyncio.create_task(s.sandbox_exec("sleep 200", timeout=300))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    assert s.liveness.in_flight is True, (
+        "long /sandbox/exec must pin in_flight so pool._should_reap returns "
+        "prompt_in_flight instead of hibernating mid-command")
+    release.set()
+    res = await asyncio.wait_for(task, timeout=5)
+    assert res["exit_code"] == 0
+    assert s.liveness.in_flight is False
+
+    # the bracket must release even when the exec path raises
+    class _Boom(_FakeTransport):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            raise RuntimeError("exec failed")
+
+    s2 = _make_session([[]], transport=_Boom())
+    s2._cwd = "/work"
+    with pytest.raises(RuntimeError):
+        await s2.sandbox_exec("true")
+    assert s2.liveness.in_flight is False
+
+
+@pytest.mark.asyncio
+async def test_session_threads_sandbox_env_into_transports():
+    """The loop's tools call transport.exec() with no env — the session's
+    sandbox secrets must ride along as the transport's default env, or a
+    native agent's own bash/git runs secret-less while /sandbox/exec (which
+    passes env explicitly) gets them: an asymmetry vs the supervisor runtime,
+    where the agent's shell inherits spawn_env."""
+    s = NativeSession(session_id="s-env",
+                      state=NativeSandboxState(provider="docker"))
+    s._cwd = "/work"
+    s._sandbox_env = {"GITHUB_TOKEN": "ghp_x", "CUSTOM": "1"}
+    for provider, ref in (("docker", "cid-1"), ("daytona", "dt-1"),
+                          ("modal", "sb-1")):
+        t = s._reattach_transport(provider, ref)
+        assert t.default_env == {"GITHUB_TOKEN": "ghp_x", "CUSTOM": "1"}, provider
+
+
+@pytest.mark.asyncio
+async def test_docker_exec_merges_default_env(monkeypatch):
+    """DockerTransport injects its default env as an in-command `export`
+    preamble on every call (NEVER `docker exec -e` — that applies before the
+    OCI runtime resolves `sh`, so a PATH-class session env would 127 every
+    exec); an explicit per-call env overrides key-by-key."""
+    from api.native import transport as T
+
+    seen: list[list] = []
+
+    async def _fake_run_docker(*args, timeout=None):
+        seen.append(list(args))
+        return 0, b"ok", b""
+
+    monkeypatch.setattr(T, "_run_docker", _fake_run_docker)
+    t = T.DockerTransport(container_id="cid-x", workdir="/w",
+                          env={"FOO": "bar", "TOK": "s3cr3t"})
+
+    await t.exec("echo hi")
+    cmd = seen[0][-1]                     # the wrapped `sh -c` payload
+    assert "-e" not in seen[0]
+    assert "export" in cmd and "FOO=bar" in cmd and "TOK=s3cr3t" in cmd
+
+    await t.exec("echo hi", env={"FOO": "baz"})
+    cmd = seen[1][-1]
+    assert "FOO=baz" in cmd and "FOO=bar" not in cmd
+    assert "TOK=s3cr3t" in cmd            # defaults persist under override
+
+
+@pytest.mark.asyncio
+async def test_docker_plumbing_is_env_immune(monkeypatch):
+    """read_file routes through exec but must SKIP the default env — a
+    session env named PATH would otherwise break `base64` lookup and with it
+    every file op. The user-facing exec keeps the env (PATH altering the
+    user's own command lookup is ordinary Unix semantics)."""
+    import base64 as b64mod
+
+    from api.native import transport as T
+
+    seen: list[list] = []
+
+    async def _fake_run_docker(*args, timeout=None):
+        seen.append(list(args))
+        return 0, b64mod.b64encode(b"data"), b""
+
+    monkeypatch.setattr(T, "_run_docker", _fake_run_docker)
+    t = T.DockerTransport(container_id="cid-x", workdir="/w",
+                          env={"PATH": "/custom/bin"})
+
+    assert await t.read_file("/f.txt") == b"data"
+    assert "export" not in seen[0][-1], (
+        "plumbing exec must not carry the session env — PATH would break "
+        "the transport's own base64/mkdir machinery")
+    assert "-e" not in seen[0]
+
+    await t.exec("mytool --version")
+    assert "export PATH=/custom/bin && mytool --version" in seen[1][-1]
+    assert "-e" not in seen[1]            # never OCI-level env injection

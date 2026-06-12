@@ -14,10 +14,12 @@ P0 ships DockerTransport. Verified provider-audit constraints baked in:
 - ``docker exec <args>`` embeds argv in one execve — base64-in-argv caps
   file payloads at ~96KiB (MAX_ARG_STRLEN), so writes stream base64 over
   STDIN instead (no practical size limit);
-- env/cwd ride ``-e``/``-w`` flags per call (the native create passes no
+- cwd rides the ``-w`` flag; env rides an in-command ``export`` preamble
+  (NOT ``-e`` — that applies before the runtime resolves ``sh``, so a
+  PATH-class env would 127 every exec). The native create passes no
   secrets into the container environment at all — the session's non-LLM
-  secrets are injected per-exec by the caller, and LLM keys never reach
-  the transport, see design §6).
+  secrets are injected per-exec, and LLM keys never reach the transport
+  (design §6).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import shlex
 from dataclasses import dataclass
 
@@ -32,6 +35,35 @@ from api.providers._shared import _MAX_OUTPUT_BYTES, _truncate
 from api.providers.docker import _run_docker, _run_docker_checked
 
 log = logging.getLogger(__name__)
+
+#: POSIX env var name — same guard as _shared._build_env_prefix. Keys are
+#: interpolated unquoted on the K= side of the export, so a non-name key
+#: would escape into shell syntax; ingress (_coerce_env_dict) already
+#: enforces this, the re-check here is defence-in-depth.
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _export_preamble(env: dict[str, str] | None) -> str:
+    """``export K='v' … && `` prefix for USER-facing exec commands.
+
+    Injected INSIDE the already-running shell — never as ``docker exec -e``
+    flags or a ``K=V cmd`` assignment-prefix — so the shell itself and the
+    transport's own plumbing words (sh/setsid) resolve under the sandbox's
+    default environment first. A session env named PATH/LD_PRELOAD then
+    alters lookup only for the user's command (ordinary Unix semantics)
+    instead of 127-ing the exec wrapper itself. ``export`` (not a bare
+    assignment-prefix) so the vars reach EVERY statement of a compound
+    command and its subprocesses, not just the first simple command.
+    """
+    if not env:
+        return ""
+    parts = []
+    for k, v in env.items():
+        if not _ENV_KEY_RE.match(k):
+            raise ValueError(
+                f"invalid env var name {k!r}: must match [A-Za-z_][A-Za-z0-9_]*")
+        parts.append(f"{k}={shlex.quote(v)}")
+    return "export " + " ".join(parts) + " && "
 
 #: in-container wall-clock cap for one tool exec when the caller passes none.
 DEFAULT_EXEC_TIMEOUT_S = 300
@@ -67,12 +99,25 @@ class DockerTransport:
 
     provider = "docker"
 
-    def __init__(self, container_id: str | None = None, workdir: str = "/"):
+    #: ``docker start`` is best-effort and SWALLOWS a start failure on a
+    #: removed/corrupt container, so a post-resume status() re-check is required
+    #: to catch the still-dead case. Resume is NOT authoritative.
+    resume_is_authoritative = False
+
+    def __init__(self, container_id: str | None = None, workdir: str = "/",
+                 env: dict[str, str] | None = None):
         self.container_id = container_id
         # Default working directory for exec and the anchor for relative
         # file paths, so a tool's ``note.txt`` and a later ``cat note.txt``
         # resolve to the same place regardless of which path was used.
         self.workdir = workdir
+        # Session env (e.g. GITHUB_TOKEN, custom secrets) injected into every
+        # exec — per-call, never baked into the container config, so secrets
+        # don't show up in `docker inspect`. The loop's bash/file tools call
+        # exec without env; without this default they'd run secret-less while
+        # /sandbox/exec (which passes env explicitly) got them — an asymmetry
+        # vs the supervisor runtime where the agent's shell sees spawn_env.
+        self.default_env = dict(env or {})
 
     @property
     def ref(self) -> str | None:
@@ -184,15 +229,24 @@ class DockerTransport:
 
     async def exec(self, command: str, *, cwd: str | None = None,
                    env: dict[str, str] | None = None,
-                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S) -> TransportExecResult:
+                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S,
+                   use_default_env: bool = True) -> TransportExecResult:
         """Run one shell command inside the sandbox.
 
         The in-container ``timeout`` is the real enforcement: killing the
         ``docker exec`` client (what an asyncio timeout alone would do)
         leaves the process running inside the container. Exit code 124 from
         the wrapper maps to ``timed_out=True``.
+
+        ``use_default_env=False`` is for the transport's OWN plumbing
+        (read_file's base64, create's readiness mkdir): those commands must
+        run env-immune so a session env named PATH/BASH_ENV can't break the
+        machinery that moves bytes (see _export_preamble).
         """
         self._require_sandbox()
+        merged = {**(self.default_env if use_default_env else {}),
+                  **(env or {})}
+        command = _export_preamble(merged) + command
         t = max(1, int(timeout_s))
         # In-container timeout that reliably reaps the WHOLE command tree.
         # Neither busybox ``timeout`` nor a TERM trap works here: busybox
@@ -212,8 +266,9 @@ class DockerTransport:
         wrapped = inner
         args = ["exec"]
         args += ["-w", cwd or self.workdir]
-        for k, v in (env or {}).items():
-            args += ["-e", f"{k}={v}"]
+        # NO -e flags: env rides the in-command export preamble above. -e
+        # applies before the runtime resolves `sh`, so a PATH-class session
+        # env would 127 every exec at the OCI layer.
         args += [self.container_id, "sh", "-c", wrapped]
         started = asyncio.get_event_loop().time()
         try:
@@ -311,7 +366,9 @@ class DockerTransport:
     async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
         self._require_sandbox()
         q = shlex.quote(self._resolve(path))
-        res = await self.exec(f"base64 < {q}", timeout_s=120)
+        # plumbing: env-immune (a session PATH must not break `base64`)
+        res = await self.exec(f"base64 < {q}", timeout_s=120,
+                              use_default_env=False)
         if res.exit_code != 0:
             raise FileNotFoundError(
                 f"read_file({path}) failed (rc={res.exit_code}): "
@@ -363,9 +420,22 @@ def _dirname(path: str) -> str:
 class DaytonaTransport:
     provider = "daytona"
 
-    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/home/daytona"):
+    #: ``start_daytona`` BLOCKS until the VM is ready and RE-RAISES on a failed
+    #: start (502 retries exhausted / readiness timeout / stopped→error), so a
+    #: clean return already proves the sandbox is running — the post-resume
+    #: status() re-check is a redundant control-plane round-trip. (One soft
+    #: spot: start_daytona returns silently when the daytona CLIENT can't be
+    #: built at all — ImportError/missing key. That config-loss path is
+    #: backstopped by exec()'s stopped→resume→retry self-heal, so skipping the
+    #: re-check can cost one failed exec there but can never wedge.)
+    resume_is_authoritative = True
+
+    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/home/daytona",
+                 env: dict[str, str] | None = None):
         self.sandbox_ref = sandbox_ref
         self.workdir = workdir
+        # Session env injected into every exec (see DockerTransport.default_env).
+        self.default_env = dict(env or {})
 
     @property
     def ref(self) -> str | None:
@@ -399,7 +469,9 @@ class DaytonaTransport:
         # destroy-before-raise; the ref isn't persisted until create returns, so
         # nothing else would tear it down).
         try:
-            await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+            # plumbing: env-immune (a session PATH must not break `mkdir`)
+            await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/",
+                            use_default_env=False)
         except BaseException:
             try:
                 await self.destroy()
@@ -433,15 +505,19 @@ class DaytonaTransport:
 
     async def exec(self, command: str, *, cwd: str | None = None,
                    env: dict[str, str] | None = None,
-                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S) -> TransportExecResult:
+                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S,
+                   use_default_env: bool = True) -> TransportExecResult:
         if not self.sandbox_ref:
             raise RuntimeError("daytona transport has no sandbox")
         from api.providers.daytona import exec_in_sandbox
         wd = cwd or self.workdir
+        merged = {**(self.default_env if use_default_env else {}),
+                  **(env or {})}
         # Daytona's process.exec has no cwd/env params plumbed in the helper;
-        # wrap with cd + env -- so relative paths and per-call env still work.
-        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
-        full = f"cd {shlex.quote(wd)} && {prefix}{command}"
+        # wrap with cd + an export preamble (reaches every statement of a
+        # compound command; an assignment-prefix would bind only the first
+        # simple command and break its lookup under a PATH-class env).
+        full = f"cd {shlex.quote(wd)} && {_export_preamble(merged)}{command}"
 
         async def _run():
             return await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
@@ -489,16 +565,18 @@ class DaytonaTransport:
         b64 = _b64.b64encode(data).decode()
         # base64-over-exec keeps it on the same SDK channel; daytona's exec
         # arg limit is generous, but chunk-free is fine for tool-sized writes.
+        # plumbing: env-immune (use_default_env=False).
         res = await self.exec(
             f"mkdir -p {qdir} && printf %s {shlex.quote(b64)} | base64 -d > {q}",
-            cwd="/")
+            cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise RuntimeError(f"daytona write_file({path}) failed: {res.stderr[:300]}")
 
     async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
         import base64 as _b64
         q = shlex.quote(self._resolve(path))
-        res = await self.exec(f"base64 < {q}", cwd="/")
+        # plumbing: env-immune (use_default_env=False)
+        res = await self.exec(f"base64 < {q}", cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise FileNotFoundError(f"daytona read_file({path}): {res.stderr[:300]}")
         return _b64.b64decode(res.stdout)
@@ -519,9 +597,17 @@ class DaytonaTransport:
 class ModalTransport:
     provider = "modal"
 
-    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/v"):
+    #: Modal can't resume (terminate is destructive); resume() is a no-op, so
+    #: the post-resume status() re-check correctly finds the sandbox missing and
+    #: falls through to recreate-on-volume. Resume is NOT authoritative.
+    resume_is_authoritative = False
+
+    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/v",
+                 env: dict[str, str] | None = None):
         self.sandbox_ref = sandbox_ref
         self.workdir = workdir
+        # Session env injected into every exec (see DockerTransport.default_env).
+        self.default_env = dict(env or {})
 
     @property
     def ref(self) -> str | None:
@@ -553,7 +639,9 @@ class ModalTransport:
         # it before propagating so we don't leak it until modal's timeout
         # ceiling (mirrors DockerTransport.create's destroy-before-raise).
         try:
-            await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/")
+            # plumbing: env-immune (a session PATH must not break `mkdir`)
+            await self.exec(f"mkdir -p {shlex.quote(self.workdir)}", cwd="/",
+                            use_default_env=False)
         except BaseException:
             try:
                 await self.destroy()
@@ -585,14 +673,17 @@ class ModalTransport:
 
     async def exec(self, command: str, *, cwd: str | None = None,
                    env: dict[str, str] | None = None,
-                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S) -> TransportExecResult:
+                   timeout_s: int = DEFAULT_EXEC_TIMEOUT_S,
+                   use_default_env: bool = True) -> TransportExecResult:
         if not self.sandbox_ref:
             raise RuntimeError("modal transport has no sandbox")
         from api.providers._shared import SandboxMissingError
         from api.providers.modal import exec_in_sandbox
         wd = cwd or self.workdir
-        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
-        full = f"cd {shlex.quote(wd)} && {prefix}{command}"
+        merged = {**(self.default_env if use_default_env else {}),
+                  **(env or {})}
+        # export preamble (not assignment-prefix) — see _export_preamble.
+        full = f"cd {shlex.quote(wd)} && {_export_preamble(merged)}{command}"
         try:
             res = await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
         except SandboxMissingError as e:
@@ -609,16 +700,18 @@ class ModalTransport:
         q = shlex.quote(self._resolve(path))
         qdir = shlex.quote(_dirname(self._resolve(path)))
         b64 = _b64.b64encode(data).decode()
+        # plumbing: env-immune (use_default_env=False)
         res = await self.exec(
             f"mkdir -p {qdir} && printf %s {shlex.quote(b64)} | base64 -d > {q}",
-            cwd="/")
+            cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise RuntimeError(f"modal write_file({path}) failed: {res.stderr[:300]}")
 
     async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
         import base64 as _b64
         q = shlex.quote(self._resolve(path))
-        res = await self.exec(f"base64 < {q}", cwd="/")
+        # plumbing: env-immune (use_default_env=False)
+        res = await self.exec(f"base64 < {q}", cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise FileNotFoundError(f"modal read_file({path}): {res.stderr[:300]}")
         return _b64.b64decode(res.stdout)

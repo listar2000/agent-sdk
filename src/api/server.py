@@ -2455,12 +2455,18 @@ async def _destroy_session_compute(session_id: str) -> None:
     # in-flight turn hits SandboxGoneError RECREATES its sandbox (a NEW ref)
     # out-from-under a concurrent DELETE. release() cancels AND awaits that turn
     # (NativeSession.shutdown → _cancel_active awaits the task), so the
-    # post-release state is final — re-reading then catches a just-recreated
-    # ref. Destroying the UNION means neither the original nor the recreated
-    # sandbox leaks as an orphan. (``state.type`` is the Pydantic discriminator
-    # — ``unix_local``/``docker``/``daytona``/``modal``, the ``_PROVIDER_MODS``
-    # key space; native is the exception: ``type=="native"`` but its compute
-    # lives on ``state.provider``, so route the destroy through that.)
+    # post-release state is final FOR THE TURN PATH — re-reading then catches a
+    # just-recreated ref. Destroying the UNION means neither the original nor
+    # the recreated sandbox leaks as an orphan. NOTE the await-guarantee covers
+    # only execute_prompt's _active_task: a concurrent /sandbox/exec has no
+    # task release() can await, so its SandboxGone-retry recreate can still
+    # land after the second read — that residual window is reconcile-bounded
+    # (boot reconcile / orphan monitor reap by the _TAG_KEY label), same class
+    # as PR #161 finding #3's residue. (``state.type`` is the Pydantic
+    # discriminator — ``unix_local``/``docker``/``daytona``/``modal``, the
+    # ``_PROVIDER_MODS`` key space; native is the exception: ``type=="native"``
+    # but its compute lives on ``state.provider``, so route the destroy
+    # through that.)
     refs: set[str] = set()
     provider_type: str | None = None
 
