@@ -218,13 +218,23 @@ class DockerTransport:
         # running". Resume the SAME container and retry once — keeps the
         # session warm (no cold-recovery / checkpoint reload) and pays
         # nothing on the happy path. A genuinely-removed container can't
-        # resume; that error propagates to the normal recovery path.
-        if rc != 0 and _container_not_running(err):
+        # resume; that falls to the recreate gate below.
+        #
+        # `err` is the SHARED docker-exec stderr — it carries BOTH the docker
+        # daemon's own error AND the inner command's forwarded stderr. So a
+        # marker match alone is NOT trustworthy: a healthy-container command
+        # that prints "is not running" / "no such container" and exits
+        # non-zero would otherwise spuriously resume (re-running a possibly
+        # non-idempotent command) or recreate. Confirm with one inspect —
+        # status() is a pure daemon query, immune to that stderr contamination.
+        # The short-circuit `and` keeps the inspect OFF the happy path: it runs
+        # only when rc!=0 AND the cheap marker pre-filter already matched.
+        if rc != 0 and _container_not_running(err) and await self.status() == "stopped":
             await self.resume()
             rc, out, err = await _run_docker(*args, timeout=t + _BACKSTOP_SLACK_S)
         # The container was REMOVED (pruned/OOM-reaped) out from under the live
         # session — resume can't bring it back. Signal the session to recreate.
-        if rc != 0 and _container_removed(err):
+        if rc != 0 and _container_removed(err) and await self.status() == "missing":
             raise SandboxGoneError(f"docker container {self.container_id[:12]} removed")
         elapsed = asyncio.get_event_loop().time() - started
         stdout, _ = _truncate(out, _MAX_OUTPUT_BYTES)
@@ -258,10 +268,13 @@ class DockerTransport:
             return proc.returncode or 0, e or b""
 
         rc, err = await _attempt()
-        if rc != 0 and _container_not_running(err):
+        # Same shared-stderr caveat as exec(): a base64 payload or path that
+        # contains the sentinel must not spoof a stopped/removed verdict, so
+        # confirm with an inspect (status()) before resuming/recreating.
+        if rc != 0 and _container_not_running(err) and await self.status() == "stopped":
             await self.resume()
             rc, err = await _attempt()
-        if rc != 0 and _container_removed(err):
+        if rc != 0 and _container_removed(err) and await self.status() == "missing":
             raise SandboxGoneError(f"docker container {self.container_id[:12]} removed")
         if rc != 0:
             raise RuntimeError(

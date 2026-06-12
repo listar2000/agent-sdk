@@ -349,3 +349,39 @@ async def test_sandbox_exec_recovers_when_container_removed():
         for ref in {s.state.sandbox_ref, extra}:
             if ref:
                 subprocess.run(["docker", "rm", "-f", ref], capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_exec_marker_in_command_stderr_does_not_false_trip_recovery():
+    """A HEALTHY container's own command may legitimately print "no such
+    container" / "is not running" to stderr (e.g. an agent running
+    `docker logs X` against a missing inner container, or grepping a log).
+    docker exec forwards that inner stderr into the SAME buffer the recovery
+    heuristics scan, so a bare substring match would misfire — spuriously
+    recreating the sandbox, or (worse) RE-RUNNING a non-idempotent command.
+    An authoritative inspect (status()) gates both verdicts, so the sentinel
+    is treated as ordinary command output and the SAME live container stays."""
+    s = _session()
+    try:
+        t = await s._ensure_sandbox()
+        cid = t.container_id
+        # CASE 1: the "removed" sentinel in the command's own stderr must NOT
+        # be read as a gone sandbox — no SandboxGoneError, no recreate.
+        r = await t.exec("echo 'Error: No such container: deadbeef' >&2; exit 1")
+        assert r.exit_code == 1
+        assert "no such container" in r.stderr.lower()
+        assert t.container_id == cid, "must NOT recreate — container is alive"
+        assert _container_state(cid) == "running"
+        # CASE 2: the "stopped" sentinel + a side effect proves the command is
+        # NOT silently re-run (no spurious resume+retry double-invocation).
+        r = await t.exec(
+            "echo one >> hits.txt; echo 'Unit x is not running' >&2; exit 1")
+        assert r.exit_code == 1
+        hits = (await t.read_file("hits.txt")).decode()
+        assert hits.count("one") == 1, f"command ran twice (double-invoked): {hits!r}"
+        assert t.container_id == cid
+        assert _container_state(cid) == "running"
+    finally:
+        if s.state.sandbox_ref:
+            subprocess.run(["docker", "rm", "-f", s.state.sandbox_ref],
+                           capture_output=True)
