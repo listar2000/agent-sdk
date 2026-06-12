@@ -173,11 +173,10 @@ async def run_turn(
             if tool is None:
                 result = f"error: unknown tool {c.name!r}"
             else:
-                try:
-                    result = await tool.invoke(transport, args)
-                except Exception as e:  # tool failure is data, not a turn error
-                    log.exception("native tool %s failed", c.name)
-                    result = f"error: {type(e).__name__}: {e}"
+                # a recreate (on SandboxGoneError) may swap the transport;
+                # reuse the returned one for the rest of this turn.
+                result, transport = await _invoke_tool(
+                    tool, transport, args, c.name, ensure_sandbox)
             await emit({"type": "tool_result", "tool_call_id": c.id,
                         "tool_name": c.name, "result": result})
             messages.append({"role": "tool", "tool_call_id": c.id,
@@ -189,6 +188,31 @@ async def run_turn(
         await emit({"type": "usage", "usage": total_usage})
     await emit({"type": "done", "stop_reason": "max_turns"})
     return TurnResult(messages, "max_turns", total_usage)
+
+
+async def _invoke_tool(tool, transport, args, name, ensure_sandbox):
+    """Run one tool. A tool failure is data (returned as an ``error:`` string),
+    NOT a turn error. The one exception is ``SandboxGoneError`` — the sandbox
+    died out from under the live session; recreate it (``refresh=True``) and
+    retry the tool ONCE so a routine modal hard-timeout (or docker prune /
+    daytona hard-kill) doesn't permanently wedge the session. Returns
+    ``(result_str, transport)`` — the transport may be a fresh one."""
+    from .transport import SandboxGoneError
+    try:
+        return await tool.invoke(transport, args), transport
+    except SandboxGoneError:
+        if ensure_sandbox is None:
+            return "error: sandbox gone and no recreate path available", transport
+        log.warning("native sandbox gone mid-turn — recreating and retrying %s", name)
+        transport = await ensure_sandbox(refresh=True)
+        try:
+            return await tool.invoke(transport, args), transport
+        except Exception as e:
+            log.exception("native tool %s failed after sandbox recreate", name)
+            return f"error: {type(e).__name__}: {e}", transport
+    except Exception as e:  # tool failure is data, not a turn error
+        log.exception("native tool %s failed", name)
+        return f"error: {type(e).__name__}: {e}", transport
 
 
 def _parse_args(raw: str) -> dict:

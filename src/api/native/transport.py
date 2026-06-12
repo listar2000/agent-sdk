@@ -53,6 +53,15 @@ class TransportExecResult:
     timed_out: bool
 
 
+class SandboxGoneError(Exception):
+    """Raised by a transport op when the sandbox has been REMOVED/TERMINATED
+    out from under a live session (docker container pruned, modal sandbox hit
+    its hard timeout ceiling, daytona VM hard-killed) — distinct from
+    'stopped', which the transport self-heals via resume. The session catches
+    this, drops the dead transport, and re-runs _ensure_sandbox to recreate a
+    fresh sandbox (recovering the workspace on modal/daytona volumes)."""
+
+
 class DockerTransport:
     """One docker container per session, ``sleep infinity`` as PID-1."""
 
@@ -213,6 +222,10 @@ class DockerTransport:
         if rc != 0 and _container_not_running(err):
             await self.resume()
             rc, out, err = await _run_docker(*args, timeout=t + _BACKSTOP_SLACK_S)
+        # The container was REMOVED (pruned/OOM-reaped) out from under the live
+        # session — resume can't bring it back. Signal the session to recreate.
+        if rc != 0 and _container_removed(err):
+            raise SandboxGoneError(f"docker container {self.container_id[:12]} removed")
         elapsed = asyncio.get_event_loop().time() - started
         stdout, _ = _truncate(out, _MAX_OUTPUT_BYTES)
         stderr, _ = _truncate(err, _MAX_OUTPUT_BYTES)
@@ -248,6 +261,8 @@ class DockerTransport:
         if rc != 0 and _container_not_running(err):
             await self.resume()
             rc, err = await _attempt()
+        if rc != 0 and _container_removed(err):
+            raise SandboxGoneError(f"docker container {self.container_id[:12]} removed")
         if rc != 0:
             raise RuntimeError(
                 f"write_file({path}) failed (rc={rc}): "
@@ -280,6 +295,13 @@ def _container_not_running(err: bytes) -> bool:
     (recoverable via resume) — not removed (which says 'no such container')."""
     msg = (err or b"").decode(errors="replace").lower()
     return "is not running" in msg or "is not paused" in msg
+
+
+def _container_removed(err: bytes) -> bool:
+    """True if a docker error means the container is GONE (removed/pruned) —
+    resume can't recover it; the session must recreate a fresh sandbox."""
+    msg = (err or b"").decode(errors="replace").lower()
+    return "no such container" in msg
 
 
 def _dirname(path: str) -> str:
@@ -375,12 +397,17 @@ class DaytonaTransport:
         # Self-heal an externally-paused sandbox (the reaper, an ops pause):
         # exec against a stopped daytona VM raises; resume the SAME VM and
         # retry once — keeps the session warm, mirrors DockerTransport.exec.
+        # A MISSING VM (hard-killed) can't resume → signal the session to
+        # recreate (workspace survives on the daytona volume).
         try:
             res = await _run()
         except Exception:
-            if await self.status() == "stopped":
+            st = await self.status()
+            if st == "stopped":
                 await self.resume()
                 res = await _run()
+            elif st == "missing":
+                raise SandboxGoneError(f"daytona sandbox {self.sandbox_ref} gone")
             else:
                 raise
         return TransportExecResult(res.stdout or "", res.stderr or "",
@@ -493,11 +520,18 @@ class ModalTransport:
                    timeout_s: int = DEFAULT_EXEC_TIMEOUT_S) -> TransportExecResult:
         if not self.sandbox_ref:
             raise RuntimeError("modal transport has no sandbox")
+        from api.providers._shared import SandboxMissingError
         from api.providers.modal import exec_in_sandbox
         wd = cwd or self.workdir
         prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
         full = f"cd {shlex.quote(wd)} && {prefix}{command}"
-        res = await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
+        try:
+            res = await exec_in_sandbox(self._inst(), full, timeout=timeout_s)
+        except SandboxMissingError as e:
+            # Sandbox terminated out from under us (routine: modal's hard
+            # timeout ceiling reaps even active sandboxes). Signal the session
+            # to recreate on the same Volume — the workspace survives there.
+            raise SandboxGoneError(f"modal sandbox {self.sandbox_ref} gone") from e
         return TransportExecResult(res.stdout or "", res.stderr or "",
                                    res.exit_code if res.exit_code is not None else -1,
                                    bool(getattr(res, "timed_out", False)))

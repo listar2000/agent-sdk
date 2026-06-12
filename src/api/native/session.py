@@ -253,14 +253,22 @@ class NativeSession(BaseSandboxSession):
 
     # ── sandbox: lazy provisioning + server exec/file routing ───────────────
 
-    async def _ensure_sandbox(self):
+    async def _ensure_sandbox(self, *, refresh: bool = False):
         """Provision the sandbox on first need (tool call or /sandbox/exec).
 
         Under a lock so concurrent tool calls in one turn provision once.
         Persists ``state.sandbox_ref`` immediately so a crash can't strand a
-        container the boot reconciler would later orphan. P0 ships docker;
-        daytona/modal transports land in P1.
+        container the boot reconciler would later orphan.
+
+        ``refresh=True`` drops the cached transport first, so a sandbox that
+        died out from under a LIVE session (``SandboxGoneError`` — docker
+        container pruned, modal hard-timeout, daytona hard-kill) re-runs the
+        status→recreate flow instead of being wedged on the dead transport
+        forever. The recreate recovers the workspace on modal/daytona volumes;
+        docker cold-creates fresh (its writable layer is gone with the container).
         """
+        if refresh:
+            self._transport = None
         if self._transport is not None:
             return self._transport
         async with self._provision_lock:

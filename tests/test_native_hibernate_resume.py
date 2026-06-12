@@ -293,3 +293,36 @@ async def test_reconcile_reaps_native_docker_orphan(monkeypatch):
         for t in (live, orphan):
             with contextlib.suppress(Exception):
                 await t.destroy()
+
+
+@pytest.mark.asyncio
+async def test_removed_container_under_live_session_recreates():
+    """A live native session whose container is REMOVED out-from-under it
+    (docker prune / OOM-reap / — on modal, the routine hard-timeout ceiling)
+    must NOT wedge: exec raises SandboxGoneError instead of failing silently,
+    and _ensure_sandbox(refresh=True) drops the dead transport and provisions a
+    fresh one. (Docker's writable layer is gone with the container — cold
+    recovery; volume-backed workspace recovery is a modal/daytona property.)"""
+    from api.native.transport import SandboxGoneError
+    s = _session()
+    extra = None
+    try:
+        t = await s._ensure_sandbox()
+        cid = t.container_id
+        assert _container_state(cid) == "running"
+        # remove the container out from under the live, cached transport
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=30)
+        assert _container_state(cid) == ""
+        # the dead transport SIGNALS gone (not a silent failed result)
+        with pytest.raises(SandboxGoneError):
+            await t.exec("true")
+        # session recovers: refresh recreates a fresh, working container
+        t2 = await s._ensure_sandbox(refresh=True)
+        extra = t2.container_id
+        assert t2.container_id and t2.container_id != cid
+        r = await t2.exec("echo recovered")
+        assert r.exit_code == 0 and "recovered" in r.stdout
+    finally:
+        for ref in {s.state.sandbox_ref, extra}:
+            if ref:
+                subprocess.run(["docker", "rm", "-f", ref], capture_output=True)

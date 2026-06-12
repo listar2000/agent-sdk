@@ -333,3 +333,55 @@ async def test_dispatch_modal_recreate_on_missing(monkeypatch):
     # missing → destroy stale → create fresh on same volume+subpath
     assert events == ["status", "destroy", ("create", "vol-9", "agents/a9")]
     assert t.ref == "modal-new" and s.state.sandbox_ref == "modal-new"
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_recreates_on_sandbox_gone():
+    """The loop's _invoke_tool must catch SandboxGoneError, recreate the
+    sandbox (ensure_sandbox(refresh=True)) and retry the tool once — so a
+    sandbox dying under a live session self-heals instead of wedging."""
+    from api.native.loop import _invoke_tool
+    from api.native.transport import SandboxGoneError
+
+    calls = {"n": 0}
+
+    class _Tool:
+        async def invoke(self, transport, args):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise SandboxGoneError("gone")
+            return f"ran on {transport}"
+
+    refreshed = {"n": 0}
+
+    async def _ensure(*, refresh=False):
+        if refresh:
+            refreshed["n"] += 1
+        return "fresh-transport"
+
+    result, transport = await _invoke_tool(_Tool(), "dead-transport", {}, "bash", _ensure)
+    assert result == "ran on fresh-transport"
+    assert transport == "fresh-transport"
+    assert refreshed["n"] == 1   # recreated exactly once
+    assert calls["n"] == 2       # retried exactly once
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_normal_failure_is_data():
+    """A non-gone tool failure is returned as an error string (turn continues),
+    and does NOT trigger a recreate."""
+    from api.native.loop import _invoke_tool
+
+    class _Tool:
+        async def invoke(self, transport, args):
+            raise ValueError("boom")
+
+    refreshed = {"n": 0}
+
+    async def _ensure(*, refresh=False):
+        refreshed["n"] += 1
+        return "x"
+
+    result, transport = await _invoke_tool(_Tool(), "t", {}, "bash", _ensure)
+    assert "error: ValueError: boom" in result
+    assert transport == "t" and refreshed["n"] == 0
