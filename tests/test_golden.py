@@ -883,7 +883,7 @@ async def test_corrupt_agent_memory_recovers_not_loops(provider, agent_type):
         print(f"[test:{provider}/{agent_type}] recovered cleanly from corrupt overlay")
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param_with_native
 @pytest.mark.asyncio
 async def test_delete_session_destroys_sandbox(provider, agent_type):
@@ -970,6 +970,18 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
                 last_state = meta[0]["State"]["Status"] if meta else "?"
             except (json.JSONDecodeError, KeyError, IndexError):
                 last_state = "?"
+
+        elif provider == "modal":
+            # Modal "delete" = terminate (no pause). The sandbox record goes
+            # away → get_sandbox_status reports 'missing'. terminate is async,
+            # so poll until the record is gone (the freed signal). 'running'
+            # means it hasn't propagated yet; 'error' is transient.
+            import sys as _sys
+            _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+            from api.providers.modal import get_sandbox_status
+            last_state = await get_sandbox_status(ref)
+            if last_state == "missing":
+                return
 
         elif provider == "unix_local":
             # Local "delete" = supervisor process gone AND the sandbox
@@ -3021,7 +3033,7 @@ async def _native_compute_state(provider: str, ref: str) -> str:
     raise AssertionError(f"_native_compute_state: provider {provider!r} unsupported")
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param_with_native
 @pytest.mark.asyncio
 async def test_tool_effects_matrix(provider, agent_type):
