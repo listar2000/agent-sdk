@@ -50,7 +50,7 @@ def _text_block(rpc_id: str, text: str) -> str:
     payload = {
         "method": "session/update",
         "params": {"update": {
-            "sessionUpdate": "agent_message_chunk",
+            "sessionUpdate": "agent_message_delta",  # legacy shape — compat pinned
             "content": {"type": "text", "text": text},
         }},
     }
