@@ -7,6 +7,7 @@ Live docker; skips when unavailable.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -234,3 +235,57 @@ async def test_exec_self_heals_externally_stopped_container():
         if s.state.sandbox_ref:
             subprocess.run(["docker", "rm", "-f", s.state.sandbox_ref],
                            capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reaps_native_docker_orphan(monkeypatch):
+    """Boot reconcile MUST reclaim a crash-orphaned native docker container
+    and leave a live one untouched.
+
+    Native containers carry the ``native_session`` label, NOT
+    ``agent-sdk.sandbox-id``; before the fix, reconcile_on_startup filtered
+    only the latter and so could never enumerate (let alone reap) a native
+    orphan — it leaked across every server restart. Mirrors the
+    modal/daytona native tag-for-reconcile contract, end-to-end against a
+    real container.
+    """
+    from api import db as dbmod
+    from api.providers import docker as dockermod
+
+    live = DockerTransport(workdir="/work")
+    orphan = DockerTransport(workdir="/work")
+    await live.create(image=IMAGE, labels={"agent_sdk_origin": "test",
+                                           "native_session": "sess-recon-live"})
+    await orphan.create(image=IMAGE, labels={"agent_sdk_origin": "test",
+                                             "native_session": "sess-recon-orphan"})
+    try:
+        # reconcile is GLOBAL: protect every OTHER agent-sdk container (parallel
+        # -n auto workers, the live container) by treating them all as live —
+        # live_refs = every present agent-sdk container EXCEPT our orphan.
+        def _present_full_ids() -> set[str]:
+            ids: set[str] = set()
+            for lk in ("agent-sdk.sandbox-id", "native_session"):
+                r = subprocess.run(
+                    ["docker", "ps", "-aq", "--no-trunc", "--filter", f"label={lk}"],
+                    capture_output=True, text=True)
+                ids |= {x for x in r.stdout.split() if x}
+            return ids
+        protected = _present_full_ids() - {orphan.container_id}
+
+        async def _live_refs():
+            return protected
+        monkeypatch.setattr(dbmod, "live_sandbox_refs", _live_refs)
+
+        await dockermod.reconcile_on_startup()
+
+        assert _container_state(orphan.container_id) == "", (
+            "reconcile did NOT reap the orphaned native docker container — "
+            "native_session-labeled containers must be enumerated by the boot "
+            "reconciler (the modal/daytona native parity)")
+        assert _container_state(live.container_id) == "running", (
+            "reconcile wrongly reaped a LIVE native container (full-id match "
+            "against live_refs regressed)")
+    finally:
+        for t in (live, orphan):
+            with contextlib.suppress(Exception):
+                await t.destroy()
