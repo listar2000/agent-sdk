@@ -81,6 +81,10 @@ _ACP_NPM_SPECS = {
     # keep the baked agent image small (the supervisor package.json mirrors
     # this in _disabledDependencies). Uncomment to re-enable the agent_type.
     # "codex": "@zed-industries/codex-acp@^0.11.1",
+    # NOTE: re-enabling codex requires restoring the codex-only
+    # `authenticate({methodId: "openai-api-key"})` retry in
+    # AcpClient.initialize — deleted as dead in 57a3160^ (audit: safe while
+    # codex is disabled; mandatory for codex bootstrap).
     # "gemini": "@google/gemini-cli@^0.37.2",
     # "cline": "cline-acp@^0.1.6",
     # "deepagents": "deepagents-acp@^0.1.8",
