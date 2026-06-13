@@ -132,26 +132,30 @@ async function load() {
   if (!ops.length) {
     $("ops").innerHTML = '<tr><td colspan="7" class="muted">no operations in window</td></tr>';
   } else {
-    // Group rows by provider; within each provider sort by fail rate then p95.
-    const byProv = {};
-    for (const o of ops) (byProv[o.provider || "—"] = byProv[o.provider || "—"] || []).push(o);
-    const provs = Object.keys(byProv).sort((a, b) =>
-      byProv[b].reduce((s, o) => s + o.count, 0) - byProv[a].reduce((s, o) => s + o.count, 0));
-    const opRow = (o) => {
+    // Group rows by operation so providers line up side-by-side under each op
+    // (compare daytona vs modal vs docker for the same operation). Within an
+    // op, sort by p95 desc (slowest provider first), then fail rate.
+    const byOp = {};
+    for (const o of ops) (byOp[o.operation] = byOp[o.operation] || []).push(o);
+    // Operation groups ordered by total calls desc.
+    const opNames = Object.keys(byOp).sort((a, b) =>
+      byOp[b].reduce((s, o) => s + o.count, 0) - byOp[a].reduce((s, o) => s + o.count, 0));
+    const row = (o) => {
       const fr = (o.fail_rate * 100).toFixed(1) + "%";
-      return `<tr><td style="padding-left:20px">${o.operation}</td><td>${o.provider ?? "—"}</td><td>${o.count}</td>` +
+      return `<tr><td style="padding-left:20px" class="muted">${o.operation}</td>` +
+        `<td><b>${o.provider ?? "—"}</b></td><td>${o.count}</td>` +
         `<td>${o.fails ? '<b style="color:#E01E5A">' + o.fails + '</b>' : 0}</td>` +
         `<td>${o.fail_rate > 0 ? '<b style="color:#E01E5A">' + fr + '</b>' : fr}</td>` +
         `<td>${o.p50_ms ?? "—"}</td><td>${o.p95_ms ?? "—"}</td></tr>`;
     };
-    $("ops").innerHTML = provs.map(p => {
-      const rows = byProv[p].slice().sort((a, b) => (b.fail_rate - a.fail_rate) || ((b.p95_ms || 0) - (a.p95_ms || 0)));
+    $("ops").innerHTML = opNames.map(op => {
+      const rows = byOp[op].slice().sort((a, b) => ((b.p95_ms || 0) - (a.p95_ms || 0)) || (b.fail_rate - a.fail_rate));
       const calls = rows.reduce((s, o) => s + o.count, 0);
       const fails = rows.reduce((s, o) => s + o.fails, 0);
       const hdr = `<tr><td colspan="7" style="background:#F2F6FB;font-weight:700;color:#1264A3;border-top:2px solid #D8DEE6">` +
-        `${p} <span class="muted" style="font-weight:400">· ${rows.length} ops · ${calls} calls` +
+        `${op} <span class="muted" style="font-weight:400">· ${rows.length} provider${rows.length > 1 ? 's' : ''} · ${calls} calls` +
         `${fails ? ' · <b style="color:#E01E5A">' + fails + ' fails</b>' : ''}</span></td></tr>`;
-      return hdr + rows.map(opRow).join("");
+      return hdr + rows.map(row).join("");
     }).join("");
   }
 
