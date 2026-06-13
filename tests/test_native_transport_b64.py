@@ -31,43 +31,33 @@ async def test_b64_roundtrip_small_and_large():
         assert await tr._b64decode(enc.decode()) == data
 
 
-async def _ticks_during(coro):
-    """Run ``coro`` while a cooperative ticker spins; return (result, ticks).
-    A high tick count means the event loop stayed free during ``coro``."""
-    ticks = [0]
-    stop = [False]
-
-    async def ticker():
-        while not stop[0]:
-            ticks[0] += 1
-            await asyncio.sleep(0)
-
-    t = asyncio.create_task(ticker())
-    await asyncio.sleep(0)
-    start = ticks[0]
-    result = await coro
-    during = ticks[0] - start
-    stop[0] = True
-    await t
-    return result, during
-
-
 @pytest.mark.asyncio
-async def test_large_b64_encode_keeps_loop_free():
-    """A >threshold encode runs off-thread, so a concurrent coroutine keeps
-    making progress (loop not blocked). Inline (sub-threshold reference) the
-    loop is frozen for the whole codec — proving the test actually discriminates."""
-    big = b"x" * (8 * 1024 * 1024)        # 8MB > 4MB threshold -> to_thread
-    enc, during_threaded = await _ticks_during(tr._b64encode(big))
-    assert enc == base64.b64encode(big)
-    assert during_threaded > 5, (
-        f"loop blocked during large off-thread b64 ({during_threaded} ticks)")
+async def test_codec_offloads_to_thread_only_when_large(monkeypatch):
+    """The size gate is what keeps a multi-MB transfer off the event loop:
+    payloads at/above the threshold dispatch to a worker thread, smaller ones
+    stay inline (the to_thread hop would cost more than the codec). Asserting
+    the OFFLOAD DECISION directly is robust — a wall-clock "did the loop stay
+    free" check is inherently flaky for base64, which holds the GIL and so only
+    yields the loop partial windows (benchmark/micro/bench_b64.py quantifies the
+    real, partial isolation; the GIL means it is never full isolation)."""
+    offloaded: list[str] = []
+    real_to_thread = asyncio.to_thread
 
-    # Reference: force the SAME work inline (no thread) and confirm the loop is
-    # frozen through it — i.e. removing the offload would regress to ~0 ticks.
-    async def _inline():
-        return base64.b64encode(big)
-    _, during_inline = await _ticks_during(_inline())
-    assert during_inline <= 1, (
-        f"inline b64 should freeze the loop, saw {during_inline} ticks")
-    assert during_threaded > during_inline * 5
+    async def _spy(fn, *a, **k):
+        offloaded.append(getattr(fn, "__name__", repr(fn)))
+        return await real_to_thread(fn, *a, **k)
+
+    monkeypatch.setattr(asyncio, "to_thread", _spy)
+
+    small = b"x" * 4096
+    big = b"x" * (tr._B64_THREAD_THRESHOLD + 1)
+
+    # small: inline, no thread hop, still correct
+    assert await tr._b64encode(small) == base64.b64encode(small)
+    assert await tr._b64decode(base64.b64encode(small)) == small
+    assert offloaded == [], "small payload must not pay the to_thread dispatch"
+
+    # large: offloaded to a worker thread, still correct
+    assert await tr._b64encode(big) == base64.b64encode(big)
+    assert await tr._b64decode(base64.b64encode(big)) == big
+    assert offloaded == ["b64encode", "b64decode"], offloaded
