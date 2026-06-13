@@ -54,7 +54,16 @@ class NativeAgentSpec:
 class _ToolCallAccum:
     id: str = ""
     name: str = ""
-    args: str = ""
+    # Streamed argument fragments, joined once at read time. Accumulating in a
+    # list keeps a tool call's arguments O(total) even when a large argument
+    # (e.g. a write_file ``content``) arrives across many deltas; the old
+    # ``args += fragment`` rebuilt the whole string every delta — O(total²),
+    # the same quadratic class as the dangling-heal full scan.
+    arg_parts: list[str] = field(default_factory=list)
+
+    @property
+    def args(self) -> str:
+        return "".join(self.arg_parts)
 
 
 @dataclass
@@ -195,7 +204,7 @@ async def run_turn(
                     if getattr(fn, "name", None):
                         acc.name = fn.name
                     if getattr(fn, "arguments", None):
-                        acc.args += fn.arguments
+                        acc.arg_parts.append(fn.arguments)
 
         # ── decide: tools or done ───────────────────────────────────────────
         assistant_msg: dict[str, Any] = {

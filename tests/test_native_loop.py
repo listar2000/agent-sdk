@@ -168,6 +168,47 @@ async def test_tool_call_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_large_streamed_tool_arg_reassembles_and_is_subquadratic():
+    """A model streaming a big tool argument (e.g. write_file content) across
+    many small deltas must reassemble exactly — and accumulate in O(total), not
+    the O(total²) that repeated string ``+=`` cost. Both the correctness and the
+    scaling are pinned here: the arg fragments are split fine enough that an
+    O(n²) accumulation would blow the time budget."""
+    import json as _json
+    import time as _time
+
+    # ~100k tiny fragments of a 2.5MB argument — the worst case for repeated
+    # attribute ``+=`` (CPython's in-place str-concat optimization does NOT
+    # apply when the accumulator is held by an attribute, so it stays O(n²)).
+    big = "x" * 2_500_000
+    payload = _json.dumps({"path": "/big.txt", "content": big})
+    frag = 25
+    fragments = [payload[i:i + frag] for i in range(0, len(payload), frag)]
+    chunks = [_Chunk(_Delta(tool_calls=[_TCDelta(0, id="c1", name="write_file")]))]
+    chunks += [_Chunk(_Delta(tool_calls=[_TCDelta(0, arguments=f)]))
+               for f in fragments]
+
+    spec = NativeAgentSpec()
+    tools = build_toolset(["write_file"])
+    transport = _FakeTransport()
+    msgs = [{"role": "user", "content": "write it"}]
+
+    t0 = _time.perf_counter()
+    events, result = await _collect(spec, msgs, tools, transport, [
+        chunks, [_Chunk(_Delta(content="done"))],
+    ])
+    elapsed = _time.perf_counter() - t0
+
+    # exact reassembly: the tool saw the full content and wrote all the bytes
+    assert transport.files["/big.txt"] == big.encode()
+    # the persisted assistant tool_call carries the full argument string
+    assert result.messages[1]["tool_calls"][0]["function"]["arguments"] == payload
+    # O(total) accumulation drives this in ~60ms; the old attribute ``+=`` is
+    # O(total²) (~3s here) and misses the budget by a wide, non-flaky margin.
+    assert elapsed < 2.0, f"tool-arg accumulation too slow ({elapsed:.2f}s)"
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_returns_error_not_raise():
     spec = NativeAgentSpec()
     tools = build_toolset(["bash"])
