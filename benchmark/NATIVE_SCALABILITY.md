@@ -152,3 +152,15 @@ green and non-flaky under `-n auto`.
   [`docs/native_checkpoint_writevolume_design.md`](../docs/native_checkpoint_writevolume_design.md).**
 * **Context compaction** — the only lever left for per-session RAM and unbounded
   context growth, but it changes what the model sees (a product decision).
+* **Concurrent model-call connection pool (identified, NOT tuned).** Every
+  in-flight native turn awaits `litellm.acompletion`; on one replica those calls
+  share litellm's HTTP client. `_litellm_completion` configures litellm's
+  behavior (telemetry / drop_params / retries) but not its httpx **pool limits**,
+  so beyond ~the default max-connections the calls queue — a ceiling on
+  *concurrent* (not per-turn) throughput at high session density. Deliberately
+  **not** tuned here: the value is litellm-version-internal, the model provider's
+  own rate limits are the likelier real bottleneck at that scale, and a pool size
+  is meaningless without a load test against a live provider (the in-process
+  benches use a fake completion, so they can't see it). Right next step if
+  concurrent density becomes the limit: load-test, then size litellm's async
+  client pool — don't guess.
