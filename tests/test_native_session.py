@@ -582,3 +582,60 @@ async def test_repeated_cancel_mid_tool_never_wedges_concurrent():
     done = await asyncio.gather(*(run_session(f"sess-wedge-{i}")
                                   for i in range(M)))
     assert len(done) == M
+
+
+@pytest.mark.asyncio
+async def test_nway_concurrent_recovery_creates_exactly_one_no_orphans():
+    """Scale the adopt-not-duplicate invariant: when a sandbox dies under load,
+    MANY callers (every tool call in a turn + racing /sandbox/exec) can hit
+    SandboxGoneError on the same dead transport at once. The _provision_lock +
+    replace-check must still create EXACTLY ONE replacement per session — a
+    second creation is an orphaned sandbox, i.e. a paid idle VM on daytona/modal
+    leaking until the reaper reclaims it. Stresses N racing recoveries across M
+    sessions; asserts one creation each and no deadlock."""
+    N, M = 24, 6   # racing recoveries per session, concurrent sessions
+
+    async def one_session(sid):
+        s = NativeSession(session_id=sid,
+                          state=NativeSandboxState(provider="docker"))
+        s._started = True
+
+        async def _noop_persist():
+            return None
+        s._persist_state = _noop_persist  # type: ignore[method-assign]
+
+        created = []
+
+        class _T:
+            def __init__(self, tag):
+                self.ref = f"{sid}-cid-{tag}"
+                self.container_id = self.ref
+
+            async def destroy(self):
+                pass
+
+        async def _factory():
+            # a tiny await so concurrent callers genuinely interleave inside the
+            # lock-acquire window rather than each running to completion first
+            await asyncio.sleep(0)
+            t = _T(len(created))
+            created.append(t)
+            return t
+
+        s._transport_factory = _factory
+        dead = _T("dead")
+        s._transport = dead
+
+        results = await asyncio.gather(
+            *(s._ensure_sandbox(replace=dead) for _ in range(N)))
+        # exactly one sandbox created, and every caller got that same one
+        assert len(created) == 1, (
+            sid, f"orphan leak: {[c.ref for c in created]}")
+        assert all(r is created[0] for r in results), (
+            sid, "a caller got a non-adopted transport")
+        assert s._transport is created[0]
+        return sid
+
+    out = await asyncio.gather(*(one_session(f"sess-orphan-{i}")
+                                 for i in range(M)))
+    assert len(out) == M
