@@ -18,6 +18,7 @@ Event vocabulary emitted (canonical taxonomy, == parse_acp_event output):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -278,18 +279,38 @@ async def run_turn(
         if transport is None and ensure_sandbox is not None:
             transport = await ensure_sandbox()
 
-        for c in ordered:
-            args = _parse_args(c.args)
+        # Parse args + emit every tool-call event up front (in order) so a
+        # parallel-tool-calling round shows all calls pending before any result.
+        calls = [(c, _parse_args(c.args)) for c in ordered]
+        for c, args in calls:
             await emit({"type": "tool", "tool_call_id": c.id,
                         "tool_name": c.name, "args": args})
+
+        async def _exec_one(c, args):
             tool = tools.get(c.name)
             if tool is None:
-                result = f"error: unknown tool {c.name!r}"
-            else:
-                # a recreate (on SandboxGoneError) may swap the transport;
-                # reuse the returned one for the rest of this turn.
-                result, transport = await _invoke_tool(
-                    tool, transport, args, c.name, ensure_sandbox)
+                return f"error: unknown tool {c.name!r}", None
+            # a recreate (on SandboxGoneError) may swap the transport; concurrent
+            # recoveries adopt-not-duplicate (one fresh sandbox), so all parallel
+            # tools converge on the same replacement.
+            return await _invoke_tool(tool, transport, args, c.name, ensure_sandbox)
+
+        # Independent tool calls the model issued in ONE round run CONCURRENTLY,
+        # so the round finishes in max(individual) instead of the sum. A single
+        # call degenerates to a gather-of-one (identical behavior). A tool
+        # failure is data (an "error:" string); only an interrupt (CancelledError)
+        # propagates out — gather then cancels the siblings and the _drive handler
+        # heals the dangling tool_calls.
+        outcomes = await asyncio.gather(*(_exec_one(c, args) for c, args in calls))
+
+        # Adopt a transport a tool recreated mid-round for the next round.
+        for _result, t in outcomes:
+            if t is not None and t is not transport:
+                transport = t
+
+        # Emit results + append to the transcript IN tool_call ORDER (the
+        # provider keys each tool result to its call id).
+        for (c, _args), (result, _t) in zip(calls, outcomes):
             await emit({"type": "tool_result", "tool_call_id": c.id,
                         "tool_name": c.name, "result": result})
             messages.append({"role": "tool", "tool_call_id": c.id,

@@ -546,3 +546,55 @@ async def test_run_turn_self_heals_poisoned_prior_transcript():
                        "content": "error: interrupted"}
     assert sent[2]["role"] == "user"
     assert result.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_calls_run_concurrently_and_in_order():
+    """Multiple tool_calls the model issues in ONE round execute CONCURRENTLY —
+    the round finishes in max(individual) not the sum — and their results are
+    appended in tool_call order (the provider keys each result to its call id)."""
+    import asyncio
+    import time
+
+    from api.native.transport import TransportExecResult
+
+    class _SlowTransport:
+        def __init__(self):
+            self.execs = []
+
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            await asyncio.sleep(0.1)
+            self.execs.append(command)
+            return TransportExecResult(f"ran:{command}", "", 0, False)
+
+        async def read_file(self, p, *, max_bytes=8 * 1024 * 1024):
+            raise FileNotFoundError(p)
+
+        async def write_file(self, p, d):
+            pass
+
+    spec = NativeAgentSpec()
+    tools = build_toolset(["bash"])
+    transport = _SlowTransport()
+    msgs = [{"role": "user", "content": "do 3 things"}]
+    round1 = [_Chunk(_Delta(tool_calls=[
+        _TCDelta(0, id="c1", name="bash", arguments='{"command":"a"}'),
+        _TCDelta(1, id="c2", name="bash", arguments='{"command":"b"}'),
+        _TCDelta(2, id="c3", name="bash", arguments='{"command":"c"}'),
+    ]))]
+    round2 = [_Chunk(_Delta(content="done"))]
+
+    t0 = time.perf_counter()
+    events, result = await _collect(spec, msgs, tools, transport, [round1, round2])
+    elapsed = time.perf_counter() - t0
+
+    # 3 tools × 0.1s each: concurrent ≈ 0.1s, sequential would be ≈ 0.3s.
+    assert elapsed < 0.25, f"parallel tool calls ran sequentially ({elapsed:.2f}s)"
+    # results in tool_call order, each keyed to its call
+    tr = [e for e in events if e["type"] == "tool_result"]
+    assert [e["tool_call_id"] for e in tr] == ["c1", "c2", "c3"]
+    assert "ran:a" in tr[0]["result"]
+    # transcript: tool results appended in order
+    tool_msgs = [m for m in result.messages if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_msgs] == ["c1", "c2", "c3"]
+    assert len(transport.execs) == 3
