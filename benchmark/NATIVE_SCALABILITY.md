@@ -26,25 +26,34 @@ machine, the ratios reproduce.
 ## End-to-end native turn throughput (`bench_native_runtime.py`)
 
 Driving `NativeSession.execute_prompt` through loop → emit → frame synthesis →
-`_broadcast` → internal queue → generator yield → per-turn checkpoint:
+`_broadcast` → internal queue → generator yield → per-turn checkpoint. These use
+a fake completion that streams instantly, so per-event CPU dominates — real turns
+are network-paced, so treat the absolute rates as CPU-cost signals, NOT
+production throughput.
 
-| metric | before (dict-dump frames) | after | delta |
+| metric | baseline | this branch | delta |
 |---|---:|---:|---:|
-| single-session turns/s | ~3,650 | ~8,500 | **~2.3×** |
+| single-session turns/s | ~3,650 | ~4,000 | ~1.1× (non-frames per-event opts) |
 | with 1 live SSE subscriber | 47% of 0-sub | **74%** of 0-sub | +59% |
 | with 4 live SSE subscribers | 21% of 0-sub | **50%** of 0-sub | +142% |
 | concurrency retention (1→32 sessions) | ~100% | ~100% | flat (no cliff) |
 | per-turn cost as a session grows to 2.4k msgs | O(n) (rising) | **O(1) (flat ×1.0)** | quadratic removed |
 
-The runtime is CPU-bound on the single event-loop thread, so aggregate
-throughput is *flat* across concurrent sessions (clean horizontal scaling
-across replicas) — the lever is reducing per-turn CPU, which the changes do.
+The single-session rate is modest on purpose: an earlier revision hit ~8,500 via
+a hand-built frame fast path, but that was a *fake-completion artifact* (per-token
+synthesis is noise against the model's network cadence), so it was reverted — see
+"Findings worth keeping." The genuine throughput wins are **structural, not
+per-token**: the subquadratic heal / tool-arg fixes (no deep-session cliff),
+parallel tool execution (N×/round), and the shared SSE-drain. The runtime is
+CPU-bound on the single event-loop thread, so aggregate throughput is *flat*
+across concurrent sessions (clean horizontal scaling across replicas) — the lever
+is reducing per-turn CPU, which the structural changes do.
 
 ## What changed (with measured impact)
 
 | area | change | impact |
 |---|---|---|
-| dangling-heal | `heal_dangling_tool_calls` re-scanned the whole transcript every turn → bound to the tail | **O(n²)→O(n)** per session; 2000-turn session ~6,900→16,800 turns/s |
+| dangling-heal | `heal_dangling_tool_calls` re-scanned the whole transcript every turn → bound to the tail | **O(n²)→O(n)** per session — a deep session no longer slows per turn (`_session_growth` stays flat ×1.0 to 2.4k msgs); pins the shape, not an absolute rate |
 | streamed tool args | `acc.args += fragment` on an attribute (GIL defeats CPython's in-place opt) → list+join | **O(n²)→O(n)**; up to ~1187× at 50k fragments |
 | **SSE drain (shared)** | `iterate_subscriber` armed an `asyncio.wait_for` timer per event → `get_nowait` hot path, timer only when idle | 1 subscriber **47%→74%**, 4 subs **21%→50%** of 0-sub; all providers |
 | internal queue | unbounded SPSC handoff → `put_nowait` / `get_nowait`-first | ~124 coroutine allocs/turn eliminated (GC/resource); +3-5% streaming |
