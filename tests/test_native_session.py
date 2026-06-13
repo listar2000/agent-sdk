@@ -414,9 +414,81 @@ async def test_session_threads_sandbox_env_into_transports():
     s._cwd = "/work"
     s._sandbox_env = {"GITHUB_TOKEN": "ghp_x", "CUSTOM": "1"}
     for provider, ref in (("docker", "cid-1"), ("daytona", "dt-1"),
-                          ("modal", "sb-1")):
+                          ("modal", "sb-1"), ("unix_local", "nl-1")):
         t = s._reattach_transport(provider, ref)
         assert t.default_env == {"GITHUB_TOKEN": "ghp_x", "CUSTOM": "1"}, provider
+
+
+def test_transport_registry_uniform_contract():
+    """The registry is only safe because every transport honors one ctor
+    contract — ``cls(sandbox_ref=…, workdir=…, env=…)`` rebinds an existing
+    sandbox — and exposes ``cold_create``. A class that drifts (e.g. renames
+    the ref kwarg) would break the resume path for its provider only, and
+    only against live infra; this pins it offline for all of them."""
+    from api.native.transport import _TRANSPORTS, transport_for
+
+    assert set(_TRANSPORTS) == {"docker", "daytona", "modal", "unix_local"}
+    for provider in _TRANSPORTS:
+        cls = transport_for(provider)
+        assert cls.provider == provider
+        t = cls(sandbox_ref="r-1", workdir="/w", env={"A": "1"})
+        assert t.ref == "r-1", provider
+        assert t.workdir == "/w", provider
+        assert t.default_env == {"A": "1"}, provider
+        assert callable(getattr(cls, "cold_create")), provider
+    with pytest.raises(RuntimeError, match="not wired"):
+        transport_for("k8s")
+
+
+@pytest.mark.asyncio
+async def test_cold_create_accepts_full_fact_bundle(monkeypatch):
+    """Every registered cold_create must tolerate the session's FULL fact
+    bundle (pick what you need, swallow the rest via ``**_kw``) — a transport
+    that drops the swallow would pass the ctor contract above and TypeError
+    only at live dispatch. create() is stubbed; no infra is touched."""
+    from api.native.transport import _TRANSPORTS, transport_for
+
+    for provider in _TRANSPORTS:
+        cls = transport_for(provider)
+
+        async def _create(self, **kw):
+            return "r-new"
+
+        monkeypatch.setattr(cls, "create", _create)
+        t = await cls.cold_create(workdir="/w", env={"A": "1"},
+                                  volume_ref="vol-1", subpath="agents/a",
+                                  session_id="s-1")
+        assert t.workdir == "/w", provider
+        assert t.default_env == {"A": "1"}, provider
+
+
+@pytest.mark.asyncio
+async def test_create_transport_hands_session_facts_to_cold_create(monkeypatch):
+    """_create_transport is pure dispatch: the per-provider create recipe
+    lives on the transport class (cold_create), and the session hands over
+    the same fact bundle regardless of provider."""
+    from api.native import transport as T
+
+    seen: dict = {}
+
+    class _Fake:
+        @classmethod
+        async def cold_create(cls, **kw):
+            seen.update(kw)
+            return "fake-transport"
+
+    monkeypatch.setattr(T, "DockerTransport", _Fake)
+    s = NativeSession(session_id="s-disp",
+                      state=NativeSandboxState(provider="docker"))
+    s._cwd = "/work"
+    s._sandbox_env = {"K": "v"}
+    s._volume_ref = "vol-1"
+    s._subpath = "agents/a"
+
+    assert await s._create_transport("docker") == "fake-transport"
+    assert seen == {"workdir": "/work", "env": {"K": "v"},
+                    "volume_ref": "vol-1", "subpath": "agents/a",
+                    "session_id": "s-disp"}
 
 
 @pytest.mark.asyncio
@@ -434,7 +506,7 @@ async def test_docker_exec_merges_default_env(monkeypatch):
         return 0, b"ok", b""
 
     monkeypatch.setattr(T, "_run_docker", _fake_run_docker)
-    t = T.DockerTransport(container_id="cid-x", workdir="/w",
+    t = T.DockerTransport(sandbox_ref="cid-x", workdir="/w",
                           env={"FOO": "bar", "TOK": "s3cr3t"})
 
     await t.exec("echo hi")
@@ -465,7 +537,7 @@ async def test_docker_plumbing_is_env_immune(monkeypatch):
         return 0, b64mod.b64encode(b"data"), b""
 
     monkeypatch.setattr(T, "_run_docker", _fake_run_docker)
-    t = T.DockerTransport(container_id="cid-x", workdir="/w",
+    t = T.DockerTransport(sandbox_ref="cid-x", workdir="/w",
                           env={"PATH": "/custom/bin"})
 
     assert await t.read_file("/f.txt") == b"data"

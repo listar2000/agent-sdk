@@ -47,22 +47,6 @@ log = logging.getLogger(__name__)
 _SENTINEL = object()
 
 
-def _origin() -> str:
-    import os
-    return os.environ.get("AGENT_SDK_ORIGIN", "production")
-
-
-def _native_image() -> str:
-    """Image for native sandboxes — needs only a shell + coreutils/base64.
-    The baked runtime image qualifies and is already pulled; override with
-    ``AGENT_SDK_NATIVE_IMAGE`` (e.g. a leaner base in P1)."""
-    import os
-    from api.providers.docker import _read_runtime_image_tag
-    return (os.environ.get("AGENT_SDK_NATIVE_IMAGE")
-            or _read_runtime_image_tag()
-            or "python:3.12-slim")
-
-
 class NativeSession(BaseSandboxSession):
     # Native's volume can live on any backend (docker/daytona/modal), so the
     # base's volume.provider == volume_provider check must be skipped.
@@ -329,8 +313,9 @@ class NativeSession(BaseSandboxSession):
             # RESUME: a prior provision left a hibernated (stopped) or
             # still-running sandbox. ONE status() classifies it — reattach +
             # resume (workspace intact) rather than create fresh. The flow is
-            # provider-uniform over the transport interface; only the class
-            # and the cold-create args differ.
+            # provider-uniform over the transport interface; the registry
+            # (transport_for) picks the class, each class's cold_create owns
+            # its own create recipe.
             if ref:
                 t = self._reattach_transport(provider, ref)
                 st = await t.status()
@@ -396,61 +381,21 @@ class NativeSession(BaseSandboxSession):
         see the same GITHUB_TOKEN/etc that /sandbox/exec injects explicitly —
         parity with the supervisor runtime, where the agent's shell inherits
         spawn_env."""
-        from .transport import (
-            DaytonaTransport,
-            DockerTransport,
-            ModalTransport,
-            UnixLocalTransport,
-        )
-        env = self._sandbox_env
-        if provider == "docker":
-            return DockerTransport(container_id=ref, workdir=self._cwd, env=env)
-        if provider == "daytona":
-            return DaytonaTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
-        if provider == "modal":
-            return ModalTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
-        if provider == "unix_local":
-            return UnixLocalTransport(sandbox_ref=ref, workdir=self._cwd, env=env)
-        raise RuntimeError(f"native provider {provider!r} not wired")
+        from .transport import transport_for
+        return transport_for(provider)(
+            sandbox_ref=ref, workdir=self._cwd, env=self._sandbox_env)
 
     async def _create_transport(self, provider: str):
         """Cold-create a fresh sandbox for ``provider`` and return its
-        transport. docker: a sleep-infinity container; daytona: a paused-
-        capable VM on the session volume."""
-        from .transport import (
-            DaytonaTransport,
-            DockerTransport,
-            ModalTransport,
-            UnixLocalTransport,
-        )
-        env = self._sandbox_env  # default exec env — see _reattach_transport
-        if provider == "unix_local":
-            # Record-only sandbox on the host: workspace dir + provider-index
-            # record, no resident compute (hibernate/resume are no-ops).
-            t = UnixLocalTransport(workdir=self._cwd, env=env)
-            await t.create(root=self._cwd)
-            return t
-        if provider == "docker":
-            t = DockerTransport(workdir=self._cwd, env=env)
-            # create() does the workdir mkdir as its readiness step, so no
-            # second exec round-trip here (matches daytona/modal below).
-            await t.create(image=_native_image(),
-                           labels={"agent_sdk_origin": _origin(),
-                                   "native_session": self.session_id})
-            return t
-        if provider == "daytona":
-            t = DaytonaTransport(workdir=self._cwd, env=env)
-            await t.create(root=self._cwd, volume_id=self._volume_ref,
-                           subpath=self._subpath)
-            return t
-        if provider == "modal":
-            # Modal is always volume-backed (recreate-on-missing keeps the
-            # workspace on the Volume, not the terminated sandbox FS).
-            t = ModalTransport(workdir=self._cwd, env=env)
-            await t.create(volume_ref=self._volume_ref, subpath=self._subpath,
-                           root=self._cwd)
-            return t
-        raise RuntimeError(f"native provider {provider!r} not wired")
+        transport. The per-provider recipe lives on each transport class
+        (``cold_create``); this hands over the session facts and the class
+        picks what it needs. env binds the session's sandbox secrets as the
+        default exec env — see _reattach_transport."""
+        from .transport import transport_for
+        return await transport_for(provider).cold_create(
+            workdir=self._cwd, env=self._sandbox_env,
+            volume_ref=self._volume_ref, subpath=self._subpath,
+            session_id=self.session_id)
 
     async def _persist_state(self) -> None:
         from api import db as _db

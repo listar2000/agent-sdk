@@ -4,8 +4,8 @@ primitives, no supervisor anywhere.
 A transport owns ONE sandbox for ONE session: create it (native flavor — a
 no-op PID-1, nothing listening, nothing inbound), run commands in it, move
 file bytes in and out, destroy it. The loop's tools (api/native/tools.py)
-call only this surface, so adding daytona/modal in P1 is a new subclass,
-not a tool change.
+call only this surface, so a new provider is a new class + a _TRANSPORTS
+entry at the bottom of this module — not a tool or session change.
 
 P0 ships DockerTransport. Verified provider-audit constraints baked in:
 - the docker CLI's exec timeout kills the CLIENT, not the in-container
@@ -94,6 +94,22 @@ class SandboxGoneError(Exception):
     fresh sandbox (recovering the workspace on modal/daytona volumes)."""
 
 
+def _origin() -> str:
+    import os
+    return os.environ.get("AGENT_SDK_ORIGIN", "production")
+
+
+def _native_image() -> str:
+    """Image for native sandboxes — needs only a shell + coreutils/base64.
+    The baked runtime image qualifies and is already pulled; override with
+    ``AGENT_SDK_NATIVE_IMAGE`` (e.g. a leaner base in P1)."""
+    import os
+    from api.providers.docker import _read_runtime_image_tag
+    return (os.environ.get("AGENT_SDK_NATIVE_IMAGE")
+            or _read_runtime_image_tag()
+            or "python:3.12-slim")
+
+
 class DockerTransport:
     """One docker container per session, ``sleep infinity`` as PID-1."""
 
@@ -104,9 +120,9 @@ class DockerTransport:
     #: to catch the still-dead case. Resume is NOT authoritative.
     resume_is_authoritative = False
 
-    def __init__(self, container_id: str | None = None, workdir: str = "/",
+    def __init__(self, sandbox_ref: str | None = None, workdir: str = "/",
                  env: dict[str, str] | None = None):
-        self.container_id = container_id
+        self.container_id = sandbox_ref
         # Default working directory for exec and the anchor for relative
         # file paths, so a tool's ``note.txt`` and a later ``cat note.txt``
         # resolve to the same place regardless of which path was used.
@@ -131,6 +147,18 @@ class DockerTransport:
         return f"{base}/{path}"
 
     # ── lifecycle ──────────────────────────────────────────────────────────
+
+    @classmethod
+    async def cold_create(cls, *, workdir: str,
+                          env: dict[str, str] | None = None,
+                          session_id: str, **_kw) -> "DockerTransport":
+        t = cls(workdir=workdir, env=env)
+        # create() does the workdir mkdir as its readiness step, so no second
+        # exec round-trip here (matches the daytona/modal cold_creates).
+        await t.create(image=_native_image(),
+                       labels={"agent_sdk_origin": _origin(),
+                               "native_session": session_id})
+        return t
 
     async def create(self, *, image: str, labels: dict[str, str] | None = None,
                      mounts: list[str] | None = None) -> str:
@@ -454,6 +482,16 @@ class DaytonaTransport:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
+    @classmethod
+    async def cold_create(cls, *, workdir: str,
+                          env: dict[str, str] | None = None,
+                          volume_ref: str | None = None,
+                          subpath: str | None = None,
+                          **_kw) -> "DaytonaTransport":
+        t = cls(workdir=workdir, env=env)
+        await t.create(root=workdir, volume_id=volume_ref, subpath=subpath)
+        return t
+
     async def create(self, *, root: str | None = None,
                      volume_id: str | None = None, subpath: str | None = None) -> str:
         from api.providers.daytona import provision_daytona_sandbox
@@ -623,6 +661,17 @@ class ModalTransport:
             return path
         return f"{self.workdir.rstrip('/')}/{path}"
 
+    @classmethod
+    async def cold_create(cls, *, workdir: str,
+                          env: dict[str, str] | None = None,
+                          volume_ref: str, subpath: str,
+                          **_kw) -> "ModalTransport":
+        # Modal is always volume-backed (recreate-on-missing keeps the
+        # workspace on the Volume, not the terminated sandbox FS).
+        t = cls(workdir=workdir, env=env)
+        await t.create(volume_ref=volume_ref, subpath=subpath, root=workdir)
+        return t
+
     async def create(self, *, volume_ref: str, subpath: str,
                      root: str | None = None) -> str:
         # NATIVE flavor: a bare `sleep infinity` sandbox (no supervisor/ACP/
@@ -770,6 +819,16 @@ class UnixLocalTransport:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
+    @classmethod
+    async def cold_create(cls, *, workdir: str,
+                          env: dict[str, str] | None = None,
+                          **_kw) -> "UnixLocalTransport":
+        # Record-only sandbox on the host: workspace dir + provider-index
+        # record, no resident compute (hibernate/resume are no-ops).
+        t = cls(workdir=workdir, env=env)
+        await t.create(root=workdir)
+        return t
+
     async def create(self, *, root: str | None = None, **_kw) -> str:
         import os as _os
         import uuid as _uuid
@@ -886,3 +945,29 @@ class UnixLocalTransport:
             raise ValueError(f"read_file({path}): {len(data)}B exceeds "
                              f"max_bytes={max_bytes}")
         return data
+
+
+#: provider name → transport CLASS NAME: the ONE place the native runtime
+#: maps providers to transports. Registered classes share one contract —
+#: ``cls(sandbox_ref=…, workdir=…, env=…)`` reattaches to an existing
+#: sandbox, and ``await cls.cold_create(workdir=…, env=…, volume_ref=…,
+#: subpath=…, session_id=…)`` provisions a fresh one (each class picks the
+#: facts it needs and swallows the rest). Wiring a fifth provider is a new
+#: class + one entry here; NativeSession needs no edit. Names, not class
+#: objects, so resolution is late-bound through the module and the dispatch
+#: tests' ``monkeypatch.setattr(T, "DaytonaTransport", …)`` keeps working
+#: (same reason the volume adapters import late).
+_TRANSPORTS: dict[str, str] = {
+    "docker": "DockerTransport",
+    "daytona": "DaytonaTransport",
+    "modal": "ModalTransport",
+    "unix_local": "UnixLocalTransport",
+}
+
+
+def transport_for(provider: str) -> type:
+    try:
+        name = _TRANSPORTS[provider]
+    except KeyError:
+        raise RuntimeError(f"native provider {provider!r} not wired") from None
+    return globals()[name]   # a broken registry entry should raise as itself

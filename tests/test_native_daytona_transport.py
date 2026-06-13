@@ -118,27 +118,32 @@ def _native_session(provider: str) -> NativeSession:
 
 @pytest.mark.asyncio
 async def test_dispatch_creates_daytona_transport(monkeypatch):
+    """No prior ref → _ensure_sandbox cold-creates through the REAL
+    DaytonaTransport.cold_create — pins the session-facts → provider-call
+    translation (root/volume_id/subpath) the transport class now owns."""
     created = {}
 
-    class _FakeDaytona:
-        provider = "daytona"
-        def __init__(self, sandbox_ref=None, workdir="/home/daytona", env=None):
-            self.sandbox_ref = sandbox_ref; self.workdir = workdir
-        @property
-        def ref(self):
-            return self.sandbox_ref
-        async def create(self, *, root=None, volume_id=None, subpath=None):
-            created.update(root=root, volume_id=volume_id, subpath=subpath)
-            self.sandbox_ref = "dt-new"; return "dt-new"
+    class _FakeInst:
+        sandbox_ref = "dt-new"
 
-    monkeypatch.setattr(T, "DaytonaTransport", _FakeDaytona)
+    async def _provision(**kw):
+        created.update(kw)
+        return _FakeInst()
+
+    async def _exec(inst, cmd, timeout=30):
+        return ExecResult(stdout="", stderr="", exit_code=0)
+
+    import api.providers.daytona as dt
+    monkeypatch.setattr(dt, "provision_daytona_sandbox", _provision)
+    monkeypatch.setattr(dt, "exec_in_sandbox", _exec)
+
     s = _native_session("daytona")
     t = await s._ensure_sandbox()
-    assert isinstance(t, _FakeDaytona)
+    assert isinstance(t, T.DaytonaTransport)
     assert s.state.sandbox_ref == "dt-new"
     # passed the session's volume + subpath (volume-backed daytona)
-    assert created == {"root": "/home/daytona", "volume_id": "vol-1",
-                       "subpath": "agents/a1"}
+    assert created == {"agent_type": "native", "root": "/home/daytona",
+                       "volume_id": "vol-1", "subpath": "agents/a1"}
 
 
 @pytest.mark.asyncio
@@ -196,8 +201,9 @@ async def test_dispatch_resume_that_raises_falls_through_to_recreate(monkeypatch
         async def destroy(self):
             events.append("destroy")
 
-        async def create(self, *, root=None, volume_id=None, subpath=None):
-            events.append("create"); self.sandbox_ref = "dt-new"; return "dt-new"
+        @classmethod
+        async def cold_create(cls, *, workdir, env=None, **kw):
+            events.append("create"); return cls("dt-new")
 
     monkeypatch.setattr(T, "DaytonaTransport", _FakeDaytona)
     s = _native_session("daytona")
@@ -353,9 +359,11 @@ async def test_dispatch_modal_recreate_on_missing(monkeypatch):
             events.append("status"); return "missing"
         async def destroy(self):
             events.append("destroy")
-        async def create(self, *, volume_ref=None, subpath=None, root=None):
+        @classmethod
+        async def cold_create(cls, *, workdir, env=None, volume_ref=None,
+                              subpath=None, **kw):
             events.append(("create", volume_ref, subpath))
-            self.sandbox_ref = "modal-new"; return "modal-new"
+            return cls("modal-new")
 
     monkeypatch.setattr(T, "ModalTransport", _FakeModal)
     s = NativeSession(session_id="s-modal",
@@ -649,8 +657,8 @@ async def test_dispatch_nonauthoritative_resume_still_verifies(monkeypatch):
     class _FakeDocker:
         resume_is_authoritative = False
 
-        def __init__(self, container_id=None, workdir="/", env=None):
-            self.container_id = container_id
+        def __init__(self, sandbox_ref=None, workdir="/", env=None):
+            self.container_id = sandbox_ref
 
         @property
         def ref(self):
