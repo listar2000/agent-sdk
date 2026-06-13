@@ -282,15 +282,30 @@ class NativeSession(BaseSandboxSession):
 
     # ── internals ───────────────────────────────────────────────────────────
 
+    #: Checkpoint write attempts on transient DB failure. The write is an
+    #: idempotent upsert on (session_id, turn_seq), so a retry can't double-apply
+    #: — and a checkpoint that never lands silently rewinds the conversation on
+    #: the next resume, so a connection blip / deadlock shouldn't lose the turn.
+    _CHECKPOINT_ATTEMPTS = 3
+
     async def _checkpoint(self, usage: dict) -> None:
         from api import db as _db
-        try:
-            await _db.write_native_checkpoint(
-                session_id=self.session_id, turn_seq=self._turn_seq,
-                messages=self._messages, usage=usage or {})
-        except Exception:
-            log.exception("native checkpoint write failed for %s",
-                          self.session_id)
+        for attempt in range(self._CHECKPOINT_ATTEMPTS):
+            try:
+                await _db.write_native_checkpoint(
+                    session_id=self.session_id, turn_seq=self._turn_seq,
+                    messages=self._messages, usage=usage or {})
+                return
+            except Exception:
+                if attempt + 1 >= self._CHECKPOINT_ATTEMPTS:
+                    # Durable failure after retries — the turn won't survive a
+                    # resume. log.exception is bridged to error_events (provider
+                    # native), so this surfaces on /admin/errors, not just stderr.
+                    log.exception(
+                        "native checkpoint write failed (durable, %d attempts) "
+                        "for %s", self._CHECKPOINT_ATTEMPTS, self.session_id)
+                    return
+                await asyncio.sleep(0.05 * (attempt + 1))
 
     # ── sandbox: lazy provisioning + server exec/file routing ───────────────
 

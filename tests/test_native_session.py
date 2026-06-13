@@ -747,3 +747,43 @@ async def test_destroy_and_hibernate_failures_record_leaks(monkeypatch):
     s2._transport = _DeadHibernate()
     await s2.stop()
     assert ("native_hibernate_failed", "modal", "s-hib") in leaks
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_retries_transient_db_failure(monkeypatch):
+    """A transient DB failure on the checkpoint write would silently rewind the
+    conversation on resume, so _checkpoint retries the idempotent upsert: it
+    succeeds once the DB recovers, and gives up gracefully (never raises) if it
+    can't — a checkpoint hiccup must not crash the turn loop."""
+    import api.db
+
+    captured = {}
+    calls = {"n": 0}
+
+    async def flaky_write(*, session_id, turn_seq, messages, usage):
+        calls["n"] += 1
+        if calls["n"] < 3:            # fail the first two attempts
+            raise RuntimeError("connection reset")
+        captured["ok"] = (session_id, turn_seq)
+
+    monkeypatch.setattr(api.db, "write_native_checkpoint", flaky_write)
+
+    s = NativeSession(session_id="s-ckpt",
+                      state=NativeSandboxState(provider="docker"))
+    s._turn_seq = 4
+    s._messages = [{"role": "user", "content": "hi"}]
+
+    await s._checkpoint({"inputTokens": 1})
+    assert calls["n"] == 3                       # retried twice, then succeeded
+    assert captured["ok"] == ("s-ckpt", 4)
+
+    # exhausting all attempts must NOT raise (the turn loop must survive)
+    calls["n"] = 0
+
+    async def always_fail(**kw):
+        calls["n"] += 1
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(api.db, "write_native_checkpoint", always_fail)
+    await s._checkpoint({})                       # no exception escapes
+    assert calls["n"] == NativeSession._CHECKPOINT_ATTEMPTS
