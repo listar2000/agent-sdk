@@ -184,6 +184,42 @@ async def test_cancel_produces_cancelled_terminal_and_checkpoint():
 
 
 @pytest.mark.asyncio
+async def test_model_failure_emits_error_terminal_and_session_recovers():
+    """A model call that RAISES (litellm out of retries, a loop bug) must surface
+    a clean ``error`` terminal AND end the stream — the sentinel in _drive's
+    ``finally`` is what stops the client's iterator from hanging forever. And the
+    failure must not wedge the session: the very next prompt must drive normally.
+    Pins both (the no-hang via wait_for, the recovery via a second turn)."""
+    base = _completion_factory([[_Chunk(_Delta(content="ok"))]])
+    calls = {"n": 0}
+
+    async def _boom_then_ok(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("model exploded")
+        return await base(**kwargs)
+
+    s = _make_session([[]])
+    s._completion = _boom_then_ok
+    s._broadcast = lambda item: None
+
+    async def _drain(rpc):
+        return [ev async for ev in s.execute_prompt("hi", rpc_id=rpc)]
+
+    # 1st prompt: the model raises → a single clean error terminal, no hang
+    events = await asyncio.wait_for(_drain("r-err"), timeout=5)
+    errs = [e for e in events if e.get("type") == "error"]
+    assert len(errs) == 1
+    assert errs[0]["kind"] == "RuntimeError"
+    assert "model exploded" in errs[0]["text"]
+
+    # 2nd prompt: the session is NOT wedged — a normal turn completes cleanly
+    events2 = await asyncio.wait_for(_drain("r-ok"), timeout=5)
+    assert [e["type"] for e in events2] == ["text", "done"]
+    assert events2[-1]["stop_reason"] == "end_turn"
+
+
+@pytest.mark.asyncio
 async def test_always_alive_liveness():
     s = NativeSession(session_id="x", state=NativeSandboxState(provider="docker"))
     assert await s.running() is True
