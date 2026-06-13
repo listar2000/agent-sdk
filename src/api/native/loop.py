@@ -36,6 +36,12 @@ class NativeAgentSpec:
     max_tokens: int | None = None
     temperature: float | None = None
     tool_names: list[str] | None = None
+    # LiteLLM retries the INITIAL model call on transient failures (rate
+    # limits, connection resets, 5xx) before the stream is established — so a
+    # blip doesn't fail the whole turn. It does NOT retry mid-stream (no
+    # double-emit). Default on (2) for resilience; set 0 via native config to
+    # disable, or higher for a flakier provider.
+    num_retries: int = 2
 
     @classmethod
     def from_config(cls, *, model: str | None, native: dict | None) -> "NativeAgentSpec":
@@ -47,6 +53,7 @@ class NativeAgentSpec:
             max_tokens=n.get("max_tokens"),
             temperature=n.get("temperature"),
             tool_names=n.get("tool_names"),
+            num_retries=int(n.get("num_retries", cls.num_retries)),
         )
 
 
@@ -168,6 +175,8 @@ async def run_turn(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if spec.num_retries:
+        call_kwargs["num_retries"] = spec.num_retries
     if tool_schemas:
         call_kwargs["tools"] = tool_schemas
     if spec.temperature is not None:

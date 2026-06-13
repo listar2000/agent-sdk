@@ -312,6 +312,43 @@ def test_tool_schema_precomputed_and_correct():
     assert "command" in s["function"]["parameters"]["properties"]
 
 
+@pytest.mark.asyncio
+async def test_run_turn_passes_num_retries_for_transient_resilience():
+    """The native loop asks LiteLLM to retry transient INITIAL-call failures
+    (rate limits / 5xx / connection resets) so a blip doesn't fail the whole
+    turn — default on (2), configurable, and 0 omits it (provider default)."""
+    captured = {}
+
+    async def completion(**kwargs):
+        captured.clear()
+        captured.update(kwargs)
+
+        async def _it():
+            yield _Chunk(_Delta(content="ok"))
+        return _it()
+
+    async def _emit(ev):
+        pass
+
+    msg = [{"role": "user", "content": "hi"}]
+
+    # default: num_retries=2 reaches the model call
+    await run_turn(NativeAgentSpec(), list(msg), {}, None, _emit,
+                   completion=completion)
+    assert captured.get("num_retries") == 2
+
+    # config override
+    spec = NativeAgentSpec.from_config(model=None, native={"num_retries": 5})
+    assert spec.num_retries == 5
+    await run_turn(spec, list(msg), {}, None, _emit, completion=completion)
+    assert captured.get("num_retries") == 5
+
+    # disabled: omitted entirely so LiteLLM's own default applies
+    await run_turn(NativeAgentSpec(num_retries=0), list(msg), {}, None, _emit,
+                   completion=completion)
+    assert "num_retries" not in captured
+
+
 # ── interrupt-wedge: dangling assistant tool_calls healing ───────────────────
 # An interrupt mid-tool-loop (CancelledError is a BaseException, so it bypasses
 # _invoke_tool's `except Exception`) lands after the assistant tool_calls
