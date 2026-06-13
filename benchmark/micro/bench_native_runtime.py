@@ -16,8 +16,9 @@ cost that multiplies across every concurrent session on a replica.
 Views: single-session text-turn rate, **tool-heavy** (a tool-call/tool-result
 loop — 2 model rounds + a tool exec per turn, exercising the tool/tool_result
 frames and the streamed tool-arg accumulator), **parallel tool-calling** (a round
-of N tool calls runs concurrently — turn time stays flat as N grows vs the N×
-sequential cost), concurrency scaling, with-subscriber fan-out, session-length
+of N tool calls runs concurrently, bounded to a cap — turn time stays flat up to
+the cap, then grows in waves, vs the N× sequential cost), concurrency scaling,
+with-subscriber fan-out, session-length
 scaling, and per-session RAM.
 
 **Run:** ``.venv/bin/python benchmark/micro/bench_native_runtime.py``
@@ -262,12 +263,15 @@ async def _single(turns: int, chunks: int) -> None:
 async def _parallel_tools(latency_ms: int = 20,
                           tool_counts: tuple[int, ...] = (1, 2, 4, 8, 16)) -> None:
     """Per-turn wall time as the model issues N tool calls in ONE round, each a
-    ``latency_ms`` exec. The native loop runs them concurrently, so the turn
-    stays ~flat as N grows (the round is ~max(individual) = one latency);
-    sequential execution would grow the round to N×latency. The speedup column
-    is that N×latency vs the measured turn."""
+    ``latency_ms`` exec. The native loop runs them concurrently, BOUNDED to
+    _MAX_CONCURRENT_TOOLS at a time: the turn stays ~flat (≈ one latency) up to
+    the cap, then grows in waves of cap-size (so the resource ceiling is fixed).
+    seq_est = N×latency, what fully-sequential execution would cost."""
+    from api.native.loop import _MAX_CONCURRENT_TOOLS as cap
+
     L = latency_ms / 1000.0
-    print(f"parallel tool-calling: a round of N bash calls, {latency_ms}ms each")
+    print(f"parallel tool-calling: a round of N bash calls, {latency_ms}ms each "
+          f"(concurrency cap {cap})")
     print(f"  {'tools/round':>11} {'turn ms':>8} {'seq est ms':>11} {'speedup':>8}")
     for n in tool_counts:
         s = _make_parallel_tool_session(f"par-{n}", n, L)
@@ -278,7 +282,8 @@ async def _parallel_tools(latency_ms: int = 20,
         dt = (time.perf_counter() - t0) / turns
         seq_est = n * L
         print(f"  {n:>11} {dt*1e3:>8.1f} {seq_est*1e3:>11.1f} {seq_est/dt:>7.1f}x")
-    print("  (turn ms ~flat as N grows = the N tools ran concurrently)\n")
+    print(f"  (flat ≈ one latency up to N={cap}; beyond, waves of {cap} = a fixed "
+          f"resource ceiling)\n")
 
 
 async def _tool_heavy(turns: int, arg_sizes: tuple[int, ...] = (16, 4096)) -> None:
