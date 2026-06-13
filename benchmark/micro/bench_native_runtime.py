@@ -156,6 +156,58 @@ async def _scaling(levels: list[int], turns: int, chunks: int) -> None:
     print()
 
 
+async def _with_subscribers(turns: int, chunks: int,
+                            sub_levels: tuple[int, ...] = (0, 1, 2, 4)) -> None:
+    """Throughput with N concurrently-draining /events subscribers attached.
+
+    Production /message turns ALWAYS have ≥1 streaming subscriber (the HTTP
+    response drains broadcast blocks), so the 0-subscriber single() number is an
+    underestimate — it skips the per-event ``put_nowait`` fan-out. Each level
+    registers N subscribers, drains them in background tasks (the SSE consumer
+    stand-in), and reports producer turns/s plus whether any event was DROPPED
+    (the subscriber queue is bounded at _QUEUE_MAXSIZE; a too-slow drain loses
+    events by design — worth seeing if it happens under this load)."""
+    from api.sandbox.session import _HEARTBEAT
+
+    print(f"with-subscriber fan-out: {turns} turns × {chunks} chunks")
+    print(f"  {'subs':>5} {'turns/s':>10} {'events/s':>11} {'delivered/sub':>14} "
+          f"{'drops':>7}")
+    base = None
+    for nsub in sub_levels:
+        s = _make_session(f"sess-sub-{nsub}", chunks)
+        await _drive_turns(s, 2)  # warmup
+        counters = [0] * nsub
+        drains = []
+        for k in range(nsub):
+            sid, q = s.register_subscriber()
+
+            async def drain(sid=sid, q=q, k=k):
+                async for item in s.iterate_subscriber(sid, q):
+                    if item is not _HEARTBEAT:
+                        counters[k] += 1
+            drains.append(asyncio.create_task(drain()))
+
+        gc.collect()
+        t0 = time.perf_counter()
+        events = await _drive_turns(s, turns)
+        dt = time.perf_counter() - t0
+        # let the drains fully catch up before measuring delivery
+        for _ in range(50):
+            await asyncio.sleep(0)
+        for d in drains:
+            d.cancel()
+        tps = turns / dt
+        if base is None and nsub == 0:
+            base = tps
+        delivered = (sum(counters) // nsub) if nsub else 0
+        # each subscriber should see every broadcast event (events/turn×turns)
+        drops = (events - delivered) if nsub else 0
+        rel = f"  ({tps/base:.0%} of 0-sub)" if base else ""
+        print(f"  {nsub:>5} {tps:>10.1f} {events/dt:>11.0f} {delivered:>14} "
+              f"{drops:>7}{rel}")
+    print("  (drops should be 0 at this load; >0 = bounded queue overflow)\n")
+
+
 async def _session_growth(turns: int, chunks: int, buckets: int = 4) -> None:
     """Per-turn latency as ONE session's conversation deepens. With an O(1)
     per-turn cost the buckets stay flat; an O(n) per-turn step (e.g. re-scanning
@@ -210,6 +262,7 @@ async def main() -> None:
     print(f"native runtime bench — turns={turns} chunks/turn={chunks}\n")
     await _single(turns, chunks)
     await _scaling(levels, turns, chunks)
+    await _with_subscribers(turns, chunks)
     await _session_growth(max(turns, 1200), chunks)
     await _ram(max(levels), turns, chunks)
 

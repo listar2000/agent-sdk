@@ -92,6 +92,14 @@ grows without bound with conversation length.
   crept into the turn path.
 * Per-turn cost is now **flat as the conversation grows** (the session-length
   table reads ×1.00 across buckets) — long-running sessions don't degrade.
+* The **with-subscriber** table measures the production streaming path (every
+  `/message` turn has ≥1 SSE subscriber draining broadcast blocks). It exposed —
+  and then validated the fix for — a shared-infra cost: `iterate_subscriber`
+  armed an `asyncio.wait_for` timeout (a fresh `TimerHandle`) on *every* event,
+  so one live subscriber roughly **halved** producer throughput. Draining with
+  `get_nowait` and arming the heartbeat timer only when the queue is empty took
+  1-subscriber throughput from ~47% to ~73% of the 0-subscriber rate (+59%),
+  and 4-subscriber from ~21% to ~50% (+142%). `drops` must stay 0 at this load.
 * It is the A/B that proved the `FrameEncoder` win (see `bench_native_frames.py`)
   end-to-end, not just on the isolated function:
 

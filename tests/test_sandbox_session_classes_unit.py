@@ -294,6 +294,40 @@ class TestSubscriberHandoffCleanup:
         assert sid not in a._subscribers
 
     @pytest.mark.asyncio
+    async def test_iterate_subscriber_hot_path_and_heartbeat(self, monkeypatch):
+        """The drain drains queued events with get_nowait (no per-event timer)
+        AND still emits a heartbeat after a full idle interval, then keeps
+        delivering — the contract the streaming fan-out optimization preserves."""
+        from api.sandbox import session as sess_mod
+        from api.sandbox.session import _END, _HEARTBEAT
+
+        # tiny interval so the idle-heartbeat path is fast to exercise
+        monkeypatch.setattr(sess_mod, "_HEARTBEAT_INTERVAL_S", 0.03)
+        a = _MiniSession(session_id="s", state=ModalSandboxState(recipe=Recipe()))
+        sid, q = a.register_subscriber()
+
+        # a burst already queued — drained via the get_nowait hot path, in order
+        for i in range(5):
+            q.put_nowait(("rpc", f"e{i}"))
+        agen = a.iterate_subscriber(sid, q)
+        got = [await agen.__anext__() for _ in range(5)]
+        assert got == [("rpc", f"e{i}") for i in range(5)]
+
+        # queue now empty → the next pull arms the timer and times out into a
+        # heartbeat (proves the idle path still fires; a busy-spin would hang)
+        assert await agen.__anext__() is _HEARTBEAT
+
+        # real events still flow after a heartbeat
+        q.put_nowait(("rpc", "after"))
+        assert await agen.__anext__() == ("rpc", "after")
+
+        # _END terminates and cleanup runs
+        q.put_nowait(_END)
+        with pytest.raises(StopAsyncIteration):
+            await agen.__anext__()
+        assert sid not in a._subscribers
+
+    @pytest.mark.asyncio
     async def test_pool_handoff_then_drain_lets_reaper_reclaim(self, monkeypatch):
         from api.sandbox.pool import SessionPool
         from api.sandbox.session import _END

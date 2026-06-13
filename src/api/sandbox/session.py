@@ -719,13 +719,27 @@ class BaseSandboxSession(abc.ABC):
         sub = self._subscribers.get(sid)
         try:
             while True:
+                # Hot path: drain whatever is already queued WITHOUT arming a
+                # timeout. ``asyncio.wait_for`` schedules and cancels a fresh
+                # TimerHandle on every call, so wrapping each ``get()`` in it
+                # churns one timer per broadcast event — which dominates the
+                # streaming fan-out (a single live subscriber otherwise ~halves
+                # producer throughput; see benchmark/micro/bench_native_runtime
+                # _with_subscribers). When events are flowing the queue is
+                # non-empty and ``get_nowait`` returns immediately; only when it
+                # genuinely drains empty do we arm the heartbeat timer. Heartbeat
+                # semantics are unchanged: a _HEARTBEAT is still emitted after a
+                # full idle ``_HEARTBEAT_INTERVAL_S`` with no event.
                 try:
-                    event = await asyncio.wait_for(
-                        q.get(), timeout=_HEARTBEAT_INTERVAL_S,
-                    )
-                except asyncio.TimeoutError:
-                    yield _HEARTBEAT
-                    continue
+                    event = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    try:
+                        event = await asyncio.wait_for(
+                            q.get(), timeout=_HEARTBEAT_INTERVAL_S,
+                        )
+                    except asyncio.TimeoutError:
+                        yield _HEARTBEAT
+                        continue
                 if event is _END:
                     return
                 yield event
@@ -755,7 +769,12 @@ class BaseSandboxSession(abc.ABC):
         endpoint is the source of truth for everything broadcast on this
         session. Mixing the two would double-deliver every event a
         cold-loading UI just fetched from /log."""
-        for sub in list(self._subscribers.values()):
+        subs = self._subscribers
+        if not subs:
+            # Common case for a turn with no live watcher (fire-and-forget
+            # /message, background drains): skip the per-event list() snapshot.
+            return
+        for sub in list(subs.values()):
             try:
                 sub.queue.put_nowait(event)
             except asyncio.QueueFull:
