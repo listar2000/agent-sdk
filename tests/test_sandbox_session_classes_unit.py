@@ -328,6 +328,44 @@ class TestSubscriberHandoffCleanup:
         assert sid not in a._subscribers
 
     @pytest.mark.asyncio
+    async def test_subscriber_cleanup_no_leak_under_churn(self):
+        """Subscribers must not accumulate in ``_subscribers`` under churn —
+        both the normal drain-to-_END path AND the realistic client-disconnect
+        (the consumer's ``async for`` cancelled) path must pop their entry.
+        Otherwise a busy session slowly leaks memory and every _broadcast
+        iterates a growing dead list. The streaming-fan-out path all providers
+        share — covers the SSE-drain optimization's cleanup contract."""
+        from api.sandbox.session import _END
+
+        a = _MiniSession(session_id="s", state=ModalSandboxState(recipe=Recipe()))
+
+        # normal completion: drain to _END
+        for i in range(20):
+            sid, q = a.register_subscriber()
+            a._broadcast((f"r{i}", "x"))
+            q.put_nowait(_END)
+            async for _ in a.iterate_subscriber(sid, q):
+                pass
+        assert a._subscribers == {}, "drain-to-_END leaked a subscriber"
+
+        # realistic disconnect: the consumer task is cancelled mid-iterate
+        for i in range(20):
+            sid, q = a.register_subscriber()
+
+            async def _consume(sid=sid, q=q):
+                async for _ in a.iterate_subscriber(sid, q):
+                    pass
+
+            t = asyncio.create_task(_consume())
+            await asyncio.sleep(0)           # block on q.get()
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        assert a._subscribers == {}, "cancelled-consumer leaked a subscriber"
+
+    @pytest.mark.asyncio
     async def test_pool_handoff_then_drain_lets_reaper_reclaim(self, monkeypatch):
         from api.sandbox.pool import SessionPool
         from api.sandbox.session import _END
