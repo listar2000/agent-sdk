@@ -146,6 +146,23 @@ def heal_dangling_tool_calls(messages: list[dict]) -> None:
         messages[j:j] = stubs   # after existing results, before next turn
 
 
+def _litellm_completion():
+    """Resolve ``litellm.acompletion`` with telemetry + debug banners disabled.
+
+    litellm ships ``telemetry=True`` by default, which egresses anonymized usage
+    (model, success/failure) to litellm's servers on calls — a server-side data
+    egress + per-call overhead we don't want from the native runtime. And
+    ``suppress_debug_info=False`` lets it print a provider-list banner to stderr.
+    Set both every time we resolve the real completion (cheap idempotent bool
+    writes; kept here rather than at import so the test seam never imports
+    litellm). No effect on completion behavior — telemetry is pure analytics.
+    """
+    import litellm
+    litellm.telemetry = False
+    litellm.suppress_debug_info = True
+    return litellm.acompletion
+
+
 async def run_turn(
     spec: NativeAgentSpec,
     messages: list[dict],
@@ -160,8 +177,7 @@ async def run_turn(
     """Drive one user turn. ``messages`` already includes the new user
     message. Returns the grown message array + terminal stop reason."""
     if completion is None:
-        import litellm
-        completion = litellm.acompletion
+        completion = _litellm_completion()
 
     # Defensive: a checkpoint persisted mid-tool-loop (interrupt/error) or an
     # in-memory transcript from a prior errored turn can carry an assistant

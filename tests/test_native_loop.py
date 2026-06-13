@@ -349,6 +349,23 @@ async def test_run_turn_passes_num_retries_for_transient_resilience():
     assert "num_retries" not in captured
 
 
+def test_litellm_completion_disables_telemetry_and_debug():
+    """The native runtime must not egress litellm's anonymized usage telemetry
+    on every model call, nor spam stderr with its provider banner. Resolving the
+    real completion disables both; it still returns litellm.acompletion."""
+    import litellm
+    from api.native.loop import _litellm_completion
+
+    # simulate litellm's shipped defaults
+    litellm.telemetry = True
+    litellm.suppress_debug_info = False
+
+    fn = _litellm_completion()
+    assert fn is litellm.acompletion
+    assert litellm.telemetry is False
+    assert litellm.suppress_debug_info is True
+
+
 def test_native_spec_clamps_misconfigured_loop_knobs():
     """A misconfigured native agent gets sane floors: a max_turns <= 0 would make
     range(max_turns) empty → a silent no-op turn (no model call), and a negative
