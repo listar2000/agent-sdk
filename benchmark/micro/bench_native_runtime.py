@@ -468,7 +468,13 @@ async def _checkpoint_serialization(turns: int, chunks: int, buckets: int = 5) -
 
 
 async def _ram(n: int, turns: int, chunks: int) -> None:
-    """Per-session resident RAM after a conversation of ``turns`` turns."""
+    """Per-session RAM for ACTIVE sessions, then the capacity-planning number
+    that makes the provider packable: what an EVICTED (hibernated/idle) session
+    leaves behind. A native session's whole footprint is its in-memory
+    ``_messages``; the pool pops a hibernated session and nothing else holds it,
+    so after eviction gc must reclaim ~all of it. The retained delta doubles as a
+    RAM-level leak check, complementing the object-count leak guard in the test
+    suite (a non-object residual — a cache, a lingering task — would show here)."""
     gc.collect()
     tracemalloc.start()
     base = tracemalloc.take_snapshot()
@@ -476,16 +482,20 @@ async def _ram(n: int, turns: int, chunks: int) -> None:
     await asyncio.gather(*(_drive_turns(s, turns) for s in sessions))
     gc.collect()
     after = tracemalloc.take_snapshot()
-    stats = after.compare_to(base, "filename")
-    total = sum(s.size_diff for s in stats)
-    tracemalloc.stop()
+    total = sum(s.size_diff for s in after.compare_to(base, "filename"))
     msgs = len(sessions[0]._messages)
     print(f"RAM: {n} sessions × {turns} turns ({msgs} msgs each retained)")
-    print(f"  {total/1024/1024:6.2f} MB total   "
-          f"{total/n/1024:6.1f} KB/session   "
-          f"(conversation held in _messages)\n")
-    # keep sessions referenced until here so the snapshot sees them
+    print(f"  active : {total/1024/1024:6.2f} MB total   "
+          f"{total/n/1024:6.1f} KB/session   (conversation held in _messages)")
+    # Evict: drop every reference (what the pool does on hibernate) and force gc.
     del sessions
+    gc.collect()
+    freed = tracemalloc.take_snapshot()
+    retained = sum(s.size_diff for s in freed.compare_to(base, "filename"))
+    tracemalloc.stop()
+    pct = (retained / total * 100) if total else 0.0
+    print(f"  evicted: {retained/1024/1024:6.2f} MB retained ({pct:4.1f}% of active) "
+          f"— idle sessions free their RAM; ~0 = no per-session leak\n")
 
 
 async def main() -> None:
