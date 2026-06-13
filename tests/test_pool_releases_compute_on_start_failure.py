@@ -75,7 +75,7 @@ class _LeakySession(BaseSandboxSession):
             "and no existing sessions found"
         )
 
-    async def running(self, *, force_probe: bool = False) -> bool:
+    async def running(self) -> bool:
         return False
 
     async def execute_prompt(self, *args, **kwargs):

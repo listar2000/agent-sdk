@@ -1,19 +1,23 @@
-"""ModalSandboxSession — concrete SandboxSession for the modal provider.
+"""ModalSandboxSession — modal rows of the supervisor-session template.
 
-Wraps existing primitives in ``src/api/providers/modal/__init__.py``. Modal's
-shape sits between docker (no native pause) and daytona (remote
-provider with managed compute lifecycle).
+See ``api.sandbox.supervisor_session`` for the shared start()/stop()
+algorithm. Modal's deltas: tunnel URLs are minted at create time (the
+reattach URL must be resolved from the provider, never derived from the
+ref), terminate is destructive (no revive of "stopped"), create
+health-waits internally (the template's health gate runs only on
+reattach), ACP attach retries with health diagnostics, and a
+freshly-created sandbox is torn down when attach fails (it isn't
+pool-visible yet — it would leak as created-but-unregistered).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from uuid import uuid4
 
 import httpx
 
-from api.sandbox.session import BaseSandboxSession
 from api.sandbox.state import ModalSandboxState, SandboxState
+from api.sandbox.supervisor_session import SupervisorSandboxSession
 
 log = logging.getLogger(__name__)
 
@@ -21,18 +25,43 @@ _ATTACH_RETRY_ATTEMPTS = 6
 _ATTACH_RETRY_DELAY_S = 1.0
 
 
-class ModalSandboxSession(BaseSandboxSession):
+class ModalSandboxSession(SupervisorSandboxSession):
     """One running Modal sandbox + supervisor + ACP child."""
 
     volume_provider = "modal"
     _default_root = "/v"
     state: ModalSandboxState
 
+    _provider_mod = "modal"
+    _health_retries = 15
+    _health_interval = 0.5
+    _health_on_fresh_create = False
+    _revive_stopped = False
+    _cleanup_fresh_on_attach_failure = True
+    _health_fail_msg = "Modal supervisor not responding at {url}"
+
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         if not isinstance(state, ModalSandboxState):
             state = ModalSandboxState(recipe=state.recipe)
         super().__init__(session_id=session_id, state=state)
         self._cwd = "/v"
+
+    def _create_kwargs(self) -> dict:
+        return {"resources": self.state.recipe.resources}
+
+    async def _reattach_url(self, mod, status: str) -> str | None:
+        if status != "running":
+            return None
+        # Fetch the REAL HTTPS tunnel URL — Modal allocates it at
+        # sandbox-create time and it is NOT derivable from sandbox_ref.
+        return await mod.resolve_supervisor_url(self.state.sandbox_ref)
+
+    async def _on_wedged_reattach(self, mod, instance) -> None:
+        self.state.sandbox_ref = None
+        self.state.listen_port = None
+
+    async def _attach(self) -> None:
+        await self._attach_with_retry()
 
     async def _attach_with_retry(self) -> None:
         last_error: Exception | None = None
@@ -63,131 +92,3 @@ class ModalSandboxSession(BaseSandboxSession):
                 await asyncio.sleep(_ATTACH_RETRY_DELAY_S * attempt)
         assert last_error is not None
         raise last_error
-
-    async def start(self) -> None:
-        if self._supervisor_url is not None and await self.running():
-            return
-
-        from api.providers import modal as md_provider
-        from api.providers._shared import _wait_for_health
-
-        volume_ref = await self._bootstrap_session()
-
-        instance = None
-        reattached = False
-        created_fresh = False
-        if self.state.sandbox_ref:
-            try:
-                status = await md_provider.get_sandbox_status(self.state.sandbox_ref)
-                if status == "running":
-                    # Fetch the REAL HTTPS tunnel URL — Modal allocates it at
-                    # sandbox-create time and it is NOT derivable from
-                    # sandbox_ref. The previous code constructed
-                    # "http://<ref>.modal.host:<port>" which never routes.
-                    url = await md_provider.resolve_supervisor_url(
-                        self.state.sandbox_ref
-                    )
-                    # Reattach ONLY if the supervisor also answers health.
-                    # Folding the probe into the decision (instead of checking
-                    # after we've already committed to the ref) lets a wedged
-                    # reattach target fall through to a fresh cold-create in
-                    # THIS call. The race we hit under concurrent load: a killed
-                    # PID-1 supervisor takes its sandbox down, but Modal's
-                    # control plane still reports the ref 'running' for a few
-                    # seconds — the old code reattached to that, failed the
-                    # health wait, and raised (surfacing as a 500 on
-                    # POST /message), deferring recovery to a *next* request the
-                    # caller may never make. The volume carries the workspace,
-                    # so cold-creating here is a transparent recovery.
-                    if url and await _wait_for_health(
-                        url, max_retries=15, interval=0.5
-                    ):
-                        instance = self._provider_instance(
-                            url=url,
-                            sandbox_ref=self.state.sandbox_ref,
-                            port=self.state.listen_port,
-                        )
-                        reattached = True
-            except Exception:
-                instance = None
-                reattached = False
-
-        if instance is None:
-            # No prior sandbox, or the reattach target was unreachable: drop
-            # any stale/wedged ref and cold-create a fresh sandbox on the
-            # volume (the workspace survives via the Modal Volume).
-            self.state.sandbox_ref = None
-            self.state.listen_port = None
-            instance = await md_provider.create_sandbox(
-                volume_ref=volume_ref,
-                subpath=self._subpath or f"sessions/{self.session_id}",
-                agent_type=self.state.recipe.agent_type,
-                root=self.state.recipe.root,
-                spawn_env=self._spawn_env,
-                pre_start_commands=self.state.recipe.pre_start_commands or None,
-                shared_mounts=self.state.recipe.shared_mounts or None,
-                resources=self.state.recipe.resources,
-            )
-            self.state.sandbox_ref = instance.sandbox_ref
-            self.state.listen_port = instance.port
-            created_fresh = True
-
-        self._supervisor_url = instance.url
-
-        try:
-            self.liveness.observe_chunk()
-            if self._acp_session_id is None:
-                self._acp_session_id = str(uuid4())
-            await self._attach_with_retry()
-        except Exception:
-            # Freshly-created Modal sandboxes are not visible to the SessionPool
-            # until start() returns and state is persisted; tear down on attach
-            # failure so we do not leak "created but unregistered" sandboxes.
-            if created_fresh and self.state.sandbox_ref:
-                try:
-                    await md_provider.stop_sandbox(self._provider_instance(
-                        url=self._supervisor_url or "",
-                        sandbox_ref=self.state.sandbox_ref,
-                        port=self.state.listen_port,
-                    ))
-                except Exception:
-                    log.exception(
-                        "modal cleanup after attach failure failed: session=%s sandbox=%s",
-                        self.session_id, self.state.sandbox_ref,
-                    )
-            if created_fresh or reattached:
-                self.state.sandbox_ref = None
-                self.state.listen_port = None
-            self._supervisor_url = None
-            raise
-
-        log.info(
-            "ModalSandboxSession started: session=%s sandbox=%s url=%s",
-            self.session_id, (self.state.sandbox_ref or "")[:16], instance.url,
-        )
-
-    # running() and _liveness_probe() inherited from BaseSandboxSession.
-
-    async def stop(self) -> None:
-        if self.state.sandbox_ref is None:
-            return
-        await self._write_snapshot("/v/snapshot.tar")
-
-        # Modal: terminate is destructive (no pause). Per docs §15.3 we
-        # still call stop_sandbox; the persisted snapshot lets the next
-        # start() restore from it.
-        from api.providers import modal as md_provider
-        try:
-            await md_provider.stop_sandbox(self._provider_instance(
-                url=self._supervisor_url or "",
-                sandbox_ref=self.state.sandbox_ref or "",
-                port=self.state.listen_port,
-            ))
-        except Exception:
-            log.exception("modal.stop_sandbox failed for session %s", self.session_id)
-        # Modal sandbox is gone; clear sandbox_ref so next start cold-creates.
-        self.state.sandbox_ref = None
-        self.state.listen_port = None
-
-    # shutdown() inherited from BaseSandboxSession (no provider-specific
-    # handles to null beyond the base's _supervisor_url).

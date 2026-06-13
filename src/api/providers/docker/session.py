@@ -1,35 +1,28 @@
-"""DockerSandboxSession — concrete SandboxSession for the docker provider.
+"""DockerSandboxSession — docker rows of the supervisor-session template.
 
-Wraps existing primitives in ``src/api/providers/docker/__init__.py`` into the
-three-method (``start``/``running``/``stop``) ``BaseSandboxSession`` contract
-— adding a provider is one file + one factory line in
-``api/sandbox/factory.py``.
-
-Docker is structurally simpler than daytona:
-  * No S3-FUSE bridge — local volume mounts are POSIX
-  * No signed-URL minting — supervisor URL is stable for the container's
-    lifetime
-  * No pause — ``stop`` stops the container (the container row persists and
-    is restartable); ``start`` revives it in place via ``docker start``, or
-    cold-creates a fresh one against the same volume subpath if it's gone
+See ``api.sandbox.supervisor_session`` for the shared start()/stop()
+algorithm; this class declares only docker's genuine deltas, each pinned in
+tests/test_supervisor_session_template.py.
 """
 from __future__ import annotations
 
 import logging
-from uuid import uuid4
 
-from api.sandbox.session import BaseSandboxSession
 from api.sandbox.state import DockerSandboxState, SandboxState
+from api.sandbox.supervisor_session import SupervisorSandboxSession
 
 log = logging.getLogger(__name__)
 
 
-class DockerSandboxSession(BaseSandboxSession):
+class DockerSandboxSession(SupervisorSandboxSession):
     """One running Docker container + supervisor + ACP child."""
 
     volume_provider = "docker"
     _default_root = "/home/agent"
     state: DockerSandboxState
+
+    _provider_mod = "docker"
+    _health_fail_msg = "Supervisor not responding at {url} after create_sandbox"
 
     def __init__(self, *, session_id: str, state: SandboxState) -> None:
         if not isinstance(state, DockerSandboxState):
@@ -38,135 +31,37 @@ class DockerSandboxSession(BaseSandboxSession):
         self._container_id: str | None = None
         self._cwd = "/home/agent"
 
-    # ------------------------------------------------------------------ #
-    # start: reattach-or-create + supervisor                              #
-    # ------------------------------------------------------------------ #
+    def _create_kwargs(self) -> dict:
+        # sandbox_ref=session_id becomes the agent-sdk.sandbox-id container
+        # label that reconcile_on_startup filters on — orphan reconciliation
+        # silently breaks without it.
+        return {
+            "resources": self.state.recipe.resources,
+            "sandbox_ref": self.session_id,
+        }
 
-    async def start(self) -> None:
-        if self._supervisor_url is not None and await self.running():
-            return
-
-        from api.providers import docker as dk_provider
-        from api.providers._shared import _wait_for_health
-
-        volume_ref = await self._bootstrap_session()
-
-        # If state has a container id, try to keep it (test invariant:
-        # external stop must restart same container, not provision new).
-        instance = None
-        reattached = False
-        if self.state.sandbox_ref:
-            try:
-                status = await dk_provider.get_sandbox_status(self.state.sandbox_ref)
-                if status == "running":
-                    instance = self._provider_instance(
-                        url=f"http://127.0.0.1:{self.state.listen_port}",
-                        sandbox_ref=self.state.sandbox_ref,
-                        port=self.state.listen_port,
-                    )
-                    reattached = True
-                elif status == "stopped":
-                    # Container exists but stopped (`docker stop` w/o --rm).
-                    # `docker start` revives it on the same image+volume.
-                    await dk_provider.start_sandbox(self.state.sandbox_ref)
-                    instance = self._provider_instance(
-                        url=f"http://127.0.0.1:{self.state.listen_port}",
-                        sandbox_ref=self.state.sandbox_ref,
-                        port=self.state.listen_port,
-                    )
-                    reattached = True
-                # missing/error → fall through to create.
-            except Exception:
-                pass
-
-        if instance is None:
-            instance = await dk_provider.create_sandbox(
-                volume_ref=volume_ref,
-                subpath=self._subpath or f"sessions/{self.session_id}",
-                agent_type=self.state.recipe.agent_type,
-                root=self.state.recipe.root,
-                spawn_env=self._spawn_env,
-                pre_start_commands=self.state.recipe.pre_start_commands or None,
-                shared_mounts=self.state.recipe.shared_mounts or None,
-                resources=self.state.recipe.resources,
-                sandbox_ref=self.session_id,
-            )
-            self.state.sandbox_ref = instance.sandbox_ref
-            self.state.listen_port = instance.port
-
+    def _on_instance_resolved(self, instance) -> None:
         self._container_id = instance.sandbox_ref
-        self._supervisor_url = instance.url
 
-        ok = await _wait_for_health(instance.url, max_retries=10, interval=0.3)
-        if not ok:
-            if reattached:
-                # We reattached to an existing container but its supervisor is
-                # unreachable and couldn't be revived in place. DESTROY the
-                # wedged container so the NEXT get_session sees it as missing
-                # and cold-creates a fresh one. Merely nulling the in-memory
-                # ref is not enough: the DB row still carries the old ref, so
-                # the next recovery reattaches to the same wedged container and
-                # loops forever. The volume (and its per-turn snapshot) survive
-                # the rm, so the fresh container restores conversation state.
-                try:
-                    await dk_provider.destroy_sandbox(instance)
-                except Exception:
-                    log.exception(
-                        "failed to destroy wedged container %s; next recovery "
-                        "may reattach to it", (self._container_id or "")[:16],
-                    )
-                self.state.sandbox_ref = None
-            raise RuntimeError(
-                f"Supervisor not responding at {instance.url} after create_sandbox"
-            )
-
-        self.liveness.observe_chunk()
-
-        if self._acp_session_id is None:
-            self._acp_session_id = str(uuid4())
-        await self._attach_acp()
-
-        log.info(
-            "DockerSandboxSession started: session=%s container=%s url=%s",
-            self.session_id, (self._container_id or "")[:16], instance.url,
-        )
-
-    # running() and _liveness_probe() inherited from BaseSandboxSession.
-
-    # ------------------------------------------------------------------ #
-    # stop: snapshot then container stop                                  #
-    # ------------------------------------------------------------------ #
-
-    async def stop(self) -> None:
-        if self._container_id is None:
-            return
-        # Snapshot via supervisor's /v1/snapshot endpoint (same shape as
-        # daytona). Local volume FS is POSIX so this is fast.
-        await self._write_snapshot("/v/snapshot.tar")
-
-        # Docker doesn't have a "pause" — stop_sandbox stops the container
-        # (the container row persists and is restartable). Per docs §15.3 we
-        # still want pause-like semantics; on docker that means: stop, but keep
-        # the volume. We then clear sandbox_ref below, so the next start on this
-        # session cold-creates a fresh container against the same volume
-        # subpath, restoring from snapshot.
-        from api.providers import docker as dk_provider
+    async def _on_wedged_reattach(self, mod, instance) -> None:
+        # DESTROY the wedged container so the NEXT get_session sees it as
+        # missing and cold-creates. Merely nulling the in-memory ref is not
+        # enough: the DB row still carries the old ref, so the next recovery
+        # would reattach to the same wedged container and loop forever. The
+        # volume (and its per-turn snapshot) survive the rm.
         try:
-            await dk_provider.stop_sandbox(self._provider_instance(
-                url=self._supervisor_url or "",
-                sandbox_ref=self.state.sandbox_ref or "",
-                port=self.state.listen_port,
-            ))
+            await mod.destroy_sandbox(instance)
         except Exception:
-            log.exception("docker.stop_sandbox failed for session %s", self.session_id)
-        # Container row persists (docker stop, not rm); clear sandbox_ref so
-        # next start cold-creates instead of reattaching to the stopped one.
+            log.exception(
+                "failed to destroy wedged container %s; next recovery "
+                "may reattach to it", (self._container_id or "")[:16],
+            )
         self.state.sandbox_ref = None
-        self.state.listen_port = None
 
-    # ------------------------------------------------------------------ #
-    # shutdown: in-memory cleanup                                         #
-    # ------------------------------------------------------------------ #
+    def _stop_ready(self) -> bool:
+        # Guard on the in-memory handle (set only by a start() in THIS
+        # process): a reloaded-but-never-started session skips snapshot+stop.
+        return self._container_id is not None
 
     async def shutdown(self) -> None:
         self._container_id = None  # provider-specific handle; rest is base

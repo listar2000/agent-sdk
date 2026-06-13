@@ -150,13 +150,13 @@ class SessionPool:
             cached = self._active.get(session_id)
             handed_off_subscribers: dict[str, _Subscriber] = {}
             if cached is not None:
-                # Force-probe so an externally-killed supervisor is detected
-                # immediately, even if the previous prompt's last chunk was
-                # observed seconds ago (the test 7 race class).
-                alive = await cached.running(force_probe=True)
+                # running() probes the supervisor NOW (no cached verdict), so
+                # an externally-killed supervisor is detected immediately even
+                # if the previous prompt's last chunk was observed seconds ago
+                # (the test 7 race class).
+                alive = await cached.running()
                 log.info("[pool.get_session] session=%s cached=True alive=%s peek=%s", session_id, alive, peek)
                 if alive:
-                    cached.liveness.observe_activity()
                     return cached
                 # Not alive. In peek mode, don't tear down or replace —
                 # caller wants a snapshot of state, not a side-effect.
@@ -357,10 +357,8 @@ class SessionPool:
         ``Liveness._last_compute_at`` (prompt chunks + successful health
         probes) plus an ``in_flight`` gate for chunk-silent long turns.
         Subscriber presence is NO LONGER consulted: an open /events
-        consumer (dashboard, monitor, idle chat UI) marks the session
-        ``alive`` for the re-probe path via ``observe_activity`` but does
-        not advance the compute clock, so it can no longer pin an idle
-        sandbox. A reaped session keeps its conversation (session/load) and
+        consumer (dashboard, monitor, idle chat UI) does not advance the
+        compute clock, so it can no longer pin an idle sandbox. A reaped session keeps its conversation (session/load) and
         cold-resumes on the next message; an SSE consumer reconnects.
         """
         # Never hibernate mid-prompt — even a multi-minute, chunk-silent

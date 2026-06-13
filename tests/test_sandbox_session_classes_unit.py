@@ -3,7 +3,7 @@
 Fast feedback for the bits the live golden suite exercises end-to-end:
 Pydantic round-trip of the discriminated SandboxState union, factory
 dispatch from state to concrete SandboxSession class, and the Liveness
-state machine (including ``force_probe`` for the external-supervisor-kill
+probe-runner contract (always-probe semantics for the external-supervisor-kill
 race characterized in the recovery tests).
 """
 import asyncio
@@ -90,84 +90,60 @@ class TestFactoryDispatch:
 
 
 # ---------------------------------------------------------------------------
-# liveness.py — state machine
+# liveness.py — probe runner + reaper signals (no cached state machine: every
+# is_alive() probes, so a stale-positive verdict — the "test 7" race, external
+# supervisor kill between prompts — is inexpressible by construction)
 # ---------------------------------------------------------------------------
 
 class TestLiveness:
-    def test_initial_state_is_unknown(self):
-        live = Liveness()
-        assert live.state == "unknown"
-
-    def test_observe_chunk_marks_alive(self):
-        live = Liveness()
-        live.observe_chunk()
-        assert live.state == "alive"
-
-    def test_observe_close_drops_alive_to_unknown(self):
-        live = Liveness()
-        live.observe_chunk()
-        live.observe_close()
-        assert live.state == "unknown"
-
-    def test_observe_error_marks_dead(self):
-        live = Liveness()
-        live.observe_chunk()
-        live.observe_error()
-        assert live.state == "dead"
-
-    def test_observe_activity_does_not_revive_dead_session(self):
-        live = Liveness()
-        live.observe_error()
-        live.observe_activity()
-        assert live.state == "dead"
-
     @pytest.mark.asyncio
-    async def test_is_alive_returns_true_when_recently_observed(self):
-        live = Liveness()
-        live.observe_chunk()
+    async def test_is_alive_always_probes(self):
+        probe_calls = []
+
+        async def _probe() -> bool:
+            probe_calls.append(1)
+            return True
+
+        live = Liveness(probe=_probe)
+        live.observe_chunk()           # compute activity must NOT cache a verdict
         assert await live.is_alive() is True
+        assert await live.is_alive() is True
+        assert probe_calls == [1, 1], "every is_alive() must hit the probe"
 
     @pytest.mark.asyncio
-    async def test_is_alive_returns_false_when_dead(self):
+    async def test_is_alive_false_on_probe_failure_or_timeout(self):
+        async def _dead() -> bool:
+            return False
+
+        async def _hang() -> bool:
+            await asyncio.sleep(60)
+            return True
+
+        assert await Liveness(probe=_dead).is_alive() is False
+        assert await Liveness(probe=_hang).is_alive(probe_timeout_s=0.05) is False
+
+    @pytest.mark.asyncio
+    async def test_no_probe_reports_alive(self):
+        # No probe configured = nothing claims the compute is dead; sessions
+        # that can't be probed (native overrides running() anyway) must not
+        # trigger pool recovery.
+        assert await Liveness().is_alive() is True
+
+    def test_compute_clock_only_moves_on_chunks(self):
         live = Liveness()
-        live.observe_error()
-        assert await live.is_alive() is False
+        assert live._last_compute_at is None
+        live.observe_chunk()
+        assert live._last_compute_at is not None
 
-    @pytest.mark.asyncio
-    async def test_is_alive_probes_when_unknown(self):
-        probe_calls = []
-
-        async def _probe() -> bool:
-            probe_calls.append(1)
-            return True
-
-        live = Liveness(probe=_probe)
-        result = await live.is_alive()
-        assert result is True
-        assert probe_calls == [1]
-
-    @pytest.mark.asyncio
-    async def test_force_probe_runs_even_when_alive(self):
-        """``force_probe=True`` must override the cached ``alive`` state.
-        The "test 7" race (external supervisor kill between prompts —
-        see test_persistent_sse_supervisor_killed_immediate_message) makes
-        the cached signal stale-positive: supervisor was alive when we
-        last observed a chunk, but is dead now. force_probe MUST hit
-        the probe to detect this. Tolerance for transient probe failures
-        (e.g. Daytona's signed-URL 502 propagation) is the responsibility
-        of the per-provider _liveness_probe (bounded retry there), not
-        this oracle's caching policy.
-        """
-        probe_calls = []
-
-        async def _probe() -> bool:
-            probe_calls.append(1)
-            return True
-
-        live = Liveness(probe=_probe)
-        live.observe_chunk()  # state = alive, no probe needed
-        await live.is_alive(force_probe=True)
-        assert probe_calls == [1], "force_probe should bypass the alive cache"
+    def test_in_flight_counter_reentrant_and_floored(self):
+        live = Liveness()
+        assert live.in_flight is False
+        live.observe_prompt_start(); live.observe_prompt_start()
+        assert live.in_flight is True
+        live.observe_prompt_end()
+        assert live.in_flight is True
+        live.observe_prompt_end(); live.observe_prompt_end()   # extra end: floored
+        assert live.in_flight is False
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +239,7 @@ class _MiniSession(BaseSandboxSession):
     async def start(self) -> None:
         pass
 
-    async def running(self, *, force_probe: bool = False) -> bool:
+    async def running(self) -> bool:
         return False
 
     async def execute_prompt(self, *args, **kwargs):
