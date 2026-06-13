@@ -25,9 +25,28 @@ import respx
 
 from api.sandbox.pool import (
     _credential_refresh_loop,
+    _should_spawn_credential_refresh,
     _write_credentials_via_supervisor,
 )
 from api.sandbox.state import Recipe, deserialize, serialize
+
+
+def test_credential_refresh_not_spawned_without_supervisor():
+    """Native sessions have no supervisor (supervisor_url is always None) and
+    can't receive supervisor-written credential files — the loop would only poll
+    forever and discard responses, so it must NOT be spawned for them. Supervisor
+    sessions (a real supervisor_url) still spawn it."""
+    with_url = Recipe(credential_refresh_url="https://creds/refresh")
+    no_url = Recipe()
+
+    # native: has the URL but no supervisor -> do NOT spawn (the gap fix)
+    assert _should_spawn_credential_refresh(with_url, None) is False
+    assert _should_spawn_credential_refresh(with_url, "") is False
+    # supervisor session: URL + a live supervisor -> spawn (unchanged)
+    assert _should_spawn_credential_refresh(with_url, "http://127.0.0.1:8080") is True
+    # no URL configured -> never spawn, regardless of supervisor
+    assert _should_spawn_credential_refresh(no_url, "http://127.0.0.1:8080") is False
+    assert _should_spawn_credential_refresh(no_url, None) is False
 
 
 # ────────────────────────── Recipe persistence ──────────────────────────

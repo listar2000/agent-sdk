@@ -292,7 +292,7 @@ class SessionPool:
             # Cancelled inside ``session.shutdown()`` (every teardown
             # path ends there), so no path can leak it.
             recipe = session.state.recipe
-            if recipe.credential_refresh_url:
+            if _should_spawn_credential_refresh(recipe, session.supervisor_url):
                 session._credential_refresh_task = asyncio.create_task(
                     _credential_refresh_loop(
                         session_id,
@@ -563,6 +563,20 @@ async def _safe_destroy_compute(session: BaseSandboxSession) -> None:
 
 
 # ────────────────────────── credential refresh ──────────────────────────
+
+
+def _should_spawn_credential_refresh(recipe, supervisor_url: str | None) -> bool:
+    """Whether to start the credential-refresh loop for a session.
+
+    The loop writes refreshed credential FILES into the sandbox *via the
+    supervisor* (``_write_credentials_via_supervisor``). A session with no
+    supervisor — the native runtime, which uses a server-side LLM key plus
+    per-exec env rather than credential files — can never write them, so the
+    loop would only poll the URL forever (≤1h cadence) and discard every
+    response: a wasted task and a silently-failing refresh. Gate on a supervisor
+    actually being present (native's ``supervisor_url`` is always None).
+    """
+    return bool(recipe.credential_refresh_url and supervisor_url)
 
 
 async def _credential_refresh_loop(
