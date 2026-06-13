@@ -81,29 +81,37 @@ def reasoning_block(session_id: str, text: str) -> str:
             + json.dumps(text) + _TEXT_SUF)
 
 
+# tool / tool_result fire once per tool call — rarer than text tokens, but a
+# tool-heavy turn emits a pair per call, so they get the same fast string-concat
+# treatment: constant fragments around a single ``json.dumps`` of each dynamic
+# field (the args dict still needs a compact dump for ``rawInput``; result text
+# is one string). Byte-identical to the dict-dump form — pinned by the
+# independent reference in tests/test_native_frames.py.
+_TOOL_PRE = ('data: {"jsonrpc":"2.0","method":"session/update","params":'
+             '{"sessionId":')
+_TOOL_MID = ',"update":{"sessionUpdate":"tool_call","toolCallId":'
+_TOOL_NAME = ',"toolName":'
+_TOOL_RAWIN = ',"rawInput":'
+_TOOL_SUF = ',"status":"pending"}}}'
+_TR_MID = ',"update":{"sessionUpdate":"tool_call_update","toolCallId":'
+_TR_STATUS = (',"status":"completed","content":[{"type":"content","content":'
+              '{"type":"text","text":')
+_TR_SUF = "}}]}}}"
+
+
 def tool_block(session_id: str, tool_call_id: str, tool_name: str,
                args: dict | None) -> str:
-    return _update(session_id, {
-        "sessionUpdate": "tool_call",
-        "toolCallId": tool_call_id,
-        "toolName": tool_name,
-        "rawInput": args or {},
-        "status": "pending",
-    })
+    return (_TOOL_PRE + json.dumps(session_id) + _TOOL_MID
+            + json.dumps(tool_call_id) + _TOOL_NAME + json.dumps(tool_name)
+            + _TOOL_RAWIN + json.dumps(args or {}, separators=_COMPACT)
+            + _TOOL_SUF)
 
 
 def tool_result_block(session_id: str, tool_call_id: str, tool_name: str,
                       result_text: str) -> str:
-    return _update(session_id, {
-        "sessionUpdate": "tool_call_update",
-        "toolCallId": tool_call_id,
-        "toolName": tool_name,
-        "status": "completed",
-        "content": [{
-            "type": "content",
-            "content": {"type": "text", "text": result_text},
-        }],
-    })
+    return (_TOOL_PRE + json.dumps(session_id) + _TR_MID
+            + json.dumps(tool_call_id) + _TOOL_NAME + json.dumps(tool_name)
+            + _TR_STATUS + json.dumps(result_text) + _TR_SUF)
 
 
 def usage_block(session_id: str, input_tokens: int, output_tokens: int,
@@ -166,19 +174,22 @@ class FrameEncoder:
 
     ``session_id`` is fixed for a session's whole life, so ``json.dumps`` of it
     (and the fixed envelope around it) is computed ONCE here instead of on every
-    ``text``/``reasoning`` event. Output is byte-identical to the stateless
-    module functions (same fragments, same ``json.dumps`` of the dynamic field);
-    the cold templates (tool/tool_result/usage/done/error) delegate straight to
-    ``block_for_event``. NativeSession holds one of these per session.
+    event. Output is byte-identical to the stateless module functions (same
+    fragments, same ``json.dumps`` of the dynamic fields); the remaining cold
+    templates (usage/done/error — once per turn) delegate to ``block_for_event``.
+    NativeSession holds one of these per session.
     """
 
-    __slots__ = ("session_id", "_text_pre", "_reason_pre")
+    __slots__ = ("session_id", "_text_pre", "_reason_pre", "_tool_pre",
+                 "_tr_pre")
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         sid = json.dumps(session_id)
         self._text_pre = _TEXT_PRE + sid + _TEXT_MID
         self._reason_pre = _TEXT_PRE + sid + _REASON_MID
+        self._tool_pre = _TOOL_PRE + sid + _TOOL_MID
+        self._tr_pre = _TOOL_PRE + sid + _TR_MID
 
     def block_for_event(self, event: dict[str, Any], rpc_id: str) -> str:
         t = event["type"]
@@ -186,4 +197,13 @@ class FrameEncoder:
             return self._text_pre + json.dumps(event["text"]) + _TEXT_SUF
         if t == "reasoning":
             return self._reason_pre + json.dumps(event["text"]) + _TEXT_SUF
+        if t == "tool":
+            return (self._tool_pre + json.dumps(event["tool_call_id"])
+                    + _TOOL_NAME + json.dumps(event["tool_name"]) + _TOOL_RAWIN
+                    + json.dumps(event.get("args") or {}, separators=_COMPACT)
+                    + _TOOL_SUF)
+        if t == "tool_result":
+            return (self._tr_pre + json.dumps(event["tool_call_id"])
+                    + _TOOL_NAME + json.dumps(event["tool_name"]) + _TR_STATUS
+                    + json.dumps(str(event["result"])) + _TR_SUF)
         return block_for_event(event, rpc_id, self.session_id)

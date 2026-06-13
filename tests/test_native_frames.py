@@ -172,6 +172,47 @@ def test_text_reasoning_byte_parity_with_reference():
                 sid, s, thought=True), (sid, s)
 
 
+def _ref_tool_block(session_id, tool_call_id, tool_name, args):
+    return "data: " + json.dumps({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": session_id, "update": {
+            "sessionUpdate": "tool_call", "toolCallId": tool_call_id,
+            "toolName": tool_name, "rawInput": args or {},
+            "status": "pending",
+        }},
+    }, separators=(",", ":"))
+
+
+def _ref_tool_result_block(session_id, tool_call_id, tool_name, result_text):
+    return "data: " + json.dumps({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": session_id, "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": tool_call_id,
+            "toolName": tool_name, "status": "completed",
+            "content": [{"type": "content",
+                         "content": {"type": "text", "text": result_text}}],
+        }},
+    }, separators=(",", ":"))
+
+
+def test_tool_and_tool_result_byte_parity_with_reference():
+    """The hand-concatenated tool/tool_result templates must byte-match an
+    INDEPENDENT dict-dump reference across adversarial ids, names, args, and
+    results — a wrong brace/fragment fails here, not silently on the wire."""
+    args_corpus = [None, {}, {"command": "ls -la", "n": 3},
+                   {"k": 'v"x', "u": "é🚀", "nested": {"a": [1, 2]}},
+                   {"}}}": "]injection["}]
+    for sid in _ADVERSARIAL_SIDS:
+        for tcid in ("c1", 'c"x', ""):
+            for name in ("bash", 'wr"ite', "漢字"):
+                for r in _ADVERSARIAL:
+                    assert frames.tool_result_block(sid, tcid, name, r) == \
+                        _ref_tool_result_block(sid, tcid, name, r), (sid, tcid, r)
+                for a in args_corpus:
+                    assert frames.tool_block(sid, tcid, name, a) == \
+                        _ref_tool_block(sid, tcid, name, a), (sid, tcid, a)
+
+
 def test_frame_encoder_matches_stateless_functions():
     """FrameEncoder must emit byte-identical frames to the module-level
     block_for_event for every event type — it only caches the session prefix."""
