@@ -118,6 +118,10 @@ async def test_broadcast_yield_parity_text_turn():
     ]])
     broadcasts = []
     s._broadcast = lambda item: broadcasts.append(item)
+    # A live watcher must be present for blocks to be synthesized at all — emit
+    # gates FrameEncoder synthesis on a non-empty subscriber set (no-watcher
+    # turns skip it). The sentinel makes the guard truthy; _broadcast is mocked.
+    s._subscribers["probe"] = object()
 
     yielded = [ev async for ev in s.execute_prompt("hi", rpc_id="rpc-1")]
 
@@ -129,6 +133,52 @@ async def test_broadcast_yield_parity_text_turn():
         assert parse_acp_event(block, "rpc-1") == ev
     assert [e["type"] for e in yielded] == ["text", "usage", "done"]
     assert yielded[-1]["stop_reason"] == "end_turn"
+
+
+class _CountingFrames:
+    """Wraps a FrameEncoder to count block_for_event calls (FrameEncoder has
+    __slots__, so the bound method can't be patched on the instance)."""
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+
+    def block_for_event(self, event, rpc_id):
+        self.calls += 1
+        return self.inner.block_for_event(event, rpc_id)
+
+
+@pytest.mark.asyncio
+async def test_no_subscriber_skips_frame_synthesis():
+    """The broadcast block (FrameEncoder SSE synthesis) is consumed ONLY by live
+    subscribers; the primary consumer (TurnRunner) pulls the raw event dict off
+    the queue. A turn with NO live watcher — the common fire-and-forget case —
+    must skip per-event frame synthesis entirely. Pins the MECHANISM (the bytes
+    are identical either way, so only a call-count probe catches a regression):
+    block_for_event fires once per event WITH a subscriber, zero WITHOUT."""
+    chunks = [[
+        _Chunk(_Delta(content="Hel")),
+        _Chunk(_Delta(content="lo")),
+        _Chunk(usage=_Usage(5, 2)),
+    ]]  # → text, text, usage, done = 4 events
+
+    # no subscriber → no synthesis at all
+    s = _make_session(list(chunks))
+    s._frames = _CountingFrames(s._frames)
+    s._broadcast = lambda item: None
+    types = [ev["type"] async for ev in s.execute_prompt("hi", rpc_id="r-nosub")]
+    assert types == ["text", "text", "usage", "done"]
+    assert s._frames.calls == 0, (
+        f"frame synthesis ran {s._frames.calls}× with no subscriber — emit must "
+        "gate block_for_event on a non-empty subscriber set")
+
+    # a live watcher present → one synthesis per emitted event
+    s2 = _make_session(list(chunks))
+    s2._frames = _CountingFrames(s2._frames)
+    s2._broadcast = lambda item: None
+    s2._subscribers["probe"] = object()
+    n = len([ev async for ev in s2.execute_prompt("hi", rpc_id="r-sub")])
+    assert s2._frames.calls == n == 4, (
+        f"expected one synthesis per event (4), got {s2._frames.calls}")
 
 
 @pytest.mark.asyncio

@@ -215,8 +215,19 @@ class NativeSession(BaseSandboxSession):
         queue: asyncio.Queue = asyncio.Queue()
 
         async def emit(event: dict) -> None:
-            block = self._frames.block_for_event(event, rpc_id)
-            self._broadcast((rpc_id, block))
+            # The broadcast block (FrameEncoder SSE synthesis) is consumed ONLY
+            # by live subscribers; the primary consumer (TurnRunner) pulls the
+            # raw event dict off the queue below. _broadcast already early-returns
+            # with no subscribers, so gate the synthesis on the SAME check: a turn
+            # with no live watcher (fire-and-forget /message, background drains —
+            # the common case) skips per-event frame synthesis entirely.
+            # block_for_event is stateless per event (only the session-constant
+            # prefix is cached), and _broadcast is live-only (no buffering for
+            # late subscribers), so skipping a no-subscriber event's block never
+            # affects a later subscriber's stream — it was delivered to nobody.
+            if self._subscribers:
+                self._broadcast(
+                    (rpc_id, self._frames.block_for_event(event, rpc_id)))
             self.liveness.observe_chunk()
             # Unbounded SPSC queue: put_nowait never raises QueueFull, and on an
             # unbounded queue ``await queue.put`` never suspends anyway — so the
