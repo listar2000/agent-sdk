@@ -21,11 +21,13 @@ log = logging.getLogger(__name__)
 
 # Fast JSON serialization for hot write paths. psycopg adapts a ``Json`` param by
 # calling ``dumps`` INLINE during ``execute`` — on the event-loop thread, holding
-# the GIL — so for a large payload (the per-turn native checkpoint re-serializes
-# the whole transcript) stdlib ``json.dumps`` blocks every other session on the
-# replica for the duration. orjson is ~3-5× faster; we wrap it to return ``str``
-# (it emits ``bytes``) since ``Json`` re-encodes. Optional: fall back to stdlib so
-# a deploy without orjson still works (the import guard makes it a soft dep).
+# the GIL — so stdlib ``json.dumps`` blocks every other session on the replica for
+# the duration. That hurts most on the per-turn native checkpoint (full transcript,
+# native only) but also on the per-event ``session_log`` write, which EVERY provider
+# (docker/daytona/modal/native) does through ``log_event`` / the batcher. orjson is
+# ~3-5× faster; we wrap it to return ``str`` (it emits ``bytes``) since ``Json``
+# re-encodes. Optional: fall back to stdlib so a deploy without orjson still works
+# (the import guard makes it a soft dep).
 try:
     import orjson as _orjson
 
@@ -713,7 +715,7 @@ async def log_event(*, session_id: str, agent_id: str,
     await _exec(
         "INSERT INTO session_log (session_id, agent_id, event_type, payload)"
         " VALUES (%s, %s, %s, %s)",
-        (session_id, agent_id, event_type, Json(payload)),
+        (session_id, agent_id, event_type, _FastJson(payload)),
     )
 
 

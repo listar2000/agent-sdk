@@ -25,8 +25,6 @@ import logging
 import os
 from typing import Any
 
-from psycopg.types.json import Json
-
 log = logging.getLogger(__name__)
 
 
@@ -110,7 +108,7 @@ class SessionLogBatcher:
                     await cur.executemany(
                         "INSERT INTO session_log (session_id, agent_id, event_type, payload)"
                         " VALUES (%s, %s, %s, %s)",
-                        [(sid, aid, et, Json(p)) for (sid, aid, et, p) in batch],
+                        [(sid, aid, et, _db._FastJson(p)) for (sid, aid, et, p) in batch],
                     )
         except Exception:
             log.exception("session_log batch flush failed (n=%d) — events dropped", len(batch))
