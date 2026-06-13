@@ -160,26 +160,28 @@ async def run_turn(
     tool_schemas = [t.schema for t in tools.values()] or None
     total_usage: dict[str, Any] = {}
 
-    for _turn in range(spec.max_turns):
-        kwargs: dict[str, Any] = {
-            "model": spec.model,
-            "messages": messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tool_schemas:
-            kwargs["tools"] = tool_schemas
-        if spec.temperature is not None:
-            kwargs["temperature"] = spec.temperature
-        if spec.max_tokens is not None:
-            kwargs["max_tokens"] = spec.max_tokens
-        if api_key:
-            kwargs["api_key"] = api_key
+    # Per-call kwargs are constant across a turn's model rounds — only
+    # ``messages`` grows (in place) — so build them once instead of
+    # re-evaluating the conditionals and rebuilding the dict every round.
+    call_kwargs: dict[str, Any] = {
+        "model": spec.model,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if tool_schemas:
+        call_kwargs["tools"] = tool_schemas
+    if spec.temperature is not None:
+        call_kwargs["temperature"] = spec.temperature
+    if spec.max_tokens is not None:
+        call_kwargs["max_tokens"] = spec.max_tokens
+    if api_key:
+        call_kwargs["api_key"] = api_key
 
+    for _turn in range(spec.max_turns):
         text_parts: list[str] = []
         tool_calls: dict[int, _ToolCallAccum] = {}
 
-        stream = await completion(**kwargs)
+        stream = await completion(messages=messages, **call_kwargs)
         async for chunk in stream:
             usage = getattr(chunk, "usage", None)
             if usage is not None:
