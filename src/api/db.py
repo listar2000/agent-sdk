@@ -910,6 +910,48 @@ async def error_timeseries(*, since_s: float | None = None, buckets: int = 48,
     return {"t0": t0, "bucket_s": bucket_s, "counts": counts}
 
 
+async def op_timeseries(*, since_s: float | None = None, buckets: int = 24) -> dict:
+    """Per (provider, operation): call totals + failures bucketed over time —
+    the data behind the dashboard's per-row error-rate sparklines.
+
+    Returns ``{"t0":..., "bucket_s":..., "buckets": N, "series": {key: {"n":
+    [...], "fails": [...]}}}`` where ``key`` is ``"<provider>\\t<operation>"``
+    (empty string for a NULL provider, to match the UI's key) and each list is
+    length ``buckets``, zero-filled. The UI computes rate = fails/n per bucket
+    (a bucket with n==0 is a gap)."""
+    import time as _time
+    from datetime import datetime, timezone
+
+    buckets = max(1, min(int(buckets), 240))
+    now = _time.time()
+    if since_s is not None:
+        t0 = float(since_s)
+    else:
+        row = await _one("SELECT EXTRACT(EPOCH FROM MIN(ts)) AS t0 FROM op_events")
+        t0 = float(row["t0"]) if row and row["t0"] is not None else now - 3600.0
+
+    span = max(now - t0, 1.0)
+    bucket_s = span / buckets
+    rows = await _all(
+        "SELECT provider, operation,"
+        " width_bucket(EXTRACT(EPOCH FROM ts), %s, %s, %s) AS b,"
+        " COUNT(*) AS n, COUNT(*) FILTER (WHERE NOT ok) AS fails"
+        " FROM op_events WHERE ts >= %s"
+        " GROUP BY provider, operation, b",
+        (t0, now, buckets, datetime.fromtimestamp(t0, tz=timezone.utc)),
+    )
+    series: dict = {}
+    for r in rows:
+        if r["b"] is None:
+            continue
+        key = f"{r['provider'] or ''}\t{r['operation']}"
+        s = series.setdefault(key, {"n": [0] * buckets, "fails": [0] * buckets})
+        i = min(max(int(r["b"]) - 1, 0), buckets - 1)
+        s["n"][i] += r["n"]
+        s["fails"][i] += r["fails"] or 0
+    return {"t0": t0, "bucket_s": bucket_s, "buckets": buckets, "series": series}
+
+
 async def _group_errors(group_col: str, *, scope: str, since_s: float | None) -> dict:
     """``{value: count}`` over error_events grouped by one column.
 
@@ -963,6 +1005,7 @@ async def get_metrics_summary(*, since_s: float | None = None) -> dict:
             "total": sum(lk.values()),
         },
         "ops": await get_op_stats(since_s=since_s),
+        "ops_timeseries": await op_timeseries(since_s=since_s),
         "recent": await get_error_events(since_s=since_s, limit=100),
     }
 

@@ -45,9 +45,9 @@
   .muted { color: var(--muted); }
   .empty { color: var(--muted); padding: 16px; text-align: center; }
   .err { color: #ffb4c4; font-size: 12px; }
-  /* per-operation error-rate bar (one per row + per op-group header) */
-  .frbar { display: inline-block; width: 54px; height: 7px; background: #EDF0F3; border-radius: 3px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
-  .frbar-fill { display: block; height: 100%; border-radius: 3px; min-width: 0; }
+  /* per-operation error-rate sparkline OVER TIME (one per row + per op-group header) */
+  .spark { display: inline-block; width: 64px; height: 16px; vertical-align: middle; margin-right: 7px; background: #F6F8FA; border-radius: 3px; }
+  .spark.empty { opacity: .4; }
   /* errors-over-time graph */
   .graph svg { display: block; width: 100%; height: 96px; }
   .graph .axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 3px; }
@@ -119,16 +119,38 @@ function catPill(c) {
   return `<span class="pill ${cls}">${c || "—"}</span>`;
 }
 
-// Small inline bar for an operation's fail rate (fixed 0–100% scale; any
-// non-zero rate gets a visible minimum so "flaky" reads at a glance, green=0).
-function frBar(rate) {
-  rate = rate || 0;
-  const pct = rate * 100;
-  const w = rate > 0 ? Math.max(6, Math.min(100, pct)) : 0;
-  const col = rate >= 0.20 ? '#E01E5A' : (rate >= 0.05 ? '#ECB22E'
-            : (rate > 0 ? '#E8912D' : '#2EB67D'));
-  return `<span class="frbar" title="${pct.toFixed(1)}% fail rate">` +
-         `<span class="frbar-fill" style="width:${w}%;background:${col}"></span></span>`;
+// Per-operation error-rate sparkline OVER TIME. ``s`` = {n:[...], fails:[...]}
+// (from /metrics ops_timeseries) — one mini bar per time bucket, height ∝ the
+// bucket's fail rate (fails/n), severity-colored; a bucket with no calls is a
+// faint baseline tick (a gap in activity, not a 0% success).
+function opSpark(s, t0, bucketS) {
+  if (!s || !s.n || !s.n.length) return '<span class="spark empty"></span>';
+  const n = s.n, f = s.fails, len = n.length, W = 64, H = 16, bw = W / len;
+  let bars = "";
+  for (let i = 0; i < len; i++) {
+    const x = (i * bw).toFixed(1), bww = Math.max(0.6, bw - 0.6).toFixed(1);
+    if (!n[i]) { bars += `<rect x="${x}" y="${H - 1}" width="${bww}" height="1" fill="#DDE3E9"/>`; continue; }
+    const rate = f[i] / n[i];
+    const h = rate > 0 ? Math.max(2, rate * (H - 2)) : 1.4;
+    const col = rate >= 0.20 ? '#E01E5A' : (rate >= 0.05 ? '#ECB22E' : (rate > 0 ? '#E8912D' : '#9FCBA8'));
+    let tip = (rate * 100).toFixed(0) + "% fail (" + f[i] + "/" + n[i] + ")";
+    if (t0 != null) tip = new Date((t0 + (i + 0.5) * bucketS) * 1000).toLocaleTimeString(undefined, { hour12: false }) + " · " + tip;
+    bars += `<rect x="${x}" y="${(H - h).toFixed(1)}" width="${bww}" height="${h.toFixed(1)}" fill="${col}"><title>${tip}</title></rect>`;
+  }
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${bars}</svg>`;
+}
+
+// Aggregate sparkline for an op group: element-wise sum of its providers' series.
+function aggSpark(rows, ts) {
+  const b = (ts && ts.buckets) || 0;
+  if (!b) return '<span class="spark empty"></span>';
+  const n = new Array(b).fill(0), f = new Array(b).fill(0);
+  for (const o of rows) {
+    const s = ts.series[(o.provider || '') + '\t' + o.operation];
+    if (!s) continue;
+    for (let i = 0; i < b; i++) { n[i] += s.n[i] || 0; f[i] += s.fails[i] || 0; }
+  }
+  return opSpark({ n, fails: f }, ts.t0, ts.bucket_s);
 }
 
 // SVG bar chart of errors per time bucket (errors.timeseries from /metrics).
@@ -180,6 +202,7 @@ async function load() {
   $("byLeak").innerHTML = chips(m.leaks.by_kind, true);
 
   const ops = m.ops || [];
+  const opsTs = m.ops_timeseries || { series: {}, buckets: 0 };
   if (!ops.length) {
     $("ops").innerHTML = '<tr><td colspan="7" class="muted">no operations in window</td></tr>';
   } else {
@@ -196,16 +219,16 @@ async function load() {
       return `<tr><td style="padding-left:20px" class="muted">${o.operation}</td>` +
         `<td><b>${o.provider ?? "—"}</b></td><td>${o.count}</td>` +
         `<td>${o.fails ? '<b style="color:#E01E5A">' + o.fails + '</b>' : 0}</td>` +
-        `<td>${frBar(o.fail_rate)}<span style="${o.fail_rate > 0 ? 'color:#E01E5A;font-weight:700' : 'color:#9098A0'}">${fr}</span></td>` +
+        `<td>${opSpark(opsTs.series[(o.provider || '') + '\t' + o.operation], opsTs.t0, opsTs.bucket_s)}` +
+        `<span style="${o.fail_rate > 0 ? 'color:#E01E5A;font-weight:700' : 'color:#9098A0'}">${fr}</span></td>` +
         `<td>${o.p50_ms ?? "—"}</td><td>${o.p95_ms ?? "—"}</td></tr>`;
     };
     $("ops").innerHTML = opNames.map(op => {
       const rows = byOp[op].slice().sort((a, b) => ((b.p95_ms || 0) - (a.p95_ms || 0)) || (b.fail_rate - a.fail_rate));
       const calls = rows.reduce((s, o) => s + o.count, 0);
       const fails = rows.reduce((s, o) => s + o.fails, 0);
-      const grpRate = calls ? fails / calls : 0;
       const hdr = `<tr><td colspan="7" style="background:#F2F6FB;font-weight:700;color:#1264A3;border-top:2px solid #D8DEE6">` +
-        `${frBar(grpRate)}${op} <span class="muted" style="font-weight:400">· ${rows.length} provider${rows.length > 1 ? 's' : ''} · ${calls} calls` +
+        `${aggSpark(rows, opsTs)}${op} <span class="muted" style="font-weight:400">· ${rows.length} provider${rows.length > 1 ? 's' : ''} · ${calls} calls` +
         `${fails ? ' · <b style="color:#E01E5A">' + fails + ' fails</b>' : ''}</span></td></tr>`;
       return hdr + rows.map(row).join("");
     }).join("");
