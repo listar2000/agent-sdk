@@ -55,6 +55,7 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
 | checkpoint write | INSERT…ON CONFLICT + separate DELETE prune → one data-modifying-CTE statement | **2 DB round-trips/turn → 1** on the turn-completion path (remote-PG latency) |
 | tool schemas | `Tool.schema` rebuilt per turn → precomputed once in `__post_init__` | **4.8×/turn** (485→102 ns); ~20 dict allocs/turn dropped |
 | model-call kwargs | rebuilt every model round → hoisted, constant once per turn | per-round dict rebuild dropped on multi-round tool turns |
+| **parallel tool-calling** | a round's multiple tool calls ran SEQUENTIALLY (round = Σ tool latencies) → `asyncio.gather`, **bounded** to a per-agent cap (default 8) | **N× per-round** for N independent tools (16 calls @ 20ms: ~320ms → ~43ms); cap = fixed per-turn resource ceiling. Verified end-to-end: recovery (one sandbox), persistence order, config flow |
 
 ## Reliability
 
