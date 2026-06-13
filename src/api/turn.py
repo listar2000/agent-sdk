@@ -285,6 +285,13 @@ class TurnRunner:
                             "execute_prompt retry: session %s recovered rpc=%s",
                             self.session.session_id, self.rpc_id,
                         )
+                        try:
+                            from .metrics import get_metrics
+                            get_metrics().record_recovery(
+                                "mid_turn_swap",
+                                session_id=self.session.session_id, rpc_id=self.rpc_id)
+                        except Exception:
+                            pass
                         self.text_buf.clear(); self.think_buf.clear()
                         self._reset_turn_observability()
                         # Move the in-flight marker onto the session the pool now
@@ -303,6 +310,21 @@ class TurnRunner:
                         "execute_prompt failed for session %s rpc=%s: %s",
                         self.session.session_id, self.rpc_id, e,
                     )
+                    # Fire-and-forget turns (POST /message) already returned
+                    # 200 + rpc_id, so this failure never reaches an HTTP
+                    # exception handler — record it explicitly. The sentinel
+                    # keeps it from double-counting against the logging net's
+                    # capture of the log.exception above.
+                    try:
+                        from .metrics import get_metrics
+                        get_metrics().record_error(
+                            e, category="turn",
+                            session_id=self.session.session_id,
+                            phase="execute_prompt", rpc_id=self.rpc_id,
+                        )
+                        get_metrics().record_turn(False)
+                    except Exception:
+                        pass
                     await self._flush_buffers()
                     await self._write({
                         "type": "error",
@@ -329,6 +351,11 @@ class TurnRunner:
                     })
                 else:
                     self._log_empty_turn_if_needed()
+                    try:
+                        from .metrics import get_metrics
+                        get_metrics().record_turn(True)
+                    except Exception:
+                        pass
             finally:
                 # Release the in-flight marker on whichever session is current
                 # (the original, or the replacement after a recovery swap) so

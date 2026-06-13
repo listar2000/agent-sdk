@@ -21,6 +21,7 @@ import time
 from typing import AsyncIterator
 
 from .identity import replica_id
+from .metrics import get_metrics
 
 log = logging.getLogger("api.timing")
 
@@ -82,6 +83,17 @@ async def timed_phase(name: str, **fields) -> AsyncIterator[None]:
             parts.append(f"err={err}")
         suffix = (" " + " ".join(parts)) if parts else ""
         log.log(level, "[%s] %s %.1fms%s", replica_id(), name, dt_ms, suffix)
+        # Perf signal: per-phase duration + ok/fail. Errors that re-raise are
+        # captured as errors by the HTTP/turn/net paths — here we only record
+        # the timing so e.g. ``sessions.cold_create`` failures surface as a
+        # phase ``fail`` count even when the route swallows them.
+        try:
+            get_metrics().record_phase(
+                name=name, duration_ms=dt_ms, ok=err is None,
+                provider=fields.get("provider"),
+            )
+        except Exception:
+            pass
 
 
 def log_request(
@@ -98,6 +110,10 @@ def log_request(
         level, "[%s] %s %s %s %.1fms%s",
         replica_id(), method, path, status, duration_ms, sid,
     )
+    try:
+        get_metrics().record_request(path=path, status=status, duration_ms=duration_ms)
+    except Exception:
+        pass
 
 
 def extract_session_id(path: str) -> str | None:

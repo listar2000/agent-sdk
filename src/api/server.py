@@ -194,6 +194,12 @@ _HTTP_CLIENT: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app):
     _configure_logging()
+    # Attach the metrics logging net as early as possible so failures during
+    # the rest of startup (init_pool, reconcile, provider warm-up) are
+    # captured. The batcher (durable Postgres writes) starts in the phase
+    # block below once the DB pool is up.
+    from .metrics import get_metrics
+    get_metrics().install()
     # Startup banner — pin replica + pid + addr so a merged tail across
     # replicas (or a single replica restart) is greppable. The same
     # ``replica_id()`` appears in every request line / phase log so you
@@ -230,6 +236,7 @@ async def lifespan(app):
     _p0 = time.perf_counter(); init_db(); _phases["db"] = (time.perf_counter() - _p0) * 1000
     _p0 = time.perf_counter(); await init_pool(); _phases["pool"] = (time.perf_counter() - _p0) * 1000
     _p0 = time.perf_counter(); await start_batcher(); _phases["batcher"] = (time.perf_counter() - _p0) * 1000
+    _p0 = time.perf_counter(); await get_metrics().start_batcher(); _phases["metrics"] = (time.perf_counter() - _p0) * 1000
 
     global _HTTP_CLIENT
     _HTTP_CLIENT = httpx.AsyncClient(
@@ -288,6 +295,10 @@ async def lifespan(app):
         await stop_batcher()
     except Exception as e:
         log.warning("stop_batcher failed: %s", e)
+    try:
+        await get_metrics().stop()
+    except Exception as e:
+        log.warning("stop metrics failed: %s", e)
     await close_pool()
     if _HTTP_CLIENT is not None:
         await _HTTP_CLIENT.aclose()
@@ -304,9 +315,27 @@ async def _log_unhandled(request: Request, exc: Exception):
     if isinstance(exc, StarletteHTTPException):
         if exc.status_code >= 500:
             log.error("HTTP %s %s → %s: %s", request.method, request.url.path, exc.status_code, exc.detail)
+            _record_http_error(request, exc, exc.status_code, exc.detail)
         return await http_exception_handler(request, exc)
     log.error("Unhandled exception in %s %s", request.method, request.url.path, exc_info=exc)
+    _record_http_error(request, exc, 500, str(exc))
     return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+def _record_http_error(request: Request, exc: BaseException, status: int, detail) -> None:
+    """Feed a >=500 response to the metrics reporter. The exception-instance
+    sentinel in ``record_error`` makes this safe to call from both this
+    handler and ``_http_exception_handler`` for the same exception."""
+    try:
+        from .metrics import get_metrics
+        category = "provider" if status == 502 else "http_5xx"
+        get_metrics().record_error(
+            exc, category=category, http_status=status,
+            message=str(detail) if not isinstance(detail, dict) else None,
+            path=request.url.path, method=request.method,
+        )
+    except Exception:
+        pass
 
 
 app.add_middleware(
@@ -352,6 +381,8 @@ async def _request_timing(request: Request, call_next):
 async def _http_exception_handler(request: Request, exc: HTTPException):
     """Uniform error shape: ``{"error": ...}`` for string details, pass-through for dict."""
     detail = exc.detail
+    if exc.status_code >= 500:
+        _record_http_error(request, exc, exc.status_code, detail)
     if isinstance(detail, dict):
         return JSONResponse(detail, status_code=exc.status_code)
     return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
@@ -431,6 +462,69 @@ async def health():
         "sessions": len(active),
         "busy_sessions": sum(1 for s in active.values() if s._subscribers),
     }
+
+
+# ---------------------------------------------------------------------------
+# Metrics / error reporting (see api.metrics)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/metrics")
+async def metrics_json():
+    """Live, in-memory metrics for THIS replica: error counts by
+    category/provider/status, a recent-errors ring buffer, request error
+    rate + latency percentiles, per-phase timings, turn ok/fail.
+
+    Durable, cross-replica history lives in ``GET /admin/errors``."""
+    from .metrics import get_metrics
+    return get_metrics().snapshot()
+
+
+@app.get("/admin/errors")
+async def admin_errors(request: Request):
+    """Durable, cross-replica error log from Postgres.
+
+    Query params: ``category``, ``provider``, ``session_id``, ``since_s``
+    (epoch seconds), ``limit`` (default 200, max 1000)."""
+    q = request.query_params
+    since_s = None
+    if q.get("since_s"):
+        try:
+            since_s = float(q["since_s"])
+        except ValueError:
+            raise HTTPException(400, "since_s must be a number (epoch seconds)")
+    try:
+        limit = min(int(q.get("limit", "200")), 1000)
+    except ValueError:
+        raise HTTPException(400, "limit must be an integer")
+    from . import db as _db
+    events = await _db.get_error_events(
+        since_s=since_s, category=q.get("category"),
+        provider=q.get("provider"), session_id=q.get("session_id"), limit=limit,
+    )
+    return {
+        "events": events,
+        "by_category": await _db.count_errors_by(field="category", since_s=since_s),
+        "by_provider": await _db.count_errors_by(field="provider", since_s=since_s),
+    }
+
+
+@app.get("/admin/ops")
+async def admin_ops(request: Request):
+    """Durable, cross-replica provider/pool operation stats: per
+    (provider, operation) count, failure rate, and latency p50/p95.
+
+    Answers "how flaky / how slow is daytona vs modal" for cold_create,
+    resume, cold_recover, release, destroy, reap. ``?since_s=`` (epoch
+    seconds) windows the stats."""
+    since_s = None
+    if request.query_params.get("since_s"):
+        try:
+            since_s = float(request.query_params["since_s"])
+        except ValueError:
+            raise HTTPException(400, "since_s must be a number (epoch seconds)")
+    from . import db as _db
+    return {"ops": await _db.get_op_stats(since_s=since_s)}
 
 
 # ---------------------------------------------------------------------------
@@ -2004,11 +2098,25 @@ async def _sessions_create_eager(data: dict) -> dict:
     except Exception as e:
         if agent_was_created_here:
             await delete_agent(agent_id)
+        # Attribute the failure to sandbox creation + the provider BEFORE the
+        # log.error (the sentinel then keeps the logging net from re-counting
+        # it). Marking the HTTPException seen keeps the HTTP handler from
+        # double-counting the same logical failure.
+        try:
+            from .metrics import get_metrics
+            get_metrics().record_error(
+                e, category="sandbox_create", provider=provider,
+                session_id=session_id, phase="cold_create")
+        except Exception:
+            pass
         log.error("sessions_create_eager: pool.cold_create failed (provider=%s): %s",
                   provider, e, exc_info=True)
         if "circuit breaker" in str(e).lower():
-            raise HTTPException(503, str(e), headers={"Retry-After": "30"})
-        raise HTTPException(502, f"Provider '{provider}' failed: {e}")
+            _http = HTTPException(503, str(e), headers={"Retry-After": "30"})
+        else:
+            _http = HTTPException(502, f"Provider '{provider}' failed: {e}")
+        setattr(_http, "__asdk_metric_seen__", True)
+        raise _http
 
     # The pool's ``sandbox_state.sandbox_ref`` IS the sandbox identity now —
     # opaque provider ref (e.g. "abc-uuid" for Daytona, "local-abc12" for
@@ -2501,15 +2609,24 @@ async def _destroy_session_compute(session_id: str) -> None:
     # caller still drops the row(s).
     mod = _prov._PROVIDER_MODS.get(provider_type) if provider_type else None
     if mod is not None:
+        from .metrics import get_metrics
         for sandbox_ref in refs:
             try:
-                await mod.destroy_sandbox(_prov.ProviderInstance(
-                    provider=provider_type, url="", root="",
-                    sandbox_ref=sandbox_ref,
-                ))
+                async with get_metrics().timed_op(
+                    provider=provider_type, operation="destroy", session_id=session_id):
+                    await mod.destroy_sandbox(_prov.ProviderInstance(
+                        provider=provider_type, url="", root="",
+                        sandbox_ref=sandbox_ref,
+                    ))
             except Exception as e:
+                # A destroy that fails leaves provider compute behind — a leak.
                 log.warning("teardown %s: provider destroy failed (%s %s): %s",
                             session_id, provider_type, sandbox_ref[:16], e)
+                try:
+                    get_metrics().record_leak("destroy_failed", provider=provider_type,
+                                              session_id=session_id, exc=e)
+                except Exception:
+                    pass
 
 
 @app.delete("/sessions/{session_id}", status_code=204)
@@ -2970,6 +3087,12 @@ async def serve_ui():
 async def serve_dashboard():
     """Serve the validation dashboard."""
     return _serve_ui_file("dashboard.html", "Dashboard")
+
+
+@app.get("/ui/errors")
+async def serve_errors_ui():
+    """Serve the error / metrics monitoring dashboard."""
+    return _serve_ui_file("errors.html", "Errors UI")
 
 
 @app.get("/ui/files")

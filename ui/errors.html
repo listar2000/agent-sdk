@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Errors &amp; Metrics</title>
+<style>
+  :root {
+    --bg: #1F2D3D; --panel: #FFFFFF; --text: #1D1C1D; --muted: #9098A0;
+    --border: #ECEEF1; --primary: #1264A3; --danger: #E01E5A;
+    --success: #2EB67D; --warning: #ECB22E; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  body { background: var(--bg); color: var(--text); padding: 18px; }
+  h1 { color: #fff; font-size: 18px; margin: 0 0 2px; }
+  .sub { color: #9AA5AE; font-size: 12px; margin-bottom: 16px; }
+  .sub b { color: #cfd6dc; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .card { background: var(--panel); border-radius: var(--radius); padding: 12px 14px; box-shadow: 0 1px 2px rgba(0,0,0,.18); }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+  .card.danger .value { color: var(--danger); }
+  .card.good .value { color: var(--success); }
+  .card.warn .value { color: var(--warning); }
+  .panel { background: var(--panel); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.18); }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; color: #5b636b; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td.msg { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #333; max-width: 540px; word-break: break-word; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.cat { background: #EAF2FB; color: var(--primary); }
+  .pill.prov { background: #F1ECFB; color: #6A3FB0; }
+  .pill.status { background: #FDEAEF; color: var(--danger); }
+  .row-flex { display: flex; gap: 18px; flex-wrap: wrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: #F6F8FA; border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; font-size: 12px; }
+  .chip b { color: var(--danger); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .toolbar input, .toolbar select { padding: 6px 8px; border: 1px solid #44566b; background: #2b3b4e; color: #e8ebed; border-radius: 8px; font-size: 12px; }
+  .toolbar label { color: #9AA5AE; font-size: 12px; }
+  .toolbar button { padding: 6px 12px; border: 0; background: var(--primary); color: #fff; border-radius: 8px; font-size: 12px; cursor: pointer; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 16px; text-align: center; }
+  .err { color: #ffb4c4; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>Errors &amp; Metrics</h1>
+  <div class="sub">
+    live replica <b id="replica">—</b> · uptime <b id="uptime">—</b> ·
+    auto-refresh <b>3s</b> · <span id="conn" class="err"></span>
+  </div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="panel">
+    <h2>Errors by category (live, this replica)</h2>
+    <div class="chips" id="byCategory"></div>
+  </div>
+
+  <div class="row-flex">
+    <div class="panel" style="flex:1; min-width:280px">
+      <h2>Silent recoveries (auto-heals)</h2>
+      <div class="chips" id="byRecovery"></div>
+    </div>
+    <div class="panel" style="flex:1; min-width:280px">
+      <h2>Resource leaks</h2>
+      <div class="chips" id="byLeak"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Provider operations — latency &amp; flakiness (live)</h2>
+    <table>
+      <thead><tr><th>operation</th><th>provider</th><th>count</th><th>fail</th><th>fail&nbsp;rate</th><th>p50&nbsp;ms</th><th>p95&nbsp;ms</th></tr></thead>
+      <tbody id="ops"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Phase timings (p50 / p95 ms · fail count)</h2>
+    <table>
+      <thead><tr><th>Phase</th><th>count</th><th>p50</th><th>p95</th><th>fail</th></tr></thead>
+      <tbody id="phases"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Recent errors (durable, all replicas)</h2>
+    <div class="toolbar">
+      <label>category</label>
+      <select id="fCategory"><option value="">all</option></select>
+      <label>provider</label>
+      <select id="fProvider"><option value="">all</option></select>
+      <button id="refresh">Refresh</button>
+      <span class="muted" id="count"></span>
+    </div>
+    <table>
+      <thead><tr><th>when</th><th>cat</th><th>provider</th><th>status</th><th>type</th><th>message</th><th>session</th><th>replica</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table>
+    <div class="empty" id="eventsEmpty" style="display:none">No errors recorded. 🎉</div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function fmtTime(epoch) {
+  if (!epoch) return "—";
+  const d = new Date(epoch * 1000);
+  return d.toLocaleString(undefined, { hour12: false });
+}
+function fmtUptime(s) {
+  if (s == null) return "—";
+  if (s < 60) return Math.round(s) + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  return (s / 3600).toFixed(1) + "h";
+}
+function card(label, value, cls) {
+  return `<div class="card ${cls || ''}"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+}
+
+async function loadMetrics() {
+  let m;
+  try {
+    const r = await fetch("/metrics");
+    m = await r.json();
+    $("conn").textContent = "";
+  } catch (e) {
+    $("conn").textContent = "metrics fetch failed: " + e;
+    return;
+  }
+  $("replica").textContent = m.replica_id || "—";
+  $("uptime").textContent = fmtUptime(m.uptime_s);
+
+  const errTotal = m.errors.total || 0;
+  const recTotal = (m.recoveries && m.recoveries.total) || 0;
+  const leakTotal = (m.leaks && m.leaks.total) || 0;
+  const rate = ((m.requests.error_rate || 0) * 100).toFixed(2) + "%";
+  $("cards").innerHTML = [
+    card("Errors (total)", errTotal, errTotal ? "danger" : "good"),
+    card("Recoveries", recTotal, recTotal ? "warn" : "good"),
+    card("Leaks", leakTotal, leakTotal ? "danger" : "good"),
+    card("Requests", m.requests.total || 0),
+    card("5xx rate", rate, (m.requests.error_rate || 0) > 0 ? "danger" : "good"),
+    card("Latency p95", (m.requests.latency_ms.p95 ?? "—") + "ms"),
+    card("Turns ok/fail", (m.turns.ok || 0) + " / " + (m.turns.fail || 0), m.turns.fail ? "danger" : "good"),
+  ].join("");
+
+  const chips = (obj, dangerVals) => Object.keys(obj || {}).length
+    ? Object.entries(obj).sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `<span class="chip">${k} <b${dangerVals ? '' : ' style="color:#5b636b"'}>${v}</b></span>`).join("")
+    : '<span class="muted">none</span>';
+
+  $("byCategory").innerHTML = chips(m.errors.by_category, true);
+  $("byRecovery").innerHTML = chips((m.recoveries || {}).by_kind, false);
+  $("byLeak").innerHTML = chips((m.leaks || {}).by_kind, true);
+
+  const ops = m.ops || {};
+  $("ops").innerHTML = Object.keys(ops).length
+    ? Object.entries(ops)
+        .sort((a, b) => (b[1].fail_rate - a[1].fail_rate) || (b[1].p95 || 0) - (a[1].p95 || 0))
+        .map(([k, o]) => {
+          const [op, prov] = k.split("@");
+          const fr = (o.fail_rate * 100).toFixed(1) + "%";
+          return `<tr><td>${op}</td><td>${prov}</td><td>${o.count}</td>` +
+            `<td>${o.fail ? '<b style="color:#E01E5A">' + o.fail + '</b>' : 0}</td>` +
+            `<td>${o.fail_rate > 0 ? '<b style="color:#E01E5A">' + fr + '</b>' : fr}</td>` +
+            `<td>${o.p50 ?? "—"}</td><td>${o.p95 ?? "—"}</td></tr>`;
+        }).join("")
+    : '<tr><td colspan="7" class="muted">no operations yet</td></tr>';
+
+  const phases = m.phases || {};
+  $("phases").innerHTML = Object.keys(phases).length
+    ? Object.entries(phases).sort((a, b) => (b[1].p95 || 0) - (a[1].p95 || 0))
+        .map(([k, p]) => `<tr><td>${k}</td><td>${p.count}</td><td>${p.p50 ?? "—"}</td><td>${p.p95 ?? "—"}</td><td>${p.fail ? '<b style="color:#E01E5A">' + p.fail + '</b>' : 0}</td></tr>`).join("")
+    : '<tr><td colspan="5" class="muted">no phase data yet</td></tr>';
+}
+
+function fillFilter(sel, values, keep) {
+  const cur = sel.value;
+  const opts = ['<option value="">all</option>']
+    .concat(values.map(v => `<option value="${v}">${v}</option>`));
+  sel.innerHTML = opts.join("");
+  if (keep) sel.value = cur;
+}
+
+async function loadEvents() {
+  const cat = $("fCategory").value, prov = $("fProvider").value;
+  const qs = new URLSearchParams();
+  if (cat) qs.set("category", cat);
+  if (prov) qs.set("provider", prov);
+  qs.set("limit", "200");
+  let data;
+  try {
+    const r = await fetch("/admin/errors?" + qs.toString());
+    data = await r.json();
+  } catch (e) {
+    $("conn").textContent = "events fetch failed: " + e;
+    return;
+  }
+  fillFilter($("fCategory"), Object.keys(data.by_category || {}), true);
+  fillFilter($("fProvider"), Object.keys(data.by_provider || {}), true);
+
+  const ev = data.events || [];
+  $("count").textContent = ev.length + " shown";
+  $("eventsEmpty").style.display = ev.length ? "none" : "block";
+  $("events").innerHTML = ev.map(e => `
+    <tr>
+      <td class="muted">${fmtTime(e.ts)}</td>
+      <td><span class="pill cat">${e.category || "—"}</span></td>
+      <td>${e.provider ? '<span class="pill prov">' + e.provider + '</span>' : '—'}</td>
+      <td>${e.http_status ? '<span class="pill status">' + e.http_status + '</span>' : '—'}</td>
+      <td>${e.exc_type || "—"}</td>
+      <td class="msg">${(e.message || "").replace(/</g, "&lt;")}</td>
+      <td class="muted">${e.session_id ? e.session_id.slice(0, 8) : "—"}</td>
+      <td class="muted">${e.replica_id || "—"}</td>
+    </tr>`).join("");
+}
+
+async function tick() { await Promise.all([loadMetrics(), loadEvents()]); }
+$("refresh").onclick = loadEvents;
+$("fCategory").onchange = loadEvents;
+$("fProvider").onchange = loadEvents;
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>
