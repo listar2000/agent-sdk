@@ -180,22 +180,22 @@ class AcpClient:
     async def handshake(self, session_id: str, agent: str) -> dict:
         """ACP protocol handshake only. Does NOT create a session.
 
-        Advertises the client capabilities our supervisor.js implements:
-        ``fs.read_text_file``, ``fs.write_text_file``, and ``terminal``.
-        Without these, opencode falls back to its internal filesystem layer
-        which has stricter per-path permission checks (denies writes outside
-        cwd even after we auto-allow the ACP permission gate). With them
-        declared, opencode delegates fs/terminal ops to the supervisor —
-        which executes them directly in-sandbox. Claude ignores the fields.
+        Advertises NO optional client capabilities. Verified empirically
+        (2026-06, pinned opencode 1.14.30 + claude-agent-acp 0.27.0): both
+        runtimes execute every tool locally in the ACP child process
+        regardless of advertised capabilities — fs/terminal flags change
+        nothing about tool routing, and writes outside cwd behave
+        identically with or without them (the earlier claim here that
+        opencode "falls back to a stricter internal filesystem layer"
+        without fs capabilities was re-tested and is false on 1.14.30).
+        The one client-side method runtimes do call is
+        ``session/request_permission``, auto-allowed by supervisor.js.
         """
         return await self._send_rpc(
             session_id, "initialize",
             {
                 "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": True, "writeTextFile": True},
-                    "terminal": True,
-                },
+                "clientCapabilities": {},
             },
             agent=agent,
         )
@@ -235,14 +235,10 @@ class AcpClient:
                     last_exc = None
                     break
                 except RuntimeError as e:
-                    if "Authentication required" in str(e):
-                        log.info("%s requires authenticate; retrying with env-var auth", agent)
-                        await self._send_rpc(session_id, "authenticate",
-                                             {"methodId": "openai-api-key"})
-                        new_result = await self._send_rpc(session_id, "session/new",
-                                                          base_params)
-                        last_exc = None
-                        break
+                    # NOTE: no authenticate retry — neither enabled runtime
+                    # (claude-agent-acp 'gateway'-only, opencode no-auth)
+                    # accepts an env-var methodId; auth failures are terminal
+                    # like any other session/new error.
                     last_exc = e
                     if attempt < len(backoffs):
                         log.info(
@@ -261,18 +257,13 @@ class AcpClient:
                 except Exception:
                     pass
         except Exception as e:
-            log.warning("session/new failed for %s, trying session/list: %s", session_id, e)
-            try:
-                sessions = await self.list_sessions(session_id)
-                if sessions:
-                    inner = sessions[0].get("sessionId")
-                    if inner:
-                        self._inner_session_ids[session_id] = inner
-            except Exception as e2:
-                raise RuntimeError(
-                    f"Failed to initialize session {session_id}: "
-                    f"session/new failed ({e}), session/list failed ({e2})"
-                ) from e2
+            # No session/list adoption fallback: neither enabled runtime
+            # exposes a useful session/list on a fresh child (a brand-new
+            # supervisor has nothing to adopt), so the rescue could never
+            # produce a usable inner session — fail plainly instead.
+            raise RuntimeError(
+                f"Failed to initialize session {session_id}: session/new failed ({e})"
+            ) from e
 
         if session_id not in self._inner_session_ids:
             raise RuntimeError(
@@ -340,11 +331,6 @@ class AcpClient:
         except Exception:
             pass
         return result
-
-    async def list_sessions(self, session_id: str) -> list[dict]:
-        """List agent sessions within this ACP connection."""
-        result = await self._send_rpc(session_id, "session/list", {})
-        return result.get("sessions", [])
 
     async def call(
         self,

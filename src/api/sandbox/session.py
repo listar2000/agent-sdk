@@ -305,13 +305,8 @@ class BaseSandboxSession(abc.ABC):
                     )
 
         self._acp_attached = True
-        # The ACP attach above is itself a successful round-trip to the
-        # supervisor — record it as a positive liveness signal so the
-        # pool's next force_probe doesn't immediately re-probe via HTTP
-        # and race the proxy (Daytona's signed-URL proxy returns 502 for
-        # ~1-2s after a fresh URL is minted; same race class PR #20
-        # fixed in the legacy path). Stale-after-idle still triggers a
-        # real probe if the session sits idle past the freshness window.
+        # The ACP attach is real agent work — advance the compute clock so
+        # a freshly-attached session isn't immediately reap-eligible.
         self.liveness.observe_chunk()
         if self._inner_session_id:
             await _db.update_session_inner_session_id(
@@ -413,11 +408,10 @@ class BaseSandboxSession(abc.ABC):
           * then → mount, supervisor boot, snapshot extract, ACP attach
         """
 
-    async def running(self, *, force_probe: bool = False) -> bool:
-        """Single liveness oracle. Cheap fast-path via ``self.liveness``;
-        falls through to a bounded supervisor probe when state is
-        ``unknown``. With ``force_probe=True`` the probe always runs."""
-        return await self.liveness.is_alive(force_probe=force_probe)
+    async def running(self) -> bool:
+        """Single liveness oracle: probe the supervisor NOW (bounded).
+        No cached verdict — see ``Liveness``."""
+        return await self.liveness.is_alive()
 
     async def execute_prompt(
         self, message: str, *, rpc_id: str | None = None,
@@ -520,7 +514,6 @@ class BaseSandboxSession(abc.ABC):
                             await send_task
                         except (asyncio.CancelledError, Exception):
                             pass
-                    self.liveness.observe_close()
         finally:
             await sse_client.aclose()
             await post_client.aclose()
@@ -702,7 +695,6 @@ class BaseSandboxSession(abc.ABC):
         # the source supervisor stream. Per docs §15.5 — keep today's behaviour.
         q: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._subscribers[sid] = _Subscriber(q, self)
-        self.liveness.observe_activity()
         return sid, q
 
     async def iterate_subscriber(
@@ -732,12 +724,10 @@ class BaseSandboxSession(abc.ABC):
                         q.get(), timeout=_HEARTBEAT_INTERVAL_S,
                     )
                 except asyncio.TimeoutError:
-                    self.liveness.observe_activity()
                     yield _HEARTBEAT
                     continue
                 if event is _END:
                     return
-                self.liveness.observe_activity()
                 yield event
         finally:
             owner = sub.owner if sub is not None else self

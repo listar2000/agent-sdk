@@ -1,0 +1,479 @@
+"""P0-F gate: NativeSession honors the BaseSandboxSession contract.
+
+Drives execute_prompt directly (bypassing start()'s DB) with a fake
+transport and mocked completion, asserting:
+- broadcast/yield parity (every yielded event re-parses from its broadcast
+  block) — the property the SSE-log parity tests enforce in production;
+- cancel mid-turn produces a done(cancelled) terminal + a checkpoint;
+- always-alive liveness survives the pool's force-probe;
+- the factory routes native states to NativeSession.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+
+import pytest
+
+
+from api.native.loop import NativeAgentSpec  # noqa: E402
+from api.native.session import NativeSession  # noqa: E402
+from api.native.tools import build_toolset  # noqa: E402
+from api.sandbox.state import NativeSandboxState  # noqa: E402
+from api.sse import parse_acp_event  # noqa: E402
+
+
+# ── fakes mirroring the loop test's ───────────────────────────────────────
+
+class _Delta:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.reasoning_content = None
+        self.tool_calls = tool_calls
+
+
+class _Chunk:
+    def __init__(self, delta=None, usage=None):
+        self.choices = [type("C", (), {"delta": delta})()] if delta else []
+        self.usage = usage
+
+
+class _TCDelta:
+    def __init__(self, index, id=None, name=None, arguments=None):
+        self.index = index
+        self.id = id
+        self.function = type("F", (), {"name": name, "arguments": arguments})()
+
+
+class _Usage:
+    def __init__(self, p, c):
+        self.prompt_tokens = p
+        self.completion_tokens = c
+        self.response_cost = 0.0
+
+
+class _FakeTransport:
+    async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+        from api.native.transport import TransportExecResult
+        await asyncio.sleep(0)
+        return TransportExecResult(f"ran:{command}", "", 0, False)
+
+    async def read_file(self, p, *, max_bytes=8 * 1024 * 1024):
+        raise FileNotFoundError(p)
+
+    async def write_file(self, p, d):
+        pass
+
+    async def destroy(self):
+        pass
+
+
+def _completion_factory(chunks_per_call):
+    calls = {"n": 0}
+
+    async def completion(**kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+
+        async def _it():
+            for c in chunks_per_call[i]:
+                yield c
+        return _it()
+    return completion
+
+
+def _make_session(chunks_per_call, *, tools=None, transport=None,
+                  capture_checkpoints=None):
+    s = NativeSession(session_id="sess-native-f",
+                      state=NativeSandboxState(provider="docker"))
+    # bypass start()/DB
+    s._started = True
+    s._spec = NativeAgentSpec(instructions="sys", max_turns=5)
+    s._tools = tools if tools is not None else {}
+    s._transport = transport
+    s._messages = [{"role": "system", "content": "sys"}]
+    s._completion = _completion_factory(chunks_per_call)
+    if capture_checkpoints is not None:
+        async def _ckpt(usage):
+            capture_checkpoints.append({"turn_seq": s._turn_seq,
+                                        "messages": list(s._messages),
+                                        "usage": usage})
+        s._checkpoint = _ckpt  # type: ignore
+    else:
+        async def _noop(usage):
+            return None
+        s._checkpoint = _noop  # type: ignore
+    return s
+
+
+# ── tests ──────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_broadcast_yield_parity_text_turn():
+    s = _make_session([[
+        _Chunk(_Delta(content="Hello")),
+        _Chunk(usage=_Usage(5, 2)),
+    ]])
+    broadcasts = []
+    s._broadcast = lambda item: broadcasts.append(item)
+
+    yielded = [ev async for ev in s.execute_prompt("hi", rpc_id="rpc-1")]
+
+    # every broadcast is (rpc_id, block); re-parsing each block reproduces
+    # the matching yielded canonical event — parity by construction.
+    assert len(broadcasts) == len(yielded)
+    for (rpc, block), ev in zip(broadcasts, yielded):
+        assert rpc == "rpc-1"
+        assert parse_acp_event(block, "rpc-1") == ev
+    assert [e["type"] for e in yielded] == ["text", "usage", "done"]
+    assert yielded[-1]["stop_reason"] == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_tool_turn_through_session():
+    ckpts = []
+    s = _make_session(
+        [
+            [_Chunk(_Delta(tool_calls=[
+                _TCDelta(0, id="c1", name="bash", arguments='{"command":"ls"}')]))],
+            [_Chunk(_Delta(content="ok"))],
+        ],
+        tools=build_toolset(["bash"]), transport=_FakeTransport(),
+        capture_checkpoints=ckpts)
+    s._broadcast = lambda item: None
+
+    types = [ev["type"] async for ev in s.execute_prompt("run", rpc_id="r2")]
+    assert types == ["tool", "tool_result", "text", "done"]
+    # one checkpoint written at turn end, turn_seq advanced
+    assert len(ckpts) == 1 and ckpts[0]["turn_seq"] == 1
+    roles = [m["role"] for m in ckpts[0]["messages"]]
+    assert roles == ["system", "user", "assistant", "tool", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_produces_cancelled_terminal_and_checkpoint():
+    # A model call that never ends until cancelled: an infinite chunk stream.
+    async def _never(**kwargs):
+        async def _it():
+            while True:
+                await asyncio.sleep(0.01)
+                yield _Chunk(_Delta(content="."))
+        return _it()
+
+    ckpts = []
+    s = _make_session([[]], capture_checkpoints=ckpts)
+    s._completion = _never
+    s._broadcast = lambda item: None
+
+    seen = []
+
+    async def _consume():
+        async for ev in s.execute_prompt("loop forever", rpc_id="r3"):
+            seen.append(ev)
+
+    consumer = asyncio.create_task(_consume())
+    # let the loop start streaming, then interrupt
+    await asyncio.sleep(0.05)
+    await s.cancel_active_prompt()
+    await asyncio.wait_for(consumer, timeout=5)
+
+    assert seen[-1] == {"type": "done", "stop_reason": "cancelled"}
+    assert len(ckpts) == 1  # partial transcript persisted
+
+
+@pytest.mark.asyncio
+async def test_always_alive_liveness():
+    s = NativeSession(session_id="x", state=NativeSandboxState(provider="docker"))
+    assert await s.running() is True
+    assert await s.running() is True   # native is always-alive
+    assert await s._liveness_probe() is True
+
+
+def test_factory_routes_native():
+    from api.sandbox import factory
+    out = factory.make_session("s1", NativeSandboxState(provider="docker"))
+    assert isinstance(out, NativeSession)
+
+
+@pytest.mark.asyncio
+async def test_recover_adopts_concurrent_replacement_no_double_create():
+    """Concurrency-safety of recovery: two recoveries from the SAME dead
+    transport must create exactly ONE replacement sandbox.
+
+    A streaming turn's tool call and a /sandbox/exec on one session are NOT
+    serialized above _provision_lock, so both can hit SandboxGoneError on the
+    same dead transport. _ensure_sandbox(replace=dead) re-provisions only while
+    `dead` is still cached; once a concurrent recovery has swapped in a fresh
+    transport, a later recovery that still names the OLD dead one must ADOPT the
+    fresh transport — not null it and create a SECOND sandbox (an orphan the
+    reaper/boot-reconcile would have to reclaim, and a paid idle VM on
+    daytona/modal until then)."""
+    s = NativeSession(session_id="sess-recover-race",
+                      state=NativeSandboxState(provider="docker"))
+    s._started = True
+
+    async def _noop_persist():   # pure unit test — no DB pool
+        return None
+    s._persist_state = _noop_persist  # type: ignore
+
+    created: list = []
+
+    class _T:
+        def __init__(self, tag):
+            self.ref = f"cid-{tag}"
+            self.container_id = self.ref
+
+        async def destroy(self):
+            pass
+
+    async def _factory():
+        t = _T(len(created))
+        created.append(t)
+        return t
+
+    s._transport_factory = _factory
+    dead = _T("dead")
+    s._transport = dead
+
+    # first recovery: `dead` is still cached → provision exactly one fresh one
+    t1 = await s._ensure_sandbox(replace=dead)
+    assert len(created) == 1 and t1 is created[0]
+    assert s._transport is t1
+
+    # second recovery STILL naming the old dead transport: the fresh one is
+    # cached now (≠ dead) → adopt it, do NOT double-create (no orphan/leak).
+    t2 = await s._ensure_sandbox(replace=dead)
+    assert t2 is t1
+    assert len(created) == 1, (
+        f"double-created a sandbox (orphan leak): {[c.ref for c in created]}")
+
+    # and genuine concurrency: gather two recoveries from one fresh-dead
+    # transport — the lock + replace-check still yields exactly one creation.
+    dead2 = t1
+    s._transport = dead2
+    created.clear()
+    g1, g2 = await asyncio.gather(
+        s._ensure_sandbox(replace=dead2),
+        s._ensure_sandbox(replace=dead2),
+    )
+    assert g1 is g2 and len(created) == 1, (
+        f"concurrent recovery double-created: {[c.ref for c in created]}")
+
+
+def _pin_session(provider, cwd, subpath="agents/abc"):
+    s = NativeSession(session_id="s",
+                      state=NativeSandboxState(provider=provider))
+    s._cwd = cwd
+    s._subpath = subpath
+    s._pin_modal_workspace_to_volume()
+    return s._cwd
+
+
+def test_modal_native_default_tmp_cwd_pinned_to_volume():
+    """A default modal native session (cwd falls back to /tmp) must run on the
+    /v Volume, not the ephemeral FS — else its workspace is lost on modal's
+    routine terminate→recreate (the entrypoint won't symlink the critical /tmp)."""
+    assert _pin_session("modal", "/tmp", "agents/abc") == "/v/agents/abc"
+    assert _pin_session("modal", "/tmp/", "sessions/s1") == "/v/sessions/s1"
+
+
+def test_modal_native_custom_cwd_left_for_symlink():
+    """A non-critical custom cwd is symlinked onto the volume by the entrypoint,
+    so the pin leaves it alone (no surprise cwd change)."""
+    assert _pin_session("modal", "/workspace") == "/workspace"
+    assert _pin_session("modal", "/home/agent") == "/home/agent"
+
+
+def test_docker_native_tmp_cwd_not_redirected():
+    """docker/daytona keep their FS across resume (and recreate is cold for
+    docker anyway), so /tmp is fine there — the pin is modal-only."""
+    assert _pin_session("docker", "/tmp") == "/tmp"
+    assert _pin_session("daytona", "/tmp") == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_secrets_split_keeps_llm_key_server_side():
+    """start()'s split: AUTH_KEYS → server-side api_key; rest → sandbox env.
+    Verified directly on the split logic without a DB round-trip."""
+    from api.providers._shared import AUTH_KEYS
+
+    s = NativeSession(session_id="x", state=NativeSandboxState(provider="docker"))
+    s._spawn_env = {"OPENROUTER_API_KEY": "sk-secret",
+                    "GITHUB_TOKEN": "ghp_x", "FOO": "bar"}
+    # mimic the split start() performs
+    s._llm_api_key = next((v for k, v in s._spawn_env.items()
+                           if k in AUTH_KEYS), None)
+    s._sandbox_env = {k: v for k, v in s._spawn_env.items()
+                      if k not in AUTH_KEYS}
+    assert s._llm_api_key == "sk-secret"
+    assert "OPENROUTER_API_KEY" not in s._sandbox_env
+    assert s._sandbox_env == {"GITHUB_TOKEN": "ghp_x", "FOO": "bar"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_tool_heals_checkpoint_no_dangling_tool_calls():
+    """Interrupt while a tool EXECUTES (not while the model streams): the
+    assistant tool_calls message is already in the array but its results are
+    not. The cancel handler must NOT checkpoint that dangling shape verbatim —
+    providers 400 on it, so the session would be durably wedged (every later
+    prompt fails, surviving hibernate/resume and server restart)."""
+    started = asyncio.Event()
+
+    class _BlockingTransport(_FakeTransport):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            started.set()
+            await asyncio.sleep(3600)   # parked until cancelled
+
+    ckpts = []
+    s = _make_session(
+        [[_Chunk(_Delta(tool_calls=[
+            _TCDelta(0, id="c1", name="bash",
+                     arguments='{"command":"sleep 60"}')]))]],
+        tools=build_toolset(["bash"]), transport=_BlockingTransport(),
+        capture_checkpoints=ckpts)
+    s._broadcast = lambda item: None
+
+    seen = []
+
+    async def _consume():
+        async for ev in s.execute_prompt("run", rpc_id="rX"):
+            seen.append(ev)
+
+    consumer = asyncio.create_task(_consume())
+    await asyncio.wait_for(started.wait(), timeout=5)   # tool is executing
+    await s.cancel_active_prompt()
+    await asyncio.wait_for(consumer, timeout=5)
+
+    assert seen[-1] == {"type": "done", "stop_reason": "cancelled"}
+    assert len(ckpts) == 1
+    msgs = ckpts[0]["messages"]
+    for i, m in enumerate(msgs):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {tc["id"] for tc in m["tool_calls"]}
+            answered = {r.get("tool_call_id") for r in msgs[i + 1:]
+                        if r.get("role") == "tool"}
+            assert ids <= answered, (
+                f"checkpoint kept dangling tool_calls {ids - answered} — "
+                f"the next prompt would 400 (durably wedged session)")
+
+
+@pytest.mark.asyncio
+async def test_sandbox_exec_pins_in_flight_against_reaper():
+    """/sandbox/exec runs no turn loop, so TurnRunner's observe_prompt bracket
+    never fires for it. Without its own bracket, in_flight stays False for the
+    whole exec — a session idle past its provider window could be hibernated
+    (docker stop -t 0 / modal terminate) out from under a long-running command
+    by the reaper's idle decision (pool._should_reap gates on in_flight)."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _ParkedTransport(_FakeTransport):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            started.set()
+            await release.wait()
+            return await super().exec(command, cwd=cwd, env=env,
+                                      timeout_s=timeout_s)
+
+    s = _make_session([[]], transport=_ParkedTransport())
+    s._cwd = "/work"
+    assert s.liveness.in_flight is False
+
+    task = asyncio.create_task(s.sandbox_exec("sleep 200", timeout=300))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    assert s.liveness.in_flight is True, (
+        "long /sandbox/exec must pin in_flight so pool._should_reap returns "
+        "prompt_in_flight instead of hibernating mid-command")
+    release.set()
+    res = await asyncio.wait_for(task, timeout=5)
+    assert res["exit_code"] == 0
+    assert s.liveness.in_flight is False
+
+    # the bracket must release even when the exec path raises
+    class _Boom(_FakeTransport):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            raise RuntimeError("exec failed")
+
+    s2 = _make_session([[]], transport=_Boom())
+    s2._cwd = "/work"
+    with pytest.raises(RuntimeError):
+        await s2.sandbox_exec("true")
+    assert s2.liveness.in_flight is False
+
+
+@pytest.mark.asyncio
+async def test_session_threads_sandbox_env_into_transports():
+    """The loop's tools call transport.exec() with no env — the session's
+    sandbox secrets must ride along as the transport's default env, or a
+    native agent's own bash/git runs secret-less while /sandbox/exec (which
+    passes env explicitly) gets them: an asymmetry vs the supervisor runtime,
+    where the agent's shell inherits spawn_env."""
+    s = NativeSession(session_id="s-env",
+                      state=NativeSandboxState(provider="docker"))
+    s._cwd = "/work"
+    s._sandbox_env = {"GITHUB_TOKEN": "ghp_x", "CUSTOM": "1"}
+    for provider, ref in (("docker", "cid-1"), ("daytona", "dt-1"),
+                          ("modal", "sb-1")):
+        t = s._reattach_transport(provider, ref)
+        assert t.default_env == {"GITHUB_TOKEN": "ghp_x", "CUSTOM": "1"}, provider
+
+
+@pytest.mark.asyncio
+async def test_docker_exec_merges_default_env(monkeypatch):
+    """DockerTransport injects its default env as an in-command `export`
+    preamble on every call (NEVER `docker exec -e` — that applies before the
+    OCI runtime resolves `sh`, so a PATH-class session env would 127 every
+    exec); an explicit per-call env overrides key-by-key."""
+    from api.native import transport as T
+
+    seen: list[list] = []
+
+    async def _fake_run_docker(*args, timeout=None):
+        seen.append(list(args))
+        return 0, b"ok", b""
+
+    monkeypatch.setattr(T, "_run_docker", _fake_run_docker)
+    t = T.DockerTransport(container_id="cid-x", workdir="/w",
+                          env={"FOO": "bar", "TOK": "s3cr3t"})
+
+    await t.exec("echo hi")
+    cmd = seen[0][-1]                     # the wrapped `sh -c` payload
+    assert "-e" not in seen[0]
+    assert "export" in cmd and "FOO=bar" in cmd and "TOK=s3cr3t" in cmd
+
+    await t.exec("echo hi", env={"FOO": "baz"})
+    cmd = seen[1][-1]
+    assert "FOO=baz" in cmd and "FOO=bar" not in cmd
+    assert "TOK=s3cr3t" in cmd            # defaults persist under override
+
+
+@pytest.mark.asyncio
+async def test_docker_plumbing_is_env_immune(monkeypatch):
+    """read_file routes through exec but must SKIP the default env — a
+    session env named PATH would otherwise break `base64` lookup and with it
+    every file op. The user-facing exec keeps the env (PATH altering the
+    user's own command lookup is ordinary Unix semantics)."""
+    import base64 as b64mod
+
+    from api.native import transport as T
+
+    seen: list[list] = []
+
+    async def _fake_run_docker(*args, timeout=None):
+        seen.append(list(args))
+        return 0, b64mod.b64encode(b"data"), b""
+
+    monkeypatch.setattr(T, "_run_docker", _fake_run_docker)
+    t = T.DockerTransport(container_id="cid-x", workdir="/w",
+                          env={"PATH": "/custom/bin"})
+
+    assert await t.read_file("/f.txt") == b"data"
+    assert "export" not in seen[0][-1], (
+        "plumbing exec must not carry the session env — PATH would break "
+        "the transport's own base64/mkdir machinery")
+    assert "-e" not in seen[0]
+
+    await t.exec("mytool --version")
+    assert "export PATH=/custom/bin && mytool --version" in seen[1][-1]
+    assert "-e" not in seen[1]            # never OCI-level env injection

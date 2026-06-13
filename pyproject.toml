@@ -19,7 +19,29 @@ dependencies = [
     # daytona reconcile + orphan monitor. Bump deliberately.
     "daytona-sdk==0.184.0",
     "modal>=1.4.2",
+    # Native runtime: one call signature across providers (anthropic /
+    # openai / openrouter / bedrock / …), streaming + tool-calls included.
+    "litellm>=1.51",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_sdk", "src/api"]
+
+[dependency-groups]
+# Test toolchain. pytest-xdist is LOAD-BEARING for every pytest invocation:
+# the addopts below pass --dist, an xdist flag (loadgroup needs xdist>=2.5).
+# Without xdist installed, even plain `pytest` errors on the unknown argument.
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1",
+    "pytest-xdist>=3.2",
+    "respx>=0.22",
+]
+
+[tool.pytest.ini_options]
+# All tests gated on TEST_DATABASE_URL share ONE physical postgres database,
+# so they must serialize onto a single xdist worker (they carry
+# `pytest.mark.xdist_group("db")`) — otherwise parallel workers truncate each
+# other's rows mid-test (clean_db) and the suite is order/parallelism-flaky.
+# loadgroup distributes ungrouped tests exactly like the default `load`.
+addopts = ["--dist", "loadgroup"]

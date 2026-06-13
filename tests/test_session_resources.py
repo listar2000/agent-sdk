@@ -334,13 +334,20 @@ async def test_modal_create_sandbox_reports_pre_start_failure(monkeypatch):
 async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
     from api.providers import modal as modal_provider
 
+    class _FakeVolHandle:
+        # create_volume now hydrates the lazy handle to force the create RPC
+        # (Volume.from_name alone is lazy and never persists the volume). The
+        # fake exposes a no-op hydrate; it must still NOT spawn a sandbox.
+        def hydrate(self):
+            return None
+
     class FakeVolume:
         @staticmethod
         def from_name(name, *, create_if_missing, version):
             assert name == "modal-prod"
             assert create_if_missing is True
             assert version == "v2"
-            return object()
+            return _FakeVolHandle()
 
     class FakeApiPb2:
         class VolumeFsVersion:
@@ -358,6 +365,7 @@ async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
 @pytest.mark.asyncio
 async def test_modal_volume_tree_missing_path_returns_empty(monkeypatch):
     from api.providers import modal as modal_provider
+    from api.providers.modal import ModalVolumeAdapter
 
     captured = {}
 
@@ -367,8 +375,12 @@ async def test_modal_volume_tree_missing_path_returns_empty(monkeypatch):
 
     monkeypatch.setattr(modal_provider, "_run_volume_shell", fake_run_volume_shell)
 
-    assert await modal_provider.volume_tree("modal-prod", "shared/123") == ""
-    assert "if [ ! -e /v/shared/123 ]; then exit 0; fi;" in captured["shell"]
+    adapter = ModalVolumeAdapter("modal-prod")
+    assert await adapter.tree("shared/123") == ""
+    # Guard: a missing OR non-directory subpath exits 0 with no output →
+    # empty tree string (-d: listing a file is also "" — the documented
+    # cross-provider unification).
+    assert "if [ ! -d /v/shared/123 ]; then exit 0; fi;" in captured["shell"]
 
 
 def test_docker_resource_flags_translates():

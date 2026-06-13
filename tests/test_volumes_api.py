@@ -6,12 +6,8 @@ import pytest_asyncio
 from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 _DB = os.environ.get("TEST_DATABASE_URL")
-pytestmark = pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+pytestmark = [pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set"), pytest.mark.xdist_group("db")]
 if _DB:
     os.environ["DATABASE_URL"] = _DB
 
@@ -19,7 +15,10 @@ from api import db as dbmod, server as srv  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def client(db_pool):
+async def client(clean_db):
+    # clean_db (not bare db_pool): these tests create volumes/agents by NAME,
+    # so leftover rows from another test file (or a prior aborted run) collide
+    # and make the file order-dependent — pass solo, fail in a batch run.
     transport = ASGITransport(app=srv.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -69,7 +68,7 @@ async def test_get_and_list_volumes(client):
 async def test_delete_volume(client):
     with patch("api.providers.daytona.create_daytona_volume",
                new=AsyncMock(return_value="dt-del")), \
-         patch("api.providers.delete_daytona_volume",
+         patch("api.providers.daytona.delete_daytona_volume",
                new=AsyncMock(return_value=None)):
         await client.post("/volumes", json={"name": "to-delete", "provider": "daytona"})
         r = await client.delete("/volumes/to-delete")
@@ -160,7 +159,7 @@ async def test_delete_volume_conflict_if_session_exists(client):
     assert r.status_code == 409
 
     # With force=true the referenced session is deleted and the volume too.
-    with patch("api.providers.delete_daytona_volume",
+    with patch("api.providers.daytona.delete_daytona_volume",
                new=AsyncMock(return_value=None)):
         r = await client.delete("/volumes/conflict?force=true")
     assert r.status_code == 204
@@ -202,6 +201,7 @@ async def test_edit_rejects_control_chars(client, bad_path):
     behavior is wired through at the HTTP boundary, not just at the
     provider layer."""
     from api.models import VolumeRecord
+    from api.providers.daytona import DaytonaVolumeAdapter
     v = VolumeRecord(id="vol_ctrl", name="files-ctrl",
                      provider="daytona", provider_ref="dt-ctrl")
     await dbmod.upsert_volume(v)
@@ -210,7 +210,7 @@ async def test_edit_rejects_control_chars(client, bad_path):
     async def blow_up(*a, **kw):
         raise AssertionError(f"provider must not be called on invalid path {bad_path!r}")
 
-    with patch("api.providers.daytona.volume_write", new=AsyncMock(side_effect=blow_up)):
+    with patch.object(DaytonaVolumeAdapter, "write", new=AsyncMock(side_effect=blow_up)):
         r = await client.post(f"/volumes/{v.id}/files/edit",
                               json={"path": bad_path, "content": "data"})
     assert r.status_code == 400, f"got {r.status_code}: {r.text}"
@@ -236,6 +236,7 @@ async def test_read_rejects_control_chars(client, bad_path):
     """MT5: ``GET /volumes/{id}/files/read`` also rejects control-char
     paths at the HTTP layer."""
     from api.models import VolumeRecord
+    from api.providers.daytona import DaytonaVolumeAdapter
     v = VolumeRecord(id="vol_ctr2", name="files-ctr2",
                      provider="daytona", provider_ref="dt-ctr2")
     await dbmod.upsert_volume(v)
@@ -243,7 +244,7 @@ async def test_read_rejects_control_chars(client, bad_path):
     async def blow_up(*a, **kw):
         raise AssertionError(f"provider must not be called on invalid path {bad_path!r}")
 
-    with patch("api.providers.daytona.volume_read", new=AsyncMock(side_effect=blow_up)):
+    with patch.object(DaytonaVolumeAdapter, "read", new=AsyncMock(side_effect=blow_up)):
         r = await client.get(f"/volumes/{v.id}/files/read",
                              params={"path": bad_path})
     assert r.status_code == 400, f"got {r.status_code}: {r.text}"
@@ -315,24 +316,25 @@ async def test_volume_files_download_path_traversal_blocked(client):
 
 @pytest.mark.asyncio
 async def test_volume_files_edit_and_read(client):
-    """File ops dispatch through the volume's provider module."""
+    """File ops dispatch through the volume adapter."""
     from api.models import VolumeRecord
+    from api.providers.daytona import DaytonaVolumeAdapter
     v = VolumeRecord(id="vol_f", name="files-test", provider="daytona", provider_ref="dt-f")
     await dbmod.upsert_volume(v)
 
-    # Patch daytona's volume_write directly — the endpoint dispatches via
-    # _PROVIDER_MODS[vol.provider].volume_write.
+    # Patch adapter methods — the endpoint dispatches via get_volume_adapter().
     write_calls = []
-    async def fake_write(ref, path, content):
-        write_calls.append((ref, path, content))
 
-    async def fake_read(ref, path):
+    async def fake_write(path, content):
+        write_calls.append(("dt-f", path, content))
+
+    async def fake_read(path):
         return b"hi"
 
-    with patch("api.providers.daytona.volume_write",
-               new=AsyncMock(side_effect=fake_write)), \
-         patch("api.providers.daytona.volume_read",
-               new=AsyncMock(side_effect=fake_read)):
+    with patch.object(DaytonaVolumeAdapter, "write",
+                      new=AsyncMock(side_effect=fake_write)), \
+         patch.object(DaytonaVolumeAdapter, "read",
+                      new=AsyncMock(side_effect=fake_read)):
         r = await client.post(f"/volumes/{v.id}/files/edit",
                               json={"path": "shared/x.txt", "content": "hi"})
         assert r.status_code == 204
@@ -348,27 +350,30 @@ async def test_volume_files_edit_and_read(client):
 @pytest.mark.asyncio
 async def test_volume_files_upload_mkdir_delete_rename_dispatch(client):
     from api.models import VolumeRecord
+    from api.providers.daytona import DaytonaVolumeAdapter
     v = VolumeRecord(id="vol_f2", name="files-test-2", provider="daytona", provider_ref="dt-f2")
     await dbmod.upsert_volume(v)
 
     calls: list[tuple[str, str, tuple]] = []
 
-    async def fake_upload(ref, path, content):
-        calls.append(("upload", ref, (path, content)))
+    # upload/mkdir/rename are adapter methods (no ref arg; ref is self.provider_ref).
+    # delete routes through the kept module-level volume_delete(ref, path).
+    async def fake_upload(path, content):
+        calls.append(("upload", "dt-f2", (path, content)))
 
-    async def fake_mkdir(ref, path):
-        calls.append(("mkdir", ref, (path,)))
+    async def fake_mkdir(path):
+        calls.append(("mkdir", "dt-f2", (path,)))
 
     async def fake_delete(ref, path):
         calls.append(("delete", ref, (path,)))
 
-    async def fake_rename(ref, path, new_path, *, overwrite=True):
-        calls.append(("rename", ref, (path, new_path)))
+    async def fake_rename(path, new_path, *, overwrite=True):
+        calls.append(("rename", "dt-f2", (path, new_path)))
 
-    with patch("api.providers.daytona.volume_upload", new=AsyncMock(side_effect=fake_upload)), \
-         patch("api.providers.daytona.volume_mkdir", new=AsyncMock(side_effect=fake_mkdir)), \
+    with patch.object(DaytonaVolumeAdapter, "upload", new=AsyncMock(side_effect=fake_upload)), \
+         patch.object(DaytonaVolumeAdapter, "mkdir", new=AsyncMock(side_effect=fake_mkdir)), \
          patch("api.providers.daytona.volume_delete", new=AsyncMock(side_effect=fake_delete)), \
-         patch("api.providers.daytona.volume_rename", new=AsyncMock(side_effect=fake_rename)):
+         patch.object(DaytonaVolumeAdapter, "rename", new=AsyncMock(side_effect=fake_rename)):
         r = await client.post(
             f"/volumes/{v.id}/files/upload",
             json={"path": "shared/u.bin", "content": "AQI="},
@@ -396,16 +401,17 @@ async def test_volume_files_upload_mkdir_delete_rename_dispatch(client):
 async def test_volume_files_rename_overwrite_false_dispatches_and_409s(client):
     from api.models import VolumeRecord
     from api.providers import VolumeFileExistsError
+    from api.providers.daytona import DaytonaVolumeAdapter
 
     v = VolumeRecord(id="vol_rename_no_overwrite", name="files-rename-no-overwrite", provider="daytona", provider_ref="dt-rn")
     await dbmod.upsert_volume(v)
 
     calls = []
 
-    async def fake_rename(ref, path, new_path, *, overwrite=True):
-        calls.append((ref, path, new_path, overwrite))
+    async def fake_rename(path, new_path, *, overwrite=True):
+        calls.append(("dt-rn", path, new_path, overwrite))
 
-    with patch("api.providers.daytona.volume_rename", new=AsyncMock(side_effect=fake_rename)):
+    with patch.object(DaytonaVolumeAdapter, "rename", new=AsyncMock(side_effect=fake_rename)):
         r = await client.post(
             f"/volumes/{v.id}/files/rename",
             json={"path": "shared/a.txt", "new_path": "shared/b.txt", "overwrite": False},
@@ -413,8 +419,8 @@ async def test_volume_files_rename_overwrite_false_dispatches_and_409s(client):
     assert r.status_code == 204
     assert calls == [("dt-rn", "shared/a.txt", "shared/b.txt", False)]
 
-    with patch(
-        "api.providers.daytona.volume_rename",
+    with patch.object(
+        DaytonaVolumeAdapter, "rename",
         new=AsyncMock(side_effect=VolumeFileExistsError("shared/b.txt")),
     ):
         r = await client.post(
@@ -428,6 +434,7 @@ async def test_volume_files_rename_overwrite_false_dispatches_and_409s(client):
 @pytest.mark.asyncio
 async def test_volume_files_rename_overwrite_false_maps_not_implemented_to_501(client):
     from api.models import VolumeRecord
+    from api.providers.daytona import DaytonaVolumeAdapter
 
     v = VolumeRecord(
         id="vol_rename_unsupported",
@@ -437,8 +444,8 @@ async def test_volume_files_rename_overwrite_false_maps_not_implemented_to_501(c
     )
     await dbmod.upsert_volume(v)
 
-    with patch(
-        "api.providers.daytona.volume_rename",
+    with patch.object(
+        DaytonaVolumeAdapter, "rename",
         new=AsyncMock(side_effect=NotImplementedError("atomic no-overwrite unsupported")),
     ):
         r = await client.post(
@@ -451,15 +458,16 @@ async def test_volume_files_rename_overwrite_false_maps_not_implemented_to_501(c
 @pytest.mark.asyncio
 async def test_volume_files_exists_dispatches(client):
     from api.models import VolumeRecord
+    from api.providers.daytona import DaytonaVolumeAdapter
 
     v = VolumeRecord(id="vol_exists", name="files-exists", provider="daytona", provider_ref="dt-exists")
     await dbmod.upsert_volume(v)
 
-    async def fake_exists(ref, path):
-        assert (ref, path) == ("dt-exists", "shared/a.txt")
+    async def fake_exists(path):
+        assert path == "shared/a.txt"
         return True
 
-    with patch("api.providers.daytona.volume_exists", new=AsyncMock(side_effect=fake_exists)):
+    with patch.object(DaytonaVolumeAdapter, "exists", new=AsyncMock(side_effect=fake_exists)):
         r = await client.get(f"/volumes/{v.id}/files/exists", params={"path": "shared/a.txt"})
     assert r.status_code == 200
     assert r.json() == {"exists": True}
@@ -484,20 +492,29 @@ async def test_volume_files_upload_rejects_invalid_base64(client):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route,body,patch_target", [
-    ("mkdir", {"path": "bad\npath"}, "api.providers.daytona.volume_mkdir"),
-    ("delete", {"path": "bad\npath"}, "api.providers.daytona.volume_delete"),
-    ("rename", {"path": "ok.txt", "new_path": "bad\npath"}, "api.providers.daytona.volume_rename"),
-    ("upload", {"path": "bad\npath", "content": "AQI="}, "api.providers.daytona.volume_upload"),
+@pytest.mark.parametrize("route,method,patch_target", [
+    ("mkdir", "mkdir", None),
+    ("delete", "delete", None),
+    ("rename", "rename", None),
+    ("upload", "upload", None),
 ])
-async def test_new_volume_file_routes_reject_control_chars(client, route, body, patch_target):
+async def test_new_volume_file_routes_reject_control_chars(client, route, method, patch_target):
     from api.models import VolumeRecord
+    from api.providers.daytona import DaytonaVolumeAdapter
     v = VolumeRecord(id=f"vol_{route}", name=f"vol-{route}", provider="daytona", provider_ref=f"dt-{route}")
     await dbmod.upsert_volume(v)
+
+    bad_bodies = {
+        "mkdir": {"path": "bad\npath"},
+        "delete": {"path": "bad\npath"},
+        "rename": {"path": "ok.txt", "new_path": "bad\npath"},
+        "upload": {"path": "bad\npath", "content": "AQI="},
+    }
+    body = bad_bodies[route]
 
     async def blow_up(*_a, **_kw):
         raise AssertionError("provider must not be called on invalid path")
 
-    with patch(patch_target, new=AsyncMock(side_effect=blow_up)):
+    with patch.object(DaytonaVolumeAdapter, method, new=AsyncMock(side_effect=blow_up)):
         r = await client.post(f"/volumes/{v.id}/files/{route}", json=body)
     assert r.status_code == 400, f"{route}: {r.status_code} {r.text}"

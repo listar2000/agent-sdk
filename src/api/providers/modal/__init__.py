@@ -28,7 +28,6 @@ recovery path (recreate a new sandbox against the same volume + subpath).
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import os
 import shlex
@@ -39,16 +38,15 @@ from .._shared import (
     ExecResult,
     ProviderInstance,
     SandboxMissingError,
-    VolumeFileExistsError,
     _MAX_OUTPUT_BYTES,
     _acp_launch_args,
     _build_env_prefix,
-    _safe_path,
     _truncate,
     _wait_for_health,
     build_supervisor_argv,
-    normalize_find_output,
 )
+from .._volume import ShellVolumeAdapter
+from ...metrics import timed_provider_op
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +81,10 @@ _SANDBOX_IDLE_TIMEOUT_SEC = int(float(
 # Tag key used to cross-reference Modal sandboxes with DB sandbox rows on
 # server startup, analogous to Docker's agent-sdk.sandbox-id label.
 _TAG_KEY = "agent-sdk.sandbox-id"
+
+# Origin tag (test|production), analogous to the docker/daytona
+# ``agent_sdk_origin`` label, so cleanup_orphans.py can isolate test residue.
+_ORIGIN_TAG = "agent_sdk_origin"
 
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
@@ -246,12 +248,17 @@ async def create_volume(name: str) -> str:
     support the append semantics the agent filesystem needs.
     """
     modal, api_pb2 = _require_modal()
-    await asyncio.to_thread(
+    vol = await asyncio.to_thread(
         modal.Volume.from_name,
         name,
         create_if_missing=True,
         version=api_pb2.VolumeFsVersion.VOLUME_FS_VERSION_V2,
     )
+    # ``from_name`` returns a LAZY handle — without hydrating it the
+    # create-or-get RPC never fires and the volume isn't actually persisted
+    # (a later ``Sandbox.create`` mount with create_if_missing=False then
+    # 404s). Force the round-trip so the name is real before we return it.
+    await asyncio.to_thread(vol.hydrate)
     log.info("modal volume %s created or adopted", name)
     return name
 
@@ -342,6 +349,7 @@ async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | N
         ) from e
 
 
+@timed_provider_op("modal", "create_sandbox")
 async def create_sandbox(
     *,
     volume_ref: str,
@@ -361,7 +369,7 @@ async def create_sandbox(
 
     Returns a ``ProviderInstance`` with ``sandbox_ref`` set to Modal's
     ``object_id`` and ``url`` set to the HTTPS tunnel URL. Supervisor is
-    already started — ``ensure_supervisor_url`` is a no-op.
+    already started — no separate supervisor-start phase is needed.
     """
     if not subpath:
         raise ValueError("modal create_sandbox requires a non-empty subpath")
@@ -473,6 +481,126 @@ async def create_sandbox(
         raise
 
 
+def _build_bare_entrypoint(*, subpath: str, root: str | None) -> str:
+    """PID-1 script for a NATIVE (no-supervisor) modal sandbox.
+
+    Mirrors ``_build_entrypoint_cmd`` minus the supervisor: it ensures the
+    workspace dir exists ON THE VOLUME (``/v/<subpath>``) and symlinks the
+    native session's ``root`` to it, so files the native loop writes survive
+    a terminate→recreate (modal's only "hibernate"). Then it execs
+    ``sleep infinity`` as PID 1 — nothing listening, no tunnel, no health
+    gate. Readiness is the caller's one ``exec true`` (like DockerTransport).
+    """
+    safe_sub = subpath.strip("/")
+    vol_workspace = f"{_VOLUME_MOUNT}/{safe_sub}"
+    lines = ["set -e", f"mkdir -p {shlex.quote(vol_workspace)}"]
+    # Symlink the session root onto the volume so workspace bytes persist on
+    # the Volume, not the ephemeral sandbox FS (lost on terminate). Skip when
+    # root is already under the volume mount, unset, or a critical system dir.
+    # The symlink does ``rm -rf root`` first, so REFUSE to clobber paths like
+    # /tmp, /, /usr, /home (a misconfigured cwd must never wipe a system dir);
+    # for those we leave the FS alone — absolute /v paths still persist, only
+    # the root-relative convenience symlink is skipped.
+    _CRITICAL = {"/", "/tmp", "/usr", "/etc", "/var", "/bin", "/sbin",
+                 "/lib", "/lib64", "/dev", "/proc", "/sys", "/root",
+                 "/home", "/opt", _VOLUME_MOUNT}
+    norm = (root or "").rstrip("/") or root
+    if root and root != vol_workspace and not root.startswith(_VOLUME_MOUNT + "/") \
+            and root != _VOLUME_MOUNT and norm not in _CRITICAL:
+        parent = root.rsplit("/", 1)[0] or "/"
+        lines += [
+            f"mkdir -p {shlex.quote(parent)}",
+            f"rm -rf {shlex.quote(root)}",
+            f"ln -s {shlex.quote(vol_workspace)} {shlex.quote(root)}",
+        ]
+    lines.append("exec sleep infinity")
+    return "\n".join(lines)
+
+
+async def create_bare_sandbox(
+    *,
+    volume_ref: str,
+    subpath: str,
+    root: str | None = None,
+    sandbox_ref: str | None = None,
+    resources: Any = None,
+    **_kw,
+) -> ProviderInstance:
+    """Create a NATIVE modal sandbox: volume mounted at ``/v``, ``sleep
+    infinity`` as PID 1, NO supervisor / ACP / tunnel / health check.
+
+    The native runtime owns its own loop in-server and only needs exec+files
+    over the volume-backed sandbox — this is the modal analogue of
+    DockerTransport's bare ``sleep infinity`` container. Cheaper than
+    ``create_sandbox`` (no tunnel setup, no 120-retry supervisor health
+    poll), which is the point: native resource lifecycle stays lean.
+
+    Returns a ``ProviderInstance`` whose ``sandbox_ref`` is the Modal
+    ``object_id`` (resolved by ``Sandbox.from_id`` in exec/status/stop).
+    """
+    if not subpath:
+        raise ValueError("modal create_bare_sandbox requires a non-empty subpath")
+    modal, _ = _require_modal()
+    app = await _get_app()
+    image = await _get_image()
+    vol = await _get_volume(volume_ref)
+    entrypoint = _build_bare_entrypoint(subpath=subpath, root=root)
+    log.info("modal create_bare_sandbox (native): volume=%s subpath=%s root=%s",
+             volume_ref, subpath, root)
+    res_kw = _to_modal_resources(resources)
+    sb = await asyncio.to_thread(
+        lambda: modal.Sandbox.create(
+            "sh", "-c", entrypoint,
+            app=app,
+            image=image,
+            volumes={_VOLUME_MOUNT: vol},
+            timeout=_SANDBOX_TIMEOUT_SEC,
+            # idle_timeout == hard timeout (not the supervisor's shorter
+            # _SANDBOX_IDLE_TIMEOUT_SEC): the bare path has NO tunnel, so
+            # modal's idle clock — documented to key off tunnel HTTP traffic —
+            # has no signal to reset and could reap an ACTIVE native session
+            # mid-tool-call. Native idle lifecycle is owned by the server's
+            # SessionPool reaper (which tracks exec activity and hibernates),
+            # so we disable modal's separate idle timer and keep only the hard
+            # ceiling as a backstop.
+            idle_timeout=_SANDBOX_TIMEOUT_SEC,
+            **res_kw,
+        )
+    )
+    origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+    try:
+        # ALWAYS tag so out-of-band reclaim can find this sandbox:
+        #  - _TAG_KEY (=object_id): reconcile_on_startup reaps it if orphaned
+        #    (crash between create and the session persisting state.sandbox_ref,
+        #    or a deleted session row). Untagged sandboxes are skipped by the
+        #    reconciler. The value matches state.sandbox_ref so live sandboxes
+        #    are never mis-reaped.
+        #  - agent_sdk_origin: lets cleanup_orphans.py (_reap_modal) isolate
+        #    test residue from production, matching the docker/daytona label.
+        await asyncio.to_thread(sb.set_tags, {
+            _TAG_KEY: sandbox_ref or sb.object_id,
+            _ORIGIN_TAG: origin,
+        })
+        # No health gate: a bare `sleep infinity` PID-1 is "running" the
+        # moment Modal schedules it. The transport's create does one
+        # `exec true`/`mkdir` as the readiness probe.
+        log.info("modal bare sandbox started: id=%s volume=%s subpath=%s",
+                 sb.object_id, volume_ref, subpath)
+        return ProviderInstance(
+            provider="modal",
+            url="",
+            root=root or f"{_VOLUME_MOUNT}/{subpath.strip('/')}",
+            sandbox_ref=sb.object_id,
+            container_id=sb.object_id,
+        )
+    except BaseException:
+        try:
+            await asyncio.to_thread(sb.terminate)
+        except Exception:
+            pass
+        raise
+
+
 def _is_missing_err(msg: str) -> bool:
     """Detect Modal error messages that indicate the sandbox record is gone.
 
@@ -529,6 +657,7 @@ async def get_sandbox_status(ref: str) -> str:
     return "missing"
 
 
+@timed_provider_op("modal", "start")
 async def start_sandbox(ref: str) -> None:
     """Modal sandboxes cannot be resumed after terminate.
 
@@ -541,6 +670,7 @@ async def start_sandbox(ref: str) -> None:
     )
 
 
+@timed_provider_op("modal", "stop")
 async def stop_sandbox(inst: ProviderInstance) -> None:
     """Terminate the sandbox. Modal has no pause — this is destructive."""
     sid = inst.sandbox_ref or inst.container_id
@@ -558,24 +688,12 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
         log.warning("modal stop %s: %s", sid, e)
 
 
+@timed_provider_op("modal", "destroy")
 async def destroy_sandbox(inst: ProviderInstance) -> None:
     """Destroy the sandbox. Same as ``stop_sandbox`` — Modal has no two-tier."""
     await stop_sandbox(inst)
     inst.sandbox_ref = None
     inst.container_id = None
-
-
-async def ensure_supervisor_url(
-    inst: ProviderInstance,
-    *, agent_type: str = "opencode", root: str = "/tmp",
-    spawn_env: dict | None = None, port: int | None = None,
-) -> str:
-    """Modal supervisor is started at ``create_sandbox`` time — URL is stable.
-
-    Signature matches the other providers so mis-spelled kwargs surface as
-    ``TypeError`` instead of being silently swallowed.
-    """
-    return inst.url
 
 
 async def resolve_supervisor_url(sandbox_ref: str) -> str | None:
@@ -723,11 +841,6 @@ async def reconcile_on_startup() -> None:
 # Volume file-ops (per-call utility sandbox)
 # ---------------------------------------------------------------------------
 
-def _safe_rel(path: str) -> str:
-    """Normalize + validate a volume-relative path (no realpath check)."""
-    return _safe_path(None, path)
-
-
 async def _run_volume_shell(
     ref: str, shell: str, *, timeout: int = 60, vol=None,
 ) -> tuple[int, bytes, bytes]:
@@ -776,172 +889,16 @@ async def _run_volume_shell(
     )
 
 
-async def volume_tree(ref: str, path: str) -> str:
-    """Tree listing of ``<volume>/<path>`` in the unified format.
+class ModalVolumeAdapter(ShellVolumeAdapter):
+    """Volume ops inside a short-lived modal sandbox (volume at /v)."""
 
-    Output: one entry per line, paths relative to the volume root,
-    directories end with ``/``, files do not, sorted.
-    """
-    rel = _safe_rel(path)
-    target = f"/v/{rel}" if rel else "/v"
-    quoted_target = shlex.quote(target)
-    shell = (
-        f"if [ ! -e {quoted_target} ]; then exit 0; fi; "
-        f"find {quoted_target} -mindepth 1 -printf '%y %P\\n' 2>/dev/null"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        raise RuntimeError(
-            f"modal volume_tree failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-    normalized = normalize_find_output(out.decode(errors="replace"))
-    if not rel or not normalized:
-        return normalized
-    lines = [f"{rel.rstrip('/')}/{ln}" for ln in normalized.splitlines()]
-    return "\n".join(sorted(lines))
+    provider = "modal"
+    tree_find_gnu = True   # debian image — single-pass find -printf
+
+    async def _run_shell(self, shell: str, *, timeout: int) -> tuple[int, bytes, bytes]:
+        return await _run_volume_shell(self.provider_ref, shell, timeout=timeout)
 
 
-async def volume_read(ref: str, path: str) -> bytes:
-    """Return the bytes of ``<volume>/<path>`` (base64 over the wire)."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_read: path required")
-    target = f"/v/{rel}"
-    shell = (
-        f"if [ ! -f {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"base64 -w0 {shlex.quote(target)} 2>/dev/null || base64 {shlex.quote(target)}"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(
-            f"modal volume_read failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-    try:
-        return base64.b64decode(out.strip())
-    except Exception as exc:
-        raise RuntimeError(f"modal volume_read: malformed base64 output: {exc}") from exc
-
-
-async def volume_exists(ref: str, path: str) -> bool:
-    """Return whether ``<volume>/<path>`` exists."""
-    rel = _safe_rel(path)
-    target = f"/v/{rel}" if rel else "/v"
-    rc, _out, err = await _run_volume_shell(
-        ref, f"test -e {shlex.quote(target)}", timeout=60,
-    )
-    if rc == 0:
-        return True
-    if rc == 1:
-        return False
-    raise RuntimeError(
-        f"modal volume_exists failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-    )
-
-
-async def volume_write(ref: str, path: str, content: bytes) -> None:
-    """Write ``content`` to ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_write: path required")
-    target = f"/v/{rel}"
-    parent = "/v/" + "/".join(rel.split("/")[:-1])
-    b64 = base64.b64encode(content).decode()
-    shell = (
-        f"mkdir -p {shlex.quote(parent)} && "
-        f"printf %s {shlex.quote(b64)} | base64 -d > {shlex.quote(target)}"
-    )
-    rc, _out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        raise RuntimeError(
-            f"modal volume_write failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_upload(ref: str, path: str, content: bytes) -> None:
-    """Upload bytes to ``<volume>/<path>``."""
-    await volume_write(ref, path, content)
-
-
-async def volume_mkdir(ref: str, path: str) -> None:
-    """Create a directory at ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("modal volume_mkdir: path required")
-    target = f"/v/{rel}"
-    rc, _out, err = await _run_volume_shell(
-        ref, f"mkdir -p {shlex.quote(target)}", timeout=60,
-    )
-    if rc != 0:
-        raise RuntimeError(
-            f"modal volume_mkdir failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_delete(ref: str, path: str) -> None:
-    """Delete a file or directory at ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("modal volume_delete: path required")
-    target = f"/v/{rel}"
-    shell = (
-        f"if [ ! -e {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"rm -rf -- {shlex.quote(target)}"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(
-            f"modal volume_delete failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
-    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
-    src_rel = _safe_rel(path)
-    dst_rel = _safe_rel(new_path)
-    if not src_rel or not dst_rel:
-        raise ValueError("modal volume_rename: path and new_path required")
-    src = f"/v/{src_rel}"
-    dst = f"/v/{dst_rel}"
-    dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
-    settle_check = (
-        f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
-        f"if [ -e {shlex.quote(dst)} ] && [ ! -e {shlex.quote(src)} ]; then exit 0; fi; "
-        f"sleep 0.1; "
-        f"done; "
-        f"echo __RENAME_NOT_VISIBLE__; exit 98"
-    )
-    if overwrite:
-        shell = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} && "
-            f"mv -- {shlex.quote(src)} {shlex.quote(dst)} && "
-            f"{settle_check}"
-        )
-    else:
-        shell = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
-            f"if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; fi; "
-            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi; "
-            f"ln {shlex.quote(src)} {shlex.quote(dst)} || "
-            f"{{ if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; else exit 1; fi; }}; "
-            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}; "
-            f"{settle_check}"
-        )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        if b"__EXISTS__" in out:
-            raise VolumeFileExistsError(new_path)
-        if b"__UNSUPPORTED_DIR__" in out:
-            raise NotImplementedError("atomic no-overwrite directory rename is not supported")
-        if b"__RENAME_NOT_VISIBLE__" in out:
-            raise RuntimeError("volume_rename postcondition failed: destination not visible")
-        raise RuntimeError(
-            f"modal volume_rename failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
+#: uniform per-provider adapter handle — ``get_volume_adapter`` dispatches
+#: via ``_dispatch_mod(provider).VolumeAdapter`` (one registry for everything).
+VolumeAdapter = ModalVolumeAdapter

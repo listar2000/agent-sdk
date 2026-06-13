@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from ... import load_dotenv
+from ...metrics import timed_provider_op
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ from .._shared import (
     VolumeFileExistsError,
     normalize_find_output,
 )
+from .._volume import ShellVolumeAdapter
 
 # The supervisor lives at ``/opt/agent-sdk/runtime/`` inside the daytona
 # sandbox image; this is the port it listens on.
@@ -159,6 +161,7 @@ async def _get_async_daytona_client():
         return _DAYTONA_CLIENT_ASYNC
 
 
+@timed_provider_op("daytona", "start_supervisor")
 async def start_supervisor_in_sandbox(
     sandbox, agent_type: str, port: int, root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
@@ -312,7 +315,8 @@ async def provision_daytona_sandbox(
     resources: Any = None,
 ) -> ProviderInstance:
     """Create a Daytona sandbox with its volume mounts, but do NOT start a
-    supervisor (that is handled later by ensure_supervisor_url).
+    supervisor (that is handled later by start_supervisor_in_sandbox
+    via DaytonaSandboxSession.start).
 
     Returns a ProviderInstance with sandbox_ref but no usable supervisor URL.
     Supervisors are started per-session via start_supervisor_in_sandbox().
@@ -379,14 +383,19 @@ async def provision_daytona_sandbox(
                 "scripts/release.sh)."
             )
 
-    # 60s for plain image-create works in light load but Daytona's
-    # control plane queues sandbox provisioning, so under -n auto with
-    # 32 concurrent test workers (or production at >10 prompts/sec) the
-    # snapshot-create itself can take 90-150s. The dockerfile path was
-    # always at 300s for the same reason. Use a single generous budget;
-    # this isn't a retry — it's giving Daytona enough room to provision
-    # one sandbox.
-    create_timeout = 300 if dockerfile else 240
+    # Daytona's control plane QUEUES provisioning. On a healthy account a
+    # create returns in seconds even under the full `-n auto` burst, but when
+    # the account is saturated (orphan/disk pressure from prior runs, or
+    # production at >10 prompts/sec) the queue+provision time can run long. We
+    # deliberately do NOT throttle create concurrency — that caps throughput
+    # and serializes provisioning; instead we give each create a generous
+    # CEILING so the legit tail fits without spurious "Function 'create'
+    # exceeded timeout" / 502 failures. This is a ceiling, not the typical
+    # latency. Not a retry — one create, enough room. Env-overridable per
+    # deployment; pair with orphan hygiene (cleanup_orphans.py) to keep the
+    # account fast.
+    _base = 540 if dockerfile else 480
+    create_timeout = int(os.environ.get("DAYTONA_CREATE_TIMEOUT_S", str(_base)))
 
     volumes = _build_volume_mounts(volume_id, subpath, shared_mounts)
     labels = _sandbox_labels()
@@ -554,11 +563,13 @@ async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
         log.warning("failed to %s daytona sandbox %s: %s", op, instance.sandbox_ref, e)
 
 
+@timed_provider_op("daytona", "destroy")
 async def destroy_daytona(instance: ProviderInstance) -> None:
     """Delete a Daytona sandbox."""
     await _daytona_sandbox_op(instance, "delete")
 
 
+@timed_provider_op("daytona", "stop")
 async def stop_daytona(instance: ProviderInstance) -> None:
     """Stop (not delete) a Daytona sandbox so it can be resumed later."""
     await _daytona_sandbox_op(instance, "stop")
@@ -900,62 +911,7 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     return ExecResult(stdout=out, stderr=err, exit_code=code, stdout_truncated=trunc)
 
 
-async def ensure_supervisor_url(inst: ProviderInstance, *, agent_type: str,
-                                root: str = "/tmp",
-                                spawn_env: dict | None = None,
-                                port: int | None = None) -> str:
-    """Daytona: start a supervisor in the sandbox referenced by ``inst`` and
-    return its URL.
-
-    Daytona follows a 2-phase "create the sandbox, then start the
-    supervisor" model — ``create_sandbox`` returns an instance with
-    ``url=""``, and the server calls this helper later to spawn the
-    supervisor process and mint a signed preview URL.
-
-    Docker and local providers collapse these two steps: their
-    ``create_sandbox`` already has ``url`` set when it returns, so the
-    corresponding ``ensure_supervisor_url`` is effectively a no-op that
-    just echoes ``inst.url``.  The dispatcher in
-    ``providers.__init__.ensure_supervisor_url`` routes transparently to
-    whichever provider the instance belongs to.
-
-    Mi3: the ``**_kw`` catch-all was removed so a mis-spelled kwarg
-    surfaces as TypeError instead of being silently swallowed — matching
-    the docker + local signatures."""
-    daytona_client = await _get_async_daytona_client()
-    try:
-        sandbox = await daytona_client.get(inst.sandbox_ref)
-    except Exception as e:
-        # Daytona raises a plain Exception with "not found" in the message when
-        # the sandbox has been deleted out-of-band. Surface this as a typed
-        # error so the server can re-provision on the same volume.
-        if "not found" in str(e).lower():
-            from .._shared import SandboxMissingError
-            raise SandboxMissingError(
-                f"Daytona sandbox {inst.sandbox_ref} not found (deleted externally)"
-            ) from e
-        raise
-    # If the sandbox was stopped externally (e.g. daytona.stop()), start it
-    # and wait for the container network to be ready before exec-ing.
-    raw_state = sandbox.state
-    state_str = _enum_str(raw_state)
-    if state_str != "started":
-        log.info("ensure_supervisor_url: sandbox %s is %s; starting", inst.sandbox_ref[:16], state_str)
-        await sandbox.start()
-        await _wait_for_daytona_sandbox_ready(daytona_client, inst.sandbox_ref)
-        sandbox = await daytona_client.get(inst.sandbox_ref)
-    # The agent's HOME is /home/daytona — a local ext4 dir the supervisor
-    # creates and populates from the volume snapshot on boot. supervisor.js
-    # sets HOME=root when spawning the ACP child so Claude Code's session
-    # JSONLs land in the restored workspace. No env-level HOME override
-    # needed here anymore.
-    return await start_supervisor_in_sandbox(
-        sandbox, agent_type, port, root=_DAYTONA_AGENT_HOME, spawn_env=spawn_env,
-    )
-
-
-
-
+@timed_provider_op("daytona", "create_sandbox")
 async def create_sandbox(
     *,
     volume_ref: str,
@@ -975,7 +931,8 @@ async def create_sandbox(
     Delegates to ``provision_daytona_sandbox`` which creates the sandbox with
     the volume mounts (per-agent subpath at /vol + any opt-in shared mounts)
     but does NOT start a supervisor; the caller must run
-    ``ensure_supervisor_url`` before talking to the supervisor.
+    ``DaytonaSandboxSession.start`` (start_supervisor_in_sandbox) before
+    talking to the supervisor.
 
     ``spawn_env`` / ``port`` / `sandbox_ref` are accepted for parity with
     docker/local but are unused here — the supervisor is started later with
@@ -1111,49 +1068,12 @@ async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
         return await _prov.exec_in_instance(inst, cmd, timeout=timeout)
 
 
-async def volume_tree(ref: str, path: str) -> str:
-    """Tree listing of ``<volume>/<path>`` in the unified format (max depth 3)."""
-    rel = _safe_path(None, path or "")
-    target = "/v/" + rel if rel else "/v"
-    res = await _run_in_utility_sandbox(
-        ref,
-        f"find {shlex.quote(target)} -mindepth 1 -maxdepth 3 -printf '%y %P\\n' 2>/dev/null"
-    )
-    normalized = normalize_find_output(res.stdout)
-    if not rel or not normalized:
-        return normalized
-    lines = [f"{rel.rstrip('/')}/{ln}" for ln in normalized.splitlines()]
-    return "\n".join(sorted(lines))
-
-
-async def volume_read(ref: str, path: str) -> bytes:
-    """Read ``<volume>/<path>`` bytes via a short-lived utility sandbox."""
-    rel = _safe_path(None, path or "")
-    if not rel:
-        raise ValueError("volume_read: path required")
-    target = "/v/" + rel
-    # base64 so binary survives the exec response.
-    res = await _run_in_utility_sandbox(
-        ref,
-        f"if [ ! -f {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"base64 -w0 {shlex.quote(target)} 2>/dev/null || base64 {shlex.quote(target)}",
-    )
-    if res.exit_code != 0:
-        if "__MISSING__" in (res.stdout or ""):
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(f"volume_read failed: {res.stderr[:400]}")
-    import base64 as _b64
-    try:
-        return _b64.b64decode((res.stdout or "").strip())
-    except Exception as exc:
-        raise RuntimeError(f"volume_read: malformed base64: {exc}") from exc
-
-
 async def volume_download(ref: str, path: str) -> bytes:
     """Read raw bytes from ``<volume>/<path>`` via Daytona's filesystem API.
 
-    This bypasses ``volume_read``'s exec/stdout path by using Daytona's
-    dedicated file-download endpoint through the SDK.
+    This bypasses the shell exec/stdout path by using Daytona's dedicated
+    file-download endpoint through the SDK. Used by DaytonaVolumeAdapter.download
+    and _daytona_supports_conditional_create.
     """
     rel = _safe_path(None, path or "")
     if not rel:
@@ -1229,6 +1149,7 @@ async def _move_overwrite(ref: str, src_abs: str, dst_abs: str) -> None:
 
 async def _daytona_supports_conditional_create(ref: str) -> bool:
     """Detect once per volume whether toolbox upload honors If-None-Match: *."""
+    import base64 as _b64
     mode = (os.environ.get("DAYTONA_CONDITIONAL_CREATE_MODE", "auto") or "auto").strip().lower()
     if mode in {"on", "true", "1", "force", "force_on"}:
         return True
@@ -1244,7 +1165,18 @@ async def _daytona_supports_conditional_create(ref: str) -> bool:
         probe_rel = f"system/.conditional-create-probe-{uuid.uuid4().hex}.txt"
         probe_abs = "/v/" + probe_rel
         try:
-            await volume_write(ref, probe_rel, b"probe-a")
+            # Inline the write: same shell pipeline the adapter's write() uses.
+            b64 = _b64.b64encode(b"probe-a").decode()
+            parent = shlex.quote("/v/system")
+            target = shlex.quote(probe_abs)
+            write_cmd = (
+                f"mkdir -p {parent} && "
+                f"printf %s {shlex.quote(b64)} | base64 -d > {target}"
+            )
+            res = await _run_in_utility_sandbox(ref, write_cmd)
+            if res.exit_code != 0:
+                _conditional_create_support_cache[ref] = False
+                return False
             result = await _conditional_upload_if_absent(ref, probe_abs, b"probe-b")
             if result != "exists":
                 _conditional_create_support_cache[ref] = False
@@ -1263,54 +1195,13 @@ async def _daytona_supports_conditional_create(ref: str) -> bool:
                 pass
 
 
-async def volume_exists(ref: str, path: str) -> bool:
-    """Return whether ``<volume>/<path>`` exists."""
-    rel = _safe_path(None, path or "")
-    target = "/v/" + rel if rel else "/v"
-    res = await _run_in_utility_sandbox(ref, f"test -e {shlex.quote(target)}")
-    if res.exit_code == 0:
-        return True
-    if res.exit_code == 1:
-        return False
-    raise RuntimeError(f"volume_exists failed: {res.stderr[:400]}")
-
-
-async def volume_write(ref: str, path: str, content: bytes) -> None:
-    """Write ``content`` to ``<volume>/<path>`` via a short-lived utility sandbox."""
-    rel = _safe_path(None, path or "")
-    if not rel:
-        raise ValueError("volume_write: path required")
-    target = "/v/" + rel
-    parent = "/v/" + "/".join(rel.split("/")[:-1])
-    import base64 as _b64
-    b64 = _b64.b64encode(content).decode()
-    cmd = (
-        f"mkdir -p {shlex.quote(parent)} && "
-        f"printf %s {shlex.quote(b64)} | base64 -d > {shlex.quote(target)}"
-    )
-    res = await _run_in_utility_sandbox(ref, cmd)
-    if res.exit_code != 0:
-        raise RuntimeError(f"volume_write failed: {res.stderr[:400]}")
-
-
-async def volume_upload(ref: str, path: str, content: bytes) -> None:
-    """Upload bytes to ``<volume>/<path>``."""
-    await volume_write(ref, path, content)
-
-
-async def volume_mkdir(ref: str, path: str) -> None:
-    """Create a directory at ``<volume>/<path>``."""
-    rel = _safe_path(None, path or "")
-    if not rel:
-        raise ValueError("volume_mkdir: path required")
-    target = "/v/" + rel
-    res = await _run_in_utility_sandbox(ref, f"mkdir -p {shlex.quote(target)}")
-    if res.exit_code != 0:
-        raise RuntimeError(f"volume_mkdir failed: {res.stderr[:400]}")
-
-
 async def volume_delete(ref: str, path: str) -> None:
-    """Delete a file or directory at ``<volume>/<path>``."""
+    """Delete a file or directory at ``<volume>/<path>`` via Daytona's fs API.
+
+    Kept as a module-level helper (not inlined into the class) because:
+    - _daytona_supports_conditional_create calls it in its finally block
+    - test_volumes_api.py patches it directly to intercept adapter.delete()
+    """
     rel = _safe_path(None, path or "")
     if not rel:
         raise ValueError("volume_delete: path required")
@@ -1334,81 +1225,149 @@ async def volume_delete(ref: str, path: str) -> None:
         raise RuntimeError(f"volume_delete failed: {msg}") from e
 
 
-async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
-    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
-    src_rel = _safe_path(None, path or "")
-    dst_rel = _safe_path(None, new_path or "")
-    if not src_rel or not dst_rel:
-        raise ValueError("volume_rename: path and new_path required")
-    src = "/v/" + src_rel
-    dst = "/v/" + dst_rel
-    dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
-    if src_rel == dst_rel:
-        return
-    # mountpoint-backed volumes can lag after copy/delete. Do not report
-    # success until dst is visible and src is gone in the utility sandbox view.
-    settle_check = (
-        f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
-        f"if [ -e {shlex.quote(dst)} ] && [ ! -e {shlex.quote(src)} ]; then exit 0; fi; "
-        f"sleep 0.1; "
-        f"done; "
-        f"echo __RENAME_NOT_VISIBLE__; exit 98"
-    )
-    if overwrite:
-        # Daytona volumes are object-store backed. Use Daytona's filesystem move
-        # endpoint so creation and source removal happen in the provider layer,
-        # not through the eventually-consistent mounted /v view.
-        res = await _run_in_utility_sandbox(
-            ref,
+# ---------------------------------------------------------------------------
+# DaytonaVolumeAdapter — ShellVolumeAdapter subclass for Daytona volumes.
+#
+# The transport is the TTL-cached utility sandbox (_run_in_utility_sandbox).
+# SDK primitives override shell where cheaper/more reliable:
+#   - download: fs.download_file (avoids base64 exec round-trip)
+#   - delete:   fs.delete_file   (SDK atomic delete, not shell rm)
+#   - rename:   extra Daytona-specific logic (_move_overwrite + conditional
+#               create for no-overwrite; same-path early return)
+# ---------------------------------------------------------------------------
+
+class DaytonaVolumeAdapter(ShellVolumeAdapter):
+    """Volume ops for Daytona via the TTL-cached utility sandbox.
+
+    Inherits tree/read/exists/write/upload/mkdir from ShellVolumeAdapter.
+    Overrides download, delete, and rename with Daytona SDK primitives.
+
+    Daytona-specific knobs vs the generic defaults:
+      - tree_max_depth = 3   (bounded depth; daytona volumes can be deep)
+      - tree_check_rc = False (partial find results tolerated on large trees)
+      - shell_timeout = 30   (tight timeout; utility sandbox is always warm)
+      - vol_root = "/v"      (volume is mounted at /v in the utility sandbox)
+    """
+
+    provider = "daytona"
+    tree_find_gnu = True   # debian image — single-pass find -printf
+    vol_root = "/v"
+    tree_max_depth = 3
+    tree_check_rc = False
+    shell_timeout = 30
+
+    async def _run_shell(self, shell: str, *, timeout: int) -> tuple[int, bytes, bytes]:
+        """Adapt utility-sandbox ExecResult to the (rc, out, err) tuple
+        that ShellVolumeAdapter expects.
+
+        exit_code=None means the SDK didn't report it — treated as 0 (OK),
+        consistent with _ExecResult.ok in the daytona module.
+        """
+        res = await _run_in_utility_sandbox(self.provider_ref, shell, timeout=timeout)
+        # Fail CLOSED on an unconfirmed exec: the daytona SDK can return
+        # exit_code=None (seen in practice on pre-start commands); treating
+        # that as success would turn exists() into a false True and let
+        # write/mkdir report 204 with no proof the command ran. -1 (not 1:
+        # exists() maps rc==1 to False) routes every op to its error path.
+        rc = res.exit_code if res.exit_code is not None else -1
+        return rc, (res.stdout or "").encode(), (res.stderr or "").encode()
+
+    async def download(self, path: str) -> bytes:
+        """Download via Daytona's fs.download_file (cheaper than base64 exec)."""
+        return await volume_download(self.provider_ref, path)
+
+    async def delete(self, path: str) -> None:
+        """Delete via Daytona's fs.delete_file SDK primitive."""
+        await volume_delete(self.provider_ref, path)
+
+    async def rename(self, path: str, new_path: str, *, overwrite: bool = True) -> None:
+        """Rename/move with Daytona-specific branches.
+
+        Diverges from generic ShellVolumeAdapter.rename:
+          - same-path early return (avoid any sandbox round-trip)
+          - overwrite path: shell precheck (missing/dir) + _move_overwrite SDK
+            call + settle loop (object-store visibility lag)
+          - no-overwrite path: _daytona_supports_conditional_create gating +
+            _conditional_upload_if_absent instead of hardlink (hardlinks are
+            unreliable on Daytona object-store volumes)
+        """
+        src_rel = self._rel(path)
+        dst_rel = self._rel(new_path)
+        if not src_rel or not dst_rel:
+            raise ValueError("volume rename: path and new_path required")
+        src = self._target(src_rel)
+        dst = self._target(dst_rel)
+        dst_parent = shlex.quote(self._parent(dst_rel))
+        if src_rel == dst_rel:
+            return
+        # mountpoint-backed volumes can lag after copy/delete.
+        settle_check = (
+            f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
+            f"if [ -e {shlex.quote(dst)} ] && [ ! -e {shlex.quote(src)} ]; then exit 0; fi; "
+            f"sleep 0.1; "
+            f"done; "
+            f"echo __RENAME_NOT_VISIBLE__; exit 98"
+        )
+        if overwrite:
+            # Use Daytona's filesystem move endpoint so creation and source
+            # removal happen in the provider layer, not through the
+            # eventually-consistent mounted /v view.
+            rc, out, err = await self._run_shell(
+                (
+                    f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
+                    f"mkdir -p {dst_parent} || exit $?; "
+                    f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi"
+                ),
+                timeout=self.shell_timeout,
+            )
+            if rc != 0:
+                if b"__MISSING__" in out:
+                    raise FileNotFoundError(f"{path} not found on volume {self.provider_ref}")
+                if b"__UNSUPPORTED_DIR__" in out:
+                    raise NotImplementedError("overwrite rename for directories is not supported")
+                raise self._err("rename", rc, err)
+            await _move_overwrite(self.provider_ref, src, dst)
+            verify_rc, _vout, _verr = await self._run_shell(
+                settle_check, timeout=self.shell_timeout,
+            )
+            if verify_rc != 0:
+                raise RuntimeError("volume rename postcondition failed: destination not visible")
+            return
+
+        # Daytona volumes are object-store backed; hardlinks are not reliable.
+        # Require a real create-if-absent primitive instead of race-prone emulation.
+        if not await _daytona_supports_conditional_create(self.provider_ref):
+            raise NotImplementedError(
+                "atomic no-overwrite rename is not supported on this Daytona volume backend"
+            )
+        rc, out, err = await self._run_shell(
             (
                 f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-                f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
+                f"mkdir -p {dst_parent} || exit $?; "
                 f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi"
             ),
+            timeout=self.shell_timeout,
         )
-        if res.exit_code != 0:
-            if "__MISSING__" in (res.stdout or ""):
-                raise FileNotFoundError(f"{path} not found on volume {ref}")
-            if "__UNSUPPORTED_DIR__" in (res.stdout or ""):
-                raise NotImplementedError("overwrite rename for directories is not supported")
-            raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")
-        await _move_overwrite(ref, src, dst)
-        verify = await _run_in_utility_sandbox(ref, settle_check)
-        if verify.exit_code != 0:
-            raise RuntimeError("volume_rename postcondition failed: destination not visible")
-        return
-
-    # Daytona volumes are object-store backed; hardlinks are not reliable.
-    # Require a real create-if-absent primitive instead of race-prone emulation.
-    if not await _daytona_supports_conditional_create(ref):
-        raise NotImplementedError(
-            "atomic no-overwrite rename is not supported on this Daytona volume backend"
+        if rc != 0:
+            if b"__MISSING__" in out:
+                raise FileNotFoundError(f"{path} not found on volume {self.provider_ref}")
+            if b"__UNSUPPORTED_DIR__" in out:
+                raise NotImplementedError("atomic no-overwrite directory rename is not supported")
+            raise self._err("rename", rc, err)
+        src_bytes = await volume_download(self.provider_ref, src_rel)
+        outcome = await _conditional_upload_if_absent(self.provider_ref, dst, src_bytes)
+        if outcome == "exists":
+            raise VolumeFileExistsError(new_path)
+        if outcome != "created":
+            raise RuntimeError(
+                "volume rename failed: conditional destination claim returned unknown result"
+            )
+        await volume_delete(self.provider_ref, src_rel)
+        verify_rc, _vout, _verr = await self._run_shell(
+            settle_check, timeout=self.shell_timeout,
         )
-    res = await _run_in_utility_sandbox(
-        ref,
-        (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
-            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi"
-        ),
-    )
-    if res.exit_code != 0:
-        if "__MISSING__" in (res.stdout or ""):
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        if "__UNSUPPORTED_DIR__" in (res.stdout or ""):
-            raise NotImplementedError("atomic no-overwrite directory rename is not supported")
-        raise RuntimeError(f"volume_rename failed: {res.stderr[:400]}")
-    src_bytes = await volume_download(ref, src_rel)
-    outcome = await _conditional_upload_if_absent(ref, dst, src_bytes)
-    if outcome == "exists":
-        raise VolumeFileExistsError(new_path)
-    if outcome != "created":
-        raise RuntimeError("volume_rename failed: conditional destination claim returned unknown result")
-    await volume_delete(ref, src_rel)
-    verify = await _run_in_utility_sandbox(ref, settle_check)
-    if verify.exit_code != 0:
-        raise RuntimeError("volume_rename postcondition failed: destination not visible")
-    return
+        if verify_rc != 0:
+            raise RuntimeError("volume rename postcondition failed: destination not visible")
 
 
 # ---------------------------------------------------------------------------
@@ -1519,3 +1478,8 @@ async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> 
         "state_hist": dict(state_hist),
         "capped": capped,
     }
+
+
+#: uniform per-provider adapter handle — ``get_volume_adapter`` dispatches
+#: via ``_dispatch_mod(provider).VolumeAdapter`` (one registry for everything).
+VolumeAdapter = DaytonaVolumeAdapter

@@ -24,10 +24,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from agent_sdk.client import Agent
 from agent_sdk.errors import PromptError, StreamError
 
@@ -54,7 +50,7 @@ def _text_block(rpc_id: str, text: str) -> str:
     payload = {
         "method": "session/update",
         "params": {"update": {
-            "sessionUpdate": "agent_message_delta",
+            "sessionUpdate": "agent_message_delta",  # legacy shape — compat pinned
             "content": {"type": "text", "text": text},
         }},
     }
@@ -117,7 +113,7 @@ class TestAstreamEventsTypes:
 
     @pytest.mark.asyncio
     async def test_yields_text_event(self):
-        """astream yields a text event for an agent_message_delta block."""
+        """astream yields a text event for an agent_message_chunk block."""
         agent = _patched_agent()
         rpc_id = "rpc-text-1"
         blocks = [_text_block(rpc_id, "Hello world"), _done_block(rpc_id)]
@@ -427,7 +423,7 @@ class TestSseReadTimeout:
             async def aiter_text(self):
                 yield "event: rpc:rpc-t\ndata: " + json.dumps({
                     "method": "session/update",
-                    "params": {"update": {"sessionUpdate": "agent_message_delta",
+                    "params": {"update": {"sessionUpdate": "agent_message_chunk",
                                           "content": {"type": "text", "text": "partial"}}},
                 }) + "\n\n"
                 raise httpx.ReadTimeout("mock timeout")
@@ -787,14 +783,14 @@ class TestRaiseForStatus:
 
     def test_200_does_not_raise(self):
         """2xx status codes do not raise."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 200
         _raise_for_status(resp)  # must not raise
 
     def test_404_raises_with_error_detail(self):
         """4xx raises HTTPStatusError with extracted 'error' field."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 404
         resp.json = MagicMock(return_value={"error": "not found"})
@@ -806,7 +802,7 @@ class TestRaiseForStatus:
 
     def test_4xx_raises_with_detail_field_fallback(self):
         """If no 'error' key, falls back to 'detail'."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 422
         resp.json = MagicMock(return_value={"detail": "validation error"})
@@ -818,7 +814,7 @@ class TestRaiseForStatus:
 
     def test_raises_even_when_json_fails(self):
         """If response body is not JSON, still raises with text fallback."""
-        from agent_sdk.client import _raise_for_status
+        from agent_sdk.api_client import _raise_for_status
         resp = MagicMock()
         resp.status_code = 500
         resp.json = MagicMock(side_effect=ValueError("not json"))

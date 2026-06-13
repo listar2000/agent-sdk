@@ -131,7 +131,7 @@ def test_heartbeat_returns_none():
     ("done", "turn_end"),
 ])
 def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
-    from api.server import _EVENT_TYPE_TO_LOG
+    from api.turn import _EVENT_TYPE_TO_LOG
     assert _EVENT_TYPE_TO_LOG.get(etype) == expected_log_type, (
         f"_EVENT_TYPE_TO_LOG must map parser output {etype!r} to "
         f"{expected_log_type!r} so persist and SSE produce the same canonical log"
@@ -163,8 +163,6 @@ class _NoopLiveness:
     def observe_prompt_start(self) -> None: ...
     def observe_prompt_end(self) -> None: ...
     def observe_chunk(self) -> None: ...
-    def observe_activity(self) -> None: ...
-    def observe_close(self) -> None: ...
 
 
 class _FakeSession:
@@ -197,9 +195,18 @@ def _capture_log_writes(monkeypatch) -> list[tuple[str, dict]]:
     async def _fake_log_event(*, session_id, agent_id, event_type, payload):
         rows.append((event_type, payload))
 
-    from api import server as srv
-    monkeypatch.setattr(srv, "log_event", _fake_log_event)
+    from api import turn as _turn
+    monkeypatch.setattr(_turn, "log_event", _fake_log_event)
     return rows
+
+
+async def _persist_prompt_events(sess, message: str, rpc_id: str) -> None:
+    """Compat shim: the free function moved into ``api.turn.TurnRunner``
+    (same lock/coalescing/flush semantics). Tests drive the runner the
+    way server.py does."""
+    from api.turn import TurnRunner
+    await TurnRunner(sess, message, rpc_id).run()
+
 
 
 @pytest.mark.asyncio
@@ -209,9 +216,8 @@ async def test_persist_logs_empty_done_turn_for_rca(monkeypatch, caplog):
         {"type": "usage", "usage": {"amount": 1.25, "currency": "USD"}},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
 
-    with caplog.at_level("WARNING", logger="api.server"):
+    with caplog.at_level("WARNING", logger="api.turn"):
         await _persist_prompt_events(sess, "hi", "rpc-empty")
 
     assert [r[0] for r in rows if r[0] != "user_message"] == [
@@ -231,7 +237,6 @@ async def test_persist_coalesces_consecutive_reasoning_chunks(monkeypatch):
         {"type": "reasoning", "text": "step 3"},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -251,7 +256,6 @@ async def test_persist_coalesces_consecutive_text_chunks(monkeypatch):
         {"type": "usage", "usage": {"in": 10, "out": 5}},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -308,7 +312,6 @@ async def test_persist_serializes_concurrent_prompts_on_same_session(monkeypatch
     sess_a.liveness = _NoopLiveness()
     sess_b.liveness = _NoopLiveness()
 
-    from api.server import _persist_prompt_events
     # Fire two concurrent persist tasks against the shared lock.
     t_a = _a.create_task(_persist_prompt_events(sess_a, "msg-a", "rpc-a"))
     t_b = _a.create_task(_persist_prompt_events(sess_b, "msg-b", "rpc-b"))
@@ -361,7 +364,6 @@ async def test_persist_flushes_buffer_on_hard_cancel(monkeypatch):
         def _broadcast(self, _evt: dict) -> None:
             pass
 
-    from api.server import _persist_prompt_events
     task = _asyncio.create_task(
         _persist_prompt_events(_SlowEvents(), "hi", "rpc-cancel"),
     )
@@ -396,7 +398,6 @@ async def test_persist_usage_mid_reasoning_does_not_split_block(monkeypatch):
         {"type": "text", "text": "answer"},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -415,7 +416,6 @@ async def test_persist_flushes_on_type_change(monkeypatch):
         {"type": "text", "text": "final"},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -436,7 +436,6 @@ async def test_persist_flushes_before_tool(monkeypatch):
         {"type": "usage", "usage": {}},
         {"type": "done", "stop_reason": "end_turn"},
     ])
-    from api.server import _persist_prompt_events
     await _persist_prompt_events(sess, "hi", "rpc-1")
 
     types = [r[0] for r in rows if r[0] != "user_message"]
@@ -448,3 +447,76 @@ async def test_persist_flushes_before_tool(monkeypatch):
         "assistant_message", "tool_call", "tool_result",
         "usage", "assistant_message", "turn_end",
     ], f"tool calls flush text; usage does not; got {types}"
+
+
+# ---------------------------------------------------------------------------
+# SEVERE: a stream that ends WITHOUT a terminal must NOT be reported as a
+# successful turn. A supervisor that dies mid-prompt and lets the SSE EOF
+# cleanly (no exception, no 'done') — exactly what a killed daytona supervisor
+# does after its proxy holds the dead connection ~180s — left _drive_one
+# returning (True, None), so the turn logged "turn done" but persisted NO
+# turn_end/error. The client polling /log (or /events) for the rpc's terminal
+# then waits forever: a SILENTLY DROPPED prompt (golden:
+# test_midprompt_recovery_does_not_leak_subscriber[*-daytona], "prompt dropped").
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_terminalless_stream_end_still_delivers_a_terminal(monkeypatch):
+    """A stream that ends without a done/error MUST still persist a terminal
+    (turn_end or error). Pre-fix: only user_message + text were written, no
+    terminal — the prompt is dropped from every client's view."""
+    rows = _capture_log_writes(monkeypatch)
+
+    # No replacement available (recovery can't find a live session) -> the run
+    # must at least write an ERROR terminal rather than claim success.
+    sess = _FakeSession([
+        {"type": "text", "text": "partial reply, then the supervisor died"},
+    ])  # NOTE: no 'done'/'error' — clean EOF mid-prompt
+
+    class _NoReplacementPool:
+        # error-broadcast path reads ``_active`` to reach live subscribers.
+        _active = {sess.session_id: sess}
+
+        async def get_session(self, _sid):
+            raise RuntimeError("no live session")
+    import api.sandbox as _sb
+    monkeypatch.setattr(_sb, "get_pool", lambda: _NoReplacementPool())
+
+    await _persist_prompt_events(sess, "do a thing", "rpc-dropped")
+
+    etypes = [et for et, _ in rows]
+    assert any(et in ("turn_end", "error") for et in etypes), (
+        "no terminal persisted for a stream that ended without a 'done' event "
+        f"— the prompt is silently dropped. persisted: {etypes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminalless_stream_end_recovers_and_delivers_turn_end(monkeypatch):
+    """When the pool HAS cold-recovered a replacement, a terminal-less stream
+    end must RETRY on it and deliver the real turn_end (the recovered reply) —
+    not falsely report the dead turn as done."""
+    rows = _capture_log_writes(monkeypatch)
+
+    sess = _FakeSession([
+        {"type": "text", "text": "partial before death"},
+    ])  # no terminal
+    replacement = _FakeSession([
+        {"type": "text", "text": "recovered reply"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    replacement.session_id = sess.session_id  # same session, fresh sandbox
+
+    class _RecoveredPool:
+        async def get_session(self, _sid):
+            return replacement
+    import api.sandbox as _sb
+    monkeypatch.setattr(_sb, "get_pool", lambda: _RecoveredPool())
+
+    await _persist_prompt_events(sess, "do a thing", "rpc-recover")
+
+    etypes = [et for et, _ in rows]
+    assert "turn_end" in etypes, (
+        "recovery did not deliver a turn_end after a terminal-less stream end "
+        f"— the recovered reply is dropped. persisted: {etypes}"
+    )

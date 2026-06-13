@@ -16,12 +16,9 @@ from pathlib import Path
 
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from api.providers import docker as dprov  # noqa: E402
 from api.providers._shared import ProviderInstance  # noqa: E402
+from api.providers.docker import DockerVolumeAdapter  # noqa: E402
 
 
 def _docker_available() -> bool:
@@ -39,10 +36,13 @@ def _docker_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _docker_available(),
-    reason="docker CLI not available / daemon unreachable",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _docker_available(),
+        reason="docker CLI not available / daemon unreachable",
+    ),
+    pytest.mark.xdist_group("db"),
+]
 
 
 def _vol_name() -> str:
@@ -60,12 +60,13 @@ async def test_create_volume_creates_layout():
         ref = await dprov.create_volume(name)
         assert ref == name
         # Layout dirs should exist via `find`.
-        tree = await dprov.volume_tree(ref, "")
+        adapter = DockerVolumeAdapter(ref)
+        tree = await adapter.tree("")
         # find -type f returns files only; no files yet, but `find` should succeed.
         assert isinstance(tree, str)
         # The shared + system/supervisor dirs exist — confirm via a write-then-read roundtrip.
-        await dprov.volume_write(ref, "shared/ping.txt", b"pong")
-        got = await dprov.volume_read(ref, "shared/ping.txt")
+        await adapter.write("shared/ping.txt", b"pong")
+        got = await adapter.read("shared/ping.txt")
         assert got == b"pong"
     finally:
         await dprov.delete_volume(name)
@@ -115,14 +116,15 @@ async def test_volume_tree_read_write_roundtrip():
     name = _vol_name()
     try:
         await dprov.create_volume(name)
-        await dprov.volume_write(name, "a/b/c.txt", b"hello")
-        await dprov.volume_write(name, "a/b/d.bin", b"\x00\x01\x02\xff\xfe")
-        tree = await dprov.volume_tree(name, "a")
+        adapter = DockerVolumeAdapter(name)
+        await adapter.write("a/b/c.txt", b"hello")
+        await adapter.write("a/b/d.bin", b"\x00\x01\x02\xff\xfe")
+        tree = await adapter.tree("a")
         files = [ln for ln in tree.splitlines() if ln.strip()]
         assert "a/b/c.txt" in files, files
         assert "a/b/d.bin" in files, files
-        assert await dprov.volume_read(name, "a/b/c.txt") == b"hello"
-        assert await dprov.volume_read(name, "a/b/d.bin") == b"\x00\x01\x02\xff\xfe"
+        assert await adapter.read("a/b/c.txt") == b"hello"
+        assert await adapter.read("a/b/d.bin") == b"\x00\x01\x02\xff\xfe"
     finally:
         await dprov.delete_volume(name)
 
@@ -132,10 +134,11 @@ async def test_volume_read_rejects_traversal():
     name = _vol_name()
     try:
         await dprov.create_volume(name)
+        adapter = DockerVolumeAdapter(name)
         with pytest.raises(ValueError):
-            await dprov.volume_read(name, "../etc/passwd")
+            await adapter.read("../etc/passwd")
         with pytest.raises(ValueError):
-            await dprov.volume_write(name, "a/../../b", b"x")
+            await adapter.write("a/../../b", b"x")
     finally:
         await dprov.delete_volume(name)
 
@@ -146,7 +149,7 @@ async def test_volume_read_missing_file_raises():
     try:
         await dprov.create_volume(name)
         with pytest.raises(FileNotFoundError):
-            await dprov.volume_read(name, "does/not/exist.txt")
+            await DockerVolumeAdapter(name).read("does/not/exist.txt")
     finally:
         await dprov.delete_volume(name)
 
@@ -204,15 +207,16 @@ async def _seed_fake_supervisor(volume_ref: str) -> None:
     node_modules/.bin/claude-agent-acp so the docker.create_sandbox command
     line doesn't need a real npm install.
     """
-    await dprov.volume_write(
-        volume_ref, "system/supervisor/supervisor.js",
+    adapter = DockerVolumeAdapter(volume_ref)
+    await adapter.write(
+        "system/supervisor/supervisor.js",
         _FAKE_SUPERVISOR_JS.encode(),
     )
     # Stub ACP binary — the fake supervisor never execs it, but the sandbox
     # command line references the path; create an empty executable so the
     # shell doesn't complain if something resolves it.
-    await dprov.volume_write(
-        volume_ref, "system/supervisor/node_modules/.bin/claude-agent-acp",
+    await adapter.write(
+        "system/supervisor/node_modules/.bin/claude-agent-acp",
         b"#!/bin/sh\necho fake-acp\n",
     )
 
@@ -351,7 +355,6 @@ async def test_label_propagation_provider_create_sandbox():
             except Exception:
                 pass
         await dprov.delete_volume(name)
-
 
 
 @pytest.mark.asyncio

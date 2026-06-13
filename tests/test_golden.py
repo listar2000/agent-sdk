@@ -64,7 +64,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Load env in order: project .env first (wins), then ~/.env as fallback
 from dotenv import load_dotenv
@@ -73,7 +72,7 @@ load_dotenv(os.path.expanduser("~/.env"), override=False)
 
 from agent_sdk import ApiClient  # noqa: E402
 from api.sse import extract_sse_tag, parse_acp_event  # noqa: E402
-from tests._acp_runtimes import agent_type_param  # noqa: E402
+from tests._acp_runtimes import agent_type_param, agent_type_param_with_native  # noqa: E402
 
 SERVER = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY")
@@ -123,10 +122,17 @@ def _has_server() -> bool:
         return False
 
 
-def _require_provider(provider: str) -> None:
+def _require_provider(provider: str, agent_type: str = "claude") -> None:
     """Call pytest.skip() if the provider isn't available. Call at test start."""
     if not _has_server():
         pytest.skip("server not running on localhost:7778")
+    # Native transports: docker (P0) + daytona/modal (P1) + unix_local
+    # (record-only: no resident compute, hibernate/resume are no-ops) — all
+    # live-verified. Tests whose contract needs EXTERNAL compute to stop
+    # (same-sandbox-after-restart) skip native×unix_local at the test level.
+    if agent_type == "native" and provider not in (
+            "docker", "daytona", "modal", "unix_local"):
+        pytest.skip(f"native runtime: {provider} transport not built")
     if provider == "daytona" and not _has_daytona():
         pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
     if provider == "docker" and not _has_docker():
@@ -151,6 +157,10 @@ _RUNTIME_DEFAULTS: dict[str, dict] = {
     "claude": {"model": "haiku", "secret_env": "CLAUDE_CODE_OAUTH_TOKEN"},
     "opencode": {"model": "openrouter/anthropic/claude-3.5-haiku",
                  "secret_env": "OPENROUTER_API_KEY"},
+    # Native: first-party in-server loop, any LiteLLM model. Pinned to a
+    # cheap tool-calling model on openrouter.
+    "native": {"model": "openrouter/openai/gpt-4o-mini",
+               "secret_env": "OPENROUTER_API_KEY"},
 }
 
 
@@ -555,7 +565,7 @@ def _extract_kv(text: str, key: str) -> str | None:
 # simply doesn't apply. Session continuity is covered by
 # ``test_session_resume_after_stop[modal]`` instead.
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
-@agent_type_param
+@agent_type_param_with_native
 @pytest.mark.asyncio
 async def test_stop_sandbox_same_sandbox_after_restart(provider, agent_type):
     """Stop sandbox externally → server restarts it → same sandbox_ref, sandbox responds.
@@ -563,9 +573,18 @@ async def test_stop_sandbox_same_sandbox_after_restart(provider, agent_type):
     Parameterised over ``agent_type`` because the recovery path goes
     through ACP ``session/load`` and the per-runtime ``set_model``
     replay — both of which had opencode-specific bugs that this test
-    catches when run with ``agent_type="opencode"``.
+    catches when run with ``agent_type="opencode"``. Includes ``native``
+    (docker-only): the SAME-sandbox-after-external-stop invariant is
+    exactly native's hibernate→resume contract (docker stop → docker
+    start the same container), and it keys off ``sandbox_ref`` not
+    ``inner_session_id`` (which native never populates), so it's a clean
+    cross-runtime golden standard.
     """
-    _require_provider(provider)
+    _require_provider(provider, agent_type)
+    if agent_type == "native" and provider == "unix_local":
+        pytest.skip("native unix_local is record-only (no resident compute) — "
+                    "nothing external exists to stop; its lifecycle is "
+                    "covered by the reap + delete goldens")
 
     async with ApiClient(SERVER) as sdk:
         sess = await _quick_session(sdk, provider, agent_type=agent_type)
@@ -867,8 +886,8 @@ async def test_corrupt_agent_memory_recovers_not_loops(provider, agent_type):
         print(f"[test:{provider}/{agent_type}] recovered cleanly from corrupt overlay")
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
-@agent_type_param
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param_with_native
 @pytest.mark.asyncio
 async def test_delete_session_destroys_sandbox(provider, agent_type):
     """``DELETE /sessions/{id}`` must destroy the underlying sandbox, not
@@ -885,14 +904,20 @@ async def test_delete_session_destroys_sandbox(provider, agent_type):
     left 6 paused-with-no-session-row daytona sandboxes against the
     2000 GiB account quota.
     """
-    _require_provider(provider)
+    _require_provider(provider, agent_type)
 
     async with ApiClient(SERVER) as sdk:
         sess = await _quick_session(sdk, provider, agent_type=agent_type)
         session_id = sess["session_id"]
+        # Native is lazy — no sandbox until the first tool call. Provision it
+        # with a one-shot exec so there's a real container to assert-destroyed.
+        # CLI runtimes already have a sandbox, so this is a cheap no-op probe.
         sandbox = await _get_sandbox(sdk, session_id)
+        if not (sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")):
+            await _ask(sdk, session_id, "Run the shell command `true` and reply OK.")
+            sandbox = await _get_sandbox(sdk, session_id)
         sandbox_ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
-        assert sandbox_ref, f"fresh session has no sandbox_ref: {sandbox}"
+        assert sandbox_ref, f"session has no sandbox_ref after provision: {sandbox}"
         print(f"\n[test:{provider}] session={session_id[:8]} sandbox={sandbox_ref[:24]}")
 
         # Skip the autouse cleanup fixture's DELETE — we're calling
@@ -905,7 +930,13 @@ async def test_delete_session_destroys_sandbox(provider, agent_type):
         assert resp.status_code == 204, f"DELETE returned {resp.status_code}: {resp.text}"
 
         try:
-            await _assert_sandbox_gone(provider, sandbox, timeout_s=20.0)
+            # Modal terminate is async (sb.terminate(wait=False)), so the exit
+            # status can take longer than docker/daytona to propagate to
+            # 'missing'; give it the same generous budget the sibling teardown
+            # goldens use (60s) to avoid a flaky-fail on a correctly-destroyed
+            # sandbox. docker/daytona/local settle fast, so 20s is plenty.
+            deadline_s = 60.0 if provider == "modal" else 20.0
+            await _assert_sandbox_gone(provider, sandbox, timeout_s=deadline_s)
         except AssertionError:
             # Best-effort cleanup so we don't leak from this test itself.
             try:
@@ -949,6 +980,29 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
             except (json.JSONDecodeError, KeyError, IndexError):
                 last_state = "?"
 
+        elif provider == "modal":
+            # Modal "delete" = terminate (no pause). The sandbox record goes
+            # away → get_sandbox_status reports 'missing'. terminate is async,
+            # so poll until the record is gone (the freed signal). 'running'
+            # means it hasn't propagated yet; 'error' is transient.
+            import sys as _sys
+            from api.providers.modal import get_sandbox_status
+            last_state = await get_sandbox_status(ref)
+            if last_state == "missing":
+                return
+
+        elif provider == "unix_local" and ref.startswith("native-local-"):
+            # Native record-only sandbox: "destroyed" = the provider-index
+            # record is cleared. (The generic pid/marker checks below would
+            # FALSE-PASS here — native has no supervisor pid and no
+            # marker_path on the sandbox row.)
+            import sys as _sys
+            from api.providers.unix_local import _load_record
+            _, record = _load_record(ref)
+            if record is None:
+                return
+            last_state = "record_present"
+
         elif provider == "unix_local":
             # Local "delete" = supervisor process gone AND the sandbox
             # marker file gone. Both are observable without server help:
@@ -963,6 +1017,16 @@ async def _assert_sandbox_gone(provider: str, sandbox: dict, *, timeout_s: float
 
         await asyncio.sleep(0.5)
 
+    # A persistent 'error' state means we could NOT verify destruction (transient
+    # provider/control-plane failure), which is distinct from observing the
+    # sandbox still alive ('running'/'exited'/pid). Say so rather than claim a
+    # leak on what may be an introspection failure.
+    if last_state == "error":
+        raise AssertionError(
+            f"could not verify {provider} sandbox {ref!r} was destroyed within "
+            f"the deadline: provider status kept returning 'error' (transient "
+            f"introspection failure, not necessarily a leak)."
+        )
     raise AssertionError(
         f"DELETE /sessions/{{id}} did not destroy {provider} sandbox "
         f"{ref!r}; last observed state: {last_state}. "
@@ -1403,7 +1467,6 @@ async def test_external_delete_preserves_agent_memory(provider, agent_type):
 
 # Neutral ticket-ID framing avoids Claude's "secret code = social engineering"
 # guardrail. The agent will freely echo/recall TKT-<digits> tokens.
-
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
@@ -1904,7 +1967,7 @@ async def test_persistent_sse_external_delete_then_message(provider, agent_type)
 
     Individual timeout bumped to 240 s. The daytona path does a full
     provision-replacement-sandbox + start-supervisor dance on turn 2
-    (see ``_type2_recover`` + ``ensure_supervisor_url``), and
+    (see ``_type2_recover`` + the daytona session start phase), and
     with daytona-side latency variance the critical path (turn 1 LLM +
     external-delete poll + SSE retry ladder + fresh provisioning +
     session/load + turn 2 LLM) can hit ~100 s on a slow day. 120 s was
@@ -2117,7 +2180,6 @@ async def test_persistent_sse_supervisor_killed_immediate_message(provider, agen
                 f"the 502/connection error on POST /v1/acp was not retried. "
                 f"Reply was: {reply2!r}"
             )
-
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
@@ -2393,7 +2455,12 @@ _ATTEMPTS = 3
 # Delay after POST returns rpc_id before stopping — long enough for the
 # background drain to register its subscriber and start execute_prompt.
 _KILL_DELAY_S = 0.6
-_TERMINAL_TIMEOUT_S = 180.0
+# Terminal-event budget for a mid-prompt recovery (kill sandbox -> cold-recover
+# -> resume -> reply). 300s, not 180s: under -n auto the recovery's daytona
+# cold-create queues behind the provisioning semaphore, so the legit recovery
+# latency tail runs longer than a lightly-loaded run. This is the precondition
+# (term is not None) — the leak assertion it guards is unaffected.
+_TERMINAL_TIMEOUT_S = 300.0
 _SETTLE_TIMEOUT_S = 15.0
 # A turn long enough to still be running when the stop lands.
 _LONG_PROMPT = "Count from 1 to 40, one number per line. Do not stop early."
@@ -2435,6 +2502,167 @@ async def _post_and_wait(sdk: ApiClient, sid: str, msg: str) -> None:
     rpc = await _send_message(sdk, sid, msg)
     term = await _wait_terminal(sdk, sid, rpc, _TERMINAL_TIMEOUT_S)
     assert term is not None, f"warm turn never terminated (rpc={rpc[:8]})"
+
+
+async def _measure_resume_median(sdk: ApiClient, agent_type: str, cycles: int = 3) -> float:
+    """Median reap→resume RESOURCE-MANAGEMENT latency (seconds) for one runtime
+    on docker: turn (sets the activity clock) → reap (hibernate) → time a
+    trivial sandbox_exec, which triggers the resume. The exec is ``true`` so
+    the measured time is the resume cost (docker start [+ supervisor reboot +
+    ACP + health poll for the supervisor path]), NOT model latency."""
+    import statistics
+    import time as _time
+    sess = await _quick_session(sdk, "docker", agent_type=agent_type)
+    sid = sess["session_id"]
+    samples: list[float] = []
+    await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+    for _ in range(cycles):
+        await _post_and_wait(sdk, sid, "Reply with the single word: ok.")
+        r = await sdk._http.post(f"/sessions/{sid}/reap",
+                                 params={"idle_s": 0}, timeout=30)
+        r.raise_for_status()
+        if r.json().get("hibernated") is not True:
+            continue  # activity not settled yet; skip this cycle
+        t0 = _time.monotonic()
+        res = await sdk.session_sandbox_exec(sid, "true", timeout=120)
+        dt = _time.monotonic() - t0
+        assert res.get("exit_code") == 0, f"{agent_type}: post-resume exec failed: {res}"
+        samples.append(dt)
+    assert samples, f"{agent_type}: no successful reap→resume cycle measured"
+    return statistics.median(samples)
+
+
+async def _measure_reap_median(sdk: ApiClient, agent_type: str, cycles: int = 3) -> float:
+    """Median REAP/hibernate latency (seconds) for one runtime on docker: warm
+    the session with a turn (sets the activity clock), then time the
+    ``POST /reap`` that hibernates it (``docker stop``). Native's sleep-infinity
+    PID-1 ignores SIGTERM, so a grace period is pure dead time — native must use
+    ``-t 0`` (immediate SIGKILL) to match the supervisor, whose supervisor.js
+    PID-1 traps SIGTERM and exits promptly. A trivial ``true`` exec resumes the
+    sandbox between cycles."""
+    import statistics
+    import time as _time
+    sess = await _quick_session(sdk, "docker", agent_type=agent_type)
+    sid = sess["session_id"]
+    samples: list[float] = []
+    await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
+    for _ in range(cycles):
+        await _post_and_wait(sdk, sid, "Reply with the single word: ok.")
+        t0 = _time.monotonic()
+        r = await sdk._http.post(f"/sessions/{sid}/reap",
+                                 params={"idle_s": 0}, timeout=30)
+        dt = _time.monotonic() - t0
+        r.raise_for_status()
+        if r.json().get("hibernated") is not True:
+            continue  # activity not settled yet; skip this cycle
+        samples.append(dt)
+        # resume for the next cycle so we re-measure a stop, not a no-op
+        res = await sdk.session_sandbox_exec(sid, "true", timeout=120)
+        assert res.get("exit_code") == 0, f"{agent_type}: post-reap resume failed: {res}"
+    assert samples, f"{agent_type}: no successful reap cycle measured"
+    return statistics.median(samples)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(420)
+async def test_native_reap_at_least_as_efficient_as_supervisor():
+    """RESOURCE-MANAGEMENT efficiency standard (the REAP/stop side): native's
+    reap (hibernate) must be at least as fast as the supervisor path.
+
+    Native ``docker stop -t 0`` SIGKILLs the sleep-infinity PID-1 immediately
+    (~0.1s); the prior ``-t 2`` waited out the full grace (~2s) because that
+    PID-1 ignores SIGTERM. The supervisor's supervisor.js traps SIGTERM and
+    exits in ~0.2s. This pins that native reap can't silently regress to
+    grace-bound latency — the resume-efficiency golden times only the START
+    side, leaving the STOP side unguarded. Relative (same host) + generous
+    tolerance keeps it off the flaky edge while still catching the ~2s
+    regression."""
+    if not _has_docker():
+        pytest.skip("docker not available")
+    if not OAUTH_TOKEN or not _OPENROUTER_KEY:
+        pytest.skip("needs CLAUDE_CODE_OAUTH_TOKEN (supervisor) + "
+                    "OPENROUTER_API_KEY (native)")
+
+    async with ApiClient(SERVER) as sdk:
+        native_med = await _measure_reap_median(sdk, "native")
+        supervisor_med = await _measure_reap_median(sdk, "claude")
+        print(f"\n[reap-efficiency] native={native_med*1000:.0f}ms "
+              f"supervisor={supervisor_med*1000:.0f}ms")
+        assert native_med <= supervisor_med + 0.5, (
+            f"NATIVE REAP REGRESSED: native hibernate ({native_med*1000:.0f}ms) "
+            f"is slower than the supervisor path ({supervisor_med*1000:.0f}ms). "
+            f"Native must `docker stop -t 0` (the sleep-infinity PID-1 ignores "
+            f"SIGTERM, so any grace is dead time) — a grace period regressed in.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(420)
+async def test_native_resume_at_least_as_efficient_as_supervisor():
+    """RESOURCE-MANAGEMENT efficiency standard: native's reap→resume must be at
+    least as fast as the supervisor (agent-in-sandbox) path.
+
+    Native resumes with ``docker start`` + one ``docker inspect`` + exec; the
+    supervisor path's docker stop() clears sandbox_ref, so its resume always
+    cold-creates a container + a supervisor.js reboot + ACP re-attach + health
+    poll. Measured ~8x faster in practice — this golden pins that native can't
+    regress to supervisor-like resume latency. Relative (same host) so it's
+    hardware-independent; the large headroom keeps it off the flaky edge.
+    """
+    if not _has_docker():
+        pytest.skip("docker not available")
+    if not OAUTH_TOKEN or not _OPENROUTER_KEY:
+        pytest.skip("needs CLAUDE_CODE_OAUTH_TOKEN (supervisor) + "
+                    "OPENROUTER_API_KEY (native)")
+
+    async with ApiClient(SERVER) as sdk:
+        native_med = await _measure_resume_median(sdk, "native")
+        supervisor_med = await _measure_resume_median(sdk, "claude")
+        print(f"\n[resume-efficiency] native={native_med*1000:.0f}ms "
+              f"supervisor={supervisor_med*1000:.0f}ms "
+              f"ratio={native_med/supervisor_med:.2f}x")
+        assert native_med <= supervisor_med, (
+            f"NATIVE RESUME REGRESSED: native reap→resume ({native_med*1000:.0f}ms) "
+            f"is SLOWER than the supervisor path ({supervisor_med*1000:.0f}ms). "
+            f"Native must resume with docker start + 1 inspect (no supervisor "
+            f"reboot / ACP / health poll) — something added round-trips to the "
+            f"native resume hot path.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+async def test_native_session_recovers_when_sandbox_removed_out_of_band():
+    """RESOURCE-MANAGEMENT golden: a native session whose sandbox is destroyed
+    out-of-band (docker prune / OOM-reap / — on modal, the routine hard-timeout
+    ceiling) must AUTO-RECOVER through the live ``/sandbox/exec`` route —
+    recreate a fresh sandbox and succeed, NOT 500 or wedge.
+
+    Pins the SandboxGoneError recover-and-retry END-TO-END at the server level.
+    The transport unit tests prove exec() raises SandboxGoneError and
+    _ensure_sandbox(refresh=True) recreates; this golden proves the WIRED route
+    (server → NativeSession.sandbox_exec → recover-and-retry) survives a real
+    sandbox vanishing under a live session. Docker is the cheap live provider;
+    the modal/daytona recreate is volume-backed and additionally covered by
+    test_native_modal_reconcile + the transport unit tests."""
+    if not _has_docker():
+        pytest.skip("docker not available")
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, "docker", agent_type="native")
+        sid = sess["session_id"]
+        # provision the sandbox via the very route under test
+        r1 = await sdk.session_sandbox_exec(sid, "echo up", timeout=60)
+        assert r1.get("exit_code") == 0, f"provision exec failed: {r1}"
+        before = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+        assert before, "no sandbox_ref after provision"
+        # destroy the container out-of-band, under the live session
+        subprocess.run(["docker", "rm", "-f", before], capture_output=True, timeout=30)
+        # the NEXT exec on the same session must recover, not 500/wedge
+        r2 = await sdk.session_sandbox_exec(sid, "echo recovered", timeout=120)
+        assert r2.get("exit_code") == 0 and "recovered" in r2.get("stdout", ""), (
+            f"native session did not auto-recover after its sandbox was "
+            f"removed under it: {r2}")
+        after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+        assert after and after != before, (
+            f"recovery did not provision a FRESH sandbox: {before!r} → {after!r}")
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
@@ -2527,14 +2755,20 @@ async def test_midprompt_recovery_does_not_leak_subscriber(provider, agent_type)
 
 
 @pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
-@agent_type_param
+@agent_type_param_with_native
 @pytest.mark.asyncio
 @pytest.mark.timeout(900)
 async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type):
     """An idle session (no prompt in flight) with an open /events consumer
     MUST hibernate when the reaper decision runs. A refusal means
-    subscriber-presence is being counted as compute activity — the pin."""
-    _require_provider(provider)
+    subscriber-presence is being counted as compute activity — the pin.
+
+    Includes ``native`` (docker-only): the reap→hibernate→cold-resume path is
+    the native resource-management contract — reap docker-stops the container,
+    the next turn docker-starts the SAME container and answers, conversation
+    preserved via the checkpoint. Behavioral oracle (hibernated flag + reply),
+    no inner_session_id dependency."""
+    _require_provider(provider, agent_type)
 
     async with ApiClient(SERVER) as sdk:
         sess = await _quick_session(sdk, provider, agent_type=agent_type)
@@ -2547,6 +2781,33 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
             "baseline broken: an idle session with no client should have 0 "
             f"subscribers, got {await _subscriber_count(sdk, sid)}"
         )
+
+        # Native: record the container + plant a workspace marker so we can
+        # prove at the SERVER level (not just white-box) that reap actually
+        # FREES compute (container docker-stopped, not merely dropped from the
+        # pool — the silent-leak class), that resume reattaches the SAME
+        # container, and that workspace bytes survive the hibernate.
+        ref_before = None
+        # docker (stop) / daytona (pause) keep the whole sandbox FS, so an
+        # absolute /tmp marker survives the hibernate. Modal hibernate=terminate
+        # LOSES the sandbox FS — only the Volume persists. Write the modal
+        # marker through the agent's CWD (/home/agent, symlinked onto the
+        # Volume by the bare entrypoint) rather than an absolute /v path: this
+        # proves the REAL workspace survives terminate→recreate. A hand-placed
+        # /v/reap_marker.txt would survive even if the cwd→Volume symlink were
+        # broken, silently hiding that regression (agent workspaces all live
+        # under cwd, not at /v root).
+        marker_path = ("reap_marker.txt" if provider == "modal"
+                       else "/tmp/reap_marker.txt")
+        if agent_type == "native":
+            await sdk.session_sandbox_exec(
+                sid, f"printf %s reap-marker-31337 > {marker_path}",
+                # 30s read-timeouts under -n auto: the trivial exec is fast,
+                # but the server proxying it to a daytona sandbox can be slow
+                # when daytona's control plane is saturated by the create burst.
+                timeout=90)
+            ref_before = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+            assert ref_before, "native session has no sandbox_ref before reap"
 
         # Open a PERSISTENT /events consumer and keep it draining in the
         # background — this is the dashboard/monitor that used to pin compute.
@@ -2584,6 +2845,44 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
                 "decision must key off compute-only activity (+ an in-flight "
                 "gate), not _subscribers membership."
             )
+            # Native LEAK GATE: hibernated:True is a *decision*. Prove the
+            # container was actually freed (docker-stopped) — release()/stop()
+            # both swallow hibernate failures, so a reaper that drops the
+            # session but never `docker stop`s would otherwise ship green,
+            # leaking compute until quota exhaustion.
+            if agent_type == "native" and provider == "unix_local":
+                # Record-only sandbox: no resident compute exists, so there
+                # is nothing for reap to free — the leak-gate is vacuous.
+                # The load-bearing assertion is the inverse: reap must KEEP
+                # the record ('running'), else the resume below would
+                # cold-create a new ref instead of reattaching.
+                st = await _native_compute_state(provider, ref_before)
+                assert st == "running", (
+                    f"reap DESTROYED the record-only local sandbox "
+                    f"{ref_before[:24]} (state={st!r}) — reap is hibernate, "
+                    f"not delete; resume needs the record")
+            elif agent_type == "native":
+                # The freed-state transition is ASYNC on every control plane:
+                # docker settles in ms, daytona passes through 'stopping' for
+                # seconds (longer under parallel suite load), and modal frees
+                # by DELETING the sandbox (terminate → status 'missing').
+                # Poll the same 30s budget for all three — fast providers exit
+                # on the first iteration, a genuine leak still fails loudly.
+                freed = {"stopped", "exited", "created"}
+                if provider == "modal":
+                    freed = freed | {"missing"}
+                st = await _native_compute_state(provider, ref_before)
+                for _ in range(20):
+                    if st in freed:
+                        break
+                    await asyncio.sleep(1.5)
+                    st = await _native_compute_state(provider, ref_before)
+                assert st in freed, (
+                    f"NATIVE COMPUTE LEAK: reap returned hibernated:True but "
+                    f"the {provider} sandbox {ref_before[:12]} is still {st!r} "
+                    f"after 30s — the reaper freed the pool slot but not the "
+                    f"compute."
+                )
         finally:
             drain.cancel()
             with contextlib.suppress(BaseException):
@@ -2596,19 +2895,50 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         assert "again" in reply.lower(), (
             f"session unusable after reap (cold-resume failed): {reply!r}"
         )
+        # Native: resume must reattach the SAME container (not cold-create a
+        # fresh one) AND the workspace bytes must survive the hibernate —
+        # lifted from white-box to the server/golden layer.
+        if agent_type == "native":
+            if provider == "modal":
+                # Recreate-on-missing: reading the marker triggers the cold
+                # recreate (terminate destroyed the sandbox). Workspace bytes
+                # survive via the Volume; the sandbox ref CHANGES (fresh one).
+                marker = await _cat_exact(sdk, sid, marker_path)
+                assert marker == "reap-marker-31337", (
+                    f"workspace did not survive terminate/recreate: {marker!r}"
+                )
+                ref_after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+                assert ref_after and ref_after != ref_before, (
+                    f"modal native should recreate-on-missing (fresh ref) after "
+                    f"reap, got {ref_before[:12]} → {ref_after}"
+                )
+            else:
+                # docker (stop) / daytona (pause): resume reattaches the SAME
+                # sandbox, workspace intact.
+                ref_after = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
+                assert ref_after == ref_before, (
+                    f"resume cold-created a NEW container instead of reattaching "
+                    f"the hibernated one: {ref_before[:12]} → {ref_after[:12]}"
+                )
+                marker = await _cat_exact(sdk, sid, marker_path)
+                assert marker == "reap-marker-31337", (
+                    f"workspace did not survive hibernate/resume: {marker!r}"
+                )
 
 
 # ===========================================================================
 # Teardown-route compute-leak goldens (cred-refresh task, agent delete, volume
 # force-delete). The leaks live in provider-agnostic code (pool.py teardown,
-# server.py delete routes), so all three parametrize over providers. Compute
-# liveness is the provider-aware _assert_sandbox_gone oracle (same one the
-# canonical test_delete_session_destroys_sandbox uses); modal is excluded
-# because _assert_sandbox_gone has no modal branch.
+# server.py delete routes), so all three parametrize over every provider
+# INCLUDING modal. Compute liveness is the provider-aware _assert_sandbox_gone
+# oracle (same one the canonical test_delete_session_destroys_sandbox uses),
+# which now has a modal branch (terminate → 'missing'); _external_stop and
+# _external_delete are likewise modal-capable, so the modal teardown paths are
+# covered here, not just on docker/daytona.
 # ===========================================================================
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(900)
@@ -2690,7 +3020,7 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
             # Finished turn so the cold-recovery RESUMES (session/load contract).
             await _post_and_wait(sdk, sid, "Reply with the single word: ready.")
 
-            # Kill the sandbox so the next get_session force_probe sees it dead
+            # Kill the sandbox so the next get_session probe sees it dead
             # and takes the stale-teardown branch (orphaning the old task).
             sandbox = await _get_sandbox(sdk, sid)
             await _external_stop(sandbox)
@@ -2742,7 +3072,7 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
         httpd.server_close()
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(300)
@@ -2797,7 +3127,7 @@ async def test_delete_agent_tears_down_session_sandboxes(provider, agent_type):
             raise
 
 
-@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local"])
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
 @agent_type_param
 @pytest.mark.asyncio
 @pytest.mark.timeout(300)
@@ -2877,3 +3207,292 @@ async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_
                     await _sdk2._http.delete(
                         f"/volumes/{vol_id}", params={"force": "true"}, timeout=20,
                     )
+
+
+# ---------------------------------------------------------------------------
+# Tool-effects matrix: exec / write / read / edit — inside AND outside cwd —
+# with exact file-content verification for every effect.
+# ---------------------------------------------------------------------------
+
+
+async def _cat_exact(sdk: ApiClient, session_id: str, path: str) -> str:
+    """Read a sandbox file via the exec proxy; assert it exists."""
+    res = await sdk.session_sandbox_exec(session_id, f"cat {path}", timeout=60)
+    assert res.get("exit_code") == 0, f"cat {path} failed: {res}"
+    return (res.get("stdout") or "").strip()
+
+
+async def _native_compute_state(provider: str, ref: str) -> str:
+    """Provider-aware introspection of whether a native sandbox's COMPUTE is
+    freed (vs the pool merely evicting the session). Normalized vocabulary:
+    'running' | 'stopped' | 'missing' | 'error'. Used by the reap leak-gate so
+    it works across docker (inspect) and daytona (control-plane status)."""
+    if provider == "docker":
+        st = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", ref],
+            capture_output=True, text=True, timeout=15).stdout.strip()
+        if st == "running":
+            return "running"
+        if st in ("exited", "created", "paused", "dead"):
+            return "stopped"
+        return "missing" if st == "" else "error"
+    if provider == "daytona":
+        import sys as _sys
+        from api.providers.daytona import get_daytona_sandbox_status
+        return await get_daytona_sandbox_status(ref)
+    if provider == "unix_local":
+        # Record-only native sandbox: 'running' while the provider-index
+        # record exists, 'missing' once cleared. Never 'stopped'.
+        import sys as _sys
+        from api.providers.unix_local import _load_record
+        _, record = _load_record(ref)
+        return "running" if record is not None else "missing"
+    if provider == "modal":
+        # Modal hibernate=terminate, so a freed sandbox reports 'missing' (the
+        # record is gone). 'running' means the terminate hasn't propagated yet
+        # (it's async) — the caller polls.
+        import sys as _sys
+        from api.providers.modal import get_sandbox_status
+        return await get_sandbox_status(ref)
+    raise AssertionError(f"_native_compute_state: provider {provider!r} unsupported")
+
+
+@pytest.mark.parametrize("provider", ["daytona", "docker", "unix_local", "modal"])
+@agent_type_param_with_native
+@pytest.mark.asyncio
+async def test_tool_effects_matrix(provider, agent_type):
+    """Exec / write / read / edit — inside and outside cwd — exact contents.
+
+    Pins both halves of the verified ACP mechanism (2026-06):
+
+    * Tool EXECUTION is always local to the ACP child (co-located with the
+      sandbox) — every effect must land in the sandbox filesystem with
+      exactly the requested bytes, for both runtimes.
+    * Tool APPROVAL is the only ACP client-side traffic. opencode raises
+      ``session/request_permission`` (kind ``external_directory``) for any
+      path outside the session cwd even on default-allow config; the
+      supervisor's auto-allow is all that stands between that and an
+      infinite per-turn hang (the #105 failure mode). The outside-cwd cases
+      here HANG (bounded by PROMPT_TIMEOUT), not fail, if that handler
+      regresses.
+
+    Includes ``native`` (docker-only): the same exec/write/read/edit effects
+    must land in the native sandbox with exact bytes. Native has no ACP
+    approval gate (no supervisor), so the outside-cwd cases just succeed —
+    this golden is the single tool-effects standard across all runtimes
+    (replaces the former standalone test_native_tool_effects_docker).
+    """
+    _require_provider(provider, agent_type)
+    uid = os.urandom(4).hex()
+    out_bash = f"/tmp/golden-bash-{uid}.txt"
+    out_note = f"/tmp/golden-note-{uid}.txt"
+    out_seed = f"/tmp/golden-seed-{uid}.txt"
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type=agent_type)
+        sid = sess["session_id"]
+        print(f"\n[test:{provider}:{agent_type}] session={sid[:8]}")
+
+        # -- bash: inside cwd, outside cwd, cwd sanity, failing command ----
+        await _ask(sdk, sid, (
+            "Run this exact shell command as ONE single command, then report "
+            "done: "
+            f"echo bash-in-$((6*7)) > bash_in.txt && "
+            f"echo bash-out-$((6*7)) > {out_bash} && "
+            "pwd > pwd_out.txt && "
+            "(ls /nonexistent-golden-xyz || echo fail-ok > fail_note.txt)"
+        ))
+        assert await _cat_exact(sdk, sid, "bash_in.txt") == "bash-in-42"
+        assert await _cat_exact(sdk, sid, out_bash) == "bash-out-42"
+        assert (await _cat_exact(sdk, sid, "pwd_out.txt")).startswith("/")
+        assert await _cat_exact(sdk, sid, "fail_note.txt") == "fail-ok"
+
+        # -- write: inside + outside cwd, exact contents -------------------
+        await _ask(sdk, sid, (
+            "Create two files. First: a file named note_in.txt in the "
+            "current directory containing exactly: golden-in-7261 . Second: "
+            f"a file at the absolute path {out_note} containing exactly: "
+            "golden-out-9483 . Nothing else inside either file."
+        ))
+        assert await _cat_exact(sdk, sid, "note_in.txt") == "golden-in-7261"
+        assert await _cat_exact(sdk, sid, out_note) == "golden-out-9483"
+
+        # -- read: round-trip planted seeds back through new files ---------
+        res = await sdk.session_sandbox_exec(
+            sid,
+            f"printf %s seed-in-5520 > seed_in.txt && "
+            f"printf %s seed-out-8847 > {out_seed} && echo planted",
+            timeout=60,
+        )
+        assert "planted" in (res.get("stdout") or ""), f"seed plant failed: {res}"
+        await _ask(sdk, sid, (
+            "Read the file seed_in.txt in the current directory and the file "
+            f"{out_seed}. Then create echo_in.txt in the current directory "
+            "whose content is exactly the contents of seed_in.txt, and "
+            f"echo_out.txt whose content is exactly the contents of {out_seed}. "
+            "Nothing else in either file."
+        ))
+        assert await _cat_exact(sdk, sid, "echo_in.txt") == "seed-in-5520"
+        assert await _cat_exact(sdk, sid, "echo_out.txt") == "seed-out-8847"
+
+        # -- edit: modify an existing file precisely -----------------------
+        res = await sdk.session_sandbox_exec(
+            sid, "printf %s 'alpha beta gamma' > editme.txt && echo planted",
+            timeout=60,
+        )
+        assert "planted" in (res.get("stdout") or "")
+        await _ask(sdk, sid, (
+            "Edit the file editme.txt in the current directory: replace the "
+            "word beta with DELTA. Change nothing else."
+        ))
+        assert await _cat_exact(sdk, sid, "editme.txt") == "alpha DELTA gamma"
+
+
+async def _wedge_supervisor_in_sandbox(sandbox: dict) -> dict:
+    """Force the WEDGED state — sandbox reports 'running' (so start() chooses
+    REATTACH) but the supervisor is unreachable (so the reattach health probe
+    fails) — deterministically, per provider. This is the race-free trigger for
+    the reattach-health-failure path.
+
+    The mechanism differs because of WHERE the supervisor sits:
+      * unix_local — the supervisor IS the host process; SIGSTOP it (a KILL
+        would make get_sandbox_status's proc.poll() report 'stopped').
+      * docker — the supervisor IS PID 1; SIGSTOP it from the HOST via the
+        cgroup freezer (``docker kill --signal=STOP``). NOT ``docker exec ...
+        kill -STOP 1`` (an exec'd process can't reliably stop PID 1) and NOT
+        ``docker pause`` (which flips State.Status to 'paused' -> not
+        reattachable). The container stays 'running', supervisor frozen.
+      * modal — the supervisor is a CHILD of modal's init; KILL it (the
+        sandbox/init stays alive -> status 'running'). KILL, not SIGSTOP: a
+        suspended child wedges modal's ``Sandbox.exec``/``proc.wait`` (observed
+        19-min hang); killing it returns cleanly (same path as
+        _kill_supervisor_in_sandbox).
+
+    Returns a token for _cleanup_wedged_supervisor.
+    """
+    import signal
+
+    provider = sandbox["provider"]
+    ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+    loop = asyncio.get_event_loop()
+
+    if provider == "unix_local":
+        pid = _local_supervisor_pid(sandbox)
+        assert pid, f"could not resolve unix_local supervisor pid: {sandbox}"
+        os.kill(pid, signal.SIGSTOP)
+        return {"provider": provider, "ref": ref, "pid": pid}
+
+    if provider == "docker":
+        await loop.run_in_executor(None, lambda: subprocess.run(
+            ["docker", "kill", "--signal=STOP", ref],
+            capture_output=True, timeout=20))
+        return {"provider": provider, "ref": ref}
+
+    if provider == "modal":
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        proc = await loop.run_in_executor(
+            None, lambda: sb.exec("bash", "-c", _PROC_KILL_SUPERVISOR))
+        await loop.run_in_executor(None, proc.wait)
+        return {"provider": provider, "ref": ref}
+
+    raise AssertionError(f"no wedge path for provider {provider!r}")
+
+
+async def _cleanup_wedged_supervisor(token: dict) -> None:
+    """Reap the wedged-and-abandoned supervisor/sandbox so it can't linger past
+    the test. Recovery cold-created a FRESH sandbox; the wedged one is orphaned
+    (docker destroys it in _on_wedged_reattach; modal/unix_local only clear the
+    ref, so it must be reaped here)."""
+    import signal
+
+    provider = token["provider"]
+    ref = token.get("ref", "")
+    loop = asyncio.get_event_loop()
+
+    if provider == "unix_local":
+        for sig in (signal.SIGCONT, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(token["pid"], sig)
+    elif provider == "docker":
+        # unfreeze (in case recovery didn't destroy it — the RED path) then rm.
+        for args in (["docker", "kill", "--signal=CONT", ref],
+                     ["docker", "rm", "-f", ref]):
+            await loop.run_in_executor(
+                None, lambda a=args: subprocess.run(
+                    a, capture_output=True, timeout=15))
+    elif provider == "modal":
+        with contextlib.suppress(Exception):
+            import modal
+            sb = await loop.run_in_executor(
+                None, lambda: modal.Sandbox.from_id(ref))
+            await loop.run_in_executor(None, sb.terminate)
+
+
+@pytest.mark.parametrize("provider", ["unix_local", "docker", "modal"])
+@pytest.mark.asyncio
+async def test_wedged_reattach_cold_recovers_not_500(provider):
+    """DETERMINISTIC wedged-reattach recovery across EVERY supervisor-template
+    provider (unix_local / docker / modal). Daytona is EXCLUDED — it has its own
+    start() that ALREADY cold-recovers on a failed reattach (see
+    DaytonaSandboxSession._resolve_or_create_sandbox), so there is no bug to
+    catch there; its recovery is covered by the test_*_daytona goldens.
+
+    start() reattaches to a persisted sandbox when the provider reports it
+    reattachable, then health-gates. If the supervisor is dead/unresponsive but
+    the sandbox is still 'running', the pre-fix template RAISED
+    ``_health_fail_msg``, which escaped ``get_session`` as a 500 on POST /message
+    and stranded the caller's turn.
+    (test_persistent_sse_supervisor_killed_immediate_message hits the same path
+    but only via a control-plane TIMING RACE — so it flakes under load. This one
+    is race-free.)
+
+    We force the wedged state by SUSPENDING (SIGSTOP) the supervisor: the
+    sandbox/process stays alive (status 'running' -> reattach chosen) while its
+    HTTP server is suspended (health probe times out -> wedged).
+
+    Invariant: turn 2 returns a non-empty reply AND the session is now backed by
+    a DIFFERENT sandbox ref — start() abandoned the wedged sandbox and
+    cold-created a fresh one on the volume IN THE SAME request, never 500.
+    """
+    _require_provider(provider)
+
+    def _ref_of(sb: dict) -> str:
+        return sb.get("sandbox_ref") or sb.get("provider_ref") or ""
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type="claude")
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(sdk, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                sdk, session_id, sse, "Reply with a single short word.")
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            sandbox = await _get_sandbox(sdk, session_id)
+            ref_before = _ref_of(sandbox)
+
+            token = await _wedge_supervisor_in_sandbox(sandbox)
+            try:
+                try:
+                    reply2 = await _ask_on_stream(
+                        sdk, session_id, sse, "Reply with a single short word.")
+                except Exception as exc:
+                    pytest.fail(
+                        f"[{provider}] turn 2 RAISED instead of recovering — "
+                        "wedged reattach (suspended supervisor, sandbox still "
+                        "'running') 500'd on POST /message instead of "
+                        f"cold-creating fresh: {exc!r}")
+                assert reply2.strip(), (
+                    f"[{provider}] turn 2 empty — wedged reattach did not "
+                    f"cold-recover on the volume. Reply was: {reply2!r}")
+            finally:
+                await _cleanup_wedged_supervisor(token)
+
+            ref_after = _ref_of(await _get_sandbox(sdk, session_id))
+            assert ref_after and ref_after != ref_before, (
+                f"[{provider}] recovery must cold-create a FRESH sandbox (the "
+                f"wedged one was abandoned); ref unchanged: "
+                f"{ref_before!r} -> {ref_after!r}")
+

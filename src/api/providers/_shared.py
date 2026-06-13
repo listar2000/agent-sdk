@@ -30,11 +30,6 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Provider constants
 # ---------------------------------------------------------------------------
 
-# Providers whose recovery model is "reprovision via create_sandbox" rather
-# than "restart supervisor inside an existing sandbox" (daytona's model).
-# local/docker reach the supervisor on localhost:<port>; modal reaches it via
-# an HTTPS tunnel; all three are recreated from scratch on miss.
-PORT_BASED_PROVIDERS = frozenset({"unix_local", "docker", "modal"})
 
 # Auth/credential env vars that the server MUST NOT leak into sandboxes via
 # its own environment. When a sandbox spawns a supervisor, any of these keys
@@ -86,6 +81,10 @@ _ACP_NPM_SPECS = {
     # keep the baked agent image small (the supervisor package.json mirrors
     # this in _disabledDependencies). Uncomment to re-enable the agent_type.
     # "codex": "@zed-industries/codex-acp@^0.11.1",
+    # NOTE: re-enabling codex requires restoring the codex-only
+    # `authenticate({methodId: "openai-api-key"})` retry in
+    # AcpClient.initialize — deleted as dead in 57a3160^ (audit: safe while
+    # codex is disabled; mandatory for codex bootstrap).
     # "gemini": "@google/gemini-cli@^0.37.2",
     # "cline": "cline-acp@^0.1.6",
     # "deepagents": "deepagents-acp@^0.1.8",
@@ -97,8 +96,6 @@ _ACP_LAUNCH_ARGS: dict[str, list[str]] = {
     "goose": ["acp"],
 }
 
-# Remote supervisor constants (also used by daytona.py)
-_SUPERVISOR_REMOTE_PORT = 9100
 
 
 # Per-provider "where the agent's persistent HOME lives". For docker this
@@ -173,7 +170,6 @@ class ProviderInstance:
     url: str                   # http:// base URL
     root: str = "/tmp"         # filesystem root for the sandbox
     sandbox_ref: str | None = None  # provider's opaque ref (Daytona id, docker container id, local "local-<hex>")
-    process: asyncio.subprocess.Process | None = None  # local subprocess
     port: int | None = 0       # local port (if local or docker)
     container_id: str | None = None  # Docker container ID (if docker)
 
@@ -190,14 +186,6 @@ class ExecResult:
     stderr_truncated: bool = False
     timed_out: bool = False
 
-    def to_dict(self) -> dict:
-        from dataclasses import asdict
-        return asdict(self)
-
-
-# ---------------------------------------------------------------------------
-# ACP helpers
-# ---------------------------------------------------------------------------
 
 def _acp_bin_name(agent_type: str) -> str:
     try:
@@ -513,8 +501,6 @@ async def _wait_for_health(url: str, max_retries: int = 150, interval: float = 0
 # ---------------------------------------------------------------------------
 
 _port_lock = asyncio.Lock()
-_sandbox_port_counters: dict[str, int] = {}
-_sandbox_freed_ports: dict[str, list[int]] = {}
 
 
 async def _find_free_port() -> int:
@@ -542,21 +528,6 @@ async def _find_free_port() -> int:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
-
-
-def allocate_sandbox_port(sandbox_id: str) -> int:
-    """Allocate a port for a new supervisor inside an existing sandbox."""
-    freed = _sandbox_freed_ports.get(sandbox_id)
-    if freed:
-        return freed.pop()
-    port = _sandbox_port_counters.get(sandbox_id, _SUPERVISOR_REMOTE_PORT)
-    _sandbox_port_counters[sandbox_id] = port + 1
-    return port
-
-
-def free_sandbox_port(sandbox_id: str, port: int) -> None:
-    """Return a port to the pool when a supervisor is shut down."""
-    _sandbox_freed_ports.setdefault(sandbox_id, []).append(port)
 
 
 # ---------------------------------------------------------------------------

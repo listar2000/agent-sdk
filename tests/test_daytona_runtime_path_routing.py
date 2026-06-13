@@ -31,10 +31,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 # api.providers.daytona imports daytona_sdk lazily inside its functions, so
 # importing the module itself is cheap. We patch the SDK at call time.
 from api.providers import _shared as shared  # noqa: E402

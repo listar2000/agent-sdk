@@ -34,6 +34,7 @@ from fastapi.responses import (
 )
 
 from .event_buffer import start_batcher, stop_batcher
+from .sse import is_terminal_block
 from .timing import extract_session_id, log_request, timed_phase
 from .db import (
     close_pool,
@@ -193,6 +194,13 @@ _HTTP_CLIENT: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app):
     _configure_logging()
+    # Attach the metrics logging net as early as possible so failures during
+    # the rest of startup (init_pool, reconcile, provider warm-up) are
+    # captured, and capture this replica's event loop so the (synchronous)
+    # net can schedule its Postgres writes onto it.
+    from .metrics import get_metrics
+    get_metrics().install()
+    get_metrics().set_loop(asyncio.get_running_loop())
     # Startup banner — pin replica + pid + addr so a merged tail across
     # replicas (or a single replica restart) is greppable. The same
     # ``replica_id()`` appears in every request line / phase log so you
@@ -287,6 +295,10 @@ async def lifespan(app):
         await stop_batcher()
     except Exception as e:
         log.warning("stop_batcher failed: %s", e)
+    try:
+        get_metrics().uninstall()
+    except Exception as e:
+        log.warning("metrics uninstall failed: %s", e)
     await close_pool()
     if _HTTP_CLIENT is not None:
         await _HTTP_CLIENT.aclose()
@@ -302,10 +314,31 @@ async def _log_unhandled(request: Request, exc: Exception):
     from starlette.exceptions import HTTPException as StarletteHTTPException
     if isinstance(exc, StarletteHTTPException):
         if exc.status_code >= 500:
+            # Record BEFORE logging so the explicit category wins and the
+            # exception sentinel keeps the logging net from re-counting it.
+            await _record_http_error(request, exc, exc.status_code, exc.detail)
             log.error("HTTP %s %s → %s: %s", request.method, request.url.path, exc.status_code, exc.detail)
         return await http_exception_handler(request, exc)
+    await _record_http_error(request, exc, 500, str(exc))
     log.error("Unhandled exception in %s %s", request.method, request.url.path, exc_info=exc)
     return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def _record_http_error(request: Request, exc: BaseException, status: int, detail) -> None:
+    """Feed a >=500 response to the metrics reporter (one durable row). The
+    exception-instance sentinel in ``record_error`` makes this safe to call
+    from both this handler and ``_http_exception_handler`` for the same
+    exception."""
+    try:
+        from .metrics import get_metrics
+        category = "provider" if status == 502 else "http_5xx"
+        await get_metrics().record_error(
+            exc, category=category, http_status=status,
+            message=str(detail) if not isinstance(detail, dict) else None,
+            path=request.url.path, method=request.method,
+        )
+    except Exception:
+        pass
 
 
 app.add_middleware(
@@ -351,6 +384,8 @@ async def _request_timing(request: Request, call_next):
 async def _http_exception_handler(request: Request, exc: HTTPException):
     """Uniform error shape: ``{"error": ...}`` for string details, pass-through for dict."""
     detail = exc.detail
+    if exc.status_code >= 500:
+        await _record_http_error(request, exc, exc.status_code, detail)
     if isinstance(detail, dict):
         return JSONResponse(detail, status_code=exc.status_code)
     return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
@@ -430,6 +465,78 @@ async def health():
         "sessions": len(active),
         "busy_sessions": sum(1 for s in active.values() if s._subscribers),
     }
+
+
+# ---------------------------------------------------------------------------
+# Metrics / error reporting (see api.metrics)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/metrics")
+async def metrics_json(request: Request):
+    """Errors, recoveries, leaks, and per-provider op latency/flakiness +
+    a recent-events tail — computed entirely from Postgres, so the result is
+    identical on every replica (no per-replica in-memory state).
+
+    Windowed by ``?window_s=`` (default ``AGENT_SDK_METRICS_WINDOW_S`` =
+    3600s; pass ``0`` for all-time)."""
+    try:
+        window_s = float(request.query_params.get(
+            "window_s", os.environ.get("AGENT_SDK_METRICS_WINDOW_S", "3600")))
+    except ValueError:
+        raise HTTPException(400, "window_s must be a number (seconds)")
+    since_s = None if window_s <= 0 else time.time() - window_s
+    from . import db as _db
+    summary = await _db.get_metrics_summary(since_s=since_s)
+    summary["window_s"] = window_s
+    return summary
+
+
+@app.get("/admin/errors")
+async def admin_errors(request: Request):
+    """Durable, cross-replica error log from Postgres.
+
+    Query params: ``category``, ``provider``, ``session_id``, ``since_s``
+    (epoch seconds), ``limit`` (default 200, max 1000)."""
+    q = request.query_params
+    since_s = None
+    if q.get("since_s"):
+        try:
+            since_s = float(q["since_s"])
+        except ValueError:
+            raise HTTPException(400, "since_s must be a number (epoch seconds)")
+    try:
+        limit = min(int(q.get("limit", "200")), 1000)
+    except ValueError:
+        raise HTTPException(400, "limit must be an integer")
+    from . import db as _db
+    events = await _db.get_error_events(
+        since_s=since_s, category=q.get("category"),
+        provider=q.get("provider"), session_id=q.get("session_id"), limit=limit,
+    )
+    return {
+        "events": events,
+        "by_category": await _db.count_errors_by(field="category", since_s=since_s),
+        "by_provider": await _db.count_errors_by(field="provider", since_s=since_s),
+    }
+
+
+@app.get("/admin/ops")
+async def admin_ops(request: Request):
+    """Durable, cross-replica provider/pool operation stats: per
+    (provider, operation) count, failure rate, and latency p50/p95.
+
+    Answers "how flaky / how slow is daytona vs modal" for cold_create,
+    resume, cold_recover, release, destroy, reap. ``?since_s=`` (epoch
+    seconds) windows the stats."""
+    since_s = None
+    if request.query_params.get("since_s"):
+        try:
+            since_s = float(request.query_params["since_s"])
+        except ValueError:
+            raise HTTPException(400, "since_s must be a number (epoch seconds)")
+    from . import db as _db
+    return {"ops": await _db.get_op_stats(since_s=since_s)}
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +708,7 @@ _CONFIG_KEYS = (
     "agent_type",
     "mode",
     "thought_level",
+    "native",  # native-runtime spec passthrough (agent_type="native")
 )
 
 # Keys that were once inside AgentConfig but now live on session / sandbox
@@ -1503,7 +1611,11 @@ async def session_sandbox_info(session_id: str):
         if sb_payload is None:
             raise HTTPException(404, f"Session {session_id} not found")
         state = deserialize(sb_payload)
-        provider = getattr(state, "type", "unknown")
+        # Report the COMPUTE backend. For native the runtime is in-server but
+        # the sandbox lives on state.provider (docker/...); reporting that
+        # lets sandbox tooling (external stop/delete, dashboards) act on the
+        # real container instead of the "native" runtime discriminator.
+        provider = getattr(state, "provider", None) or getattr(state, "type", "unknown")
         sandbox_ref = getattr(state, "sandbox_ref", None)
         result: dict = {
             "session_id": session_id,
@@ -1521,8 +1633,9 @@ async def session_sandbox_info(session_id: str):
     state = pool_session.state
     # Provider name is the canonical ``state.type`` discriminator —
     # ``"unix_local"`` for the unix subprocess provider; no legacy
-    # ``"local"`` alias.
-    provider = getattr(state, "type", "unknown")
+    # ``"local"`` alias. Native reports its compute backend (state.provider)
+    # so sandbox tooling acts on the real container, not the runtime tag.
+    provider = getattr(state, "provider", None) or getattr(state, "type", "unknown")
     sandbox_ref = getattr(state, "sandbox_ref", None)
     result: dict = {
         "session_id": session_id,
@@ -1755,23 +1868,36 @@ async def sessions_create(request: Request):
         if existing is not None:
             raise HTTPException(409, f"session id {supplied_id} already exists")
         data["id"] = supplied_id
+    # Native sessions are ALWAYS lazy: the runtime is the server-side loop,
+    # compute is provisioned on the first tool call. Eager provisioning would
+    # route a native session into a provider cold-create + ACP attach (which
+    # rejects agent_type="native"). Force lazy and persist an initial
+    # NativeSandboxState so recovery dispatches to NativeSession rather than
+    # the daytona default for a NULL state.
+    if data.get("agent_type") == "native":
+        return await _sessions_create_lazy(data, native=True)
     if data.get("provision", True):
         return await _sessions_create_eager(data)
     return await _sessions_create_lazy(data)
 
 
-async def _sessions_create_lazy(data: dict) -> dict:
+async def _sessions_create_lazy(data: dict, *, native: bool = False) -> dict:
     """Create a session row only — no sandbox, no ACP, no scheduler.
 
     Used when the UI wants to render a session shell before paying the
     provisioning cost (daytona: ~15-30 s; local: ~2-3 s). The sandbox
     appears on the first ``POST /sessions/{id}/message`` (the pool
     cold-creates on demand).
+
+    ``native=True`` additionally persists an initial ``NativeSandboxState``
+    so the factory dispatches recovery to NativeSession (a NULL state would
+    default to daytona). The native compute backend is the requested
+    ``provider`` (docker in P0).
     """
     # SECURITY: strip env/secrets first so they can't leak into agents.config.
     body_env, body_secrets = _pop_env_and_secrets(data)
 
-    default_provider = data.get("provider") or data.get("config", {}).get("provider") or "unix_local"
+    default_provider = data.get("provider") or data.get("config", {}).get("provider") or ("docker" if native else "unix_local")
     workspace, volume_record, config_data, extra_options = (
         await _parse_session_create_common(data, default_provider)
     )
@@ -1819,8 +1945,20 @@ async def _sessions_create_lazy(data: dict) -> dict:
         extra_options=extra_options,
     )
 
+    if native:
+        from api.sandbox.state import NativeSandboxState, serialize
+        from api.sandbox.state import Recipe
+        state = NativeSandboxState(
+            provider=default_provider,
+            recipe=Recipe(agent_type="native",
+                          pre_start_commands=list(lazy_user_pre_start),
+                          root=cwd if cwd != "/tmp" else None),
+        )
+        await write_sandbox_state(session_id, serialize(state))
+
     return {
         "id": session_id,
+        "session_id": session_id,  # alias — matches the eager path's key
         "agent_id": agent_id,
         "volume_id": volume_record.id,
         "workspace": workspace,
@@ -1972,11 +2110,25 @@ async def _sessions_create_eager(data: dict) -> dict:
     except Exception as e:
         if agent_was_created_here:
             await delete_agent(agent_id)
+        # Attribute the failure to sandbox creation + the provider BEFORE the
+        # log.error (the sentinel then keeps the logging net from re-counting
+        # it). Marking the HTTPException seen keeps the HTTP handler from
+        # double-counting the same logical failure.
+        try:
+            from .metrics import get_metrics
+            await get_metrics().record_error(
+                e, category="sandbox_create", provider=provider,
+                session_id=session_id, phase="cold_create")
+        except Exception:
+            pass
         log.error("sessions_create_eager: pool.cold_create failed (provider=%s): %s",
                   provider, e, exc_info=True)
         if "circuit breaker" in str(e).lower():
-            raise HTTPException(503, str(e), headers={"Retry-After": "30"})
-        raise HTTPException(502, f"Provider '{provider}' failed: {e}")
+            _http = HTTPException(503, str(e), headers={"Retry-After": "30"})
+        else:
+            _http = HTTPException(502, f"Provider '{provider}' failed: {e}")
+        setattr(_http, "__asdk_metric_seen__", True)
+        raise _http
 
     # The pool's ``sandbox_state.sandbox_ref`` IS the sandbox identity now —
     # opaque provider ref (e.g. "abc-uuid" for Daytona, "local-abc12" for
@@ -2305,28 +2457,22 @@ async def _execute_and_stream_sse_for(
                 if tag != rpc_id:
                     continue
                 yield f"event: rpc:{tag}\n{block}\n\n"
-                # Terminal:
-                #   * ``"stopReason"`` — JSON-RPC ``result`` envelope
-                #     emitted by ACP for a clean turn-end (end_turn /
-                #     cancelled / max_tokens / max_turn_requests). The
-                #     existing snake_case ``"stop_reason"`` substring
-                #     was a long-standing bug — ACP wires camelCase, so
-                #     the check never fired on real frames; success-
-                #     termination depended on client disconnect.
-                #   * ``"error":`` — top-level JSON-RPC error envelope
-                #     emitted by ACP for a fatal turn-end (auth failure
-                #     / internal error / process death). Verified end-
-                #     to-end with claude-agent-acp 0.31.4.
-                # Tool-call failures arrive as ``method=session/update``
-                # notifications and never produce a top-level ``error``
-                # field; ``-32601`` handshake errors are filtered by
-                # ``parse_acp_payload`` before broadcast (see
-                # ``api/sse.py:86``) so they don't reach this check.
-                if (
-                    "stopReason" in block
-                    or '"type":"done"' in block
-                    or '"error":' in block
-                ):
+                # Terminal = a CONFIRMED JSON-RPC envelope for this rpc:
+                # ``result.stopReason`` (clean turn-end: end_turn /
+                # cancelled / max_tokens / max_turn_requests) or a
+                # top-level ``error`` (fatal turn-end). The previous
+                # bare-substring check matched inside CONTENT too — an
+                # agent whose streamed text or tool output contained the
+                # characters ``stopReason`` (e.g. an agent reading
+                # api/sse.py) truncated its own stream mid-turn.
+                # ``is_terminal_block`` keeps the substrings as a cheap
+                # prefilter and JSON-parses candidates to confirm the
+                # envelope (id must match this rpc). Tool-call failures
+                # arrive as ``method=session/update`` notifications and
+                # never produce a top-level ``error`` field; ``-32601``
+                # handshake errors are filtered by ``parse_acp_payload``
+                # before broadcast so they don't reach this check.
+                if is_terminal_block(block, rpc_id):
                     return
             elif isinstance(item, dict):
                 if item.get("rpc_id") != rpc_id:
@@ -2424,42 +2570,75 @@ async def _destroy_session_compute(session_id: str) -> None:
     from api import providers as _prov
     from api.sandbox import deserialize, get_pool
 
-    # Capture sandbox ref + provider type from the DB BEFORE pool.release
-    # wipes the in-memory state.
-    sandbox_ref: str | None = None
+    # Collect the sandbox ref(s) to destroy + the provider type, reading the DB
+    # BOTH before AND after pool.release(). Why twice: a native session whose
+    # in-flight turn hits SandboxGoneError RECREATES its sandbox (a NEW ref)
+    # out-from-under a concurrent DELETE. release() cancels AND awaits that turn
+    # (NativeSession.shutdown → _cancel_active awaits the task), so the
+    # post-release state is final FOR THE TURN PATH — re-reading then catches a
+    # just-recreated ref. Destroying the UNION means neither the original nor
+    # the recreated sandbox leaks as an orphan. NOTE the await-guarantee covers
+    # only execute_prompt's _active_task: a concurrent /sandbox/exec has no
+    # task release() can await, so its SandboxGone-retry recreate can still
+    # land after the second read — that residual window is reconcile-bounded
+    # (boot reconcile / orphan monitor reap by the _TAG_KEY label), same class
+    # as PR #161 finding #3's residue. (``state.type`` is the Pydantic
+    # discriminator — ``unix_local``/``docker``/``daytona``/``modal``, the
+    # ``_PROVIDER_MODS`` key space; native is the exception: ``type=="native"``
+    # but its compute lives on ``state.provider``, so route the destroy
+    # through that.)
+    refs: set[str] = set()
     provider_type: str | None = None
-    try:
-        payload = await read_sandbox_state(session_id)
-        if payload is not None:
-            state = deserialize(payload)
-            sandbox_ref = getattr(state, "sandbox_ref", None)
-            # ``state.type`` is the Pydantic discriminator
-            # (``"unix_local"`` / ``"docker"`` / ``"daytona"`` /
-            # ``"modal"``) — same key space as ``_PROVIDER_MODS``,
-            # so this is a direct lookup.
-            provider_type = getattr(state, "type", None)
-    except Exception as e:
-        log.warning("teardown %s: read state failed: %s", session_id, e)
 
+    async def _collect() -> None:
+        nonlocal provider_type
+        try:
+            payload = await read_sandbox_state(session_id)
+        except Exception as e:
+            log.warning("teardown %s: read state failed: %s", session_id, e)
+            return
+        if payload is None:
+            return
+        state = deserialize(payload)
+        pt = getattr(state, "type", None)
+        if pt == "native":
+            pt = getattr(state, "provider", None)
+        if pt:
+            provider_type = pt
+        ref = getattr(state, "sandbox_ref", None)
+        if ref:
+            refs.add(ref)
+
+    await _collect()                       # before release
     try:
         await get_pool().release(session_id)
     except Exception as e:
         log.warning("teardown %s: pool.release failed: %s", session_id, e)
+    await _collect()                       # after release — catches a recreate
 
-    # Destroy the sandbox via the provider's uniform ``destroy_sandbox`` entry
-    # point. Best-effort — if the provider can't reach the sandbox (already
-    # gone, network blip), the caller still drops the row(s).
-    if provider_type and sandbox_ref:
-        try:
-            mod = _prov._PROVIDER_MODS.get(provider_type)
-            if mod is not None:
-                await mod.destroy_sandbox(_prov.ProviderInstance(
-                    provider=provider_type, url="", root="",
-                    sandbox_ref=sandbox_ref,
-                ))
-        except Exception as e:
-            log.warning("teardown %s: provider destroy failed (%s %s): %s",
-                        session_id, provider_type, sandbox_ref[:16], e)
+    # Destroy via the provider's uniform ``destroy_sandbox``. Best-effort — if
+    # the provider can't reach the sandbox (already gone, network blip), the
+    # caller still drops the row(s).
+    mod = _prov._PROVIDER_MODS.get(provider_type) if provider_type else None
+    if mod is not None:
+        from .metrics import get_metrics
+        for sandbox_ref in refs:
+            try:
+                async with get_metrics().timed_op(
+                    provider=provider_type, operation="destroy", session_id=session_id):
+                    await mod.destroy_sandbox(_prov.ProviderInstance(
+                        provider=provider_type, url="", root="",
+                        sandbox_ref=sandbox_ref,
+                    ))
+            except Exception as e:
+                # A destroy that fails leaves provider compute behind — a leak.
+                log.warning("teardown %s: provider destroy failed (%s %s): %s",
+                            session_id, provider_type, sandbox_ref[:16], e)
+                try:
+                    await get_metrics().record_leak("destroy_failed", provider=provider_type,
+                                                     session_id=session_id, exc=e)
+                except Exception:
+                    pass
 
 
 @app.delete("/sessions/{session_id}", status_code=204)
@@ -2738,10 +2917,23 @@ async def session_sandbox_exec(session_id: str, request: Request):
         raise HTTPException(400, "command required")
     timeout = min(data.get("timeout", 30), 300)
 
+    # Native sessions have no supervisor — run through the session's
+    # transport (provisions the sandbox lazily on first exec). Keyed off the
+    # state discriminator the factory already dispatches on, so no extra
+    # capability flag on the base class.
+    from api.sandbox import get_pool
+    pool_session = await get_pool().get_session(session_id)
+    if getattr(pool_session.state, "type", None) == "native":
+        return await pool_session.sandbox_exec(command, timeout)
+
+    # Reuse the session we just resolved — pass its supervisor URL so the
+    # proxy doesn't re-run get_session() (it brings compute up, idempotent
+    # but a redundant pool round-trip on every CLI exec).
     response = await _proxy_from_session(
         session_id, "POST", "/v1/exec",
         json={"command": command, "timeout": timeout},
         timeout=timeout + 5,
+        supervisor_url=pool_session.supervisor_url or "",
     )
     if response.status_code >= 400:
         return response
@@ -2773,13 +2965,16 @@ async def _resolve_supervisor_url(session_id: str) -> str:
 async def _proxy_from_session(
     session_id: str, method: str, path: str, *,
     params: dict | None = None, json: dict | None = None,
-    timeout: int = 30,
+    timeout: int = 30, supervisor_url: str | None = None,
 ) -> Response:
     """Forward a request to the session's supervisor (resolved through
     the SessionPool) and return its JSON response. Used by every
     session-scoped file proxy. Uses the module-shared ``_HTTP_CLIENT`` so
-    repeat calls reuse the keep-alive connection to that supervisor."""
-    url = await _resolve_supervisor_url(session_id)
+    repeat calls reuse the keep-alive connection to that supervisor.
+
+    ``supervisor_url`` lets a caller that already resolved the session pass
+    its URL to skip a redundant ``get_session`` pool round-trip."""
+    url = supervisor_url if supervisor_url is not None else await _resolve_supervisor_url(session_id)
     if _HTTP_CLIENT is None:
         raise HTTPException(503, "server not yet initialised")
     try:
@@ -2904,6 +3099,12 @@ async def serve_ui():
 async def serve_dashboard():
     """Serve the validation dashboard."""
     return _serve_ui_file("dashboard.html", "Dashboard")
+
+
+@app.get("/ui/errors")
+async def serve_errors_ui():
+    """Serve the error / metrics monitoring dashboard."""
+    return _serve_ui_file("errors.html", "Errors UI")
 
 
 @app.get("/ui/files")

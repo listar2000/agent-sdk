@@ -81,5 +81,18 @@ async def _orphan_monitor_loop() -> None:
                 origin, total, total - n, n, report["state_hist"],
                 report["capped"], sample,
             )
+            if n > 0:
+                # Orphans are sandboxes with no session row — already-leaked
+                # compute against the account quota. Record the count so the
+                # dashboard tracks "how much is leaking" over time.
+                try:
+                    from api.metrics import get_metrics
+                    await get_metrics().record_leak(
+                        "orphan_detected", provider="daytona",
+                        count=n, total_seen=total, capped=report["capped"],
+                        states=report["state_hist"],
+                    )
+                except Exception:
+                    pass
         except Exception:
             log.exception("orphan-monitor tick failed")

@@ -1,8 +1,8 @@
 """Integration test: interrupt flow against a real claude-agent-acp with Haiku.
 
 Requires:
-  - Server running at localhost:7778 (docker compose up -d --build)
-  - ANTHROPIC_API_KEY set (or in ~/.env)
+  - Server running at localhost:7778 (scripts/launch_server_test.sh)
+  - CLAUDE_CODE_OAUTH_TOKEN set (or in ~/.env)
 
 Run:
   .venv/bin/pytest tests/test_interrupt_integration.py -v -s
@@ -14,13 +14,20 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# Live-server suite — SERIAL-BY-DESIGN (one shared stack, real sandboxes/
+# LLM quota): xdist_group("live") pins it to one worker so `-n auto tests/`
+# cannot run live tests concurrently (pyproject --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("live")
+
 
 from agent_sdk.client import Agent
 
-# Load API keys from ~/.env if not already set
+# Load API keys from ~/.env if not already set. ANTHROPIC_API_KEY is
+# deliberately NOT loaded: the claude CLI prefers it over the OAuth token
+# when both are present, so a stale/revoked key in ~/.env would 401 every
+# claude session even though CLAUDE_CODE_OAUTH_TOKEN (the repo's blessed
+# credential — see CLAUDE.md) is valid. Export it explicitly to use it.
 _KEY_PREFIXES = (
-    "ANTHROPIC_API_KEY=",
     "GEMINI_API_KEY=",
     "GOOGLE_API_KEY=",
     "OPENROUTER_API_KEY=",
@@ -37,7 +44,7 @@ if os.path.exists(env_path):
                     if not os.environ.get(key):
                         os.environ[key] = val
 
-API_URL = "http://localhost:7778"
+API_URL = os.environ.get("AGENT_SERVER_URL", "http://localhost:7778")
 MODEL = "claude-haiku-4-5-20251001"
 
 
@@ -412,10 +419,13 @@ _OPENCODE_MODEL = "openrouter/anthropic/claude-3.5-haiku"
     reason="OPENROUTER_API_KEY required for OpenCode (uses openrouter/* models)",
 )
 class TestOpenCodeIntegration:
-    """OpenCode delegates fs/terminal access to the client. Tests confirm the
-    full ACP loop (handshake → session/new → session/prompt → tool calls →
-    stopReason) works with the supervisor's session/request_permission +
-    fs/* + terminal/* handlers."""
+    """OpenCode executes tools locally in the ACP child (verified 2026-06:
+    no fs/terminal client delegation on the pinned 1.14.30). The only
+    client-side ACP traffic is ``session/request_permission`` — auto-allowed
+    by supervisor.js, and load-bearing: unanswered, every gated tool call
+    hangs the turn. Tests confirm the full ACP loop (handshake →
+    session/new → session/prompt → tool calls → stopReason) through that
+    wiring."""
 
     @pytest.mark.asyncio
     async def test_opencode_basic_prompt(self):
@@ -864,8 +874,11 @@ class TestSSELogParity:
 
             await asyncio.wait_for(listener, timeout=120)
 
+            # 3 queued prompts -> 3 turns. Waiting on just 1 turn_end races
+            # the log batcher (SSE leads persist; see helper docstring) and
+            # intermittently snapshots the log before turns 2-3 flush.
             log_entries = _fetch_log_after_n_turn_ends(
-                agent.session_id, 1, limit=30, deadline_s=10.0,
+                agent.session_id, 3, limit=40, deadline_s=10.0,
             )
 
             user_msgs = [e for e in log_entries if e["event_type"] == "user_message"]

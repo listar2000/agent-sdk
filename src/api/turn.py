@@ -233,7 +233,16 @@ class TurnRunner:
                     if t in ("done", "error"):
                         terminal = True
             await self._flush_buffers()
-            return True, None
+            # A stream that ENDS WITHOUT a done/error is NOT a successful turn:
+            # the supervisor died mid-prompt and the SSE EOF'd cleanly (no
+            # exception) — a killed daytona supervisor does this after its proxy
+            # holds the dead connection ~180s. Returning ``True`` here claimed
+            # success, so run() neither recovered nor wrote a terminal, and the
+            # client polling /log (or /events) waited forever for a turn_end
+            # that was never persisted: a silently DROPPED prompt. Report
+            # ``terminal`` (False when none was seen) so run() recovers or
+            # writes an error.
+            return terminal, None
         except Exception as e:
             return terminal, e
 
@@ -274,7 +283,11 @@ class TurnRunner:
                 # would otherwise land on a dict that was cleared during the
                 # migration, and the SDK would time out waiting for an event
                 # that never arrives.
-                if not ok and exc is not None:
+                # Retry on ANY non-terminal outcome — an exception OR a clean
+                # stream end that produced no terminal (both mean the supervisor
+                # died mid-prompt). The pool may already have cold-recovered a
+                # replacement session; re-drive the prompt on it.
+                if not ok:
                     try:
                         from api.sandbox import get_pool as _gp
                         replacement = await _gp().get_session(self.session.session_id)
@@ -285,6 +298,13 @@ class TurnRunner:
                             "execute_prompt retry: session %s recovered rpc=%s",
                             self.session.session_id, self.rpc_id,
                         )
+                        try:
+                            from .metrics import get_metrics
+                            await get_metrics().record_recovery(
+                                "mid_turn_swap",
+                                session_id=self.session.session_id, rpc_id=self.rpc_id)
+                        except Exception:
+                            pass
                         self.text_buf.clear(); self.think_buf.clear()
                         self._reset_turn_observability()
                         # Move the in-flight marker onto the session the pool now
@@ -303,6 +323,19 @@ class TurnRunner:
                         "execute_prompt failed for session %s rpc=%s: %s",
                         self.session.session_id, self.rpc_id, e,
                     )
+                    # Fire-and-forget turns (POST /message) already returned
+                    # 200 + rpc_id, so this never reaches an HTTP handler —
+                    # record it explicitly. The sentinel keeps it from
+                    # double-counting against the logging net's capture of the
+                    # log.exception above.
+                    try:
+                        from .metrics import get_metrics
+                        await get_metrics().record_error(
+                            e, category="turn",
+                            session_id=self.session.session_id,
+                            phase="execute_prompt", rpc_id=self.rpc_id)
+                    except Exception:
+                        pass
                     await self._flush_buffers()
                     await self._write({
                         "type": "error",

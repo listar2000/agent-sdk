@@ -37,7 +37,6 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.sandbox import (  # noqa: E402
     BaseSandboxSession,
@@ -76,7 +75,7 @@ class _LeakySession(BaseSandboxSession):
             "and no existing sessions found"
         )
 
-    async def running(self, *, force_probe: bool = False) -> bool:
+    async def running(self) -> bool:
         return False
 
     async def execute_prompt(self, *args, **kwargs):

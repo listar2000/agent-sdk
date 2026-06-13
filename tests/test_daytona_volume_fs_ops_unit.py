@@ -1,4 +1,4 @@
-"""Unit tests for Daytona volume FS helper commands.
+"""Unit tests for DaytonaVolumeAdapter file-system operations.
 
 These tests patch the utility-sandbox executor so no real Daytona API key
 or sandbox is required.
@@ -11,29 +11,28 @@ from types import SimpleNamespace
 
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
+
+def _make_adapter(ref: str = "vol-ref"):
+    from api.providers.daytona import DaytonaVolumeAdapter
+    return DaytonaVolumeAdapter(ref)
 
 
 @pytest.mark.asyncio
-async def test_volume_mkdir_uses_mkdir_p(monkeypatch):
-    from api.providers import daytona
+async def test_volume_mkdir_uses_mkdir_p():
+    adapter = _make_adapter()
+    calls: list[tuple[str, int]] = []
 
-    calls: list[tuple[str, str]] = []
+    async def fake_run_shell(shell: str, *, timeout: int):
+        calls.append((shell, timeout))
+        return (0, b"", b"")
 
-    async def fake_run(ref: str, cmd: str, timeout: int = 30):
-        calls.append((ref, cmd))
-        return SimpleNamespace(stdout="", stderr="", exit_code=0)
-
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
-    await daytona.volume_mkdir("vol-ref", "shared/docs/a")
+    adapter._run_shell = fake_run_shell  # type: ignore[method-assign]
+    await adapter.mkdir("shared/docs/a")
 
     assert calls
-    ref, cmd = calls[0]
-    assert ref == "vol-ref"
-    assert "mkdir -p" in cmd
-    assert "/v/shared/docs/a" in cmd
+    shell, _ = calls[0]
+    assert "mkdir -p" in shell
+    assert "/v/shared/docs/a" in shell
 
 
 @pytest.mark.asyncio
@@ -58,8 +57,9 @@ async def test_volume_delete_missing_maps_to_filenotfound(monkeypatch):
         AsyncMock(return_value=fake_client),
     )
 
+    adapter = _make_adapter()
     with pytest.raises(FileNotFoundError):
-        await daytona.volume_delete("vol-ref", "shared/missing.txt")
+        await adapter.delete("shared/missing.txt")
 
 
 @pytest.mark.asyncio
@@ -87,7 +87,8 @@ async def test_volume_delete_uses_provider_file_api(monkeypatch):
         AsyncMock(return_value=fake_client),
     )
 
-    await daytona.volume_delete("vol-ref", "shared/docs/a.txt")
+    adapter = _make_adapter()
+    await adapter.delete("shared/docs/a.txt")
 
     assert captured == {"path": "/v/shared/docs/a.txt", "recursive": True}
 
@@ -99,17 +100,19 @@ async def test_volume_rename_overwrite_uses_provider_file_api_move(monkeypatch):
     calls: list[str] = []
     captured: dict[str, object] = {}
 
-    async def fake_run(_ref: str, cmd: str, timeout: int = 30):
-        calls.append(cmd)
-        return SimpleNamespace(stdout="", stderr="", exit_code=0)
+    async def fake_run_shell(shell: str, *, timeout: int):
+        calls.append(shell)
+        return (0, b"", b"")
 
     async def fake_move(_ref: str, src_abs: str, dst_abs: str) -> None:
         captured["src_abs"] = src_abs
         captured["dst_abs"] = dst_abs
 
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
     monkeypatch.setattr(daytona, "_move_overwrite", fake_move)
-    await daytona.volume_rename("vol-ref", "shared/a.txt", "shared/sub/b.txt")
+
+    adapter = _make_adapter()
+    adapter._run_shell = fake_run_shell  # type: ignore[method-assign]
+    await adapter.rename("shared/a.txt", "shared/sub/b.txt")
 
     assert len(calls) == 2
     cmd = calls[0]
@@ -123,26 +126,26 @@ async def test_volume_rename_overwrite_uses_provider_file_api_move(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_volume_rename_overwrite_directory_is_unsupported(monkeypatch):
-    from api.providers import daytona
+async def test_volume_rename_overwrite_directory_is_unsupported():
+    adapter = _make_adapter()
 
-    async def fake_run(_ref: str, _cmd: str, timeout: int = 30):
-        return SimpleNamespace(stdout="__UNSUPPORTED_DIR__", stderr="", exit_code=95)
+    async def fake_run_shell(shell: str, *, timeout: int):
+        return (95, b"__UNSUPPORTED_DIR__", b"")
 
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
+    adapter._run_shell = fake_run_shell  # type: ignore[method-assign]
     with pytest.raises(NotImplementedError, match="directories"):
-        await daytona.volume_rename("vol-ref", "shared/dir", "shared/sub/dir")
+        await adapter.rename("shared/dir", "shared/sub/dir")
 
 
 @pytest.mark.asyncio
-async def test_volume_rename_same_path_is_noop(monkeypatch):
-    from api.providers import daytona
+async def test_volume_rename_same_path_is_noop():
+    adapter = _make_adapter()
 
-    async def fake_run(_ref: str, _cmd: str, timeout: int = 30):
+    async def fake_run_shell(shell: str, *, timeout: int):
         raise AssertionError("same-path rename should not touch Daytona")
 
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
-    await daytona.volume_rename("vol-ref", "shared/a.txt", "shared/a.txt")
+    adapter._run_shell = fake_run_shell  # type: ignore[method-assign]
+    await adapter.rename("shared/a.txt", "shared/a.txt")
 
 
 @pytest.mark.asyncio
@@ -152,9 +155,9 @@ async def test_volume_rename_no_overwrite_uses_conditional_create(monkeypatch):
     calls: list[str] = []
     captured: dict[str, object] = {}
 
-    async def fake_run(_ref: str, cmd: str, timeout: int = 30):
-        calls.append(cmd)
-        return SimpleNamespace(stdout="", stderr="", exit_code=0)
+    async def fake_run_shell(shell: str, *, timeout: int):
+        calls.append(shell)
+        return (0, b"", b"")
 
     async def fake_supports(_ref: str) -> bool:
         return True
@@ -170,14 +173,14 @@ async def test_volume_rename_no_overwrite_uses_conditional_create(monkeypatch):
     async def fake_delete(_ref: str, _path: str) -> None:
         captured["deleted"] = True
 
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
     monkeypatch.setattr(daytona, "_daytona_supports_conditional_create", fake_supports)
     monkeypatch.setattr(daytona, "volume_download", fake_download)
     monkeypatch.setattr(daytona, "_conditional_upload_if_absent", fake_conditional)
     monkeypatch.setattr(daytona, "volume_delete", fake_delete)
-    await daytona.volume_rename(
-        "vol-ref", "shared/a.txt", "shared/sub/b.txt", overwrite=False,
-    )
+
+    adapter = _make_adapter()
+    adapter._run_shell = fake_run_shell  # type: ignore[method-assign]
+    await adapter.rename("shared/a.txt", "shared/sub/b.txt", overwrite=False)
 
     assert len(calls) == 2
     assert "mkdir -p" in calls[0]
@@ -193,8 +196,8 @@ async def test_volume_rename_no_overwrite_uses_conditional_create(monkeypatch):
 async def test_volume_rename_no_overwrite_exists_maps_to_error(monkeypatch):
     from api.providers import VolumeFileExistsError, daytona
 
-    async def fake_run(_ref: str, _cmd: str, timeout: int = 30):
-        return SimpleNamespace(stdout="", stderr="", exit_code=0)
+    async def fake_run_shell(shell: str, *, timeout: int):
+        return (0, b"", b"")
 
     async def fake_supports(_ref: str) -> bool:
         return True
@@ -205,14 +208,14 @@ async def test_volume_rename_no_overwrite_exists_maps_to_error(monkeypatch):
     async def fake_conditional(_ref: str, _abs_path: str, _content: bytes) -> str:
         return "exists"
 
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
     monkeypatch.setattr(daytona, "_daytona_supports_conditional_create", fake_supports)
     monkeypatch.setattr(daytona, "volume_download", fake_download)
     monkeypatch.setattr(daytona, "_conditional_upload_if_absent", fake_conditional)
+
+    adapter = _make_adapter()
+    adapter._run_shell = fake_run_shell  # type: ignore[method-assign]
     with pytest.raises(VolumeFileExistsError) as exc:
-        await daytona.volume_rename(
-            "vol-ref", "shared/a.txt", "shared/sub/b.txt", overwrite=False,
-        )
+        await adapter.rename("shared/a.txt", "shared/sub/b.txt", overwrite=False)
     assert exc.value.path == "shared/sub/b.txt"
 
 
@@ -224,10 +227,10 @@ async def test_volume_rename_no_overwrite_unsupported_when_conditional_missing(m
         return False
 
     monkeypatch.setattr(daytona, "_daytona_supports_conditional_create", fake_supports)
+
+    adapter = _make_adapter()
     with pytest.raises(NotImplementedError, match="not supported"):
-        await daytona.volume_rename(
-            "vol-ref", "shared/a.txt", "shared/sub/b.txt", overwrite=False,
-        )
+        await adapter.rename("shared/a.txt", "shared/sub/b.txt", overwrite=False)
 
 
 @pytest.mark.asyncio
@@ -236,17 +239,19 @@ async def test_volume_rename_postcondition_failure_maps_to_runtime_error(monkeyp
 
     calls = 0
 
-    async def fake_run(_ref: str, _cmd: str, timeout: int = 30):
+    async def fake_run_shell(shell: str, *, timeout: int):
         nonlocal calls
         calls += 1
         if calls == 1:
-            return SimpleNamespace(stdout="", stderr="", exit_code=0)
-        return SimpleNamespace(stdout="__RENAME_NOT_VISIBLE__", stderr="", exit_code=98)
+            return (0, b"", b"")
+        return (98, b"__RENAME_NOT_VISIBLE__", b"")
 
     async def fake_move(_ref: str, _src_abs: str, _dst_abs: str) -> None:
         return None
 
-    monkeypatch.setattr(daytona, "_run_in_utility_sandbox", fake_run)
     monkeypatch.setattr(daytona, "_move_overwrite", fake_move)
+
+    adapter = _make_adapter()
+    adapter._run_shell = fake_run_shell  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="postcondition failed"):
-        await daytona.volume_rename("vol-ref", "shared/a.txt", "shared/sub/b.txt")
+        await adapter.rename("shared/a.txt", "shared/sub/b.txt")

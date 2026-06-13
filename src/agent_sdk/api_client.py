@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -378,7 +379,10 @@ class ApiClient:
         session is a no-op."""
         return await self._json(
             "POST", f"/sessions/{session_id}/release",
-            timeout=httpx.Timeout(5.0, read=10.0),
+            # Release SNAPSHOTS before dropping the lease; on daytona the
+            # S3-FUSE tarball snapshot can take tens of seconds under
+            # concurrent load, so a 10s read timeout spuriously ReadTimeouts.
+            timeout=httpx.Timeout(5.0, read=60.0),
         )
 
     async def reload_session(
@@ -629,6 +633,42 @@ class ApiClient:
     # ------------------------------------------------------------------
     # Sessions — events (SSE)
     # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def open_events(self, session_id: str, *, read_timeout: float = 90.0):
+        """``GET /sessions/{id}/events`` as an iterator of FRAMED SSE blocks.
+
+        The block-level surface (``api.sse.iter_sse_blocks`` output) — use
+        this instead of hand-rolling ``\\n\\n`` framing over
+        ``stream_events``'s raw bytes. Parsing policy (tag demux,
+        ``parse_acp_event``, heartbeat handling) stays with the caller.
+        Cancellation closes the underlying response.
+        """
+        from api.sse import iter_sse_blocks
+        async with self._http.stream(
+            "GET", f"/sessions/{session_id}/events",
+            headers={"Accept": "text/event-stream"},
+            timeout=httpx.Timeout(30.0, read=read_timeout),
+        ) as resp:
+            # NOTE: no _raise_for_status here — the long-lived /events GET has
+            # never status-checked (errors surface as stream errors), and
+            # Session.events() relies on that (its fakes yield bare responses).
+            yield iter_sse_blocks(resp)
+
+    @asynccontextmanager
+    async def open_message_stream(self, session_id: str, text: str, *,
+                                  interrupt: bool = False):
+        """``POST /sessions/{id}/message+stream`` as framed SSE blocks —
+        blocks are already scoped to this prompt's rpc_id server-side."""
+        from api.sse import iter_sse_blocks
+        async with self._http.stream(
+            "POST", f"/sessions/{session_id}/message+stream",
+            json={"message": text, "interrupt": interrupt},
+            headers={"Accept": "text/event-stream"},
+            timeout=httpx.Timeout(30.0, read=None),
+        ) as resp:
+            _raise_for_status(resp)
+            yield iter_sse_blocks(resp)
 
     async def stream_events(
         self, session_id: str

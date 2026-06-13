@@ -32,8 +32,6 @@ import sys
 import pytest
 
 _SRC_DIR = pathlib.Path(__file__).resolve().parents[1] / "src"
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +175,9 @@ def test_well_known_reexports_stay_on_api_providers():
         "_get_sandbox_env_vars",
         "_wait_for_health",
         "_exec_subprocess",
-        "allocate_sandbox_port",
-        "free_sandbox_port",
         "AUTH_KEYS",
         "ProviderInstance",
         "ExecResult",
-        "PORT_BASED_PROVIDERS",
     ]
     # Daytona helpers surfaced at the package root.
     daytona_reexports = [
@@ -197,7 +192,6 @@ def test_well_known_reexports_stay_on_api_providers():
         "exec_in_instance",
         "create_volume",
         "delete_volume",
-        "ensure_supervisor_url",
         "reconcile_sandboxes",
     ]
 

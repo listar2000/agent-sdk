@@ -38,6 +38,7 @@ from .._shared import (
     _safe_path,
     _wait_for_health,
 )
+from .._volume import BaseVolumeAdapter
 
 log = logging.getLogger(__name__)
 
@@ -465,7 +466,6 @@ async def create_sandbox(
         root=str(home_dir),
         sandbox_ref=ref,
         port=port,
-        process=proc,
     )
 
 
@@ -607,222 +607,217 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
 # Supervisor URL
 # ---------------------------------------------------------------------------
 
-async def ensure_supervisor_url(
-    inst: ProviderInstance,
-    *, agent_type: str = "opencode", root: str = "/tmp",
-    spawn_env: dict | None = None, port: int | None = None,
-) -> str:
-    """Local: the supervisor started at create_sandbox time. No-op, return
-    the URL already on the instance.
-
-    Signature matches Daytona's ``ensure_supervisor_url`` exactly so
-    mis-spelled kwargs surface as TypeError instead of being silently
-    swallowed by a ``**_kw`` catch-all."""
-    return inst.url
-
-
 # ---------------------------------------------------------------------------
 # Volume file ops (direct FS in-process, with realpath containment)
 # ---------------------------------------------------------------------------
 
-async def volume_tree(ref: str, path: str = "") -> str:
-    """Return a newline-separated tree listing of ``<ref>/<path>``.
+class UnixLocalVolumeAdapter(BaseVolumeAdapter):
+    """Per-volume file operations for the unix_local provider.
 
-    Symlinks are not followed; any path that resolves outside ``ref`` is
-    rejected by ``_safe_join``.
-
-    ``path`` matches the uniform provider API (docker/daytona expose the
-    same name).  The previous ``subpath`` name is dropped — callers that
-    used the keyword will get a TypeError, which surfaces a clear mismatch
-    rather than a silent ``**kw``-swallowed pass-through.
+    Direct filesystem access via openat-hardened path resolution — NOT
+    shell-backed.  ``self.provider_ref`` is the absolute path of the
+    volume directory.
     """
-    target = await asyncio.to_thread(_safe_join, ref, path or "")
 
-    def _walk() -> str:
-        if not os.path.exists(target):
-            return ""
-        lines: list[str] = []
-        root_real = os.path.realpath(ref)
-        for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
-            # Keep deterministic ordering for tests.
-            dirnames.sort()
-            filenames.sort()
-            rel = os.path.relpath(dirpath, root_real)
-            if rel == ".":
-                rel = ""
-            for d in dirnames:
-                lines.append((os.path.join(rel, d) + "/").lstrip("/"))
-            for f in filenames:
-                lines.append(os.path.join(rel, f).lstrip("/"))
-        lines.sort()
-        return "\n".join(lines)
+    provider = "unix_local"
 
-    return await asyncio.to_thread(_walk)
+    async def tree(self, path: str = "") -> str:
+        """Return a newline-separated tree listing of ``<ref>/<path>``.
 
+        Symlinks are not followed; any path that resolves outside ``ref`` is
+        rejected by ``_safe_join``.
 
-async def volume_read(ref: str, path: str) -> bytes:
-    """Read a file from the volume. Symlink-escape is rejected.
+        ``path`` matches the uniform provider API (docker/daytona expose the
+        same name).  The previous ``subpath`` name is dropped — callers that
+        used the keyword will get a TypeError, which surfaces a clear mismatch
+        rather than a silent ``**kw``-swallowed pass-through.
+        """
+        ref = self.provider_ref
+        target = await asyncio.to_thread(_safe_join, ref, path or "")
 
-    Hardened against TOCTOU: after ``_safe_join`` resolves the path we
-    reopen via ``openat(O_NOFOLLOW)`` relative to a directory fd of the
-    parent so a concurrent rename-over with a symlink can't escape the
-    volume between resolution and open.
-    """
-    target = await asyncio.to_thread(_safe_join, ref, path)
+        def _walk() -> str:
+            if not os.path.exists(target):
+                return ""
+            lines: list[str] = []
+            root_real = os.path.realpath(ref)
+            for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
+                # Keep deterministic ordering for tests.
+                dirnames.sort()
+                filenames.sort()
+                rel = os.path.relpath(dirpath, root_real)
+                if rel == ".":
+                    rel = ""
+                for d in dirnames:
+                    lines.append((os.path.join(rel, d) + "/").lstrip("/"))
+                for f in filenames:
+                    lines.append(os.path.join(rel, f).lstrip("/"))
+            lines.sort()
+            return "\n".join(lines)
 
-    def _read() -> bytes:
-        parent_dir, basename = os.path.split(target)
-        if not basename:
-            raise IsADirectoryError(target)
-        # Open the parent directory O_NOFOLLOW so a symlink swap on the
-        # parent itself fails here rather than silently redirecting.
-        parent_fd = os.open(parent_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            fd = os.open(
-                basename,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=parent_fd,
-            )
+        return await asyncio.to_thread(_walk)
+
+    async def read(self, path: str) -> bytes:
+        """Read a file from the volume. Symlink-escape is rejected.
+
+        Hardened against TOCTOU: after ``_safe_join`` resolves the path we
+        reopen via ``openat(O_NOFOLLOW)`` relative to a directory fd of the
+        parent so a concurrent rename-over with a symlink can't escape the
+        volume between resolution and open.
+        """
+        ref = self.provider_ref
+        target = await asyncio.to_thread(_safe_join, ref, path)
+
+        def _read() -> bytes:
+            parent_dir, basename = os.path.split(target)
+            if not basename:
+                raise IsADirectoryError(target)
+            # Open the parent directory O_NOFOLLOW so a symlink swap on the
+            # parent itself fails here rather than silently redirecting.
+            parent_fd = os.open(parent_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
-                chunks: list[bytes] = []
-                while True:
-                    buf = os.read(fd, 1 << 20)  # 1 MiB chunks
-                    if not buf:
-                        break
-                    chunks.append(buf)
-                return b"".join(chunks)
-            finally:
-                os.close(fd)
-        finally:
-            os.close(parent_fd)
-
-    return await asyncio.to_thread(_read)
-
-
-async def volume_download(ref: str, path: str) -> bytes:
-    """Read raw bytes from ``<volume>/<path>`` for the download endpoint."""
-    return await volume_read(ref, path)
-
-
-async def volume_exists(ref: str, path: str) -> bool:
-    """Return whether ``<volume>/<path>`` exists."""
-    target = await asyncio.to_thread(_safe_join, ref, path or "")
-    return await asyncio.to_thread(os.path.exists, target)
-
-
-async def volume_write(ref: str, path: str, content: bytes) -> None:
-    """Write to the volume. Creates parent dirs. Symlink-escape is rejected.
-
-    Hardened against TOCTOU: opens the target via ``openat(O_NOFOLLOW)``
-    relative to a directory fd of the parent so a concurrent rename-over
-    with a symlink can't redirect the write outside the volume.
-
-    ``content`` is bytes-only (matching docker/daytona).  Callers with a
-    ``str`` payload must encode() at the call site; leaving the implicit
-    encoding here diverged the local signature from the other providers
-    and defeated load-time arg checking.
-    """
-    target = await asyncio.to_thread(_safe_join, ref, path)
-    if not isinstance(content, (bytes, bytearray, memoryview)):
-        raise TypeError(
-            f"volume_write: content must be bytes, got {type(content).__name__}"
-        )
-    data = bytes(content)
-
-    def _write() -> None:
-        parent_dir, basename = os.path.split(target)
-        if not basename:
-            raise IsADirectoryError(target)
-        # os.makedirs is fine here: even if it races with a symlink
-        # plant, the subsequent O_NOFOLLOW open of the parent directory
-        # will refuse to follow a symlink that tries to retarget it.
-        os.makedirs(parent_dir, exist_ok=True)
-        parent_fd = os.open(parent_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            fd = os.open(
-                basename,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o644,
-                dir_fd=parent_fd,
-            )
-            try:
-                to_write = memoryview(data)
-                while to_write:
-                    n = os.write(fd, to_write)
-                    to_write = to_write[n:]
-            finally:
-                os.close(fd)
-        finally:
-            os.close(parent_fd)
-
-    await asyncio.to_thread(_write)
-
-
-async def volume_upload(ref: str, path: str, content: bytes) -> None:
-    """Upload bytes to ``<volume>/<path>``."""
-    await volume_write(ref, path, content)
-
-
-async def volume_mkdir(ref: str, path: str) -> None:
-    """Create a directory at ``<volume>/<path>``."""
-    target = await asyncio.to_thread(_safe_join, ref, path or "")
-    if target == os.path.realpath(ref):
-        raise ValueError("volume_mkdir: path required")
-    await asyncio.to_thread(lambda: os.makedirs(target, exist_ok=True))
-
-
-async def volume_delete(ref: str, path: str) -> None:
-    """Delete a file or directory at ``<volume>/<path>``."""
-    target = await asyncio.to_thread(_safe_join, ref, path or "")
-    if target == os.path.realpath(ref):
-        raise ValueError("volume_delete: path required")
-
-    def _delete() -> None:
-        if os.path.isdir(target):
-            shutil.rmtree(target)
-            return
-        if os.path.isfile(target):
-            os.remove(target)
-            return
-        raise FileNotFoundError(path)
-
-    await asyncio.to_thread(_delete)
-
-
-async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
-    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
-    src = await asyncio.to_thread(_safe_join, ref, path or "")
-    dst = await asyncio.to_thread(_safe_join, ref, new_path or "")
-    root = os.path.realpath(ref)
-    if src == root or dst == root:
-        raise ValueError("volume_rename: path and new_path required")
-
-    def _rename() -> None:
-        if not os.path.exists(src):
-            raise FileNotFoundError(path)
-        parent = os.path.dirname(dst)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        if not overwrite:
-            if os.path.isdir(src):
-                raise NotImplementedError("atomic no-overwrite directory rename is not supported")
-            try:
-                os.link(src, dst)
-            except FileExistsError as exc:
-                raise VolumeFileExistsError(new_path) from exc
-            try:
-                os.unlink(src)
-            except Exception:
-                log.exception(
-                    "volume_rename overwrite=False linked %s to %s but failed to unlink source",
-                    src,
-                    dst,
+                fd = os.open(
+                    basename,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
                 )
-                raise
-            return
-        os.replace(src, dst)
+                try:
+                    chunks: list[bytes] = []
+                    while True:
+                        buf = os.read(fd, 1 << 20)  # 1 MiB chunks
+                        if not buf:
+                            break
+                        chunks.append(buf)
+                    return b"".join(chunks)
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(parent_fd)
 
-    await asyncio.to_thread(_rename)
+        return await asyncio.to_thread(_read)
+
+    async def download(self, path: str) -> bytes:
+        """Read raw bytes from ``<volume>/<path>`` for the download endpoint."""
+        return await self.read(path)
+
+    async def exists(self, path: str) -> bool:
+        """Return whether ``<volume>/<path>`` exists."""
+        ref = self.provider_ref
+        target = await asyncio.to_thread(_safe_join, ref, path or "")
+        return await asyncio.to_thread(os.path.exists, target)
+
+    async def write(self, path: str, content: bytes) -> None:
+        """Write to the volume. Creates parent dirs. Symlink-escape is rejected.
+
+        Hardened against TOCTOU: opens the target via ``openat(O_NOFOLLOW)``
+        relative to a directory fd of the parent so a concurrent rename-over
+        with a symlink can't redirect the write outside the volume.
+
+        ``content`` is bytes-only (matching docker/daytona).  Callers with a
+        ``str`` payload must encode() at the call site; leaving the implicit
+        encoding here diverged the local signature from the other providers
+        and defeated load-time arg checking.
+        """
+        ref = self.provider_ref
+        target = await asyncio.to_thread(_safe_join, ref, path)
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                f"volume_write: content must be bytes, got {type(content).__name__}"
+            )
+        data = bytes(content)
+
+        def _write() -> None:
+            parent_dir, basename = os.path.split(target)
+            if not basename:
+                raise IsADirectoryError(target)
+            # os.makedirs is fine here: even if it races with a symlink
+            # plant, the subsequent O_NOFOLLOW open of the parent directory
+            # will refuse to follow a symlink that tries to retarget it.
+            os.makedirs(parent_dir, exist_ok=True)
+            parent_fd = os.open(parent_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                fd = os.open(
+                    basename,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o644,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    to_write = memoryview(data)
+                    while to_write:
+                        n = os.write(fd, to_write)
+                        to_write = to_write[n:]
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(parent_fd)
+
+        await asyncio.to_thread(_write)
+
+    async def upload(self, path: str, content: bytes) -> None:
+        """Upload bytes to ``<volume>/<path>``."""
+        await self.write(path, content)
+
+    async def mkdir(self, path: str) -> None:
+        """Create a directory at ``<volume>/<path>``."""
+        ref = self.provider_ref
+        target = await asyncio.to_thread(_safe_join, ref, path or "")
+        if target == os.path.realpath(ref):
+            raise ValueError("volume_mkdir: path required")
+        await asyncio.to_thread(lambda: os.makedirs(target, exist_ok=True))
+
+    async def delete(self, path: str) -> None:
+        """Delete a file or directory at ``<volume>/<path>``."""
+        ref = self.provider_ref
+        target = await asyncio.to_thread(_safe_join, ref, path or "")
+        if target == os.path.realpath(ref):
+            raise ValueError("volume_delete: path required")
+
+        def _delete() -> None:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+                return
+            if os.path.isfile(target):
+                os.remove(target)
+                return
+            raise FileNotFoundError(path)
+
+        await asyncio.to_thread(_delete)
+
+    async def rename(self, path: str, new_path: str, *, overwrite: bool = True) -> None:
+        """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
+        ref = self.provider_ref
+        src = await asyncio.to_thread(_safe_join, ref, path or "")
+        dst = await asyncio.to_thread(_safe_join, ref, new_path or "")
+        root = os.path.realpath(ref)
+        if src == root or dst == root:
+            raise ValueError("volume_rename: path and new_path required")
+
+        def _rename() -> None:
+            if not os.path.exists(src):
+                raise FileNotFoundError(path)
+            parent = os.path.dirname(dst)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if not overwrite:
+                if os.path.isdir(src):
+                    raise NotImplementedError("atomic no-overwrite directory rename is not supported")
+                try:
+                    os.link(src, dst)
+                except FileExistsError as exc:
+                    raise VolumeFileExistsError(new_path) from exc
+                try:
+                    os.unlink(src)
+                except Exception:
+                    log.exception(
+                        "volume_rename overwrite=False linked %s to %s but failed to unlink source",
+                        src,
+                        dst,
+                    )
+                    raise
+                return
+            os.replace(src, dst)
+
+        await asyncio.to_thread(_rename)
 
 
 # ---------------------------------------------------------------------------
@@ -874,3 +869,8 @@ async def reconcile_on_startup() -> None:
             await asyncio.to_thread(os.remove, path)
         except FileNotFoundError:
             pass
+
+
+#: uniform per-provider adapter handle — ``get_volume_adapter`` dispatches
+#: via ``_dispatch_mod(provider).VolumeAdapter`` (one registry for everything).
+VolumeAdapter = UnixLocalVolumeAdapter

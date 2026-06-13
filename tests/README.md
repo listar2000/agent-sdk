@@ -39,7 +39,7 @@ End-to-end tests are parametrized over `claude` + `opencode` via `tests/_acp_run
 | 8 | Stop, POST `/message` with no delay — scheduler picks up before reader sees EOF. Exercises `ConnectError` retry that clears `_reader_connected` and forces rebind. |
 | 9 | Stop + 4 s wait + POST. Reader has seen the disconnect; reusable-state check must tear down cleanly rather than POST to a dead URL. "Confidently dead" path. |
 | 10 | UI flow: one `/events` connection held across turn 1 / stop / turn 2. Pins in-place rebind (`_rebind_state` mutates state instead of replacing it, so subscribers don't get kicked). |
-| 11 | #10 with out-of-band delete. Server provisions replacement daytona AND calls `ensure_supervisor_url` (daytona is 2-phase: `create_sandbox` returns `url=""`); without it `AcpClient("")` raises `UnsupportedProtocol`. |
+| 11 | #10 with out-of-band delete. Server provisions replacement daytona AND starts its supervisor via `DaytonaSandboxSession.start` / `start_supervisor_in_sandbox` (daytona is 2-phase: `create_sandbox` returns `url=""`); without that phase `AcpClient("")` raises `UnsupportedProtocol`. |
 | 12 | #10 with `DELETE /sessions/{id}`. Pins zombie-state fix: `force=True` shutdown + kicking subscribers so `/events` wakes onto the replacement. |
 | 13 | Supervisor dies in place, sandbox alive (prod 502 / OOM). `pkill supervisor.js` (daytona) / `kill -9` (local). Recovery in place — DB row untouched. No docker (`pkill` takes container PID 1 down, covered by #11). |
 | 14 | #13 with no delay — POST in the ~100 ms `_reader_connected=True` stale window; daytona 502. Exercises `_execute_one_prompt`'s retry on `ConnectError`/`RemoteProtocolError`/`ReadError`. |
@@ -68,7 +68,7 @@ You touched:
 - `SessionPool.get_session` / `cold_create` / `release`
 - `SandboxSession.start`, `_recover_after_disconnect`, `_shutdown_session_state`
 - The session-delete route (#3)
-- The daytona replacement branch (#11), `ensure_supervisor_url`, `restart_daytona_supervisor`
+- The daytona replacement branch (#11), `start_supervisor_in_sandbox`, `restart_daytona_supervisor`
 - `HOME` in the supervisor spawn_env or the snapshot tarball (`AGENT_MEMORY_DIRS`)
 - `sandbox_state.recipe` or `_build_volume_mounts`
 - Subscriber dispatch (`broadcast` / `dispatch` / `subscribe_session`)

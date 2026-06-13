@@ -17,7 +17,6 @@ slot is the current Sonnet, so the mapping is semantically correct.
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.acp_client import _normalize_acp_model
 

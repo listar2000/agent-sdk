@@ -149,14 +149,19 @@ class SessionPool:
         async with self._lock(session_id):
             cached = self._active.get(session_id)
             handed_off_subscribers: dict[str, _Subscriber] = {}
+            # Whether this call is silently replacing a dead cached session
+            # (server-side cold-recover) vs. a first-time cold-create / a
+            # warm-from-hibernation resume. Drives the op label + the
+            # recovery signal below.
+            was_cold_recover = False
             if cached is not None:
-                # Force-probe so an externally-killed supervisor is detected
-                # immediately, even if the previous prompt's last chunk was
-                # observed seconds ago (the test 7 race class).
-                alive = await cached.running(force_probe=True)
+                # running() probes the supervisor NOW (no cached verdict), so
+                # an externally-killed supervisor is detected immediately even
+                # if the previous prompt's last chunk was observed seconds ago
+                # (the test 7 race class).
+                alive = await cached.running()
                 log.info("[pool.get_session] session=%s cached=True alive=%s peek=%s", session_id, alive, peek)
                 if alive:
-                    cached.liveness.observe_activity()
                     return cached
                 # Not alive. In peek mode, don't tear down or replace —
                 # caller wants a snapshot of state, not a side-effect.
@@ -175,6 +180,7 @@ class SessionPool:
                 # research / Task Builder silent-failure repro). Clearing
                 # the dict on the cached session makes ``_close_subscribers``
                 # a no-op so subscribers see no spurious _END.
+                was_cold_recover = True
                 handed_off_subscribers = dict(cached._subscribers)
                 cached._subscribers.clear()
                 # Tear the dead session down in the background. ``shutdown()``
@@ -227,8 +233,18 @@ class SessionPool:
                 for sub in handed_off_subscribers.values():
                     sub.owner = session
                 session._subscribers.update(handed_off_subscribers)
+            # Operation label + provider for the metrics op timing: a dead
+            # cached session being replaced is a silent ``cold_recover``; an
+            # explicit recipe is a ``cold_create``; otherwise we're warming a
+            # hibernated session back up (``resume``).
+            _op = "cold_recover" if was_cold_recover else (
+                "cold_create" if initial_state is not None else "resume")
+            _provider = getattr(state, "provider", None) or getattr(state, "type", None)
+            from api.metrics import get_metrics as _get_metrics
             try:
-                await session.start()
+                async with _get_metrics().timed_op(
+                    provider=_provider, operation=_op, session_id=session_id):
+                    await session.start()
             except BaseException:
                 # Bug A fix — fail-safe compute release. ``start()`` may have
                 # already acquired the sandbox (create_sandbox succeeded)
@@ -258,6 +274,13 @@ class SessionPool:
                 raise
             await db.write_sandbox_state(session_id, serialize(session.state))
             self._active[session_id] = session
+            if was_cold_recover:
+                # Silent server-side auto-heal that SUCCEEDED — no error
+                # surfaced to the caller, but a churn / instability signal.
+                # (A recovery whose start() failed is captured by the
+                # ``cold_recover`` op's fail_rate above, not here.)
+                await _get_metrics().record_recovery(
+                    "cold_recover", provider=_provider, session_id=session_id)
             # Publish the updated session_ids snapshot so the dashboard
             # sees this session as "active" without waiting for the
             # 25s heartbeat tick. Best-effort; the periodic heartbeat
@@ -357,10 +380,8 @@ class SessionPool:
         ``Liveness._last_compute_at`` (prompt chunks + successful health
         probes) plus an ``in_flight`` gate for chunk-silent long turns.
         Subscriber presence is NO LONGER consulted: an open /events
-        consumer (dashboard, monitor, idle chat UI) marks the session
-        ``alive`` for the re-probe path via ``observe_activity`` but does
-        not advance the compute clock, so it can no longer pin an idle
-        sandbox. A reaped session keeps its conversation (session/load) and
+        consumer (dashboard, monitor, idle chat UI) does not advance the
+        compute clock, so it can no longer pin an idle sandbox. A reaped session keeps its conversation (session/load) and
         cold-resumes on the next message; an SSE consumer reconnects.
         """
         # Never hibernate mid-prompt — even a multi-minute, chunk-silent
@@ -373,7 +394,12 @@ class SessionPool:
             # but hasn't had a prompt yet. Seed the idle window from now.
             sess.liveness._last_compute_at = now
             return False, "no_activity_yet"
-        provider = getattr(sess.state, "type", "")
+        # Key the idle window off the COMPUTE backend. For native sessions
+        # ``state.type`` is "native" but the sandbox lives on ``state.provider``
+        # (docker/daytona/modal), so a native-on-modal session inherits modal's
+        # window (modal stop is destructive — needless churn at the docker
+        # default). No-op for CLI sessions where provider isn't set.
+        provider = getattr(sess.state, "provider", None) or getattr(sess.state, "type", "")
         limit = (provider_idle_s or {}).get(provider, idle_s)
         if (now - last) > limit:
             return True, "idle"
@@ -394,11 +420,29 @@ class SessionPool:
             sid for sid, sess in list(self._active.items())
             if self._should_reap(sess, idle_s, now, provider_idle_s)[0]
         ]
+        from api.metrics import get_metrics
         for sid in stale:
+            sess = self._active.get(sid)
+            prov = None
+            if sess is not None:
+                prov = (getattr(getattr(sess, "state", None), "provider", None)
+                        or getattr(getattr(sess, "state", None), "type", None))
+            ok = False
+            t0 = _time.perf_counter()
             try:
                 await self.release(sid)
+                ok = True
             except Exception:
                 log.exception("reap_idle: release(%s) failed", sid)
+                # A reaper release that fails leaves a session that should be
+                # hibernated still holding live compute — a slow leak source.
+                await get_metrics().record_leak("reap_release_failed", provider=prov, session_id=sid)
+            finally:
+                await get_metrics().record_op(
+                    provider=prov, operation="reap",
+                    duration_ms=(_time.perf_counter() - t0) * 1000,
+                    ok=ok, session_id=sid,
+                )
         return len(stale)
 
     async def reap_session(
@@ -502,8 +546,20 @@ async def _safe_destroy_compute(session: BaseSandboxSession) -> None:
     stopped container, modal/unix_local terminate)."""
     try:
         await session.destroy()
-    except Exception:
+    except Exception as e:
+        # The compute was acquired, start() failed, AND the cleanup delete
+        # failed — that sandbox is now leaked against the provider quota.
         log.exception("destroy() failed for failed-start session %s", session.session_id)
+        try:
+            from api.metrics import get_metrics
+            await get_metrics().record_leak(
+                "destroy_failed_on_start",
+                provider=getattr(getattr(session, "state", None), "provider", None)
+                or getattr(getattr(session, "state", None), "type", None),
+                session_id=session.session_id, exc=e,
+            )
+        except Exception:
+            pass
 
 
 # ────────────────────────── credential refresh ──────────────────────────

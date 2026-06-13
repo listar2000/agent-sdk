@@ -60,3 +60,11 @@ the snapshot tags are pinned to a specific commit:
 
 Commit `.runtime-image-tag` / `.runtime-snapshot-tag` /
 `.modal-snapshot-tag` alongside the runtime-affecting source change.
+
+## Imports in tests/scripts
+
+The package is installed EDITABLE into the venv (`pip install -e .` maps
+`src/agent_sdk` + `src/api`), so `import api` / `import agent_sdk` works in
+any venv process from any cwd. Never add `sys.path.insert(0, ".../src")`
+boilerplate to tests, scripts, or benchmarks — the entire tree was swept
+clean of it; keep it that way.

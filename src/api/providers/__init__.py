@@ -11,7 +11,7 @@ providers/__init__.py:
   - Re-exports the ``_shared`` and ``.daytona`` symbols that server.py
     (and tests) import from ``api.providers``.
   - Provides universal dispatch wrappers (destroy_instance, exec_in_instance,
-    create_volume, delete_volume, reconcile_sandboxes, ensure_supervisor_url)
+    create_volume, delete_volume, reconcile_sandboxes)
     that route to the per-provider module of the same name.
 """
 
@@ -27,7 +27,6 @@ load_dotenv()
 # ``._shared`` and are imported by provider modules directly — no need to
 # expose them at the package level too.
 from ._shared import (
-    PORT_BASED_PROVIDERS,
     AUTH_KEYS,
     ProviderInstance,
     ExecResult,
@@ -40,8 +39,6 @@ from ._shared import (
     _acp_launch_args,
     _get_sandbox_env_vars,
     _wait_for_health,
-    allocate_sandbox_port,
-    free_sandbox_port,
     _exec_subprocess,
     _normalize_workspace,
 )
@@ -120,8 +117,6 @@ async def create_volume(provider: str, *args, **kwargs):
 async def delete_volume(provider: str, *args, **kwargs):
     return await _dispatch_mod(provider).delete_volume(*args, **kwargs)
 
-async def ensure_supervisor_url(provider: str, *args, **kwargs):
-    return await _dispatch_mod(provider).ensure_supervisor_url(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -132,40 +127,15 @@ async def ensure_supervisor_url(provider: str, *args, **kwargs):
 
 from ._volume import BaseVolumeAdapter  # noqa: E402
 
-_VOLUME_ADAPTERS: dict[str, type[BaseVolumeAdapter]] = {}
-
-
-def _register_volume_adapters() -> None:
-    """Lazy-load each provider's volume adapter class. Same lazy pattern
-    as ``api.sandbox.factory._register_default_providers`` — first call
-    populates the table; subsequent calls are no-ops."""
-    if _VOLUME_ADAPTERS:
-        return
-    from .daytona.volumes import DaytonaVolumeAdapter
-    from .docker.volumes import DockerVolumeAdapter
-    from .modal.volumes import ModalVolumeAdapter
-    from .unix_local.volumes import UnixLocalVolumeAdapter
-    _VOLUME_ADAPTERS["daytona"] = DaytonaVolumeAdapter
-    _VOLUME_ADAPTERS["docker"] = DockerVolumeAdapter
-    _VOLUME_ADAPTERS["modal"] = ModalVolumeAdapter
-    _VOLUME_ADAPTERS["unix_local"] = UnixLocalVolumeAdapter
-
-
 def get_volume_adapter(provider: str, provider_ref: str) -> BaseVolumeAdapter:
     """Construct a per-volume adapter bound to ``provider_ref``.
 
-    Raises ``ValueError`` for unknown providers (same shape as
-    ``_dispatch_mod``). All four providers have a registered adapter, so
-    this is the single path for per-volume file ops.
+    One registry: each provider module exposes its ``VolumeAdapter`` class
+    attribute, dispatched through the same ``_PROVIDER_MODS`` table as every
+    other provider op (``_dispatch_mod`` raises the uniform ValueError for
+    unknown providers).
     """
-    _register_volume_adapters()
-    cls = _VOLUME_ADAPTERS.get(provider)
-    if cls is None:
-        raise ValueError(
-            f"no volume adapter registered for provider {provider!r}; "
-            f"available: {sorted(_VOLUME_ADAPTERS)}"
-        )
-    return cls(provider_ref)
+    return _dispatch_mod(provider).VolumeAdapter(provider_ref)
 
 
 async def reconcile_sandboxes(provider: str) -> None:

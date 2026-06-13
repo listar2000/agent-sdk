@@ -31,7 +31,6 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from api.providers import unix_local as lp
 from api.providers._shared import ProviderInstance

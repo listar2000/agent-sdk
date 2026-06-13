@@ -700,81 +700,27 @@ function pickAllowOptionId(params) {
   return options[0]?.optionId || "allow_always";
 }
 
-// Active terminals from terminal/create. ACP runtimes (opencode in particular)
-// delegate shell execution to the client, so we spawn here and stash output
-// for terminal/output to drain. Lifetime: from terminal/create to whichever
-// of terminal/release or terminal/kill the agent calls last.
-const terminals = new Map();
-let _termSeq = 0;
-
-function _terminalCreate(params) {
-  const command = params.command;
-  if (!command || typeof command !== "string") {
-    throw new Error("terminal/create: command is required");
-  }
-  const cmdArgs = Array.isArray(params.args) ? params.args : [];
-  const cwd = params.cwd || undefined;
-  const envObj = { ...process.env };
-  if (Array.isArray(params.env)) {
-    for (const e of params.env) {
-      if (e && typeof e.name === "string") envObj[e.name] = String(e.value ?? "");
-    }
-  }
-  const limit = Number.isFinite(params.outputByteLimit)
-    ? Math.max(1024, Math.min(params.outputByteLimit, 32 * 1024 * 1024))
-    : 1024 * 1024;
-  const id = `term-${++_termSeq}-${Math.random().toString(36).slice(2, 8)}`;
-  const proc = spawn(command, cmdArgs, {
-    cwd,
-    env: envObj,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let output = "";
-  let truncated = false;
-  const collect = (chunk) => {
-    if (truncated) return;
-    const s = chunk.toString("utf8");
-    if (output.length + s.length > limit) {
-      output += s.slice(0, limit - output.length);
-      truncated = true;
-    } else {
-      output += s;
-    }
-  };
-  proc.stdout.on("data", collect);
-  proc.stderr.on("data", collect);
-  const term = {
-    proc,
-    get output() { return output; },
-    get truncated() { return truncated; },
-    exitStatus: null,
-    waiters: [],
-  };
-  proc.on("exit", (code, signal) => {
-    term.exitStatus = { exitCode: code, signal: signal || null };
-    for (const w of term.waiters) w(term.exitStatus);
-    term.waiters.length = 0;
-  });
-  proc.on("error", (e) => {
-    term.exitStatus = { exitCode: null, signal: null, error: e.message };
-    for (const w of term.waiters) w(term.exitStatus);
-    term.waiters.length = 0;
-  });
-  terminals.set(id, term);
-  return id;
-}
-
-function _terminalGet(terminalId) {
-  const term = terminals.get(terminalId);
-  if (!term) throw new Error(`unknown terminalId: ${terminalId}`);
-  return term;
-}
-
 // ACP client-side method handlers. Each takes the request params and returns
-// the JSON-RPC ``result`` value (or throws to surface an error frame). The
-// supervisor IS the agent's runtime environment (sandboxed container or local
-// subprocess), so fs/terminal calls execute directly against node fs and
-// child_process — no roundtrip to the Python server.
+// the JSON-RPC ``result`` value (or throws to surface an error frame).
+//
+// Only ONE client-side method is actually called by the runtimes we ship
+// (verified empirically 2026-06 on the pinned opencode 1.14.30 and
+// claude-agent-acp 0.27.0: both execute every tool locally in their own
+// process, so fs/shell effects land in-sandbox by co-location — NOT via ACP
+// client requests, regardless of advertised client capabilities):
+//
+//   session/request_permission — load-bearing. opencode routes tool
+//   APPROVAL through the client: any tool under permission "ask" config,
+//   plus external_directory whenever a tool touches paths outside the
+//   session cwd (fires even on default-allow config). An unanswered
+//   request hangs the turn forever, so this auto-allow is what keeps
+//   turns completing.
+//
+// fs/* and terminal/* handlers were removed after verification that no
+// shipped runtime calls them. dispatchClientRequest answers unknown methods
+// with -32601, the correct graceful reply if a future runtime version
+// starts delegating (its tool falls back locally or surfaces an error
+// instead of hanging the turn).
 const CLIENT_HANDLERS = {
   async "session/request_permission"(params) {
     // Sandbox trust model: agent runs in an isolated container/VM, so the
@@ -784,69 +730,6 @@ const CLIENT_HANDLERS = {
     // off its permission flow before the first tool call.
     const optionId = pickAllowOptionId(params);
     return { outcome: { outcome: "selected", optionId } };
-  },
-  async "fs/read_text_file"(params) {
-    const filePath = params.path;
-    if (typeof filePath !== "string") throw new Error("fs/read_text_file: path required");
-    let content = fs.readFileSync(filePath, "utf8");
-    // ACP optional line/limit windowing — applied AFTER read to keep the
-    // implementation compact (1-based line numbering per spec).
-    if (Number.isFinite(params.line) || Number.isFinite(params.limit)) {
-      const lines = content.split("\n");
-      const start = Number.isFinite(params.line) ? Math.max(0, params.line - 1) : 0;
-      const end = Number.isFinite(params.limit) ? start + params.limit : lines.length;
-      content = lines.slice(start, end).join("\n");
-    }
-    return { content };
-  },
-  async "fs/write_text_file"(params) {
-    const filePath = params.path;
-    const content = params.content;
-    if (typeof filePath !== "string") throw new Error("fs/write_text_file: path required");
-    if (typeof content !== "string") throw new Error("fs/write_text_file: content required");
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, content, "utf8");
-    return null;
-  },
-  async "terminal/create"(params) {
-    const terminalId = _terminalCreate(params);
-    return { terminalId };
-  },
-  async "terminal/output"(params) {
-    const term = _terminalGet(params.terminalId);
-    return {
-      output: term.output,
-      truncated: term.truncated,
-      exitStatus: term.exitStatus,
-    };
-  },
-  async "terminal/wait_for_exit"(params) {
-    const term = _terminalGet(params.terminalId);
-    if (term.exitStatus) {
-      return {
-        exitCode: term.exitStatus.exitCode,
-        signal: term.exitStatus.signal,
-      };
-    }
-    return new Promise((resolve) => {
-      term.waiters.push((status) => resolve({
-        exitCode: status.exitCode,
-        signal: status.signal,
-      }));
-    });
-  },
-  async "terminal/kill"(params) {
-    const term = _terminalGet(params.terminalId);
-    try { term.proc.kill("SIGKILL"); } catch {}
-    return null;
-  },
-  async "terminal/release"(params) {
-    const term = terminals.get(params.terminalId);
-    if (term) {
-      try { term.proc.kill("SIGKILL"); } catch {}
-      terminals.delete(params.terminalId);
-    }
-    return null;
   },
 };
 

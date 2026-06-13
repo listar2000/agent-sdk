@@ -18,7 +18,6 @@ install.
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import os
 import shlex
@@ -28,17 +27,15 @@ from typing import Any
 from .._shared import (
     ExecResult,
     ProviderInstance,
-    VolumeFileExistsError,
     _acp_launch_args,
     _build_env_prefix,
     _exec_subprocess,
     _find_free_port,
     _read_runtime_image_tag,
-    _safe_path,
     _wait_for_health,
     build_supervisor_argv,
-    normalize_find_output,
 )
+from .._volume import ShellVolumeAdapter
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +147,11 @@ async def _ensure_subpath_dir(volume_ref: str, subpath: str) -> None:
 
 _LABEL_KEY = "agent-sdk.sandbox-id"
 _ORIGIN_LABEL_KEY = "agent_sdk_origin"
+# Native runtime containers carry this label (session_id) instead of
+# _LABEL_KEY — they're bare `sleep infinity` containers whose sandbox_ref is
+# the container id (assigned post-create), so reconcile enumerates them by
+# this label and matches their container_id against live_sandbox_refs.
+_NATIVE_LABEL_KEY = "native_session"
 
 
 def _agent_sdk_origin() -> str:
@@ -204,7 +206,7 @@ async def create_sandbox(
     """Create a Docker container with three volume-subpath mounts + supervisor.
 
     Returns a ``ProviderInstance`` with ``container_id`` set; supervisor is
-    already started (``ensure_supervisor_url`` will be a no-op).
+    already started (no separate supervisor-start phase is needed).
 
     If `sandbox_ref` is provided it is attached as the
     ``agent-sdk.sandbox-id`` label so ``reconcile_on_startup`` can
@@ -442,19 +444,6 @@ async def destroy_sandbox(inst: ProviderInstance) -> None:
         log.info("docker sandbox destroyed: %s (port %d freed)", cid[:12], port)
 
 
-async def ensure_supervisor_url(
-    inst: ProviderInstance,
-    *, agent_type: str = "opencode", root: str = "/tmp",
-    spawn_env: dict | None = None, port: int | None = None,
-) -> str:
-    """Docker supervisor is started at create_sandbox time — URL is stable.
-
-    Signature matches Daytona's ``ensure_supervisor_url`` exactly so
-    mis-spelled kwargs surface as TypeError instead of being silently
-    swallowed by a ``**_kw`` catch-all."""
-    return inst.url
-
-
 # ---------------------------------------------------------------------------
 # Startup reconciliation — cross-reference live containers w/ DB sandbox rows
 # ---------------------------------------------------------------------------
@@ -483,28 +472,38 @@ async def reconcile_on_startup() -> None:
         log.warning("docker reconcile: cannot import api.db: %s", e)
         return
 
-    try:
-        out = await _run_docker_checked(
-            "ps", "-a",
-            "--filter", f"label={_LABEL_KEY}",
-            "--format", "{{.ID}} {{.State}} {{.Label \"" + _LABEL_KEY + "\"}}",
-            timeout=30,
-        )
-    except Exception as e:
-        log.warning("docker reconcile: ps failed: %s", e)
-        return
+    # Enumerate BOTH supervisor containers (labeled agent-sdk.sandbox-id) AND
+    # native-runtime containers (labeled native_session). Native bare
+    # containers never carry the sandbox-id label, so the supervisor filter
+    # alone left crash-orphaned native containers un-reclaimable at boot (they
+    # leaked across restarts until manual cleanup_orphans). Each filter uses
+    # its own label in the format so the third field is always present.
+    lines: list[str] = []
+    for label_key in (_LABEL_KEY, _NATIVE_LABEL_KEY):
+        try:
+            out = await _run_docker_checked(
+                "ps", "-a", "--no-trunc",
+                "--filter", f"label={label_key}",
+                "--format", "{{.ID}} {{.State}} {{.Label \"" + label_key + "\"}}",
+                timeout=30,
+            )
+        except Exception as e:
+            log.warning("docker reconcile: ps (label=%s) failed: %s", label_key, e)
+            continue
+        lines += out.decode(errors="replace").splitlines()
 
-    # Reconcile only does orphan cleanup now: any container whose labeled
-    # sandbox-id (= the docker container id) doesn't appear in any live
-    # session's ``sandbox_state.sandbox_ref`` gets force-removed. The
-    # SessionPool's sandbox_state JSONB on ``sessions`` is the single
-    # source of truth for "what sandboxes belong to live sessions."
+    # Reconcile only does orphan cleanup now: any container whose
+    # container_id (= sandbox_ref for native; also the post-d5 supervisor ref)
+    # doesn't appear in any live session's ``sandbox_state.sandbox_ref`` gets
+    # force-removed. The SessionPool's sandbox_state JSONB on ``sessions`` is
+    # the single source of truth for "what sandboxes belong to live sessions."
     try:
         live_refs = await dbmod.live_sandbox_refs()
     except Exception as e:
         log.warning("docker reconcile: live-session query failed: %s", e)
         return
-    for line in out.decode(errors="replace").splitlines():
+    seen: set[str] = set()
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -512,6 +511,9 @@ async def reconcile_on_startup() -> None:
         if len(parts) < 3:
             continue
         container_id, state, sandbox_ref_label = parts[0], parts[1].lower(), parts[2]
+        if container_id in seen:
+            continue
+        seen.add(container_id)
         # "stopped" containers are NOT orphans if a live session still
         # references them — they're resumable. The label may be the
         # legacy sb_<hex> PK (pre-d5) or the container_id (post-d5);
@@ -537,16 +539,6 @@ async def reconcile_on_startup() -> None:
 # Volume file-ops (per-call utility container)
 # ---------------------------------------------------------------------------
 
-def _safe_rel(path: str) -> str:
-    """Normalize + validate a path relative to the volume root.
-
-    Thin wrapper over :func:`api.providers._shared._safe_path` — no realpath
-    check here because the shell runs inside an alpine container that only
-    sees ``/v`` of the volume; traversal / control-char rejection is enough.
-    """
-    return _safe_path(None, path)
-
-
 async def _run_volume_shell(
     ref: str, shell: str, *, timeout: int = 60,
 ) -> tuple[int, bytes, bytes]:
@@ -560,185 +552,14 @@ async def _run_volume_shell(
     )
 
 
-async def volume_tree(ref: str, path: str) -> str:
-    """Tree listing of ``<volume>/<path>`` in the unified format.
+class DockerVolumeAdapter(ShellVolumeAdapter):
+    """Volume ops over a one-shot alpine util container (volume at /v)."""
+    provider = "docker"
 
-    Output: one entry per line, paths relative to the volume root, directories
-    end with ``/``, files do not, sorted. See ``_shared.normalize_find_output``.
-    """
-    rel = _safe_rel(path)
-    target = f"/v/{rel}" if rel else "/v"
-    # busybox find (alpine) lacks -printf, so emit "<type> <relpath>" via
-    # three -type passes. Output stays sorted/normalized in
-    # ``normalize_find_output``. cd into target so paths are emitted relative.
-    qt = shlex.quote(target)
-    shell = (
-        f"cd {qt} 2>/dev/null && ("
-        "find . -mindepth 1 -type l -exec sh -c 'printf \"l %s\\n\" \"${0#./}\"' {} \\; ; "
-        "find . -mindepth 1 -type d -exec sh -c 'printf \"d %s\\n\" \"${0#./}\"' {} \\; ; "
-        "find . -mindepth 1 -type f -exec sh -c 'printf \"f %s\\n\" \"${0#./}\"' {} \\;"
-        ") 2>/dev/null"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        raise RuntimeError(
-            f"volume_tree failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-    normalized = normalize_find_output(out.decode(errors="replace"))
-    if not rel or not normalized:
-        return normalized
-    # Re-anchor to volume root when a subpath was queried
-    lines = [f"{rel.rstrip('/')}/{ln}" for ln in normalized.splitlines()]
-    return "\n".join(sorted(lines))
+    async def _run_shell(self, shell: str, *, timeout: int) -> tuple[int, bytes, bytes]:
+        return await _run_volume_shell(self.provider_ref, shell, timeout=timeout)
 
 
-async def volume_read(ref: str, path: str) -> bytes:
-    """Return the bytes of ``<volume>/<path>``. Base64 over the wire to preserve binary data."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_read: path required")
-    target = f"/v/{rel}"
-    # cat to base64 to survive binary payloads; emit a sentinel on missing.
-    shell = (
-        f"if [ ! -f {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"base64 -w0 {shlex.quote(target)} 2>/dev/null || base64 {shlex.quote(target)}"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        msg = (err or b"").decode(errors="replace").strip()
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(f"volume_read failed (rc={rc}): {msg[:400]}")
-    try:
-        return base64.b64decode(out.strip())
-    except Exception as exc:
-        raise RuntimeError(f"volume_read: malformed base64 output: {exc}") from exc
-
-
-async def volume_download(ref: str, path: str) -> bytes:
-    """Read raw bytes from ``<volume>/<path>`` for the download endpoint."""
-    return await volume_read(ref, path)
-
-
-async def volume_exists(ref: str, path: str) -> bool:
-    """Return whether ``<volume>/<path>`` exists."""
-    rel = _safe_rel(path)
-    target = f"/v/{rel}" if rel else "/v"
-    rc, _out, err = await _run_volume_shell(
-        ref, f"test -e {shlex.quote(target)}", timeout=60,
-    )
-    if rc == 0:
-        return True
-    if rc == 1:
-        return False
-    raise RuntimeError(
-        f"volume_exists failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-    )
-
-
-async def volume_write(ref: str, path: str, content: bytes) -> None:
-    """Write ``content`` to ``<volume>/<path>`` (atomic mkdir -p + tee base64 -d)."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_write: path required")
-    target = f"/v/{rel}"
-    parent = "/v/" + "/".join(rel.split("/")[:-1])
-    b64 = base64.b64encode(content).decode()
-    # `printf %s` avoids newline; feed base64 -d via pipe into the target file.
-    shell = (
-        f"mkdir -p {shlex.quote(parent)} && "
-        f"printf %s {shlex.quote(b64)} | base64 -d > {shlex.quote(target)}"
-    )
-    rc, _out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        raise RuntimeError(
-            f"volume_write failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_upload(ref: str, path: str, content: bytes) -> None:
-    """Upload bytes to ``<volume>/<path>``."""
-    await volume_write(ref, path, content)
-
-
-async def volume_mkdir(ref: str, path: str) -> None:
-    """Create a directory at ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_mkdir: path required")
-    target = f"/v/{rel}"
-    rc, _out, err = await _run_volume_shell(
-        ref, f"mkdir -p {shlex.quote(target)}", timeout=60,
-    )
-    if rc != 0:
-        raise RuntimeError(
-            f"volume_mkdir failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_delete(ref: str, path: str) -> None:
-    """Delete a file or directory at ``<volume>/<path>``."""
-    rel = _safe_rel(path)
-    if not rel:
-        raise ValueError("volume_delete: path required")
-    target = f"/v/{rel}"
-    shell = (
-        f"if [ ! -e {shlex.quote(target)} ]; then echo __MISSING__; exit 2; fi; "
-        f"rm -rf -- {shlex.quote(target)}"
-    )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        raise RuntimeError(
-            f"volume_delete failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
-
-
-async def volume_rename(ref: str, path: str, new_path: str, *, overwrite: bool = True) -> None:
-    """Rename or move ``<volume>/<path>`` to ``<volume>/<new_path>``."""
-    src_rel = _safe_rel(path)
-    dst_rel = _safe_rel(new_path)
-    if not src_rel or not dst_rel:
-        raise ValueError("volume_rename: path and new_path required")
-    src = f"/v/{src_rel}"
-    dst = f"/v/{dst_rel}"
-    dst_parent = "/v/" + "/".join(dst_rel.split("/")[:-1])
-    settle_check = (
-        f"for _i in 1 2 3 4 5 6 7 8 9 10; do "
-        f"if [ -e {shlex.quote(dst)} ] && [ ! -e {shlex.quote(src)} ]; then exit 0; fi; "
-        f"sleep 0.1; "
-        f"done; "
-        f"echo __RENAME_NOT_VISIBLE__; exit 98"
-    )
-    if overwrite:
-        shell = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} && "
-            f"mv -- {shlex.quote(src)} {shlex.quote(dst)} && "
-            f"{settle_check}"
-        )
-    else:
-        shell = (
-            f"if [ ! -e {shlex.quote(src)} ]; then echo __MISSING__; exit 2; fi; "
-            f"mkdir -p {shlex.quote(dst_parent)} || exit $?; "
-            f"if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; fi; "
-            f"if [ -d {shlex.quote(src)} ]; then echo __UNSUPPORTED_DIR__; exit 95; fi; "
-            f"ln {shlex.quote(src)} {shlex.quote(dst)} || "
-            f"{{ if [ -e {shlex.quote(dst)} ]; then echo __EXISTS__; exit 17; else exit 1; fi; }}; "
-            f"rm -- {shlex.quote(src)} || {{ echo __UNLINK_FAILED__; exit 96; }}; "
-            f"{settle_check}"
-        )
-    rc, out, err = await _run_volume_shell(ref, shell, timeout=60)
-    if rc != 0:
-        if b"__MISSING__" in out:
-            raise FileNotFoundError(f"{path} not found on volume {ref}")
-        if b"__EXISTS__" in out:
-            raise VolumeFileExistsError(new_path)
-        if b"__UNSUPPORTED_DIR__" in out:
-            raise NotImplementedError("atomic no-overwrite directory rename is not supported")
-        if b"__RENAME_NOT_VISIBLE__" in out:
-            raise RuntimeError("volume_rename postcondition failed: destination not visible")
-        raise RuntimeError(
-            f"volume_rename failed (rc={rc}): {err.decode(errors='replace').strip()[:400]}"
-        )
+#: uniform per-provider adapter handle — ``get_volume_adapter`` dispatches
+#: via ``_dispatch_mod(provider).VolumeAdapter`` (one registry for everything).
+VolumeAdapter = DockerVolumeAdapter

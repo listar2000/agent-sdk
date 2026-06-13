@@ -25,10 +25,6 @@ import pytest_asyncio
 from fastapi import Response
 from httpx import ASGITransport, AsyncClient
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
 from api import server as srv  # noqa: E402
 
 
