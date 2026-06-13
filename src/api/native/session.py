@@ -202,7 +202,11 @@ class NativeSession(BaseSandboxSession):
             block = self._frames.block_for_event(event, rpc_id)
             self._broadcast((rpc_id, block))
             self.liveness.observe_chunk()
-            await queue.put(event)
+            # Unbounded SPSC queue: put_nowait never raises QueueFull, and on an
+            # unbounded queue ``await queue.put`` never suspends anyway — so the
+            # nowait form is behavior-identical and skips the put() coroutine
+            # frame, one of the hottest per-event costs on the streaming path.
+            queue.put_nowait(event)
 
         async def _drive() -> None:
             try:
@@ -233,13 +237,20 @@ class NativeSession(BaseSandboxSession):
                 await emit({"type": "error", "text": str(e)[:500],
                             "kind": type(e).__name__})
             finally:
-                await queue.put(_SENTINEL)
+                queue.put_nowait(_SENTINEL)
 
         task = asyncio.create_task(_drive())
         self._active_task = task
         try:
             while True:
-                item = await queue.get()
+                # Drain ready events with get_nowait (no get() coroutine frame);
+                # only await when the queue is genuinely empty. Same pattern as
+                # iterate_subscriber. The queue + _drive task structure is
+                # unchanged, so cancel_active_prompt/interrupt semantics hold.
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    item = await queue.get()
                 if item is _SENTINEL:
                     break
                 yield item
