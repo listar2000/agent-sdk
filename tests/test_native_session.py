@@ -477,3 +477,108 @@ async def test_docker_plumbing_is_env_immune(monkeypatch):
     await t.exec("mytool --version")
     assert "export PATH=/custom/bin && mytool --version" in seen[1][-1]
     assert "-e" not in seen[1]            # never OCI-level env injection
+
+
+# ── durable-wedge stress: repeated interrupt-mid-tool must never wedge ────────
+def _first_dangling(messages):
+    """Return the tool_call ids an assistant message left unanswered (the shape
+    that 400s every future provider call = a durably wedged session), or None."""
+    answered = {m.get("tool_call_id") for m in messages
+                if m.get("role") == "tool"}
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {tc["id"] for tc in m["tool_calls"]}
+            missing = ids - answered
+            if missing:
+                return missing
+    return None
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_mid_tool_never_wedges_concurrent():
+    """Stress the durable-wedge guarantee: many sessions, each cycling
+    interrupt-while-a-tool-executes -> recovery prompt, many times over. Every
+    recovery must complete cleanly (the session is never wedged), no checkpoint
+    may ever carry a dangling tool_calls, and no _active_task may leak. The
+    single-shot heal is covered elsewhere; this drives the heal -> checkpoint ->
+    next-prompt cycle REPEATEDLY and CONCURRENTLY to catch accumulation/state
+    races a one-shot test can't."""
+    K, M = 6, 8   # cycles per session, concurrent sessions
+
+    async def run_session(sid):
+        s = NativeSession(session_id=sid,
+                          state=NativeSandboxState(provider="docker"))
+        s._started = True
+        s._spec = NativeAgentSpec(instructions="sys", max_turns=5)
+        s._tools = build_toolset(["bash"])
+        s._messages = [{"role": "system", "content": "sys"}]
+        s._broadcast = lambda item: None
+
+        async def _noop(usage):
+            return None
+        s._checkpoint = _noop  # type: ignore[method-assign]
+
+        state = {"mode": "cancel", "cycle": 0, "started": asyncio.Event()}
+
+        async def completion(**kwargs):
+            if state["mode"] == "cancel":
+                cid = f"c{state['cycle']}"
+
+                async def _it():
+                    yield _Chunk(_Delta(tool_calls=[_TCDelta(
+                        0, id=cid, name="bash",
+                        arguments='{"command":"sleep 60"}')]))
+                return _it()
+
+            async def _ok():
+                yield _Chunk(_Delta(content="recovered"))
+            return _ok()
+        s._completion = completion
+
+        class _BlockingTransport:
+            async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+                state["started"].set()
+                await asyncio.sleep(3600)   # parked until the turn is cancelled
+
+            async def read_file(self, p, *, max_bytes=8 * 1024 * 1024):
+                raise FileNotFoundError(p)
+
+            async def write_file(self, p, d):
+                pass
+
+            async def destroy(self):
+                pass
+        s._transport = _BlockingTransport()
+
+        for k in range(K):
+            # 1) interrupt while the tool is executing
+            state["mode"], state["cycle"] = "cancel", k
+            state["started"] = asyncio.Event()
+            seen = []
+
+            async def _consume(rpc):
+                async for ev in s.execute_prompt("go", rpc_id=rpc):
+                    seen.append(ev)
+
+            consumer = asyncio.create_task(_consume(f"{sid}-c{k}"))
+            await asyncio.wait_for(state["started"].wait(), timeout=5)
+            await s.cancel_active_prompt()
+            await asyncio.wait_for(consumer, timeout=5)
+            assert seen[-1] == {"type": "done", "stop_reason": "cancelled"}, \
+                (sid, k, seen[-1:])
+            assert s._active_task is None, (sid, k, "leaked active task")
+            assert _first_dangling(s._messages) is None, \
+                (sid, k, "dangling after cancel -> would wedge")
+
+            # 2) recovery prompt MUST succeed (not wedged)
+            state["mode"] = "recover"
+            seen2 = [ev async for ev
+                     in s.execute_prompt("ok?", rpc_id=f"{sid}-r{k}")]
+            assert seen2[-1] == {"type": "done", "stop_reason": "end_turn"}, \
+                (sid, k, seen2[-1:])
+            assert _first_dangling(s._messages) is None, (sid, k, "dangling")
+        return s.session_id
+
+    done = await asyncio.gather(*(run_session(f"sess-wedge-{i}")
+                                  for i in range(M)))
+    assert len(done) == M
