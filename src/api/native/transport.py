@@ -121,6 +121,24 @@ async def _b64decode(text) -> bytes:
     return await asyncio.to_thread(base64.b64decode, text)
 
 
+def _enforce_read_limit(data: bytes, path: str, max_bytes: int) -> bytes:
+    """``read_file``'s size guard — shared by every transport so the contract is
+    uniform (daytona/modal previously accepted ``max_bytes`` but never enforced
+    it, silently returning an oversized file that then bloated the conversation
+    + every checkpoint and could overflow the model context).
+
+    NOTE: the whole file is already decoded into ``data`` by the time we get
+    here, so this bounds the RETURNED bytes (what enters ``messages`` and the
+    checkpoint), NOT peak transfer memory. Bounding at the source — reading only
+    ``max_bytes+1`` from the sandbox — needs a pipefail-portable exec across
+    docker/daytona/modal/busybox plus real-sandbox validation (a pipe masks the
+    upstream missing-file exit code); deferred as a follow-up."""
+    if len(data) > max_bytes:
+        raise ValueError(f"read_file({path}): {len(data)}B exceeds "
+                         f"max_bytes={max_bytes}")
+    return data
+
+
 class DockerTransport:
     """One docker container per session, ``sleep infinity`` as PID-1."""
 
@@ -400,11 +418,7 @@ class DockerTransport:
             raise FileNotFoundError(
                 f"read_file({path}) failed (rc={res.exit_code}): "
                 f"{res.stderr[:300]}")
-        data = await _b64decode(res.stdout)
-        if len(data) > max_bytes:
-            raise ValueError(f"read_file({path}): {len(data)}B exceeds "
-                             f"max_bytes={max_bytes}")
-        return data
+        return _enforce_read_limit(await _b64decode(res.stdout), path, max_bytes)
 
     # ── internal ───────────────────────────────────────────────────────────
 
@@ -604,7 +618,7 @@ class DaytonaTransport:
         res = await self.exec(f"base64 < {q}", cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise FileNotFoundError(f"daytona read_file({path}): {res.stderr[:300]}")
-        return await _b64decode(res.stdout)
+        return _enforce_read_limit(await _b64decode(res.stdout), path, max_bytes)
 
 
 # ===========================================================================
@@ -737,7 +751,7 @@ class ModalTransport:
         res = await self.exec(f"base64 < {q}", cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise FileNotFoundError(f"modal read_file({path}): {res.stderr[:300]}")
-        return await _b64decode(res.stdout)
+        return _enforce_read_limit(await _b64decode(res.stdout), path, max_bytes)
 
 
 # ===========================================================================
@@ -905,7 +919,4 @@ class UnixLocalTransport:
         from pathlib import Path as _Path
         p = _Path(self._resolve(path))
         data = await asyncio.to_thread(p.read_bytes)   # FileNotFoundError as-is
-        if len(data) > max_bytes:
-            raise ValueError(f"read_file({path}): {len(data)}B exceeds "
-                             f"max_bytes={max_bytes}")
-        return data
+        return _enforce_read_limit(data, path, max_bytes)

@@ -61,3 +61,40 @@ async def test_codec_offloads_to_thread_only_when_large(monkeypatch):
     assert await tr._b64encode(big) == base64.b64encode(big)
     assert await tr._b64decode(base64.b64encode(big)) == big
     assert offloaded == ["b64encode", "b64decode"], offloaded
+
+
+def test_enforce_read_limit_guard():
+    """The shared read_file size guard: returns within-limit data unchanged,
+    raises ValueError past the limit (the value an oversized read would
+    otherwise store in the conversation + checkpoint)."""
+    data = b"z" * 100
+    assert tr._enforce_read_limit(data, "/p", 100) is data        # exactly at limit
+    assert tr._enforce_read_limit(data, "/p", 200) is data        # under
+    with pytest.raises(ValueError, match="101B exceeds max_bytes=100"):
+        tr._enforce_read_limit(b"z" * 101, "/p", 100)
+
+
+@pytest.mark.parametrize("make", [
+    lambda: tr.DockerTransport(container_id="fake"),
+    lambda: tr.DaytonaTransport(),
+    lambda: tr.ModalTransport(),
+], ids=["docker", "daytona", "modal"])
+@pytest.mark.asyncio
+async def test_read_file_enforces_max_bytes_on_every_transport(make):
+    """Every base64-exec transport must honor read_file's max_bytes. Daytona and
+    modal previously accepted the param but never checked it — silently returning
+    an oversized file that then bloated ``messages`` + every checkpoint and could
+    overflow the model context. Stub exec to deliver an over-limit payload and
+    assert the guard fires uniformly; an in-limit read still returns the bytes."""
+    t = make()
+    payload = b"y" * 5000
+    enc = base64.b64encode(payload).decode()
+
+    async def fake_exec(command, **kwargs):
+        return tr.TransportExecResult(stdout=enc, stderr="",
+                                      exit_code=0, timed_out=False)
+    t.exec = fake_exec  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="exceeds max_bytes"):
+        await t.read_file("/big", max_bytes=1000)
+    assert await t.read_file("/ok", max_bytes=8000) == payload
