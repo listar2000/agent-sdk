@@ -147,7 +147,7 @@ green and non-flaky under `-n auto`.
   re-serializes the *full* transcript to JSONB every turn (O(n²) over a session).
   The `_checkpoint_serialization` bench view quantifies it: at ~4800 messages the
   per-turn serialize was **~1.86 ms (GIL-holding, on the loop thread) + ~0.95 MB
-  to Postgres**, ~16× the flat ~118 µs loop cost and still climbing. The CPU half
+  to Postgres**, ~7× the flat ~250 µs loop cost and still climbing. The CPU half
   is now mitigated (the orjson row above cuts the serialize ~4.4× to ~0.5 ms), so
   the remaining lever is specifically the **O(n²) WAL + network write volume** —
   still the dominant deep-session cost since it grows with the session while the

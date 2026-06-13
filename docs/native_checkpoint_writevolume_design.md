@@ -36,12 +36,16 @@ contents):
 | 4807 | 1857 | 946 | 0.39 |
 
 `µs/msg` is flat → strictly O(n) per turn (O(n²) cumulative). The takeaway that
-reframes the whole loop: the **loop** per-turn cost is ~118 µs and FLAT
-(`_session_growth`), so by ~4800 messages the checkpoint serialize (~1.86 ms) is
-**~16× the entire loop** and still climbing — it is the dominant per-turn cost
-for deep sessions, and it's GIL-holding on the event-loop thread (psycopg
-serializes the param inline), so it stalls every other session on the replica
-for that window. Plus ~0.95 MB/turn of WAL+network at that depth.
+reframes the whole loop: the **loop** per-turn cost is ~250 µs and FLAT
+(`_session_growth`, dict-dump frames), so by ~4800 messages the checkpoint
+serialize (~1.86 ms stdlib) is **~7× the entire loop** and still climbing — it is
+the dominant per-turn cost for deep sessions, and it's GIL-holding on the
+event-loop thread (psycopg serializes the param inline), so it stalls every other
+session on the replica for that window. Plus ~0.95 MB/turn of WAL+network at that
+depth. (Pre-frames-removal the loop was ~118 µs and the ratio ~16×; removing the
+synthetic frame fast path made the loop itself dearer, so the checkpoint is a
+*smaller* multiple of it now — but it still grows O(n²) while the loop stays
+flat, so it remains the dominant deep-session cost.)
 
 **Update — the CPU half is now mitigated (orjson).** `write_native_checkpoint`
 now serializes via `db._fast_dumps` (orjson, stdlib fallback), ~1.8× faster on
