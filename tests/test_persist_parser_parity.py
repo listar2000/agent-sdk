@@ -447,3 +447,76 @@ async def test_persist_flushes_before_tool(monkeypatch):
         "assistant_message", "tool_call", "tool_result",
         "usage", "assistant_message", "turn_end",
     ], f"tool calls flush text; usage does not; got {types}"
+
+
+# ---------------------------------------------------------------------------
+# SEVERE: a stream that ends WITHOUT a terminal must NOT be reported as a
+# successful turn. A supervisor that dies mid-prompt and lets the SSE EOF
+# cleanly (no exception, no 'done') — exactly what a killed daytona supervisor
+# does after its proxy holds the dead connection ~180s — left _drive_one
+# returning (True, None), so the turn logged "turn done" but persisted NO
+# turn_end/error. The client polling /log (or /events) for the rpc's terminal
+# then waits forever: a SILENTLY DROPPED prompt (golden:
+# test_midprompt_recovery_does_not_leak_subscriber[*-daytona], "prompt dropped").
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_terminalless_stream_end_still_delivers_a_terminal(monkeypatch):
+    """A stream that ends without a done/error MUST still persist a terminal
+    (turn_end or error). Pre-fix: only user_message + text were written, no
+    terminal — the prompt is dropped from every client's view."""
+    rows = _capture_log_writes(monkeypatch)
+
+    # No replacement available (recovery can't find a live session) -> the run
+    # must at least write an ERROR terminal rather than claim success.
+    sess = _FakeSession([
+        {"type": "text", "text": "partial reply, then the supervisor died"},
+    ])  # NOTE: no 'done'/'error' — clean EOF mid-prompt
+
+    class _NoReplacementPool:
+        # error-broadcast path reads ``_active`` to reach live subscribers.
+        _active = {sess.session_id: sess}
+
+        async def get_session(self, _sid):
+            raise RuntimeError("no live session")
+    import api.sandbox as _sb
+    monkeypatch.setattr(_sb, "get_pool", lambda: _NoReplacementPool())
+
+    await _persist_prompt_events(sess, "do a thing", "rpc-dropped")
+
+    etypes = [et for et, _ in rows]
+    assert any(et in ("turn_end", "error") for et in etypes), (
+        "no terminal persisted for a stream that ended without a 'done' event "
+        f"— the prompt is silently dropped. persisted: {etypes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminalless_stream_end_recovers_and_delivers_turn_end(monkeypatch):
+    """When the pool HAS cold-recovered a replacement, a terminal-less stream
+    end must RETRY on it and deliver the real turn_end (the recovered reply) —
+    not falsely report the dead turn as done."""
+    rows = _capture_log_writes(monkeypatch)
+
+    sess = _FakeSession([
+        {"type": "text", "text": "partial before death"},
+    ])  # no terminal
+    replacement = _FakeSession([
+        {"type": "text", "text": "recovered reply"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    replacement.session_id = sess.session_id  # same session, fresh sandbox
+
+    class _RecoveredPool:
+        async def get_session(self, _sid):
+            return replacement
+    import api.sandbox as _sb
+    monkeypatch.setattr(_sb, "get_pool", lambda: _RecoveredPool())
+
+    await _persist_prompt_events(sess, "do a thing", "rpc-recover")
+
+    etypes = [et for et, _ in rows]
+    assert "turn_end" in etypes, (
+        "recovery did not deliver a turn_end after a terminal-less stream end "
+        f"— the recovered reply is dropped. persisted: {etypes}"
+    )
