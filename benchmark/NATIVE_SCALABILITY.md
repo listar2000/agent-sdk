@@ -106,6 +106,9 @@ code (the loop's discipline); the full native suite stays green.
   ceiling). The bounded fix is an append-only-delta + periodic-snapshot storage
   redesign — a schema migration on a durability-critical table with
   retry-idempotency and crash-atomicity implications. Out of scope for an
-  automated change; needs human review.
+  automated change; needs human review. **A worked design proposal (schema,
+  resume reconstruction, the subtle delta↔heal interaction, and a data-driven
+  "implement only if…" recommendation) is at
+  [`docs/native_checkpoint_writevolume_design.md`](../docs/native_checkpoint_writevolume_design.md).**
 * **Context compaction** — the only lever left for per-session RAM and unbounded
   context growth, but it changes what the model sees (a product decision).
