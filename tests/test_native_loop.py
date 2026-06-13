@@ -370,16 +370,20 @@ def test_litellm_completion_sets_native_config():
 
 
 def test_native_spec_clamps_misconfigured_loop_knobs():
-    """A misconfigured native agent gets sane floors: a max_turns <= 0 would make
-    range(max_turns) empty → a silent no-op turn (no model call), and a negative
-    num_retries would be handed straight to LiteLLM."""
+    """A misconfigured native agent gets sane floors: max_turns <= 0 → a silent
+    no-op turn; a negative num_retries goes straight to LiteLLM; a
+    max_concurrent_tools <= 0 makes asyncio.Semaphore raise."""
     f = NativeAgentSpec.from_config
     assert f(model=None, native={"max_turns": 0}).max_turns == 1
     assert f(model=None, native={"max_turns": -5}).max_turns == 1
     assert f(model=None, native={"num_retries": -3}).num_retries == 0
-    # valid values pass through untouched
-    s = f(model=None, native={"max_turns": 10, "num_retries": 4})
+    assert f(model=None, native={"max_concurrent_tools": 0}).max_concurrent_tools == 1
+    assert f(model=None, native={"max_concurrent_tools": -2}).max_concurrent_tools == 1
+    # the tool-concurrency cap is configurable; valid values pass through
+    s = f(model=None, native={"max_turns": 10, "num_retries": 4,
+                              "max_concurrent_tools": 16})
     assert s.max_turns == 10 and s.num_retries == 4
+    assert s.max_concurrent_tools == 16
 
 
 # ── interrupt-wedge: dangling assistant tool_calls healing ───────────────────
@@ -601,13 +605,13 @@ async def test_parallel_tool_calls_run_concurrently_and_in_order():
 
 
 @pytest.mark.asyncio
-async def test_parallel_tool_calls_bounded_concurrency():
+async def test_parallel_tool_calls_bounded_to_configured_cap():
     """A big parallel-tool batch must not spike the subprocess/connection count:
-    at most _MAX_CONCURRENT_TOOLS execute at once, the rest run in waves —
-    still parallel, but with a fixed per-turn resource ceiling."""
+    at most spec.max_concurrent_tools execute at once, the rest run in waves —
+    still parallel, but with a fixed per-turn ceiling. A CUSTOM cap proves the
+    knob flows through to the bound (subsumes the default — same mechanism)."""
     import asyncio
 
-    from api.native.loop import _MAX_CONCURRENT_TOOLS
     from api.native.transport import TransportExecResult
 
     live = {"now": 0, "max": 0}
@@ -626,8 +630,9 @@ async def test_parallel_tool_calls_bounded_concurrency():
         async def write_file(self, p, d):
             pass
 
-    n = _MAX_CONCURRENT_TOOLS + 4
-    spec = NativeAgentSpec()
+    cap = 4                                            # configured, < default 8
+    n = cap + 5                                        # more tools than the cap
+    spec = NativeAgentSpec(max_concurrent_tools=cap)
     tools = build_toolset(["bash"])
     msgs = [{"role": "user", "content": "do many"}]
     round1 = [_Chunk(_Delta(tool_calls=[
@@ -639,7 +644,7 @@ async def test_parallel_tool_calls_bounded_concurrency():
                                      [round1, round2])
 
     tool_results = [e for e in events if e["type"] == "tool_result"]
-    assert len(tool_results) == n                     # all ran
-    assert live["max"] <= _MAX_CONCURRENT_TOOLS, \
-        f"peaked at {live['max']} concurrent (cap {_MAX_CONCURRENT_TOOLS})"
-    assert live["max"] >= 2                            # but DID run in parallel
+    assert len(tool_results) == n                      # all ran
+    assert live["max"] <= cap, \
+        f"peaked at {live['max']} concurrent (configured cap {cap})"
+    assert live["max"] >= 2                             # but DID run in parallel

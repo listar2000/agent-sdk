@@ -52,6 +52,11 @@ class NativeAgentSpec:
     # double-emit). Default on (2) for resilience; set 0 via native config to
     # disable, or higher for a flakier provider.
     num_retries: int = 2
+    # How many of a round's tool calls execute concurrently. The common case
+    # (a few tools) runs fully in parallel; a big batch runs in waves of this
+    # size — a fixed per-turn resource ceiling. Tune per workload: higher for
+    # cheap I/O-bound tools, lower for heavy ones / tight resource budgets.
+    max_concurrent_tools: int = _MAX_CONCURRENT_TOOLS
 
     @classmethod
     def from_config(cls, *, model: str | None, native: dict | None) -> "NativeAgentSpec":
@@ -63,12 +68,15 @@ class NativeAgentSpec:
             # agent fails LOUDLY (or just runs) rather than silently: a
             # max_turns <= 0 makes ``range(max_turns)`` empty → a no-op turn
             # with no model call and a bare done(max_turns); a negative
-            # num_retries would be handed straight to LiteLLM.
+            # num_retries would be handed straight to LiteLLM; a
+            # max_concurrent_tools <= 0 would make asyncio.Semaphore raise.
             max_turns=max(1, int(n.get("max_turns", cls.max_turns))),
             max_tokens=n.get("max_tokens"),
             temperature=n.get("temperature"),
             tool_names=n.get("tool_names"),
             num_retries=max(0, int(n.get("num_retries", cls.num_retries))),
+            max_concurrent_tools=max(
+                1, int(n.get("max_concurrent_tools", cls.max_concurrent_tools))),
         )
 
 
@@ -297,13 +305,13 @@ async def run_turn(
 
         # Independent tool calls the model issued in ONE round run CONCURRENTLY,
         # so the round finishes in max(individual) instead of the sum — bounded
-        # to _MAX_CONCURRENT_TOOLS at a time so a huge batch can't spike the
+        # to spec.max_concurrent_tools at a time so a huge batch can't spike the
         # subprocess/connection count. A single call degenerates to a
         # gather-of-one (identical behavior). A tool failure is data (an "error:"
         # string); only an interrupt (CancelledError) propagates out — gather
         # then cancels the siblings and the _drive handler heals the dangling
         # tool_calls.
-        sem = asyncio.Semaphore(_MAX_CONCURRENT_TOOLS)
+        sem = asyncio.Semaphore(spec.max_concurrent_tools)
 
         async def _exec_one(c, args):
             async with sem:
