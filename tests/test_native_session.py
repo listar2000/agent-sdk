@@ -706,3 +706,44 @@ async def test_ensure_sandbox_records_native_op_telemetry(monkeypatch):
     await s2._ensure_sandbox()
     assert ("op", "docker", "cold_recover") in recorded
     assert ("recovery", "docker", "cold_recover") in recorded
+
+
+@pytest.mark.asyncio
+async def test_destroy_and_hibernate_failures_record_leaks(monkeypatch):
+    """A failed native destroy ORPHANS a paid sandbox; a failed hibernate leaves
+    compute RUNNING. Both are resource leaks — they must surface on /metrics via
+    record_leak (counted like the supervisor path's reap-release leaks), not just
+    a log line."""
+    import api.metrics
+
+    leaks = []
+
+    class _FakeMetrics:
+        async def record_leak(self, kind, *, provider=None, session_id=None, **ctx):
+            leaks.append((kind, provider, session_id))
+
+    monkeypatch.setattr(api.metrics, "get_metrics", lambda: _FakeMetrics())
+
+    # destroy failure -> leak (orphaned sandbox)
+    s = NativeSession(session_id="s-del", state=NativeSandboxState(
+        provider="daytona", sandbox_ref="ref-x"))
+
+    class _DeadDestroy:
+        async def destroy(self):
+            raise RuntimeError("delete refused")
+    s._reattach_transport = lambda provider, ref: _DeadDestroy()  # type: ignore
+    await s.destroy()
+    assert ("native_destroy_failed", "daytona", "s-del") in leaks
+    assert s._transport is None   # still tears down the in-memory handle
+
+    # hibernate failure -> leak (compute not freed)
+    leaks.clear()
+    s2 = NativeSession(session_id="s-hib",
+                       state=NativeSandboxState(provider="modal"))
+
+    class _DeadHibernate:
+        async def hibernate(self):
+            raise RuntimeError("stop refused")
+    s2._transport = _DeadHibernate()
+    await s2.stop()
+    assert ("native_hibernate_failed", "modal", "s-hib") in leaks

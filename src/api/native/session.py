@@ -138,7 +138,16 @@ class NativeSession(BaseSandboxSession):
             try:
                 await self._transport.hibernate()
             except Exception:
+                # A failed hibernate leaves the sandbox RUNNING — paid compute
+                # that was never freed. Count it as a leak (best-effort; the
+                # reporter never raises) so /metrics sees native leaks like the
+                # supervisor path's reap-release failures, not just a log line.
                 log.exception("native: hibernate failed for %s", self.session_id)
+                from api.metrics import get_metrics
+                await get_metrics().record_leak(
+                    "native_hibernate_failed",
+                    provider=getattr(self.state, "provider", "docker"),
+                    session_id=self.session_id)
 
     async def shutdown(self) -> None:
         """In-memory teardown only — must NOT destroy compute (release()
@@ -160,8 +169,15 @@ class NativeSession(BaseSandboxSession):
         try:
             await self._reattach_transport(provider, ref).destroy()
         except Exception:
+            # A failed hard-delete ORPHANS the sandbox — a paid idle daytona/
+            # modal VM (or docker container) leaking until the boot reconciler
+            # reclaims it. Count it as a leak so it surfaces on /metrics.
             log.exception("native: destroy failed for %s ref=%s",
                           self.session_id, ref)
+            from api.metrics import get_metrics
+            await get_metrics().record_leak(
+                "native_destroy_failed", provider=provider,
+                session_id=self.session_id)
         self._transport = None
 
     # ── liveness: the session object is the runtime ─────────────────────────
