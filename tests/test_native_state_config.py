@@ -171,6 +171,17 @@ def test_fast_dumps_is_always_callable_returning_str():
     assert isinstance(out, str)
 
 
+def test_fast_dumps_falls_back_for_orjson_rejected_input():
+    """``_fast_dumps`` feeds DURABILITY writes (checkpoint, session_log), so it
+    must never be LESS robust than the stdlib json it replaced. orjson rejects
+    some inputs stdlib coerces — e.g. non-string dict keys — so the wrapper must
+    fall back, not let a payload shape crash the write. Pins that contract."""
+    import json
+    from api import db as dbmod
+    out = dbmod._fast_dumps({1: "a", 2: "b"})      # int keys: orjson raises
+    assert json.loads(out) == {"1": "a", "2": "b"}  # stdlib coerces → still valid
+
+
 # ── native_transcripts accessors (Postgres required; skips if absent) ──────
 
 import pytest_asyncio

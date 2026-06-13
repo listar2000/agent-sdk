@@ -32,7 +32,18 @@ try:
     import orjson as _orjson
 
     def _fast_dumps(obj) -> str:
-        return _orjson.dumps(obj).decode()
+        # orjson is stricter than stdlib (it rejects non-str dict keys that
+        # json.dumps coerces, and a few exotic types). This serializer feeds
+        # DURABILITY writes (the native checkpoint, session_log), so it must
+        # never be LESS robust than the stdlib it replaced: fall back to
+        # json.dumps for anything orjson rejects, so a payload shape can't turn a
+        # speedup into a dropped checkpoint / lost log row. (orjson stays the fast
+        # common path — and for NaN/Infinity it's actually MORE correct, emitting
+        # null vs stdlib's PG-invalid `NaN`.)
+        try:
+            return _orjson.dumps(obj).decode()
+        except Exception:
+            return json.dumps(obj)
 except ImportError:  # pragma: no cover - orjson is a declared dep; guard for safety
     _orjson = None
     _fast_dumps = json.dumps
