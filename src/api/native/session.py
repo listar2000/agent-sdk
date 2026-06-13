@@ -340,6 +340,12 @@ class NativeSession(BaseSandboxSession):
 
             provider = getattr(self.state, "provider", "docker")
             ref = getattr(self.state, "sandbox_ref", None)
+            # Native provisions compute HERE (lazily), not in the pool's
+            # timed_op around start() — so without this the /admin/ops dashboard
+            # is blind to native sandbox create/resume latency + flakiness.
+            # Record the same ops the supervisor path does (best-effort; the
+            # reporter never raises into the caller).
+            from api.metrics import get_metrics as _metrics
 
             # RESUME: a prior provision left a hibernated (stopped) or
             # still-running sandbox. ONE status() classifies it — reattach +
@@ -366,7 +372,10 @@ class NativeSession(BaseSandboxSession):
                     #    wedges the session (every later prompt re-raises) while
                     #    LEAKING the dead VM. Catch it and fall through.
                     try:
-                        await t.resume()
+                        async with _metrics().timed_op(
+                                provider=provider, operation="resume",
+                                session_id=self.session_id):
+                            await t.resume()
                     except Exception:
                         log.warning("native: resume failed for sandbox %s; "
                                     "destroying + recreating", ref[:12])
@@ -398,10 +407,19 @@ class NativeSession(BaseSandboxSession):
                 except Exception:
                     pass
 
-            t = await self._create_transport(provider)
+            # cold_create = a fresh first provision; cold_recover = recreate
+            # after a dead/missing ref or a SandboxGoneError swap (``replace``)
+            # — the silent auto-heal the recovery dashboard counts.
+            op = "cold_recover" if (ref or replace is not None) else "cold_create"
+            async with _metrics().timed_op(
+                    provider=provider, operation=op, session_id=self.session_id):
+                t = await self._create_transport(provider)
             self._transport = t
             self.state.sandbox_ref = t.ref
             await self._persist_state()
+            if op == "cold_recover":
+                await _metrics().record_recovery(
+                    op, provider=provider, session_id=self.session_id)
             return t
 
     def _reattach_transport(self, provider: str, ref: str):

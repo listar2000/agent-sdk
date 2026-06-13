@@ -639,3 +639,70 @@ async def test_nway_concurrent_recovery_creates_exactly_one_no_orphans():
     out = await asyncio.gather(*(one_session(f"sess-orphan-{i}")
                                  for i in range(M)))
     assert len(out) == M
+
+
+@pytest.mark.asyncio
+async def test_ensure_sandbox_records_native_op_telemetry(monkeypatch):
+    """Native provisions compute lazily in _ensure_sandbox (not the pool's
+    timed_op around start()), so it must record its own op_events — otherwise
+    /admin/ops is blind to native sandbox create/resume latency + flakiness.
+    A fresh provision records cold_create; a recreate over a dead ref records
+    cold_recover + a recovery signal (the silent auto-heal the dashboard counts)."""
+    import contextlib as _ctx
+    import api.metrics
+
+    recorded = []
+
+    class _FakeMetrics:
+        @_ctx.asynccontextmanager
+        async def timed_op(self, *, provider, operation, session_id=None):
+            try:
+                yield
+            finally:
+                recorded.append(("op", provider, operation))
+
+        async def record_recovery(self, kind, *, provider=None,
+                                  session_id=None, **ctx):
+            recorded.append(("recovery", provider, kind))
+
+    monkeypatch.setattr(api.metrics, "get_metrics", lambda: _FakeMetrics())
+
+    class _T:
+        def __init__(self, ref="cid-x"):
+            self.ref = ref
+            self.container_id = ref
+
+        async def destroy(self):
+            pass
+
+        async def status(self):
+            return "missing"
+
+    async def _noop_persist():
+        return None
+
+    async def _create(provider):
+        return _T("cid-fresh")
+
+    # 1) fresh provision (no ref, no replace) -> cold_create, no recovery
+    s = NativeSession(session_id="s-cc",
+                      state=NativeSandboxState(provider="docker"))
+    s._started = True
+    s._persist_state = _noop_persist  # type: ignore[method-assign]
+    s._create_transport = _create     # type: ignore[method-assign]
+    t = await s._ensure_sandbox()
+    assert t.ref == "cid-fresh"
+    assert ("op", "docker", "cold_create") in recorded
+    assert not any(r[0] == "recovery" for r in recorded)
+
+    # 2) recreate over a dead/missing ref -> cold_recover + recovery
+    recorded.clear()
+    s2 = NativeSession(session_id="s-cr", state=NativeSandboxState(
+        provider="docker", sandbox_ref="old-dead"))
+    s2._started = True
+    s2._persist_state = _noop_persist       # type: ignore[method-assign]
+    s2._create_transport = _create          # type: ignore[method-assign]
+    s2._reattach_transport = lambda provider, ref: _T("old-dead")  # type: ignore
+    await s2._ensure_sandbox()
+    assert ("op", "docker", "cold_recover") in recorded
+    assert ("recovery", "docker", "cold_recover") in recorded
