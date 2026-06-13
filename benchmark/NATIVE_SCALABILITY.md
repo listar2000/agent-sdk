@@ -66,6 +66,13 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
   resume source of truth; a dropped write silently rewinds the conversation on
   resume. The idempotent upsert is now retried (3 attempts, backoff) on a
   transient DB failure, and never raises into the turn loop.
+* **litellm hardening** — the native model call now runs with `telemetry=False`
+  (litellm ships it True, egressing anonymized usage to litellm's servers every
+  call — a server-side data egress we don't want), `suppress_debug_info=True`
+  (no provider banner on stderr), and `drop_params=True` (the runtime runs
+  arbitrary models; a model that doesn't support a sent param degrades
+  gracefully instead of erroring the whole turn). Config-only, no behavior change
+  for a supporting model.
 * **Telemetry parity with the supervisor path** — native provisions compute
   lazily in `_ensure_sandbox` (outside the pool's `timed_op`), so it was a blind
   spot on `/admin/ops` and `/metrics`. Now records op timing (`cold_create` /
