@@ -16,7 +16,6 @@ runtime through its real path via the `_completion` / `_transport_factory` test
 seams:
 
 ```bash
-.venv/bin/python benchmark/micro/bench_native_frames.py      # frame synthesis
 .venv/bin/python benchmark/micro/bench_native_runtime.py     # end-to-end runtime
 .venv/bin/python benchmark/micro/bench_b64.py                # transport b64 isolation
 ```
@@ -45,8 +44,6 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
 
 | area | change | impact |
 |---|---|---|
-| frame synthesis | `text`/`reasoning` (per token) → string-concat + per-session cached prefix (`FrameEncoder`) | **7.3×** per event (2150→295 ns) |
-| frame synthesis | `tool`/`tool_result` → same fast path | **3.9×** per event (2700→690 ns) |
 | dangling-heal | `heal_dangling_tool_calls` re-scanned the whole transcript every turn → bound to the tail | **O(n²)→O(n)** per session; 2000-turn session ~6,900→16,800 turns/s |
 | streamed tool args | `acc.args += fragment` on an attribute (GIL defeats CPython's in-place opt) → list+join | **O(n²)→O(n)**; up to ~1187× at 50k fragments |
 | **SSE drain (shared)** | `iterate_subscriber` armed an `asyncio.wait_for` timer per event → `get_nowait` hot path, timer only when idle | 1 subscriber **47%→74%**, 4 subs **21%→50%** of 0-sub; all providers |
@@ -120,6 +117,18 @@ green and non-flaky under `-n auto`.
   the in-memory `_messages` array (message dict ~232 B + content) is required and
   irreducible without context compaction (a product decision). Hibernated/reaped
   sessions are evicted from the pool and GC'd, so there is no idle-RAM win.
+* **Per-token frame synthesis was NOT worth optimizing — removed.** An earlier
+  pass hand-built byte-concatenated `text`/`reasoning`/`tool` templates + a
+  per-session `FrameEncoder` cache (~2.2 µs → ~0.26 µs/event, "7×"). But tokens
+  arrive at the model's network pace (~10 ms apart), so per-event synthesis is
+  noise: the saving is ~0.2% of one core at 10 concurrent sessions, ~2% at 100,
+  ~10% at 500 — only material at extreme concurrency, and bought with a
+  byte-fragile second source of truth maintained by hand. Reverted to a single
+  `json.dumps` of the canonical dict (`frames.block_for_event`). The "~2×
+  end-to-end" the runtime bench once showed was a synthetic artifact — the fake
+  completion streams tokens at infinite speed, removing the network wait that
+  dominates production. Lesson: micro-benchmark the *isolated* op, but size it
+  against the *production* cadence before optimizing it.
 
 ## Deliberately deferred (need human review)
 

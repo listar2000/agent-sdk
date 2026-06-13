@@ -38,29 +38,6 @@ identical. **The win is purely isolation** — the loop stays free to
 serve other requests while a big upload is being decoded. Use it
 gated on payload size; below ~1 MB the thread-dispatch overhead loses.
 
-### `bench_native_frames.py`
-**Question:** how much CPU does the native runtime burn turning ONE LLM stream
-delta into a broadcast block? `text`/`reasoning` events fire once per token, so
-at high session concurrency this is a shared-core cost on the event loop thread.
-
-**Run:** `.venv/bin/python benchmark/micro/bench_native_frames.py`
-
-**Findings (repeatable; absolute ns scale with the host):**
-
-| path                          | ns/event | speedup |
-|-------------------------------|---------:|--------:|
-| dict-dump (original)          |   ~2180  |   1.0×  |
-| stateless fast template       |    ~430  |   ~5.0× |
-| `FrameEncoder` (cached prefix)|    ~310  |   ~7.0× |
-
-The per-token templates are a fixed envelope around one dynamic string, so
-concatenating constant fragments around a single `json.dumps(text)` is ~5×
-cheaper than building+encoding the nested dict — and `FrameEncoder` caches
-`json.dumps(session_id)` (the only other constant) for ~7× total. **Wire bytes
-are byte-identical** (pinned by `tests/test_native_frames.py`); this is pure
-per-token CPU saved under concurrent native load. The session uses the cached
-`FrameEncoder` path.
-
 ### `bench_native_runtime.py`
 **Question:** end-to-end throughput, concurrency scaling, and per-session RAM
 of the **native runtime** — without an LLM key, a sandbox, or a running server.
@@ -106,17 +83,9 @@ grows without bound with conversation length.
   `get_nowait` and arming the heartbeat timer only when the queue is empty took
   1-subscriber throughput from ~47% to ~73% of the 0-subscriber rate (+59%),
   and 4-subscriber from ~21% to ~50% (+142%). `drops` must stay 0 at this load.
-* It is the A/B that proved the `FrameEncoder` win (see `bench_native_frames.py`)
-  end-to-end, not just on the isolated function:
-
-  | frame path                | agg turns/s | agg events/s |
-  |---------------------------|------------:|-------------:|
-  | dict-dump (pre-opt)       |      ~3,650 |     ~227,000 |
-  | `FrameEncoder` (current)  |      ~7,300 |     ~452,000 |
-
-  **~2× end-to-end native turn throughput** from cheaper per-token frame
-  synthesis. RAM is identical (CPU-only win): per-session RAM is dominated by
-  the conversation held in `_messages` (~0.26 MB for a 400-message session).
+* Per-session RAM is dominated by the conversation held in `_messages`
+  (~0.26 MB for a 400-message session); the loop itself is CPU-bound and flat
+  in conversation length.
 
 ### `bench_httpx_pool.py`
 **Question:** what's the cost of constructing a fresh `httpx.AsyncClient`
