@@ -28,6 +28,15 @@ log = logging.getLogger(__name__)
 
 Emit = Callable[[dict], Awaitable[None]]
 
+#: Cap on tool calls executed CONCURRENTLY within one round. The model can issue
+#: a large parallel-tool batch ("read these 40 files"); each tool is a sandbox
+#: exec / file round-trip (a docker exec subprocess, an SDK call), so an
+#: unbounded gather would spike to N concurrent subprocesses per turn — and
+#: across many sessions, explode. Bound it: the common case (a handful of tools)
+#: still runs fully in parallel; a big batch runs in waves of this size, trading
+#: a little latency for a fixed per-turn resource ceiling.
+_MAX_CONCURRENT_TOOLS = 8
+
 
 @dataclass
 class NativeAgentSpec:
@@ -286,21 +295,27 @@ async def run_turn(
             await emit({"type": "tool", "tool_call_id": c.id,
                         "tool_name": c.name, "args": args})
 
-        async def _exec_one(c, args):
-            tool = tools.get(c.name)
-            if tool is None:
-                return f"error: unknown tool {c.name!r}", None
-            # a recreate (on SandboxGoneError) may swap the transport; concurrent
-            # recoveries adopt-not-duplicate (one fresh sandbox), so all parallel
-            # tools converge on the same replacement.
-            return await _invoke_tool(tool, transport, args, c.name, ensure_sandbox)
-
         # Independent tool calls the model issued in ONE round run CONCURRENTLY,
-        # so the round finishes in max(individual) instead of the sum. A single
-        # call degenerates to a gather-of-one (identical behavior). A tool
-        # failure is data (an "error:" string); only an interrupt (CancelledError)
-        # propagates out — gather then cancels the siblings and the _drive handler
-        # heals the dangling tool_calls.
+        # so the round finishes in max(individual) instead of the sum — bounded
+        # to _MAX_CONCURRENT_TOOLS at a time so a huge batch can't spike the
+        # subprocess/connection count. A single call degenerates to a
+        # gather-of-one (identical behavior). A tool failure is data (an "error:"
+        # string); only an interrupt (CancelledError) propagates out — gather
+        # then cancels the siblings and the _drive handler heals the dangling
+        # tool_calls.
+        sem = asyncio.Semaphore(_MAX_CONCURRENT_TOOLS)
+
+        async def _exec_one(c, args):
+            async with sem:
+                tool = tools.get(c.name)
+                if tool is None:
+                    return f"error: unknown tool {c.name!r}", None
+                # a recreate (on SandboxGoneError) may swap the transport;
+                # concurrent recoveries adopt-not-duplicate (one fresh sandbox),
+                # so all parallel tools converge on the same replacement.
+                return await _invoke_tool(
+                    tool, transport, args, c.name, ensure_sandbox)
+
         outcomes = await asyncio.gather(*(_exec_one(c, args) for c, args in calls))
 
         # Adopt a transport a tool recreated mid-round for the next round.

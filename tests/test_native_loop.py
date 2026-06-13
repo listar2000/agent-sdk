@@ -598,3 +598,48 @@ async def test_parallel_tool_calls_run_concurrently_and_in_order():
     tool_msgs = [m for m in result.messages if m.get("role") == "tool"]
     assert [m["tool_call_id"] for m in tool_msgs] == ["c1", "c2", "c3"]
     assert len(transport.execs) == 3
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_calls_bounded_concurrency():
+    """A big parallel-tool batch must not spike the subprocess/connection count:
+    at most _MAX_CONCURRENT_TOOLS execute at once, the rest run in waves —
+    still parallel, but with a fixed per-turn resource ceiling."""
+    import asyncio
+
+    from api.native.loop import _MAX_CONCURRENT_TOOLS
+    from api.native.transport import TransportExecResult
+
+    live = {"now": 0, "max": 0}
+
+    class _CountingTransport:
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+            await asyncio.sleep(0.02)
+            live["now"] -= 1
+            return TransportExecResult(f"ran:{command}", "", 0, False)
+
+        async def read_file(self, p, *, max_bytes=8 * 1024 * 1024):
+            raise FileNotFoundError(p)
+
+        async def write_file(self, p, d):
+            pass
+
+    n = _MAX_CONCURRENT_TOOLS + 4
+    spec = NativeAgentSpec()
+    tools = build_toolset(["bash"])
+    msgs = [{"role": "user", "content": "do many"}]
+    round1 = [_Chunk(_Delta(tool_calls=[
+        _TCDelta(i, id=f"c{i}", name="bash", arguments='{"command":"x"}')
+        for i in range(n)]))]
+    round2 = [_Chunk(_Delta(content="done"))]
+
+    events, _result = await _collect(spec, msgs, tools, _CountingTransport(),
+                                     [round1, round2])
+
+    tool_results = [e for e in events if e["type"] == "tool_result"]
+    assert len(tool_results) == n                     # all ran
+    assert live["max"] <= _MAX_CONCURRENT_TOOLS, \
+        f"peaked at {live['max']} concurrent (cap {_MAX_CONCURRENT_TOOLS})"
+    assert live["max"] >= 2                            # but DID run in parallel
