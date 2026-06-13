@@ -388,10 +388,13 @@ async def _with_subscribers(turns: int, chunks: int,
 
 
 async def _session_growth(turns: int, chunks: int, buckets: int = 4) -> None:
-    """Per-turn latency as ONE session's conversation deepens. With an O(1)
-    per-turn cost the buckets stay flat; an O(n) per-turn step (e.g. re-scanning
-    the whole transcript) shows up as later buckets getting slower — i.e. the
-    session is secretly O(n²). This is the canary for that whole bug class."""
+    """Per-turn latency of the in-memory LOOP as ONE session's conversation
+    deepens. With an O(1) per-turn cost the buckets stay flat; an O(n) per-turn
+    step (e.g. re-scanning the whole transcript — the heal / tool-arg-accum bug
+    class) shows up as later buckets getting slower, i.e. secretly O(n²). This is
+    the canary for that LOOP bug class ONLY: the checkpoint is stubbed here
+    (``_make_session`` installs ``_noop_ckpt``), so the known O(n²) write-volume
+    cost is invisible to this view — ``_checkpoint_serialization`` measures that."""
     s = _make_session("sess-growth", chunks)
     await _drive_turns(s, 3)  # warmup
     per = max(1, turns // buckets)
