@@ -228,6 +228,14 @@ async def run_turn(
             if not choices:
                 continue
             delta = choices[0].delta
+            # Reasoning is STREAMED for display only and is NOT added to the
+            # assistant message — the model's thinking stays ephemeral, which is
+            # correct for the common case (the reasoning isn't fed back next
+            # round). A model that needs its thinking blocks preserved across
+            # tool calls (e.g. Anthropic extended thinking + tools) is not
+            # supported here yet: persisting reasoning would also feed it to
+            # models that reject a thinking field, so it needs per-model handling
+            # — out of scope until such a model is configured and validated.
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 await emit({"type": "reasoning", "text": reasoning})
