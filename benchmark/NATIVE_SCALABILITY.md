@@ -79,10 +79,24 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
 * **N-way orphan-leak stress** — 24 racing sandbox recoveries × 6 sessions,
   asserting exactly one replacement sandbox per session (an orphan is a paid
   idle daytona/modal VM leaking until reclaimed).
+* **Memory-leak coverage (all three vectors, proven clean + guarded)** — the
+  native lifecycle holds no references under load: (1) session-lifecycle churn —
+  N create/drive/shutdown/del cycles leave 0 live `NativeSession`s + flat task
+  count; (2) SSE-subscriber churn — `_subscribers` empties after both
+  drain-to-end and the realistic cancelled-consumer (client-disconnect) path;
+  (3) a long *live* session — 200 back-to-back prompts grow only the
+  conversation (2 msgs/turn), no `_drive`-task / queue accumulation. Object-count
+  assertions (deterministic post-`gc.collect()`) — non-flaky under `-n auto`.
+* **Credential-refresh spawn-gate** — native (no supervisor) no longer spawns the
+  supervisor-only credential-file refresh loop that would poll forever and
+  discard every response.
+* **Config clamps** — `max_turns ≥ 1` (a 0 made a silent no-op turn),
+  `num_retries ≥ 0`.
 * **De-flaked** the b64 isolation test (wall-clock → mechanism assertion).
 
 Every change above carries a regression test verified to fail on the unfixed
-code (the loop's discipline); the full native suite stays green.
+code (the loop's discipline); the full native + adjacent suite (145 tests) stays
+green and non-flaky under `-n auto`.
 
 ## Findings worth keeping
 
