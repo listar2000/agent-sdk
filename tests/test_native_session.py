@@ -787,3 +787,48 @@ async def test_checkpoint_retries_transient_db_failure(monkeypatch):
     monkeypatch.setattr(api.db, "write_native_checkpoint", always_fail)
     await s._checkpoint({})                       # no exception escapes
     assert calls["n"] == NativeSession._CHECKPOINT_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_no_session_or_task_leak_across_lifecycle_churn():
+    """A per-session leak — a lingering _drive task, a closure, or a registry
+    ref pinning the session — would silently grow RAM under session churn and
+    break scalability. After many create/drive/shutdown/del cycles, no
+    NativeSession and no extra asyncio task may remain alive. Object counts are
+    deterministic after gc.collect(), so this is a robust guard (no byte-level
+    flakiness)."""
+    import gc
+
+    def live_native_sessions() -> int:
+        gc.collect()
+        return sum(1 for o in gc.get_objects() if isinstance(o, NativeSession))
+
+    def live_tasks() -> int:
+        return sum(1 for t in asyncio.all_tasks() if not t.done())
+
+    async def one_cycle(i: int) -> None:
+        s = _make_session([[
+            _Chunk(_Delta(content="hi")),
+            _Chunk(usage=_Usage(5, 2)),
+        ]])
+        s._broadcast = lambda item: None
+        async for _ev in s.execute_prompt(f"go-{i}", rpc_id=f"r{i}"):
+            pass
+        await s.shutdown()
+        # s drops out of scope on return -> eligible for GC
+
+    # warmup so any one-time module caches are populated, then snapshot baseline
+    for i in range(3):
+        await one_cycle(i)
+    base_sessions = live_native_sessions()
+    base_tasks = live_tasks()
+
+    for i in range(30):
+        await one_cycle(1000 + i)
+
+    leaked_sessions = live_native_sessions() - base_sessions
+    leaked_tasks = live_tasks() - base_tasks
+    assert leaked_sessions <= 0, \
+        f"{leaked_sessions} NativeSession(s) leaked across 30 lifecycle cycles"
+    assert leaked_tasks <= 0, \
+        f"{leaked_tasks} asyncio task(s) leaked (lingering _drive?)"
