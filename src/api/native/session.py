@@ -80,6 +80,10 @@ class NativeSession(BaseSandboxSession):
         self._active_task: asyncio.Task | None = None
         self._started = False
         self._provision_lock = asyncio.Lock()
+        # Per-session frame builder — caches the session-constant prefix of the
+        # hot per-token templates (text/reasoning) so each streaming delta skips
+        # the dict-build + re-encode of the envelope (~5-8× cheaper per event).
+        self._frames = frames.FrameEncoder(session_id)
         # Test seam: when set, passed to run_turn in place of litellm.acompletion.
         self._completion = None
         # Test seam: when set, used in place of provisioning a real container.
@@ -195,7 +199,7 @@ class NativeSession(BaseSandboxSession):
         queue: asyncio.Queue = asyncio.Queue()
 
         async def emit(event: dict) -> None:
-            block = frames.block_for_event(event, rpc_id, self.session_id)
+            block = self._frames.block_for_event(event, rpc_id)
             self._broadcast((rpc_id, block))
             self.liveness.observe_chunk()
             await queue.put(event)

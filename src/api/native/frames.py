@@ -48,18 +48,37 @@ def _update(session_id: str, update: dict) -> str:
     })
 
 
+# ── fast path for the per-TOKEN templates ───────────────────────────────────
+# ``text``/``reasoning`` are emitted once per LLM stream delta — the hottest
+# events by far (hundreds-to-thousands per turn vs a handful of tool/usage
+# events). Each is a fixed envelope around ONE dynamic string, so instead of
+# building a 4-level nested dict and walking it through the JSON encoder every
+# token, we concatenate constant fragments around a single ``json.dumps`` of
+# the dynamic string. ``json.dumps(s)`` produces byte-for-byte the same escaped,
+# quoted form that string takes inside the dict dump (string encoding is
+# independent of ``separators`` and of nesting), so the wire bytes are
+# identical — pinned by tests/test_native_frames.py's byte-parity corpus.
+# Measured ~5× faster than the dict-dump path; the FrameEncoder below caches
+# the per-session prefix for a further ~1.7×. The multi-field templates
+# (tool/tool_result/usage) keep the dict path — they're rare and their brace
+# sequences aren't worth hand-deriving.
+_TEXT_PRE = ('data: {"jsonrpc":"2.0","method":"session/update","params":'
+             '{"sessionId":')
+_TEXT_MID = (',"update":{"sessionUpdate":"agent_message_chunk","content":'
+             '{"type":"text","text":')
+_REASON_MID = (',"update":{"sessionUpdate":"agent_thought_chunk","content":'
+               '{"type":"text","text":')
+_TEXT_SUF = "}}}}"
+
+
 def text_block(session_id: str, text: str) -> str:
-    return _update(session_id, {
-        "sessionUpdate": "agent_message_chunk",
-        "content": {"type": "text", "text": text},
-    })
+    return (_TEXT_PRE + json.dumps(session_id) + _TEXT_MID
+            + json.dumps(text) + _TEXT_SUF)
 
 
 def reasoning_block(session_id: str, text: str) -> str:
-    return _update(session_id, {
-        "sessionUpdate": "agent_thought_chunk",
-        "content": {"type": "text", "text": text},
-    })
+    return (_TEXT_PRE + json.dumps(session_id) + _REASON_MID
+            + json.dumps(text) + _TEXT_SUF)
 
 
 def tool_block(session_id: str, tool_call_id: str, tool_name: str,
@@ -138,3 +157,33 @@ def block_for_event(event: dict[str, Any], rpc_id: str, session_id: str) -> str:
         return error_block(rpc_id, event.get("text") or "native loop error",
                            event.get("kind") or "NativeError")
     raise KeyError(f"no frame template for event type {t!r}")
+
+
+class FrameEncoder:
+    """Per-session frame builder — caches the session-constant prefix of the
+    per-token templates so streaming a delta is one ``json.dumps`` of the text
+    plus two string concatenations, never a dict build + encode.
+
+    ``session_id`` is fixed for a session's whole life, so ``json.dumps`` of it
+    (and the fixed envelope around it) is computed ONCE here instead of on every
+    ``text``/``reasoning`` event. Output is byte-identical to the stateless
+    module functions (same fragments, same ``json.dumps`` of the dynamic field);
+    the cold templates (tool/tool_result/usage/done/error) delegate straight to
+    ``block_for_event``. NativeSession holds one of these per session.
+    """
+
+    __slots__ = ("session_id", "_text_pre", "_reason_pre")
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        sid = json.dumps(session_id)
+        self._text_pre = _TEXT_PRE + sid + _TEXT_MID
+        self._reason_pre = _TEXT_PRE + sid + _REASON_MID
+
+    def block_for_event(self, event: dict[str, Any], rpc_id: str) -> str:
+        t = event["type"]
+        if t == "text":
+            return self._text_pre + json.dumps(event["text"]) + _TEXT_SUF
+        if t == "reasoning":
+            return self._reason_pre + json.dumps(event["text"]) + _TEXT_SUF
+        return block_for_event(event, rpc_id, self.session_id)

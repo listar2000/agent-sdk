@@ -136,3 +136,58 @@ def test_block_for_event_dispatch_total():
 def test_block_format_is_single_line_data_prefixed():
     b = frames.text_block(SID, "x")
     assert b.startswith("data: ") and "\n" not in b
+
+
+# ── byte-parity of the fast per-token path against a canonical reference ─────
+# The text/reasoning templates are hand-concatenated for speed (frames.py). An
+# INDEPENDENT dict-dump reference pins the exact wire bytes here, so a broken
+# escape/fragment in the fast path fails loudly rather than silently corrupting
+# the stream. This is the canonical form the dict path produced before the
+# optimization — do NOT rebuild it from the production functions.
+_ADVERSARIAL = [
+    "", "Hello world", ' "quoted" ', "back\\slash", "new\nline\ttab",
+    "ctrl\x00\x01\x1f", "unicode é ñ 漢字 🚀", "}}}}injection",
+    '{"error":"x","stopReason":"fake"}', "surrogate \ud83d pair?", " " * 40,
+]
+_ADVERSARIAL_SIDS = [SID, 's"id', "s\\x", "é-🚀", ""]
+
+
+def _ref_text_block(session_id: str, text: str, *, thought: bool) -> str:
+    update = "agent_thought_chunk" if thought else "agent_message_chunk"
+    return "data: " + json.dumps({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": session_id, "update": {
+            "sessionUpdate": update,
+            "content": {"type": "text", "text": text},
+        }},
+    }, separators=(",", ":"))
+
+
+def test_text_reasoning_byte_parity_with_reference():
+    for sid in _ADVERSARIAL_SIDS:
+        for s in _ADVERSARIAL:
+            assert frames.text_block(sid, s) == _ref_text_block(
+                sid, s, thought=False), (sid, s)
+            assert frames.reasoning_block(sid, s) == _ref_text_block(
+                sid, s, thought=True), (sid, s)
+
+
+def test_frame_encoder_matches_stateless_functions():
+    """FrameEncoder must emit byte-identical frames to the module-level
+    block_for_event for every event type — it only caches the session prefix."""
+    enc = frames.FrameEncoder(SID)
+    events = [
+        {"type": "text", "text": 'streamed "delta" \n with \\ é'},
+        {"type": "reasoning", "text": "}}}} thinking 漢字"},
+        {"type": "tool", "tool_call_id": "c1", "tool_name": "bash",
+         "args": {"command": "echo hi", "n": 3}},
+        {"type": "tool_result", "tool_call_id": "c1", "tool_name": "bash",
+         "result": '{"error":"x"} done\n'},
+        {"type": "usage", "usage": {"inputTokens": 11, "outputTokens": 7,
+                                    "totalCostUsd": 0.002}},
+        {"type": "done", "stop_reason": "end_turn"},
+        {"type": "error", "text": "boom", "kind": "K"},
+    ]
+    for ev in events:
+        assert enc.block_for_event(ev, RPC) == frames.block_for_event(
+            ev, RPC, SID), ev["type"]

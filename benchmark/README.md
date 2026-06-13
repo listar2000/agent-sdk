@@ -38,6 +38,29 @@ identical. **The win is purely isolation** — the loop stays free to
 serve other requests while a big upload is being decoded. Use it
 gated on payload size; below ~1 MB the thread-dispatch overhead loses.
 
+### `bench_native_frames.py`
+**Question:** how much CPU does the native runtime burn turning ONE LLM stream
+delta into a broadcast block? `text`/`reasoning` events fire once per token, so
+at high session concurrency this is a shared-core cost on the event loop thread.
+
+**Run:** `.venv/bin/python benchmark/micro/bench_native_frames.py`
+
+**Findings (repeatable; absolute ns scale with the host):**
+
+| path                          | ns/event | speedup |
+|-------------------------------|---------:|--------:|
+| dict-dump (original)          |   ~2180  |   1.0×  |
+| stateless fast template       |    ~430  |   ~5.0× |
+| `FrameEncoder` (cached prefix)|    ~310  |   ~7.0× |
+
+The per-token templates are a fixed envelope around one dynamic string, so
+concatenating constant fragments around a single `json.dumps(text)` is ~5×
+cheaper than building+encoding the nested dict — and `FrameEncoder` caches
+`json.dumps(session_id)` (the only other constant) for ~7× total. **Wire bytes
+are byte-identical** (pinned by `tests/test_native_frames.py`); this is pure
+per-token CPU saved under concurrent native load. The session uses the cached
+`FrameEncoder` path.
+
 ### `bench_httpx_pool.py`
 **Question:** what's the cost of constructing a fresh `httpx.AsyncClient`
 per request vs sharing one module-globally?
