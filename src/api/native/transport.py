@@ -94,6 +94,33 @@ class SandboxGoneError(Exception):
     fresh sandbox (recovering the workspace on modal/daytona volumes)."""
 
 
+# ── base64 codec, loop-isolated for large payloads ─────────────────────────
+#: Above this size, run the base64 codec in a worker thread so a multi-MB file
+#: transfer through read_file/write_file doesn't block the event loop for every
+#: other session on the replica. base64 holds the GIL, so threading is NOT a
+#: speedup — it's purely the loop-isolation win measured in
+#: benchmark/micro/bench_b64.py (a 10MB decode blocks the loop ~9ms inline, 0ms
+#: threaded). Matches server._maybe_in_thread's 4MB threshold; below it the
+#: thread-dispatch overhead loses. unix_local needs none of this — it reads and
+#: writes file bytes directly via asyncio.to_thread already (no base64 hop).
+_B64_THREAD_THRESHOLD = 4 * 1024 * 1024
+
+
+async def _b64encode(data: bytes) -> bytes:
+    """base64-encode ``data``, off-thread above the threshold (loop isolation)."""
+    if len(data) < _B64_THREAD_THRESHOLD:
+        return base64.b64encode(data)
+    return await asyncio.to_thread(base64.b64encode, data)
+
+
+async def _b64decode(text) -> bytes:
+    """base64-decode ``text`` (the encoded form, ~1.33× the raw size, so the
+    length gate is slightly eager — correct: decode cost scales with input)."""
+    if len(text) < _B64_THREAD_THRESHOLD:
+        return base64.b64decode(text)
+    return await asyncio.to_thread(base64.b64decode, text)
+
+
 class DockerTransport:
     """One docker container per session, ``sleep infinity`` as PID-1."""
 
@@ -330,7 +357,7 @@ class DockerTransport:
         path = self._resolve(path)
         q = shlex.quote(path)
         qdir = shlex.quote(_dirname(path))
-        payload = base64.b64encode(data)
+        payload = await _b64encode(data)
 
         async def _attempt() -> tuple[int, bytes]:
             from api.providers.docker import _require_docker
@@ -373,7 +400,7 @@ class DockerTransport:
             raise FileNotFoundError(
                 f"read_file({path}) failed (rc={res.exit_code}): "
                 f"{res.stderr[:300]}")
-        data = base64.b64decode(res.stdout)
+        data = await _b64decode(res.stdout)
         if len(data) > max_bytes:
             raise ValueError(f"read_file({path}): {len(data)}B exceeds "
                              f"max_bytes={max_bytes}")
@@ -559,10 +586,9 @@ class DaytonaTransport:
                                    bool(getattr(res, "timed_out", False)))
 
     async def write_file(self, path: str, data: bytes) -> None:
-        import base64 as _b64
         q = shlex.quote(self._resolve(path))
         qdir = shlex.quote(_dirname(self._resolve(path)))
-        b64 = _b64.b64encode(data).decode()
+        b64 = (await _b64encode(data)).decode()
         # base64-over-exec keeps it on the same SDK channel; daytona's exec
         # arg limit is generous, but chunk-free is fine for tool-sized writes.
         # plumbing: env-immune (use_default_env=False).
@@ -573,13 +599,12 @@ class DaytonaTransport:
             raise RuntimeError(f"daytona write_file({path}) failed: {res.stderr[:300]}")
 
     async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
-        import base64 as _b64
         q = shlex.quote(self._resolve(path))
         # plumbing: env-immune (use_default_env=False)
         res = await self.exec(f"base64 < {q}", cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise FileNotFoundError(f"daytona read_file({path}): {res.stderr[:300]}")
-        return _b64.b64decode(res.stdout)
+        return await _b64decode(res.stdout)
 
 
 # ===========================================================================
@@ -696,10 +721,9 @@ class ModalTransport:
                                    bool(getattr(res, "timed_out", False)))
 
     async def write_file(self, path: str, data: bytes) -> None:
-        import base64 as _b64
         q = shlex.quote(self._resolve(path))
         qdir = shlex.quote(_dirname(self._resolve(path)))
-        b64 = _b64.b64encode(data).decode()
+        b64 = (await _b64encode(data)).decode()
         # plumbing: env-immune (use_default_env=False)
         res = await self.exec(
             f"mkdir -p {qdir} && printf %s {shlex.quote(b64)} | base64 -d > {q}",
@@ -708,13 +732,12 @@ class ModalTransport:
             raise RuntimeError(f"modal write_file({path}) failed: {res.stderr[:300]}")
 
     async def read_file(self, path: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes:
-        import base64 as _b64
         q = shlex.quote(self._resolve(path))
         # plumbing: env-immune (use_default_env=False)
         res = await self.exec(f"base64 < {q}", cwd="/", use_default_env=False)
         if res.exit_code != 0:
             raise FileNotFoundError(f"modal read_file({path}): {res.stderr[:300]}")
-        return _b64.b64decode(res.stdout)
+        return await _b64decode(res.stdout)
 
 
 # ===========================================================================
