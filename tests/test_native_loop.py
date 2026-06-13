@@ -295,6 +295,23 @@ def test_build_toolset_unknown_raises():
     assert set(build_toolset(None)) == {"bash", "read_file", "write_file", "edit_file"}
 
 
+def test_tool_schema_precomputed_and_correct():
+    """``Tool.schema`` is precomputed once (run_turn reads it per turn), so it's
+    the SAME object across accesses — a regression to a per-access property
+    (rebuilding the nested dict every turn = GC churn) fails the identity check.
+    The shape must still match the OpenAI/LiteLLM function-tool contract."""
+    bash = build_toolset(["bash"])["bash"]
+    assert bash.schema is bash.schema           # cached, not rebuilt per access
+    # toolset copies share the same singleton Tool, so the same schema object
+    assert build_toolset(None)["bash"].schema is bash.schema
+    s = bash.schema
+    assert s["type"] == "function"
+    assert s["function"]["name"] == "bash"
+    assert s["function"]["description"]
+    assert s["function"]["parameters"]["type"] == "object"
+    assert "command" in s["function"]["parameters"]["properties"]
+
+
 # ── interrupt-wedge: dangling assistant tool_calls healing ───────────────────
 # An interrupt mid-tool-loop (CancelledError is a BaseException, so it bypasses
 # _invoke_tool's `except Exception`) lands after the assistant tool_calls
