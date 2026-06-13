@@ -55,6 +55,110 @@ async def test_modal_start_cleans_up_fresh_sandbox_when_attach_fails(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_modal_start_cold_creates_when_reattach_target_is_wedged(monkeypatch):
+    """Recovery race under load: a killed PID-1 supervisor takes its sandbox
+    down, but Modal's control plane still reports the ref 'running' for a few
+    seconds. start() must NOT 500 the caller — it abandons the wedged ref and
+    cold-creates a fresh sandbox on the volume in the SAME call.
+
+    Regression guard: before the fix start() raised
+    ``RuntimeError("Modal supervisor not responding")`` here (the reattach
+    health wait failed AFTER committing to the ref), which surfaced as a 500
+    on POST /message and lost the turn on the persistent SSE — the
+    [claude-modal] failure in test_persistent_sse_supervisor_killed_immediate_message
+    under -n auto.
+    """
+    import api.providers.modal as md_provider
+
+    state = ModalSandboxState(recipe=Recipe(), sandbox_ref="sb-stale", listen_port=9100)
+    sess = ModalSandboxSession(session_id="sess-modal-wedged-reattach", state=state)
+
+    async def _bootstrap():
+        return "vol-1"
+
+    async def _status(_ref):
+        return "running"          # STALE: control plane lags the kill
+
+    async def _resolve(_ref):
+        return "https://stale.modal.test"
+
+    async def _dead_health(url, **_kw):
+        # The wedged reattach target never answers health.
+        return url != "https://stale.modal.test"
+
+    created: list[dict] = []
+
+    async def _create_sandbox(**kw):
+        created.append(kw)
+        return ProviderInstance(
+            provider="modal",
+            url="https://fresh.modal.test",
+            root="/v",
+            sandbox_ref="sb-fresh",
+            port=9200,
+        )
+
+    async def _attach_ok():
+        return None
+
+    monkeypatch.setattr(sess, "_bootstrap_session", _bootstrap)
+    monkeypatch.setattr(sess, "_attach_acp", _attach_ok)
+    monkeypatch.setattr(md_provider, "get_sandbox_status", _status)
+    monkeypatch.setattr(md_provider, "resolve_supervisor_url", _resolve)
+    monkeypatch.setattr(md_provider, "create_sandbox", _create_sandbox)
+    monkeypatch.setattr("api.providers._shared._wait_for_health", _dead_health)
+
+    # Must recover in-place, not raise.
+    await sess.start()
+
+    assert len(created) == 1, "wedged reattach should fall through to one cold-create"
+    assert sess.state.sandbox_ref == "sb-fresh"
+    assert sess.state.listen_port == 9200
+    assert sess.supervisor_url == "https://fresh.modal.test"
+
+
+@pytest.mark.asyncio
+async def test_modal_start_reattaches_when_supervisor_healthy(monkeypatch):
+    """The happy reattach path still works: a running sandbox whose supervisor
+    answers health is reused — NO cold-create. Pins that folding the health
+    probe into the reattach decision didn't break normal resume."""
+    import api.providers.modal as md_provider
+
+    state = ModalSandboxState(recipe=Recipe(), sandbox_ref="sb-live", listen_port=9100)
+    sess = ModalSandboxSession(session_id="sess-modal-live-reattach", state=state)
+
+    async def _bootstrap():
+        return "vol-1"
+
+    async def _status(_ref):
+        return "running"
+
+    async def _resolve(_ref):
+        return "https://live.modal.test"
+
+    async def _healthy(_url, **_kw):
+        return True
+
+    async def _create_should_not_run(**_kw):
+        raise AssertionError("healthy reattach must not cold-create")
+
+    async def _attach_ok():
+        return None
+
+    monkeypatch.setattr(sess, "_bootstrap_session", _bootstrap)
+    monkeypatch.setattr(sess, "_attach_acp", _attach_ok)
+    monkeypatch.setattr(md_provider, "get_sandbox_status", _status)
+    monkeypatch.setattr(md_provider, "resolve_supervisor_url", _resolve)
+    monkeypatch.setattr(md_provider, "create_sandbox", _create_should_not_run)
+    monkeypatch.setattr("api.providers._shared._wait_for_health", _healthy)
+
+    await sess.start()
+
+    assert sess.state.sandbox_ref == "sb-live"        # reused, not replaced
+    assert sess.supervisor_url == "https://live.modal.test"
+
+
+@pytest.mark.asyncio
 async def test_modal_start_retries_attach_before_success(monkeypatch):
     import api.providers.modal as md_provider
 

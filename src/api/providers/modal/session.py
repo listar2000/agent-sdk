@@ -87,7 +87,21 @@ class ModalSandboxSession(BaseSandboxSession):
                     url = await md_provider.resolve_supervisor_url(
                         self.state.sandbox_ref
                     )
-                    if url:
+                    # Reattach ONLY if the supervisor also answers health.
+                    # Folding the probe into the decision (instead of checking
+                    # after we've already committed to the ref) lets a wedged
+                    # reattach target fall through to a fresh cold-create in
+                    # THIS call. The race we hit under concurrent load: a killed
+                    # PID-1 supervisor takes its sandbox down, but Modal's
+                    # control plane still reports the ref 'running' for a few
+                    # seconds — the old code reattached to that, failed the
+                    # health wait, and raised (surfacing as a 500 on
+                    # POST /message), deferring recovery to a *next* request the
+                    # caller may never make. The volume carries the workspace,
+                    # so cold-creating here is a transparent recovery.
+                    if url and await _wait_for_health(
+                        url, max_retries=15, interval=0.5
+                    ):
                         instance = self._provider_instance(
                             url=url,
                             sandbox_ref=self.state.sandbox_ref,
@@ -95,9 +109,15 @@ class ModalSandboxSession(BaseSandboxSession):
                         )
                         reattached = True
             except Exception:
-                pass
+                instance = None
+                reattached = False
 
         if instance is None:
+            # No prior sandbox, or the reattach target was unreachable: drop
+            # any stale/wedged ref and cold-create a fresh sandbox on the
+            # volume (the workspace survives via the Modal Volume).
+            self.state.sandbox_ref = None
+            self.state.listen_port = None
             instance = await md_provider.create_sandbox(
                 volume_ref=volume_ref,
                 subpath=self._subpath or f"sessions/{self.session_id}",
@@ -113,18 +133,6 @@ class ModalSandboxSession(BaseSandboxSession):
             created_fresh = True
 
         self._supervisor_url = instance.url
-
-        if reattached:
-            ok = await _wait_for_health(instance.url, max_retries=15, interval=0.5)
-            if not ok:
-                # Reattached to an existing modal sandbox but its supervisor
-                # is unreachable. Abandon the ref so the next get_session
-                # cold-creates fresh instead of looping on the wedged one.
-                self.state.sandbox_ref = None
-                self.state.listen_port = None
-                raise RuntimeError(
-                    f"Modal supervisor not responding at {instance.url}"
-                )
 
         try:
             self.liveness.observe_chunk()
