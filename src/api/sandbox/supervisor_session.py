@@ -123,9 +123,30 @@ class SupervisorSandboxSession(BaseSandboxSession):
                         sandbox_ref=self.state.sandbox_ref,
                         port=self.state.listen_port,
                     )
-                    reattached = True
+                    self._on_instance_resolved(instance)
+                    # Gate reattach on health HERE, not after committing below.
+                    # A WEDGED target — supervisor dead/suspended while the
+                    # provider still reports the sandbox reattachable (a killed
+                    # PID-1 supervisor whose control plane lags, a SIGSTOPped
+                    # one, an OOM'd ACP child) — must RECOVER by cold-creating
+                    # below, never raise. Raising here escapes get_session as a
+                    # 500 on POST /message and strands the caller's turn; the
+                    # volume carries the workspace, so a fresh sandbox resumes
+                    # transparently. The provider hook abandons the wedged ref
+                    # (docker DESTROYS the container — else the DB row's stale
+                    # ref reattaches to it and loops forever).
+                    if await _shared._wait_for_health(
+                        url,
+                        max_retries=self._health_retries,
+                        interval=self._health_interval,
+                    ):
+                        reattached = True
+                    else:
+                        await self._on_wedged_reattach(mod, instance)
+                        instance = None
             except Exception:
-                pass
+                instance = None
+                reattached = False
 
         if instance is None:
             instance = await mod.create_sandbox(
@@ -141,19 +162,22 @@ class SupervisorSandboxSession(BaseSandboxSession):
             self.state.sandbox_ref = instance.sandbox_ref
             self.state.listen_port = instance.port
             created_fresh = True
+            self._on_instance_resolved(instance)
 
-        self._on_instance_resolved(instance)
         self._supervisor_url = instance.url
 
-        if reattached or self._health_on_fresh_create:
+        # A FRESHLY-created sandbox that won't come healthy cannot be recovered
+        # by creating yet another one (it would loop), so this gate still
+        # raises. Reattach health is gated above, where failure recovers
+        # instead. (Providers whose create() health-waits internally set
+        # ``_health_on_fresh_create = False`` and skip this entirely.)
+        if created_fresh and self._health_on_fresh_create:
             ok = await _shared._wait_for_health(
                 instance.url,
                 max_retries=self._health_retries,
                 interval=self._health_interval,
             )
             if not ok:
-                if reattached:
-                    await self._on_wedged_reattach(mod, instance)
                 raise RuntimeError(self._health_fail_msg.format(url=instance.url))
 
         try:
