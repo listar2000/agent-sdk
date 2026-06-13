@@ -879,3 +879,89 @@ async def test_no_per_prompt_task_leak_in_a_long_live_session():
     assert live_tasks() <= base, "per-prompt _drive task leaked in a live session"
     # _active_task is cleared after each prompt completes
     assert s._active_task is None
+
+
+@pytest.mark.asyncio
+async def test_parallel_tools_concurrent_sandbox_recovery_one_replacement():
+    """When a round's parallel tool calls all hit SandboxGoneError on the shared
+    transport, they recover CONCURRENTLY — and must converge on exactly ONE
+    replacement sandbox (no orphan leak), each retrying on it and returning a
+    result, in order. Composition of the parallel-tool execution + the
+    adopt-not-duplicate recovery."""
+    from api.native.transport import SandboxGoneError, TransportExecResult
+
+    class _Dead:
+        ref = "dead"
+
+        async def exec(self, *a, **k):
+            raise SandboxGoneError("sandbox gone")
+
+        async def destroy(self):
+            pass
+
+    class _Fresh:
+        def __init__(self, tag):
+            self.ref = f"fresh-{tag}"
+            self.container_id = self.ref
+
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            return TransportExecResult(f"ran:{command}", "", 0, False)
+
+        async def destroy(self):
+            pass
+
+    s = NativeSession(session_id="par-rec",
+                      state=NativeSandboxState(provider="docker"))
+    s._started = True
+    s._spec = NativeAgentSpec(max_turns=4)
+    s._tools = build_toolset(["bash"])
+    s._messages = [{"role": "system", "content": "sys"}]
+    s._broadcast = lambda item: None
+    s._transport = _Dead()
+
+    created = []
+
+    async def _factory():
+        # yield inside provisioning so the concurrent recoveries genuinely
+        # interleave in the lock-acquire window (else scheduling can serialize
+        # them and the pre-lock adopt-check masks an absent under-lock one).
+        await asyncio.sleep(0)
+        t = _Fresh(len(created))
+        created.append(t)
+        return t
+    s._transport_factory = _factory
+
+    async def _noop_persist():
+        return None
+    s._persist_state = _noop_persist  # type: ignore[method-assign]
+
+    async def _noop_ckpt(usage):
+        return None
+    s._checkpoint = _noop_ckpt  # type: ignore[method-assign]
+
+    n_calls = {"n": 0}
+
+    async def completion(**kwargs):
+        n_calls["n"] += 1
+        if n_calls["n"] == 1:
+            async def _it():
+                yield _Chunk(_Delta(tool_calls=[
+                    _TCDelta(i, id=f"c{i}", name="bash",
+                             arguments='{"command":"x%d"}' % i)
+                    for i in range(3)]))
+            return _it()
+
+        async def _done():
+            yield _Chunk(_Delta(content="done"))
+        return _done()
+    s._completion = completion
+
+    events = [ev async for ev in s.execute_prompt("go", rpc_id="r")]
+
+    results = [e for e in events if e["type"] == "tool_result"]
+    assert [e["tool_call_id"] for e in results] == ["c0", "c1", "c2"]
+    assert all("ran:" in e["result"] for e in results), \
+        "a parallel tool didn't recover"
+    assert len(created) == 1, \
+        f"concurrent recovery leaked sandboxes: {[c.ref for c in created]}"
+    assert s._transport is created[0]
