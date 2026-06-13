@@ -832,3 +832,50 @@ async def test_no_session_or_task_leak_across_lifecycle_churn():
         f"{leaked_sessions} NativeSession(s) leaked across 30 lifecycle cycles"
     assert leaked_tasks <= 0, \
         f"{leaked_tasks} asyncio task(s) leaked (lingering _drive?)"
+
+
+@pytest.mark.asyncio
+async def test_no_per_prompt_task_leak_in_a_long_live_session():
+    """A LIVE session running many prompts back-to-back (no shutdown between)
+    must not accumulate _drive tasks — only the conversation grows. The
+    lifecycle-churn guard destroys+shuts-down each session, so shutdown's
+    cancel would mask a per-prompt task leak; this drives ONE live session
+    across many prompts to catch it directly."""
+    import gc
+
+    def live_tasks() -> int:
+        gc.collect()
+        return sum(1 for t in asyncio.all_tasks() if not t.done())
+
+    s = NativeSession(session_id="long-live",
+                      state=NativeSandboxState(provider="docker"))
+    s._started = True
+    s._spec = NativeAgentSpec(instructions="sys", max_turns=2)
+    s._tools = {}
+    s._messages = [{"role": "system", "content": "sys"}]
+    s._broadcast = lambda item: None
+
+    async def _noop_ckpt(usage):
+        return None
+    s._checkpoint = _noop_ckpt  # type: ignore[method-assign]
+
+    async def completion(**kwargs):
+        async def _it():
+            yield _Chunk(_Delta(content="ok"))
+            yield _Chunk(usage=_Usage(5, 2))
+        return _it()
+    s._completion = completion
+
+    # warmup, then baseline; each prompt's _drive task must be done (GC'd) after
+    for i in range(20):
+        async for _ in s.execute_prompt(f"w{i}", rpc_id=f"w{i}"):
+            pass
+    base = live_tasks()
+
+    for i in range(200):
+        async for _ in s.execute_prompt(f"p{i}", rpc_id=f"p{i}"):
+            pass
+
+    assert live_tasks() <= base, "per-prompt _drive task leaked in a live session"
+    # _active_task is cleared after each prompt completes
+    assert s._active_task is None
