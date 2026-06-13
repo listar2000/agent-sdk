@@ -302,6 +302,88 @@ def test_heal_dangling_tool_calls_inserts_stubs():
     assert sum(1 for x in m if x["role"] == "tool") == 1
 
 
+def _heal_forward_oracle(messages: list[dict]) -> None:
+    """The ORIGINAL full forward scan, kept here as an equivalence oracle for
+    the tail-bounded production implementation. If they ever diverge on a
+    transcript this system can produce, test_heal_tail_matches_forward_oracle
+    fails loudly. Do NOT 'optimize' this — it is the reference."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+            j = i + 1
+            answered: set = set()
+            while j < len(messages) and messages[j].get("role") == "tool":
+                answered.add(messages[j].get("tool_call_id"))
+                j += 1
+            missing = [cid for cid in call_ids if cid not in answered]
+            if missing:
+                stubs = [{"role": "tool", "tool_call_id": cid,
+                          "content": "error: interrupted"} for cid in missing]
+                messages[j:j] = stubs
+                i = j + len(stubs)
+                continue
+        i += 1
+
+
+def _gen_transcript(rng) -> list[dict]:
+    """Build a transcript shaped like ones THIS loop actually produces: a run
+    of fully-completed turns, then an optional dangling tail (interrupt
+    mid-tool-loop), then an optional just-appended user message."""
+    msgs: list[dict] = [{"role": "system", "content": "sys"}]
+    cid = 0
+    for _ in range(rng.randint(0, 6)):
+        msgs.append({"role": "user", "content": "u"})
+        # 0+ fully-answered tool rounds, then a final assistant text
+        for _ in range(rng.randint(0, 3)):
+            ids = [f"c{cid + k}" for k in range(rng.randint(1, 3))]
+            cid += len(ids)
+            msgs.append({"role": "assistant", "tool_calls": [
+                {"id": i, "type": "function",
+                 "function": {"name": "bash", "arguments": "{}"}} for i in ids]})
+            for i in ids:  # every call answered (completed round)
+                msgs.append({"role": "tool", "tool_call_id": i, "content": "ok"})
+        msgs.append({"role": "assistant", "content": "done"})
+    # optional dangling tail: assistant tool_calls with a SUBSET answered
+    if rng.random() < 0.6:
+        ids = [f"d{cid + k}" for k in range(rng.randint(1, 4))]
+        cid += len(ids)
+        msgs.append({"role": "assistant", "tool_calls": [
+            {"id": i, "type": "function",
+             "function": {"name": "bash", "arguments": "{}"}} for i in ids]})
+        answered = [i for i in ids if rng.random() < 0.5]
+        for i in answered:
+            msgs.append({"role": "tool", "tool_call_id": i, "content": "ok"})
+        if rng.random() < 0.5:   # a new prompt already appended (poisoned ckpt)
+            msgs.append({"role": "user", "content": "next"})
+    return msgs
+
+
+def test_heal_tail_matches_forward_oracle():
+    """The tail-bounded heal must produce byte-identical output to the original
+    O(n) forward scan on every transcript this system can produce — that
+    equivalence is what lets us bound the scan (killing the O(n²)-per-session
+    cost) without weakening the durable-wedge safety net."""
+    import random
+    from api.native.loop import heal_dangling_tool_calls
+
+    rng = random.Random(20260613)
+    for _ in range(3000):
+        msgs = _gen_transcript(rng)
+        a = [dict(x) for x in msgs]
+        b = [dict(x) for x in msgs]
+        _heal_forward_oracle(a)
+        heal_dangling_tool_calls(b)
+        assert a == b, (msgs, a, b)
+        # and the result is actually valid: every tool_call id is answered
+        ans = {x.get("tool_call_id") for x in b if x.get("role") == "tool"}
+        for x in b:
+            if x.get("role") == "assistant" and x.get("tool_calls"):
+                for tc in x["tool_calls"]:
+                    assert tc["id"] in ans, (msgs, b)
+
+
 @pytest.mark.asyncio
 async def test_run_turn_self_heals_poisoned_prior_transcript():
     """A checkpoint persisted mid-tool-loop carries an assistant tool_calls

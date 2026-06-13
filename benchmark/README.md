@@ -75,6 +75,14 @@ replica.
 Knobs (env): `TURNS` (default 200), `CHUNKS` (text deltas/turn, default 60),
 `LEVELS` (concurrency points, default `1,2,4,8,16,32`).
 
+Three views: single-session rate, **concurrency scaling** (does aggregate
+throughput hold as sessions pile on?), and **session-length scaling** (does
+per-turn cost stay flat as ONE conversation deepens, or is there a hidden
+O(n²)?). The last is the canary that caught the `heal_dangling_tool_calls`
+quadratic — it re-scanned the whole transcript every turn; bounding it to the
+tail flipped a 2000-turn session from ~6,900 to ~16,800 turns/s, and the gap
+grows without bound with conversation length.
+
 **Findings (repeatable; absolute rate scales with the host):**
 
 * The runtime is CPU-bound on the single event-loop thread, so aggregate
@@ -82,6 +90,8 @@ Knobs (env): `TURNS` (default 200), `CHUNKS` (text deltas/turn, default 60),
   the 1-session rate) — the good result: no contention cliff, clean horizontal
   scaling across replicas. `retention` < ~95% would mean per-session contention
   crept into the turn path.
+* Per-turn cost is now **flat as the conversation grows** (the session-length
+  table reads ×1.00 across buckets) — long-running sessions don't degrade.
 * It is the A/B that proved the `FrameEncoder` win (see `bench_native_frames.py`)
   end-to-end, not just on the isolated function:
 

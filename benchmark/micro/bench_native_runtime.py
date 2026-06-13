@@ -156,6 +156,32 @@ async def _scaling(levels: list[int], turns: int, chunks: int) -> None:
     print()
 
 
+async def _session_growth(turns: int, chunks: int, buckets: int = 4) -> None:
+    """Per-turn latency as ONE session's conversation deepens. With an O(1)
+    per-turn cost the buckets stay flat; an O(n) per-turn step (e.g. re-scanning
+    the whole transcript) shows up as later buckets getting slower — i.e. the
+    session is secretly O(n²). This is the canary for that whole bug class."""
+    s = _make_session("sess-growth", chunks)
+    await _drive_turns(s, 3)  # warmup
+    per = max(1, turns // buckets)
+    print(f"session-length scaling: per-turn cost as one session grows "
+          f"({turns} turns × {chunks} chunks)")
+    print(f"  {'turns so far':>13} {'µs/turn':>9} {'msgs':>7}")
+    done = 0
+    first = None
+    for b in range(buckets):
+        t0 = time.perf_counter()
+        await _drive_turns(s, per)
+        dt = time.perf_counter() - t0
+        done += per
+        us = dt / per * 1e6
+        if first is None:
+            first = us
+        print(f"  {done:>13} {us:>9.0f} {len(s._messages):>7}  "
+              f"{'×%.2f' % (us / first)}")
+    print("  (flat = O(1) per turn; rising = a hidden O(n²) over the session)\n")
+
+
 async def _ram(n: int, turns: int, chunks: int) -> None:
     """Per-session resident RAM after a conversation of ``turns`` turns."""
     gc.collect()
@@ -184,6 +210,7 @@ async def main() -> None:
     print(f"native runtime bench — turns={turns} chunks/turn={chunks}\n")
     await _single(turns, chunks)
     await _scaling(levels, turns, chunks)
+    await _session_growth(max(turns, 1200), chunks)
     await _ram(max(levels), turns, chunks)
 
 

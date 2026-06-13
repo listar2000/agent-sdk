@@ -89,26 +89,40 @@ def heal_dangling_tool_calls(messages: list[dict]) -> None:
     every later prompt re-raises across hibernate/resume/restart. Mutates
     ``messages`` in place, inserting an ``interrupted`` stub for each unanswered
     id right after the assistant's existing results. Idempotent — a clean
-    transcript is left unchanged."""
-    i = 0
-    while i < len(messages):
-        m = messages[i]
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
-            # the contiguous run of tool results immediately after this message
-            j = i + 1
-            answered: set = set()
-            while j < len(messages) and messages[j].get("role") == "tool":
-                answered.add(messages[j].get("tool_call_id"))
-                j += 1
-            missing = [cid for cid in call_ids if cid not in answered]
-            if missing:
-                stubs = [{"role": "tool", "tool_call_id": cid,
-                          "content": "error: interrupted"} for cid in missing]
-                messages[j:j] = stubs   # after existing results, before next turn
-                i = j + len(stubs)
-                continue
-        i += 1
+    transcript is left unchanged.
+
+    Only the LAST assistant message can be dangling, so we scan back to it
+    rather than walking the whole transcript: the loop appends a tool result for
+    every call before its next model round (and an interrupt heals before the
+    next user turn), so any earlier assistant ``tool_calls`` block is already
+    fully answered. A checkpoint persisted mid-tool-loop leaves the gap at ITS
+    tail too — which, after a new user message is appended, is still the last
+    *assistant* message. Bounding the scan to the tail turns this from O(n) per
+    turn — i.e. O(n²) over a long session, the dominant per-turn CPU cost — into
+    O(tool-calls-in-the-current-turn). Equivalence with the full forward scan on
+    every system-producible transcript is pinned by an oracle test in
+    tests/test_native_loop.py."""
+    n = len(messages)
+    a = n - 1
+    while a >= 0 and messages[a].get("role") != "assistant":
+        a -= 1
+    if a < 0:
+        return
+    m = messages[a]
+    if not m.get("tool_calls"):
+        return
+    call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+    # the contiguous run of tool results immediately after this assistant
+    j = a + 1
+    answered: set = set()
+    while j < n and messages[j].get("role") == "tool":
+        answered.add(messages[j].get("tool_call_id"))
+        j += 1
+    missing = [cid for cid in call_ids if cid not in answered]
+    if missing:
+        stubs = [{"role": "tool", "tool_call_id": cid,
+                  "content": "error: interrupted"} for cid in missing]
+        messages[j:j] = stubs   # after existing results, before next turn
 
 
 async def run_turn(
