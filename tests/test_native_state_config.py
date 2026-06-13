@@ -52,6 +52,33 @@ def test_agent_config_native_absent_stays_none():
     assert "native" not in c.to_dict()
 
 
+def test_native_config_knobs_flow_end_to_end_through_agentconfig():
+    """The native dict is opaque on purpose so loop knobs need no AgentConfig
+    migration — but only if AgentConfig preserves arbitrary keys through BOTH
+    from_dict AND the to_dict round-trip (the DB serialize path), and from_config
+    then reads them. Pins that for the runtime-control knobs (incl. the ones
+    added without an AgentConfig change): a regression here silently reverts a
+    configured agent to defaults."""
+    from api.native.loop import NativeAgentSpec
+
+    native = {"max_concurrent_tools": 16, "num_retries": 5, "max_turns": 7,
+              "instructions": "be brief", "tool_names": ["bash"]}
+    cfg = AgentConfig.from_dict({
+        "agent_type": "native",
+        "model": "openrouter/anthropic/claude-3.5-sonnet",
+        "native": dict(native),
+    })
+    # survives the DB serialize round-trip unchanged
+    back = AgentConfig.from_dict(cfg.to_dict())
+    assert back.native == native
+
+    spec = NativeAgentSpec.from_config(model=cfg.model, native=back.native)
+    assert spec.max_concurrent_tools == 16
+    assert spec.num_retries == 5
+    assert spec.max_turns == 7
+    assert spec.model == "openrouter/anthropic/claude-3.5-sonnet"
+
+
 # ── State variant ───────────────────────────────────────────────────────────
 
 def test_native_state_serialize_roundtrip():
