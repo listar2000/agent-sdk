@@ -81,8 +81,8 @@ grows without bound with conversation length.
   armed an `asyncio.wait_for` timeout (a fresh `TimerHandle`) on *every* event,
   so one live subscriber roughly **halved** producer throughput. Draining with
   `get_nowait` and arming the heartbeat timer only when the queue is empty took
-  1-subscriber throughput from ~47% to ~73% of the 0-subscriber rate (+59%),
-  and 4-subscriber from ~21% to ~50% (+142%). `drops` must stay 0 at this load.
+  1-subscriber throughput from ~64% to ~87% of the 0-subscriber rate (+43%),
+  and 4-subscriber from ~36% to ~69% (+104%). `drops` must stay 0 at this load.
 * Per-session RAM is dominated by the conversation held in `_messages`
   (~0.26 MB for a 400-message session); the loop itself is CPU-bound and flat
   in conversation length.

@@ -34,8 +34,8 @@ production throughput.
 | metric | baseline | this branch | delta |
 |---|---:|---:|---:|
 | single-session turns/s | ~3,650 | ~4,000 | ~1.1× (non-frames per-event opts) |
-| with 1 live SSE subscriber | 47% of 0-sub | **74%** of 0-sub | +59% |
-| with 4 live SSE subscribers | 21% of 0-sub | **50%** of 0-sub | +142% |
+| with 1 live SSE subscriber | 64% of 0-sub | **87%** of 0-sub | +43% |
+| with 4 live SSE subscribers | 36% of 0-sub | **69%** of 0-sub | +104% |
 | concurrency retention (1→32 sessions) | ~100% | ~100% | flat (no cliff) |
 | per-turn cost as a session grows to 2.4k msgs | O(n) (rising) | **O(1) (flat ×1.0)** | quadratic removed |
 
@@ -55,7 +55,7 @@ is reducing per-turn CPU, which the structural changes do.
 |---|---|---|
 | dangling-heal | `heal_dangling_tool_calls` re-scanned the whole transcript every turn → bound to the tail | **O(n²)→O(n)** per session — a deep session no longer slows per turn (`_session_growth` stays flat ×1.0 to 2.4k msgs); pins the shape, not an absolute rate |
 | streamed tool args | `acc.args += fragment` on an attribute (GIL defeats CPython's in-place opt) → list+join | **O(n²)→O(n)**; up to ~1187× at 50k fragments |
-| **SSE drain (shared)** | `iterate_subscriber` armed an `asyncio.wait_for` timer per event → `get_nowait` hot path, timer only when idle | 1 subscriber **47%→74%**, 4 subs **21%→50%** of 0-sub; all providers |
+| **SSE drain (shared)** | `iterate_subscriber` armed an `asyncio.wait_for` timer per event → `get_nowait` hot path, timer only when idle | 1 subscriber **64%→87%** (+43%), 4 subs **36%→69%** (+104%) of 0-sub; all providers |
 | internal queue | unbounded SPSC handoff → `put_nowait` / `get_nowait`-first | ~124 coroutine allocs/turn eliminated (GC/resource); +3-5% streaming |
 | transport b64 | large `read_file`/`write_file` codec → off-thread above 4 MB | partial loop isolation for multi-MB transfers (GIL-limited; see below) |
 | checkpoint write | INSERT…ON CONFLICT + separate DELETE prune → one data-modifying-CTE statement | **2 DB round-trips/turn → 1** on the turn-completion path (remote-PG latency) |
