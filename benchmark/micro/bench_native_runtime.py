@@ -13,6 +13,11 @@ It is the native counterpart to the supervisor-path ``load/`` benches: those
 need a running uvicorn + a real agent; this isolates the in-process runtime
 cost that multiplies across every concurrent session on a replica.
 
+Views: single-session text-turn rate, **tool-heavy** (a tool-call/tool-result
+loop — 2 model rounds + a tool exec per turn, exercising the tool/tool_result
+frames and the streamed tool-arg accumulator), concurrency scaling, with-
+subscriber fan-out, session-length scaling, and per-session RAM.
+
 **Run:** ``.venv/bin/python benchmark/micro/bench_native_runtime.py``
 Knobs (env): ``TURNS`` (per session, default 200), ``CHUNKS`` (text deltas per
 turn, default 60), ``LEVELS`` (concurrency points, default ``1,2,4,8,16,32``).
@@ -27,12 +32,14 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import os
 import time
 import tracemalloc
 
 from api.native.loop import NativeAgentSpec
 from api.native.session import NativeSession
+from api.native.tools import build_toolset
 from api.sandbox.state import NativeSandboxState
 
 
@@ -86,6 +93,80 @@ def _completion_for(chunks: int):
     return completion
 
 
+# ── tool-heavy shape: a tool-call/tool-result loop (the realistic agent) ─────
+class _TCDelta:
+    __slots__ = ("index", "id", "function")
+
+    def __init__(self, index, id=None, name=None, arguments=None):
+        self.index = index
+        self.id = id
+        self.function = type("F", (), {"name": name, "arguments": arguments})()
+
+
+class _ToolDelta:
+    __slots__ = ("content", "reasoning_content", "tool_calls")
+
+    def __init__(self, tool_calls):
+        self.content = None
+        self.reasoning_content = None
+        self.tool_calls = tool_calls
+
+
+class _ExecResult:
+    __slots__ = ("stdout", "stderr", "exit_code", "timed_out")
+
+    def __init__(self):
+        self.stdout, self.stderr, self.exit_code, self.timed_out = "ok", "", 0, False
+
+
+class _FakeTransport:
+    async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+        return _ExecResult()
+
+
+def _tool_completion(arg_size: int):
+    """Each tool-heavy turn = 2 model rounds: round 1 streams a bash tool_call
+    (its argument split into 8-char fragments, exercising the tool-arg
+    accumulator), round 2 returns text + usage → done. Drives the tool +
+    tool_result frame templates and the loop's tool-execution path."""
+    state = {"n": 0}
+
+    async def completion(**kwargs):
+        state["n"] += 1
+        if state["n"] % 2 == 1:
+            payload = json.dumps({"command": "echo " + "x" * arg_size})
+            frags = [payload[i:i + 8] for i in range(0, len(payload), 8)]
+
+            async def _it():
+                yield _Chunk(_ToolDelta([_TCDelta(0, id=f"c{state['n']}",
+                                                  name="bash")]))
+                for f in frags:
+                    yield _Chunk(_ToolDelta([_TCDelta(0, arguments=f)]))
+            return _it()
+
+        async def _done():
+            yield _Chunk(_Delta(content="done"))
+            yield _Chunk(usage=_Usage(100, 10))
+        return _done()
+    return completion
+
+
+def _make_tool_session(sid: str, arg_size: int) -> NativeSession:
+    s = NativeSession(session_id=sid,
+                      state=NativeSandboxState(provider="docker"))
+    s._started = True
+    s._spec = NativeAgentSpec(instructions="sys", max_turns=4)
+    s._tools = build_toolset(["bash"])
+    s._transport = _FakeTransport()
+    s._messages = [{"role": "system", "content": "sys"}]
+    s._completion = _tool_completion(arg_size)
+
+    async def _noop_ckpt(usage):
+        return None
+    s._checkpoint = _noop_ckpt  # type: ignore[method-assign]
+    return s
+
+
 def _make_session(sid: str, chunks: int) -> NativeSession:
     s = NativeSession(session_id=sid,
                       state=NativeSandboxState(provider="docker"))
@@ -122,6 +203,23 @@ async def _single(turns: int, chunks: int) -> None:
     print(f"single session: {turns} turns × {chunks} chunks")
     print(f"  {turns/dt:8.1f} turns/s   {events/dt/1e3:7.1f}k events/s   "
           f"{dt/turns*1e6:6.0f} µs/turn\n")
+
+
+async def _tool_heavy(turns: int, arg_sizes: tuple[int, ...] = (16, 4096)) -> None:
+    """Throughput of the tool-call/tool-result loop (2 model rounds + a tool
+    exec per turn). Exercises the tool/tool_result frame templates and the
+    streamed tool-arg accumulator — the paths the text-only single() never
+    touches. arg_size sweeps a small vs a large streamed tool argument."""
+    print(f"tool-heavy turns (2 model rounds + 1 tool exec each): {turns} turns")
+    print(f"  {'arg bytes':>10} {'turns/s':>10} {'ms/turn':>9}")
+    for arg in arg_sizes:
+        s = _make_tool_session("sess-tool", arg)
+        await _drive_turns(s, 3)
+        t0 = time.perf_counter()
+        await _drive_turns(s, turns)
+        dt = time.perf_counter() - t0
+        print(f"  {arg:>10} {turns/dt:>10.1f} {dt/turns*1e3:>9.2f}")
+    print()
 
 
 async def _scaling(levels: list[int], turns: int, chunks: int) -> None:
@@ -261,6 +359,7 @@ async def main() -> None:
     levels = [int(x) for x in os.environ.get("LEVELS", "1,2,4,8,16,32").split(",")]
     print(f"native runtime bench — turns={turns} chunks/turn={chunks}\n")
     await _single(turns, chunks)
+    await _tool_heavy(turns)
     await _scaling(levels, turns, chunks)
     await _with_subscribers(turns, chunks)
     await _session_growth(max(turns, 1200), chunks)
