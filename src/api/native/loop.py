@@ -147,19 +147,27 @@ def heal_dangling_tool_calls(messages: list[dict]) -> None:
 
 
 def _litellm_completion():
-    """Resolve ``litellm.acompletion`` with telemetry + debug banners disabled.
+    """Resolve ``litellm.acompletion`` with the native runtime's litellm config.
 
-    litellm ships ``telemetry=True`` by default, which egresses anonymized usage
-    (model, success/failure) to litellm's servers on calls — a server-side data
-    egress + per-call overhead we don't want from the native runtime. And
-    ``suppress_debug_info=False`` lets it print a provider-list banner to stderr.
-    Set both every time we resolve the real completion (cheap idempotent bool
-    writes; kept here rather than at import so the test seam never imports
-    litellm). No effect on completion behavior — telemetry is pure analytics.
+    - ``telemetry=False``: litellm ships this True, egressing anonymized usage
+      (model, success/failure) to litellm's servers on calls — a server-side
+      data egress + per-call overhead we don't want.
+    - ``suppress_debug_info=True``: don't print a provider-list banner to stderr.
+    - ``drop_params=True``: the native runtime runs ARBITRARY litellm models;
+      this loop always sends ``stream_options``/``tools``/``temperature`` etc.
+      A model that doesn't support one would otherwise ERROR the whole turn —
+      dropping the unsupported param degrades gracefully (e.g. a non-tool model
+      runs text-only) instead of failing. The default model supports them all,
+      so this is a no-op there.
+
+    Set on every resolve (cheap idempotent writes; kept off the import path so
+    the completion test seam never imports litellm). No effect on completion
+    behavior for a model that supports the params.
     """
     import litellm
     litellm.telemetry = False
     litellm.suppress_debug_info = True
+    litellm.drop_params = True
     return litellm.acompletion
 
 

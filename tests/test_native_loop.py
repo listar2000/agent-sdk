@@ -349,21 +349,24 @@ async def test_run_turn_passes_num_retries_for_transient_resilience():
     assert "num_retries" not in captured
 
 
-def test_litellm_completion_disables_telemetry_and_debug():
+def test_litellm_completion_sets_native_config():
     """The native runtime must not egress litellm's anonymized usage telemetry
-    on every model call, nor spam stderr with its provider banner. Resolving the
-    real completion disables both; it still returns litellm.acompletion."""
+    on every model call, must not spam stderr with its provider banner, and must
+    drop params an arbitrary model doesn't support (instead of failing the turn).
+    Resolving the real completion sets all three; it still returns acompletion."""
     import litellm
     from api.native.loop import _litellm_completion
 
     # simulate litellm's shipped defaults
     litellm.telemetry = True
     litellm.suppress_debug_info = False
+    litellm.drop_params = False
 
     fn = _litellm_completion()
     assert fn is litellm.acompletion
     assert litellm.telemetry is False
     assert litellm.suppress_debug_info is True
+    assert litellm.drop_params is True
 
 
 def test_native_spec_clamps_misconfigured_loop_knobs():
