@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import threading
@@ -533,3 +534,18 @@ _METRICS = MetricsRegistry()
 
 def get_metrics() -> MetricsRegistry:
     return _METRICS
+
+
+def timed_provider_op(provider: str, operation: str):
+    """Decorator for an async provider SDK entry point (daytona/modal
+    ``create_sandbox``, ``stop``, ``destroy``, ``exec``, …). Records its
+    latency + ok/fail under ``(provider, "sdk.<operation>")`` so cold_create
+    and friends decompose into the individual SDK calls — answering *which*
+    call is the bottleneck and how flaky each provider's API is."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            async with _METRICS.timed_op(provider=provider, operation=f"sdk.{operation}"):
+                return await fn(*args, **kwargs)
+        return wrapper
+    return deco

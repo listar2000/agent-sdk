@@ -17,7 +17,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-from api.metrics import MetricsRegistry, _category_for_logger
+from api.metrics import MetricsRegistry, _category_for_logger, get_metrics, timed_provider_op
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +152,33 @@ async def test_timed_op_records_per_provider_latency_and_flakiness():
     assert ops["cold_create@daytona"]["fail_rate"] == 0.0
     assert ops["cold_create@modal"]["fail_rate"] == 1.0
     assert ops["cold_create@daytona"]["p50"] is not None
+
+
+@pytest.mark.asyncio
+async def test_timed_provider_op_decorator_records_sdk_op_and_is_transparent():
+    """The provider decorator records under ``sdk.<op>@<provider>`` and is
+    transparent (preserves name + return value + raised exceptions)."""
+    reg = get_metrics()
+    reg.reset()
+    reg._op_batcher._pending.clear()
+
+    @timed_provider_op("daytona", "create_sandbox")
+    async def create(x):
+        return x * 2
+
+    @timed_provider_op("modal", "destroy")
+    async def boom():
+        raise RuntimeError("modal terminate failed")
+
+    assert create.__name__ == "create"          # functools.wraps preserved
+    assert await create(21) == 42                # return value passes through
+    with pytest.raises(RuntimeError):
+        await boom()
+
+    ops = reg.snapshot()["ops"]
+    assert ops["sdk.create_sandbox@daytona"]["count"] == 1
+    assert ops["sdk.create_sandbox@daytona"]["fail"] == 0
+    assert ops["sdk.destroy@modal"]["fail_rate"] == 1.0
 
 
 def test_phase_timing_is_bucketed_per_provider():
