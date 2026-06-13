@@ -52,9 +52,27 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
 | **SSE drain (shared)** | `iterate_subscriber` armed an `asyncio.wait_for` timer per event → `get_nowait` hot path, timer only when idle | 1 subscriber **47%→74%**, 4 subs **21%→50%** of 0-sub; all providers |
 | internal queue | unbounded SPSC handoff → `put_nowait` / `get_nowait`-first | ~124 coroutine allocs/turn eliminated (GC/resource); +3-5% streaming |
 | transport b64 | large `read_file`/`write_file` codec → off-thread above 4 MB | partial loop isolation for multi-MB transfers (GIL-limited; see below) |
+| checkpoint write | INSERT…ON CONFLICT + separate DELETE prune → one data-modifying-CTE statement | **2 DB round-trips/turn → 1** on the turn-completion path (remote-PG latency) |
+| tool schemas | `Tool.schema` rebuilt per turn → precomputed once in `__post_init__` | **4.8×/turn** (485→102 ns); ~20 dict allocs/turn dropped |
+| model-call kwargs | rebuilt every model round → hoisted, constant once per turn | per-round dict rebuild dropped on multi-round tool turns |
 
 ## Reliability
 
+* **Transient model-call retries** — LiteLLM `num_retries` (default 2,
+  configurable) retries the INITIAL completion call on rate-limit / 5xx /
+  connection-reset before the stream starts, so a blip no longer fails the whole
+  turn (no mid-stream double-emit).
+* **Checkpoint-write retries** — the per-turn conversation checkpoint is the
+  resume source of truth; a dropped write silently rewinds the conversation on
+  resume. The idempotent upsert is now retried (3 attempts, backoff) on a
+  transient DB failure, and never raises into the turn loop.
+* **Telemetry parity with the supervisor path** — native provisions compute
+  lazily in `_ensure_sandbox` (outside the pool's `timed_op`), so it was a blind
+  spot on `/admin/ops` and `/metrics`. Now records op timing (`cold_create` /
+  `cold_recover` / `resume`), a recovery signal on silent cold-recover, and
+  resource leaks (`native_hibernate_failed` = compute not freed,
+  `native_destroy_failed` = orphaned paid VM). Best-effort — never a new failure
+  mode on the provisioning path.
 * **Durable-wedge stress** — 8 sessions × 6 cycles of interrupt-mid-tool →
   recovery, asserting no dangling tool_calls (the provider-400 shape that bricks
   a session forever), no leaked task, recovery always succeeds.
@@ -62,6 +80,9 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
   asserting exactly one replacement sandbox per session (an orphan is a paid
   idle daytona/modal VM leaking until reclaimed).
 * **De-flaked** the b64 isolation test (wall-clock → mechanism assertion).
+
+Every change above carries a regression test verified to fail on the unfixed
+code (the loop's discipline); the full native suite stays green.
 
 ## Findings worth keeping
 
@@ -78,9 +99,13 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
 
 ## Deliberately deferred (need human review)
 
-* **Checkpoint write amplification** — `write_native_checkpoint` re-serializes
-  the full transcript to JSONB every turn (O(n²) DB-write bytes / serialization
-  CPU over a session, capped by the context-window ceiling). A bounded fix is an
-  append-only-delta + periodic-snapshot storage redesign — a schema migration on
-  a durability-critical table with retry-idempotency and crash-atomicity
-  implications. Out of scope for an automated change.
+* **Checkpoint write *volume*** — the per-turn round-trip is already halved (the
+  CTE above) and a transient-failure retry added, but `write_native_checkpoint`
+  still re-serializes the *full* transcript to JSONB every turn (O(n²) DB-write
+  bytes / serialization CPU over a session, capped by the context-window
+  ceiling). The bounded fix is an append-only-delta + periodic-snapshot storage
+  redesign — a schema migration on a durability-critical table with
+  retry-idempotency and crash-atomicity implications. Out of scope for an
+  automated change; needs human review.
+* **Context compaction** — the only lever left for per-session RAM and unbounded
+  context growth, but it changes what the model sees (a product decision).
