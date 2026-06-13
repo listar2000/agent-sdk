@@ -520,3 +520,36 @@ async def test_terminalless_stream_end_recovers_and_delivers_turn_end(monkeypatc
         "recovery did not deliver a turn_end after a terminal-less stream end "
         f"— the recovered reply is dropped. persisted: {etypes}"
     )
+
+
+@pytest.mark.asyncio
+async def test_persist_parallel_tool_round_preserves_order(monkeypatch):
+    """A parallel-tool round (native loop) emits ALL tool events, then ALL
+    tool_result events — not interleaved. TurnRunner writes each independently in
+    arrival order (no tool->result pairing assumption), so the round persists 3
+    tool rows then 3 tool_result rows with ids preserved, text coalesced, then
+    turn_end. Guards the parallel-tool emit order against a TurnRunner change."""
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "tool", "tool_call_id": "c1", "tool_name": "bash", "args": {}},
+        {"type": "tool", "tool_call_id": "c2", "tool_name": "bash", "args": {}},
+        {"type": "tool", "tool_call_id": "c3", "tool_name": "bash", "args": {}},
+        {"type": "tool_result", "tool_call_id": "c1", "tool_name": "bash",
+         "result": "a"},
+        {"type": "tool_result", "tool_call_id": "c2", "tool_name": "bash",
+         "result": "b"},
+        {"type": "tool_result", "tool_call_id": "c3", "tool_name": "bash",
+         "result": "c"},
+        {"type": "text", "text": "done"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    await _persist_prompt_events(sess, "go", "rpc-par")
+
+    from api.turn import _EVENT_TYPE_TO_LOG as M
+    types = [r[0] for r in rows if r[0] != "user_message"]
+    assert types == ([M["tool"]] * 3 + [M["tool_result"]] * 3
+                     + [M["text"], M["done"]])
+    tool_ids = [r[1]["tool_call_id"] for r in rows if r[0] == M["tool"]]
+    result_ids = [r[1]["tool_call_id"] for r in rows if r[0] == M["tool_result"]]
+    assert tool_ids == ["c1", "c2", "c3"]
+    assert result_ids == ["c1", "c2", "c3"]
