@@ -2797,7 +2797,10 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         if agent_type == "native":
             await sdk.session_sandbox_exec(
                 sid, f"printf %s reap-marker-31337 > {marker_path}",
-                timeout=30)
+                # 30s read-timeouts under -n auto: the trivial exec is fast,
+                # but the server proxying it to a daytona sandbox can be slow
+                # when daytona's control plane is saturated by the create burst.
+                timeout=90)
             ref_before = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
             assert ref_before, "native session has no sandbox_ref before reap"
 
