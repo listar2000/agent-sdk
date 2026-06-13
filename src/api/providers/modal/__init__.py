@@ -46,6 +46,7 @@ from .._shared import (
     build_supervisor_argv,
 )
 from .._volume import ShellVolumeAdapter
+from ...metrics import timed_provider_op
 
 log = logging.getLogger(__name__)
 
@@ -348,6 +349,7 @@ async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | N
         ) from e
 
 
+@timed_provider_op("modal", "create_sandbox")
 async def create_sandbox(
     *,
     volume_ref: str,
@@ -655,6 +657,7 @@ async def get_sandbox_status(ref: str) -> str:
     return "missing"
 
 
+@timed_provider_op("modal", "start")
 async def start_sandbox(ref: str) -> None:
     """Modal sandboxes cannot be resumed after terminate.
 
@@ -667,6 +670,7 @@ async def start_sandbox(ref: str) -> None:
     )
 
 
+@timed_provider_op("modal", "stop")
 async def stop_sandbox(inst: ProviderInstance) -> None:
     """Terminate the sandbox. Modal has no pause — this is destructive."""
     sid = inst.sandbox_ref or inst.container_id
@@ -684,6 +688,7 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
         log.warning("modal stop %s: %s", sid, e)
 
 
+@timed_provider_op("modal", "destroy")
 async def destroy_sandbox(inst: ProviderInstance) -> None:
     """Destroy the sandbox. Same as ``stop_sandbox`` — Modal has no two-tier."""
     await stop_sandbox(inst)

@@ -52,7 +52,8 @@ if not os.environ.get("TEST_DATABASE_URL"):
 
 
 # ``sandboxes`` was dropped in commit 27f0cc9 (sandbox_state JSONB took over).
-_DB_TABLES = ("session_log", "sessions", "volumes", "agents")
+# ``error_events`` / ``op_events`` have no FK, so DELETE order is moot.
+_DB_TABLES = ("error_events", "op_events", "session_log", "sessions", "volumes", "agents")
 
 
 @pytest.fixture(scope="session", autouse=True)

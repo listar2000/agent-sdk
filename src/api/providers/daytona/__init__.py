@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from ... import load_dotenv
+from ...metrics import timed_provider_op
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ async def _get_async_daytona_client():
         return _DAYTONA_CLIENT_ASYNC
 
 
+@timed_provider_op("daytona", "start_supervisor")
 async def start_supervisor_in_sandbox(
     sandbox, agent_type: str, port: int, root: str = "/tmp",
     spawn_env: dict[str, str] | None = None,
@@ -561,11 +563,13 @@ async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
         log.warning("failed to %s daytona sandbox %s: %s", op, instance.sandbox_ref, e)
 
 
+@timed_provider_op("daytona", "destroy")
 async def destroy_daytona(instance: ProviderInstance) -> None:
     """Delete a Daytona sandbox."""
     await _daytona_sandbox_op(instance, "delete")
 
 
+@timed_provider_op("daytona", "stop")
 async def stop_daytona(instance: ProviderInstance) -> None:
     """Stop (not delete) a Daytona sandbox so it can be resumed later."""
     await _daytona_sandbox_op(instance, "stop")
@@ -907,6 +911,7 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     return ExecResult(stdout=out, stderr=err, exit_code=code, stdout_truncated=trunc)
 
 
+@timed_provider_op("daytona", "create_sandbox")
 async def create_sandbox(
     *,
     volume_ref: str,

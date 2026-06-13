@@ -184,6 +184,17 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     "DaytonaSandboxSession: reattach to %s failed (%s); destroying + cold-creating",
                     (self.state.sandbox_ref or "")[:16], e,
                 )
+                # Silent recovery: the wedged VM is torn down and a fresh one
+                # cold-created from the /vol snapshot. The user sees no error,
+                # but this is exactly the churn the daytona-flood incident was
+                # about, so track it (provider + as a recovery signal).
+                try:
+                    from api.metrics import get_metrics
+                    await get_metrics().record_recovery(
+                        "reattach_fallback", provider="daytona",
+                        session_id=self.session_id)
+                except Exception:
+                    pass
                 # Destroy the unreachable old VM instead of abandoning it — an
                 # abandoned ref leaks against the account disk quota (no
                 # automated prod reclaim: reconcile is boot-only, cleanup_orphans
