@@ -925,19 +925,26 @@ async def write_native_checkpoint(*, session_id: str, turn_seq: int,
     correctness. Upsert on (session_id, turn_seq) makes the retry path
     after a recovery swap idempotent. Prunes rows older than ``keep_last``
     turns in the same call so storage stays O(keep_last) per session.
+
+    The upsert and the prune ride a SINGLE statement (the upsert as a
+    data-modifying CTE, which Postgres always executes to completion) — one
+    round-trip per turn instead of two, on the turn-completion critical path
+    that TurnRunner awaits before finalizing. The DELETE sees the pre-statement
+    snapshot, so it never targets the just-written row (its turn_seq is above
+    the prune threshold regardless).
     """
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO native_transcripts (session_id, turn_seq, messages, usage)"
+            "WITH upsert AS ("
+            " INSERT INTO native_transcripts (session_id, turn_seq, messages, usage)"
             " VALUES (%s, %s, %s, %s)"
             " ON CONFLICT (session_id, turn_seq)"
-            " DO UPDATE SET messages = EXCLUDED.messages, usage = EXCLUDED.usage",
-            (session_id, turn_seq, Json(messages), Json(usage or {})),
-        )
-        await conn.execute(
-            "DELETE FROM native_transcripts"
+            " DO UPDATE SET messages = EXCLUDED.messages, usage = EXCLUDED.usage"
+            ")"
+            " DELETE FROM native_transcripts"
             " WHERE session_id = %s AND turn_seq <= %s",
-            (session_id, turn_seq - keep_last),
+            (session_id, turn_seq, Json(messages), Json(usage or {}),
+             session_id, turn_seq - keep_last),
         )
 
 
