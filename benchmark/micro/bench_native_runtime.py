@@ -413,6 +413,45 @@ async def _session_growth(turns: int, chunks: int, buckets: int = 4) -> None:
     print("  (flat = O(1) per turn; rising = a hidden O(n²) over the session)\n")
 
 
+async def _checkpoint_serialization(turns: int, chunks: int, buckets: int = 5) -> None:
+    """The per-turn checkpoint cost the OTHER views can't see. The real
+    ``_checkpoint`` serializes the FULL ``_messages`` array to JSONB EVERY turn
+    (``db.write_native_checkpoint`` via psycopg's ``Json`` adapter), so both its
+    CPU and the bytes written to Postgres grow O(n) per turn → O(n²) over the
+    session (docs/native_checkpoint_writevolume_design.md). Every other view
+    stubs the checkpoint (``_noop_ckpt``, no DB), so ``_session_growth``'s
+    "flat = O(1)" canary structurally CANNOT see this one. Here we measure
+    ``json.dumps(_messages)`` — what the ``Json`` adapter does — per bucket:
+    rising serialize-µs + payload-KB quantify whether the deferred
+    delta-checkpoint migration is worth it at realistic conversation lengths.
+
+    NOTE: synthetic messages here are small (a few chars), so the absolute µs is
+    a LOWER BOUND — real turns carry tool args / file contents. The SHAPE (linear
+    in msg count, flat µs/msg) is the signal, and it's payload-size-independent."""
+    import json
+    s = _make_session("sess-ckpt", chunks)
+    await _drive_turns(s, 3)  # warmup
+    per = max(1, turns // buckets)
+    print(f"checkpoint serialization cost as one session grows "
+          f"({turns} turns × {chunks} chunks)")
+    print(f"  {'turns so far':>13} {'msgs':>6} {'serialize µs':>13} "
+          f"{'payload KB':>11} {'µs/msg':>8}")
+    done = 0
+    for _b in range(buckets):
+        await _drive_turns(s, per)
+        done += per
+        reps = 5
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            blob = json.dumps(s._messages)
+        ser_us = (time.perf_counter() - t0) / reps * 1e6
+        n = len(s._messages)
+        print(f"  {done:>13} {n:>6} {ser_us:>13.0f} {len(blob)/1024:>11.1f} "
+              f"{ser_us/n:>8.2f}")
+    print("  (serialize µs + payload KB rise ~linearly with msgs → O(n²) write-"
+          "volume over the session; µs/msg ~flat = it's array size, not per-msg)\n")
+
+
 async def _ram(n: int, turns: int, chunks: int) -> None:
     """Per-session resident RAM after a conversation of ``turns`` turns."""
     gc.collect()
@@ -445,6 +484,7 @@ async def main() -> None:
     await _scaling(levels, turns, chunks)
     await _with_subscribers(turns, chunks)
     await _session_growth(max(turns, 1200), chunks)
+    await _checkpoint_serialization(max(turns, 1200), chunks)
     await _ram(max(levels), turns, chunks)
 
 

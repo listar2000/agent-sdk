@@ -19,6 +19,33 @@ window, so `n` is capped (~hundreds of messages / ~1 MB JSON at a 200k-token
 window) — but a long session at high context still re-ships its whole transcript
 every turn (~100× write amplification for a 200-turn session).
 
+### Measured cost (benchmark/micro/bench_native_runtime.py `_checkpoint_serialization`)
+
+Per-turn `json.dumps(_messages)` — exactly what psycopg's `Json` adapter pays on
+every `write_native_checkpoint` — as one session deepens (synthetic SMALL
+messages, so these are a **lower bound**; real turns carry tool args / file
+contents):
+
+| msgs | serialize µs/turn | payload KB/turn | µs/msg |
+|---:|---:|---:|---:|
+| 807 | 351 | 159 | 0.43 |
+| 1607 | 591 | 316 | 0.37 |
+| 2407 | 927 | 474 | 0.39 |
+| 3207 | 1302 | 631 | 0.41 |
+| 4007 | 1478 | 788 | 0.37 |
+| 4807 | 1857 | 946 | 0.39 |
+
+`µs/msg` is flat → strictly O(n) per turn (O(n²) cumulative). The takeaway that
+reframes the whole loop: the **loop** per-turn cost is ~118 µs and FLAT
+(`_session_growth`), so by ~4800 messages the checkpoint serialize (~1.86 ms) is
+**~16× the entire loop** and still climbing — it is the dominant per-turn cost
+for deep sessions, and it's GIL-holding on the event-loop thread (psycopg
+serializes the param inline), so it stalls every other session on the replica
+for that window. Plus ~0.95 MB/turn of WAL+network at that depth. Every hot-path
+micro-optimization in this branch is dwarfed by this once a conversation gets
+long. This is the single biggest remaining native scalability lever — and it's
+the one that needs human sign-off (durability-critical schema migration).
+
 ### Already shipped (orthogonal, keep regardless)
 - **1 round-trip/turn** — upsert + prune folded into one data-modifying CTE.
 - **Transient-failure retry** — idempotent upsert retried 3× with backoff; a DB

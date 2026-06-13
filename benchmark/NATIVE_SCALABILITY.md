@@ -122,16 +122,21 @@ green and non-flaky under `-n auto`.
 
 ## Deliberately deferred (need human review)
 
-* **Checkpoint write *volume*** — the per-turn round-trip is already halved (the
-  CTE above) and a transient-failure retry added, but `write_native_checkpoint`
-  still re-serializes the *full* transcript to JSONB every turn (O(n²) DB-write
-  bytes / serialization CPU over a session, capped by the context-window
-  ceiling). The bounded fix is an append-only-delta + periodic-snapshot storage
-  redesign — a schema migration on a durability-critical table with
-  retry-idempotency and crash-atomicity implications. Out of scope for an
-  automated change; needs human review. **A worked design proposal (schema,
-  resume reconstruction, the subtle delta↔heal interaction, and a data-driven
-  "implement only if…" recommendation) is at
+* **Checkpoint write *volume* — now measured to be the single biggest remaining
+  lever.** The per-turn round-trip is already halved (the CTE above) and a
+  transient-failure retry added, but `write_native_checkpoint` still
+  re-serializes the *full* transcript to JSONB every turn (O(n²) over a session).
+  The `_checkpoint_serialization` bench view quantifies it: at ~4800 messages the
+  per-turn serialize is **~1.86 ms (GIL-holding, on the loop thread) + ~0.95 MB
+  to Postgres**, ~16× the flat ~118 µs loop cost and still climbing — so for deep
+  sessions this dominates every hot-path micro-opt in this branch (which are all
+  flat in conversation length). Every other bench view stubs the checkpoint
+  (`_noop_ckpt`), so `_session_growth`'s "flat O(1)" canary structurally can't
+  see it — `_checkpoint_serialization` is the view that does. The bounded fix is
+  an append-only-delta + periodic-snapshot redesign — a schema migration on a
+  durability-critical table with retry-idempotency and crash-atomicity
+  implications, so it needs human review. **Worked design + the measurement
+  table:
   [`docs/native_checkpoint_writevolume_design.md`](../docs/native_checkpoint_writevolume_design.md).**
 * **Context compaction** — the only lever left for per-session RAM and unbounded
   context growth, but it changes what the model sees (a product decision).
