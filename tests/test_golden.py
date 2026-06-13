@@ -2455,7 +2455,12 @@ _ATTEMPTS = 3
 # Delay after POST returns rpc_id before stopping — long enough for the
 # background drain to register its subscriber and start execute_prompt.
 _KILL_DELAY_S = 0.6
-_TERMINAL_TIMEOUT_S = 180.0
+# Terminal-event budget for a mid-prompt recovery (kill sandbox -> cold-recover
+# -> resume -> reply). 300s, not 180s: under -n auto the recovery's daytona
+# cold-create queues behind the provisioning semaphore, so the legit recovery
+# latency tail runs longer than a lightly-loaded run. This is the precondition
+# (term is not None) — the leak assertion it guards is unaffected.
+_TERMINAL_TIMEOUT_S = 300.0
 _SETTLE_TIMEOUT_S = 15.0
 # A turn long enough to still be running when the stop lands.
 _LONG_PROMPT = "Count from 1 to 40, one number per line. Do not stop early."
@@ -2797,7 +2802,10 @@ async def test_idle_session_with_open_subscriber_is_reaped(provider, agent_type)
         if agent_type == "native":
             await sdk.session_sandbox_exec(
                 sid, f"printf %s reap-marker-31337 > {marker_path}",
-                timeout=30)
+                # 30s read-timeouts under -n auto: the trivial exec is fast,
+                # but the server proxying it to a daytona sandbox can be slow
+                # when daytona's control plane is saturated by the create burst.
+                timeout=90)
             ref_before = (await _get_sandbox(sdk, sid)).get("sandbox_ref")
             assert ref_before, "native session has no sandbox_ref before reap"
 
@@ -3338,4 +3346,153 @@ async def test_tool_effects_matrix(provider, agent_type):
             "word beta with DELTA. Change nothing else."
         ))
         assert await _cat_exact(sdk, sid, "editme.txt") == "alpha DELTA gamma"
+
+
+async def _wedge_supervisor_in_sandbox(sandbox: dict) -> dict:
+    """Force the WEDGED state — sandbox reports 'running' (so start() chooses
+    REATTACH) but the supervisor is unreachable (so the reattach health probe
+    fails) — deterministically, per provider. This is the race-free trigger for
+    the reattach-health-failure path.
+
+    The mechanism differs because of WHERE the supervisor sits:
+      * unix_local — the supervisor IS the host process; SIGSTOP it (a KILL
+        would make get_sandbox_status's proc.poll() report 'stopped').
+      * docker — the supervisor IS PID 1; SIGSTOP it from the HOST via the
+        cgroup freezer (``docker kill --signal=STOP``). NOT ``docker exec ...
+        kill -STOP 1`` (an exec'd process can't reliably stop PID 1) and NOT
+        ``docker pause`` (which flips State.Status to 'paused' -> not
+        reattachable). The container stays 'running', supervisor frozen.
+      * modal — the supervisor is a CHILD of modal's init; KILL it (the
+        sandbox/init stays alive -> status 'running'). KILL, not SIGSTOP: a
+        suspended child wedges modal's ``Sandbox.exec``/``proc.wait`` (observed
+        19-min hang); killing it returns cleanly (same path as
+        _kill_supervisor_in_sandbox).
+
+    Returns a token for _cleanup_wedged_supervisor.
+    """
+    import signal
+
+    provider = sandbox["provider"]
+    ref = sandbox.get("sandbox_ref") or sandbox.get("provider_ref", "")
+    loop = asyncio.get_event_loop()
+
+    if provider == "unix_local":
+        pid = _local_supervisor_pid(sandbox)
+        assert pid, f"could not resolve unix_local supervisor pid: {sandbox}"
+        os.kill(pid, signal.SIGSTOP)
+        return {"provider": provider, "ref": ref, "pid": pid}
+
+    if provider == "docker":
+        await loop.run_in_executor(None, lambda: subprocess.run(
+            ["docker", "kill", "--signal=STOP", ref],
+            capture_output=True, timeout=20))
+        return {"provider": provider, "ref": ref}
+
+    if provider == "modal":
+        import modal
+        sb = await loop.run_in_executor(None, lambda: modal.Sandbox.from_id(ref))
+        proc = await loop.run_in_executor(
+            None, lambda: sb.exec("bash", "-c", _PROC_KILL_SUPERVISOR))
+        await loop.run_in_executor(None, proc.wait)
+        return {"provider": provider, "ref": ref}
+
+    raise AssertionError(f"no wedge path for provider {provider!r}")
+
+
+async def _cleanup_wedged_supervisor(token: dict) -> None:
+    """Reap the wedged-and-abandoned supervisor/sandbox so it can't linger past
+    the test. Recovery cold-created a FRESH sandbox; the wedged one is orphaned
+    (docker destroys it in _on_wedged_reattach; modal/unix_local only clear the
+    ref, so it must be reaped here)."""
+    import signal
+
+    provider = token["provider"]
+    ref = token.get("ref", "")
+    loop = asyncio.get_event_loop()
+
+    if provider == "unix_local":
+        for sig in (signal.SIGCONT, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(token["pid"], sig)
+    elif provider == "docker":
+        # unfreeze (in case recovery didn't destroy it — the RED path) then rm.
+        for args in (["docker", "kill", "--signal=CONT", ref],
+                     ["docker", "rm", "-f", ref]):
+            await loop.run_in_executor(
+                None, lambda a=args: subprocess.run(
+                    a, capture_output=True, timeout=15))
+    elif provider == "modal":
+        with contextlib.suppress(Exception):
+            import modal
+            sb = await loop.run_in_executor(
+                None, lambda: modal.Sandbox.from_id(ref))
+            await loop.run_in_executor(None, sb.terminate)
+
+
+@pytest.mark.parametrize("provider", ["unix_local", "docker", "modal"])
+@pytest.mark.asyncio
+async def test_wedged_reattach_cold_recovers_not_500(provider):
+    """DETERMINISTIC wedged-reattach recovery across EVERY supervisor-template
+    provider (unix_local / docker / modal). Daytona is EXCLUDED — it has its own
+    start() that ALREADY cold-recovers on a failed reattach (see
+    DaytonaSandboxSession._resolve_or_create_sandbox), so there is no bug to
+    catch there; its recovery is covered by the test_*_daytona goldens.
+
+    start() reattaches to a persisted sandbox when the provider reports it
+    reattachable, then health-gates. If the supervisor is dead/unresponsive but
+    the sandbox is still 'running', the pre-fix template RAISED
+    ``_health_fail_msg``, which escaped ``get_session`` as a 500 on POST /message
+    and stranded the caller's turn.
+    (test_persistent_sse_supervisor_killed_immediate_message hits the same path
+    but only via a control-plane TIMING RACE — so it flakes under load. This one
+    is race-free.)
+
+    We force the wedged state by SUSPENDING (SIGSTOP) the supervisor: the
+    sandbox/process stays alive (status 'running' -> reattach chosen) while its
+    HTTP server is suspended (health probe times out -> wedged).
+
+    Invariant: turn 2 returns a non-empty reply AND the session is now backed by
+    a DIFFERENT sandbox ref — start() abandoned the wedged sandbox and
+    cold-created a fresh one on the volume IN THE SAME request, never 500.
+    """
+    _require_provider(provider)
+
+    def _ref_of(sb: dict) -> str:
+        return sb.get("sandbox_ref") or sb.get("provider_ref") or ""
+
+    async with ApiClient(SERVER) as sdk:
+        sess = await _quick_session(sdk, provider, agent_type="claude")
+        session_id = sess["session_id"]
+        print(f"\n[test:{provider}] session={session_id[:8]}")
+
+        async with _PersistentSse(sdk, session_id) as sse:
+            reply1 = await _ask_on_stream(
+                sdk, session_id, sse, "Reply with a single short word.")
+            assert reply1.strip(), f"turn 1 empty: {reply1!r}"
+
+            sandbox = await _get_sandbox(sdk, session_id)
+            ref_before = _ref_of(sandbox)
+
+            token = await _wedge_supervisor_in_sandbox(sandbox)
+            try:
+                try:
+                    reply2 = await _ask_on_stream(
+                        sdk, session_id, sse, "Reply with a single short word.")
+                except Exception as exc:
+                    pytest.fail(
+                        f"[{provider}] turn 2 RAISED instead of recovering — "
+                        "wedged reattach (suspended supervisor, sandbox still "
+                        "'running') 500'd on POST /message instead of "
+                        f"cold-creating fresh: {exc!r}")
+                assert reply2.strip(), (
+                    f"[{provider}] turn 2 empty — wedged reattach did not "
+                    f"cold-recover on the volume. Reply was: {reply2!r}")
+            finally:
+                await _cleanup_wedged_supervisor(token)
+
+            ref_after = _ref_of(await _get_sandbox(sdk, session_id))
+            assert ref_after and ref_after != ref_before, (
+                f"[{provider}] recovery must cold-create a FRESH sandbox (the "
+                f"wedged one was abandoned); ref unchanged: "
+                f"{ref_before!r} -> {ref_after!r}")
 

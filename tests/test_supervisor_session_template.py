@@ -120,32 +120,59 @@ async def test_stopped_sandbox_is_revived_not_recreated(
 
 # ── wedged reattach: who destroys, who only clears ───────────────────────────
 
+def _wedged_then_fresh_health(seen, monkeypatch):
+    """Reattach health FAILS (wedged), the subsequent fresh-create health
+    PASSES — the real wedged-recovery shape (the dead supervisor fails, the
+    cold-created one comes up)."""
+    results = iter([False])
+
+    async def _health(url, max_retries=10, interval=0.3):
+        seen["calls"].append(("health", max_retries, interval))
+        return next(results, True)
+
+    monkeypatch.setattr("api.providers._shared._wait_for_health", _health)
+
+
 @pytest.mark.asyncio
-async def test_docker_wedged_reattach_destroys_container_and_clears_ref(monkeypatch):
+async def test_docker_wedged_reattach_destroys_then_cold_creates(monkeypatch):
+    """Wedged reattach (sandbox 'running' but supervisor unhealthy) must NOT
+    500 the caller. docker DESTROYS the wedged container, clears the ref, and
+    cold-creates a fresh sandbox IN THE SAME start(). Pre-fix this raised
+    '...not responding', which escaped get_session as a 500 on POST /message
+    and stranded the turn (golden: test_wedged_reattach_cold_recovers_not_500).
+    """
     import api.providers.docker as dk
     state = DockerSandboxState(recipe=Recipe())
     state.sandbox_ref = "wedged-1"
     state.listen_port = 9000
     sess = DockerSandboxSession(session_id="sess-wedge", state=state)
-    seen = _wire(monkeypatch, sess, dk, status="running", health_ok=False)
-    with pytest.raises(RuntimeError, match="not responding"):
-        await sess.start()
-    assert ("destroy", "wedged-1") in seen["calls"]
-    assert sess.state.sandbox_ref is None
+    seen = _wire(monkeypatch, sess, dk, status="running")
+    _wedged_then_fresh_health(seen, monkeypatch)
+
+    await sess.start()                                  # recovers, no raise
+
+    assert ("destroy", "wedged-1") in seen["calls"]     # wedged container torn down
+    assert ("create", "fresh-1") in seen["calls"]       # cold-created fresh
+    assert sess.state.sandbox_ref == "fresh-1"          # now backed by the fresh one
 
 
 @pytest.mark.asyncio
-async def test_unix_local_wedged_reattach_only_clears_ref(monkeypatch):
+async def test_unix_local_wedged_reattach_clears_then_cold_creates(monkeypatch):
+    """unix_local has no container to destroy: it clears the wedged ref and
+    cold-creates fresh (no destroy call). Also no 500."""
     import api.providers.unix_local as lc
     state = UnixLocalSandboxState(recipe=Recipe())
     state.sandbox_ref = "wedged-2"
     state.listen_port = 9001
     sess = UnixLocalSandboxSession(session_id="sess-wedge2", state=state)
-    seen = _wire(monkeypatch, sess, lc, status="running", health_ok=False)
-    with pytest.raises(RuntimeError, match="not responding"):
-        await sess.start()
+    seen = _wire(monkeypatch, sess, lc, status="running")
+    _wedged_then_fresh_health(seen, monkeypatch)
+
+    await sess.start()                                  # recovers, no raise
+
     assert not any(c[0] == "destroy" for c in seen["calls"])
-    assert sess.state.sandbox_ref is None
+    assert ("create", "fresh-1") in seen["calls"]
+    assert sess.state.sandbox_ref == "fresh-1"
 
 
 # ── fresh-create health failure must NOT clear the ref ──────────────────────

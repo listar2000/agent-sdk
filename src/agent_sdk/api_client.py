@@ -379,7 +379,10 @@ class ApiClient:
         session is a no-op."""
         return await self._json(
             "POST", f"/sessions/{session_id}/release",
-            timeout=httpx.Timeout(5.0, read=10.0),
+            # Release SNAPSHOTS before dropping the lease; on daytona the
+            # S3-FUSE tarball snapshot can take tens of seconds under
+            # concurrent load, so a 10s read timeout spuriously ReadTimeouts.
+            timeout=httpx.Timeout(5.0, read=60.0),
         )
 
     async def reload_session(

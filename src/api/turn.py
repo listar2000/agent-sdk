@@ -233,7 +233,16 @@ class TurnRunner:
                     if t in ("done", "error"):
                         terminal = True
             await self._flush_buffers()
-            return True, None
+            # A stream that ENDS WITHOUT a done/error is NOT a successful turn:
+            # the supervisor died mid-prompt and the SSE EOF'd cleanly (no
+            # exception) — a killed daytona supervisor does this after its proxy
+            # holds the dead connection ~180s. Returning ``True`` here claimed
+            # success, so run() neither recovered nor wrote a terminal, and the
+            # client polling /log (or /events) waited forever for a turn_end
+            # that was never persisted: a silently DROPPED prompt. Report
+            # ``terminal`` (False when none was seen) so run() recovers or
+            # writes an error.
+            return terminal, None
         except Exception as e:
             return terminal, e
 
@@ -274,7 +283,11 @@ class TurnRunner:
                 # would otherwise land on a dict that was cleared during the
                 # migration, and the SDK would time out waiting for an event
                 # that never arrives.
-                if not ok and exc is not None:
+                # Retry on ANY non-terminal outcome — an exception OR a clean
+                # stream end that produced no terminal (both mean the supervisor
+                # died mid-prompt). The pool may already have cold-recovered a
+                # replacement session; re-drive the prompt on it.
+                if not ok:
                     try:
                         from api.sandbox import get_pool as _gp
                         replacement = await _gp().get_session(self.session.session_id)

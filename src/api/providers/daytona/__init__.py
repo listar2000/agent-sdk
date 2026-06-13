@@ -381,14 +381,19 @@ async def provision_daytona_sandbox(
                 "scripts/release.sh)."
             )
 
-    # 60s for plain image-create works in light load but Daytona's
-    # control plane queues sandbox provisioning, so under -n auto with
-    # 32 concurrent test workers (or production at >10 prompts/sec) the
-    # snapshot-create itself can take 90-150s. The dockerfile path was
-    # always at 300s for the same reason. Use a single generous budget;
-    # this isn't a retry — it's giving Daytona enough room to provision
-    # one sandbox.
-    create_timeout = 300 if dockerfile else 240
+    # Daytona's control plane QUEUES provisioning. On a healthy account a
+    # create returns in seconds even under the full `-n auto` burst, but when
+    # the account is saturated (orphan/disk pressure from prior runs, or
+    # production at >10 prompts/sec) the queue+provision time can run long. We
+    # deliberately do NOT throttle create concurrency — that caps throughput
+    # and serializes provisioning; instead we give each create a generous
+    # CEILING so the legit tail fits without spurious "Function 'create'
+    # exceeded timeout" / 502 failures. This is a ceiling, not the typical
+    # latency. Not a retry — one create, enough room. Env-overridable per
+    # deployment; pair with orphan hygiene (cleanup_orphans.py) to keep the
+    # account fast.
+    _base = 540 if dockerfile else 480
+    create_timeout = int(os.environ.get("DAYTONA_CREATE_TIMEOUT_S", str(_base)))
 
     volumes = _build_volume_mounts(volume_id, subpath, shared_mounts)
     labels = _sandbox_labels()
