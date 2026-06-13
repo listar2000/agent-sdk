@@ -859,6 +859,57 @@ async def get_op_stats(*, since_s: float | None = None) -> list[dict]:
     return out
 
 
+async def error_timeseries(*, since_s: float | None = None, buckets: int = 48,
+                           scope: str = "errors") -> dict:
+    """Error-event counts bucketed evenly across the window — the data behind the
+    dashboard's "errors over time" graph.
+
+    Returns ``{"t0": <window-start epoch>, "bucket_s": <seconds/bucket>,
+    "counts": [n0, n1, ...]}`` with EXACTLY ``buckets`` entries (empty buckets
+    zero-filled) so the UI draws a continuous axis. ``scope`` is allow-listed
+    (errors / recovery / leak), same category constraint as ``_group_errors``:
+    ``errors`` excludes recoveries + leaks."""
+    assert scope in ("errors", "recovery", "leak")
+    import time as _time
+    from datetime import datetime, timezone
+
+    buckets = max(1, min(int(buckets), 240))
+    now = _time.time()
+    cat_sql, cat_params = (
+        ("category NOT IN ('recovery','leak')", [])
+        if scope == "errors" else ("category = %s", [scope]))
+
+    # Window start: explicit since_s, else the earliest matching event (all-time),
+    # else a 1h fallback so an empty table still yields a sane axis.
+    if since_s is not None:
+        t0 = float(since_s)
+    else:
+        row = await _one(
+            f"SELECT EXTRACT(EPOCH FROM MIN(ts)) AS t0 FROM error_events"
+            f" WHERE {cat_sql}", tuple(cat_params))
+        t0 = float(row["t0"]) if row and row["t0"] is not None else now - 3600.0
+
+    span = max(now - t0, 1.0)
+    bucket_s = span / buckets
+    # width_bucket(x, low, high, count) → 1..count within [low,high); we filter
+    # ts >= t0 so it's >= 1, and clamp the high edge (ts == now → count+1) down.
+    rows = await _all(
+        "SELECT width_bucket(EXTRACT(EPOCH FROM ts), %s, %s, %s) AS b,"
+        " COUNT(*) AS n"
+        f" FROM error_events WHERE ts >= %s AND {cat_sql}"
+        " GROUP BY b ORDER BY b",
+        (t0, now, buckets,
+         datetime.fromtimestamp(t0, tz=timezone.utc), *cat_params),
+    )
+    counts = [0] * buckets
+    for r in rows:
+        if r["b"] is None:
+            continue
+        i = min(max(int(r["b"]) - 1, 0), buckets - 1)
+        counts[i] += r["n"]
+    return {"t0": t0, "bucket_s": bucket_s, "counts": counts}
+
+
 async def _group_errors(group_col: str, *, scope: str, since_s: float | None) -> dict:
     """``{value: count}`` over error_events grouped by one column.
 
@@ -899,6 +950,7 @@ async def get_metrics_summary(*, since_s: float | None = None) -> dict:
             "by_category": errors_by_cat,
             "by_provider": await _group_errors("provider", scope="errors", since_s=since_s),
             "by_http_status": await _group_errors("http_status", scope="errors", since_s=since_s),
+            "timeseries": await error_timeseries(since_s=since_s),
         },
         "recoveries": {
             "by_kind": (rec := await _group_errors("phase", scope="recovery", since_s=since_s)),

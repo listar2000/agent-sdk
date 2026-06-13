@@ -45,6 +45,12 @@
   .muted { color: var(--muted); }
   .empty { color: var(--muted); padding: 16px; text-align: center; }
   .err { color: #ffb4c4; font-size: 12px; }
+  /* per-operation error-rate bar (one per row + per op-group header) */
+  .frbar { display: inline-block; width: 54px; height: 7px; background: #EDF0F3; border-radius: 3px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
+  .frbar-fill { display: block; height: 100%; border-radius: 3px; min-width: 0; }
+  /* errors-over-time graph */
+  .graph svg { display: block; width: 100%; height: 96px; }
+  .graph .axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 3px; }
 </style>
 </head>
 <body>
@@ -69,6 +75,11 @@
   </div>
 
   <div class="grid" id="cards"></div>
+
+  <div class="panel graph">
+    <h2>Errors over time</h2>
+    <div id="errGraph"><div class="muted">loading…</div></div>
+  </div>
 
   <div class="row-flex">
     <div class="panel" style="flex:1; min-width:240px"><h2>Errors by category</h2><div class="chips" id="byCategory"></div></div>
@@ -108,6 +119,44 @@ function catPill(c) {
   return `<span class="pill ${cls}">${c || "—"}</span>`;
 }
 
+// Small inline bar for an operation's fail rate (fixed 0–100% scale; any
+// non-zero rate gets a visible minimum so "flaky" reads at a glance, green=0).
+function frBar(rate) {
+  rate = rate || 0;
+  const pct = rate * 100;
+  const w = rate > 0 ? Math.max(6, Math.min(100, pct)) : 0;
+  const col = rate >= 0.20 ? '#E01E5A' : (rate >= 0.05 ? '#ECB22E'
+            : (rate > 0 ? '#E8912D' : '#2EB67D'));
+  return `<span class="frbar" title="${pct.toFixed(1)}% fail rate">` +
+         `<span class="frbar-fill" style="width:${w}%;background:${col}"></span></span>`;
+}
+
+// SVG bar chart of errors per time bucket (errors.timeseries from /metrics).
+function renderErrGraph(ts) {
+  const el = $("errGraph");
+  const counts = (ts && ts.counts) || [];
+  if (!counts.length) { el.innerHTML = '<div class="muted">no error data in window 🎉</div>'; return; }
+  const n = counts.length, max = Math.max(1, ...counts), total = counts.reduce((a, b) => a + b, 0);
+  const W = 1000, H = 96, base = H - 14, top = 6, bw = W / n;
+  let bars = "";
+  for (let i = 0; i < n; i++) {
+    const c = counts[i];
+    const h = c ? Math.max(2, (c / max) * (base - top)) : 0;
+    const x = i * bw, y = base - h;
+    const tms = (ts.t0 + (i + 0.5) * ts.bucket_s) * 1000;
+    const tip = new Date(tms).toLocaleString(undefined, { hour12: false }) + " · " + c + " error" + (c === 1 ? "" : "s");
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(0.5, bw - 1).toFixed(1)}" ` +
+            `height="${h.toFixed(1)}" rx="1" fill="${c ? '#E01E5A' : '#EDF0F3'}"><title>${tip}</title></rect>`;
+  }
+  const t0 = new Date(ts.t0 * 1000).toLocaleTimeString(undefined, { hour12: false });
+  const t1 = new Date((ts.t0 + ts.bucket_s * n) * 1000).toLocaleTimeString(undefined, { hour12: false });
+  el.innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+    `<line x1="0" y1="${base}" x2="${W}" y2="${base}" stroke="#D8DEE6" stroke-width="1"/>` +
+    bars + `</svg>` +
+    `<div class="axis"><span>${t0}</span><span>${total} total · peak ${max}/bucket</span><span>${t1}</span></div>`;
+}
+
 async function load() {
   const win = $("window").value;
   $("winLabel").textContent = $("window").selectedOptions[0].text;
@@ -123,6 +172,8 @@ async function load() {
     card("Leaks", m.leaks.total || 0, (m.leaks.total || 0) ? "danger" : "good"),
     card("Op kinds", (m.ops || []).length),
   ].join("");
+
+  renderErrGraph(m.errors.timeseries);
 
   $("byCategory").innerHTML = chips(m.errors.by_category, true);
   $("byRecovery").innerHTML = chips(m.recoveries.by_kind, false);
@@ -145,15 +196,16 @@ async function load() {
       return `<tr><td style="padding-left:20px" class="muted">${o.operation}</td>` +
         `<td><b>${o.provider ?? "—"}</b></td><td>${o.count}</td>` +
         `<td>${o.fails ? '<b style="color:#E01E5A">' + o.fails + '</b>' : 0}</td>` +
-        `<td>${o.fail_rate > 0 ? '<b style="color:#E01E5A">' + fr + '</b>' : fr}</td>` +
+        `<td>${frBar(o.fail_rate)}<span style="${o.fail_rate > 0 ? 'color:#E01E5A;font-weight:700' : 'color:#9098A0'}">${fr}</span></td>` +
         `<td>${o.p50_ms ?? "—"}</td><td>${o.p95_ms ?? "—"}</td></tr>`;
     };
     $("ops").innerHTML = opNames.map(op => {
       const rows = byOp[op].slice().sort((a, b) => ((b.p95_ms || 0) - (a.p95_ms || 0)) || (b.fail_rate - a.fail_rate));
       const calls = rows.reduce((s, o) => s + o.count, 0);
       const fails = rows.reduce((s, o) => s + o.fails, 0);
+      const grpRate = calls ? fails / calls : 0;
       const hdr = `<tr><td colspan="7" style="background:#F2F6FB;font-weight:700;color:#1264A3;border-top:2px solid #D8DEE6">` +
-        `${op} <span class="muted" style="font-weight:400">· ${rows.length} provider${rows.length > 1 ? 's' : ''} · ${calls} calls` +
+        `${frBar(grpRate)}${op} <span class="muted" style="font-weight:400">· ${rows.length} provider${rows.length > 1 ? 's' : ''} · ${calls} calls` +
         `${fails ? ' · <b style="color:#E01E5A">' + fails + ' fails</b>' : ''}</span></td></tr>`;
       return hdr + rows.map(row).join("");
     }).join("");
