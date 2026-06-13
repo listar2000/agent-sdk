@@ -287,10 +287,15 @@ async def run_turn(
         # Record the assistant's tool-call request in the message array so
         # the follow-up tool messages are valid.
         ordered = [tool_calls[i] for i in sorted(tool_calls)]
+        # Join each call's streamed argument fragments exactly once: both the
+        # assistant message and the _parse_args below need the raw string, and
+        # ``c.args`` re-runs an O(content) ``"".join`` on every access — reading
+        # it twice would copy a large write_file ``content`` argument twice.
+        raw_args = [c.args for c in ordered]
         assistant_msg["tool_calls"] = [{
             "id": c.id, "type": "function",
-            "function": {"name": c.name, "arguments": c.args or "{}"},
-        } for c in ordered]
+            "function": {"name": c.name, "arguments": ra or "{}"},
+        } for c, ra in zip(ordered, raw_args)]
         messages.append(assistant_msg)
 
         if transport is None and ensure_sandbox is not None:
@@ -298,7 +303,7 @@ async def run_turn(
 
         # Parse args + emit every tool-call event up front (in order) so a
         # parallel-tool-calling round shows all calls pending before any result.
-        calls = [(c, _parse_args(c.args)) for c in ordered]
+        calls = [(c, _parse_args(ra)) for c, ra in zip(ordered, raw_args)]
         for c, args in calls:
             await emit({"type": "tool", "tool_call_id": c.id,
                         "tool_name": c.name, "args": args})

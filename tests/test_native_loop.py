@@ -209,6 +209,46 @@ async def test_large_streamed_tool_arg_reassembles_and_is_subquadratic():
 
 
 @pytest.mark.asyncio
+async def test_tool_args_joined_once_per_call(monkeypatch):
+    """run_turn needs each tool call's raw argument string in two places — the
+    persisted assistant message AND _parse_args — but ``c.args`` re-runs
+    ``"".join(arg_parts)`` (an O(content) copy) on every access. It must be read
+    ONCE per call and the result reused, never joined twice. This pins the
+    MECHANISM, not the outcome: reading ``c.args`` twice (the prior code) still
+    produces the right bytes, so only a join-count probe catches it. A
+    regression silently re-copies a large write_file ``content`` every round."""
+    from api.native import loop as _loop
+
+    joins = {"n": 0}
+    orig = _loop._ToolCallAccum.args.fget
+
+    def _counting(self):
+        joins["n"] += 1
+        return orig(self)
+
+    monkeypatch.setattr(_loop._ToolCallAccum, "args", property(_counting))
+
+    # two independent tool calls in ONE round (a parallel-tool round): each of
+    # the two accumulators must be joined exactly once → 2 total, not 4.
+    chunks = [
+        _Chunk(_Delta(tool_calls=[_TCDelta(0, id="c1", name="bash",
+                                           arguments='{"command": "ls"}')])),
+        _Chunk(_Delta(tool_calls=[_TCDelta(1, id="c2", name="bash",
+                                           arguments='{"command": "pwd"}')])),
+    ]
+    spec = NativeAgentSpec()
+    tools = build_toolset(["bash"])
+    transport = _FakeTransport()
+    msgs = [{"role": "user", "content": "go"}]
+    await _collect(spec, msgs, tools, transport, [
+        chunks, [_Chunk(_Delta(content="done"))],
+    ])
+    assert joins["n"] == 2, (
+        f"expected one args-join per tool call (2 calls → 2), got {joins['n']}"
+        " — run_turn is re-joining c.args instead of reusing the raw string")
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_returns_error_not_raise():
     spec = NativeAgentSpec()
     tools = build_toolset(["bash"])
