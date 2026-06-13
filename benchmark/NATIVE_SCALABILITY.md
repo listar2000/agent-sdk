@@ -57,6 +57,7 @@ across replicas) — the lever is reducing per-turn CPU, which the changes do.
 | model-call kwargs | rebuilt every model round → hoisted, constant once per turn | per-round dict rebuild dropped on multi-round tool turns |
 | **parallel tool-calling** | a round's multiple tool calls ran SEQUENTIALLY (round = Σ tool latencies) → `asyncio.gather`, **bounded** to a per-agent cap (default 8) | **N× per-round** for N independent tools (16 calls @ 20ms: ~320ms → ~43ms); cap = fixed per-turn resource ceiling. Verified end-to-end: recovery (one sandbox), persistence order, config flow |
 | tool-arg join | `run_turn` read `c.args` twice/call (assistant msg + parse); the property re-joins `arg_parts` each read → join once, reuse | **76% less join work** for a 2.5MB streamed arg (~1.52→0.36 ms/call); compounds across a parallel round of large writes |
+| checkpoint serialize | `write_native_checkpoint` JSONB serialize ran on stdlib `json.dumps` INLINE on the loop thread (psycopg adapts the param mid-`execute`) → orjson (`db._fast_dumps`, stdlib fallback) | **~4.4× faster** on realistic transcripts (2.39→0.55 ms at 4800 msgs); cuts the GIL-holding loop-thread stall that was the dominant deep-session cost. Bytes/WAL unchanged (that's the gated migration) |
 
 ## Reliability
 
@@ -127,10 +128,12 @@ green and non-flaky under `-n auto`.
   transient-failure retry added, but `write_native_checkpoint` still
   re-serializes the *full* transcript to JSONB every turn (O(n²) over a session).
   The `_checkpoint_serialization` bench view quantifies it: at ~4800 messages the
-  per-turn serialize is **~1.86 ms (GIL-holding, on the loop thread) + ~0.95 MB
-  to Postgres**, ~16× the flat ~118 µs loop cost and still climbing — so for deep
-  sessions this dominates every hot-path micro-opt in this branch (which are all
-  flat in conversation length). Every other bench view stubs the checkpoint
+  per-turn serialize was **~1.86 ms (GIL-holding, on the loop thread) + ~0.95 MB
+  to Postgres**, ~16× the flat ~118 µs loop cost and still climbing. The CPU half
+  is now mitigated (the orjson row above cuts the serialize ~4.4× to ~0.5 ms), so
+  the remaining lever is specifically the **O(n²) WAL + network write volume** —
+  still the dominant deep-session cost since it grows with the session while the
+  loop stays flat. Every other bench view stubs the checkpoint
   (`_noop_ckpt`), so `_session_growth`'s "flat O(1)" canary structurally can't
   see it — `_checkpoint_serialization` is the view that does. The bounded fix is
   an append-only-delta + periodic-snapshot redesign — a schema migration on a

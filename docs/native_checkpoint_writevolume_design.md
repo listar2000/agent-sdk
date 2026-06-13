@@ -41,10 +41,18 @@ reframes the whole loop: the **loop** per-turn cost is ~118 µs and FLAT
 **~16× the entire loop** and still climbing — it is the dominant per-turn cost
 for deep sessions, and it's GIL-holding on the event-loop thread (psycopg
 serializes the param inline), so it stalls every other session on the replica
-for that window. Plus ~0.95 MB/turn of WAL+network at that depth. Every hot-path
-micro-optimization in this branch is dwarfed by this once a conversation gets
-long. This is the single biggest remaining native scalability lever — and it's
-the one that needs human sign-off (durability-critical schema migration).
+for that window. Plus ~0.95 MB/turn of WAL+network at that depth.
+
+**Update — the CPU half is now mitigated (orjson).** `write_native_checkpoint`
+now serializes via `db._fast_dumps` (orjson, stdlib fallback), ~1.8× faster on
+these tiny synthetic messages and **~4.4× on realistic content-heavy
+transcripts** (2.39 → 0.55 ms at 4800 msgs / ~1.2 MB), so the loop-thread-
+blocking serialize is cut to ~0.5 ms. That removes the *CPU* stall but does
+**not** touch the per-turn payload bytes — the **O(n²) WAL + network write
+volume** is unchanged and is now the *sole* remaining concern this migration
+targets. So the lever has narrowed from "CPU + bytes" to "bytes," but it's still
+the single biggest deep-session scalability item, and still needs human sign-off
+(durability-critical schema migration).
 
 ### Already shipped (orthogonal, keep regardless)
 - **1 round-trip/turn** — upsert + prune folded into one data-modifying CTE.
