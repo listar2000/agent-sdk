@@ -74,6 +74,47 @@ _PG_SCHEMA = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_native_transcripts_session"
     " ON native_transcripts(session_id, turn_seq DESC)",
+    # Captured failures across the server (sandbox creation, provider, ACP,
+    # turn, HTTP 5xx, pool/recovery). Written by the metrics batcher.
+    #
+    # ``session_id`` is intentionally NOT a foreign key (unlike session_log):
+    # the most valuable errors — sandbox-creation failures, reattaches to a
+    # deleted VM — reference sessions that don't exist or are already gone,
+    # and an FK would make the INSERT fail exactly when we most need the row.
+    """CREATE TABLE IF NOT EXISTS error_events (
+        id          BIGSERIAL PRIMARY KEY,
+        ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        replica_id  TEXT,
+        category    TEXT NOT NULL,
+        provider    TEXT,
+        session_id  TEXT,
+        agent_id    TEXT,
+        exc_type    TEXT,
+        http_status INTEGER,
+        phase       TEXT,
+        message     TEXT,
+        context     JSONB NOT NULL DEFAULT '{}'::jsonb
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_error_events_ts ON error_events(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_error_events_category ON error_events(category, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_error_events_provider ON error_events(provider, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_error_events_session ON error_events(session_id)",
+    # Per-operation timing/outcome — every provider/pool op (cold_create,
+    # resume, cold_recover, release, destroy, reap). Answers "how flaky /
+    # how slow is daytona/modal" via latency percentiles + failure rate.
+    """CREATE TABLE IF NOT EXISTS op_events (
+        id          BIGSERIAL PRIMARY KEY,
+        ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        replica_id  TEXT,
+        provider    TEXT,
+        operation   TEXT NOT NULL,
+        duration_ms DOUBLE PRECISION,
+        ok          BOOLEAN NOT NULL,
+        session_id  TEXT,
+        error       TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_op_events_ts ON op_events(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_op_events_op ON op_events(operation, provider, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_session ON session_log(session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_session_log_agent ON session_log(agent_id, created_at DESC)",
@@ -673,6 +714,205 @@ async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
         (session_id, limit),
     )
     return [_row_to_log_entry(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Error events (metrics reporter — see api.metrics)
+# ---------------------------------------------------------------------------
+
+async def insert_error_events(rows: list[dict]) -> None:
+    """Batch-insert captured error rows. Called by ``ErrorEventBatcher``.
+
+    Rows are the dicts produced by ``MetricsRegistry.record_error``; ``ts`` is
+    epoch seconds (float) and is converted to a tz-aware datetime here.
+    """
+    if not rows:
+        return
+    from datetime import datetime, timezone
+    params = [
+        (
+            datetime.fromtimestamp(r["ts"], tz=timezone.utc),
+            r.get("replica_id"), r["category"], r.get("provider"),
+            r.get("session_id"), r.get("agent_id"), r.get("exc_type"),
+            r.get("http_status"), r.get("phase"), r.get("message"),
+            Json(r.get("context") or {}),
+        )
+        for r in rows
+    ]
+    async with get_db() as conn:
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO error_events"
+                " (ts, replica_id, category, provider, session_id, agent_id,"
+                "  exc_type, http_status, phase, message, context)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                params,
+            )
+
+
+def _build_error_filters(since_s, category, provider, session_id):
+    clauses: list[str] = []
+    params: list = []
+    if since_s is not None:
+        from datetime import datetime, timezone
+        clauses.append("ts >= %s")
+        params.append(datetime.fromtimestamp(since_s, tz=timezone.utc))
+    if category:
+        clauses.append("category = %s"); params.append(category)
+    if provider:
+        clauses.append("provider = %s"); params.append(provider)
+    if session_id:
+        clauses.append("session_id = %s"); params.append(session_id)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+async def get_error_events(*, since_s: float | None = None, category: str | None = None,
+                           provider: str | None = None, session_id: str | None = None,
+                           limit: int = 200) -> list[dict]:
+    """Most-recent-first error rows, optionally filtered. Cross-replica
+    (every replica writes to the same table). ``ts`` is returned as epoch
+    seconds for symmetry with the in-memory ``/metrics`` snapshot."""
+    where, params = _build_error_filters(since_s, category, provider, session_id)
+    params.append(limit)
+    rows = await _all(
+        "SELECT id, ts, replica_id, category, provider, session_id, agent_id,"
+        " exc_type, http_status, phase, message, context"
+        f" FROM error_events{where} ORDER BY id DESC LIMIT %s",
+        tuple(params),
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["ts"] = r["ts"].timestamp() if r.get("ts") else None
+        out.append(d)
+    return out
+
+
+async def count_errors_by(*, field: str = "category", since_s: float | None = None) -> dict:
+    """``{value: count}`` grouped by one column. ``field`` is allow-listed
+    (not interpolated from user input) to keep the GROUP BY injection-safe."""
+    if field not in ("category", "provider", "exc_type", "http_status", "replica_id"):
+        raise ValueError(f"unsupported group field: {field}")
+    where, params = _build_error_filters(since_s, None, None, None)
+    rows = await _all(
+        f"SELECT {field} AS k, COUNT(*) AS n FROM error_events{where}"
+        f" GROUP BY {field} ORDER BY n DESC",
+        tuple(params),
+    )
+    return {str(r["k"]): r["n"] for r in rows if r["k"] is not None}
+
+
+async def insert_op_events(rows: list[dict]) -> None:
+    """Batch-insert provider/pool operation outcomes. Called by the metrics
+    op batcher."""
+    if not rows:
+        return
+    from datetime import datetime, timezone
+    params = [
+        (
+            datetime.fromtimestamp(r["ts"], tz=timezone.utc),
+            r.get("replica_id"), r.get("provider"), r["operation"],
+            r.get("duration_ms"), bool(r["ok"]), r.get("session_id"), r.get("error"),
+        )
+        for r in rows
+    ]
+    async with get_db() as conn:
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO op_events"
+                " (ts, replica_id, provider, operation, duration_ms, ok, session_id, error)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                params,
+            )
+
+
+async def get_op_stats(*, since_s: float | None = None) -> list[dict]:
+    """Per (provider, operation): count, failures, fail_rate, and latency
+    p50/p95 — the durable, cross-replica flakiness + latency view."""
+    clauses, params = [], []
+    if since_s is not None:
+        from datetime import datetime, timezone
+        clauses.append("ts >= %s")
+        params.append(datetime.fromtimestamp(since_s, tz=timezone.utc))
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = await _all(
+        "SELECT provider, operation, COUNT(*) AS n,"
+        " COUNT(*) FILTER (WHERE NOT ok) AS fails,"
+        " percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) AS p50,"
+        " percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95"
+        f" FROM op_events{where} GROUP BY provider, operation"
+        " ORDER BY n DESC",
+        tuple(params),
+    )
+    out = []
+    for r in rows:
+        n = r["n"] or 0
+        fails = r["fails"] or 0
+        out.append({
+            "provider": r["provider"], "operation": r["operation"],
+            "count": n, "fails": fails,
+            "fail_rate": round(fails / n, 4) if n else 0.0,
+            "p50_ms": round(r["p50"], 1) if r["p50"] is not None else None,
+            "p95_ms": round(r["p95"], 1) if r["p95"] is not None else None,
+        })
+    return out
+
+
+async def _group_errors(group_col: str, *, scope: str, since_s: float | None) -> dict:
+    """``{value: count}`` over error_events grouped by one column.
+
+    ``group_col`` and ``scope`` are allow-listed (never interpolated from user
+    input). ``scope`` selects the category constraint: ``errors`` =
+    everything except recoveries/leaks; ``recovery`` / ``leak`` = just those.
+    """
+    assert group_col in ("category", "provider", "http_status", "phase")
+    clauses, params = [], []
+    if since_s is not None:
+        from datetime import datetime, timezone
+        clauses.append("ts >= %s")
+        params.append(datetime.fromtimestamp(since_s, tz=timezone.utc))
+    if scope == "errors":
+        clauses.append("category NOT IN ('recovery','leak')")
+    elif scope in ("recovery", "leak"):
+        clauses.append("category = %s")
+        params.append(scope)
+    clauses.append(f"{group_col} IS NOT NULL")
+    where = " WHERE " + " AND ".join(clauses)
+    rows = await _all(
+        f"SELECT {group_col} AS k, COUNT(*) AS n FROM error_events{where}"
+        f" GROUP BY {group_col} ORDER BY n DESC",
+        tuple(params),
+    )
+    return {str(r["k"]): r["n"] for r in rows if r["k"] is not None}
+
+
+async def get_metrics_summary(*, since_s: float | None = None) -> dict:
+    """The ``/metrics`` payload, computed entirely from Postgres so it's
+    identical on every replica. Errors / recoveries / leaks counts +
+    per-provider op latency/flakiness + a recent-events tail."""
+    errors_by_cat = await _group_errors("category", scope="errors", since_s=since_s)
+    return {
+        "since_s": since_s,
+        "errors": {
+            "total": sum(errors_by_cat.values()),
+            "by_category": errors_by_cat,
+            "by_provider": await _group_errors("provider", scope="errors", since_s=since_s),
+            "by_http_status": await _group_errors("http_status", scope="errors", since_s=since_s),
+        },
+        "recoveries": {
+            "by_kind": (rec := await _group_errors("phase", scope="recovery", since_s=since_s)),
+            "by_provider": await _group_errors("provider", scope="recovery", since_s=since_s),
+            "total": sum(rec.values()),
+        },
+        "leaks": {
+            "by_kind": (lk := await _group_errors("phase", scope="leak", since_s=since_s)),
+            "by_provider": await _group_errors("provider", scope="leak", since_s=since_s),
+            "total": sum(lk.values()),
+        },
+        "ops": await get_op_stats(since_s=since_s),
+        "recent": await get_error_events(since_s=since_s, limit=100),
+    }
 
 
 async def write_native_checkpoint(*, session_id: str, turn_seq: int,

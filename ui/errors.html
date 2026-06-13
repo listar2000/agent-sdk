@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Errors &amp; Metrics</title>
+<style>
+  :root {
+    --bg: #1F2D3D; --panel: #FFFFFF; --text: #1D1C1D; --muted: #9098A0;
+    --border: #ECEEF1; --primary: #1264A3; --danger: #E01E5A;
+    --success: #2EB67D; --warning: #ECB22E; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  body { background: var(--bg); color: var(--text); padding: 18px; }
+  h1 { color: #fff; font-size: 18px; margin: 0 0 2px; }
+  .sub { color: #9AA5AE; font-size: 12px; margin-bottom: 14px; }
+  .sub b { color: #cfd6dc; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .toolbar label { color: #9AA5AE; font-size: 12px; }
+  .toolbar select, .toolbar input { padding: 6px 8px; border: 1px solid #44566b; background: #2b3b4e; color: #e8ebed; border-radius: 8px; font-size: 12px; }
+  .toolbar button { padding: 6px 12px; border: 0; background: var(--primary); color: #fff; border-radius: 8px; font-size: 12px; cursor: pointer; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .card { background: var(--panel); border-radius: var(--radius); padding: 12px 14px; box-shadow: 0 1px 2px rgba(0,0,0,.18); }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+  .card.danger .value { color: var(--danger); }
+  .card.good .value { color: var(--success); }
+  .card.warn .value { color: var(--warning); }
+  .row-flex { display: flex; gap: 14px; flex-wrap: wrap; }
+  .panel { background: var(--panel); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.18); }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; color: #5b636b; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td.msg { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #333; max-width: 520px; word-break: break-word; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.cat { background: #EAF2FB; color: var(--primary); }
+  .pill.recovery { background: #FFF7E6; color: #B7791F; }
+  .pill.leak { background: #FDEAEF; color: var(--danger); }
+  .pill.prov { background: #F1ECFB; color: #6A3FB0; }
+  .pill.status { background: #FDEAEF; color: var(--danger); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: #F6F8FA; border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 16px; text-align: center; }
+  .err { color: #ffb4c4; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>Errors &amp; Metrics</h1>
+  <div class="sub">
+    source: <b>Postgres</b> (replica-independent) · window <b id="winLabel">1h</b> ·
+    auto-refresh <b>3s</b> · <span id="conn" class="err"></span>
+  </div>
+
+  <div class="toolbar">
+    <label>window</label>
+    <select id="window">
+      <option value="3600" selected>1 hour</option>
+      <option value="21600">6 hours</option>
+      <option value="86400">24 hours</option>
+      <option value="0">all time</option>
+    </select>
+    <label>category</label><select id="fCategory"><option value="">all</option></select>
+    <label>provider</label><select id="fProvider"><option value="">all</option></select>
+    <button id="refresh">Refresh</button>
+    <span class="muted" id="count"></span>
+  </div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="row-flex">
+    <div class="panel" style="flex:1; min-width:240px"><h2>Errors by category</h2><div class="chips" id="byCategory"></div></div>
+    <div class="panel" style="flex:1; min-width:240px"><h2>Silent recoveries</h2><div class="chips" id="byRecovery"></div></div>
+    <div class="panel" style="flex:1; min-width:240px"><h2>Resource leaks</h2><div class="chips" id="byLeak"></div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Provider operations — latency &amp; flakiness</h2>
+    <table>
+      <thead><tr><th>operation</th><th>provider</th><th>count</th><th>fails</th><th>fail&nbsp;rate</th><th>p50&nbsp;ms</th><th>p95&nbsp;ms</th></tr></thead>
+      <tbody id="ops"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Recent events (errors · recoveries · leaks)</h2>
+    <table>
+      <thead><tr><th>when</th><th>category</th><th>provider</th><th>status</th><th>type / kind</th><th>message</th><th>session</th><th>replica</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table>
+    <div class="empty" id="eventsEmpty" style="display:none">No events in this window. 🎉</div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function fmtTime(epoch) { return epoch ? new Date(epoch * 1000).toLocaleString(undefined, { hour12: false }) : "—"; }
+function card(label, value, cls) { return `<div class="card ${cls || ''}"><div class="label">${label}</div><div class="value">${value}</div></div>`; }
+function chips(obj, danger) {
+  return Object.keys(obj || {}).length
+    ? Object.entries(obj).sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `<span class="chip">${k} <b style="color:${danger ? '#E01E5A' : '#5b636b'}">${v}</b></span>`).join("")
+    : '<span class="muted">none</span>';
+}
+function catPill(c) {
+  const cls = c === "recovery" ? "recovery" : (c === "leak" ? "leak" : "cat");
+  return `<span class="pill ${cls}">${c || "—"}</span>`;
+}
+
+async function load() {
+  const win = $("window").value;
+  $("winLabel").textContent = $("window").selectedOptions[0].text;
+  let m;
+  try {
+    m = await (await fetch("/metrics?window_s=" + win)).json();
+    $("conn").textContent = "";
+  } catch (e) { $("conn").textContent = "fetch failed: " + e; return; }
+
+  $("cards").innerHTML = [
+    card("Errors", m.errors.total || 0, (m.errors.total || 0) ? "danger" : "good"),
+    card("Recoveries", m.recoveries.total || 0, (m.recoveries.total || 0) ? "warn" : "good"),
+    card("Leaks", m.leaks.total || 0, (m.leaks.total || 0) ? "danger" : "good"),
+    card("Op kinds", (m.ops || []).length),
+  ].join("");
+
+  $("byCategory").innerHTML = chips(m.errors.by_category, true);
+  $("byRecovery").innerHTML = chips(m.recoveries.by_kind, false);
+  $("byLeak").innerHTML = chips(m.leaks.by_kind, true);
+
+  const ops = m.ops || [];
+  $("ops").innerHTML = ops.length
+    ? ops.slice().sort((a, b) => (b.fail_rate - a.fail_rate) || ((b.p95_ms || 0) - (a.p95_ms || 0)))
+        .map(o => {
+          const fr = (o.fail_rate * 100).toFixed(1) + "%";
+          return `<tr><td>${o.operation}</td><td>${o.provider ?? "—"}</td><td>${o.count}</td>` +
+            `<td>${o.fails ? '<b style="color:#E01E5A">' + o.fails + '</b>' : 0}</td>` +
+            `<td>${o.fail_rate > 0 ? '<b style="color:#E01E5A">' + fr + '</b>' : fr}</td>` +
+            `<td>${o.p50_ms ?? "—"}</td><td>${o.p95_ms ?? "—"}</td></tr>`;
+        }).join("")
+    : '<tr><td colspan="7" class="muted">no operations in window</td></tr>';
+
+  // Populate filter dropdowns from the data, then render the recent table.
+  const cats = Object.keys(m.errors.by_category)
+    .concat(m.recoveries.total ? ["recovery"] : []).concat(m.leaks.total ? ["leak"] : []);
+  fillSelect($("fCategory"), [...new Set(cats)]);
+  fillSelect($("fProvider"), [...new Set([
+    ...Object.keys(m.errors.by_provider), ...Object.keys(m.recoveries.by_provider), ...Object.keys(m.leaks.by_provider),
+  ])]);
+
+  const fc = $("fCategory").value, fp = $("fProvider").value;
+  const ev = (m.recent || []).filter(e =>
+    (!fc || e.category === fc) && (!fp || e.provider === fp));
+  $("count").textContent = ev.length + " shown";
+  $("eventsEmpty").style.display = ev.length ? "none" : "block";
+  $("events").innerHTML = ev.map(e => `
+    <tr>
+      <td class="muted">${fmtTime(e.ts)}</td>
+      <td>${catPill(e.category)}</td>
+      <td>${e.provider ? '<span class="pill prov">' + e.provider + '</span>' : '—'}</td>
+      <td>${e.http_status ? '<span class="pill status">' + e.http_status + '</span>' : '—'}</td>
+      <td>${e.exc_type || e.phase || "—"}</td>
+      <td class="msg">${(e.message || "").replace(/</g, "&lt;")}</td>
+      <td class="muted">${e.session_id ? String(e.session_id).slice(0, 8) : "—"}</td>
+      <td class="muted">${e.replica_id || "—"}</td>
+    </tr>`).join("");
+}
+
+function fillSelect(sel, values) {
+  const cur = sel.value;
+  sel.innerHTML = ['<option value="">all</option>'].concat(values.map(v => `<option value="${v}">${v}</option>`)).join("");
+  sel.value = cur;
+}
+
+$("refresh").onclick = load;
+$("window").onchange = load;
+$("fCategory").onchange = load;
+$("fProvider").onchange = load;
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>
