@@ -22,6 +22,12 @@ dependencies = [
     # Native runtime: one call signature across providers (anthropic /
     # openai / openrouter / bedrock / …), streaming + tool-calls included.
     "litellm>=1.51",
+    # Faster JSON serialization for the per-turn native checkpoint write — the
+    # full-transcript json.dumps runs on the event-loop thread (psycopg adapts
+    # the param inline) and is the dominant deep-session cost (see
+    # docs/native_checkpoint_writevolume_design.md). Optional at runtime: db.py
+    # falls back to stdlib json if orjson is absent.
+    "orjson>=3.9",
 ]
 
 [tool.hatch.build.targets.wheel]

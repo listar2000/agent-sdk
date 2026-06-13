@@ -19,6 +19,32 @@ from .models import AgentConfig, AgentRecord, LogEntry, VolumeRecord
 
 log = logging.getLogger(__name__)
 
+# Fast JSON serialization for hot write paths. psycopg adapts a ``Json`` param by
+# calling ``dumps`` INLINE during ``execute`` — on the event-loop thread, holding
+# the GIL — so for a large payload (the per-turn native checkpoint re-serializes
+# the whole transcript) stdlib ``json.dumps`` blocks every other session on the
+# replica for the duration. orjson is ~3-5× faster; we wrap it to return ``str``
+# (it emits ``bytes``) since ``Json`` re-encodes. Optional: fall back to stdlib so
+# a deploy without orjson still works (the import guard makes it a soft dep).
+try:
+    import orjson as _orjson
+
+    def _fast_dumps(obj) -> str:
+        return _orjson.dumps(obj).decode()
+except ImportError:  # pragma: no cover - orjson is a declared dep; guard for safety
+    _orjson = None
+    _fast_dumps = json.dumps
+
+
+def _FastJson(obj) -> Json:
+    """A ``Json`` param serialized with orjson when available (else stdlib).
+
+    Byte-equivalence isn't required: the column is JSONB, which Postgres parses
+    and stores in its own normalized binary form — orjson's UTF-8 output and
+    stdlib's ``ensure_ascii`` escaping decode to the identical value. Use only
+    for native-JSON payloads (dict/list/str/int/float/bool/None)."""
+    return Json(obj, dumps=_fast_dumps)
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/agent_sdk_server")
 
 _PG_SCHEMA = [
@@ -943,7 +969,7 @@ async def write_native_checkpoint(*, session_id: str, turn_seq: int,
             ")"
             " DELETE FROM native_transcripts"
             " WHERE session_id = %s AND turn_seq <= %s",
-            (session_id, turn_seq, Json(messages), Json(usage or {}),
+            (session_id, turn_seq, _FastJson(messages), _FastJson(usage or {}),
              session_id, turn_seq - keep_last),
         )
 
