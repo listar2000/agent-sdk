@@ -25,6 +25,27 @@ log = logging.getLogger(__name__)
 load_dotenv()
 
 
+#: Bound concurrent Daytona sandbox CREATES per replica. Daytona's control
+#: plane queues provisioning, so an unbounded burst — `-n auto` fires ~50
+#: golden creates at once; production can exceed 10 prompts/sec — drives each
+#: create's queue time past its 240s budget, surfacing as
+#: "Function 'create' exceeded timeout" / 502. Capping in-flight creates keeps
+#: each one's queue depth (and so its latency) bounded, which is what makes
+#: provisioning deterministic instead of flaky under load. This bounds CREATE
+#: only (the control-plane choke point); exec/delete/health are unaffected.
+#: Lazily constructed so the Semaphore binds to the running loop, not import.
+_PROVISION_CONCURRENCY = int(
+    os.environ.get("DAYTONA_MAX_CONCURRENT_PROVISION", "4"))
+_provision_sem: "asyncio.Semaphore | None" = None
+
+
+def _get_provision_sem() -> "asyncio.Semaphore":
+    global _provision_sem
+    if _provision_sem is None:
+        _provision_sem = asyncio.Semaphore(_PROVISION_CONCURRENCY)
+    return _provision_sem
+
+
 class _ExecResult(NamedTuple):
     stdout: str
     stderr: str
@@ -409,7 +430,12 @@ async def provision_daytona_sandbox(
             ), timeout=create_timeout,
         )
 
-    sandbox = await _daytona_create_with_502_retry(_do_create)
+    # Bound concurrent creates so the control-plane queue can't push any one
+    # create past its timeout budget (the dominant -n auto flake). Acquired
+    # only around the create call — not the pre-start commands below — so a
+    # slow pre-start can't hold a provisioning slot.
+    async with _get_provision_sem():
+        sandbox = await _daytona_create_with_502_retry(_do_create)
 
     try:
         # Run pre-start commands (skills, CLI install, etc.).
