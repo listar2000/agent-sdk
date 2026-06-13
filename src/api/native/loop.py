@@ -49,11 +49,16 @@ class NativeAgentSpec:
         return cls(
             instructions=n.get("instructions", ""),
             model=model or n.get("model") or cls.model,
-            max_turns=int(n.get("max_turns", cls.max_turns)),
+            # Clamp the loop-control knobs to sane floors so a misconfigured
+            # agent fails LOUDLY (or just runs) rather than silently: a
+            # max_turns <= 0 makes ``range(max_turns)`` empty → a no-op turn
+            # with no model call and a bare done(max_turns); a negative
+            # num_retries would be handed straight to LiteLLM.
+            max_turns=max(1, int(n.get("max_turns", cls.max_turns))),
             max_tokens=n.get("max_tokens"),
             temperature=n.get("temperature"),
             tool_names=n.get("tool_names"),
-            num_retries=int(n.get("num_retries", cls.num_retries)),
+            num_retries=max(0, int(n.get("num_retries", cls.num_retries))),
         )
 
 

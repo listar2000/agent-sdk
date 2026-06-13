@@ -349,6 +349,19 @@ async def test_run_turn_passes_num_retries_for_transient_resilience():
     assert "num_retries" not in captured
 
 
+def test_native_spec_clamps_misconfigured_loop_knobs():
+    """A misconfigured native agent gets sane floors: a max_turns <= 0 would make
+    range(max_turns) empty → a silent no-op turn (no model call), and a negative
+    num_retries would be handed straight to LiteLLM."""
+    f = NativeAgentSpec.from_config
+    assert f(model=None, native={"max_turns": 0}).max_turns == 1
+    assert f(model=None, native={"max_turns": -5}).max_turns == 1
+    assert f(model=None, native={"num_retries": -3}).num_retries == 0
+    # valid values pass through untouched
+    s = f(model=None, native={"max_turns": 10, "num_retries": 4})
+    assert s.max_turns == 10 and s.num_retries == 4
+
+
 # ── interrupt-wedge: dangling assistant tool_calls healing ───────────────────
 # An interrupt mid-tool-loop (CancelledError is a BaseException, so it bypasses
 # _invoke_tool's `except Exception`) lands after the assistant tool_calls
