@@ -77,11 +77,14 @@ Knobs (env): `TURNS` (default 200), `CHUNKS` (text deltas/turn, default 60),
 
 Views: single-session text rate, **tool-heavy** (a tool-call/tool-result loop —
 2 model rounds + a tool exec per turn, the realistic agent shape, exercising the
-tool/tool_result frames and the streamed tool-arg accumulator), **concurrency
-scaling** (does aggregate throughput hold as sessions pile on?), **with-
-subscriber** fan-out, and **session-length scaling** (does per-turn cost stay
-flat as ONE conversation deepens, or is there a hidden O(n²)?). The last is the
-canary that caught the `heal_dangling_tool_calls` quadratic — it re-scanned the whole transcript every turn; bounding it to the
+tool/tool_result frames and the streamed tool-arg accumulator), **parallel
+tool-calling** (a round of N tool calls runs concurrently — turn time stays flat
+as N grows: ~21ms for 1→16 tools at 20ms/exec, i.e. up to ~15× vs the N×
+sequential cost), **concurrency scaling** (does aggregate throughput hold as
+sessions pile on?), **with-subscriber** fan-out, and **session-length scaling**
+(does per-turn cost stay flat as ONE conversation deepens, or is there a hidden
+O(n²)?). The last is the canary that caught the `heal_dangling_tool_calls`
+quadratic — it re-scanned the whole transcript every turn; bounding it to the
 tail flipped a 2000-turn session from ~6,900 to ~16,800 turns/s, and the gap
 grows without bound with conversation length.
 

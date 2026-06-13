@@ -15,8 +15,10 @@ cost that multiplies across every concurrent session on a replica.
 
 Views: single-session text-turn rate, **tool-heavy** (a tool-call/tool-result
 loop — 2 model rounds + a tool exec per turn, exercising the tool/tool_result
-frames and the streamed tool-arg accumulator), concurrency scaling, with-
-subscriber fan-out, session-length scaling, and per-session RAM.
+frames and the streamed tool-arg accumulator), **parallel tool-calling** (a round
+of N tool calls runs concurrently — turn time stays flat as N grows vs the N×
+sequential cost), concurrency scaling, with-subscriber fan-out, session-length
+scaling, and per-session RAM.
 
 **Run:** ``.venv/bin/python benchmark/micro/bench_native_runtime.py``
 Knobs (env): ``TURNS`` (per session, default 200), ``CHUNKS`` (text deltas per
@@ -167,6 +169,58 @@ def _make_tool_session(sid: str, arg_size: int) -> NativeSession:
     return s
 
 
+# ── parallel tool-calling: N independent tool calls in ONE round ─────────────
+class _LatencyTransport:
+    """exec() sleeps a fixed latency, standing in for a real sandbox exec round
+    trip — so concurrent vs sequential tool execution is visible."""
+
+    def __init__(self, latency_s: float):
+        self.latency_s = latency_s
+
+    async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+        await asyncio.sleep(self.latency_s)
+        return _ExecResult()
+
+
+def _parallel_tool_completion(n_tools: int):
+    """Round 1 issues N bash tool_calls AT ONCE (parallel tool-calling); round 2
+    returns text → done."""
+    state = {"n": 0}
+
+    async def completion(**kwargs):
+        state["n"] += 1
+        if state["n"] % 2 == 1:
+            async def _it():
+                yield _Chunk(_ToolDelta([
+                    _TCDelta(i, id=f"c{state['n']}-{i}", name="bash",
+                             arguments='{"command":"x"}')
+                    for i in range(n_tools)]))
+            return _it()
+
+        async def _done():
+            yield _Chunk(_Delta(content="done"))
+            yield _Chunk(usage=_Usage(100, 10))
+        return _done()
+    return completion
+
+
+def _make_parallel_tool_session(sid: str, n_tools: int,
+                                latency_s: float) -> NativeSession:
+    s = NativeSession(session_id=sid,
+                      state=NativeSandboxState(provider="docker"))
+    s._started = True
+    s._spec = NativeAgentSpec(instructions="sys", max_turns=4)
+    s._tools = build_toolset(["bash"])
+    s._transport = _LatencyTransport(latency_s)
+    s._messages = [{"role": "system", "content": "sys"}]
+    s._completion = _parallel_tool_completion(n_tools)
+
+    async def _noop_ckpt(usage):
+        return None
+    s._checkpoint = _noop_ckpt  # type: ignore[method-assign]
+    return s
+
+
 def _make_session(sid: str, chunks: int) -> NativeSession:
     s = NativeSession(session_id=sid,
                       state=NativeSandboxState(provider="docker"))
@@ -203,6 +257,28 @@ async def _single(turns: int, chunks: int) -> None:
     print(f"single session: {turns} turns × {chunks} chunks")
     print(f"  {turns/dt:8.1f} turns/s   {events/dt/1e3:7.1f}k events/s   "
           f"{dt/turns*1e6:6.0f} µs/turn\n")
+
+
+async def _parallel_tools(latency_ms: int = 20,
+                          tool_counts: tuple[int, ...] = (1, 2, 4, 8, 16)) -> None:
+    """Per-turn wall time as the model issues N tool calls in ONE round, each a
+    ``latency_ms`` exec. The native loop runs them concurrently, so the turn
+    stays ~flat as N grows (the round is ~max(individual) = one latency);
+    sequential execution would grow the round to N×latency. The speedup column
+    is that N×latency vs the measured turn."""
+    L = latency_ms / 1000.0
+    print(f"parallel tool-calling: a round of N bash calls, {latency_ms}ms each")
+    print(f"  {'tools/round':>11} {'turn ms':>8} {'seq est ms':>11} {'speedup':>8}")
+    for n in tool_counts:
+        s = _make_parallel_tool_session(f"par-{n}", n, L)
+        await _drive_turns(s, 2)
+        turns = 20
+        t0 = time.perf_counter()
+        await _drive_turns(s, turns)
+        dt = (time.perf_counter() - t0) / turns
+        seq_est = n * L
+        print(f"  {n:>11} {dt*1e3:>8.1f} {seq_est*1e3:>11.1f} {seq_est/dt:>7.1f}x")
+    print("  (turn ms ~flat as N grows = the N tools ran concurrently)\n")
 
 
 async def _tool_heavy(turns: int, arg_sizes: tuple[int, ...] = (16, 4096)) -> None:
@@ -360,6 +436,7 @@ async def main() -> None:
     print(f"native runtime bench — turns={turns} chunks/turn={chunks}\n")
     await _single(turns, chunks)
     await _tool_heavy(turns)
+    await _parallel_tools()
     await _scaling(levels, turns, chunks)
     await _with_subscribers(turns, chunks)
     await _session_growth(max(turns, 1200), chunks)
