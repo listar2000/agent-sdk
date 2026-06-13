@@ -61,6 +61,39 @@ are byte-identical** (pinned by `tests/test_native_frames.py`); this is pure
 per-token CPU saved under concurrent native load. The session uses the cached
 `FrameEncoder` path.
 
+### `bench_native_runtime.py`
+**Question:** end-to-end throughput, concurrency scaling, and per-session RAM
+of the **native runtime** — without an LLM key, a sandbox, or a running server.
+Drives `NativeSession.execute_prompt` through its real path (loop → `emit` →
+frame synthesis → `_broadcast` → internal queue → generator yield → per-turn
+checkpoint) using the `_completion` test seam as a fake token stream. This is
+the native counterpart to the supervisor-path `load/` benches: it isolates the
+in-process per-turn cost that multiplies across every concurrent session on a
+replica.
+
+**Run:** `.venv/bin/python benchmark/micro/bench_native_runtime.py`
+Knobs (env): `TURNS` (default 200), `CHUNKS` (text deltas/turn, default 60),
+`LEVELS` (concurrency points, default `1,2,4,8,16,32`).
+
+**Findings (repeatable; absolute rate scales with the host):**
+
+* The runtime is CPU-bound on the single event-loop thread, so aggregate
+  throughput is **flat** across 1→32 concurrent sessions (~100% *retention* of
+  the 1-session rate) — the good result: no contention cliff, clean horizontal
+  scaling across replicas. `retention` < ~95% would mean per-session contention
+  crept into the turn path.
+* It is the A/B that proved the `FrameEncoder` win (see `bench_native_frames.py`)
+  end-to-end, not just on the isolated function:
+
+  | frame path                | agg turns/s | agg events/s |
+  |---------------------------|------------:|-------------:|
+  | dict-dump (pre-opt)       |      ~3,650 |     ~227,000 |
+  | `FrameEncoder` (current)  |      ~7,300 |     ~452,000 |
+
+  **~2× end-to-end native turn throughput** from cheaper per-token frame
+  synthesis. RAM is identical (CPU-only win): per-session RAM is dominated by
+  the conversation held in `_messages` (~0.26 MB for a 400-message session).
+
 ### `bench_httpx_pool.py`
 **Question:** what's the cost of constructing a fresh `httpx.AsyncClient`
 per request vs sharing one module-globally?
