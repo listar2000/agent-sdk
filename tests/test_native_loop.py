@@ -168,6 +168,42 @@ async def test_tool_call_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_usage_accumulates_across_tool_rounds():
+    """A tool turn runs ≥2 model rounds, each reporting its OWN usage chunk. The
+    turn's single terminal ``usage`` event must be the SUM across rounds —
+    token + cost accounting feeds billing, so a per-round overwrite/reset would
+    silently under-report (only the last round counted). test_text_only_turn
+    covers the single-round case; this pins the multi-round SUM."""
+    spec = NativeAgentSpec()
+    tools = build_toolset(["bash"])
+    transport = _FakeTransport()
+    msgs = [{"role": "user", "content": "run it"}]
+    events, result = await _collect(spec, msgs, tools, transport, [
+        # round 1: a tool call + this round's usage
+        [
+            _Chunk(_Delta(tool_calls=[_TCDelta(
+                0, id="c1", name="bash", arguments='{"command":"echo hi"}')])),
+            _Chunk(usage=_Usage(10, 5, 0.001)),
+        ],
+        # round 2: final text + this round's usage
+        [
+            _Chunk(_Delta(content="done")),
+            _Chunk(usage=_Usage(20, 8, 0.002)),
+        ],
+    ])
+    # exactly ONE usage event, emitted at turn-end, carrying the SUM
+    usage_events = [e for e in events if e["type"] == "usage"]
+    assert len(usage_events) == 1
+    u = usage_events[0]["usage"]
+    assert u["inputTokens"] == 30                      # 10 + 20
+    assert u["outputTokens"] == 13                     # 5 + 8
+    assert abs(u["totalCostUsd"] - 0.003) < 1e-9       # 0.001 + 0.002
+    # TurnResult carries the same accumulated total (what the session checkpoints)
+    assert result.usage["inputTokens"] == 30
+    assert result.usage["outputTokens"] == 13
+
+
+@pytest.mark.asyncio
 async def test_large_streamed_tool_arg_reassembles_and_is_subquadratic():
     """A model streaming a big tool argument (e.g. write_file content) across
     many small deltas must reassemble exactly — and accumulate in O(total), not
