@@ -2455,7 +2455,12 @@ _ATTEMPTS = 3
 # Delay after POST returns rpc_id before stopping — long enough for the
 # background drain to register its subscriber and start execute_prompt.
 _KILL_DELAY_S = 0.6
-_TERMINAL_TIMEOUT_S = 180.0
+# Terminal-event budget for a mid-prompt recovery (kill sandbox -> cold-recover
+# -> resume -> reply). 300s, not 180s: under -n auto the recovery's daytona
+# cold-create queues behind the provisioning semaphore, so the legit recovery
+# latency tail runs longer than a lightly-loaded run. This is the precondition
+# (term is not None) — the leak assertion it guards is unaffected.
+_TERMINAL_TIMEOUT_S = 300.0
 _SETTLE_TIMEOUT_S = 15.0
 # A turn long enough to still be running when the stop lands.
 _LONG_PROMPT = "Count from 1 to 40, one number per line. Do not stop early."
