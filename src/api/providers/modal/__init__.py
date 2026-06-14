@@ -835,6 +835,13 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
+    # Origin scope. Unlike daytona (whose reconcile LISTS only its own
+    # origin-labelled sandboxes), modal lists the WHOLE shared app — test /
+    # staging / production all resolve the same `agent-sdk` app — so we MUST
+    # filter by origin here, or a non-prod server's startup reconcile would
+    # terminate a LIVE production sandbox (whose ref isn't in this server's DB).
+    own_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+
     for sb in sandboxes:
         try:
             tags = await asyncio.to_thread(sb.get_tags)
@@ -844,6 +851,10 @@ async def reconcile_on_startup() -> None:
         sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
         if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
+            continue
+        if tags.get(_ORIGIN_TAG) != own_origin:
+            # Different origin (test vs production share the app) — never
+            # cross-reap; that origin's own reconcile handles it.
             continue
         # Modal tags also carry the modal sandbox object_id; the pool stores
         # whatever was passed to create_sandbox as state.sandbox_ref. Check
