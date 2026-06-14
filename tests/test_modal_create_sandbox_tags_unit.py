@@ -23,33 +23,42 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
+class _AioStream:
+    """Async-iterable stand-in for a modal stdout|stderr stream."""
+
+    def __init__(self, text: str = ""):
+        self._text = text
+
+    def __aiter__(self):
+        text = self._text
+
+        async def _gen():
+            if text:
+                yield text
+
+        return _gen()
+
+
 class _FakeProc:
     def __init__(self, sb):
         self._sb = sb
-
-    def wait(self, timeout=None):
-        return 0
-
-    @property
-    def stdout(self):
-        return SimpleNamespace(read=lambda: "")
+        self.stdout = _AioStream()
+        self.stderr = _AioStream()
 
     @property
-    def stderr(self):
-        return SimpleNamespace(read=lambda: "")
+    def wait(self):
+        async def _a():
+            return 0
+        return SimpleNamespace(aio=_a)
 
 
 class _DualTunnels:
-    """tunnels mock that works whether create_sandbox calls it sync
-    (``to_thread(sb.tunnels, 60)``) or async (``sb.tunnels.aio(60)`` once the
-    tunnels-async PR lands) — so this test is robust across that change."""
+    """``sb.tunnels`` mock exposing ``.aio`` (create_sandbox calls
+    ``sb.tunnels.aio(60)``)."""
 
     def _result(self):
         from api.providers.modal import _SUPERVISOR_CONTAINER_PORT
         return {_SUPERVISOR_CONTAINER_PORT: SimpleNamespace(url="https://fake.modal.host")}
-
-    def __call__(self, timeout):
-        return self._result()
 
     async def aio(self, timeout):
         return self._result()
@@ -61,15 +70,26 @@ class _FakeSandbox:
     def __init__(self):
         self.tag_calls: list[dict] = []
         self.tunnels = _DualTunnels()
+        self.stdout = _AioStream()
+        self.stderr = _AioStream()
 
-    def set_tags(self, tags):
-        self.tag_calls.append(dict(tags))
+    @property
+    def set_tags(self):
+        async def _a(tags):
+            self.tag_calls.append(dict(tags))
+        return SimpleNamespace(aio=_a)
 
-    def exec(self, *a, **k):
-        return _FakeProc(self)
+    @property
+    def exec(self):
+        async def _a(*a, **k):
+            return _FakeProc(self)
+        return SimpleNamespace(aio=_a)
 
+    @property
     def terminate(self):
-        pass
+        async def _a():
+            return None
+        return SimpleNamespace(aio=_a)
 
 
 async def _drive_create(monkeypatch, *, sandbox_ref, origin="test"):
@@ -79,7 +99,11 @@ async def _drive_create(monkeypatch, *, sandbox_ref, origin="test"):
     monkeypatch.setenv("AGENT_SDK_ORIGIN", origin)
 
     sb = _FakeSandbox()
-    fake_modal = SimpleNamespace(Sandbox=SimpleNamespace(create=lambda *a, **k: sb))
+
+    async def _create_aio(*a, **k):
+        return sb
+
+    fake_modal = SimpleNamespace(Sandbox=SimpleNamespace(create=SimpleNamespace(aio=_create_aio)))
 
     monkeypatch.setattr(mmod, "_require_modal", lambda: (fake_modal, None))
 

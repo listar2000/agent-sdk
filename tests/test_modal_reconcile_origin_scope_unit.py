@@ -1,8 +1,9 @@
 """modal reconcile_on_startup must not reap a different origin's sandbox.
 
-Test and production share the Modal app, so ``Sandbox.list(app_id=...)`` returns
-both. Without the origin check a test-origin server's boot reconcile would see
-production sandboxes (their refs aren't in the test DB) and terminate them.
+Test and production share the Modal app, so ``Sandbox.list.aio(app_id=...)``
+returns both. Without the origin check a test-origin server's boot reconcile
+would see production sandboxes (their refs aren't in the test DB) and terminate
+them.
 """
 from __future__ import annotations
 
@@ -11,14 +12,24 @@ from types import SimpleNamespace
 import pytest
 
 
+def _coro(fn):
+    """A modal-style method exposing ``.aio`` (async), mirroring synchronicity."""
+    async def _a(*a, **k):
+        return fn(*a, **k)
+    return SimpleNamespace(aio=_a)
+
+
 def _sb(oid, *, tag, origin):
     tags = {}
     if tag:
         tags["agent-sdk.sandbox-id"] = tag
     if origin:
         tags["agent_sdk_origin"] = origin
-    return SimpleNamespace(object_id=oid, get_tags=lambda: dict(tags),
-                           terminate=lambda: reaped.add(oid))
+    return SimpleNamespace(
+        object_id=oid,
+        get_tags=_coro(lambda: dict(tags)),
+        terminate=_coro(lambda: reaped.add(oid)),
+    )
 
 
 reaped: set[str] = set()
@@ -29,8 +40,15 @@ def _install(monkeypatch, sandboxes):
     from api.providers import modal as mmod
     reaped.clear()
     monkeypatch.setenv("AGENT_SDK_ORIGIN", "test")
+
+    def _list_aio(app_id=None):
+        async def _gen():
+            for sb in list(sandboxes):
+                yield sb
+        return _gen()
+
     fake_modal = SimpleNamespace(
-        Sandbox=SimpleNamespace(list=lambda app_id=None: list(sandboxes)))
+        Sandbox=SimpleNamespace(list=SimpleNamespace(aio=_list_aio)))
     monkeypatch.setattr(mmod, "_require_modal", lambda: (fake_modal, None))
 
     async def _app():

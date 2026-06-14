@@ -15,6 +15,7 @@ import os
 import shlex
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -669,7 +670,7 @@ async def start_daytona(sandbox_ref: str) -> None:
     sandbox, state_str = await _wait_for_stable_daytona_state(daytona, sandbox_ref)
     if state_str in ("started", "running"):
         log.info("daytona sandbox %s already started", sandbox_ref)
-        await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref, sandbox=sandbox)
+        await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref)
         return
     try:
         await sandbox.start()
@@ -689,8 +690,13 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     best-effort deleted so callers don't end up with an orphaned resource
     they can't identify later.
 
-    After the volume is ready, a utility sandbox is spun up to pre-create
-    the directory structure: shared/ and system/supervisor/.
+    Returns as soon as the volume is READY. daytona auto-creates mount
+    subpaths on first mount (the main ``agents/<id>`` mount was never
+    pre-created either, yet sessions work), so the standard layout
+    (``shared/<name>``, ``agents/<id>``) materialises on demand. We do NOT
+    eagerly spin a utility sandbox to mkdir it: that was a full daytona create
+    (the queue-bound bottleneck) per volume bootstrap, and ``system/supervisor/``
+    had no consumer at all.
     """
     from daytona_api_client_async import VolumesApi as AsyncVolumesApi
     from daytona_api_client.models import VolumeState
@@ -727,9 +733,6 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
                 vol_id, cleanup_err,
             )
         raise
-
-    # Pre-create the standard directory layout on the volume.
-    await _init_volume_dirs(vol_id)
 
     return vol_id
 
@@ -768,66 +771,21 @@ async def _daytona_create_with_502_retry(do_create, retries: int = 2):
     raise last_exc  # unreachable but satisfies type-checker
 
 
-async def _init_volume_dirs(volume_ref: str) -> None:
-    """Spin a 1-shot sandbox to mkdir -p shared/ system/supervisor/ on the volume."""
-    from daytona_sdk import (
-        CreateSandboxFromSnapshotParams,
-        CreateSandboxFromImageParams, VolumeMount,
-    )
-
-    daytona = await _get_async_daytona_client()
-
-    # _init_volume_dirs only runs `mkdir` on a brand-new volume — any image
-    # with a POSIX shell works. Phase E: no implicit hive-large default;
-    # operators opt into a snapshot via DAYTONA_SNAPSHOT, otherwise the
-    # ``node:22-slim`` fallback is used (volume-init does not need the
-    # agent-sdk runtime).
-    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "").strip()
-    use_snapshot = snapshot.lower() not in {"", "0", "false", "image"}
-
-    # Mount the whole volume at /v (no subpath) so we can create dirs.
-    volumes = [VolumeMount(volume_id=volume_ref, mount_path="/v")]
-    init_labels = _sandbox_labels()
-
-    async def _do_init_create():
-        if use_snapshot:
-            return await daytona.create(
-                CreateSandboxFromSnapshotParams(
-                    snapshot=snapshot, auto_stop_interval=0,
-                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                    labels=init_labels,
-                ), timeout=120,
-            )
-        return await daytona.create(
-            CreateSandboxFromImageParams(
-                image="node:22-slim", auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=init_labels,
-            ), timeout=120,
-        )
-
-    sb = await _daytona_create_with_502_retry(_do_init_create)
-
-    try:
-        await _run_sandbox_exec_async(
-            sb, "mkdir -p /v/shared /v/system/supervisor", timeout=30,
-        )
-        log.info("volume %s: initialized shared/ and system/supervisor/ dirs", volume_ref)
-    finally:
-        try:
-            await daytona.delete(sb)
-        except Exception:
-            pass
-
-
 async def delete_daytona_volume(provider_ref: str) -> None:
     """Delete a Daytona volume by provider-native id (UUID)."""
     from daytona_api_client_async import VolumesApi as AsyncVolumesApi
     client = await _get_async_daytona_client()
     volumes_api = AsyncVolumesApi(client._api_client)
     await volumes_api.delete_volume(provider_ref)
+    # The volume is gone — evict its per-volume caches so they don't accumulate
+    # stale entries. The conditional-create bool would otherwise live forever
+    # (it has no TTL reaper); the utility sandbox would otherwise linger up to
+    # _UTILITY_TTL_S mounting a now-deleted volume, so reap it now.
+    _conditional_create_support_cache.pop(provider_ref, None)
+    await _drop_utility(provider_ref)
 
 
+@timed_provider_op("daytona", "status")
 async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
     """Return one of: 'running' | 'stopped' | 'missing' | 'error'.
 
@@ -928,8 +886,14 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     out = (r.result if hasattr(r, "result") else str(r)) or ""
     err = (r.stderr if hasattr(r, "stderr") else "") or ""
     code = r.exit_code if hasattr(r, "exit_code") else None
-    out, trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
-    return ExecResult(stdout=out, stderr=err, exit_code=code, stdout_truncated=trunc)
+    # Cap BOTH streams at 1 MiB. stderr was previously returned UNTRUNCATED —
+    # a command with huge stderr (a verbose tool, an error dump) returned all
+    # of it, holding it in RAM and flowing it downstream unbounded. Match
+    # stdout (and the modal/docker providers, which cap both).
+    out, out_trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
+    err, err_trunc = _truncate(err.encode(), _MAX_OUTPUT_BYTES)
+    return ExecResult(stdout=out, stderr=err, exit_code=code,
+                      stdout_truncated=out_trunc, stderr_truncated=err_trunc)
 
 
 @timed_provider_op("daytona", "create_sandbox")
@@ -991,8 +955,34 @@ _UTILITY_REAPER_TICK_S = 30.0
 _utility_cache: dict[str, tuple["ProviderInstance", float]] = {}  # ref -> (inst, last_used)
 _utility_cache_lock = asyncio.Lock()
 _utility_reaper_started = False
-_conditional_create_support_cache: dict[str, bool] = {}
+# Per-volume "does this backend honour If-None-Match: *" detection, cached so
+# the probe (a write + conditional-upload + download round-trip) runs once per
+# volume. LRU-BOUNDED: a long-running server churns through many distinct
+# volumes, and volumes can vanish out-of-band (reconcile / external delete)
+# without hitting delete_volume — so an unbounded dict here is a slow leak.
+# Cap + evict-on-delete keeps it flat. Re-probing an evicted volume is cheap
+# and idempotent.
+_conditional_create_support_cache: "OrderedDict[str, bool]" = OrderedDict()
+_CONDCREATE_CACHE_MAX = int(
+    os.environ.get("AGENT_SDK_DAYTONA_CONDCREATE_CACHE_MAX", "2048")
+)
 _conditional_create_probe_lock = asyncio.Lock()
+
+
+def _condcreate_cache_get(ref: str) -> bool | None:
+    """LRU read: refresh recency on hit so hot volumes survive eviction."""
+    val = _conditional_create_support_cache.get(ref)
+    if val is not None:
+        _conditional_create_support_cache.move_to_end(ref)
+    return val
+
+
+def _condcreate_cache_set(ref: str, val: bool) -> None:
+    """LRU write: bound the dict, evicting the least-recently-used entry."""
+    _conditional_create_support_cache[ref] = val
+    _conditional_create_support_cache.move_to_end(ref)
+    while len(_conditional_create_support_cache) > _CONDCREATE_CACHE_MAX:
+        _conditional_create_support_cache.popitem(last=False)
 
 
 async def _get_or_create_utility(ref: str) -> "ProviderInstance":
@@ -1176,11 +1166,11 @@ async def _daytona_supports_conditional_create(ref: str) -> bool:
         return True
     if mode in {"off", "false", "0", "disable", "force_off"}:
         return False
-    cached = _conditional_create_support_cache.get(ref)
+    cached = _condcreate_cache_get(ref)
     if cached is not None:
         return cached
     async with _conditional_create_probe_lock:
-        cached = _conditional_create_support_cache.get(ref)
+        cached = _condcreate_cache_get(ref)
         if cached is not None:
             return cached
         probe_rel = f"system/.conditional-create-probe-{uuid.uuid4().hex}.txt"
@@ -1196,18 +1186,18 @@ async def _daytona_supports_conditional_create(ref: str) -> bool:
             )
             res = await _run_in_utility_sandbox(ref, write_cmd)
             if res.exit_code != 0:
-                _conditional_create_support_cache[ref] = False
+                _condcreate_cache_set(ref, False)
                 return False
             result = await _conditional_upload_if_absent(ref, probe_abs, b"probe-b")
             if result != "exists":
-                _conditional_create_support_cache[ref] = False
+                _condcreate_cache_set(ref, False)
                 return False
             current = await volume_download(ref, probe_rel)
             supported = current == b"probe-a"
-            _conditional_create_support_cache[ref] = supported
+            _condcreate_cache_set(ref, supported)
             return supported
         except Exception:
-            _conditional_create_support_cache[ref] = False
+            _condcreate_cache_set(ref, False)
             return False
         finally:
             try:

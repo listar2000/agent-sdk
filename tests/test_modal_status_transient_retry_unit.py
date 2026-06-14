@@ -37,11 +37,14 @@ async def test_status_retries_transient_then_running(monkeypatch):
 
     calls = {"n": 0}
 
+    async def _poll_aio():
+        return None  # running
+
     async def _lookup(ref):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("transient SandboxWait blip")
-        return SimpleNamespace(poll=lambda: None)  # running
+        return SimpleNamespace(poll=SimpleNamespace(aio=_poll_aio))
 
     monkeypatch.setattr(mmod, "_lookup_sandbox", _lookup)
 
@@ -91,14 +94,14 @@ async def test_status_retries_transient_poll_error(monkeypatch):
 
     state = {"n": 0}
 
-    def _poll():
+    async def _poll_aio():
         state["n"] += 1
         if state["n"] == 1:
             raise RuntimeError("poll RPC blip")
         return None  # running
 
     async def _lookup(ref):
-        return SimpleNamespace(poll=_poll)
+        return SimpleNamespace(poll=SimpleNamespace(aio=_poll_aio))
 
     monkeypatch.setattr(mmod, "_lookup_sandbox", _lookup)
 
