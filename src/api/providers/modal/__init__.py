@@ -99,6 +99,9 @@ _APP_NAME = "agent-sdk"
 _STATUS_PROBE_ATTEMPTS = int(os.environ.get("AGENT_SDK_MODAL_STATUS_ATTEMPTS", "3"))
 _STATUS_PROBE_BACKOFF_S = float(os.environ.get("AGENT_SDK_MODAL_STATUS_BACKOFF_S", "0.25"))
 
+# Runaway guard for the read-only orphan DETECTOR's per-sandbox tag scan.
+_DETECT_MAX_ITEMS = int(os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000"))
+
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
@@ -998,6 +1001,72 @@ async def reconcile_on_startup() -> None:
             log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
 
     await bounded_gather([_reap(sb, ref) for sb, ref in orphans])
+
+
+async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> dict:
+    """List our-origin modal sandboxes and diff them against live session refs.
+
+    Pure DETECTION — never terminates. The modal counterpart to
+    ``daytona.detect_orphan_sandboxes`` so the orphan monitor can track modal
+    leaked compute too (a sandbox with no session row is leaked compute, e.g.
+    a recovery path that abandoned it, or the untagged-supervisor leak class).
+
+    ``origin`` defaults to ``AGENT_SDK_ORIGIN``. Like the reconcile, we list the
+    whole shared app and scope to our own origin so a non-prod monitor never
+    counts (or, in reconcile, reaps) another origin's live sandboxes.
+
+    Returns ``{"total_seen": int, "orphans": [(id, "")],
+    "state_hist": {}, "capped": bool}`` — same shape as the daytona detector
+    (state breakdown is omitted: modal state needs a per-sandbox poll() RPC,
+    not worth it for a read-only 30-min monitor; the orphan COUNT is the signal).
+    """
+    from collections import Counter
+
+    modal, _ = _require_modal()
+    app = await _get_app()
+    own = origin or os.environ.get("AGENT_SDK_ORIGIN", "production")
+
+    # Scope to our origin SERVER-SIDE (Sandbox.list tags filter) + cap DURING
+    # iteration, mirroring reconcile_on_startup: a non-prod monitor never even
+    # lists another origin's sandboxes (no get_tags paid on them), and a huge
+    # account can't balloon memory by materialising the whole list first.
+    def _list():
+        out = []
+        for sb in modal.Sandbox.list(
+            app_id=app.app_id, tags={_ORIGIN_TAG: own},
+        ):
+            out.append(sb)
+            if len(out) >= _DETECT_MAX_ITEMS:
+                break
+        return out
+
+    sandboxes = await asyncio.to_thread(_list)
+    capped = len(sandboxes) >= _DETECT_MAX_ITEMS
+
+    if live_refs is None:
+        from ... import db as dbmod
+        live_refs = await dbmod.live_sandbox_refs()
+
+    orphans: list[tuple[str, str]] = []
+    seen = 0
+    for sb in sandboxes:
+        try:
+            tags = await asyncio.to_thread(sb.get_tags)
+        except Exception:
+            continue
+        ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
+        if not ref_tag:
+            continue  # untagged — not ours
+        # Origin already scoped by the server-side list filter above.
+        seen += 1
+        if ref_tag not in live_refs and sb.object_id not in live_refs:
+            orphans.append((sb.object_id, ""))
+    return {
+        "total_seen": seen,
+        "orphans": orphans,
+        "state_hist": dict(Counter()),
+        "capped": capped,
+    }
 
 
 # ---------------------------------------------------------------------------
