@@ -89,6 +89,15 @@ _ORIGIN_TAG = "agent_sdk_origin"
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
 
+# get_sandbox_status retry budget. A transient control-plane blip (from_id /
+# SandboxWait is high-variance; poll is an RPC) must NOT classify a healthy
+# sandbox as "error" — the recovery path treats "error" as unrecoverable and
+# destroys + cold-recreates it (orphaning the live one). A definitive
+# SandboxMissingError still returns "missing" immediately (no retry); only
+# transient errors are retried before giving up.
+_STATUS_PROBE_ATTEMPTS = int(os.environ.get("AGENT_SDK_MODAL_STATUS_ATTEMPTS", "3"))
+_STATUS_PROBE_BACKOFF_S = float(os.environ.get("AGENT_SDK_MODAL_STATUS_BACKOFF_S", "0.25"))
+
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
@@ -420,9 +429,19 @@ async def create_sandbox(
     )
 
     try:
-        if sandbox_ref:
-            # Tags persist on the Modal side and drive reconcile_on_startup.
-            await asyncio.to_thread(sb.set_tags, {_TAG_KEY: sandbox_ref})
+        # ALWAYS tag — mirror create_bare_sandbox. supervisor_session creates
+        # WITHOUT passing sandbox_ref, so the old `if sandbox_ref:` gate left
+        # these sandboxes UNTAGGED: invisible to reconcile_on_startup (skips
+        # sandboxes with no _TAG_KEY) AND to cleanup_orphans.py (filters by
+        # _ORIGIN_TAG), so an orphan leaked until the 1h hard timeout. The
+        # object_id fallback keeps live sandboxes correctly matched — the pool
+        # stores object_id as state.sandbox_ref, so reconcile's live-ref check
+        # finds them.
+        origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+        await asyncio.to_thread(sb.set_tags, {
+            _TAG_KEY: sandbox_ref or sb.object_id,
+            _ORIGIN_TAG: origin,
+        })
 
         # Fetch the HTTPS tunnel URL. ``timeout`` here is the time Modal will
         # spend waiting for the tunnel to become ready.
@@ -638,23 +657,30 @@ async def get_sandbox_status(ref: str) -> str:
     """
     if not ref:
         return "missing"
-    try:
-        sb = await _lookup_sandbox(ref)
-    except SandboxMissingError:
-        return "missing"
-    except Exception as e:
-        log.warning("modal get_sandbox_status %s: %s", ref, e)
-        return "error"
-    try:
-        rc = await asyncio.to_thread(sb.poll)
-    except Exception as e:
-        log.warning("modal poll %s: %s", ref, e)
-        return "error"
-    if rc is None:
-        return "running"
-    # Returncode is set — sandbox has exited. Modal records linger briefly
-    # after exit; treat as 'missing' so the server doesn't try to resume.
-    return "missing"
+    last_err: Exception | None = None
+    for attempt in range(_STATUS_PROBE_ATTEMPTS):
+        try:
+            sb = await _lookup_sandbox(ref)
+            rc = await asyncio.to_thread(sb.poll)
+            if rc is None:
+                return "running"
+            # Returncode is set — sandbox has exited. Modal records linger
+            # briefly after exit; treat as 'missing' so the server doesn't
+            # try to resume.
+            return "missing"
+        except SandboxMissingError:
+            return "missing"  # definitive — the record is gone, don't retry
+        except Exception as e:
+            # Transient (network / SandboxWait blip / poll RPC error): retry
+            # before declaring "error", which would destroy a healthy sandbox.
+            last_err = e
+            if attempt + 1 < _STATUS_PROBE_ATTEMPTS:
+                await asyncio.sleep(_STATUS_PROBE_BACKOFF_S * (attempt + 1))
+    log.warning(
+        "modal get_sandbox_status %s: error after %d attempts: %s",
+        ref, _STATUS_PROBE_ATTEMPTS, last_err,
+    )
+    return "error"
 
 
 @timed_provider_op("modal", "start")
@@ -809,6 +835,13 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
+    # Origin scope. Unlike daytona (whose reconcile LISTS only its own
+    # origin-labelled sandboxes), modal lists the WHOLE shared app — test /
+    # staging / production all resolve the same `agent-sdk` app — so we MUST
+    # filter by origin here, or a non-prod server's startup reconcile would
+    # terminate a LIVE production sandbox (whose ref isn't in this server's DB).
+    own_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+
     for sb in sandboxes:
         try:
             tags = await asyncio.to_thread(sb.get_tags)
@@ -818,6 +851,10 @@ async def reconcile_on_startup() -> None:
         sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
         if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
+            continue
+        if tags.get(_ORIGIN_TAG) != own_origin:
+            # Different origin (test vs production share the app) — never
+            # cross-reap; that origin's own reconcile handles it.
             continue
         # Modal tags also carry the modal sandbox object_id; the pool stores
         # whatever was passed to create_sandbox as state.sandbox_ref. Check
