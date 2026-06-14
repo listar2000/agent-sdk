@@ -89,6 +89,15 @@ _ORIGIN_TAG = "agent_sdk_origin"
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
 
+# get_sandbox_status retry budget. A transient control-plane blip (from_id /
+# SandboxWait is high-variance; poll is an RPC) must NOT classify a healthy
+# sandbox as "error" — the recovery path treats "error" as unrecoverable and
+# destroys + cold-recreates it (orphaning the live one). A definitive
+# SandboxMissingError still returns "missing" immediately (no retry); only
+# transient errors are retried before giving up.
+_STATUS_PROBE_ATTEMPTS = int(os.environ.get("AGENT_SDK_MODAL_STATUS_ATTEMPTS", "3"))
+_STATUS_PROBE_BACKOFF_S = float(os.environ.get("AGENT_SDK_MODAL_STATUS_BACKOFF_S", "0.25"))
+
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
@@ -638,23 +647,30 @@ async def get_sandbox_status(ref: str) -> str:
     """
     if not ref:
         return "missing"
-    try:
-        sb = await _lookup_sandbox(ref)
-    except SandboxMissingError:
-        return "missing"
-    except Exception as e:
-        log.warning("modal get_sandbox_status %s: %s", ref, e)
-        return "error"
-    try:
-        rc = await asyncio.to_thread(sb.poll)
-    except Exception as e:
-        log.warning("modal poll %s: %s", ref, e)
-        return "error"
-    if rc is None:
-        return "running"
-    # Returncode is set — sandbox has exited. Modal records linger briefly
-    # after exit; treat as 'missing' so the server doesn't try to resume.
-    return "missing"
+    last_err: Exception | None = None
+    for attempt in range(_STATUS_PROBE_ATTEMPTS):
+        try:
+            sb = await _lookup_sandbox(ref)
+            rc = await asyncio.to_thread(sb.poll)
+            if rc is None:
+                return "running"
+            # Returncode is set — sandbox has exited. Modal records linger
+            # briefly after exit; treat as 'missing' so the server doesn't
+            # try to resume.
+            return "missing"
+        except SandboxMissingError:
+            return "missing"  # definitive — the record is gone, don't retry
+        except Exception as e:
+            # Transient (network / SandboxWait blip / poll RPC error): retry
+            # before declaring "error", which would destroy a healthy sandbox.
+            last_err = e
+            if attempt + 1 < _STATUS_PROBE_ATTEMPTS:
+                await asyncio.sleep(_STATUS_PROBE_BACKOFF_S * (attempt + 1))
+    log.warning(
+        "modal get_sandbox_status %s: error after %d attempts: %s",
+        ref, _STATUS_PROBE_ATTEMPTS, last_err,
+    )
+    return "error"
 
 
 @timed_provider_op("modal", "start")
