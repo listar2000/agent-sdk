@@ -497,8 +497,9 @@ async def restart_daytona_supervisor(
         log.info("starting stopped daytona sandbox %s (state=%s)",
                  daytona_sandbox_id, state_str)
         await sandbox.start()
-        await _wait_for_daytona_sandbox_ready(daytona, daytona_sandbox_id)
-        sandbox = await daytona.get(daytona_sandbox_id)
+        # The ready-poll already fetched a fresh, network-ready handle — reuse
+        # it instead of paying another daytona.get() control-plane round-trip.
+        sandbox = await _wait_for_daytona_sandbox_ready(daytona, daytona_sandbox_id)
 
     # Volume-cached path. Uses the fixed supervisor port so the signed URL
     # is stable across restarts for an already-issued session (Daytona maps
@@ -605,8 +606,9 @@ async def _wait_for_stable_daytona_state(
         await asyncio.sleep(0.5)
 
 
-async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=None) -> None:
-    """Poll until the sandbox is "started" AND an exec succeeds (IP allocated).
+async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str):
+    """Poll until the sandbox is "started" AND an exec succeeds (IP allocated),
+    then RETURN the fresh ``AsyncSandbox`` handle it confirmed ready on.
 
     sandbox.start() returns as soon as Daytona accepts the request, before the
     container network is configured.  Subsequent exec calls fail with
@@ -616,7 +618,10 @@ async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=Non
     every restart even when the sandbox was already ready. 0.5s cadence
     also surfaces readiness ~4x faster than the old 2s polls.
 
-    ``daytona`` must be an ``AsyncDaytona``.
+    Returning the handle lets the restart path reuse it instead of issuing a
+    redundant ``daytona.get()`` (a control-plane RTT) right after — the loop
+    already fetched a fresh handle to confirm readiness. ``daytona`` must be an
+    ``AsyncDaytona``.
     """
     for attempt in range(30):  # 30 * 0.5s = 15s max
         if attempt > 0:
@@ -631,7 +636,7 @@ async def _wait_for_daytona_sandbox_ready(daytona, sandbox_ref: str, sandbox=Non
             result = (r.result if hasattr(r, "result") else str(r)) or ""
             if "ready" in result:
                 log.info("daytona sandbox %s is ready", sandbox_ref[:16])
-                return
+                return sandbox
         except Exception:
             pass
     raise RuntimeError(
@@ -660,7 +665,7 @@ async def start_daytona(sandbox_ref: str) -> None:
     sandbox, state_str = await _wait_for_stable_daytona_state(daytona, sandbox_ref)
     if state_str in ("started", "running"):
         log.info("daytona sandbox %s already started", sandbox_ref)
-        await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref, sandbox=sandbox)
+        await _wait_for_daytona_sandbox_ready(daytona, sandbox_ref)
         return
     try:
         await sandbox.start()
