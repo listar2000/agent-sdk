@@ -36,8 +36,17 @@ async def test_modal_detect_counts_only_our_origin_orphans(monkeypatch):
         _sb("sb-prod", tag="sb-prod", origin="production"),     # other origin → ignore
         _sb("sb-untagged", tag=None, origin="test"),            # untagged → ignore
     ]
-    fake_modal = SimpleNamespace(
-        Sandbox=SimpleNamespace(list=lambda app_id=None: list(sandboxes)))
+    def _list(app_id=None, tags=None):
+        # Mirror the real Sandbox.list server-side tag filter: only sandboxes
+        # with at least the requested tags. Origin scoping happens HERE now.
+        out = []
+        for sb in sandboxes:
+            sb_tags = sb.get_tags()
+            if tags is None or all(sb_tags.get(k) == v for k, v in tags.items()):
+                out.append(sb)
+        return out
+
+    fake_modal = SimpleNamespace(Sandbox=SimpleNamespace(list=_list))
     monkeypatch.setattr(mmod, "_require_modal", lambda: (fake_modal, None))
 
     async def _app():
@@ -62,7 +71,7 @@ async def test_modal_detect_never_queries_db_when_live_refs_passed(monkeypatch):
     from api.providers import modal as mmod
 
     monkeypatch.setenv("AGENT_SDK_ORIGIN", "test")
-    fake_modal = SimpleNamespace(Sandbox=SimpleNamespace(list=lambda app_id=None: []))
+    fake_modal = SimpleNamespace(Sandbox=SimpleNamespace(list=lambda app_id=None, tags=None: []))
     monkeypatch.setattr(mmod, "_require_modal", lambda: (fake_modal, None))
 
     async def _app():

@@ -863,13 +863,22 @@ async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> 
     app = await _get_app()
     own = origin or os.environ.get("AGENT_SDK_ORIGIN", "production")
 
+    # Scope to our origin SERVER-SIDE (Sandbox.list tags filter) + cap DURING
+    # iteration, mirroring reconcile_on_startup: a non-prod monitor never even
+    # lists another origin's sandboxes (no get_tags paid on them), and a huge
+    # account can't balloon memory by materialising the whole list first.
     def _list():
-        return list(modal.Sandbox.list(app_id=app.app_id))
+        out = []
+        for sb in modal.Sandbox.list(
+            app_id=app.app_id, tags={_ORIGIN_TAG: own},
+        ):
+            out.append(sb)
+            if len(out) >= _DETECT_MAX_ITEMS:
+                break
+        return out
 
     sandboxes = await asyncio.to_thread(_list)
     capped = len(sandboxes) >= _DETECT_MAX_ITEMS
-    if capped:
-        sandboxes = sandboxes[:_DETECT_MAX_ITEMS]
 
     if live_refs is None:
         from ... import db as dbmod
@@ -885,8 +894,7 @@ async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> 
         ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
         if not ref_tag:
             continue  # untagged — not ours
-        if tags.get(_ORIGIN_TAG) != own:
-            continue  # different origin — not ours, never count it
+        # Origin already scoped by the server-side list filter above.
         seen += 1
         if ref_tag not in live_refs and sb.object_id not in live_refs:
             orphans.append((sb.object_id, ""))
