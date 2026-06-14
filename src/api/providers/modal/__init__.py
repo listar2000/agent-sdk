@@ -41,7 +41,6 @@ from .._shared import (
     _MAX_OUTPUT_BYTES,
     _acp_launch_args,
     _build_env_prefix,
-    _truncate,
     _wait_for_health,
     build_supervisor_argv,
 )
@@ -726,12 +725,34 @@ async def resolve_supervisor_url(sandbox_ref: str) -> str | None:
 # Exec helper (used by the package-level ``exec_in_instance`` dispatch)
 # ---------------------------------------------------------------------------
 
+def _read_stream_capped(stream, cap: int) -> tuple[str, bool]:
+    """Read a Modal exec output stream, bounding peak RAM to ~``cap`` bytes.
+
+    Modal's ``StreamReader.read()`` fetches the ENTIRE stream until EOF — a
+    command with huge output (``cat biglog``, ``find /``, a runaway loop) would
+    buffer all of it in the server's RAM *before* the 1 MiB truncation ever ran.
+    At scale a few such concurrent execs could OOM a replica. We iterate the
+    stream instead (verified sync-iterable on a real sandbox) and stop the
+    moment we exceed ``cap``, so peak RAM is ``cap`` + one chunk regardless of
+    how much the command emitted. Returns ``(text, truncated)`` with the same
+    semantics as ``_truncate`` (truncated iff output exceeded ``cap``).
+    """
+    buf = bytearray()
+    for chunk in stream:
+        buf.extend(chunk.encode() if isinstance(chunk, str) else chunk)
+        if len(buf) > cap:
+            return buf[:cap].decode(errors="replace"), True
+    return buf.decode(errors="replace"), False
+
+
 async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
     """Run ``cmd`` via ``sh -c`` inside the Modal sandbox.
 
     Truncation and timeout semantics mirror the other providers'
     ``_exec_subprocess`` helper: stdout/stderr capped at 1 MiB each, a
-    timeout yields ``ExecResult(timed_out=True)``.
+    timeout yields ``ExecResult(timed_out=True)``. The cap is enforced WHILE
+    reading (``_read_stream_capped``), so a huge-output command never buffers
+    its full output in server RAM.
     """
     sid = inst.sandbox_ref or inst.container_id
     if not sid:
@@ -745,18 +766,16 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
         except TypeError:
             # Older SDKs don't accept timeout on wait(); fall back.
             rc = p.wait()
-        out = p.stdout.read() or ""
-        err = p.stderr.read() or ""
-        return rc, out, err
+        out_s, out_trunc = _read_stream_capped(p.stdout, _MAX_OUTPUT_BYTES)
+        err_s, err_trunc = _read_stream_capped(p.stderr, _MAX_OUTPUT_BYTES)
+        return rc, out_s, out_trunc, err_s, err_trunc
 
     try:
-        rc, out, err = await asyncio.wait_for(
+        rc, out_s, out_trunc, err_s, err_trunc = await asyncio.wait_for(
             asyncio.to_thread(_run), timeout=timeout + 5,
         )
     except asyncio.TimeoutError:
         return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
-    out_s, out_trunc = _truncate(out.encode() if isinstance(out, str) else out, _MAX_OUTPUT_BYTES)
-    err_s, err_trunc = _truncate(err.encode() if isinstance(err, str) else err, _MAX_OUTPUT_BYTES)
     return ExecResult(
         stdout=out_s, stderr=err_s,
         exit_code=int(rc) if rc is not None else -1,
