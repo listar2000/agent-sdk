@@ -725,11 +725,14 @@ async def get_sandbox_status(ref: str) -> str:
     """
     if not ref:
         return "missing"
+    # #179 transient-retry loop + #195 async poll: retry transient blips
+    # (don't misclassify a healthy sandbox as "error"), polling via the async
+    # ``sb.poll.aio()`` so the status probe holds no threadpool worker.
     last_err: Exception | None = None
     for attempt in range(_STATUS_PROBE_ATTEMPTS):
         try:
             sb = await _lookup_sandbox(ref)
-            rc = await asyncio.to_thread(sb.poll)
+            rc = await sb.poll.aio()
             if rc is None:
                 return "running"
             # Returncode is set — sandbox has exited. Modal records linger
