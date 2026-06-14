@@ -548,24 +548,26 @@ async def create_bare_sandbox(
     log.info("modal create_bare_sandbox (native): volume=%s subpath=%s root=%s",
              volume_ref, subpath, root)
     res_kw = _to_modal_resources(resources)
-    sb = await asyncio.to_thread(
-        lambda: modal.Sandbox.create(
-            "sh", "-c", entrypoint,
-            app=app,
-            image=image,
-            volumes={_VOLUME_MOUNT: vol},
-            timeout=_SANDBOX_TIMEOUT_SEC,
-            # idle_timeout == hard timeout (not the supervisor's shorter
-            # _SANDBOX_IDLE_TIMEOUT_SEC): the bare path has NO tunnel, so
-            # modal's idle clock — documented to key off tunnel HTTP traffic —
-            # has no signal to reset and could reap an ACTIVE native session
-            # mid-tool-call. Native idle lifecycle is owned by the server's
-            # SessionPool reaper (which tracks exec activity and hibernates),
-            # so we disable modal's separate idle timer and keep only the hard
-            # ceiling as a backstop.
-            idle_timeout=_SANDBOX_TIMEOUT_SEC,
-            **res_kw,
-        )
+    # Async create (modal ``.aio``) — not asyncio.to_thread: Sandbox.create
+    # holds its thread for the ~2s scheduling wait, so a burst of native
+    # session starts (autoscale) would cap at the shared threadpool. Async
+    # frees the loop the same way the exec path does (#190).
+    sb = await modal.Sandbox.create.aio(
+        "sh", "-c", entrypoint,
+        app=app,
+        image=image,
+        volumes={_VOLUME_MOUNT: vol},
+        timeout=_SANDBOX_TIMEOUT_SEC,
+        # idle_timeout == hard timeout (not the supervisor's shorter
+        # _SANDBOX_IDLE_TIMEOUT_SEC): the bare path has NO tunnel, so
+        # modal's idle clock — documented to key off tunnel HTTP traffic —
+        # has no signal to reset and could reap an ACTIVE native session
+        # mid-tool-call. Native idle lifecycle is owned by the server's
+        # SessionPool reaper (which tracks exec activity and hibernates),
+        # so we disable modal's separate idle timer and keep only the hard
+        # ceiling as a backstop.
+        idle_timeout=_SANDBOX_TIMEOUT_SEC,
+        **res_kw,
     )
     origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
     try:
@@ -577,7 +579,7 @@ async def create_bare_sandbox(
         #    are never mis-reaped.
         #  - agent_sdk_origin: lets cleanup_orphans.py (_reap_modal) isolate
         #    test residue from production, matching the docker/daytona label.
-        await asyncio.to_thread(sb.set_tags, {
+        await sb.set_tags.aio({
             _TAG_KEY: sandbox_ref or sb.object_id,
             _ORIGIN_TAG: origin,
         })
@@ -595,7 +597,7 @@ async def create_bare_sandbox(
         )
     except BaseException:
         try:
-            await asyncio.to_thread(sb.terminate)
+            await sb.terminate.aio()
         except Exception:
             pass
         raise
