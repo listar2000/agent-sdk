@@ -89,6 +89,9 @@ _ORIGIN_TAG = "agent_sdk_origin"
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
 
+# Runaway guard for the read-only orphan DETECTOR's per-sandbox tag scan.
+_DETECT_MAX_ITEMS = int(os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000"))
+
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
@@ -835,6 +838,64 @@ async def reconcile_on_startup() -> None:
                 await asyncio.to_thread(sb.terminate)
             except Exception as e:
                 log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
+
+
+async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> dict:
+    """List our-origin modal sandboxes and diff them against live session refs.
+
+    Pure DETECTION — never terminates. The modal counterpart to
+    ``daytona.detect_orphan_sandboxes`` so the orphan monitor can track modal
+    leaked compute too (a sandbox with no session row is leaked compute, e.g.
+    a recovery path that abandoned it, or the untagged-supervisor leak class).
+
+    ``origin`` defaults to ``AGENT_SDK_ORIGIN``. Like the reconcile, we list the
+    whole shared app and scope to our own origin so a non-prod monitor never
+    counts (or, in reconcile, reaps) another origin's live sandboxes.
+
+    Returns ``{"total_seen": int, "orphans": [(id, "")],
+    "state_hist": {}, "capped": bool}`` — same shape as the daytona detector
+    (state breakdown is omitted: modal state needs a per-sandbox poll() RPC,
+    not worth it for a read-only 30-min monitor; the orphan COUNT is the signal).
+    """
+    from collections import Counter
+
+    modal, _ = _require_modal()
+    app = await _get_app()
+    own = origin or os.environ.get("AGENT_SDK_ORIGIN", "production")
+
+    def _list():
+        return list(modal.Sandbox.list(app_id=app.app_id))
+
+    sandboxes = await asyncio.to_thread(_list)
+    capped = len(sandboxes) >= _DETECT_MAX_ITEMS
+    if capped:
+        sandboxes = sandboxes[:_DETECT_MAX_ITEMS]
+
+    if live_refs is None:
+        from ... import db as dbmod
+        live_refs = await dbmod.live_sandbox_refs()
+
+    orphans: list[tuple[str, str]] = []
+    seen = 0
+    for sb in sandboxes:
+        try:
+            tags = await asyncio.to_thread(sb.get_tags)
+        except Exception:
+            continue
+        ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
+        if not ref_tag:
+            continue  # untagged — not ours
+        if tags.get(_ORIGIN_TAG) != own:
+            continue  # different origin — not ours, never count it
+        seen += 1
+        if ref_tag not in live_refs and sb.object_id not in live_refs:
+            orphans.append((sb.object_id, ""))
+    return {
+        "total_seen": seen,
+        "orphans": orphans,
+        "state_hist": dict(Counter()),
+        "capped": capped,
+    }
 
 
 # ---------------------------------------------------------------------------

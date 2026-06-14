@@ -244,10 +244,13 @@ async def lifespan(app):
         limits=httpx.Limits(max_keepalive_connections=200, max_connections=400),
     )
 
-    # Startup reconciliation: kill orphan containers labeled with a
+    # Startup reconciliation: kill orphan sandboxes labeled with a
     # sandbox_ref whose DB row is gone or marked deleted. Per-provider in
-    # parallel so a slow provider doesn't serialise boot. In practice
-    # only Docker does real work; daytona/local/modal are no-ops today.
+    # parallel so a slow provider doesn't serialise boot. docker, daytona, and
+    # modal all reap real orphans here (origin-scoped); unix_local is a no-op.
+    # This runs in EVERY replica (no lease) on purpose — redundant reaping is
+    # cheap insurance that orphans are reclaimed even if a replica's boot
+    # reconcile fails; the read-only orphan_monitor is the ongoing backstop.
     async def _safe_reconcile(prov: str) -> None:
         try:
             await _providers_mod.reconcile_sandboxes(prov)
