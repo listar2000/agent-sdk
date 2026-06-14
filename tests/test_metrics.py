@@ -149,6 +149,57 @@ async def test_record_writes_rows_and_summary_reads_from_postgres(clean_db):
 @pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
 @pytest.mark.xdist_group("db")
 @pytest.mark.asyncio
+async def test_error_timeseries_buckets_errors_only(clean_db):
+    """The dashboard's 'errors over time' graph: bucketed error counts that
+    EXCLUDE recoveries + leaks (same scope as the rest of the errors panel),
+    a fixed bucket count, and the same series surfaced under
+    ``/metrics`` → ``errors.timeseries``."""
+    from api import db
+    r = MetricsReporter()
+    await r.record_error(RuntimeError("e1"), category="provider", provider="native")
+    await r.record_error(RuntimeError("e2"), category="http_5xx", http_status=500)
+    await r.record_recovery("cold_recover", provider="native")   # must NOT count
+    await r.record_leak("orphan_detected", provider="native")    # must NOT count
+
+    ts = await db.error_timeseries(since_s=None, buckets=24)
+    assert len(ts["counts"]) == 24 and ts["bucket_s"] > 0
+    assert sum(ts["counts"]) == 2, ts["counts"]   # the 2 errors, not recovery/leak
+
+    # the same series rides the /metrics summary the dashboard fetches
+    summary = await db.get_metrics_summary(since_s=None)
+    assert sum(summary["errors"]["timeseries"]["counts"]) == 2
+
+
+@pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+@pytest.mark.xdist_group("db")
+@pytest.mark.asyncio
+async def test_op_timeseries_per_operation_over_time(clean_db):
+    """The dashboard's per-operation error-rate sparklines: per (provider,
+    operation), call totals + failures bucketed over time, keyed
+    ``"<provider>\\t<operation>"`` and zero-filled to a fixed bucket count, also
+    surfaced under ``/metrics`` → ``ops_timeseries``."""
+    from api import db
+    r = MetricsReporter()
+    async with r.timed_op(provider="daytona", operation="cold_create"):
+        pass
+    with pytest.raises(RuntimeError):
+        async with r.timed_op(provider="daytona", operation="cold_create"):
+            raise RuntimeError("create failed")
+
+    ts = await db.op_timeseries(since_s=None, buckets=12)
+    key = "daytona\tcold_create"
+    assert key in ts["series"]
+    s = ts["series"][key]
+    assert len(s["n"]) == 12 and len(s["fails"]) == 12
+    assert sum(s["n"]) == 2 and sum(s["fails"]) == 1   # 2 calls, 1 failed
+
+    summary = await db.get_metrics_summary(since_s=None)
+    assert key in summary["ops_timeseries"]["series"]
+
+
+@pytest.mark.skipif(_DB is None, reason="TEST_DATABASE_URL not set")
+@pytest.mark.xdist_group("db")
+@pytest.mark.asyncio
 async def test_record_error_dedups_per_exception_in_db(clean_db):
     from api import db
     r = MetricsReporter()
