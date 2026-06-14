@@ -646,7 +646,7 @@ async def get_sandbox_status(ref: str) -> str:
         log.warning("modal get_sandbox_status %s: %s", ref, e)
         return "error"
     try:
-        rc = await asyncio.to_thread(sb.poll)
+        rc = await sb.poll.aio()
     except Exception as e:
         log.warning("modal poll %s: %s", ref, e)
         return "error"
