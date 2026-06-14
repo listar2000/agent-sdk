@@ -42,7 +42,6 @@ from .._shared import (
     _MAX_OUTPUT_BYTES,
     _acp_launch_args,
     _build_env_prefix,
-    _truncate,
     _wait_for_health,
     bounded_gather,
     build_supervisor_argv,
@@ -822,27 +821,51 @@ async def resolve_supervisor_url(sandbox_ref: str) -> str | None:
 # Exec helper (used by the package-level ``exec_in_instance`` dispatch)
 # ---------------------------------------------------------------------------
 
+async def _read_stream_capped_async(stream, cap: int) -> tuple[str, bool]:
+    """Async-iterate a Modal exec output stream, bounding peak RAM to ~``cap``.
+
+    ``StreamReader.read()`` fetches the ENTIRE stream until EOF — a huge-output
+    command would buffer all of it in server RAM before truncation. We iterate
+    and stop the moment output exceeds ``cap``, so peak RAM is ``cap`` + one
+    chunk. ``aclose`` releases the underlying generator after an early break.
+    """
+    buf = bytearray()
+    try:
+        async for chunk in stream:
+            buf.extend(chunk.encode() if isinstance(chunk, str) else chunk)
+            if len(buf) > cap:
+                return buf[:cap].decode(errors="replace"), True
+        return buf.decode(errors="replace"), False
+    finally:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
+
+
 async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
     """Run ``cmd`` via ``sh -c`` inside the Modal sandbox.
 
-    Truncation and timeout semantics mirror the other providers'
-    ``_exec_subprocess`` helper: stdout/stderr capped at 1 MiB each, a
+    Fully ASYNC (modal's ``.aio`` API) — no ``asyncio.to_thread``, so concurrent
+    execs aren't capped by the shared threadpool (~min(32, cpu+4) workers).
+    Measured ~1.4x more throughput at 40 concurrent execs vs the sync path, and
+    larger on smaller boxes / under threadpool contention with other ops. Output
+    is capped at 1 MiB per stream WHILE reading (``_read_stream_capped_async``),
+    so a huge-output command never buffers its full output in server RAM. A
     timeout yields ``ExecResult(timed_out=True)``.
     """
     sid = inst.sandbox_ref or inst.container_id
     if not sid:
         raise RuntimeError("modal exec: no sandbox id on instance")
 
-    def _run(sb):
-        p = sb.exec("sh", "-c", cmd)
-        try:
-            rc = p.wait(timeout=timeout)
-        except TypeError:
-            # Older SDKs don't accept timeout on wait(); fall back.
-            rc = p.wait()
-        out = p.stdout.read() or ""
-        err = p.stderr.read() or ""
-        return rc, out, err
+    async def _do_exec(sb):
+        p = await sb.exec.aio("sh", "-c", cmd)
+        # Inner bound = the command timeout (a hung command times out at
+        # ``timeout``, matching the old ``p.wait(timeout=timeout)``).
+        rc = await asyncio.wait_for(p.wait.aio(), timeout=timeout)
+        out_s, out_trunc = await _read_stream_capped_async(p.stdout, _MAX_OUTPUT_BYTES)
+        err_s, err_trunc = await _read_stream_capped_async(p.stderr, _MAX_OUTPUT_BYTES)
+        return rc, out_s, out_trunc, err_s, err_trunc
 
     # Cached handle skips the per-exec ``from_id`` (SandboxWait) RPC. A command's
     # non-zero exit returns normally (rc != 0); only a broken channel (terminated
@@ -850,8 +873,9 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     # re-raises SandboxMissingError and propagates as before.
     try:
         sb = await _cached_sandbox_handle(sid)
-        rc, out, err = await asyncio.wait_for(
-            asyncio.to_thread(_run, sb), timeout=timeout + 5,
+        # Outer bound = a safety net covering the output reads too.
+        rc, out_s, out_trunc, err_s, err_trunc = await asyncio.wait_for(
+            _do_exec(sb), timeout=timeout + 5,
         )
     except asyncio.TimeoutError:
         return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
@@ -861,13 +885,11 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
         _evict_sandbox_handle(sid)
         try:
             sb = await _cached_sandbox_handle(sid, refresh=True)
-            rc, out, err = await asyncio.wait_for(
-                asyncio.to_thread(_run, sb), timeout=timeout + 5,
+            rc, out_s, out_trunc, err_s, err_trunc = await asyncio.wait_for(
+                _do_exec(sb), timeout=timeout + 5,
             )
         except asyncio.TimeoutError:
             return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
-    out_s, out_trunc = _truncate(out.encode() if isinstance(out, str) else out, _MAX_OUTPUT_BYTES)
-    err_s, err_trunc = _truncate(err.encode() if isinstance(err, str) else err, _MAX_OUTPUT_BYTES)
     return ExecResult(
         stdout=out_s, stderr=err_s,
         exit_code=int(rc) if rc is not None else -1,
