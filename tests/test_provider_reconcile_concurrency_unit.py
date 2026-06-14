@@ -142,6 +142,33 @@ async def test_daytona_reconcile_skips_live_sandboxes(monkeypatch):
     assert deleted == {"s-0", "s-2"}, "live sandboxes must be left untouched"
 
 
+async def test_daytona_utility_reaper_destroys_concurrently(monkeypatch):
+    """The idle utility-sandbox reaper must fan out its destroys so one slow
+    teardown doesn't stall the rest of the batch (or the reaper tick)."""
+    from api.providers import daytona as dmod
+
+    n = 6
+    state = {"in_flight": 0, "max": 0}
+    destroyed: set[str] = set()
+
+    async def _destroy(inst):
+        state["in_flight"] += 1
+        state["max"] = max(state["max"], state["in_flight"])
+        await asyncio.sleep(0.02)
+        destroyed.add(inst.sandbox_ref)
+        state["in_flight"] -= 1
+
+    monkeypatch.setattr(dmod, "destroy_daytona", _destroy)
+
+    stale = [(f"vol-{i}", SimpleNamespace(sandbox_ref=f"vol-{i}")) for i in range(n)]
+    await dmod._reap_stale_utility(stale)
+
+    assert destroyed == {f"vol-{i}" for i in range(n)}, "all stale must be reaped"
+    assert state["max"] >= 2, (
+        f"utility reaper destroyed sequentially (max in-flight {state['max']}) "
+        f"— a single slow destroy must not block reaping the rest")
+
+
 # ---------------------------------------------------------------------------
 # modal reconcile
 # ---------------------------------------------------------------------------

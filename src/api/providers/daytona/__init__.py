@@ -1030,6 +1030,23 @@ def _ensure_utility_reaper() -> None:
     _utility_reaper_started = True
 
 
+async def _reap_stale_utility(stale: list[tuple[str, "ProviderInstance"]]) -> None:
+    """Destroy a batch of stale utility sandboxes concurrently.
+
+    Each ``destroy_daytona`` is a control-plane round-trip; reaping them one at
+    a time lets a single slow/hung destroy stall the rest of the batch (and the
+    reaper tick). Fan out (bounded) so the slow one doesn't block its siblings.
+    """
+    async def _one(ref, inst) -> None:
+        log.info("daytona utility sandbox: reaping idle volume %s", ref[:16])
+        try:
+            await destroy_daytona(inst)
+        except Exception as e:  # pragma: no cover
+            log.warning("utility reaper: destroy failed for %s: %s", ref[:16], e)
+
+    await bounded_gather([_one(ref, inst) for ref, inst in stale])
+
+
 async def _utility_reaper_loop() -> None:
     """Destroy utility sandboxes that have been idle for > _UTILITY_TTL_S."""
     import time as _time
@@ -1042,12 +1059,7 @@ async def _utility_reaper_loop() -> None:
                 if now - last > _UTILITY_TTL_S:
                     stale.append((ref, inst))
                     _utility_cache.pop(ref, None)
-        for ref, inst in stale:
-            log.info("daytona utility sandbox: reaping idle volume %s", ref[:16])
-            try:
-                await destroy_daytona(inst)
-            except Exception as e:  # pragma: no cover
-                log.warning("utility reaper: destroy failed for %s: %s", ref[:16], e)
+        await _reap_stale_utility(stale)
 
 
 async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
