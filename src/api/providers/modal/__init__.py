@@ -102,6 +102,18 @@ _STATUS_PROBE_BACKOFF_S = float(os.environ.get("AGENT_SDK_MODAL_STATUS_BACKOFF_S
 # Runaway guard for the read-only orphan DETECTOR's per-sandbox tag scan.
 _DETECT_MAX_ITEMS = int(os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000"))
 
+# Grace before reconcile_on_startup reaps an orphan candidate. A sibling
+# replica may have a create in flight — the sandbox is already tagged on Modal
+# but its sandbox_ref hasn't been committed to the DB yet (the pool persists it
+# only after start() finishes: supervisor boot + ACP attach, which is seconds).
+# A booting replica reconciles account-globally, so without this wait it would
+# reap a peer's mid-create sandbox and break the create. We wait this long, then
+# re-query live sessions and reap only candidates that are STILL orphaned.
+# Covers the worst-case cold-create + persist; tune via the env var.
+_RECONCILE_MIDCREATE_GRACE_S = float(
+    os.environ.get("AGENT_SDK_RECONCILE_GRACE_S", "120")
+)
+
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
@@ -957,9 +969,9 @@ async def reconcile_on_startup() -> None:
     # as an orphan and terminate it. Only ever reap our own origin's sandboxes.
     own_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
 
-    # Classify every sandbox concurrently: each ``get_tags`` is a control-plane
-    # round-trip, so scanning them one at a time serialises N RTTs on the
-    # startup path. Returns the orphan sandbox + its ref tag, or None.
+    # Pass 1: classify every sandbox concurrently — each ``get_tags`` is a
+    # control-plane round-trip, so scanning serially serialises N RTTs on the
+    # startup path. Returns the orphan candidate (sb, ref_tag), or None.
     async def _classify(sb):
         try:
             tags = await asyncio.to_thread(sb.get_tags)
@@ -968,29 +980,38 @@ async def reconcile_on_startup() -> None:
             return None
         sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
         if not sandbox_ref_tag:
-            # Untagged — not ours or created before tagging was wired.
-            return None
+            return None  # untagged — not ours or created before tagging
         # NEVER reap a sandbox from a different origin (or one with no origin
-        # tag — legacy/edge): cross-origin termination of a live sandbox is
-        # far worse than leaving an orphan for that origin's own reconcile.
+        # tag — legacy/edge): cross-origin termination of a live sandbox is far
+        # worse than leaving an orphan for that origin's own reconcile.
         if tags.get(_ORIGIN_TAG) != own_origin:
             return None
         # Modal tags also carry the modal sandbox object_id; the pool stores
         # whatever was passed to create_sandbox as state.sandbox_ref. Check
         # both forms so a label-rename doesn't strand live sandboxes.
-        is_orphan = (
-            sandbox_ref_tag not in live_refs
-            and sb.object_id not in live_refs
-        )
-        return (sb, sandbox_ref_tag) if is_orphan else None
+        if sandbox_ref_tag not in live_refs and sb.object_id not in live_refs:
+            return (sb, sandbox_ref_tag)
+        return None
 
     classified = await bounded_gather([_classify(sb) for sb in sandboxes])
-    orphans = [c for c in classified if c and not isinstance(c, BaseException)]
-    if not orphans:
+    candidates = [c for c in classified if c and not isinstance(c, BaseException)]
+    if not candidates:
         return
 
-    # Reclaim the orphans concurrently too (each terminate is another RTT).
+    # Mid-create grace: a sibling replica may have a create in flight (sandbox
+    # tagged on Modal, sandbox_ref not yet committed to the DB). Wait, re-query,
+    # and reap only candidates STILL orphaned — never a peer's in-flight create.
+    await asyncio.sleep(_RECONCILE_MIDCREATE_GRACE_S)
+    try:
+        live_refs = await dbmod.live_sandbox_refs()
+    except Exception as e:
+        log.warning("modal reconcile: re-query failed, skipping reap: %s", e)
+        return
+
+    # Reclaim the still-orphaned concurrently too (each terminate is an RTT).
     async def _reap(sb, sandbox_ref_tag) -> None:
+        if sandbox_ref_tag in live_refs or sb.object_id in live_refs:
+            return  # committed during the grace — a live in-flight create
         log.info(
             "modal reconcile: terminating orphan %s (sandbox_ref=%s)",
             sb.object_id, sandbox_ref_tag,
@@ -1000,7 +1021,7 @@ async def reconcile_on_startup() -> None:
         except Exception as e:
             log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
 
-    await bounded_gather([_reap(sb, ref) for sb, ref in orphans])
+    await bounded_gather([_reap(sb, ref) for sb, ref in candidates])
 
 
 async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> dict:
@@ -1011,9 +1032,9 @@ async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> 
     leaked compute too (a sandbox with no session row is leaked compute, e.g.
     a recovery path that abandoned it, or the untagged-supervisor leak class).
 
-    ``origin`` defaults to ``AGENT_SDK_ORIGIN``. Like the reconcile, we list the
-    whole shared app and scope to our own origin so a non-prod monitor never
-    counts (or, in reconcile, reaps) another origin's live sandboxes.
+    ``origin`` defaults to ``AGENT_SDK_ORIGIN``. Like the reconcile, we scope to
+    our own origin so a non-prod monitor never counts another origin's live
+    sandboxes.
 
     Returns ``{"total_seen": int, "orphans": [(id, "")],
     "state_hist": {}, "capped": bool}`` — same shape as the daytona detector

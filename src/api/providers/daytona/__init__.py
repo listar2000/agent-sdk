@@ -1474,6 +1474,18 @@ class DaytonaVolumeAdapter(ShellVolumeAdapter):
 # Reconciliation — delete orphaned daytona sandboxes on startup
 # ---------------------------------------------------------------------------
 
+# Grace before reconcile reaps an orphan candidate. A sibling replica may have
+# a create in flight — the sandbox exists + is labelled on daytona but its
+# sandbox_ref hasn't been committed to the DB yet (the pool persists it only
+# after start() finishes: supervisor boot + ACP attach). A booting replica
+# reconciles account-globally, so without this wait it would delete a peer's
+# mid-create sandbox and break the create. Wait this long, re-query, reap only
+# candidates still orphaned. Tune via the env var.
+_RECONCILE_MIDCREATE_GRACE_S = float(
+    os.environ.get("AGENT_SDK_RECONCILE_GRACE_S", "120")
+)
+
+
 async def reconcile_on_startup() -> None:
     """Delete daytona sandboxes whose id is not in any live session row.
 
@@ -1508,11 +1520,22 @@ async def reconcile_on_startup() -> None:
         log.warning("daytona reconcile: live-session query failed: %s", e)
         return
 
-    orphans = [
+    # Pass 1: orphan candidates (labelled, not in any live session).
+    candidates = [
         sb for sb in items
-        if getattr(sb, "id", None) and getattr(sb, "id") not in live_refs
+        if getattr(sb, "id", None) and sb.id not in live_refs
     ]
-    if not orphans:
+    if not candidates:
+        return
+
+    # Mid-create grace: a sibling replica may have a create in flight (sandbox
+    # labelled, sandbox_ref not yet committed to the DB). Wait, re-query, and
+    # reap only candidates STILL orphaned — never a peer's in-flight create.
+    await asyncio.sleep(_RECONCILE_MIDCREATE_GRACE_S)
+    try:
+        live_refs = await dbmod.live_sandbox_refs()
+    except Exception as e:
+        log.warning("daytona reconcile: re-query failed, skipping reap: %s", e)
         return
 
     # Fan out the deletes: a crash can strand many orphans, and reclaiming them
@@ -1520,13 +1543,15 @@ async def reconcile_on_startup() -> None:
     # the startup path. Bounded so we don't stampede the shared client pool.
     async def _reap(sb) -> None:
         sid = sb.id
+        if sid in live_refs:
+            return  # committed during the grace — a live in-flight create
         log.info("daytona reconcile: deleting orphan %s", sid[:16])
         try:
             await daytona.delete(sb)
         except Exception as e:
             log.warning("daytona reconcile: delete %s: %s", sid[:16], e)
 
-    await bounded_gather([_reap(sb) for sb in orphans])
+    await bounded_gather([_reap(sb) for sb in candidates])
 
 
 async def _list_labeled_sandboxes(daytona, labels: dict[str, str]) -> tuple[list, bool]:
