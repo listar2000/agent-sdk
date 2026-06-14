@@ -69,10 +69,13 @@ async def test_reattach_failure_destroys_old_vm():
         async def _get_async_daytona_client(self):
             return SimpleNamespace(get=_aget)
 
-    sandbox = await sess._resolve_or_create_sandbox(_FakeDt())
+    # _resolve_or_create_sandbox returns (sandbox, created_fresh); a reattach
+    # that falls through to cold-create reports created_fresh=True.
+    sandbox, created_fresh = await sess._resolve_or_create_sandbox(_FakeDt())
 
     # Recovery preserved: a replacement VM was cold-created.
     assert sandbox.id == "new-ref"
+    assert created_fresh is True
     assert "new-ref" in live
 
     # The destroy is fire-and-forget (so recovery isn't blocked on daytona's
