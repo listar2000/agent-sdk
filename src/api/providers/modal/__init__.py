@@ -420,9 +420,19 @@ async def create_sandbox(
     )
 
     try:
-        if sandbox_ref:
-            # Tags persist on the Modal side and drive reconcile_on_startup.
-            await asyncio.to_thread(sb.set_tags, {_TAG_KEY: sandbox_ref})
+        # ALWAYS tag — mirror create_bare_sandbox. supervisor_session creates
+        # WITHOUT passing sandbox_ref, so the old `if sandbox_ref:` gate left
+        # these sandboxes UNTAGGED: invisible to reconcile_on_startup (skips
+        # sandboxes with no _TAG_KEY) AND to cleanup_orphans.py (filters by
+        # _ORIGIN_TAG), so an orphan leaked until the 1h hard timeout. The
+        # object_id fallback keeps live sandboxes correctly matched — the pool
+        # stores object_id as state.sandbox_ref, so reconcile's live-ref check
+        # finds them.
+        origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+        await asyncio.to_thread(sb.set_tags, {
+            _TAG_KEY: sandbox_ref or sb.object_id,
+            _ORIGIN_TAG: origin,
+        })
 
         # Fetch the HTTPS tunnel URL. ``timeout`` here is the time Modal will
         # spend waiting for the tunnel to become ready.
