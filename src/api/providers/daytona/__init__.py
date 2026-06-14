@@ -866,6 +866,12 @@ async def delete_daytona_volume(provider_ref: str) -> None:
     client = await _get_async_daytona_client()
     volumes_api = AsyncVolumesApi(client._api_client)
     await volumes_api.delete_volume(provider_ref)
+    # The volume is gone — evict its per-volume caches so they don't accumulate
+    # stale entries. The conditional-create bool would otherwise live forever
+    # (it has no TTL reaper); the utility sandbox would otherwise linger up to
+    # _UTILITY_TTL_S mounting a now-deleted volume, so reap it now.
+    _conditional_create_support_cache.pop(provider_ref, None)
+    await _drop_utility(provider_ref)
 
 
 async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
@@ -1037,8 +1043,34 @@ _UTILITY_REAPER_TICK_S = 30.0
 _utility_cache: dict[str, tuple["ProviderInstance", float]] = {}  # ref -> (inst, last_used)
 _utility_cache_lock = asyncio.Lock()
 _utility_reaper_started = False
-_conditional_create_support_cache: dict[str, bool] = {}
+# Per-volume "does this backend honour If-None-Match: *" detection, cached so
+# the probe (a write + conditional-upload + download round-trip) runs once per
+# volume. LRU-BOUNDED: a long-running server churns through many distinct
+# volumes, and volumes can vanish out-of-band (reconcile / external delete)
+# without hitting delete_volume — so an unbounded dict here is a slow leak.
+# Cap + evict-on-delete keeps it flat. Re-probing an evicted volume is cheap
+# and idempotent.
+_conditional_create_support_cache: "OrderedDict[str, bool]" = OrderedDict()
+_CONDCREATE_CACHE_MAX = int(
+    os.environ.get("AGENT_SDK_DAYTONA_CONDCREATE_CACHE_MAX", "2048")
+)
 _conditional_create_probe_lock = asyncio.Lock()
+
+
+def _condcreate_cache_get(ref: str) -> bool | None:
+    """LRU read: refresh recency on hit so hot volumes survive eviction."""
+    val = _conditional_create_support_cache.get(ref)
+    if val is not None:
+        _conditional_create_support_cache.move_to_end(ref)
+    return val
+
+
+def _condcreate_cache_set(ref: str, val: bool) -> None:
+    """LRU write: bound the dict, evicting the least-recently-used entry."""
+    _conditional_create_support_cache[ref] = val
+    _conditional_create_support_cache.move_to_end(ref)
+    while len(_conditional_create_support_cache) > _CONDCREATE_CACHE_MAX:
+        _conditional_create_support_cache.popitem(last=False)
 
 
 async def _get_or_create_utility(ref: str) -> "ProviderInstance":
@@ -1234,11 +1266,11 @@ async def _daytona_supports_conditional_create(ref: str) -> bool:
         return True
     if mode in {"off", "false", "0", "disable", "force_off"}:
         return False
-    cached = _conditional_create_support_cache.get(ref)
+    cached = _condcreate_cache_get(ref)
     if cached is not None:
         return cached
     async with _conditional_create_probe_lock:
-        cached = _conditional_create_support_cache.get(ref)
+        cached = _condcreate_cache_get(ref)
         if cached is not None:
             return cached
         probe_rel = f"system/.conditional-create-probe-{uuid.uuid4().hex}.txt"
@@ -1254,18 +1286,18 @@ async def _daytona_supports_conditional_create(ref: str) -> bool:
             )
             res = await _run_in_utility_sandbox(ref, write_cmd)
             if res.exit_code != 0:
-                _conditional_create_support_cache[ref] = False
+                _condcreate_cache_set(ref, False)
                 return False
             result = await _conditional_upload_if_absent(ref, probe_abs, b"probe-b")
             if result != "exists":
-                _conditional_create_support_cache[ref] = False
+                _condcreate_cache_set(ref, False)
                 return False
             current = await volume_download(ref, probe_rel)
             supported = current == b"probe-a"
-            _conditional_create_support_cache[ref] = supported
+            _condcreate_cache_set(ref, supported)
             return supported
         except Exception:
-            _conditional_create_support_cache[ref] = False
+            _condcreate_cache_set(ref, False)
             return False
         finally:
             try:
