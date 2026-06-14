@@ -176,8 +176,9 @@ async def test_daytona_utility_reaper_destroys_concurrently(monkeypatch):
 async def test_modal_reconcile_scans_and_reaps_concurrently(monkeypatch):
     from api import db as dbmod
     from api.providers import modal as mmod
-    from api.providers.modal import _TAG_KEY
+    from api.providers.modal import _TAG_KEY, _ORIGIN_TAG
 
+    monkeypatch.setenv("AGENT_SDK_ORIGIN", "test")
     n = 8
     tag_state = {"in_flight": 0, "max": 0}
     lock = threading.Lock()
@@ -193,7 +194,7 @@ async def test_modal_reconcile_scans_and_reaps_concurrently(monkeypatch):
             time.sleep(0.02)
             with lock:
                 tag_state["in_flight"] -= 1
-            return {_TAG_KEY: oid}
+            return {_TAG_KEY: oid, _ORIGIN_TAG: "test"}
 
         def _terminate():
             terminated.add(oid)
@@ -229,20 +230,27 @@ async def test_modal_reconcile_scans_and_reaps_concurrently(monkeypatch):
 async def test_modal_reconcile_leaves_live_and_untagged(monkeypatch):
     from api import db as dbmod
     from api.providers import modal as mmod
-    from api.providers.modal import _TAG_KEY
+    from api.providers.modal import _TAG_KEY, _ORIGIN_TAG
 
+    monkeypatch.setenv("AGENT_SDK_ORIGIN", "test")
     terminated: set[str] = set()
 
-    def _make_sb(oid, tag):
+    def _make_sb(oid, tag, origin="test"):
+        tags = {}
+        if tag:
+            tags[_TAG_KEY] = tag
+        if origin:
+            tags[_ORIGIN_TAG] = origin
         return SimpleNamespace(
             object_id=oid,
-            get_tags=lambda: ({_TAG_KEY: tag} if tag else {}),
+            get_tags=lambda: dict(tags),
             terminate=lambda: terminated.add(oid))
 
     sandboxes = [
-        _make_sb("sb-orphan", "sb-orphan"),  # tagged, not live → reap
-        _make_sb("sb-live", "sb-live"),      # tagged, live → keep
-        _make_sb("sb-untagged", None),       # untagged → not ours, keep
+        _make_sb("sb-orphan", "sb-orphan"),               # ours, not live → reap
+        _make_sb("sb-live", "sb-live"),                   # ours, live → keep
+        _make_sb("sb-untagged", None),                    # untagged → keep
+        _make_sb("sb-prod", "sb-prod", origin="production"),  # other origin → keep
     ]
     fake_modal = SimpleNamespace(
         Sandbox=SimpleNamespace(list=lambda app_id=None: list(sandboxes)))
@@ -259,4 +267,5 @@ async def test_modal_reconcile_leaves_live_and_untagged(monkeypatch):
 
     await mmod.reconcile_on_startup()
     assert terminated == {"sb-orphan"}, (
-        "only the tagged, non-live sandbox may be terminated")
+        "only our-origin, tagged, non-live sandboxes may be terminated — never "
+        "an untagged or cross-origin (e.g. production) sandbox")
