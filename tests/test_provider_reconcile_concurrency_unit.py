@@ -204,10 +204,14 @@ async def test_modal_reconcile_scans_and_reaps_concurrently(monkeypatch):
 
     sandboxes = [_make_sb(i) for i in range(n)]
 
-    fake_modal = SimpleNamespace(
-        Sandbox=SimpleNamespace(list=lambda app_id=None: list(sandboxes)))
+    fake_modal = SimpleNamespace(Sandbox=SimpleNamespace(
+        list=lambda app_id=None, tags=None: [
+            sb for sb in sandboxes
+            if tags is None
+            or all(sb.get_tags().get(k) == v for k, v in tags.items())]))
 
     monkeypatch.setattr(mmod, "_require_modal", lambda: (fake_modal, None))
+    monkeypatch.setattr(mmod, "_RECONCILE_MIDCREATE_GRACE_S", 0)
 
     async def _app():
         return SimpleNamespace(app_id="ap-test")
@@ -252,9 +256,13 @@ async def test_modal_reconcile_leaves_live_and_untagged(monkeypatch):
         _make_sb("sb-untagged", None),                    # untagged → keep
         _make_sb("sb-prod", "sb-prod", origin="production"),  # other origin → keep
     ]
-    fake_modal = SimpleNamespace(
-        Sandbox=SimpleNamespace(list=lambda app_id=None: list(sandboxes)))
+    fake_modal = SimpleNamespace(Sandbox=SimpleNamespace(
+        list=lambda app_id=None, tags=None: [
+            sb for sb in sandboxes
+            if tags is None
+            or all(sb.get_tags().get(k) == v for k, v in tags.items())]))
     monkeypatch.setattr(mmod, "_require_modal", lambda: (fake_modal, None))
+    monkeypatch.setattr(mmod, "_RECONCILE_MIDCREATE_GRACE_S", 0)
 
     async def _app():
         return SimpleNamespace(app_id="ap-test")

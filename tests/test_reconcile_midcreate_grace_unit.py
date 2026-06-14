@@ -47,10 +47,15 @@ def _install_modal(monkeypatch, sandboxes, live_refs_seq):
     from api import db as dbmod
     from api.providers import modal as modalmod
 
+    # reconcile lists origin-scoped server-side; the fakes are origin=test.
+    monkeypatch.setenv("AGENT_SDK_ORIGIN", "test")
+
     class _FakeSandboxNS:
         @staticmethod
-        def list(app_id=None):
-            return list(sandboxes)
+        def list(app_id=None, tags=None):
+            return [sb for sb in sandboxes
+                    if tags is None
+                    or all(sb._tags.get(k) == v for k, v in tags.items())]
 
     class _FakeModal:
         Sandbox = _FakeSandboxNS

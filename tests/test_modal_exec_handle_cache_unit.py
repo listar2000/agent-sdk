@@ -20,12 +20,38 @@ def _inst(ref):
     return ProviderInstance(provider="modal", url="", root="/tmp", sandbox_ref=ref)
 
 
+class _AsyncStream:
+    """Async-iterable modal exec output stream (what _read_stream_capped_async
+    consumes)."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def __aiter__(self):
+        async def _gen():
+            if self._data:
+                yield self._data
+        return _gen()
+
+    async def aclose(self):
+        pass
+
+
 def _fake_proc(rc=0, out="ok", err=""):
+    async def _wait_aio():
+        return rc
     return SimpleNamespace(
-        wait=lambda timeout=None: rc,
-        stdout=SimpleNamespace(read=lambda: out),
-        stderr=SimpleNamespace(read=lambda: err),
+        wait=SimpleNamespace(aio=_wait_aio),
+        stdout=_AsyncStream(out),
+        stderr=_AsyncStream(err),
     )
+
+
+def _exec_handle(proc_fn):
+    """A fake ``sb.exec`` whose ``.aio(*a)`` returns a fresh proc (async exec)."""
+    async def _aio(*a, **k):
+        return proc_fn()
+    return SimpleNamespace(aio=_aio)
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +67,7 @@ async def test_exec_caches_handle_one_lookup_across_many_execs(monkeypatch):
     from api.providers import modal as m
 
     lookups = {"n": 0}
-    fake_sb = SimpleNamespace(exec=lambda *a, **k: _fake_proc(rc=0, out="x"))
+    fake_sb = SimpleNamespace(exec=_exec_handle(lambda: _fake_proc(rc=0, out="x")))
 
     async def _lookup(ref):
         lookups["n"] += 1
@@ -62,12 +88,12 @@ async def test_exec_refreshes_handle_when_channel_raises(monkeypatch):
 
     lookups = {"n": 0}
 
-    def _bad_exec(*a, **k):
+    async def _bad_exec_aio(*a, **k):
         raise ConnectionError("channel dead")
 
     handles = [
-        SimpleNamespace(exec=_bad_exec),
-        SimpleNamespace(exec=lambda *a, **k: _fake_proc(rc=0, out="ok")),
+        SimpleNamespace(exec=SimpleNamespace(aio=_bad_exec_aio)),
+        SimpleNamespace(exec=_exec_handle(lambda: _fake_proc(rc=0, out="ok"))),
     ]
 
     async def _lookup(ref):

@@ -53,8 +53,11 @@ async def test_daytona_status_emits_telemetry(monkeypatch, _capture_ops):
 async def test_modal_status_emits_telemetry(monkeypatch, _capture_ops):
     from api.providers import modal as mmod
 
+    async def _poll_aio():
+        return None  # running
+
     async def _lookup(ref):
-        return SimpleNamespace(poll=lambda: None)  # running
+        return SimpleNamespace(poll=SimpleNamespace(aio=_poll_aio))
 
     monkeypatch.setattr(mmod, "_lookup_sandbox", _lookup)
 

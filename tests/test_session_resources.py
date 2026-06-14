@@ -183,9 +183,15 @@ async def test_modal_create_sandbox_runs_pre_start_before_supervisor_exec(monkey
         stdout = SimpleNamespace(read=lambda: "")
         stderr = SimpleNamespace(read=lambda: "")
 
-        def tunnels(self, timeout):
-            assert timeout == 60
-            return {9100: SimpleNamespace(url="https://modal-unit.test")}
+        def set_tags(self, tags):
+            pass
+
+        @property
+        def tunnels(self):
+            async def _aio(timeout):
+                assert timeout == 60
+                return {9100: SimpleNamespace(url="https://modal-unit.test")}
+            return SimpleNamespace(aio=_aio)
 
         def terminate(self):
             raise AssertionError("healthy startup should not terminate sandbox")
@@ -266,8 +272,14 @@ async def test_modal_create_sandbox_reports_pre_start_failure(monkeypatch):
         stdout = SimpleNamespace(read=lambda: "")
         stderr = SimpleNamespace(read=lambda: "")
 
-        def tunnels(self, _timeout):
-            return {9100: SimpleNamespace(url="https://modal-unit.test")}
+        def set_tags(self, tags):
+            pass
+
+        @property
+        def tunnels(self):
+            async def _aio(_timeout):
+                return {9100: SimpleNamespace(url="https://modal-unit.test")}
+            return SimpleNamespace(aio=_aio)
 
         def exec(self, *args, timeout=None):
             class P:
