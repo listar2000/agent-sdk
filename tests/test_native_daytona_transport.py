@@ -246,12 +246,18 @@ async def test_bare_sandbox_always_tags_for_reconcile(monkeypatch):
     no sandbox_ref is passed, so reconcile_on_startup can reap orphans."""
     import api.providers.modal as md
 
+    from types import SimpleNamespace
     tagged = {}
 
     class _SB:
         object_id = "sb-bare-1"
-        def set_tags(self, t):
-            tagged.update(t)
+
+        @property
+        def set_tags(self):  # create_bare uses sb.set_tags.aio(...)  (#193)
+            async def _aio(t):
+                tagged.update(t)
+            return SimpleNamespace(aio=_aio)
+
         def terminate(self):
             pass
 
@@ -264,15 +270,18 @@ async def test_bare_sandbox_always_tags_for_reconcile(monkeypatch):
     async def _vol(ref):
         return object()
 
+    async def _create_aio(*a, **k):
+        return _SB()
+
     monkeypatch.setattr(md, "_get_app", _app)
     monkeypatch.setattr(md, "_get_image", _img)
     monkeypatch.setattr(md, "_get_volume", _vol)
     monkeypatch.setattr(md, "_to_modal_resources", lambda r: {})
-    monkeypatch.setattr(md, "_require_modal",
-                        lambda: (type("M", (), {"Sandbox": type(
-                            "S", (), {"create": staticmethod(lambda *a, **k: _SB())})})(),
-                            None))
-    # Sandbox.create is called via asyncio.to_thread(lambda: modal.Sandbox.create(...))
+    monkeypatch.setattr(md, "_require_modal", lambda: (
+        SimpleNamespace(Sandbox=SimpleNamespace(
+            create=SimpleNamespace(aio=_create_aio))),
+        None))
+    # Sandbox.create is async (modal .aio) since #193.
     monkeypatch.setenv("AGENT_SDK_ORIGIN", "test")
     inst = await md.create_bare_sandbox(volume_ref="vol-1", subpath="agents/a1")
     assert inst.sandbox_ref == "sb-bare-1"
