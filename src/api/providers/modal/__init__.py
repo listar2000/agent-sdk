@@ -992,8 +992,8 @@ async def _run_volume_shell(
     if vol is None:
         vol = await _get_volume(ref)
 
-    def _run():
-        sb = modal.Sandbox.create(
+    async def _run():
+        sb = await modal.Sandbox.create.aio(
             "bash", "-c", shell,
             app=app,
             image=image,
@@ -1001,29 +1001,32 @@ async def _run_volume_shell(
             timeout=max(timeout + 30, 120),
         )
         try:
-            sb.wait()
-            # sb.wait() returns None; the exit code lives on .returncode /
+            await sb.wait.aio()
+            # wait() returns None; the exit code lives on .returncode /
             # .poll() once the sandbox has finished. Default to -1 if the
             # sandbox somehow reports no code (shouldn't happen post-wait).
-            rc = sb.poll()
+            rc = await sb.poll.aio()
             if rc is None:
                 rc = sb.returncode
-            out = sb.stdout.read() or b""
-            err = sb.stderr.read() or b""
-            if isinstance(out, str):
-                out = out.encode()
-            if isinstance(err, str):
-                err = err.encode()
+            # Async-iterate both streams to a full read (the volume adapter
+            # needs the complete tree/file output, so this is unbounded by
+            # design — same as the prior sync ``stdout.read()``).
+            out = b"".join(
+                [c.encode() if isinstance(c, str) else c async for c in sb.stdout]
+            )
+            err = b"".join(
+                [c.encode() if isinstance(c, str) else c async for c in sb.stderr]
+            )
             return int(rc) if rc is not None else -1, out, err
         finally:
             try:
-                sb.terminate()
+                await sb.terminate.aio()
             except Exception:
                 pass
 
-    return await asyncio.wait_for(
-        asyncio.to_thread(_run), timeout=timeout + 120,
-    )
+    # The volume-op sandbox's own ``timeout`` (>= 120s, above) is the cleanup
+    # backstop; this wait_for guards against a hang in the SDK calls themselves.
+    return await asyncio.wait_for(_run(), timeout=timeout + 120)
 
 
 class ModalVolumeAdapter(ShellVolumeAdapter):
