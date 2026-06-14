@@ -89,6 +89,18 @@ _ORIGIN_TAG = "agent_sdk_origin"
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
 
+# Grace before reconcile_on_startup reaps an orphan candidate. A sibling
+# replica may have a create in flight — the sandbox is already tagged on Modal
+# but its sandbox_ref hasn't been committed to the DB yet (the pool persists it
+# only after start() finishes: supervisor boot + ACP attach, which is seconds).
+# A booting replica reconciles account-globally, so without this wait it would
+# reap a peer's mid-create sandbox and break the create. We wait this long, then
+# re-query live sessions and reap only candidates that are STILL orphaned.
+# Covers the worst-case cold-create + persist; tune via the env var.
+_RECONCILE_MIDCREATE_GRACE_S = float(
+    os.environ.get("AGENT_SDK_RECONCILE_GRACE_S", "120")
+)
+
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
@@ -809,6 +821,11 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
+    # Pass 1: collect orphan CANDIDATES (tagged, not in any live session).
+    # Modal tags also carry the modal sandbox object_id; the pool stores
+    # whatever was passed to create_sandbox as state.sandbox_ref — check both
+    # forms so a label-rename doesn't strand live sandboxes.
+    candidates = []  # list[(sb, sandbox_ref_tag)]
     for sb in sandboxes:
         try:
             tags = await asyncio.to_thread(sb.get_tags)
@@ -819,22 +836,32 @@ async def reconcile_on_startup() -> None:
         if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
             continue
-        # Modal tags also carry the modal sandbox object_id; the pool stores
-        # whatever was passed to create_sandbox as state.sandbox_ref. Check
-        # both forms so a label-rename doesn't strand live sandboxes.
-        is_orphan = (
-            sandbox_ref_tag not in live_refs
-            and sb.object_id not in live_refs
+        if sandbox_ref_tag not in live_refs and sb.object_id not in live_refs:
+            candidates.append((sb, sandbox_ref_tag))
+
+    if not candidates:
+        return
+
+    # Mid-create grace: re-query after a wait so we never reap a peer's
+    # in-flight create (sandbox tagged, sandbox_ref not yet committed).
+    await asyncio.sleep(_RECONCILE_MIDCREATE_GRACE_S)
+    try:
+        live_refs = await dbmod.live_sandbox_refs()
+    except Exception as e:
+        log.warning("modal reconcile: re-query failed, skipping reap: %s", e)
+        return
+
+    for sb, sandbox_ref_tag in candidates:
+        if sandbox_ref_tag in live_refs or sb.object_id in live_refs:
+            continue  # committed during the grace — a live in-flight create
+        log.info(
+            "modal reconcile: terminating orphan %s (sandbox_ref=%s)",
+            sb.object_id, sandbox_ref_tag,
         )
-        if is_orphan:
-            log.info(
-                "modal reconcile: terminating orphan %s (sandbox_ref=%s)",
-                sb.object_id, sandbox_ref_tag,
-            )
-            try:
-                await asyncio.to_thread(sb.terminate)
-            except Exception as e:
-                log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
+        try:
+            await asyncio.to_thread(sb.terminate)
+        except Exception as e:
+            log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
 
 
 # ---------------------------------------------------------------------------

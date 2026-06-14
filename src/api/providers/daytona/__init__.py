@@ -1374,6 +1374,18 @@ class DaytonaVolumeAdapter(ShellVolumeAdapter):
 # Reconciliation — delete orphaned daytona sandboxes on startup
 # ---------------------------------------------------------------------------
 
+# Grace before reconcile reaps an orphan candidate. A sibling replica may have
+# a create in flight — the sandbox exists + is labelled on daytona but its
+# sandbox_ref hasn't been committed to the DB yet (the pool persists it only
+# after start() finishes: supervisor boot + ACP attach). A booting replica
+# reconciles account-globally, so without this wait it would delete a peer's
+# mid-create sandbox and break the create. Wait this long, re-query, reap only
+# candidates still orphaned. Tune via the env var.
+_RECONCILE_MIDCREATE_GRACE_S = float(
+    os.environ.get("AGENT_SDK_RECONCILE_GRACE_S", "120")
+)
+
+
 async def reconcile_on_startup() -> None:
     """Delete daytona sandboxes whose id is not in any live session row.
 
@@ -1408,10 +1420,25 @@ async def reconcile_on_startup() -> None:
         log.warning("daytona reconcile: live-session query failed: %s", e)
         return
 
-    for sb in items:
-        sid = getattr(sb, "id", None)
-        if not sid or sid in live_refs:
-            continue
+    # Pass 1: collect orphan CANDIDATES (labelled, not in any live session).
+    candidates = [sb for sb in items
+                  if getattr(sb, "id", None) and sb.id not in live_refs]
+    if not candidates:
+        return
+
+    # Mid-create grace: re-query after a wait so we never reap a peer's
+    # in-flight create (sandbox labelled, sandbox_ref not yet committed).
+    await asyncio.sleep(_RECONCILE_MIDCREATE_GRACE_S)
+    try:
+        live_refs = await dbmod.live_sandbox_refs()
+    except Exception as e:
+        log.warning("daytona reconcile: re-query failed, skipping reap: %s", e)
+        return
+
+    for sb in candidates:
+        sid = sb.id
+        if sid in live_refs:
+            continue  # committed during the grace — a live in-flight create
         log.info("daytona reconcile: deleting orphan %s", sid[:16])
         try:
             await daytona.delete(sb)
