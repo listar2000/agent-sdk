@@ -39,18 +39,31 @@ class _FakeProc:
         return SimpleNamespace(read=lambda: "")
 
 
+class _DualTunnels:
+    """tunnels mock that works whether create_sandbox calls it sync
+    (``to_thread(sb.tunnels, 60)``) or async (``sb.tunnels.aio(60)`` once the
+    tunnels-async PR lands) — so this test is robust across that change."""
+
+    def _result(self):
+        from api.providers.modal import _SUPERVISOR_CONTAINER_PORT
+        return {_SUPERVISOR_CONTAINER_PORT: SimpleNamespace(url="https://fake.modal.host")}
+
+    def __call__(self, timeout):
+        return self._result()
+
+    async def aio(self, timeout):
+        return self._result()
+
+
 class _FakeSandbox:
     object_id = "sb-modal-fresh-001"
 
     def __init__(self):
         self.tag_calls: list[dict] = []
+        self.tunnels = _DualTunnels()
 
     def set_tags(self, tags):
         self.tag_calls.append(dict(tags))
-
-    def tunnels(self, timeout):
-        from api.providers.modal import _SUPERVISOR_CONTAINER_PORT
-        return {_SUPERVISOR_CONTAINER_PORT: SimpleNamespace(url="https://fake.modal.host")}
 
     def exec(self, *a, **k):
         return _FakeProc(self)
