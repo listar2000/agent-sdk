@@ -130,6 +130,16 @@ _app: Any | None = None
 _image: Any | None = None
 _volume_image: Any | None = None
 
+# Double-checked-locking guards for the lazy singletons. Without these, a burst
+# of concurrent first-creates (e.g. a freshly autoscaled replica taking a batch
+# of sessions before the singletons are memoized) all see ``None`` and each fire
+# a redundant control-plane call (App.lookup / Image.from_id) — a thundering
+# herd that also contends for the threadpool. The lock collapses it to one.
+# (Mirrors daytona's ``_DAYTONA_ASYNC_INIT_LOCK``.)
+_app_lock = asyncio.Lock()
+_image_lock = asyncio.Lock()
+_volume_image_lock = asyncio.Lock()
+
 
 def _require_modal():
     """Import the modal SDK lazily, raise with a friendly error if missing."""
@@ -153,11 +163,14 @@ async def _get_app():
     global _app
     if _app is not None:
         return _app
-    modal, _ = _require_modal()
-    _app = await asyncio.to_thread(
-        modal.App.lookup, _APP_NAME, create_if_missing=True,
-    )
-    return _app
+    async with _app_lock:
+        if _app is not None:  # another coroutine won the race while we waited
+            return _app
+        modal, _ = _require_modal()
+        _app = await asyncio.to_thread(
+            modal.App.lookup, _APP_NAME, create_if_missing=True,
+        )
+        return _app
 
 
 async def _get_image():
@@ -182,40 +195,43 @@ async def _get_image():
     global _image
     if _image is not None:
         return _image
-    modal, _ = _require_modal()
-    # repo root is 5 levels up from src/api/providers/modal/__init__.py
-    # (modal/ → providers/ → api/ → src/ → repo)
-    repo_root = Path(__file__).resolve().parents[4]
+    async with _image_lock:
+        if _image is not None:  # lost the race while waiting — reuse the winner's
+            return _image
+        modal, _ = _require_modal()
+        # repo root is 5 levels up from src/api/providers/modal/__init__.py
+        # (modal/ → providers/ → api/ → src/ → repo)
+        repo_root = Path(__file__).resolve().parents[4]
 
-    snapshot_tag = repo_root / ".modal-snapshot-tag"
-    if snapshot_tag.exists():
-        snap_id = snapshot_tag.read_text().strip()
-        if snap_id:
-            try:
-                _image = await asyncio.to_thread(
-                    modal.Image.from_id, snap_id,
-                )
-                log.info(
-                    "modal: using pre-built filesystem snapshot %s "
-                    "(cold-create ~2s; rebuild via scripts/release_modal_snapshot.py)",
-                    snap_id,
-                )
-                return _image
-            except Exception as e:
-                log.warning(
-                    "modal: snapshot %s lookup failed (%s); falling back to "
-                    "Image.from_dockerfile (slower cold-create)",
-                    snap_id, e,
-                )
+        snapshot_tag = repo_root / ".modal-snapshot-tag"
+        if snapshot_tag.exists():
+            snap_id = snapshot_tag.read_text().strip()
+            if snap_id:
+                try:
+                    _image = await asyncio.to_thread(
+                        modal.Image.from_id, snap_id,
+                    )
+                    log.info(
+                        "modal: using pre-built filesystem snapshot %s "
+                        "(cold-create ~2s; rebuild via scripts/release_modal_snapshot.py)",
+                        snap_id,
+                    )
+                    return _image
+                except Exception as e:
+                    log.warning(
+                        "modal: snapshot %s lookup failed (%s); falling back to "
+                        "Image.from_dockerfile (slower cold-create)",
+                        snap_id, e,
+                    )
 
-    dockerfile_path = repo_root / "Dockerfile"
-    if not dockerfile_path.exists():
-        raise RuntimeError(
-            f"Modal provider requires a Dockerfile at the repo root; "
-            f"not found at {dockerfile_path}"
-        )
-    _image = modal.Image.from_dockerfile(str(dockerfile_path))
-    return _image
+        dockerfile_path = repo_root / "Dockerfile"
+        if not dockerfile_path.exists():
+            raise RuntimeError(
+                f"Modal provider requires a Dockerfile at the repo root; "
+                f"not found at {dockerfile_path}"
+            )
+        _image = modal.Image.from_dockerfile(str(dockerfile_path))
+        return _image
 
 
 async def _get_volume_image():
@@ -228,9 +244,12 @@ async def _get_volume_image():
     global _volume_image
     if _volume_image is not None:
         return _volume_image
-    modal, _ = _require_modal()
-    _volume_image = modal.Image.debian_slim()
-    return _volume_image
+    async with _volume_image_lock:
+        if _volume_image is not None:
+            return _volume_image
+        modal, _ = _require_modal()
+        _volume_image = modal.Image.debian_slim()
+        return _volume_image
 
 
 async def _get_volume(ref: str):
