@@ -465,8 +465,10 @@ async def create_sandbox(
         })
 
         # Fetch the HTTPS tunnel URL. ``timeout`` here is the time Modal will
-        # spend waiting for the tunnel to become ready.
-        tunnels = await asyncio.to_thread(sb.tunnels, 60)
+        # spend waiting for the tunnel to become ready — async (``.aio``) so we
+        # don't hold a threadpool worker for up to 60s per concurrent create
+        # (the longest thread-hold on the modal create path).
+        tunnels = await sb.tunnels.aio(60)
         tun = tunnels.get(_SUPERVISOR_CONTAINER_PORT)
         if not tun:
             raise RuntimeError(
@@ -807,7 +809,7 @@ async def resolve_supervisor_url(sandbox_ref: str) -> str | None:
     except SandboxMissingError:
         return None
     try:
-        tunnels = await asyncio.to_thread(sb.tunnels, 60)
+        tunnels = await sb.tunnels.aio(60)
     except Exception as e:
         log.warning("modal resolve_supervisor_url: tunnels(%s) failed: %s",
                     sandbox_ref, e)
