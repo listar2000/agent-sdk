@@ -738,8 +738,13 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
     best-effort deleted so callers don't end up with an orphaned resource
     they can't identify later.
 
-    After the volume is ready, a utility sandbox is spun up to pre-create
-    the directory structure: shared/ and system/supervisor/.
+    Returns as soon as the volume is READY. daytona auto-creates mount
+    subpaths (verified live by test_daytona_volume_subpath_autocreate_live —
+    the main ``agents/<id>`` mount was never pre-created either), so the
+    standard layout (``shared/<name>``, ``agents/<id>``) materialises on first
+    mount. We do NOT eagerly spin a utility sandbox to mkdir it: that was a
+    full daytona create (the queue-bound bottleneck) per volume bootstrap, and
+    ``system/supervisor/`` had no consumer at all.
     """
     from daytona_api_client_async import VolumesApi as AsyncVolumesApi
     from daytona_api_client.models import VolumeState
@@ -777,9 +782,6 @@ async def create_daytona_volume(name: str, wait_ready_timeout: int = 120) -> str
             )
         raise
 
-    # Pre-create the standard directory layout on the volume.
-    await _init_volume_dirs(vol_id)
-
     return vol_id
 
 
@@ -815,58 +817,6 @@ async def _daytona_create_with_502_retry(do_create, retries: int = 2):
             delay *= 2
             last_exc = e
     raise last_exc  # unreachable but satisfies type-checker
-
-
-async def _init_volume_dirs(volume_ref: str) -> None:
-    """Spin a 1-shot sandbox to mkdir -p shared/ system/supervisor/ on the volume."""
-    from daytona_sdk import (
-        CreateSandboxFromSnapshotParams,
-        CreateSandboxFromImageParams, VolumeMount,
-    )
-
-    daytona = await _get_async_daytona_client()
-
-    # _init_volume_dirs only runs `mkdir` on a brand-new volume — any image
-    # with a POSIX shell works. Phase E: no implicit hive-large default;
-    # operators opt into a snapshot via DAYTONA_SNAPSHOT, otherwise the
-    # ``node:22-slim`` fallback is used (volume-init does not need the
-    # agent-sdk runtime).
-    snapshot = os.environ.get("DAYTONA_SNAPSHOT", "").strip()
-    use_snapshot = snapshot.lower() not in {"", "0", "false", "image"}
-
-    # Mount the whole volume at /v (no subpath) so we can create dirs.
-    volumes = [VolumeMount(volume_id=volume_ref, mount_path="/v")]
-    init_labels = _sandbox_labels()
-
-    async def _do_init_create():
-        if use_snapshot:
-            return await daytona.create(
-                CreateSandboxFromSnapshotParams(
-                    snapshot=snapshot, auto_stop_interval=0,
-                    env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                    labels=init_labels,
-                ), timeout=120,
-            )
-        return await daytona.create(
-            CreateSandboxFromImageParams(
-                image="node:22-slim", auto_stop_interval=0,
-                env_vars=_get_sandbox_env_vars(), volumes=volumes,
-                labels=init_labels,
-            ), timeout=120,
-        )
-
-    sb = await _daytona_create_with_502_retry(_do_init_create)
-
-    try:
-        await _run_sandbox_exec_async(
-            sb, "mkdir -p /v/shared /v/system/supervisor", timeout=30,
-        )
-        log.info("volume %s: initialized shared/ and system/supervisor/ dirs", volume_ref)
-    finally:
-        try:
-            await daytona.delete(sb)
-        except Exception:
-            pass
 
 
 async def delete_daytona_volume(provider_ref: str) -> None:
