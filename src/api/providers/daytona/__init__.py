@@ -62,6 +62,7 @@ from .._shared import (
     _build_env_prefix,
     _build_volume_mounts,
     _enum_str,
+    bounded_gather,
     _get_sandbox_env_vars,
     _read_runtime_image_tag,
     _read_runtime_snapshot_tag,
@@ -1408,15 +1409,25 @@ async def reconcile_on_startup() -> None:
         log.warning("daytona reconcile: live-session query failed: %s", e)
         return
 
-    for sb in items:
-        sid = getattr(sb, "id", None)
-        if not sid or sid in live_refs:
-            continue
+    orphans = [
+        sb for sb in items
+        if getattr(sb, "id", None) and getattr(sb, "id") not in live_refs
+    ]
+    if not orphans:
+        return
+
+    # Fan out the deletes: a crash can strand many orphans, and reclaiming them
+    # one blocking `daytona.delete` at a time serialises N control-plane RTTs on
+    # the startup path. Bounded so we don't stampede the shared client pool.
+    async def _reap(sb) -> None:
+        sid = sb.id
         log.info("daytona reconcile: deleting orphan %s", sid[:16])
         try:
             await daytona.delete(sb)
         except Exception as e:
             log.warning("daytona reconcile: delete %s: %s", sid[:16], e)
+
+    await bounded_gather([_reap(sb) for sb in orphans])
 
 
 async def _list_labeled_sandboxes(daytona, labels: dict[str, str]) -> tuple[list, bool]:
