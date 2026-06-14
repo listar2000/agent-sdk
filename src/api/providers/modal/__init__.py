@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import shlex
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -629,6 +630,42 @@ async def _lookup_sandbox(ref: str):
         raise
 
 
+# Cache of resolved Modal ``Sandbox`` handles, keyed by sandbox id. ``from_id``
+# is a control-plane RPC (``client.stub.SandboxWait``), so resolving it before
+# EVERY exec — as ``exec_in_sandbox`` did — was a per-exec round-trip on the hot
+# native-on-modal tool path. A handle is reusable for the sandbox's lifetime
+# (it wraps the id + the process-shared client), and Modal has no pause/restart
+# (terminate is destructive → a new id), so a ref maps 1:1 to one sandbox — no
+# cross-restart staleness to worry about; evict on terminate. Bounded LRU caps
+# the RAM cost. Mirrors the daytona handle cache.
+_SANDBOX_HANDLE_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+_SANDBOX_HANDLE_CACHE_MAX = int(
+    os.environ.get("AGENT_SDK_MODAL_HANDLE_CACHE_MAX", "512"))
+
+
+async def _cached_sandbox_handle(ref: str, *, refresh: bool = False):
+    """Resolved Modal ``Sandbox`` handle for ``ref``, cached. ``refresh=True``
+    forces a fresh ``from_id`` (used after an exec raised on a stale handle)."""
+    if not refresh:
+        cached = _SANDBOX_HANDLE_CACHE.get(ref)
+        if cached is not None:
+            _SANDBOX_HANDLE_CACHE.move_to_end(ref)
+            return cached
+    sandbox = await _lookup_sandbox(ref)
+    _SANDBOX_HANDLE_CACHE[ref] = sandbox
+    _SANDBOX_HANDLE_CACHE.move_to_end(ref)
+    while len(_SANDBOX_HANDLE_CACHE) > _SANDBOX_HANDLE_CACHE_MAX:
+        _SANDBOX_HANDLE_CACHE.popitem(last=False)  # evict least-recently-used
+    return sandbox
+
+
+def _evict_sandbox_handle(ref: str | None) -> None:
+    """Drop a sandbox's cached handle — call on terminate so a destroyed
+    sandbox's handle can't linger."""
+    if ref:
+        _SANDBOX_HANDLE_CACHE.pop(ref, None)
+
+
 async def get_sandbox_status(ref: str) -> str:
     """Map Modal sandbox state to the provider-agnostic vocabulary.
 
@@ -683,6 +720,7 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
         return
     try:
         await asyncio.to_thread(sb.terminate)
+        _evict_sandbox_handle(sid)  # sandbox is gone; drop its cached handle
         log.info("modal sandbox stopped (terminated): %s", sid)
     except Exception as e:
         log.warning("modal stop %s: %s", sid, e)
@@ -736,9 +774,8 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     sid = inst.sandbox_ref or inst.container_id
     if not sid:
         raise RuntimeError("modal exec: no sandbox id on instance")
-    sb = await _lookup_sandbox(sid)
 
-    def _run():
+    def _run(sb):
         p = sb.exec("sh", "-c", cmd)
         try:
             rc = p.wait(timeout=timeout)
@@ -749,12 +786,28 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
         err = p.stderr.read() or ""
         return rc, out, err
 
+    # Cached handle skips the per-exec ``from_id`` (SandboxWait) RPC. A command's
+    # non-zero exit returns normally (rc != 0); only a broken channel (terminated
+    # sandbox) raises — drop the handle, re-resolve once, retry. A gone sandbox
+    # re-raises SandboxMissingError and propagates as before.
     try:
+        sb = await _cached_sandbox_handle(sid)
         rc, out, err = await asyncio.wait_for(
-            asyncio.to_thread(_run), timeout=timeout + 5,
+            asyncio.to_thread(_run, sb), timeout=timeout + 5,
         )
     except asyncio.TimeoutError:
         return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
+    except SandboxMissingError:
+        raise
+    except Exception:
+        _evict_sandbox_handle(sid)
+        try:
+            sb = await _cached_sandbox_handle(sid, refresh=True)
+            rc, out, err = await asyncio.wait_for(
+                asyncio.to_thread(_run, sb), timeout=timeout + 5,
+            )
+        except asyncio.TimeoutError:
+            return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
     out_s, out_trunc = _truncate(out.encode() if isinstance(out, str) else out, _MAX_OUTPUT_BYTES)
     err_s, err_trunc = _truncate(err.encode() if isinstance(err, str) else err, _MAX_OUTPUT_BYTES)
     return ExecResult(
