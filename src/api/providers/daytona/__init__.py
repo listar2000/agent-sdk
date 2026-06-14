@@ -63,6 +63,7 @@ from .._shared import (
     _build_env_prefix,
     _build_volume_mounts,
     _enum_str,
+    bounded_gather,
     _get_sandbox_env_vars,
     _read_runtime_image_tag,
     _read_runtime_snapshot_tag,
@@ -1095,6 +1096,23 @@ def _ensure_utility_reaper() -> None:
     _utility_reaper_started = True
 
 
+async def _reap_stale_utility(stale: list[tuple[str, "ProviderInstance"]]) -> None:
+    """Destroy a batch of stale utility sandboxes concurrently.
+
+    Each ``destroy_daytona`` is a control-plane round-trip; reaping them one at
+    a time lets a single slow/hung destroy stall the rest of the batch (and the
+    reaper tick). Fan out (bounded) so the slow one doesn't block its siblings.
+    """
+    async def _one(ref, inst) -> None:
+        log.info("daytona utility sandbox: reaping idle volume %s", ref[:16])
+        try:
+            await destroy_daytona(inst)
+        except Exception as e:  # pragma: no cover
+            log.warning("utility reaper: destroy failed for %s: %s", ref[:16], e)
+
+    await bounded_gather([_one(ref, inst) for ref, inst in stale])
+
+
 async def _utility_reaper_loop() -> None:
     """Destroy utility sandboxes that have been idle for > _UTILITY_TTL_S."""
     import time as _time
@@ -1107,12 +1125,7 @@ async def _utility_reaper_loop() -> None:
                 if now - last > _UTILITY_TTL_S:
                     stale.append((ref, inst))
                     _utility_cache.pop(ref, None)
-        for ref, inst in stale:
-            log.info("daytona utility sandbox: reaping idle volume %s", ref[:16])
-            try:
-                await destroy_daytona(inst)
-            except Exception as e:  # pragma: no cover
-                log.warning("utility reaper: destroy failed for %s: %s", ref[:16], e)
+        await _reap_stale_utility(stale)
 
 
 async def _run_in_utility_sandbox(ref: str, cmd: str, timeout: int = 30):
@@ -1474,15 +1487,25 @@ async def reconcile_on_startup() -> None:
         log.warning("daytona reconcile: live-session query failed: %s", e)
         return
 
-    for sb in items:
-        sid = getattr(sb, "id", None)
-        if not sid or sid in live_refs:
-            continue
+    orphans = [
+        sb for sb in items
+        if getattr(sb, "id", None) and getattr(sb, "id") not in live_refs
+    ]
+    if not orphans:
+        return
+
+    # Fan out the deletes: a crash can strand many orphans, and reclaiming them
+    # one blocking `daytona.delete` at a time serialises N control-plane RTTs on
+    # the startup path. Bounded so we don't stampede the shared client pool.
+    async def _reap(sb) -> None:
+        sid = sb.id
         log.info("daytona reconcile: deleting orphan %s", sid[:16])
         try:
             await daytona.delete(sb)
         except Exception as e:
             log.warning("daytona reconcile: delete %s: %s", sid[:16], e)
+
+    await bounded_gather([_reap(sb) for sb in orphans])
 
 
 async def _list_labeled_sandboxes(daytona, labels: dict[str, str]) -> tuple[list, bool]:

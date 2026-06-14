@@ -44,6 +44,7 @@ from .._shared import (
     _build_env_prefix,
     _truncate,
     _wait_for_health,
+    bounded_gather,
     build_supervisor_argv,
 )
 from .._volume import ShellVolumeAdapter
@@ -862,16 +863,32 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
-    for sb in sandboxes:
+    # Origin scope. Unlike daytona (whose reconcile LISTS only its own
+    # origin-labelled sandboxes), modal lists the WHOLE shared app — test /
+    # staging / production all resolve the same `agent-sdk` app. So we MUST
+    # filter by origin here, or a non-prod server's startup reconcile would
+    # classify a LIVE production sandbox (whose ref isn't in this server's DB)
+    # as an orphan and terminate it. Only ever reap our own origin's sandboxes.
+    own_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+
+    # Classify every sandbox concurrently: each ``get_tags`` is a control-plane
+    # round-trip, so scanning them one at a time serialises N RTTs on the
+    # startup path. Returns the orphan sandbox + its ref tag, or None.
+    async def _classify(sb):
         try:
             tags = await asyncio.to_thread(sb.get_tags)
         except Exception as e:
             log.warning("modal reconcile: get_tags %s: %s", sb.object_id, e)
-            continue
+            return None
         sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
         if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
-            continue
+            return None
+        # NEVER reap a sandbox from a different origin (or one with no origin
+        # tag — legacy/edge): cross-origin termination of a live sandbox is
+        # far worse than leaving an orphan for that origin's own reconcile.
+        if tags.get(_ORIGIN_TAG) != own_origin:
+            return None
         # Modal tags also carry the modal sandbox object_id; the pool stores
         # whatever was passed to create_sandbox as state.sandbox_ref. Check
         # both forms so a label-rename doesn't strand live sandboxes.
@@ -879,15 +896,25 @@ async def reconcile_on_startup() -> None:
             sandbox_ref_tag not in live_refs
             and sb.object_id not in live_refs
         )
-        if is_orphan:
-            log.info(
-                "modal reconcile: terminating orphan %s (sandbox_ref=%s)",
-                sb.object_id, sandbox_ref_tag,
-            )
-            try:
-                await asyncio.to_thread(sb.terminate)
-            except Exception as e:
-                log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
+        return (sb, sandbox_ref_tag) if is_orphan else None
+
+    classified = await bounded_gather([_classify(sb) for sb in sandboxes])
+    orphans = [c for c in classified if c and not isinstance(c, BaseException)]
+    if not orphans:
+        return
+
+    # Reclaim the orphans concurrently too (each terminate is another RTT).
+    async def _reap(sb, sandbox_ref_tag) -> None:
+        log.info(
+            "modal reconcile: terminating orphan %s (sandbox_ref=%s)",
+            sb.object_id, sandbox_ref_tag,
+        )
+        try:
+            await asyncio.to_thread(sb.terminate)
+        except Exception as e:
+            log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
+
+    await bounded_gather([_reap(sb, ref) for sb, ref in orphans])
 
 
 # ---------------------------------------------------------------------------

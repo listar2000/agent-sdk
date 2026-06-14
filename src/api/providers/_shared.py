@@ -609,6 +609,39 @@ def _truncate(data: bytes, limit: int) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Bounded concurrency
+# ---------------------------------------------------------------------------
+
+# Fan-out width for provider control-plane batch ops (startup orphan reclaim,
+# tag scans). Bounded so a crash that strands hundreds of orphans fans out
+# without stampeding the provider — the daytona client pool is 300 conns and
+# modal's gRPC channel is shared, so we want parallelism, not a thundering herd.
+RECONCILE_CONCURRENCY = int(os.environ.get("AGENT_SDK_RECONCILE_CONCURRENCY", "16"))
+
+
+async def bounded_gather(coros, *, limit: int = RECONCILE_CONCURRENCY):
+    """Run awaitables concurrently with at most ``limit`` in flight at once.
+
+    Like ``asyncio.gather`` but caps concurrency with a semaphore, so a large
+    batch of control-plane calls runs in parallel without opening one RPC per
+    item simultaneously. Results preserve input order. A failing awaitable
+    yields its exception in its result slot (``return_exceptions`` semantics)
+    rather than cancelling siblings — batch reclaim must not abort because one
+    sandbox delete raced a concurrent teardown.
+    """
+    coros = list(coros)
+    if not coros:
+        return []
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def _run(coro):
+        async with sem:
+            return await coro
+
+    return await asyncio.gather(*(_run(c) for c in coros), return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
 # Workspace name normalizer
 # ---------------------------------------------------------------------------
 
