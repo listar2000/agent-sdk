@@ -40,8 +40,16 @@ def _install_modal(monkeypatch, sandboxes, live_refs):
 
     class _FakeSandboxNS:
         @staticmethod
-        def list(app_id=None):
-            return list(sandboxes)
+        def list(app_id=None, tags=None):
+            # Mirror the real Sandbox.list: "only Sandboxes that have at least
+            # those tags are returned." Origin scoping happens HERE (server
+            # side), so a reconcile that fails to pass the origin tag would
+            # (wrongly) see every origin's sandboxes.
+            out = []
+            for sb in sandboxes:
+                if tags is None or all(sb._tags.get(k) == v for k, v in tags.items()):
+                    out.append(sb)
+            return out
 
     class _FakeModal:
         Sandbox = _FakeSandboxNS

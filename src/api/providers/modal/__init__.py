@@ -89,6 +89,13 @@ _ORIGIN_TAG = "agent_sdk_origin"
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
 
+# Runaway guard on reconcile's sandbox listing — mirrors daytona's
+# ``_DAYTONA_MAX_ITEMS``. Bounds memory + the per-sandbox get_tags fan-out on a
+# huge account so boot reconcile can't stall.
+_MODAL_RECONCILE_MAX_ITEMS = int(
+    os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000")
+)
+
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
     """Map our ``Resources`` to Modal's ``Sandbox.create`` kwargs.
@@ -791,9 +798,25 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: modal unavailable: %s", e)
         return
 
+    # Origin scope: test and production share the Modal app (``_APP_NAME``), so
+    # an unfiltered list returns sandboxes from BOTH. Filter SERVER-SIDE by the
+    # origin tag — the Modal analogue of daytona's label-scoped list — so a
+    # test-origin reconcile never even sees (let alone reaps) PRODUCTION
+    # sandboxes (their refs aren't in the test DB's live_refs; that was the
+    # daytona origin-collision incident), and we don't pay a get_tags RPC per
+    # foreign-origin sandbox. Capped like daytona as a runaway guard.
+    expected_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+
     # ``Sandbox.list`` is an async generator — iterate via to_thread helper.
     def _list_sandboxes():
-        return list(modal.Sandbox.list(app_id=app.app_id))
+        out = []
+        for sb in modal.Sandbox.list(
+            app_id=app.app_id, tags={_ORIGIN_TAG: expected_origin},
+        ):
+            out.append(sb)
+            if len(out) >= _MODAL_RECONCILE_MAX_ITEMS:
+                break
+        return out
 
     try:
         sandboxes = await asyncio.to_thread(_list_sandboxes)
@@ -809,14 +832,6 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
-    # Origin scope: test and production share the Modal app (``_APP_NAME``), so
-    # the list above returns sandboxes from BOTH. Daytona filters its list by
-    # the origin label; Modal's ``Sandbox.list`` can't, so we filter per-sandbox
-    # here. Without this a test-origin server's reconcile would terminate
-    # PRODUCTION sandboxes (their refs aren't in the test DB's live_refs) — the
-    # Modal analogue of the daytona origin-collision incident.
-    expected_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
-
     for sb in sandboxes:
         try:
             tags = await asyncio.to_thread(sb.get_tags)
@@ -829,10 +844,9 @@ async def reconcile_on_startup() -> None:
         if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
             continue
-        if tags.get(_ORIGIN_TAG) != expected_origin:
-            # Different origin (test vs production) — never cross-reap.
-            continue
-        # Modal tags also carry the modal sandbox object_id; the pool stores
+        # The list is already origin-scoped server-side, so every sandbox here
+        # is ours. Modal tags also carry the modal sandbox object_id; the pool
+        # stores
         # whatever was passed to create_sandbox as state.sandbox_ref. Check
         # both forms so a label-rename doesn't strand live sandboxes.
         is_orphan = (
