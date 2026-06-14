@@ -819,6 +819,7 @@ async def delete_daytona_volume(provider_ref: str) -> None:
     await volumes_api.delete_volume(provider_ref)
 
 
+@timed_provider_op("daytona", "status")
 async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
     """Return one of: 'running' | 'stopped' | 'missing' | 'error'.
 

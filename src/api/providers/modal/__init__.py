@@ -629,6 +629,7 @@ async def _lookup_sandbox(ref: str):
         raise
 
 
+@timed_provider_op("modal", "status")
 async def get_sandbox_status(ref: str) -> str:
     """Map Modal sandbox state to the provider-agnostic vocabulary.
 
