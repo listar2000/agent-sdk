@@ -110,6 +110,18 @@ _DETECT_MAX_ITEMS = int(os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000"))
 # reap a peer's mid-create sandbox and break the create. We wait this long, then
 # re-query live sessions and reap only candidates that are STILL orphaned.
 # Covers the worst-case cold-create + persist; tune via the env var.
+_MODAL_RECONCILE_MAX_ITEMS = int(
+    os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000")
+)
+
+# Grace before reconcile_on_startup reaps an orphan candidate. A sibling
+# replica may have a create in flight — the sandbox is already tagged on Modal
+# but its sandbox_ref hasn't been committed to the DB yet (the pool persists it
+# only after start() finishes: supervisor boot + ACP attach, which is seconds).
+# A booting replica reconciles account-globally, so without this wait it would
+# reap a peer's mid-create sandbox and break the create. We wait this long, then
+# re-query live sessions and reap only candidates that are STILL orphaned.
+# Covers the worst-case cold-create + persist; tune via the env var.
 _RECONCILE_MIDCREATE_GRACE_S = float(
     os.environ.get("AGENT_SDK_RECONCILE_GRACE_S", "120")
 )
@@ -943,9 +955,25 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: modal unavailable: %s", e)
         return
 
+    # Origin scope: test and production share the Modal app (``_APP_NAME``), so
+    # an unfiltered list returns sandboxes from BOTH. Filter SERVER-SIDE by the
+    # origin tag — the Modal analogue of daytona's label-scoped list — so a
+    # test-origin reconcile never even sees (let alone reaps) PRODUCTION
+    # sandboxes (their refs aren't in the test DB's live_refs; that was the
+    # daytona origin-collision incident), and we don't pay a get_tags RPC per
+    # foreign-origin sandbox. Capped like daytona as a runaway guard.
+    expected_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+
     # ``Sandbox.list`` is an async generator — iterate via to_thread helper.
     def _list_sandboxes():
-        return list(modal.Sandbox.list(app_id=app.app_id))
+        out = []
+        for sb in modal.Sandbox.list(
+            app_id=app.app_id, tags={_ORIGIN_TAG: expected_origin},
+        ):
+            out.append(sb)
+            if len(out) >= _MODAL_RECONCILE_MAX_ITEMS:
+                break
+        return out
 
     try:
         sandboxes = await asyncio.to_thread(_list_sandboxes)
@@ -961,14 +989,6 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
-    # Origin scope. Unlike daytona (whose reconcile LISTS only its own
-    # origin-labelled sandboxes), modal lists the WHOLE shared app — test /
-    # staging / production all resolve the same `agent-sdk` app. So we MUST
-    # filter by origin here, or a non-prod server's startup reconcile would
-    # classify a LIVE production sandbox (whose ref isn't in this server's DB)
-    # as an orphan and terminate it. Only ever reap our own origin's sandboxes.
-    own_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
-
     # Pass 1: classify every sandbox concurrently — each ``get_tags`` is a
     # control-plane round-trip, so scanning serially serialises N RTTs on the
     # startup path. Returns the orphan candidate (sb, ref_tag), or None.
@@ -978,17 +998,15 @@ async def reconcile_on_startup() -> None:
         except Exception as e:
             log.warning("modal reconcile: get_tags %s: %s", sb.object_id, e)
             return None
-        sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
+        if not isinstance(tags, dict):
+            return None
+        sandbox_ref_tag = tags.get(_TAG_KEY)
         if not sandbox_ref_tag:
             return None  # untagged — not ours or created before tagging
-        # NEVER reap a sandbox from a different origin (or one with no origin
-        # tag — legacy/edge): cross-origin termination of a live sandbox is far
-        # worse than leaving an orphan for that origin's own reconcile.
-        if tags.get(_ORIGIN_TAG) != own_origin:
-            return None
-        # Modal tags also carry the modal sandbox object_id; the pool stores
-        # whatever was passed to create_sandbox as state.sandbox_ref. Check
-        # both forms so a label-rename doesn't strand live sandboxes.
+        # The list is already origin-scoped server-side, so every sandbox here
+        # is ours. Modal tags also carry the modal sandbox object_id; the pool
+        # stores whatever was passed to create_sandbox as state.sandbox_ref.
+        # Check both forms so a label-rename doesn't strand live sandboxes.
         if sandbox_ref_tag not in live_refs and sb.object_id not in live_refs:
             return (sb, sandbox_ref_tag)
         return None
