@@ -49,6 +49,11 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # Best-effort destroy of an unreachable old VM on reattach failure;
         # kept on a strong ref so the fire-and-forget task isn't GC'd.
         self._reattach_destroy_task: asyncio.Task | None = None
+        # Same, for a freshly cold-created VM whose supervisor/ACP bringup
+        # fails — a SEPARATE ref so it can't clobber a concurrent
+        # reattach-destroy (both can fire in one start(): reattach the old VM
+        # away, then the fresh replacement fails to boot).
+        self._fresh_destroy_task: asyncio.Task | None = None
         self._cwd = "/home/daytona"  # provider-specific default
 
     # ------------------------------------------------------------------ #
@@ -98,48 +103,80 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # (A) Resolve the daytona sandbox handle: reattach, restart, or
         #     create. Cold-create pays VM allocation + 3-volume mount here.
         _t = time.monotonic()
-        sandbox = await self._resolve_or_create_sandbox(dt_provider)
+        sandbox, created_fresh = await self._resolve_or_create_sandbox(dt_provider)
         _bench("resolve_or_create_sandbox", _t)
         self._daytona_sandbox = sandbox
         self.state.sandbox_ref = sandbox.id
 
-        # (B) Bring the supervisor up. ``start_supervisor_in_sandbox`` is
-        # idempotent (skips re-spawning when one is already healthy on
-        # this port); reused across reattach / restart / cold-create.
-        _t = time.monotonic()
-        url = await dt_provider.start_supervisor_in_sandbox(
-            sandbox,
-            self.state.recipe.agent_type,
-            _SUPERVISOR_PORT,
-            root=self.state.recipe.root or "/home/daytona",
-            spawn_env=self._spawn_env,
-            # First cold-create has no prior tarball — skip the boot restore
-            # poll (writes still happen). Recovery (had a sandbox) restores.
-            restore_snapshot=had_prior_sandbox,
-        )
-        _bench("start_supervisor", _t)
-        self._supervisor_url = url
-        self.state.listen_port = _SUPERVISOR_PORT
+        # (B) supervisor + (C) ACP attach, under one guard. If either fails for
+        # a FRESHLY cold-created VM, that VM is running and burning compute with
+        # nothing recoverable on it (session state lives on the /vol snapshot,
+        # not the VM). Destroy it now rather than abandon it — a labelled
+        # abandoned VM leaks against the account disk quota with no automated
+        # prod reclaim (cleanup_orphans defaults to origin=test; reconcile is
+        # boot-only). This is the same leak — and the same fix — as the
+        # reattach-fallback in ``_resolve_or_create_sandbox``, which the daytona
+        # flood incident was about; the fresh-create path was the remaining
+        # hole. A reattached VM is left alone (it may be healthy and only hit a
+        # transient ACP blip; recovery handles it).
+        try:
+            # (B) Bring the supervisor up. ``start_supervisor_in_sandbox`` is
+            # idempotent (skips re-spawning when one is already healthy on
+            # this port); reused across reattach / restart / cold-create.
+            _t = time.monotonic()
+            url = await dt_provider.start_supervisor_in_sandbox(
+                sandbox,
+                self.state.recipe.agent_type,
+                _SUPERVISOR_PORT,
+                root=self.state.recipe.root or "/home/daytona",
+                spawn_env=self._spawn_env,
+                # First cold-create has no prior tarball — skip the boot
+                # restore poll (writes still happen). Recovery restores.
+                restore_snapshot=had_prior_sandbox,
+            )
+            _bench("start_supervisor", _t)
+            self._supervisor_url = url
+            self.state.listen_port = _SUPERVISOR_PORT
 
-        # ``start_supervisor_in_sandbox`` returned only after its own
-        # ``_wait_for_health`` saw a 200 — the supervisor IS healthy as
-        # of microseconds ago. We used to do another 3-attempt poll here
-        # as a "sanity check" but it never caught anything that ``ACP
-        # attach`` (which fires next, also via HTTP to the same URL)
-        # wouldn't catch on the same round trip; it just added 100-500ms
-        # to every session_create. Trust the upstream signal and let ACP
-        # attach be the next probe.
-        self.liveness.observe_chunk()
+            # ``start_supervisor_in_sandbox`` returned only after its own
+            # ``_wait_for_health`` saw a 200 — the supervisor IS healthy as
+            # of microseconds ago. We used to do another 3-attempt poll here
+            # as a "sanity check" but it never caught anything that ``ACP
+            # attach`` (which fires next, also via HTTP to the same URL)
+            # wouldn't catch on the same round trip; it just added 100-500ms
+            # to every session_create. Trust the upstream signal and let ACP
+            # attach be the next probe.
+            self.liveness.observe_chunk()
 
-        # ACP attach happens on first execute_prompt; we pre-allocate the
-        # acp_session_id so multiple subscribers + multiple prompts share
-        # one ACP child.
-        if self._acp_session_id is None:
-            self._acp_session_id = str(uuid4())
-        # (C) ACP handshake + session/new (cold) or session/load (recovery).
-        _t = time.monotonic()
-        await self._attach_acp()
-        _bench("acp_attach", _t)
+            # ACP attach happens on first execute_prompt; we pre-allocate the
+            # acp_session_id so multiple subscribers + multiple prompts share
+            # one ACP child.
+            if self._acp_session_id is None:
+                self._acp_session_id = str(uuid4())
+            # (C) ACP handshake + session/new (cold) or session/load (recovery).
+            _t = time.monotonic()
+            await self._attach_acp()
+            _bench("acp_attach", _t)
+        except BaseException:
+            if created_fresh and self.state.sandbox_ref:
+                dead_ref = self.state.sandbox_ref
+                log.warning(
+                    "DaytonaSandboxSession: fresh sandbox %s failed supervisor/"
+                    "ACP bringup; destroying it to avoid a leaked running VM",
+                    dead_ref[:16],
+                )
+                # Fire-and-forget (daytona's delete-confirm poll can take up to
+                # 60s) on a strong, dedicated ref so it can't clobber a pending
+                # reattach-destroy. State is on /vol, so a retry cold-creates
+                # cleanly from the snapshot.
+                self._fresh_destroy_task = asyncio.create_task(
+                    dt_provider.destroy_daytona(
+                        self._provider_instance(sandbox_ref=dead_ref)
+                    )
+                )
+                self.state.sandbox_ref = None
+                self._supervisor_url = None
+            raise
         _bench("TOTAL", _t_total)
 
         log.info(
@@ -147,8 +184,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
             self.session_id, sandbox.id[:16], url,
         )
 
-    async def _resolve_or_create_sandbox(self, dt_provider) -> Any:
-        """The internal Type-1-vs-Type-2 decision tree, hidden from callers."""
+    async def _resolve_or_create_sandbox(self, dt_provider) -> tuple[Any, bool]:
+        """The internal Type-1-vs-Type-2 decision tree, hidden from callers.
+
+        Returns ``(sandbox, created_fresh)`` — ``created_fresh`` is True only
+        when this cold-created a brand-new VM (vs reattaching an existing one),
+        so ``start()`` knows whether a bringup failure should destroy the VM
+        (fresh: nothing recoverable on it) or leave it (reattached: maybe a
+        healthy VM hit by a transient blip)."""
         if self.state.sandbox_ref:
             try:
                 # Try reattach + resume from pause if needed. The existing
@@ -169,7 +212,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 client = await dt_provider._get_async_daytona_client()
                 sandbox = await client.get(self.state.sandbox_ref)
                 self._supervisor_url = instance.url
-                return sandbox
+                return sandbox, False
             except Exception as e:
                 # Whether the sandbox is genuinely missing (404) or alive
                 # but unreachable for any other reason — Daytona 5xx,
@@ -240,7 +283,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         # path without any further sync boundary.
         client = await dt_provider._get_async_daytona_client()
         sandbox = await client.get(instance.sandbox_ref)
-        return sandbox
+        return sandbox, True
 
     # ------------------------------------------------------------------ #
     # running: liveness oracle — inherited from BaseSandboxSession       #
