@@ -951,8 +951,14 @@ async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -
     out = (r.result if hasattr(r, "result") else str(r)) or ""
     err = (r.stderr if hasattr(r, "stderr") else "") or ""
     code = r.exit_code if hasattr(r, "exit_code") else None
-    out, trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
-    return ExecResult(stdout=out, stderr=err, exit_code=code, stdout_truncated=trunc)
+    # Cap BOTH streams at 1 MiB. stderr was previously returned UNTRUNCATED —
+    # a command with huge stderr (a verbose tool, an error dump) returned all
+    # of it, holding it in RAM and flowing it downstream unbounded. Match
+    # stdout (and the modal/docker providers, which cap both).
+    out, out_trunc = _truncate(out.encode(), _MAX_OUTPUT_BYTES)
+    err, err_trunc = _truncate(err.encode(), _MAX_OUTPUT_BYTES)
+    return ExecResult(stdout=out, stderr=err, exit_code=code,
+                      stdout_truncated=out_trunc, stderr_truncated=err_trunc)
 
 
 @timed_provider_op("daytona", "create_sandbox")
