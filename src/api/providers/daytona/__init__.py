@@ -141,6 +141,15 @@ _DAYTONA_ASYNC_POOL_MAX = int(os.environ.get("AGENT_SDK_DAYTONA_POOL_MAX", "300"
 # count is a lower bound.
 _DAYTONA_MAX_ITEMS = int(os.environ.get("AGENT_SDK_DAYTONA_MAX_ITEMS", "5000"))
 
+# get_sandbox_status retry budget. A transient client.get() failure (network
+# blip / daytona 5xx) must NOT classify a healthy sandbox as "error" — the
+# recovery path treats "error" as unrecoverable and destroys + cold-replaces
+# it (abandoning the live/paused one). A definitive "not found"/404 still
+# returns "missing" immediately (no retry); only transient errors are retried.
+# Mirrors the modal provider's get_sandbox_status retry.
+_DAYTONA_STATUS_ATTEMPTS = int(os.environ.get("AGENT_SDK_DAYTONA_STATUS_ATTEMPTS", "3"))
+_DAYTONA_STATUS_BACKOFF_S = float(os.environ.get("AGENT_SDK_DAYTONA_STATUS_BACKOFF_S", "0.25"))
+
 
 async def _get_async_daytona_client():
     """Process-shared AsyncDaytona client. Lazy-init under a lock."""
@@ -889,26 +898,38 @@ async def get_daytona_sandbox_status(sandbox_ref: str) -> str:
     haven't seen yet should fall through to ``_wait_for_health`` /
     ``start_sandbox``, not to destroy + replace.
     """
-    try:
-        client = await _get_async_daytona_client()
-        sb = await client.get(sandbox_ref)
-    except Exception as e:
-        msg = str(e).lower()
-        if "not found" in msg or "404" in msg:
+    last_err: Exception | None = None
+    for attempt in range(_DAYTONA_STATUS_ATTEMPTS):
+        try:
+            client = await _get_async_daytona_client()
+            sb = await client.get(sandbox_ref)
+        except Exception as e:
+            msg = str(e).lower()
+            if "not found" in msg or "404" in msg:
+                return "missing"  # definitive — the record is gone, don't retry
+            # Transient (network / daytona 5xx / timeout): retry before
+            # declaring "error", which would destroy a healthy sandbox.
+            last_err = e
+            if attempt + 1 < _DAYTONA_STATUS_ATTEMPTS:
+                await asyncio.sleep(_DAYTONA_STATUS_BACKOFF_S * (attempt + 1))
+            continue
+        state = (getattr(sb, "state", None) or "")
+        state_str = _enum_str(state)
+        if state_str in ("started", "running", "starting",
+                         "pulling_image", "creating", "resizing"):
+            return "running"
+        if state_str in ("stopped", "paused", "stopping"):
+            return "stopped"
+        if state_str in ("destroyed", "destroying", "archived"):
             return "missing"
-        return "error"
-    state = (getattr(sb, "state", None) or "")
-    state_str = _enum_str(state)
-    if state_str in ("started", "running", "starting",
-                     "pulling_image", "creating", "resizing"):
+        if state_str == "error":
+            return "error"
         return "running"
-    if state_str in ("stopped", "paused", "stopping"):
-        return "stopped"
-    if state_str in ("destroyed", "destroying", "archived"):
-        return "missing"
-    if state_str == "error":
-        return "error"
-    return "running"
+    log.warning(
+        "daytona get_sandbox_status %s: error after %d attempts: %s",
+        sandbox_ref, _DAYTONA_STATUS_ATTEMPTS, last_err,
+    )
+    return "error"
 
 
 # ---------------------------------------------------------------------------
