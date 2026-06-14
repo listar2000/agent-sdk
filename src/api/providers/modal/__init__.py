@@ -619,10 +619,18 @@ def _is_missing_err(msg: str) -> bool:
 
 
 async def _lookup_sandbox(ref: str):
-    """Return a Modal ``Sandbox`` by id or raise ``SandboxMissingError``."""
+    """Return a Modal ``Sandbox`` by id or raise ``SandboxMissingError``.
+
+    Uses modal's async ``from_id.aio`` (not ``asyncio.to_thread``): from_id
+    (a ``SandboxWait`` RPC, high-variance) is on the exec / status / recovery
+    hot paths, so threading it competed for the shared default threadpool
+    (~min(32, cpu+4) workers). Async removes that ceiling — measured ~1.3x at
+    40 concurrent lookups. Completes the modal exec path's async-ification
+    (#190 made exec/wait/read async; this drops its last to_thread).
+    """
     modal, _ = _require_modal()
     try:
-        return await asyncio.to_thread(modal.Sandbox.from_id, ref)
+        return await modal.Sandbox.from_id.aio(ref)
     except Exception as e:
         if _is_missing_err(str(e)):
             raise SandboxMissingError(f"modal sandbox {ref} not found") from e
