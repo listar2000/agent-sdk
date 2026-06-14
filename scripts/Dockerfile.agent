@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 RUN pip install --no-cache-dir uv
 RUN mkdir -p /home/daytona
 COPY hive_build_credentials.tmp /home/daytona/.git-credentials
-RUN HOME=/home/daytona git config --global credential.helper store && chmod 600 /home/daytona/.git-credentials && HOME=/home/daytona uv tool install --with click "git+https://github.com/rllm-org/hive-space.git@37ffa2f7940d29b44aebdc6cd69dd74b7e30b78b" && rm -f /home/daytona/.git-credentials
+RUN HOME=/home/daytona git config --global credential.helper store && chmod 600 /home/daytona/.git-credentials && HOME=/home/daytona uv tool install --with click "git+https://github.com/rllm-org/hive-space.git@e08a16e88b7501ace388f921214a4afa0728490c" && rm -f /home/daytona/.git-credentials
 
 FROM python:3.12-slim
 
