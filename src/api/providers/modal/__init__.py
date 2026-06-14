@@ -809,15 +809,28 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
+    # Origin scope: test and production share the Modal app (``_APP_NAME``), so
+    # the list above returns sandboxes from BOTH. Daytona filters its list by
+    # the origin label; Modal's ``Sandbox.list`` can't, so we filter per-sandbox
+    # here. Without this a test-origin server's reconcile would terminate
+    # PRODUCTION sandboxes (their refs aren't in the test DB's live_refs) — the
+    # Modal analogue of the daytona origin-collision incident.
+    expected_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+
     for sb in sandboxes:
         try:
             tags = await asyncio.to_thread(sb.get_tags)
         except Exception as e:
             log.warning("modal reconcile: get_tags %s: %s", sb.object_id, e)
             continue
-        sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
+        if not isinstance(tags, dict):
+            continue
+        sandbox_ref_tag = tags.get(_TAG_KEY)
         if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
+            continue
+        if tags.get(_ORIGIN_TAG) != expected_origin:
+            # Different origin (test vs production) — never cross-reap.
             continue
         # Modal tags also carry the modal sandbox object_id; the pool stores
         # whatever was passed to create_sandbox as state.sandbox_ref. Check
