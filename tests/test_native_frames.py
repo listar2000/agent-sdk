@@ -1,19 +1,19 @@
-"""Native frame synthesis — byte-level parity with the real ACP parsers.
+"""Native frame synthesis — round-trip parity with the real ACP parsers.
 
-Pins the wire contract from docs/native_runtime_design.md §2: for every
-event the native loop emits, ``parse_acp_event(block, rpc_id)`` must
-reconstruct the canonical event. Any change to api/sse.py parsing that
-breaks native frames fails here loudly (and vice versa).
+Pins the wire contract from docs/native_runtime_design.md §2: for every event
+the native loop emits, ``parse_acp_event(block_for_event(event), rpc_id)`` must
+reconstruct the canonical event. Any change to api/sse.py parsing that breaks
+native frames fails here loudly (and vice versa).
 
-Promoted from the design-phase validation spike (42/42).
+(Frames are now a single ``json.dumps`` of the canonical dict — the earlier
+hand-concatenated fast path + its byte-parity corpus were removed as
+over-optimized; see frames.py's history note. The contract that matters is the
+round-trip below, not the exact bytes.)
 """
 
 from __future__ import annotations
 
 import json
-import os
-import sys
-
 
 from api.sse import parse_acp_event  # noqa: E402
 from api.native import frames  # noqa: E402
@@ -26,19 +26,24 @@ def parse(block: str):
     return parse_acp_event(block, RPC)
 
 
+def block(ev: dict) -> str:
+    return frames.block_for_event(ev, RPC, SID)
+
+
 def test_text_roundtrip():
-    ev = parse(frames.text_block(SID, "Hello world"))
+    ev = parse(block({"type": "text", "text": "Hello world"}))
     assert ev["type"] == "text" and ev["text"] == "Hello world"
 
 
 def test_reasoning_roundtrip():
-    ev = parse(frames.reasoning_block(SID, "thinking..."))
+    ev = parse(block({"type": "reasoning", "text": "thinking..."}))
     assert ev["type"] == "reasoning" and ev["text"] == "thinking..."
 
 
 def test_tool_args_ride_rawinput():
     args = {"command": "echo hi", "timeout_s": 30}
-    ev = parse(frames.tool_block(SID, "call_abc123", "bash", args))
+    ev = parse(block({"type": "tool", "tool_call_id": "call_abc123",
+                      "tool_name": "bash", "args": args}))
     assert ev["type"] == "tool"
     assert ev["tool_name"] == "bash"
     assert ev["tool_call_id"] == "call_abc123"
@@ -48,7 +53,8 @@ def test_tool_args_ride_rawinput():
 
 
 def test_tool_result_slot_and_identity():
-    ev = parse(frames.tool_result_block(SID, "call_abc123", "bash", "hi\n"))
+    ev = parse(block({"type": "tool_result", "tool_call_id": "call_abc123",
+                      "tool_name": "bash", "result": "hi\n"}))
     assert ev["type"] == "tool_result"
     assert ev["tool_name"] == "bash"
     assert ev["tool_call_id"] == "call_abc123"
@@ -61,14 +67,14 @@ def test_adversarial_tool_result_content_parses():
     """Result text containing JSON-looking error/stopReason keys must still
     parse as a normal tool_result (stringified-into-text contract)."""
     nasty = json.dumps({"error": "boom", "stopReason": "fake"}) + ' and "error": literal'
-    ev = parse(frames.tool_result_block(SID, "call_x", "bash", nasty))
+    b = block({"type": "tool_result", "tool_call_id": "call_x",
+               "tool_name": "bash", "result": nasty})
+    ev = parse(b)
     assert ev["type"] == "tool_result"
     # JSON string-escaping protects the '"error":' substring class: the raw
-    # block must not contain an unescaped top-level-looking '"error":'
-    # outside the stringified content. (Bare 'stopReason' in content is
-    # handled by the precise terminal detection from P0-B, not by frames.)
-    block = frames.tool_result_block(SID, "call_x", "bash", nasty)
-    payload = json.loads(block[len("data: "):])
+    # block must not carry a top-level ``error`` key outside the stringified
+    # content (which would trip the stream's terminal detection).
+    payload = json.loads(b[len("data: "):])
     assert "error" not in payload  # no top-level error key
 
 
@@ -88,8 +94,8 @@ def test_done_roundtrip_all_stop_reasons():
 
 
 def test_done_wrong_rpc_dropped():
-    # Envelope id must byte-equal the rpc — mismatches are silently skipped
-    # by the parser, so a wrong id would hang every golden.
+    # Envelope id must equal the rpc — mismatches are silently skipped by the
+    # parser, so a wrong id would hang every golden.
     assert parse_acp_event(frames.done_block("other-rpc", "end_turn"), RPC) is None
 
 
@@ -121,8 +127,7 @@ def test_block_for_event_dispatch_total():
         {"type": "error", "text": "x", "kind": "K"},
     ]
     for ev in cases:
-        block = frames.block_for_event(ev, RPC, SID)
-        parsed = parse_acp_event(block, RPC)
+        parsed = parse_acp_event(block(ev), RPC)
         assert parsed is not None and parsed["type"] == ev["type"], (
             f"{ev['type']}: {parsed!r}")
     try:
@@ -134,5 +139,49 @@ def test_block_for_event_dispatch_total():
 
 
 def test_block_format_is_single_line_data_prefixed():
-    b = frames.text_block(SID, "x")
+    b = block({"type": "text", "text": "x"})
     assert b.startswith("data: ") and "\n" not in b
+
+
+# ── adversarial round-trip: nasty content survives synthesis → parse ─────────
+# The native loop never emits empty text (``if content:`` guard), so the corpus
+# is non-empty; everything else (quotes, backslashes, control chars, unicode,
+# brace-injection, JSON-looking payloads) must round-trip exactly.
+_ADVERSARIAL = [
+    "Hello world", ' "quoted" ', "back\\slash", "new\nline\ttab",
+    "ctrl\x01\x1f chars", "unicode é ñ 漢字 🚀", "}}}}injection {{{{",
+    '{"error":"x","stopReason":"fake"}', " " * 40,
+]
+_SIDS = [SID, 's"id', "s\\x", "é-🚀", ""]
+
+
+def test_adversarial_text_reasoning_roundtrip():
+    for sid in _SIDS:
+        for s in _ADVERSARIAL:
+            for typ in ("text", "reasoning"):
+                ev = {"type": typ, "text": s}
+                b = frames.block_for_event(ev, RPC, sid)
+                assert parse_acp_event(b, RPC) == ev, (sid, s, typ)
+
+
+def test_adversarial_tool_roundtrip():
+    args_corpus = [None, {}, {"command": "ls -la", "n": 3},
+                   {"k": 'v"x', "u": "é🚀", "nested": {"a": [1, 2]}},
+                   {"}}}": "]injection["}]
+    for sid in _SIDS:
+        for tcid in ("c1", 'c"x'):
+            for name in ("bash", 'wr"ite', "漢字"):
+                for r in _ADVERSARIAL:
+                    ev = {"type": "tool_result", "tool_call_id": tcid,
+                          "tool_name": name, "result": r}
+                    got = parse_acp_event(frames.block_for_event(ev, RPC, sid), RPC)
+                    assert got["type"] == "tool_result"
+                    assert got["tool_call_id"] == tcid and got["tool_name"] == name
+                    # the parser returns the structured content slot; the nasty
+                    # result text is stringified into it and recoverable intact
+                    assert got["result"][0]["content"]["text"] == r
+                for a in args_corpus:
+                    ev = {"type": "tool", "tool_call_id": tcid,
+                          "tool_name": name, "args": a}
+                    got = parse_acp_event(frames.block_for_event(ev, RPC, sid), RPC)
+                    assert got["type"] == "tool" and got["args"] == (a or {})

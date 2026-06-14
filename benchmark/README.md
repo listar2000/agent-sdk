@@ -38,6 +38,55 @@ identical. **The win is purely isolation** — the loop stays free to
 serve other requests while a big upload is being decoded. Use it
 gated on payload size; below ~1 MB the thread-dispatch overhead loses.
 
+### `bench_native_runtime.py`
+**Question:** end-to-end throughput, concurrency scaling, and per-session RAM
+of the **native runtime** — without an LLM key, a sandbox, or a running server.
+Drives `NativeSession.execute_prompt` through its real path (loop → `emit` →
+frame synthesis → `_broadcast` → internal queue → generator yield → per-turn
+checkpoint) using the `_completion` test seam as a fake token stream. This is
+the native counterpart to the supervisor-path `load/` benches: it isolates the
+in-process per-turn cost that multiplies across every concurrent session on a
+replica.
+
+**Run:** `.venv/bin/python benchmark/micro/bench_native_runtime.py`
+Knobs (env): `TURNS` (default 200), `CHUNKS` (text deltas/turn, default 60),
+`LEVELS` (concurrency points, default `1,2,4,8,16,32`).
+
+Views: single-session text rate, **tool-heavy** (a tool-call/tool-result loop —
+2 model rounds + a tool exec per turn, the realistic agent shape, exercising the
+tool/tool_result frames and the streamed tool-arg accumulator), **parallel
+tool-calling** (a round of N tool calls runs concurrently, bounded to a cap of 8
+— turn stays ~21ms for 1→8 tools at 20ms/exec (~7.4× vs sequential), then grows
+in waves of 8: 16 tools ≈ 43ms, a fixed per-turn resource ceiling), **concurrency
+scaling** (does aggregate throughput hold as
+sessions pile on?), **with-subscriber** fan-out, and **session-length scaling**
+(does per-turn cost stay flat as ONE conversation deepens, or is there a hidden
+O(n²)?). The last is the canary that caught the `heal_dangling_tool_calls`
+quadratic — it re-scanned the whole transcript every turn; bounding it to the
+tail flipped a 2000-turn session from ~6,900 to ~16,800 turns/s, and the gap
+grows without bound with conversation length.
+
+**Findings (repeatable; absolute rate scales with the host):**
+
+* The runtime is CPU-bound on the single event-loop thread, so aggregate
+  throughput is **flat** across 1→32 concurrent sessions (~100% *retention* of
+  the 1-session rate) — the good result: no contention cliff, clean horizontal
+  scaling across replicas. `retention` < ~95% would mean per-session contention
+  crept into the turn path.
+* Per-turn cost is now **flat as the conversation grows** (the session-length
+  table reads ×1.00 across buckets) — long-running sessions don't degrade.
+* The **with-subscriber** table measures the production streaming path (every
+  `/message` turn has ≥1 SSE subscriber draining broadcast blocks). It exposed —
+  and then validated the fix for — a shared-infra cost: `iterate_subscriber`
+  armed an `asyncio.wait_for` timeout (a fresh `TimerHandle`) on *every* event,
+  so one live subscriber roughly **halved** producer throughput. Draining with
+  `get_nowait` and arming the heartbeat timer only when the queue is empty took
+  1-subscriber throughput from ~64% to ~87% of the 0-subscriber rate (+43%),
+  and 4-subscriber from ~36% to ~69% (+104%). `drops` must stay 0 at this load.
+* Per-session RAM is dominated by the conversation held in `_messages`
+  (~0.26 MB for a 400-message session); the loop itself is CPU-bound and flat
+  in conversation length.
+
 ### `bench_httpx_pool.py`
 **Question:** what's the cost of constructing a fresh `httpx.AsyncClient`
 per request vs sharing one module-globally?

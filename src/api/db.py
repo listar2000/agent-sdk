@@ -19,6 +19,45 @@ from .models import AgentConfig, AgentRecord, LogEntry, VolumeRecord
 
 log = logging.getLogger(__name__)
 
+# Fast JSON serialization for hot write paths. psycopg adapts a ``Json`` param by
+# calling ``dumps`` INLINE during ``execute`` — on the event-loop thread, holding
+# the GIL — so stdlib ``json.dumps`` blocks every other session on the replica for
+# the duration. That hurts most on the per-turn native checkpoint (full transcript,
+# native only) but also on the per-event ``session_log`` write, which EVERY provider
+# (docker/daytona/modal/native) does through ``log_event`` / the batcher. orjson is
+# ~3-5× faster; we wrap it to return ``str`` (it emits ``bytes``) since ``Json``
+# re-encodes. Optional: fall back to stdlib so a deploy without orjson still works
+# (the import guard makes it a soft dep).
+try:
+    import orjson as _orjson
+
+    def _fast_dumps(obj) -> str:
+        # orjson is stricter than stdlib (it rejects non-str dict keys that
+        # json.dumps coerces, and a few exotic types). This serializer feeds
+        # DURABILITY writes (the native checkpoint, session_log), so it must
+        # never be LESS robust than the stdlib it replaced: fall back to
+        # json.dumps for anything orjson rejects, so a payload shape can't turn a
+        # speedup into a dropped checkpoint / lost log row. (orjson stays the fast
+        # common path — and for NaN/Infinity it's actually MORE correct, emitting
+        # null vs stdlib's PG-invalid `NaN`.)
+        try:
+            return _orjson.dumps(obj).decode()
+        except Exception:
+            return json.dumps(obj)
+except ImportError:  # pragma: no cover - orjson is a declared dep; guard for safety
+    _orjson = None
+    _fast_dumps = json.dumps
+
+
+def _FastJson(obj) -> Json:
+    """A ``Json`` param serialized with orjson when available (else stdlib).
+
+    Byte-equivalence isn't required: the column is JSONB, which Postgres parses
+    and stores in its own normalized binary form — orjson's UTF-8 output and
+    stdlib's ``ensure_ascii`` escaping decode to the identical value. Use only
+    for native-JSON payloads (dict/list/str/int/float/bool/None)."""
+    return Json(obj, dumps=_fast_dumps)
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/agent_sdk_server")
 
 _PG_SCHEMA = [
@@ -687,7 +726,7 @@ async def log_event(*, session_id: str, agent_id: str,
     await _exec(
         "INSERT INTO session_log (session_id, agent_id, event_type, payload)"
         " VALUES (%s, %s, %s, %s)",
-        (session_id, agent_id, event_type, Json(payload)),
+        (session_id, agent_id, event_type, _FastJson(payload)),
     )
 
 
@@ -1020,19 +1059,26 @@ async def write_native_checkpoint(*, session_id: str, turn_seq: int,
     correctness. Upsert on (session_id, turn_seq) makes the retry path
     after a recovery swap idempotent. Prunes rows older than ``keep_last``
     turns in the same call so storage stays O(keep_last) per session.
+
+    The upsert and the prune ride a SINGLE statement (the upsert as a
+    data-modifying CTE, which Postgres always executes to completion) — one
+    round-trip per turn instead of two, on the turn-completion critical path
+    that TurnRunner awaits before finalizing. The DELETE sees the pre-statement
+    snapshot, so it never targets the just-written row (its turn_seq is above
+    the prune threshold regardless).
     """
     async with get_db() as conn:
         await conn.execute(
-            "INSERT INTO native_transcripts (session_id, turn_seq, messages, usage)"
+            "WITH upsert AS ("
+            " INSERT INTO native_transcripts (session_id, turn_seq, messages, usage)"
             " VALUES (%s, %s, %s, %s)"
             " ON CONFLICT (session_id, turn_seq)"
-            " DO UPDATE SET messages = EXCLUDED.messages, usage = EXCLUDED.usage",
-            (session_id, turn_seq, Json(messages), Json(usage or {})),
-        )
-        await conn.execute(
-            "DELETE FROM native_transcripts"
+            " DO UPDATE SET messages = EXCLUDED.messages, usage = EXCLUDED.usage"
+            ")"
+            " DELETE FROM native_transcripts"
             " WHERE session_id = %s AND turn_seq <= %s",
-            (session_id, turn_seq - keep_last),
+            (session_id, turn_seq, _FastJson(messages), _FastJson(usage or {}),
+             session_id, turn_seq - keep_last),
         )
 
 

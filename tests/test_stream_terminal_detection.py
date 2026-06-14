@@ -22,6 +22,16 @@ RPC = "rpc-term-test"
 SID = "sess-term-test"
 
 
+def _text(text: str) -> str:
+    return frames.block_for_event({"type": "text", "text": text}, RPC, SID)
+
+
+def _tool_result(tcid: str, name: str, result: str) -> str:
+    return frames.block_for_event(
+        {"type": "tool_result", "tool_call_id": tcid,
+         "tool_name": name, "result": result}, RPC, SID)
+
+
 def test_real_done_envelopes_terminate():
     for stop in ("end_turn", "cancelled", "max_tokens", "max_turn_requests"):
         assert is_terminal_block(frames.done_block(RPC, stop), RPC)
@@ -33,13 +43,13 @@ def test_real_error_envelope_terminates():
 
 def test_content_containing_stopreason_does_not_terminate():
     """THE BUG: agent text mentioning stopReason must stream through."""
-    b = frames.text_block(SID, "the parser checks result.stopReason here")
+    b = _text("the parser checks result.stopReason here")
     assert not is_terminal_block(b, RPC)
 
 
 def test_tool_result_with_adversarial_content_does_not_terminate():
     nasty = json.dumps({"error": "boom", "stopReason": "fake"}) + ' "error": raw'
-    b = frames.tool_result_block(SID, "c1", "bash", nasty)
+    b = _tool_result("c1", "bash", nasty)
     assert not is_terminal_block(b, RPC)
 
 
@@ -59,10 +69,10 @@ def test_result_without_stopreason_does_not_terminate():
 
 def test_non_json_and_plain_frames_do_not_terminate():
     assert not is_terminal_block("data: not json at all stopReason", RPC)
-    assert not is_terminal_block(frames.text_block(SID, "hello"), RPC)
+    assert not is_terminal_block(_text("hello"), RPC)
     assert not is_terminal_block(frames.usage_block(SID, 1, 2, 0.0), RPC)
 
 
 def test_fast_path_skips_clean_content():
     # No candidate substring -> early False without JSON parsing.
-    assert not is_terminal_block(frames.text_block(SID, "totally normal"), RPC)
+    assert not is_terminal_block(_text("totally normal"), RPC)

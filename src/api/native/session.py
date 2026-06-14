@@ -134,7 +134,16 @@ class NativeSession(BaseSandboxSession):
             try:
                 await self._transport.hibernate()
             except Exception:
+                # A failed hibernate leaves the sandbox RUNNING — paid compute
+                # that was never freed. Count it as a leak (best-effort; the
+                # reporter never raises) so /metrics sees native leaks like the
+                # supervisor path's reap-release failures, not just a log line.
                 log.exception("native: hibernate failed for %s", self.session_id)
+                from api.metrics import get_metrics
+                await get_metrics().record_leak(
+                    "native_hibernate_failed",
+                    provider=getattr(self.state, "provider", "docker"),
+                    session_id=self.session_id)
 
     async def shutdown(self) -> None:
         """In-memory teardown only — must NOT destroy compute (release()
@@ -156,8 +165,15 @@ class NativeSession(BaseSandboxSession):
         try:
             await self._reattach_transport(provider, ref).destroy()
         except Exception:
+            # A failed hard-delete ORPHANS the sandbox — a paid idle daytona/
+            # modal VM (or docker container) leaking until the boot reconciler
+            # reclaims it. Count it as a leak so it surfaces on /metrics.
             log.exception("native: destroy failed for %s ref=%s",
                           self.session_id, ref)
+            from api.metrics import get_metrics
+            await get_metrics().record_leak(
+                "native_destroy_failed", provider=provider,
+                session_id=self.session_id)
         self._transport = None
 
     # ── liveness: the session object is the runtime ─────────────────────────
@@ -195,10 +211,22 @@ class NativeSession(BaseSandboxSession):
         queue: asyncio.Queue = asyncio.Queue()
 
         async def emit(event: dict) -> None:
+            # Every native prompt turn is driven through
+            # ``_execute_and_stream_sse_for`` (server.py), which
+            # ``register_subscriber()`` BEFORE driving the turn — for BOTH
+            # /message (fire-and-forget, drains+discards) and /message+stream.
+            # So there is always ≥1 subscriber when emit runs and the block is
+            # always consumed; synthesizing it unconditionally is correct. (An
+            # earlier change gated this on ``self._subscribers`` — a no-op on the
+            # prompt path and reverted; the broadcast IS the SSE response.)
             block = frames.block_for_event(event, rpc_id, self.session_id)
             self._broadcast((rpc_id, block))
             self.liveness.observe_chunk()
-            await queue.put(event)
+            # Unbounded SPSC queue: put_nowait never raises QueueFull, and on an
+            # unbounded queue ``await queue.put`` never suspends anyway — so the
+            # nowait form is behavior-identical and skips the put() coroutine
+            # frame, one of the hottest per-event costs on the streaming path.
+            queue.put_nowait(event)
 
         async def _drive() -> None:
             try:
@@ -229,13 +257,20 @@ class NativeSession(BaseSandboxSession):
                 await emit({"type": "error", "text": str(e)[:500],
                             "kind": type(e).__name__})
             finally:
-                await queue.put(_SENTINEL)
+                queue.put_nowait(_SENTINEL)
 
         task = asyncio.create_task(_drive())
         self._active_task = task
         try:
             while True:
-                item = await queue.get()
+                # Drain ready events with get_nowait (no get() coroutine frame);
+                # only await when the queue is genuinely empty. Same pattern as
+                # iterate_subscriber. The queue + _drive task structure is
+                # unchanged, so cancel_active_prompt/interrupt semantics hold.
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    item = await queue.get()
                 if item is _SENTINEL:
                     break
                 yield item
@@ -251,15 +286,30 @@ class NativeSession(BaseSandboxSession):
 
     # ── internals ───────────────────────────────────────────────────────────
 
+    #: Checkpoint write attempts on transient DB failure. The write is an
+    #: idempotent upsert on (session_id, turn_seq), so a retry can't double-apply
+    #: — and a checkpoint that never lands silently rewinds the conversation on
+    #: the next resume, so a connection blip / deadlock shouldn't lose the turn.
+    _CHECKPOINT_ATTEMPTS = 3
+
     async def _checkpoint(self, usage: dict) -> None:
         from api import db as _db
-        try:
-            await _db.write_native_checkpoint(
-                session_id=self.session_id, turn_seq=self._turn_seq,
-                messages=self._messages, usage=usage or {})
-        except Exception:
-            log.exception("native checkpoint write failed for %s",
-                          self.session_id)
+        for attempt in range(self._CHECKPOINT_ATTEMPTS):
+            try:
+                await _db.write_native_checkpoint(
+                    session_id=self.session_id, turn_seq=self._turn_seq,
+                    messages=self._messages, usage=usage or {})
+                return
+            except Exception:
+                if attempt + 1 >= self._CHECKPOINT_ATTEMPTS:
+                    # Durable failure after retries — the turn won't survive a
+                    # resume. log.exception is bridged to error_events (provider
+                    # native), so this surfaces on /admin/errors, not just stderr.
+                    log.exception(
+                        "native checkpoint write failed (durable, %d attempts) "
+                        "for %s", self._CHECKPOINT_ATTEMPTS, self.session_id)
+                    return
+                await asyncio.sleep(0.05 * (attempt + 1))
 
     # ── sandbox: lazy provisioning + server exec/file routing ───────────────
 
@@ -325,6 +375,12 @@ class NativeSession(BaseSandboxSession):
 
             provider = getattr(self.state, "provider", "docker")
             ref = getattr(self.state, "sandbox_ref", None)
+            # Native provisions compute HERE (lazily), not in the pool's
+            # timed_op around start() — so without this the /admin/ops dashboard
+            # is blind to native sandbox create/resume latency + flakiness.
+            # Record the same ops the supervisor path does (best-effort; the
+            # reporter never raises into the caller).
+            from api.metrics import get_metrics as _metrics
 
             # RESUME: a prior provision left a hibernated (stopped) or
             # still-running sandbox. ONE status() classifies it — reattach +
@@ -351,7 +407,10 @@ class NativeSession(BaseSandboxSession):
                     #    wedges the session (every later prompt re-raises) while
                     #    LEAKING the dead VM. Catch it and fall through.
                     try:
-                        await t.resume()
+                        async with _metrics().timed_op(
+                                provider=provider, operation="resume",
+                                session_id=self.session_id):
+                            await t.resume()
                     except Exception:
                         log.warning("native: resume failed for sandbox %s; "
                                     "destroying + recreating", ref[:12])
@@ -383,10 +442,19 @@ class NativeSession(BaseSandboxSession):
                 except Exception:
                     pass
 
-            t = await self._create_transport(provider)
+            # cold_create = a fresh first provision; cold_recover = recreate
+            # after a dead/missing ref or a SandboxGoneError swap (``replace``)
+            # — the silent auto-heal the recovery dashboard counts.
+            op = "cold_recover" if (ref or replace is not None) else "cold_create"
+            async with _metrics().timed_op(
+                    provider=provider, operation=op, session_id=self.session_id):
+                t = await self._create_transport(provider)
             self._transport = t
             self.state.sandbox_ref = t.ref
             await self._persist_state()
+            if op == "cold_recover":
+                await _metrics().record_recovery(
+                    op, provider=provider, session_id=self.session_id)
             return t
 
     def _reattach_transport(self, provider: str, ref: str):

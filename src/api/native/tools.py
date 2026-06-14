@@ -36,9 +36,14 @@ class Tool:
     parameters: dict          # JSON schema for the function's args
     invoke: Callable[[Any, dict], Awaitable[str]]  # (transport, args) -> result
 
-    @property
-    def schema(self) -> dict:
-        return {
+    def __post_init__(self) -> None:
+        # Precompute the (immutable) OpenAI/LiteLLM function schema once at
+        # construction. ``run_turn`` reads ``t.schema`` for every tool on every
+        # turn; rebuilding the nested dict each time is pure GC churn. Safe to
+        # share one dict across turns: run_turn already reuses ONE schema list
+        # across every model round of a turn, so the provider doesn't mutate it
+        # (a destructive mutation would break multi-round tool turns today).
+        self.schema = {
             "type": "function",
             "function": {
                 "name": self.name,
