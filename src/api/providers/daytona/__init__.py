@@ -597,13 +597,24 @@ async def _daytona_sandbox_op(instance: ProviderInstance, op: str) -> None:
             # daytona's index). Bounded to 60s; if it doesn't go in that
             # window, log a warning and let the caller proceed — daytona
             # will eventually clean up.
+            #
+            # Exponential backoff on the confirm interval: each probe is a
+            # control-plane GET, and the control plane is daytona's scaling
+            # ceiling. A fixed 0.5s poll burns ~20-120 GETs per delete; deletes
+            # fire per session-lifecycle AND on every recovery cleanup
+            # (reattach-fallback, fresh-create teardown), so under churn that
+            # floods the very bottleneck. Backoff (0.5s →×1.5→ 5s cap) keeps
+            # the same 60s budget with ~6x fewer GETs; confirm latency grows by
+            # at most one interval (<=5s), negligible vs the 10-30s teardown.
             deadline = asyncio.get_running_loop().time() + 60.0
+            delay = 0.5
             while asyncio.get_running_loop().time() < deadline:
                 try:
                     await daytona.get(instance.sandbox_ref)
                 except Exception:
                     break  # get() raised → sandbox is gone
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.5, 5.0)
             else:
                 log.warning(
                     "daytona delete confirm timeout for %s (still in"
