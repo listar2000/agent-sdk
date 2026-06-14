@@ -716,6 +716,7 @@ def _evict_sandbox_handle(ref: str | None) -> None:
         _SANDBOX_HANDLE_CACHE.pop(ref, None)
 
 
+@timed_provider_op("modal", "status")
 async def get_sandbox_status(ref: str) -> str:
     """Map Modal sandbox state to the provider-agnostic vocabulary.
 
