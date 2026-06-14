@@ -187,6 +187,9 @@ async def test_modal_create_sandbox_runs_pre_start_before_supervisor_exec(monkey
             assert timeout == 60
             return {9100: SimpleNamespace(url="https://modal-unit.test")}
 
+        def set_tags(self, tags):
+            pass
+
         def terminate(self):
             raise AssertionError("healthy startup should not terminate sandbox")
 
@@ -268,6 +271,9 @@ async def test_modal_create_sandbox_reports_pre_start_failure(monkeypatch):
 
         def tunnels(self, _timeout):
             return {9100: SimpleNamespace(url="https://modal-unit.test")}
+
+        def set_tags(self, tags):
+            pass
 
         def exec(self, *args, timeout=None):
             class P:
