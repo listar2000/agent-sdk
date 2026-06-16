@@ -45,6 +45,12 @@
   .muted { color: var(--muted); }
   .empty { color: var(--muted); padding: 16px; text-align: center; }
   .err { color: #ffb4c4; font-size: 12px; }
+  /* per-operation error-rate sparkline OVER TIME (one per row + per op-group header) */
+  .spark { display: inline-block; width: 64px; height: 16px; vertical-align: middle; margin-right: 7px; background: #F6F8FA; border-radius: 3px; }
+  .spark.empty { opacity: .4; }
+  /* errors-over-time graph */
+  .graph svg { display: block; width: 100%; height: 96px; }
+  .graph .axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 3px; }
 </style>
 </head>
 <body>
@@ -69,6 +75,11 @@
   </div>
 
   <div class="grid" id="cards"></div>
+
+  <div class="panel graph">
+    <h2>Errors over time</h2>
+    <div id="errGraph"><div class="muted">loading…</div></div>
+  </div>
 
   <div class="row-flex">
     <div class="panel" style="flex:1; min-width:240px"><h2>Errors by category</h2><div class="chips" id="byCategory"></div></div>
@@ -108,6 +119,66 @@ function catPill(c) {
   return `<span class="pill ${cls}">${c || "—"}</span>`;
 }
 
+// Per-operation error-rate sparkline OVER TIME. ``s`` = {n:[...], fails:[...]}
+// (from /metrics ops_timeseries) — one mini bar per time bucket, height ∝ the
+// bucket's fail rate (fails/n), severity-colored; a bucket with no calls is a
+// faint baseline tick (a gap in activity, not a 0% success).
+function opSpark(s, t0, bucketS) {
+  if (!s || !s.n || !s.n.length) return '<span class="spark empty"></span>';
+  const n = s.n, f = s.fails, len = n.length, W = 64, H = 16, bw = W / len;
+  let bars = "";
+  for (let i = 0; i < len; i++) {
+    const x = (i * bw).toFixed(1), bww = Math.max(0.6, bw - 0.6).toFixed(1);
+    if (!n[i]) { bars += `<rect x="${x}" y="${H - 1}" width="${bww}" height="1" fill="#DDE3E9"/>`; continue; }
+    const rate = f[i] / n[i];
+    const h = rate > 0 ? Math.max(2, rate * (H - 2)) : 1.4;
+    const col = rate >= 0.20 ? '#E01E5A' : (rate >= 0.05 ? '#ECB22E' : (rate > 0 ? '#E8912D' : '#9FCBA8'));
+    let tip = (rate * 100).toFixed(0) + "% fail (" + f[i] + "/" + n[i] + ")";
+    if (t0 != null) tip = new Date((t0 + (i + 0.5) * bucketS) * 1000).toLocaleTimeString(undefined, { hour12: false }) + " · " + tip;
+    bars += `<rect x="${x}" y="${(H - h).toFixed(1)}" width="${bww}" height="${h.toFixed(1)}" fill="${col}"><title>${tip}</title></rect>`;
+  }
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${bars}</svg>`;
+}
+
+// Aggregate sparkline for an op group: element-wise sum of its providers' series.
+function aggSpark(rows, ts) {
+  const b = (ts && ts.buckets) || 0;
+  if (!b) return '<span class="spark empty"></span>';
+  const n = new Array(b).fill(0), f = new Array(b).fill(0);
+  for (const o of rows) {
+    const s = ts.series[(o.provider || '') + '\t' + o.operation];
+    if (!s) continue;
+    for (let i = 0; i < b; i++) { n[i] += s.n[i] || 0; f[i] += s.fails[i] || 0; }
+  }
+  return opSpark({ n, fails: f }, ts.t0, ts.bucket_s);
+}
+
+// SVG bar chart of errors per time bucket (errors.timeseries from /metrics).
+function renderErrGraph(ts) {
+  const el = $("errGraph");
+  const counts = (ts && ts.counts) || [];
+  if (!counts.length) { el.innerHTML = '<div class="muted">no error data in window 🎉</div>'; return; }
+  const n = counts.length, max = Math.max(1, ...counts), total = counts.reduce((a, b) => a + b, 0);
+  const W = 1000, H = 96, base = H - 14, top = 6, bw = W / n;
+  let bars = "";
+  for (let i = 0; i < n; i++) {
+    const c = counts[i];
+    const h = c ? Math.max(2, (c / max) * (base - top)) : 0;
+    const x = i * bw, y = base - h;
+    const tms = (ts.t0 + (i + 0.5) * ts.bucket_s) * 1000;
+    const tip = new Date(tms).toLocaleString(undefined, { hour12: false }) + " · " + c + " error" + (c === 1 ? "" : "s");
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(0.5, bw - 1).toFixed(1)}" ` +
+            `height="${h.toFixed(1)}" rx="1" fill="${c ? '#E01E5A' : '#EDF0F3'}"><title>${tip}</title></rect>`;
+  }
+  const t0 = new Date(ts.t0 * 1000).toLocaleTimeString(undefined, { hour12: false });
+  const t1 = new Date((ts.t0 + ts.bucket_s * n) * 1000).toLocaleTimeString(undefined, { hour12: false });
+  el.innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+    `<line x1="0" y1="${base}" x2="${W}" y2="${base}" stroke="#D8DEE6" stroke-width="1"/>` +
+    bars + `</svg>` +
+    `<div class="axis"><span>${t0}</span><span>${total} total · peak ${max}/bucket</span><span>${t1}</span></div>`;
+}
+
 async function load() {
   const win = $("window").value;
   $("winLabel").textContent = $("window").selectedOptions[0].text;
@@ -124,11 +195,14 @@ async function load() {
     card("Op kinds", (m.ops || []).length),
   ].join("");
 
+  renderErrGraph(m.errors.timeseries);
+
   $("byCategory").innerHTML = chips(m.errors.by_category, true);
   $("byRecovery").innerHTML = chips(m.recoveries.by_kind, false);
   $("byLeak").innerHTML = chips(m.leaks.by_kind, true);
 
   const ops = m.ops || [];
+  const opsTs = m.ops_timeseries || { series: {}, buckets: 0 };
   if (!ops.length) {
     $("ops").innerHTML = '<tr><td colspan="7" class="muted">no operations in window</td></tr>';
   } else {
@@ -145,7 +219,8 @@ async function load() {
       return `<tr><td style="padding-left:20px" class="muted">${o.operation}</td>` +
         `<td><b>${o.provider ?? "—"}</b></td><td>${o.count}</td>` +
         `<td>${o.fails ? '<b style="color:#E01E5A">' + o.fails + '</b>' : 0}</td>` +
-        `<td>${o.fail_rate > 0 ? '<b style="color:#E01E5A">' + fr + '</b>' : fr}</td>` +
+        `<td>${opSpark(opsTs.series[(o.provider || '') + '\t' + o.operation], opsTs.t0, opsTs.bucket_s)}` +
+        `<span style="${o.fail_rate > 0 ? 'color:#E01E5A;font-weight:700' : 'color:#9098A0'}">${fr}</span></td>` +
         `<td>${o.p50_ms ?? "—"}</td><td>${o.p95_ms ?? "—"}</td></tr>`;
     };
     $("ops").innerHTML = opNames.map(op => {
@@ -153,7 +228,7 @@ async function load() {
       const calls = rows.reduce((s, o) => s + o.count, 0);
       const fails = rows.reduce((s, o) => s + o.fails, 0);
       const hdr = `<tr><td colspan="7" style="background:#F2F6FB;font-weight:700;color:#1264A3;border-top:2px solid #D8DEE6">` +
-        `${op} <span class="muted" style="font-weight:400">· ${rows.length} provider${rows.length > 1 ? 's' : ''} · ${calls} calls` +
+        `${aggSpark(rows, opsTs)}${op} <span class="muted" style="font-weight:400">· ${rows.length} provider${rows.length > 1 ? 's' : ''} · ${calls} calls` +
         `${fails ? ' · <b style="color:#E01E5A">' + fails + ' fails</b>' : ''}</span></td></tr>`;
       return hdr + rows.map(row).join("");
     }).join("");

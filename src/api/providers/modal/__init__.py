@@ -41,7 +41,6 @@ from .._shared import (
     _MAX_OUTPUT_BYTES,
     _acp_launch_args,
     _build_env_prefix,
-    _truncate,
     _wait_for_health,
     build_supervisor_argv,
 )
@@ -88,6 +87,25 @@ _ORIGIN_TAG = "agent_sdk_origin"
 
 # Modal App name (shared across all agent-sdk sandboxes in the workspace).
 _APP_NAME = "agent-sdk"
+
+# Runaway guard on reconcile's sandbox listing — mirrors daytona's
+# ``_DAYTONA_MAX_ITEMS``. Bounds memory + the per-sandbox get_tags fan-out on a
+# huge account so boot reconcile can't stall.
+_MODAL_RECONCILE_MAX_ITEMS = int(
+    os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000")
+)
+
+# Runaway guard for the read-only orphan DETECTOR's per-sandbox tag scan.
+_DETECT_MAX_ITEMS = int(os.environ.get("AGENT_SDK_MODAL_MAX_ITEMS", "5000"))
+
+# get_sandbox_status retry budget. A transient control-plane blip (from_id /
+# SandboxWait is high-variance; poll is an RPC) must NOT classify a healthy
+# sandbox as "error" — the recovery path treats "error" as unrecoverable and
+# destroys + cold-recreates it (orphaning the live one). A definitive
+# SandboxMissingError still returns "missing" immediately (no retry); only
+# transient errors are retried before giving up.
+_STATUS_PROBE_ATTEMPTS = int(os.environ.get("AGENT_SDK_MODAL_STATUS_ATTEMPTS", "3"))
+_STATUS_PROBE_BACKOFF_S = float(os.environ.get("AGENT_SDK_MODAL_STATUS_BACKOFF_S", "0.25"))
 
 
 def _to_modal_resources(req: Any) -> dict[str, Any]:
@@ -143,9 +161,7 @@ async def _get_app():
     if _app is not None:
         return _app
     modal, _ = _require_modal()
-    _app = await asyncio.to_thread(
-        modal.App.lookup, _APP_NAME, create_if_missing=True,
-    )
+    _app = await modal.App.lookup.aio(_APP_NAME, create_if_missing=True)
     return _app
 
 
@@ -181,9 +197,10 @@ async def _get_image():
         snap_id = snapshot_tag.read_text().strip()
         if snap_id:
             try:
-                _image = await asyncio.to_thread(
-                    modal.Image.from_id, snap_id,
-                )
+                # ``Image.from_id`` is a lazy, non-IO constructor (like
+                # ``from_dockerfile`` / ``debian_slim`` below) — call it
+                # directly. Its ``.aio`` form is deprecated in modal 1.4.x.
+                _image = modal.Image.from_id(snap_id)
                 log.info(
                     "modal: using pre-built filesystem snapshot %s "
                     "(cold-create ~2s; rebuild via scripts/release_modal_snapshot.py)",
@@ -229,8 +246,9 @@ async def _get_volume(ref: str):
     for the create path.
     """
     modal, api_pb2 = _require_modal()
-    return await asyncio.to_thread(
-        modal.Volume.from_name,
+    # ``from_name`` is a lazy local constructor (no network until hydrate /
+    # first mount), so there's nothing to offload — call it directly.
+    return modal.Volume.from_name(
         ref,
         create_if_missing=False,
         version=api_pb2.VolumeFsVersion.VOLUME_FS_VERSION_V2,
@@ -248,8 +266,7 @@ async def create_volume(name: str) -> str:
     support the append semantics the agent filesystem needs.
     """
     modal, api_pb2 = _require_modal()
-    vol = await asyncio.to_thread(
-        modal.Volume.from_name,
+    vol = modal.Volume.from_name(
         name,
         create_if_missing=True,
         version=api_pb2.VolumeFsVersion.VOLUME_FS_VERSION_V2,
@@ -258,7 +275,7 @@ async def create_volume(name: str) -> str:
     # create-or-get RPC never fires and the volume isn't actually persisted
     # (a later ``Sandbox.create`` mount with create_if_missing=False then
     # 404s). Force the round-trip so the name is real before we return it.
-    await asyncio.to_thread(vol.hydrate)
+    await vol.hydrate.aio()
     log.info("modal volume %s created or adopted", name)
     return name
 
@@ -268,9 +285,7 @@ async def delete_volume(ref: str) -> None:
     modal, _ = _require_modal()
     # ``Volume.objects.delete(name=...)`` is the current API; ``Volume.delete``
     # still works but emits a DeprecationError at call time.
-    await asyncio.to_thread(
-        modal.Volume.objects.delete, ref, allow_missing=True,
-    )
+    await modal.Volume.objects.delete.aio(ref, allow_missing=True)
     log.info("modal volume %s removed", ref)
 
 
@@ -318,25 +333,22 @@ def _build_entrypoint_cmd(
     return "\n".join(lines)
 
 
-def _run_modal_exec_sync(sb: Any, cmd: str, timeout: int) -> tuple[int | None, str, str]:
-    # Match ``exec_in_sandbox``: use ``sh -c`` because slim images may not
-    # ship bash. Pass timeout to Modal's control plane so long pre-start
-    # installs are bounded server-side, then collect diagnostics.
-    proc = sb.exec("sh", "-c", cmd, timeout=timeout)
-    try:
-        rc = proc.wait()
-    except TypeError:
-        rc = proc.wait(timeout=timeout)
-    return rc, proc.stdout.read() or "", proc.stderr.read() or ""
-
-
 async def _exec_modal_shell(sb: Any, cmd: str, *, timeout: int) -> tuple[int | None, str, str]:
+    """Run ``cmd`` via ``sh -c`` (slim images may not ship bash) using modal's
+    async API. ``timeout`` is passed to Modal's control plane so long pre-start
+    installs are bounded server-side; stdout/stderr are collected as diagnostics
+    (the bringup output is small and expected in full, so no cap here)."""
     outer = timeout + 5
+
+    async def _run() -> tuple[int | None, str, str]:
+        proc = await sb.exec.aio("sh", "-c", cmd, timeout=timeout)
+        rc = await proc.wait.aio()
+        out = "".join([c async for c in proc.stdout])
+        err = "".join([c async for c in proc.stderr])
+        return rc, out, err
+
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_run_modal_exec_sync, sb, cmd, timeout),
-            timeout=outer,
-        )
+        return await asyncio.wait_for(_run(), timeout=outer)
     except asyncio.TimeoutError as e:
         preview = (cmd[:200] + "...") if len(cmd) > 200 else cmd
         raise RuntimeError(
@@ -406,27 +418,37 @@ async def create_sandbox(
         volume_ref, subpath, agent_type, resources,
     )
     res_kw = _to_modal_resources(resources)
-    sb = await asyncio.to_thread(
-        lambda: modal.Sandbox.create(
-            "sh", "-c", entrypoint,
-            app=app,
-            image=image,
-            volumes={_VOLUME_MOUNT: vol},
-            timeout=_SANDBOX_TIMEOUT_SEC,
-            idle_timeout=_SANDBOX_IDLE_TIMEOUT_SEC,
-            encrypted_ports=[_SUPERVISOR_CONTAINER_PORT],
-            **res_kw,
-        )
+    sb = await modal.Sandbox.create.aio(
+        "sh", "-c", entrypoint,
+        app=app,
+        image=image,
+        volumes={_VOLUME_MOUNT: vol},
+        timeout=_SANDBOX_TIMEOUT_SEC,
+        idle_timeout=_SANDBOX_IDLE_TIMEOUT_SEC,
+        encrypted_ports=[_SUPERVISOR_CONTAINER_PORT],
+        **res_kw,
     )
 
     try:
-        if sandbox_ref:
-            # Tags persist on the Modal side and drive reconcile_on_startup.
-            await asyncio.to_thread(sb.set_tags, {_TAG_KEY: sandbox_ref})
+        # ALWAYS tag — mirror create_bare_sandbox. supervisor_session creates
+        # WITHOUT passing sandbox_ref, so the old `if sandbox_ref:` gate left
+        # these sandboxes UNTAGGED: invisible to reconcile_on_startup (skips
+        # sandboxes with no _TAG_KEY) AND to cleanup_orphans.py (filters by
+        # _ORIGIN_TAG), so an orphan leaked until the 1h hard timeout. The
+        # object_id fallback keeps live sandboxes correctly matched — the pool
+        # stores object_id as state.sandbox_ref, so reconcile's live-ref check
+        # finds them.
+        origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+        await sb.set_tags.aio({
+            _TAG_KEY: sandbox_ref or sb.object_id,
+            _ORIGIN_TAG: origin,
+        })
 
         # Fetch the HTTPS tunnel URL. ``timeout`` here is the time Modal will
-        # spend waiting for the tunnel to become ready.
-        tunnels = await asyncio.to_thread(sb.tunnels, 60)
+        # spend waiting for the tunnel to become ready — async (``.aio``) so we
+        # don't hold a threadpool worker for up to 60s per concurrent create
+        # (the longest thread-hold on the modal create path).
+        tunnels = await sb.tunnels.aio(60)
         tun = tunnels.get(_SUPERVISOR_CONTAINER_PORT)
         if not tun:
             raise RuntimeError(
@@ -445,8 +467,8 @@ async def create_sandbox(
                     "tail -80 /tmp/agent-sdk-supervisor.log 2>&1 || true",
                     timeout=10,
                 )
-                out_tail = await asyncio.to_thread(sb.stdout.read)
-                err_tail = await asyncio.to_thread(sb.stderr.read)
+                out_tail = "".join([c async for c in sb.stdout])
+                err_tail = "".join([c async for c in sb.stderr])
                 log.warning(
                     "modal supervisor healthcheck failed. sandbox=%s supervisor_log=%s stdout=%s stderr=%s",
                     sb.object_id,
@@ -456,7 +478,7 @@ async def create_sandbox(
                 )
             except Exception:
                 pass
-            await asyncio.to_thread(sb.terminate)
+            await sb.terminate.aio()
             raise RuntimeError(
                 f"supervisor sandbox {sb.object_id} failed health check at {url}"
             )
@@ -475,7 +497,7 @@ async def create_sandbox(
     except BaseException:
         # Best-effort cleanup on any failure path.
         try:
-            await asyncio.to_thread(sb.terminate)
+            await sb.terminate.aio()
         except Exception:
             pass
         raise
@@ -548,24 +570,26 @@ async def create_bare_sandbox(
     log.info("modal create_bare_sandbox (native): volume=%s subpath=%s root=%s",
              volume_ref, subpath, root)
     res_kw = _to_modal_resources(resources)
-    sb = await asyncio.to_thread(
-        lambda: modal.Sandbox.create(
-            "sh", "-c", entrypoint,
-            app=app,
-            image=image,
-            volumes={_VOLUME_MOUNT: vol},
-            timeout=_SANDBOX_TIMEOUT_SEC,
-            # idle_timeout == hard timeout (not the supervisor's shorter
-            # _SANDBOX_IDLE_TIMEOUT_SEC): the bare path has NO tunnel, so
-            # modal's idle clock — documented to key off tunnel HTTP traffic —
-            # has no signal to reset and could reap an ACTIVE native session
-            # mid-tool-call. Native idle lifecycle is owned by the server's
-            # SessionPool reaper (which tracks exec activity and hibernates),
-            # so we disable modal's separate idle timer and keep only the hard
-            # ceiling as a backstop.
-            idle_timeout=_SANDBOX_TIMEOUT_SEC,
-            **res_kw,
-        )
+    # Async create (modal ``.aio``) — not asyncio.to_thread: Sandbox.create
+    # holds its thread for the ~2s scheduling wait, so a burst of native
+    # session starts (autoscale) would cap at the shared threadpool. Async
+    # frees the loop the same way the exec path does (#190).
+    sb = await modal.Sandbox.create.aio(
+        "sh", "-c", entrypoint,
+        app=app,
+        image=image,
+        volumes={_VOLUME_MOUNT: vol},
+        timeout=_SANDBOX_TIMEOUT_SEC,
+        # idle_timeout == hard timeout (not the supervisor's shorter
+        # _SANDBOX_IDLE_TIMEOUT_SEC): the bare path has NO tunnel, so
+        # modal's idle clock — documented to key off tunnel HTTP traffic —
+        # has no signal to reset and could reap an ACTIVE native session
+        # mid-tool-call. Native idle lifecycle is owned by the server's
+        # SessionPool reaper (which tracks exec activity and hibernates),
+        # so we disable modal's separate idle timer and keep only the hard
+        # ceiling as a backstop.
+        idle_timeout=_SANDBOX_TIMEOUT_SEC,
+        **res_kw,
     )
     origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
     try:
@@ -577,7 +601,7 @@ async def create_bare_sandbox(
         #    are never mis-reaped.
         #  - agent_sdk_origin: lets cleanup_orphans.py (_reap_modal) isolate
         #    test residue from production, matching the docker/daytona label.
-        await asyncio.to_thread(sb.set_tags, {
+        await sb.set_tags.aio({
             _TAG_KEY: sandbox_ref or sb.object_id,
             _ORIGIN_TAG: origin,
         })
@@ -595,7 +619,7 @@ async def create_bare_sandbox(
         )
     except BaseException:
         try:
-            await asyncio.to_thread(sb.terminate)
+            await sb.terminate.aio()
         except Exception:
             pass
         raise
@@ -619,16 +643,25 @@ def _is_missing_err(msg: str) -> bool:
 
 
 async def _lookup_sandbox(ref: str):
-    """Return a Modal ``Sandbox`` by id or raise ``SandboxMissingError``."""
+    """Return a Modal ``Sandbox`` by id or raise ``SandboxMissingError``.
+
+    Uses modal's async ``from_id.aio`` (not ``asyncio.to_thread``): from_id
+    (a ``SandboxWait`` RPC, high-variance) is on the exec / status / recovery
+    hot paths, so threading it competed for the shared default threadpool
+    (~min(32, cpu+4) workers). Async removes that ceiling — measured ~1.3x at
+    40 concurrent lookups. Completes the modal exec path's async-ification
+    (#190 made exec/wait/read async; this drops its last to_thread).
+    """
     modal, _ = _require_modal()
     try:
-        return await asyncio.to_thread(modal.Sandbox.from_id, ref)
+        return await modal.Sandbox.from_id.aio(ref)
     except Exception as e:
         if _is_missing_err(str(e)):
             raise SandboxMissingError(f"modal sandbox {ref} not found") from e
         raise
 
 
+@timed_provider_op("modal", "status")
 async def get_sandbox_status(ref: str) -> str:
     """Map Modal sandbox state to the provider-agnostic vocabulary.
 
@@ -638,23 +671,30 @@ async def get_sandbox_status(ref: str) -> str:
     """
     if not ref:
         return "missing"
-    try:
-        sb = await _lookup_sandbox(ref)
-    except SandboxMissingError:
-        return "missing"
-    except Exception as e:
-        log.warning("modal get_sandbox_status %s: %s", ref, e)
-        return "error"
-    try:
-        rc = await asyncio.to_thread(sb.poll)
-    except Exception as e:
-        log.warning("modal poll %s: %s", ref, e)
-        return "error"
-    if rc is None:
-        return "running"
-    # Returncode is set — sandbox has exited. Modal records linger briefly
-    # after exit; treat as 'missing' so the server doesn't try to resume.
-    return "missing"
+    last_err: Exception | None = None
+    for attempt in range(_STATUS_PROBE_ATTEMPTS):
+        try:
+            sb = await _lookup_sandbox(ref)
+            rc = await sb.poll.aio()
+            if rc is None:
+                return "running"
+            # Returncode is set — sandbox has exited. Modal records linger
+            # briefly after exit; treat as 'missing' so the server doesn't
+            # try to resume.
+            return "missing"
+        except SandboxMissingError:
+            return "missing"  # definitive — the record is gone, don't retry
+        except Exception as e:
+            # Transient (network / SandboxWait blip / poll RPC error): retry
+            # before declaring "error", which would destroy a healthy sandbox.
+            last_err = e
+            if attempt + 1 < _STATUS_PROBE_ATTEMPTS:
+                await asyncio.sleep(_STATUS_PROBE_BACKOFF_S * (attempt + 1))
+    log.warning(
+        "modal get_sandbox_status %s: error after %d attempts: %s",
+        ref, _STATUS_PROBE_ATTEMPTS, last_err,
+    )
+    return "error"
 
 
 @timed_provider_op("modal", "start")
@@ -682,7 +722,7 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
         log.info("modal stop: sandbox %s already gone", sid)
         return
     try:
-        await asyncio.to_thread(sb.terminate)
+        await sb.terminate.aio()
         log.info("modal sandbox stopped (terminated): %s", sid)
     except Exception as e:
         log.warning("modal stop %s: %s", sid, e)
@@ -713,7 +753,7 @@ async def resolve_supervisor_url(sandbox_ref: str) -> str | None:
     except SandboxMissingError:
         return None
     try:
-        tunnels = await asyncio.to_thread(sb.tunnels, 60)
+        tunnels = await sb.tunnels.aio(60)
     except Exception as e:
         log.warning("modal resolve_supervisor_url: tunnels(%s) failed: %s",
                     sandbox_ref, e)
@@ -726,37 +766,60 @@ async def resolve_supervisor_url(sandbox_ref: str) -> str | None:
 # Exec helper (used by the package-level ``exec_in_instance`` dispatch)
 # ---------------------------------------------------------------------------
 
+async def _read_stream_capped_async(stream, cap: int) -> tuple[str, bool]:
+    """Async-iterate a Modal exec output stream, bounding peak RAM to ~``cap``.
+
+    ``StreamReader.read()`` fetches the ENTIRE stream until EOF — a huge-output
+    command would buffer all of it in server RAM before truncation. We iterate
+    and stop the moment output exceeds ``cap``, so peak RAM is ``cap`` + one
+    chunk. ``aclose`` releases the underlying generator after an early break.
+    """
+    buf = bytearray()
+    try:
+        async for chunk in stream:
+            buf.extend(chunk.encode() if isinstance(chunk, str) else chunk)
+            if len(buf) > cap:
+                return buf[:cap].decode(errors="replace"), True
+        return buf.decode(errors="replace"), False
+    finally:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
+
+
 async def exec_in_sandbox(inst: ProviderInstance, cmd: str, timeout: int = 30) -> ExecResult:
     """Run ``cmd`` via ``sh -c`` inside the Modal sandbox.
 
-    Truncation and timeout semantics mirror the other providers'
-    ``_exec_subprocess`` helper: stdout/stderr capped at 1 MiB each, a
+    Fully ASYNC (modal's ``.aio`` API) — no ``asyncio.to_thread``, so concurrent
+    execs aren't capped by the shared threadpool (~min(32, cpu+4) workers).
+    Measured ~1.4x more throughput at 40 concurrent execs vs the sync path, and
+    larger on smaller boxes / under threadpool contention with other ops. Output
+    is capped at 1 MiB per stream WHILE reading (``_read_stream_capped_async``),
+    so a huge-output command never buffers its full output in server RAM. A
     timeout yields ``ExecResult(timed_out=True)``.
     """
     sid = inst.sandbox_ref or inst.container_id
     if not sid:
         raise RuntimeError("modal exec: no sandbox id on instance")
-    sb = await _lookup_sandbox(sid)
 
-    def _run():
-        p = sb.exec("sh", "-c", cmd)
-        try:
-            rc = p.wait(timeout=timeout)
-        except TypeError:
-            # Older SDKs don't accept timeout on wait(); fall back.
-            rc = p.wait()
-        out = p.stdout.read() or ""
-        err = p.stderr.read() or ""
-        return rc, out, err
+    async def _do_exec(sb):
+        p = await sb.exec.aio("sh", "-c", cmd)
+        # Inner bound = the command timeout (a hung command times out at
+        # ``timeout``, matching the old ``p.wait(timeout=timeout)``).
+        rc = await asyncio.wait_for(p.wait.aio(), timeout=timeout)
+        out_s, out_trunc = await _read_stream_capped_async(p.stdout, _MAX_OUTPUT_BYTES)
+        err_s, err_trunc = await _read_stream_capped_async(p.stderr, _MAX_OUTPUT_BYTES)
+        return rc, out_s, out_trunc, err_s, err_trunc
 
+    sb = await _lookup_sandbox(sid)  # SandboxMissingError propagates to recovery
+    # Outer bound = a safety net covering the output reads too.
     try:
-        rc, out, err = await asyncio.wait_for(
-            asyncio.to_thread(_run), timeout=timeout + 5,
+        rc, out_s, out_trunc, err_s, err_trunc = await asyncio.wait_for(
+            _do_exec(sb), timeout=timeout + 5,
         )
     except asyncio.TimeoutError:
         return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
-    out_s, out_trunc = _truncate(out.encode() if isinstance(out, str) else out, _MAX_OUTPUT_BYTES)
-    err_s, err_trunc = _truncate(err.encode() if isinstance(err, str) else err, _MAX_OUTPUT_BYTES)
     return ExecResult(
         stdout=out_s, stderr=err_s,
         exit_code=int(rc) if rc is not None else -1,
@@ -791,12 +854,17 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: modal unavailable: %s", e)
         return
 
-    # ``Sandbox.list`` is an async generator — iterate via to_thread helper.
-    def _list_sandboxes():
-        return list(modal.Sandbox.list(app_id=app.app_id))
-
+    # ``Sandbox.list.aio`` is an async generator — iterate it directly. Capped as
+    # a runaway guard so a huge account can't balloon memory. Origin scoping is
+    # the per-sandbox ``_ORIGIN_TAG`` check in the loop below: test and
+    # production share the Modal app, so the list returns both, but we never
+    # reap a foreign origin's sandbox.
+    sandboxes = []
     try:
-        sandboxes = await asyncio.to_thread(_list_sandboxes)
+        async for sb in modal.Sandbox.list.aio(app_id=app.app_id):
+            sandboxes.append(sb)
+            if len(sandboxes) >= _MODAL_RECONCILE_MAX_ITEMS:
+                break
     except Exception as e:
         log.warning("modal reconcile: list failed: %s", e)
         return
@@ -809,15 +877,28 @@ async def reconcile_on_startup() -> None:
         log.warning("modal reconcile: live-session query failed: %s", e)
         return
 
+    # Origin scope. Unlike daytona (whose reconcile LISTS only its own
+    # origin-labelled sandboxes), modal lists the WHOLE shared app — test /
+    # staging / production all resolve the same `agent-sdk` app — so we MUST
+    # filter by origin here, or a non-prod server's startup reconcile would
+    # terminate a LIVE production sandbox (whose ref isn't in this server's DB).
+    own_origin = os.environ.get("AGENT_SDK_ORIGIN", "production")
+
     for sb in sandboxes:
         try:
-            tags = await asyncio.to_thread(sb.get_tags)
+            tags = await sb.get_tags.aio()
         except Exception as e:
             log.warning("modal reconcile: get_tags %s: %s", sb.object_id, e)
             continue
-        sandbox_ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
+        if not isinstance(tags, dict):
+            continue
+        sandbox_ref_tag = tags.get(_TAG_KEY)
         if not sandbox_ref_tag:
             # Untagged — not ours or created before tagging was wired.
+            continue
+        if tags.get(_ORIGIN_TAG) != own_origin:
+            # Different origin (test vs production share the app) — never
+            # cross-reap; that origin's own reconcile handles it.
             continue
         # Modal tags also carry the modal sandbox object_id; the pool stores
         # whatever was passed to create_sandbox as state.sandbox_ref. Check
@@ -832,9 +913,70 @@ async def reconcile_on_startup() -> None:
                 sb.object_id, sandbox_ref_tag,
             )
             try:
-                await asyncio.to_thread(sb.terminate)
+                await sb.terminate.aio()
             except Exception as e:
                 log.warning("modal reconcile: terminate %s: %s", sb.object_id, e)
+
+
+async def detect_orphan_sandboxes(origin: str | None = None, live_refs=None) -> dict:
+    """List our-origin modal sandboxes and diff them against live session refs.
+
+    Pure DETECTION — never terminates. The modal counterpart to
+    ``daytona.detect_orphan_sandboxes`` so the orphan monitor can track modal
+    leaked compute too (a sandbox with no session row is leaked compute, e.g.
+    a recovery path that abandoned it, or the untagged-supervisor leak class).
+
+    ``origin`` defaults to ``AGENT_SDK_ORIGIN``. Like the reconcile, we list the
+    whole shared app and scope to our own origin so a non-prod monitor never
+    counts (or, in reconcile, reaps) another origin's live sandboxes.
+
+    Returns ``{"total_seen": int, "orphans": [(id, "")],
+    "state_hist": {}, "capped": bool}`` — same shape as the daytona detector
+    (state breakdown is omitted: modal state needs a per-sandbox poll() RPC,
+    not worth it for a read-only 30-min monitor; the orphan COUNT is the signal).
+    """
+    from collections import Counter
+
+    modal, _ = _require_modal()
+    app = await _get_app()
+    own = origin or os.environ.get("AGENT_SDK_ORIGIN", "production")
+
+    # Cap DURING iteration so a huge account can't balloon memory. Origin is
+    # scoped per-sandbox in the loop below (mirroring reconcile_on_startup): the
+    # list returns every origin's sandboxes since they share the app, and we
+    # only count our own.
+    sandboxes = []
+    async for sb in modal.Sandbox.list.aio(app_id=app.app_id):
+        sandboxes.append(sb)
+        if len(sandboxes) >= _DETECT_MAX_ITEMS:
+            break
+    capped = len(sandboxes) >= _DETECT_MAX_ITEMS
+
+    if live_refs is None:
+        from ... import db as dbmod
+        live_refs = await dbmod.live_sandbox_refs()
+
+    orphans: list[tuple[str, str]] = []
+    seen = 0
+    for sb in sandboxes:
+        try:
+            tags = await sb.get_tags.aio()
+        except Exception:
+            continue
+        ref_tag = tags.get(_TAG_KEY) if isinstance(tags, dict) else None
+        if not ref_tag:
+            continue  # untagged — not ours
+        if tags.get(_ORIGIN_TAG) != own:
+            continue  # different origin — not our leaked compute to count
+        seen += 1
+        if ref_tag not in live_refs and sb.object_id not in live_refs:
+            orphans.append((sb.object_id, ""))
+    return {
+        "total_seen": seen,
+        "orphans": orphans,
+        "state_hist": dict(Counter()),
+        "capped": capped,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -855,8 +997,8 @@ async def _run_volume_shell(
     if vol is None:
         vol = await _get_volume(ref)
 
-    def _run():
-        sb = modal.Sandbox.create(
+    async def _run():
+        sb = await modal.Sandbox.create.aio(
             "bash", "-c", shell,
             app=app,
             image=image,
@@ -864,29 +1006,32 @@ async def _run_volume_shell(
             timeout=max(timeout + 30, 120),
         )
         try:
-            sb.wait()
-            # sb.wait() returns None; the exit code lives on .returncode /
+            await sb.wait.aio()
+            # wait() returns None; the exit code lives on .returncode /
             # .poll() once the sandbox has finished. Default to -1 if the
             # sandbox somehow reports no code (shouldn't happen post-wait).
-            rc = sb.poll()
+            rc = await sb.poll.aio()
             if rc is None:
                 rc = sb.returncode
-            out = sb.stdout.read() or b""
-            err = sb.stderr.read() or b""
-            if isinstance(out, str):
-                out = out.encode()
-            if isinstance(err, str):
-                err = err.encode()
+            # Async-iterate both streams to a full read (the volume adapter
+            # needs the complete tree/file output, so this is unbounded by
+            # design — same as the prior sync ``stdout.read()``).
+            out = b"".join(
+                [c.encode() if isinstance(c, str) else c async for c in sb.stdout]
+            )
+            err = b"".join(
+                [c.encode() if isinstance(c, str) else c async for c in sb.stderr]
+            )
             return int(rc) if rc is not None else -1, out, err
         finally:
             try:
-                sb.terminate()
+                await sb.terminate.aio()
             except Exception:
                 pass
 
-    return await asyncio.wait_for(
-        asyncio.to_thread(_run), timeout=timeout + 120,
-    )
+    # The volume-op sandbox's own ``timeout`` (>= 120s, above) is the cleanup
+    # backstop; this wait_for guards against a hang in the SDK calls themselves.
+    return await asyncio.wait_for(_run(), timeout=timeout + 120)
 
 
 class ModalVolumeAdapter(ShellVolumeAdapter):

@@ -52,6 +52,33 @@ def test_agent_config_native_absent_stays_none():
     assert "native" not in c.to_dict()
 
 
+def test_native_config_knobs_flow_end_to_end_through_agentconfig():
+    """The native dict is opaque on purpose so loop knobs need no AgentConfig
+    migration — but only if AgentConfig preserves arbitrary keys through BOTH
+    from_dict AND the to_dict round-trip (the DB serialize path), and from_config
+    then reads them. Pins that for the runtime-control knobs (incl. the ones
+    added without an AgentConfig change): a regression here silently reverts a
+    configured agent to defaults."""
+    from api.native.loop import NativeAgentSpec
+
+    native = {"max_concurrent_tools": 16, "num_retries": 5, "max_turns": 7,
+              "instructions": "be brief", "tool_names": ["bash"]}
+    cfg = AgentConfig.from_dict({
+        "agent_type": "native",
+        "model": "openrouter/anthropic/claude-3.5-sonnet",
+        "native": dict(native),
+    })
+    # survives the DB serialize round-trip unchanged
+    back = AgentConfig.from_dict(cfg.to_dict())
+    assert back.native == native
+
+    spec = NativeAgentSpec.from_config(model=cfg.model, native=back.native)
+    assert spec.max_concurrent_tools == 16
+    assert spec.num_retries == 5
+    assert spec.max_turns == 7
+    assert spec.model == "openrouter/anthropic/claude-3.5-sonnet"
+
+
 # ── State variant ───────────────────────────────────────────────────────────
 
 def test_native_state_serialize_roundtrip():
@@ -106,6 +133,53 @@ def test_factory_dispatches_native_to_registered_class():
     finally:
         if saved is not None:
             factory.register("native", saved)
+
+
+# ── fast checkpoint JSON serialization (orjson, stdlib fallback) ────────────
+
+def test_fast_dumps_parses_identically_to_stdlib():
+    """``_fast_dumps`` (orjson when present) feeds the native checkpoint write.
+    The column is JSONB, so byte-equality isn't required — but the PARSED value
+    must equal stdlib's exactly across the shapes a transcript carries: unicode,
+    escapes, None, bools, floats, nested tool_calls. A divergence here would
+    silently corrupt a resumed conversation."""
+    import json
+    from api import db as dbmod
+
+    samples = [
+        [{"role": "system", "content": "sys"}],
+        [{"role": "user", "content": "héllo • 日本語 \" \\ \n\ttab"}],
+        [{"role": "assistant", "content": None,
+          "tool_calls": [{"id": "c1", "type": "function",
+                          "function": {"name": "bash",
+                                       "arguments": '{"command":"ls -la"}'}}]}],
+        [{"role": "tool", "tool_call_id": "c1", "content": "x" * 2000}],
+        [{"a": 1, "b": 1.5, "c": True, "d": False, "e": None,
+          "f": [1, 2, {"g": "h", "i": [None, "j"]}]}],
+    ]
+    for s in samples:
+        assert json.loads(dbmod._fast_dumps(s)) == s
+        assert json.loads(dbmod._fast_dumps(s)) == json.loads(json.dumps(s))
+
+
+def test_fast_dumps_is_always_callable_returning_str():
+    """The import guard must leave ``_fast_dumps`` defined and ``str``-returning
+    whether or not orjson is installed (Json re-encodes the str) — a deploy
+    without orjson must degrade, not crash the checkpoint write."""
+    from api import db as dbmod
+    out = dbmod._fast_dumps([{"role": "user", "content": "hi"}])
+    assert isinstance(out, str)
+
+
+def test_fast_dumps_falls_back_for_orjson_rejected_input():
+    """``_fast_dumps`` feeds DURABILITY writes (checkpoint, session_log), so it
+    must never be LESS robust than the stdlib json it replaced. orjson rejects
+    some inputs stdlib coerces — e.g. non-string dict keys — so the wrapper must
+    fall back, not let a payload shape crash the write. Pins that contract."""
+    import json
+    from api import db as dbmod
+    out = dbmod._fast_dumps({1: "a", 2: "b"})      # int keys: orjson raises
+    assert json.loads(out) == {"1": "a", "2": "b"}  # stdlib coerces → still valid
 
 
 # ── native_transcripts accessors (Postgres required; skips if absent) ──────

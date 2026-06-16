@@ -9,6 +9,8 @@ No live providers are exercised; translators are pure functions.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from api.sandbox.state import (
@@ -17,6 +19,31 @@ from api.sandbox.state import (
     parse_gpu,
     validate_resources_for_provider,
 )
+
+
+def _aio_prop(fn):
+    """A modal-style instance method exposing ``.aio`` (async). Use as a
+    ``@property`` so ``sb.method.aio(...)`` resolves to an async callable."""
+    async def _a(*a, **k):
+        return fn(*a, **k)
+    return SimpleNamespace(aio=_a)
+
+
+class _AioStream:
+    """Async-iterable stand-in for a modal sandbox/proc stdout|stderr stream
+    (``async for chunk in stream``)."""
+
+    def __init__(self, text: str = ""):
+        self._text = text
+
+    def __aiter__(self):
+        text = self._text
+
+        async def _gen():
+            if text:
+                yield text
+
+        return _gen()
 
 
 # ---------------------------------------------------------------------------
@@ -180,23 +207,33 @@ async def test_modal_create_sandbox_runs_pre_start_before_supervisor_exec(monkey
 
     class FakeSandbox:
         object_id = "sb-modal-unit"
-        stdout = SimpleNamespace(read=lambda: "")
-        stderr = SimpleNamespace(read=lambda: "")
+        stdout = _AioStream()
+        stderr = _AioStream()
 
-        def tunnels(self, timeout):
-            assert timeout == 60
-            return {9100: SimpleNamespace(url="https://modal-unit.test")}
+        @property
+        def set_tags(self):
+            return _aio_prop(lambda tags: None)
 
+        @property
+        def tunnels(self):
+            async def _aio(timeout):
+                assert timeout == 60
+                return {9100: SimpleNamespace(url="https://modal-unit.test")}
+            return SimpleNamespace(aio=_aio)
+
+        @property
         def terminate(self):
-            raise AssertionError("healthy startup should not terminate sandbox")
+            def _boom():
+                raise AssertionError("healthy startup should not terminate sandbox")
+            return _aio_prop(_boom)
 
-    class FakeSandboxFactory:
-        @staticmethod
-        def create(*args, **kwargs):
-            entrypoint = args[2]
-            assert args[:2] == ("sh", "-c")
-            captured_entrypoint.append(entrypoint)
-            return FakeSandbox()
+    async def _create_aio(*args, **kwargs):
+        entrypoint = args[2]
+        assert args[:2] == ("sh", "-c")
+        captured_entrypoint.append(entrypoint)
+        return FakeSandbox()
+
+    FakeSandboxFactory = SimpleNamespace(create=SimpleNamespace(aio=_create_aio))
 
     async def fake_get_app():
         return object()
@@ -263,27 +300,40 @@ async def test_modal_create_sandbox_reports_pre_start_failure(monkeypatch):
 
     class FakeSandbox:
         object_id = "sb-modal-fail"
-        stdout = SimpleNamespace(read=lambda: "")
-        stderr = SimpleNamespace(read=lambda: "")
+        stdout = _AioStream()
+        stderr = _AioStream()
 
-        def tunnels(self, _timeout):
-            return {9100: SimpleNamespace(url="https://modal-unit.test")}
+        @property
+        def set_tags(self):
+            return _aio_prop(lambda tags: None)
 
-        def exec(self, *args, timeout=None):
-            class P:
-                stdout = SimpleNamespace(read=lambda: "")
-                stderr = SimpleNamespace(read=lambda: "")
-                def wait(self, *a, **kw):
-                    return 1
-            return P()
+        @property
+        def tunnels(self):
+            async def _aio(_timeout):
+                return {9100: SimpleNamespace(url="https://modal-unit.test")}
+            return SimpleNamespace(aio=_aio)
 
+        @property
+        def exec(self):
+            async def _aio(*args, **kw):
+                # diagnostic tail exec (sh -c "tail ..."): a finished proc with
+                # empty streams; rc value is irrelevant to the health-fail path.
+                async def _wait():
+                    return 0
+                return SimpleNamespace(
+                    stdout=_AioStream(), stderr=_AioStream(),
+                    wait=SimpleNamespace(aio=_wait),
+                )
+            return SimpleNamespace(aio=_aio)
+
+        @property
         def terminate(self):
-            terminated.append(self.object_id)
+            return _aio_prop(lambda: terminated.append("sb-modal-fail"))
 
-    class FakeSandboxFactory:
-        @staticmethod
-        def create(*args, **kwargs):
-            return FakeSandbox()
+    async def _create_fail_aio(*args, **kwargs):
+        return FakeSandbox()
+
+    FakeSandboxFactory = SimpleNamespace(create=SimpleNamespace(aio=_create_fail_aio))
 
     async def fake_get_app():
         return object()
@@ -337,9 +387,10 @@ async def test_modal_create_volume_does_not_spawn_layout_sandbox(monkeypatch):
     class _FakeVolHandle:
         # create_volume now hydrates the lazy handle to force the create RPC
         # (Volume.from_name alone is lazy and never persists the volume). The
-        # fake exposes a no-op hydrate; it must still NOT spawn a sandbox.
+        # fake exposes a no-op hydrate.aio; it must still NOT spawn a sandbox.
+        @property
         def hydrate(self):
-            return None
+            return _aio_prop(lambda: None)
 
     class FakeVolume:
         @staticmethod

@@ -168,6 +168,123 @@ async def test_tool_call_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_usage_accumulates_across_tool_rounds():
+    """A tool turn runs ≥2 model rounds, each reporting its OWN usage chunk. The
+    turn's single terminal ``usage`` event must be the SUM across rounds —
+    token + cost accounting feeds billing, so a per-round overwrite/reset would
+    silently under-report (only the last round counted). test_text_only_turn
+    covers the single-round case; this pins the multi-round SUM."""
+    spec = NativeAgentSpec()
+    tools = build_toolset(["bash"])
+    transport = _FakeTransport()
+    msgs = [{"role": "user", "content": "run it"}]
+    events, result = await _collect(spec, msgs, tools, transport, [
+        # round 1: a tool call + this round's usage
+        [
+            _Chunk(_Delta(tool_calls=[_TCDelta(
+                0, id="c1", name="bash", arguments='{"command":"echo hi"}')])),
+            _Chunk(usage=_Usage(10, 5, 0.001)),
+        ],
+        # round 2: final text + this round's usage
+        [
+            _Chunk(_Delta(content="done")),
+            _Chunk(usage=_Usage(20, 8, 0.002)),
+        ],
+    ])
+    # exactly ONE usage event, emitted at turn-end, carrying the SUM
+    usage_events = [e for e in events if e["type"] == "usage"]
+    assert len(usage_events) == 1
+    u = usage_events[0]["usage"]
+    assert u["inputTokens"] == 30                      # 10 + 20
+    assert u["outputTokens"] == 13                     # 5 + 8
+    assert abs(u["totalCostUsd"] - 0.003) < 1e-9       # 0.001 + 0.002
+    # TurnResult carries the same accumulated total (what the session checkpoints)
+    assert result.usage["inputTokens"] == 30
+    assert result.usage["outputTokens"] == 13
+
+
+@pytest.mark.asyncio
+async def test_large_streamed_tool_arg_reassembles_and_is_subquadratic():
+    """A model streaming a big tool argument (e.g. write_file content) across
+    many small deltas must reassemble exactly — and accumulate in O(total), not
+    the O(total²) that repeated string ``+=`` cost. Both the correctness and the
+    scaling are pinned here: the arg fragments are split fine enough that an
+    O(n²) accumulation would blow the time budget."""
+    import json as _json
+    import time as _time
+
+    # ~100k tiny fragments of a 2.5MB argument — the worst case for repeated
+    # attribute ``+=`` (CPython's in-place str-concat optimization does NOT
+    # apply when the accumulator is held by an attribute, so it stays O(n²)).
+    big = "x" * 2_500_000
+    payload = _json.dumps({"path": "/big.txt", "content": big})
+    frag = 25
+    fragments = [payload[i:i + frag] for i in range(0, len(payload), frag)]
+    chunks = [_Chunk(_Delta(tool_calls=[_TCDelta(0, id="c1", name="write_file")]))]
+    chunks += [_Chunk(_Delta(tool_calls=[_TCDelta(0, arguments=f)]))
+               for f in fragments]
+
+    spec = NativeAgentSpec()
+    tools = build_toolset(["write_file"])
+    transport = _FakeTransport()
+    msgs = [{"role": "user", "content": "write it"}]
+
+    t0 = _time.perf_counter()
+    events, result = await _collect(spec, msgs, tools, transport, [
+        chunks, [_Chunk(_Delta(content="done"))],
+    ])
+    elapsed = _time.perf_counter() - t0
+
+    # exact reassembly: the tool saw the full content and wrote all the bytes
+    assert transport.files["/big.txt"] == big.encode()
+    # the persisted assistant tool_call carries the full argument string
+    assert result.messages[1]["tool_calls"][0]["function"]["arguments"] == payload
+    # O(total) accumulation drives this in ~60ms; the old attribute ``+=`` is
+    # O(total²) (~3s here) and misses the budget by a wide, non-flaky margin.
+    assert elapsed < 2.0, f"tool-arg accumulation too slow ({elapsed:.2f}s)"
+
+
+@pytest.mark.asyncio
+async def test_tool_args_joined_once_per_call(monkeypatch):
+    """run_turn needs each tool call's raw argument string in two places — the
+    persisted assistant message AND _parse_args — but ``c.args`` re-runs
+    ``"".join(arg_parts)`` (an O(content) copy) on every access. It must be read
+    ONCE per call and the result reused, never joined twice. This pins the
+    MECHANISM, not the outcome: reading ``c.args`` twice (the prior code) still
+    produces the right bytes, so only a join-count probe catches it. A
+    regression silently re-copies a large write_file ``content`` every round."""
+    from api.native import loop as _loop
+
+    joins = {"n": 0}
+    orig = _loop._ToolCallAccum.args.fget
+
+    def _counting(self):
+        joins["n"] += 1
+        return orig(self)
+
+    monkeypatch.setattr(_loop._ToolCallAccum, "args", property(_counting))
+
+    # two independent tool calls in ONE round (a parallel-tool round): each of
+    # the two accumulators must be joined exactly once → 2 total, not 4.
+    chunks = [
+        _Chunk(_Delta(tool_calls=[_TCDelta(0, id="c1", name="bash",
+                                           arguments='{"command": "ls"}')])),
+        _Chunk(_Delta(tool_calls=[_TCDelta(1, id="c2", name="bash",
+                                           arguments='{"command": "pwd"}')])),
+    ]
+    spec = NativeAgentSpec()
+    tools = build_toolset(["bash"])
+    transport = _FakeTransport()
+    msgs = [{"role": "user", "content": "go"}]
+    await _collect(spec, msgs, tools, transport, [
+        chunks, [_Chunk(_Delta(content="done"))],
+    ])
+    assert joins["n"] == 2, (
+        f"expected one args-join per tool call (2 calls → 2), got {joins['n']}"
+        " — run_turn is re-joining c.args instead of reusing the raw string")
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_returns_error_not_raise():
     spec = NativeAgentSpec()
     tools = build_toolset(["bash"])
@@ -254,6 +371,97 @@ def test_build_toolset_unknown_raises():
     assert set(build_toolset(None)) == {"bash", "read_file", "write_file", "edit_file"}
 
 
+def test_tool_schema_precomputed_and_correct():
+    """``Tool.schema`` is precomputed once (run_turn reads it per turn), so it's
+    the SAME object across accesses — a regression to a per-access property
+    (rebuilding the nested dict every turn = GC churn) fails the identity check.
+    The shape must still match the OpenAI/LiteLLM function-tool contract."""
+    bash = build_toolset(["bash"])["bash"]
+    assert bash.schema is bash.schema           # cached, not rebuilt per access
+    # toolset copies share the same singleton Tool, so the same schema object
+    assert build_toolset(None)["bash"].schema is bash.schema
+    s = bash.schema
+    assert s["type"] == "function"
+    assert s["function"]["name"] == "bash"
+    assert s["function"]["description"]
+    assert s["function"]["parameters"]["type"] == "object"
+    assert "command" in s["function"]["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_passes_num_retries_for_transient_resilience():
+    """The native loop asks LiteLLM to retry transient INITIAL-call failures
+    (rate limits / 5xx / connection resets) so a blip doesn't fail the whole
+    turn — default on (2), configurable, and 0 omits it (provider default)."""
+    captured = {}
+
+    async def completion(**kwargs):
+        captured.clear()
+        captured.update(kwargs)
+
+        async def _it():
+            yield _Chunk(_Delta(content="ok"))
+        return _it()
+
+    async def _emit(ev):
+        pass
+
+    msg = [{"role": "user", "content": "hi"}]
+
+    # default: num_retries=2 reaches the model call
+    await run_turn(NativeAgentSpec(), list(msg), {}, None, _emit,
+                   completion=completion)
+    assert captured.get("num_retries") == 2
+
+    # config override
+    spec = NativeAgentSpec.from_config(model=None, native={"num_retries": 5})
+    assert spec.num_retries == 5
+    await run_turn(spec, list(msg), {}, None, _emit, completion=completion)
+    assert captured.get("num_retries") == 5
+
+    # disabled: omitted entirely so LiteLLM's own default applies
+    await run_turn(NativeAgentSpec(num_retries=0), list(msg), {}, None, _emit,
+                   completion=completion)
+    assert "num_retries" not in captured
+
+
+def test_litellm_completion_sets_native_config():
+    """The native runtime must not egress litellm's anonymized usage telemetry
+    on every model call, must not spam stderr with its provider banner, and must
+    drop params an arbitrary model doesn't support (instead of failing the turn).
+    Resolving the real completion sets all three; it still returns acompletion."""
+    import litellm
+    from api.native.loop import _litellm_completion
+
+    # simulate litellm's shipped defaults
+    litellm.telemetry = True
+    litellm.suppress_debug_info = False
+    litellm.drop_params = False
+
+    fn = _litellm_completion()
+    assert fn is litellm.acompletion
+    assert litellm.telemetry is False
+    assert litellm.suppress_debug_info is True
+    assert litellm.drop_params is True
+
+
+def test_native_spec_clamps_misconfigured_loop_knobs():
+    """A misconfigured native agent gets sane floors: max_turns <= 0 → a silent
+    no-op turn; a negative num_retries goes straight to LiteLLM; a
+    max_concurrent_tools <= 0 makes asyncio.Semaphore raise."""
+    f = NativeAgentSpec.from_config
+    assert f(model=None, native={"max_turns": 0}).max_turns == 1
+    assert f(model=None, native={"max_turns": -5}).max_turns == 1
+    assert f(model=None, native={"num_retries": -3}).num_retries == 0
+    assert f(model=None, native={"max_concurrent_tools": 0}).max_concurrent_tools == 1
+    assert f(model=None, native={"max_concurrent_tools": -2}).max_concurrent_tools == 1
+    # the tool-concurrency cap is configurable; valid values pass through
+    s = f(model=None, native={"max_turns": 10, "num_retries": 4,
+                              "max_concurrent_tools": 16})
+    assert s.max_turns == 10 and s.num_retries == 4
+    assert s.max_concurrent_tools == 16
+
+
 # ── interrupt-wedge: dangling assistant tool_calls healing ───────────────────
 # An interrupt mid-tool-loop (CancelledError is a BaseException, so it bypasses
 # _invoke_tool's `except Exception`) lands after the assistant tool_calls
@@ -302,6 +510,88 @@ def test_heal_dangling_tool_calls_inserts_stubs():
     assert sum(1 for x in m if x["role"] == "tool") == 1
 
 
+def _heal_forward_oracle(messages: list[dict]) -> None:
+    """The ORIGINAL full forward scan, kept here as an equivalence oracle for
+    the tail-bounded production implementation. If they ever diverge on a
+    transcript this system can produce, test_heal_tail_matches_forward_oracle
+    fails loudly. Do NOT 'optimize' this — it is the reference."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+            j = i + 1
+            answered: set = set()
+            while j < len(messages) and messages[j].get("role") == "tool":
+                answered.add(messages[j].get("tool_call_id"))
+                j += 1
+            missing = [cid for cid in call_ids if cid not in answered]
+            if missing:
+                stubs = [{"role": "tool", "tool_call_id": cid,
+                          "content": "error: interrupted"} for cid in missing]
+                messages[j:j] = stubs
+                i = j + len(stubs)
+                continue
+        i += 1
+
+
+def _gen_transcript(rng) -> list[dict]:
+    """Build a transcript shaped like ones THIS loop actually produces: a run
+    of fully-completed turns, then an optional dangling tail (interrupt
+    mid-tool-loop), then an optional just-appended user message."""
+    msgs: list[dict] = [{"role": "system", "content": "sys"}]
+    cid = 0
+    for _ in range(rng.randint(0, 6)):
+        msgs.append({"role": "user", "content": "u"})
+        # 0+ fully-answered tool rounds, then a final assistant text
+        for _ in range(rng.randint(0, 3)):
+            ids = [f"c{cid + k}" for k in range(rng.randint(1, 3))]
+            cid += len(ids)
+            msgs.append({"role": "assistant", "tool_calls": [
+                {"id": i, "type": "function",
+                 "function": {"name": "bash", "arguments": "{}"}} for i in ids]})
+            for i in ids:  # every call answered (completed round)
+                msgs.append({"role": "tool", "tool_call_id": i, "content": "ok"})
+        msgs.append({"role": "assistant", "content": "done"})
+    # optional dangling tail: assistant tool_calls with a SUBSET answered
+    if rng.random() < 0.6:
+        ids = [f"d{cid + k}" for k in range(rng.randint(1, 4))]
+        cid += len(ids)
+        msgs.append({"role": "assistant", "tool_calls": [
+            {"id": i, "type": "function",
+             "function": {"name": "bash", "arguments": "{}"}} for i in ids]})
+        answered = [i for i in ids if rng.random() < 0.5]
+        for i in answered:
+            msgs.append({"role": "tool", "tool_call_id": i, "content": "ok"})
+        if rng.random() < 0.5:   # a new prompt already appended (poisoned ckpt)
+            msgs.append({"role": "user", "content": "next"})
+    return msgs
+
+
+def test_heal_tail_matches_forward_oracle():
+    """The tail-bounded heal must produce byte-identical output to the original
+    O(n) forward scan on every transcript this system can produce — that
+    equivalence is what lets us bound the scan (killing the O(n²)-per-session
+    cost) without weakening the durable-wedge safety net."""
+    import random
+    from api.native.loop import heal_dangling_tool_calls
+
+    rng = random.Random(20260613)
+    for _ in range(3000):
+        msgs = _gen_transcript(rng)
+        a = [dict(x) for x in msgs]
+        b = [dict(x) for x in msgs]
+        _heal_forward_oracle(a)
+        heal_dangling_tool_calls(b)
+        assert a == b, (msgs, a, b)
+        # and the result is actually valid: every tool_call id is answered
+        ans = {x.get("tool_call_id") for x in b if x.get("role") == "tool"}
+        for x in b:
+            if x.get("role") == "assistant" and x.get("tool_calls"):
+                for tc in x["tool_calls"]:
+                    assert tc["id"] in ans, (msgs, b)
+
+
 @pytest.mark.asyncio
 async def test_run_turn_self_heals_poisoned_prior_transcript():
     """A checkpoint persisted mid-tool-loop carries an assistant tool_calls
@@ -336,3 +626,101 @@ async def test_run_turn_self_heals_poisoned_prior_transcript():
                        "content": "error: interrupted"}
     assert sent[2]["role"] == "user"
     assert result.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_calls_run_concurrently_and_in_order():
+    """Multiple tool_calls the model issues in ONE round execute CONCURRENTLY —
+    the round finishes in max(individual) not the sum — and their results are
+    appended in tool_call order (the provider keys each result to its call id)."""
+    import asyncio
+    import time
+
+    from api.native.transport import TransportExecResult
+
+    class _SlowTransport:
+        def __init__(self):
+            self.execs = []
+
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            await asyncio.sleep(0.1)
+            self.execs.append(command)
+            return TransportExecResult(f"ran:{command}", "", 0, False)
+
+        async def read_file(self, p, *, max_bytes=8 * 1024 * 1024):
+            raise FileNotFoundError(p)
+
+        async def write_file(self, p, d):
+            pass
+
+    spec = NativeAgentSpec()
+    tools = build_toolset(["bash"])
+    transport = _SlowTransport()
+    msgs = [{"role": "user", "content": "do 3 things"}]
+    round1 = [_Chunk(_Delta(tool_calls=[
+        _TCDelta(0, id="c1", name="bash", arguments='{"command":"a"}'),
+        _TCDelta(1, id="c2", name="bash", arguments='{"command":"b"}'),
+        _TCDelta(2, id="c3", name="bash", arguments='{"command":"c"}'),
+    ]))]
+    round2 = [_Chunk(_Delta(content="done"))]
+
+    t0 = time.perf_counter()
+    events, result = await _collect(spec, msgs, tools, transport, [round1, round2])
+    elapsed = time.perf_counter() - t0
+
+    # 3 tools × 0.1s each: concurrent ≈ 0.1s, sequential would be ≈ 0.3s.
+    assert elapsed < 0.25, f"parallel tool calls ran sequentially ({elapsed:.2f}s)"
+    # results in tool_call order, each keyed to its call
+    tr = [e for e in events if e["type"] == "tool_result"]
+    assert [e["tool_call_id"] for e in tr] == ["c1", "c2", "c3"]
+    assert "ran:a" in tr[0]["result"]
+    # transcript: tool results appended in order
+    tool_msgs = [m for m in result.messages if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_msgs] == ["c1", "c2", "c3"]
+    assert len(transport.execs) == 3
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_calls_bounded_to_configured_cap():
+    """A big parallel-tool batch must not spike the subprocess/connection count:
+    at most spec.max_concurrent_tools execute at once, the rest run in waves —
+    still parallel, but with a fixed per-turn ceiling. A CUSTOM cap proves the
+    knob flows through to the bound (subsumes the default — same mechanism)."""
+    import asyncio
+
+    from api.native.transport import TransportExecResult
+
+    live = {"now": 0, "max": 0}
+
+    class _CountingTransport:
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=300):
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+            await asyncio.sleep(0.02)
+            live["now"] -= 1
+            return TransportExecResult(f"ran:{command}", "", 0, False)
+
+        async def read_file(self, p, *, max_bytes=8 * 1024 * 1024):
+            raise FileNotFoundError(p)
+
+        async def write_file(self, p, d):
+            pass
+
+    cap = 4                                            # configured, < default 8
+    n = cap + 5                                        # more tools than the cap
+    spec = NativeAgentSpec(max_concurrent_tools=cap)
+    tools = build_toolset(["bash"])
+    msgs = [{"role": "user", "content": "do many"}]
+    round1 = [_Chunk(_Delta(tool_calls=[
+        _TCDelta(i, id=f"c{i}", name="bash", arguments='{"command":"x"}')
+        for i in range(n)]))]
+    round2 = [_Chunk(_Delta(content="done"))]
+
+    events, _result = await _collect(spec, msgs, tools, _CountingTransport(),
+                                     [round1, round2])
+
+    tool_results = [e for e in events if e["type"] == "tool_result"]
+    assert len(tool_results) == n                      # all ran
+    assert live["max"] <= cap, \
+        f"peaked at {live['max']} concurrent (configured cap {cap})"
+    assert live["max"] >= 2                             # but DID run in parallel

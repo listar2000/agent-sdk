@@ -18,6 +18,7 @@ Event vocabulary emitted (canonical taxonomy, == parse_acp_event output):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -26,6 +27,15 @@ from typing import Any, Awaitable, Callable
 log = logging.getLogger(__name__)
 
 Emit = Callable[[dict], Awaitable[None]]
+
+#: Cap on tool calls executed CONCURRENTLY within one round. The model can issue
+#: a large parallel-tool batch ("read these 40 files"); each tool is a sandbox
+#: exec / file round-trip (a docker exec subprocess, an SDK call), so an
+#: unbounded gather would spike to N concurrent subprocesses per turn — and
+#: across many sessions, explode. Bound it: the common case (a handful of tools)
+#: still runs fully in parallel; a big batch runs in waves of this size, trading
+#: a little latency for a fixed per-turn resource ceiling.
+_MAX_CONCURRENT_TOOLS = 8
 
 
 @dataclass
@@ -36,6 +46,17 @@ class NativeAgentSpec:
     max_tokens: int | None = None
     temperature: float | None = None
     tool_names: list[str] | None = None
+    # LiteLLM retries the INITIAL model call on transient failures (rate
+    # limits, connection resets, 5xx) before the stream is established — so a
+    # blip doesn't fail the whole turn. It does NOT retry mid-stream (no
+    # double-emit). Default on (2) for resilience; set 0 via native config to
+    # disable, or higher for a flakier provider.
+    num_retries: int = 2
+    # How many of a round's tool calls execute concurrently. The common case
+    # (a few tools) runs fully in parallel; a big batch runs in waves of this
+    # size — a fixed per-turn resource ceiling. Tune per workload: higher for
+    # cheap I/O-bound tools, lower for heavy ones / tight resource budgets.
+    max_concurrent_tools: int = _MAX_CONCURRENT_TOOLS
 
     @classmethod
     def from_config(cls, *, model: str | None, native: dict | None) -> "NativeAgentSpec":
@@ -43,10 +64,19 @@ class NativeAgentSpec:
         return cls(
             instructions=n.get("instructions", ""),
             model=model or n.get("model") or cls.model,
-            max_turns=int(n.get("max_turns", cls.max_turns)),
+            # Clamp the loop-control knobs to sane floors so a misconfigured
+            # agent fails LOUDLY (or just runs) rather than silently: a
+            # max_turns <= 0 makes ``range(max_turns)`` empty → a no-op turn
+            # with no model call and a bare done(max_turns); a negative
+            # num_retries would be handed straight to LiteLLM; a
+            # max_concurrent_tools <= 0 would make asyncio.Semaphore raise.
+            max_turns=max(1, int(n.get("max_turns", cls.max_turns))),
             max_tokens=n.get("max_tokens"),
             temperature=n.get("temperature"),
             tool_names=n.get("tool_names"),
+            num_retries=max(0, int(n.get("num_retries", cls.num_retries))),
+            max_concurrent_tools=max(
+                1, int(n.get("max_concurrent_tools", cls.max_concurrent_tools))),
         )
 
 
@@ -54,7 +84,16 @@ class NativeAgentSpec:
 class _ToolCallAccum:
     id: str = ""
     name: str = ""
-    args: str = ""
+    # Streamed argument fragments, joined once at read time. Accumulating in a
+    # list keeps a tool call's arguments O(total) even when a large argument
+    # (e.g. a write_file ``content``) arrives across many deltas; the old
+    # ``args += fragment`` rebuilt the whole string every delta — O(total²),
+    # the same quadratic class as the dangling-heal full scan.
+    arg_parts: list[str] = field(default_factory=list)
+
+    @property
+    def args(self) -> str:
+        return "".join(self.arg_parts)
 
 
 @dataclass
@@ -89,26 +128,65 @@ def heal_dangling_tool_calls(messages: list[dict]) -> None:
     every later prompt re-raises across hibernate/resume/restart. Mutates
     ``messages`` in place, inserting an ``interrupted`` stub for each unanswered
     id right after the assistant's existing results. Idempotent — a clean
-    transcript is left unchanged."""
-    i = 0
-    while i < len(messages):
-        m = messages[i]
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
-            # the contiguous run of tool results immediately after this message
-            j = i + 1
-            answered: set = set()
-            while j < len(messages) and messages[j].get("role") == "tool":
-                answered.add(messages[j].get("tool_call_id"))
-                j += 1
-            missing = [cid for cid in call_ids if cid not in answered]
-            if missing:
-                stubs = [{"role": "tool", "tool_call_id": cid,
-                          "content": "error: interrupted"} for cid in missing]
-                messages[j:j] = stubs   # after existing results, before next turn
-                i = j + len(stubs)
-                continue
-        i += 1
+    transcript is left unchanged.
+
+    Only the LAST assistant message can be dangling, so we scan back to it
+    rather than walking the whole transcript: the loop appends a tool result for
+    every call before its next model round (and an interrupt heals before the
+    next user turn), so any earlier assistant ``tool_calls`` block is already
+    fully answered. A checkpoint persisted mid-tool-loop leaves the gap at ITS
+    tail too — which, after a new user message is appended, is still the last
+    *assistant* message. Bounding the scan to the tail turns this from O(n) per
+    turn — i.e. O(n²) over a long session, the dominant per-turn CPU cost — into
+    O(tool-calls-in-the-current-turn). Equivalence with the full forward scan on
+    every system-producible transcript is pinned by an oracle test in
+    tests/test_native_loop.py."""
+    n = len(messages)
+    a = n - 1
+    while a >= 0 and messages[a].get("role") != "assistant":
+        a -= 1
+    if a < 0:
+        return
+    m = messages[a]
+    if not m.get("tool_calls"):
+        return
+    call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+    # the contiguous run of tool results immediately after this assistant
+    j = a + 1
+    answered: set = set()
+    while j < n and messages[j].get("role") == "tool":
+        answered.add(messages[j].get("tool_call_id"))
+        j += 1
+    missing = [cid for cid in call_ids if cid not in answered]
+    if missing:
+        stubs = [{"role": "tool", "tool_call_id": cid,
+                  "content": "error: interrupted"} for cid in missing]
+        messages[j:j] = stubs   # after existing results, before next turn
+
+
+def _litellm_completion():
+    """Resolve ``litellm.acompletion`` with the native runtime's litellm config.
+
+    - ``telemetry=False``: litellm ships this True, egressing anonymized usage
+      (model, success/failure) to litellm's servers on calls — a server-side
+      data egress + per-call overhead we don't want.
+    - ``suppress_debug_info=True``: don't print a provider-list banner to stderr.
+    - ``drop_params=True``: the native runtime runs ARBITRARY litellm models;
+      this loop always sends ``stream_options``/``tools``/``temperature`` etc.
+      A model that doesn't support one would otherwise ERROR the whole turn —
+      dropping the unsupported param degrades gracefully (e.g. a non-tool model
+      runs text-only) instead of failing. The default model supports them all,
+      so this is a no-op there.
+
+    Set on every resolve (cheap idempotent writes; kept off the import path so
+    the completion test seam never imports litellm). No effect on completion
+    behavior for a model that supports the params.
+    """
+    import litellm
+    litellm.telemetry = False
+    litellm.suppress_debug_info = True
+    litellm.drop_params = True
+    return litellm.acompletion
 
 
 async def run_turn(
@@ -125,8 +203,7 @@ async def run_turn(
     """Drive one user turn. ``messages`` already includes the new user
     message. Returns the grown message array + terminal stop reason."""
     if completion is None:
-        import litellm
-        completion = litellm.acompletion
+        completion = _litellm_completion()
 
     # Defensive: a checkpoint persisted mid-tool-loop (interrupt/error) or an
     # in-memory transcript from a prior errored turn can carry an assistant
@@ -137,26 +214,30 @@ async def run_turn(
     tool_schemas = [t.schema for t in tools.values()] or None
     total_usage: dict[str, Any] = {}
 
-    for _turn in range(spec.max_turns):
-        kwargs: dict[str, Any] = {
-            "model": spec.model,
-            "messages": messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tool_schemas:
-            kwargs["tools"] = tool_schemas
-        if spec.temperature is not None:
-            kwargs["temperature"] = spec.temperature
-        if spec.max_tokens is not None:
-            kwargs["max_tokens"] = spec.max_tokens
-        if api_key:
-            kwargs["api_key"] = api_key
+    # Per-call kwargs are constant across a turn's model rounds — only
+    # ``messages`` grows (in place) — so build them once instead of
+    # re-evaluating the conditionals and rebuilding the dict every round.
+    call_kwargs: dict[str, Any] = {
+        "model": spec.model,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if spec.num_retries:
+        call_kwargs["num_retries"] = spec.num_retries
+    if tool_schemas:
+        call_kwargs["tools"] = tool_schemas
+    if spec.temperature is not None:
+        call_kwargs["temperature"] = spec.temperature
+    if spec.max_tokens is not None:
+        call_kwargs["max_tokens"] = spec.max_tokens
+    if api_key:
+        call_kwargs["api_key"] = api_key
 
+    for _turn in range(spec.max_turns):
         text_parts: list[str] = []
         tool_calls: dict[int, _ToolCallAccum] = {}
 
-        stream = await completion(**kwargs)
+        stream = await completion(messages=messages, **call_kwargs)
         async for chunk in stream:
             usage = getattr(chunk, "usage", None)
             if usage is not None:
@@ -165,6 +246,14 @@ async def run_turn(
             if not choices:
                 continue
             delta = choices[0].delta
+            # Reasoning is STREAMED for display only and is NOT added to the
+            # assistant message — the model's thinking stays ephemeral, which is
+            # correct for the common case (the reasoning isn't fed back next
+            # round). A model that needs its thinking blocks preserved across
+            # tool calls (e.g. Anthropic extended thinking + tools) is not
+            # supported here yet: persisting reasoning would also feed it to
+            # models that reject a thinking field, so it needs per-model handling
+            # — out of scope until such a model is configured and validated.
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 await emit({"type": "reasoning", "text": reasoning})
@@ -181,7 +270,7 @@ async def run_turn(
                     if getattr(fn, "name", None):
                         acc.name = fn.name
                     if getattr(fn, "arguments", None):
-                        acc.args += fn.arguments
+                        acc.arg_parts.append(fn.arguments)
 
         # ── decide: tools or done ───────────────────────────────────────────
         assistant_msg: dict[str, Any] = {
@@ -198,27 +287,58 @@ async def run_turn(
         # Record the assistant's tool-call request in the message array so
         # the follow-up tool messages are valid.
         ordered = [tool_calls[i] for i in sorted(tool_calls)]
+        # Join each call's streamed argument fragments exactly once: both the
+        # assistant message and the _parse_args below need the raw string, and
+        # ``c.args`` re-runs an O(content) ``"".join`` on every access — reading
+        # it twice would copy a large write_file ``content`` argument twice.
+        raw_args = [c.args for c in ordered]
         assistant_msg["tool_calls"] = [{
             "id": c.id, "type": "function",
-            "function": {"name": c.name, "arguments": c.args or "{}"},
-        } for c in ordered]
+            "function": {"name": c.name, "arguments": ra or "{}"},
+        } for c, ra in zip(ordered, raw_args)]
         messages.append(assistant_msg)
 
         if transport is None and ensure_sandbox is not None:
             transport = await ensure_sandbox()
 
-        for c in ordered:
-            args = _parse_args(c.args)
+        # Parse args + emit every tool-call event up front (in order) so a
+        # parallel-tool-calling round shows all calls pending before any result.
+        calls = [(c, _parse_args(ra)) for c, ra in zip(ordered, raw_args)]
+        for c, args in calls:
             await emit({"type": "tool", "tool_call_id": c.id,
                         "tool_name": c.name, "args": args})
-            tool = tools.get(c.name)
-            if tool is None:
-                result = f"error: unknown tool {c.name!r}"
-            else:
+
+        # Independent tool calls the model issued in ONE round run CONCURRENTLY,
+        # so the round finishes in max(individual) instead of the sum — bounded
+        # to spec.max_concurrent_tools at a time so a huge batch can't spike the
+        # subprocess/connection count. A single call degenerates to a
+        # gather-of-one (identical behavior). A tool failure is data (an "error:"
+        # string); only an interrupt (CancelledError) propagates out — gather
+        # then cancels the siblings and the _drive handler heals the dangling
+        # tool_calls.
+        sem = asyncio.Semaphore(spec.max_concurrent_tools)
+
+        async def _exec_one(c, args):
+            async with sem:
+                tool = tools.get(c.name)
+                if tool is None:
+                    return f"error: unknown tool {c.name!r}", None
                 # a recreate (on SandboxGoneError) may swap the transport;
-                # reuse the returned one for the rest of this turn.
-                result, transport = await _invoke_tool(
+                # concurrent recoveries adopt-not-duplicate (one fresh sandbox),
+                # so all parallel tools converge on the same replacement.
+                return await _invoke_tool(
                     tool, transport, args, c.name, ensure_sandbox)
+
+        outcomes = await asyncio.gather(*(_exec_one(c, args) for c, args in calls))
+
+        # Adopt a transport a tool recreated mid-round for the next round.
+        for _result, t in outcomes:
+            if t is not None and t is not transport:
+                transport = t
+
+        # Emit results + append to the transcript IN tool_call ORDER (the
+        # provider keys each tool result to its call id).
+        for (c, _args), (result, _t) in zip(calls, outcomes):
             await emit({"type": "tool_result", "tool_call_id": c.id,
                         "tool_name": c.name, "result": result})
             messages.append({"role": "tool", "tool_call_id": c.id,
