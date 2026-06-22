@@ -55,6 +55,15 @@ class TestSandboxStateRoundTrip:
         assert isinstance(out, DockerSandboxState)
         assert out.recipe.shared_mounts == ["/srv:/srv:ro"]
 
+    def test_no_reap_round_trips_and_defaults_false_on_legacy(self):
+        # Set True → survives serialize/deserialize.
+        s = DaytonaSandboxState(recipe=Recipe(no_reap=True))
+        assert deserialize(serialize(s)).recipe.no_reap is True
+        # Legacy payload with no ``no_reap`` key → defaults False (safe).
+        legacy = serialize(DaytonaSandboxState(recipe=Recipe()))
+        legacy["recipe"].pop("no_reap", None)
+        assert deserialize(legacy).recipe.no_reap is False
+
     def test_unknown_state_when_payload_missing_or_garbled(self):
         for payload in (None, {}, {"type": ""}, {"type": "not-a-real-provider"}):
             out = deserialize(payload)
@@ -226,6 +235,38 @@ class TestSessionPoolReaper:
 
         assert count == 1
         assert released == ["watched"]
+
+    @pytest.mark.asyncio
+    async def test_no_reap_recipe_flag_exempts_session(self, monkeypatch):
+        """A ``recipe.no_reap=True`` session is never hibernated, even with a
+        stale compute clock; an otherwise-identical session is. This is the
+        prewarmed-pool opt-out (``_should_reap`` short-circuit)."""
+        from api.sandbox.pool import SessionPool
+
+        pool = SessionPool(factory=lambda _sid, _state: None)
+        pooled = _FakePoolSession(DaytonaSandboxState(recipe=Recipe(no_reap=True)))
+        normal = _FakePoolSession(DaytonaSandboxState(recipe=Recipe()))
+        for sess in (pooled, normal):
+            sess.liveness.observe_chunk()
+            sess.liveness._last_compute_at -= 100  # very stale → idle
+        pool._active = {"pooled": pooled, "normal": normal}
+
+        released = []
+
+        async def _release(session_id):
+            released.append(session_id)
+
+        monkeypatch.setattr(pool, "release", _release)
+
+        # Directly assert the decision, then the end-to-end reap.
+        import time as _time
+        now = _time.monotonic()
+        assert pool._should_reap(pooled, 5, now)[1] == "no_reap"
+        assert pool._should_reap(normal, 5, now)[0] is True
+
+        count = await pool.reap_idle(5)
+        assert count == 1
+        assert released == ["normal"]
 
 
 class _MiniSession(BaseSandboxSession):
