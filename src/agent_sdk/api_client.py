@@ -394,8 +394,16 @@ class ApiClient:
         cli_tools: list | dict | None = None,
         secrets: dict[str, str] | None = None,
         pre_start_commands: list[str] | None = None,
+        no_reap: bool | None = None,
+        release: bool | None = None,
     ) -> dict[str, Any]:
         """``POST /sessions/{id}/reload`` — hot-swap skills / MCP / CLI / secrets / pre-start.
+
+        ``no_reap`` flips the idle-reaper opt-out on the recipe + the live
+        session (used to clear it when a prewarmed pool placeholder is claimed
+        into a real chat). ``release`` (default server-side ``True``) controls
+        the trailing release: pass ``False`` to apply config to a still-running
+        sandbox in place — the instant-claim path, no release+cold-recover.
 
         ``None`` (default) means "leave alone"; pass ``[]`` / ``{}`` to
         clear. Updates ``agents.config`` for skills/MCP/CLI and
@@ -436,11 +444,17 @@ class ApiClient:
             body["secrets"] = secrets
         if pre_start_commands is not None:
             body["pre_start_commands"] = pre_start_commands
+        if no_reap is not None:
+            body["no_reap"] = no_reap
         if not body:
             raise ValueError(
                 "reload_session: pass at least one of skills, mcp_servers, "
-                "cli_tools, secrets, pre_start_commands"
+                "cli_tools, secrets, pre_start_commands, no_reap"
             )
+        # ``release`` is a control flag, not a mutable field — send it (when
+        # explicitly set) but don't let it satisfy the at-least-one check.
+        if release is not None:
+            body["release"] = release
         return await self._json(
             "POST", f"/sessions/{session_id}/reload",
             json=body,
