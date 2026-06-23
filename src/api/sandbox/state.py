@@ -123,6 +123,14 @@ class Recipe(BaseModel):
     # (GitHub installation tokens, etc.) without an in-sandbox daemon.
     credential_refresh_url: str | None = None
     credential_refresh_token: str | None = None
+    # When True, the SessionPool idle reaper never hibernates this session
+    # (``_should_reap`` short-circuits). Set on prewarmed/pooled sandboxes
+    # that sit idle on purpose; cleared (via ``/reload``) when the session is
+    # claimed and should rejoin normal idle-hibernation. Provider-level
+    # auto-stop is already disabled (daytona ``auto_stop_interval=0``), so this
+    # only governs the SessionPool reaper. Defaults False → existing persisted
+    # recipes deserialize unchanged.
+    no_reap: bool = False
 
 
 class _BaseSandboxState(BaseModel):

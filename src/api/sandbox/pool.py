@@ -384,6 +384,11 @@ class SessionPool:
         compute clock, so it can no longer pin an idle sandbox. A reaped session keeps its conversation (session/load) and
         cold-resumes on the next message; an SSE consumer reconnects.
         """
+        # Pooled/prewarmed sandboxes opt out of idle hibernation entirely —
+        # they sit idle on purpose until claimed. Cleared via ``/reload`` when
+        # the session is claimed and should rejoin normal reaping.
+        if getattr(sess.state.recipe, "no_reap", False):
+            return False, "no_reap"
         # Never hibernate mid-prompt — even a multi-minute, chunk-silent
         # tool call whose compute clock has gone stale.
         if sess.liveness.in_flight:

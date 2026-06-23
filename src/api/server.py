@@ -2075,6 +2075,9 @@ async def _sessions_create_eager(data: dict) -> dict:
         # the recipe so it survives hibernation + recovery.
         credential_refresh_url=data.get("credential_refresh_url"),
         credential_refresh_token=data.get("credential_refresh_token"),
+        # Prewarmed/pooled sandboxes pass no_reap=true so the idle reaper
+        # leaves them running until claimed; cleared at claim via /reload.
+        no_reap=bool(data.get("no_reap", False)),
     )
 
     session_id = data.get("id") or str(uuid.uuid4())
@@ -2697,8 +2700,15 @@ async def session_reload(session_id: str, request: Request):
           "mcp_servers":        {...},
           "cli_tools":          [...] | {...},
           "secrets":            {...},
-          "pre_start_commands": [...]
+          "pre_start_commands": [...],
+          "no_reap":            true | false,
+          "release":            true | false   # default true
         }
+
+    ``no_reap`` flips the idle-reaper opt-out on the recipe (and on the live
+    session). ``release=False`` skips the trailing release so config lands on a
+    still-running sandbox in place — used by the placeholder-pool claim path to
+    inject a chat's config (and clear ``no_reap``) without a release+cold-recover.
 
     Steps:
       1. Update ``agents.config.{skills, mcp_servers, cli_tools}`` —
@@ -2734,7 +2744,12 @@ async def session_reload(session_id: str, request: Request):
     disk until the volume is wiped. Removal is a follow-up.
     """
     data = await _json_body(request)
-    mutable = {"skills", "mcp_servers", "cli_tools", "secrets", "pre_start_commands"}
+    # ``release`` is a control flag (default True), not a mutable field — pop it
+    # before the must-include-a-field check so it isn't required and doesn't
+    # satisfy the check on its own. ``release=False`` keeps the live sandbox
+    # running instead of the usual release+cold-recover (the claim path).
+    release = bool(data.pop("release", True))
+    mutable = {"skills", "mcp_servers", "cli_tools", "secrets", "pre_start_commands", "no_reap"}
     if not (mutable & data.keys()):
         raise HTTPException(
             400, f"body must include at least one of {sorted(mutable)}",
@@ -2745,6 +2760,9 @@ async def session_reload(session_id: str, request: Request):
     # the agent so they don't accidentally flow into ``AgentConfig``.
     new_secrets = data.pop("secrets", None)
     new_pre_start = data.pop("pre_start_commands", None)
+    new_no_reap = data.pop("no_reap", None)
+    if new_no_reap is not None and not isinstance(new_no_reap, bool):
+        raise HTTPException(400, "reload body 'no_reap' must be a boolean")
     if new_pre_start is not None:
         if not isinstance(new_pre_start, list) or not all(
             isinstance(c, str) for c in new_pre_start
@@ -2799,8 +2817,19 @@ async def session_reload(session_id: str, request: Request):
     if state_jsonb is not None:
         recipe = state_jsonb.get("recipe") or {}
         recipe["pre_start_commands"] = merged
+        if new_no_reap is not None:
+            recipe["no_reap"] = new_no_reap
         state_jsonb["recipe"] = recipe
         await write_sandbox_state(session_id, state_jsonb)
+    # Mutate the LIVE session's in-memory recipe too — the idle reaper reads
+    # ``sess.state.recipe.no_reap`` off the active object, not the DB. Without
+    # this, a ``release=False`` reload (claim path) would leave a running
+    # sandbox still flagged no_reap, and it would never hibernate.
+    if new_no_reap is not None:
+        from api.sandbox import get_pool as _get_pool
+        _live = _get_pool()._active.get(session_id)
+        if _live is not None:
+            _live.state.recipe.no_reap = new_no_reap
 
     # 3. Exec the install set on the live sandbox so it's hot.
     #    Both ``npx skills add`` and ``uv tool install`` are idempotent
@@ -2846,11 +2875,16 @@ async def session_reload(session_id: str, request: Request):
     #    no benefit; the user's next prompt pays the cost they'd pay
     #    anyway. Matches hive-space's release_session-then-next-message
     #    pattern.
+    #    ``release=False`` (claim path) skips this: config was hot-exec'd above
+    #    and no_reap flipped on the live session, so the warm sandbox keeps
+    #    running and serves the claiming chat's first message with no recovery.
     from api.sandbox import get_pool
-    await get_pool().release(session_id)
+    if release:
+        await get_pool().release(session_id)
 
     return {
         "status": "ok",
+        "released": release,
         "skills": agent.config.skills,
         "mcp_servers": agent.config.mcp_servers,
         "cli_tools": agent.config.cli_tools,
