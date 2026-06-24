@@ -93,29 +93,20 @@ SNAPSHOT_NAME="agent-sdk-${SHA}${DIRTY_SUFFIX}"
 
 # Slim agent SANDBOX image (daytona + modal snapshots build from THIS, not the
 # full server Dockerfile): drops the FastAPI server, keeps node+uv+supervisor,
-# and bakes the hivespace CLI + default skills. See scripts/Dockerfile.agent.
+# and bakes the hivespace CLI (from public PyPI) + default skills. See
+# scripts/Dockerfile.agent.
 DOCKERFILE_AGENT="${REPO_ROOT}/scripts/Dockerfile.agent"
-HIVE_TOKEN="${GH_TOKEN:-${HIVESPACE_INSTALL_TOKEN:-}}"
-_AGENT_CRED="${REPO_ROOT}/hive_build_credentials.tmp"
 _AGENT_DF_TMP="${REPO_ROOT}/.Dockerfile.agent.build"
 
-# Stage the slim agent Dockerfile for a context-correct build: its hivecli stage
-# COPYs hive_build_credentials.tmp (the GitHub token — kept out of the Dockerfile
-# text / snapshot build_info), and ``COPY src/supervisor`` needs the repo-root
-# build context, so we drop a temp copy at the repo root. The token never enters
-# the Dockerfile text or the published image (multi-stage; cred file is rm'd in
-# the throwaway builder + deleted here after the build).
+# Stage the slim agent Dockerfile at the repo root for a context-correct build:
+# ``COPY src/supervisor`` needs the repo-root build context, and daytona/modal
+# build from a path whose parent dir becomes the context — so we drop a temp
+# copy at the repo root. The CLI is a public PyPI install now, so there's no
+# build credential to write.
 prepare_agent_build() {
-  if [[ -z "${HIVE_TOKEN}" ]]; then
-    echo "[release] ERROR: set GH_TOKEN (or HIVESPACE_INSTALL_TOKEN) — required to" >&2
-    echo "[release]   bake the private hivespace CLI into scripts/Dockerfile.agent." >&2
-    return 1
-  fi
-  printf 'https://x-access-token:%s@github.com\n' "${HIVE_TOKEN}" > "${_AGENT_CRED}"
-  chmod 600 "${_AGENT_CRED}"
   cp "${DOCKERFILE_AGENT}" "${_AGENT_DF_TMP}"
 }
-cleanup_agent_build() { rm -f "${_AGENT_CRED}" "${_AGENT_DF_TMP}"; }
+cleanup_agent_build() { rm -f "${_AGENT_DF_TMP}"; }
 VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
 
 want() {
@@ -146,9 +137,8 @@ build_docker() {
 
   echo "[release] building $LOCAL_TAG from scripts/Dockerfile.agent"
   # All providers build the SLIM agent image (scripts/Dockerfile.agent) — the
-  # same image agents run in. prepare_agent_build writes the hive-token cred
-  # file; ``-f`` points at the agent Dockerfile with repo-root context so
-  # ``COPY src/supervisor`` + the cred-file COPY resolve.
+  # same image agents run in. ``-f`` points at the agent Dockerfile with
+  # repo-root context (``.``) so ``COPY src/supervisor`` resolves.
   prepare_agent_build || return 1
   # Don't take the whole script down if docker build fails — daytona/modal
   # snapshots build remotely and don't need the local image.
