@@ -1,18 +1,14 @@
-# ── Stage 1: build the private hivespace CLI (throwaway; token via the
-#    build-context file hive_build_credentials.tmp, COPYd + rm'd here). ──
-# The CLI ref is pinned to a concrete hive-space commit (not the moving
-# @staging branch) on purpose: the install is a single RUN layer, so a
-# branch ref never changes the command string and Docker/Daytona reuse the
-# cached layer — silently baking a stale CLI even after staging moves. Pin
-# to a SHA so the layer (and the snapshot) actually rebuild when the CLI
-# changes. BUMP THIS on every CLI release: `git rev-parse origin/staging` in
-# hive-space → paste below. (Follow-up: have release.sh resolve + inject it.)
+# ── Stage 1: install the hivespace CLI from public PyPI (throwaway builder;
+#    its /home/daytona/.local is COPYd into the final image). ──
+# Token-free: `hivespace` is a public PyPI package, so there's no private-repo
+# clone, no build credential, and nothing to bump per CLI release. The version
+# baked here is only a BASELINE — hive-space's provision/reload installs the
+# server-pinned version (HIVESPACE_VERSION) over it, so an agent self-heals to
+# the right CLI at runtime regardless of what's frozen in the image.
 FROM python:3.12-slim AS hivecli
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv
-RUN mkdir -p /home/daytona
-COPY hive_build_credentials.tmp /home/daytona/.git-credentials
-RUN HOME=/home/daytona git config --global credential.helper store && chmod 600 /home/daytona/.git-credentials && HOME=/home/daytona uv tool install --with click "git+https://github.com/rllm-org/hive-space.git@b5546526b95a78e1862e4db563d0ec41e45bf423" && rm -f /home/daytona/.git-credentials
+RUN mkdir -p /home/daytona && HOME=/home/daytona uv tool install hivespace
 
 FROM python:3.12-slim
 
@@ -56,7 +52,7 @@ RUN cd src/supervisor && npm install --loglevel=warn
 RUN mkdir -p /opt/agent-sdk && ln -s /app/src/supervisor /opt/agent-sdk/runtime
 ENV AGENT_SDK_RUNTIME_PATH=/opt/agent-sdk/runtime
 
-# ── bake: hivespace CLI (from builder, no token) + default skills ─────
+# ── bake: hivespace CLI (from the PyPI builder stage) + default skills ─────
 COPY --from=hivecli /home/daytona/.local /home/daytona/.local
 RUN export HOME=/home/daytona && mkdir -p $HOME/.claude/skills && npx -y skills add 'claude-office-skills/skills@html-slides' --yes -g && npx -y skills add 'github/awesome-copilot@excalidraw-diagram-generator' --yes -g && npx -y skills add 'anthropics/skills@frontend-design' --yes -g
 CMD ["sleep", "infinity"]

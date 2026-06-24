@@ -17,10 +17,11 @@ from agent_sdk import ApiClient
 BASE = os.environ.get("AGENT_SDK_BASE_URL", "http://localhost:7778")
 OAUTH = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
 
-# The hivespace CLI binary is named ``hivespace`` (package builds from the
-# private hive-space repo). Token scan looks for the actual PAT prefix VALUE,
-# not the literal string ``x-access-token`` (which appears in the hivespace
-# source code itself — a false positive).
+# The hivespace CLI binary is named ``hivespace`` (installed from the public
+# PyPI package at bake time). The token scan is defense-in-depth — it looks for
+# an actual PAT prefix VALUE, not the literal string ``x-access-token`` (which
+# can appear in source as a false positive). With the PyPI install there's no
+# build credential, so this should always come back clean.
 CHECKS = [
     ("which hivespace", "command -v hivespace || ls ~/.local/bin/hivespace 2>/dev/null || echo __NONE__"),
     ("hivespace --help", "hivespace --help 2>&1 | head -2 || echo __FAIL__"),
