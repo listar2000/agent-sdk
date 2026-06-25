@@ -101,6 +101,7 @@ import shlex as _sh
 from ._shared import (
     VolumeFileExistsError,
     _safe_path,
+    normalize_find_entries,
     normalize_find_output,
 )
 
@@ -187,6 +188,43 @@ class ShellVolumeAdapter(BaseVolumeAdapter):
             return normalized
         lines = [f"{rel.rstrip('/')}/{ln}" for ln in normalized.splitlines()]
         return "\n".join(sorted(lines))
+
+    async def tree_entries(self, path: str = "") -> list[dict]:
+        """Like :meth:`tree`, but returns structured entries with size + mtime.
+
+        ``[{"path", "is_dir", "size", "mtime"}]`` — paths in the same normalized
+        form as ``tree`` (dirs end ``/``), sorted. Only the GNU ``-printf`` path
+        carries metadata; on busybox/portable transports (``find`` lacks
+        ``-printf``) it degrades to the plain tree with ``size``/``mtime`` of
+        ``None`` rather than paying a per-file ``stat`` walk. One ``find`` pass.
+        """
+        if not self.tree_find_gnu:
+            # No -printf here — reuse the plain (already rel-prefixed) tree and
+            # report paths only. Callers treat missing metadata as "unknown".
+            flat = await self.tree(path)
+            return [
+                {"path": ln, "is_dir": ln.endswith("/"), "size": None, "mtime": None}
+                for ln in flat.splitlines() if ln
+            ]
+        rel = self._rel(path)
+        qt = _sh.quote(self._target(rel))
+        depth = f"-maxdepth {self.tree_max_depth} " if self.tree_max_depth else ""
+        # Same single GNU walk as tree(), with size (%s) + epoch mtime (%T@)
+        # added; tab-delimited so paths containing spaces survive the split.
+        shell = (
+            f"if [ ! -d {qt} ]; then exit 0; fi; "
+            f"find {qt} -mindepth 1 {depth}-printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null"
+        )
+        rc, out, err = await self._run_shell(shell, timeout=self.shell_timeout)
+        if rc != 0 and self.tree_check_rc:
+            raise self._err("tree", rc, err)
+        entries = normalize_find_entries(out.decode(errors="replace"))
+        if rel and entries:
+            pre = rel.rstrip("/") + "/"
+            for e in entries:
+                e["path"] = pre + e["path"]
+            entries.sort(key=lambda e: e["path"])
+        return entries
 
     async def read(self, path: str) -> bytes:
         rel = self._rel(path)
