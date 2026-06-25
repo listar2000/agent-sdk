@@ -1155,15 +1155,20 @@ async def _maybe_in_thread(fn, payload, *args, **kwargs):
 
 
 @app.get("/volumes/{id_or_name}/files/tree")
-async def volume_files_tree(id_or_name: str, path: str = ""):
+async def volume_files_tree(id_or_name: str, path: str = "", stat: bool = False):
     vol = await _resolve_volume(id_or_name)
     adapter = get_volume_adapter(vol.provider, vol.provider_ref)
     rel = _safe_path(path)
     try:
-        tree = await adapter.tree(rel)
+        # Default: the plain path tree (unchanged contract, one find pass).
+        # ?stat=1: one *enriched* pass returning per-entry size + mtime, with
+        # `tree` derived from the same entries so both fields stay consistent.
+        if stat:
+            entries = await adapter.tree_entries(rel)
+            return {"tree": "\n".join(e["path"] for e in entries), "entries": entries}
+        return {"tree": await adapter.tree(rel)}
     except Exception as e:
         raise _volume_fs_err("Tree", vol.provider, e)
-    return {"tree": tree}
 
 
 @app.get("/volumes/{id_or_name}/files/read")

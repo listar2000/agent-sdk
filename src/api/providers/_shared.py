@@ -701,6 +701,48 @@ def normalize_find_output(raw: str) -> str:
     return "\n".join(sorted(entries))
 
 
+def normalize_find_entries(raw: str) -> list[dict]:
+    """Parse ``find -printf '%y\\t%s\\t%T@\\t%P\\n'`` into structured entries.
+
+    The metadata-bearing counterpart to :func:`normalize_find_output`: each line
+    is tab-separated ``"<type>\\t<size>\\t<mtime>\\t<relpath>"`` (type d/f/l, size
+    in bytes, mtime as a unix epoch — ``%T@`` yields ``seconds.fraction``). Tabs
+    (not spaces) separate the fields so paths containing spaces survive.
+
+    Returns ``[{"path", "is_dir", "size", "mtime"}]`` sorted by path: dirs keep a
+    trailing ``/`` and report ``size=None``; files/symlinks carry size + mtime.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for line in (raw or "").splitlines():
+        line = line.rstrip("\r")
+        if not line:
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) != 4:
+            continue
+        type_char, size_s, mtime_s, path = parts
+        path = path.strip().lstrip("/")
+        if not path or type_char not in ("d", "f", "l"):
+            continue  # the find root itself, or an unsupported type
+        is_dir = type_char == "d"
+        norm = path.rstrip("/") + ("/" if is_dir else "")
+        if norm in seen:
+            continue
+        seen.add(norm)
+        try:
+            size = None if is_dir else int(size_s)
+        except ValueError:
+            size = None
+        try:
+            mtime = int(float(mtime_s))
+        except ValueError:
+            mtime = None
+        out.append({"path": norm, "is_dir": is_dir, "size": size, "mtime": mtime})
+    out.sort(key=lambda e: e["path"])
+    return out
+
+
 async def _exec_subprocess(proc, timeout: int) -> ExecResult:
     timed_out = False
     try:

@@ -247,3 +247,44 @@ def test_validate_volume_name_rejects_path_escape():
         with pytest.raises(HTTPException) as exc:
             _validate_volume_name(bad)
         assert exc.value.status_code == 400, f"should 400 on {bad!r}"
+
+
+def test_normalize_find_entries_parses_size_and_mtime():
+    from api.providers._shared import normalize_find_entries
+
+    raw = (
+        "f\t1024\t1719100000.5\ta.jsonl\n"
+        "d\t4096\t1719100001\tsub\n"
+        "f\t0\t1719100002\tsub/empty.txt\n"
+        "l\t12\t1719100003\tlink\n"
+    )
+    entries = normalize_find_entries(raw)
+    by_path = {e["path"]: e for e in entries}
+
+    # sorted by path
+    assert [e["path"] for e in entries] == sorted(e["path"] for e in entries)
+    # files carry size + mtime; mtime floored from %T@ "seconds.fraction"
+    assert by_path["a.jsonl"] == {"path": "a.jsonl", "is_dir": False, "size": 1024, "mtime": 1719100000}
+    # dirs keep a trailing slash and report size=None
+    assert by_path["sub/"] == {"path": "sub/", "is_dir": True, "size": None, "mtime": 1719100001}
+    # symlinks treated like files (no trailing slash)
+    assert by_path["link"]["is_dir"] is False
+
+
+def test_normalize_find_entries_handles_paths_with_spaces_and_junk():
+    from api.providers._shared import normalize_find_entries
+
+    raw = (
+        "f\t5\t1719100000\tmy notes.md\n"   # space in path survives (tab-split)
+        "\n"                                  # blank line
+        "garbage line without tabs\n"         # wrong shape → skipped
+        "c\t0\t0\tdev-node\n"                 # unsupported type → skipped
+        "f\tNaN\tbad\toops.txt\n"             # unparseable size/mtime → None
+    )
+    entries = normalize_find_entries(raw)
+    by_path = {e["path"]: e for e in entries}
+
+    assert by_path["my notes.md"]["size"] == 5
+    assert "dev-node" not in by_path
+    assert by_path["oops.txt"] == {"path": "oops.txt", "is_dir": False, "size": None, "mtime": None}
+    assert len(entries) == 2

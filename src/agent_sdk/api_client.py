@@ -164,12 +164,22 @@ class ApiClient:
     # Volume filesystem (shared across sandboxes on the same volume)
 
     async def volume_file_tree(
-        self, volume_id: str, path: str = ""
+        self, volume_id: str, path: str = "", *, stat: bool = False
     ) -> dict[str, Any]:
-        """``GET /volumes/{id}/files/tree``."""
-        params = {"path": path} if path else None
+        """``GET /volumes/{id}/files/tree``.
+
+        ``stat=True`` adds an ``entries`` list to the response — one
+        ``{"path", "is_dir", "size", "mtime"}`` per file (size in bytes, mtime as
+        a unix epoch). Metadata is populated on GNU-find transports (daytona,
+        modal); elsewhere size/mtime come back ``None``.
+        """
+        params: dict[str, Any] = {}
+        if path:
+            params["path"] = path
+        if stat:
+            params["stat"] = "true"
         return await self._json(
-            "GET", f"/volumes/{volume_id}/files/tree", params=params,
+            "GET", f"/volumes/{volume_id}/files/tree", params=params or None,
         )
 
     async def volume_file_read(self, volume_id: str, path: str) -> dict[str, Any]:
