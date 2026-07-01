@@ -47,7 +47,15 @@ class ModalSandboxSession(SupervisorSandboxSession):
         self._cwd = "/v"
 
     def _create_kwargs(self) -> dict:
-        return {"resources": self.state.recipe.resources}
+        # Thread the per-session custom image / dockerfile from the recipe so
+        # the modal provider can boot a non-default image (e.g. LocalStack +
+        # the agent-sdk runtime) on the SUPERVISOR path. Both default to None
+        # (the baked agent-sdk runtime image) when unset.
+        return {
+            "resources": self.state.recipe.resources,
+            "image": self.state.recipe.image,
+            "dockerfile": self.state.recipe.dockerfile,
+        }
 
     async def _reattach_url(self, mod, status: str) -> str | None:
         if status != "running":

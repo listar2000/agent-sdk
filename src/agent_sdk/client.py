@@ -594,7 +594,7 @@ class Agent:
     _CLONABLE_FIELDS = (
         "agent_type", "provider", "model", "cwd", "root",
         "mcp_servers", "skills", "cli_tools", "dockerfile",
-        "volume_id", "pre_start_commands", "shared_mounts",
+        "image", "volume_id", "pre_start_commands", "shared_mounts",
         "resources", "workspace", "extra_options",
     )
 
@@ -613,6 +613,7 @@ class Agent:
         session_id: str | None = None,
         sandbox_ref: str | None = None,
         dockerfile: str | None = None,
+        image: str | None = None,
         oauth_token: str | None = None,
         api_key: str | None = None,
         volume_id: str | None = None,
@@ -636,6 +637,10 @@ class Agent:
         self.cli_tools = cli_tools
         self.id: str | None = None  # set after registration (server-side agent_id)
         self.dockerfile = dockerfile
+        # Per-session registry image ref (modal only). Boots an EXISTING image
+        # that MUST already contain the agent-sdk runtime at
+        # /opt/agent-sdk/runtime; pairs with provider="modal".
+        self.image = image
         self.volume_id = volume_id
         self.pre_start_commands = pre_start_commands
         self.shared_mounts = shared_mounts

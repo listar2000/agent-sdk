@@ -105,6 +105,13 @@ class Recipe(BaseModel):
     """
 
     dockerfile: str | None = None
+    # Optional pre-built registry image ref (e.g.
+    # ``localstack/localstack:4.4.0`` or a private ``im-...`` snapshot id).
+    # Distinct from ``dockerfile``: ``image`` boots an EXISTING image, while
+    # ``dockerfile`` builds one. Providers that support custom images (modal)
+    # boot it via ``Image.from_registry``; the image MUST already contain the
+    # agent-sdk runtime at ``/opt/agent-sdk/runtime`` for the supervisor path.
+    image: str | None = None
     shared_mounts: list[str] = Field(default_factory=list)
     root: str | None = None
     agent_type: str = "opencode"

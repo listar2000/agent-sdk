@@ -165,10 +165,20 @@ async def _get_app():
     return _app
 
 
-async def _get_image():
-    """Return the shared sandbox Image (memoized).
+async def _get_image(image: str | None = None, dockerfile: str | None = None):
+    """Return the sandbox Image.
 
-    Two paths in priority order:
+    Priority order:
+
+    0. **Per-session custom image** — when the caller passes an explicit
+       ``image`` (a registry ref / pre-built snapshot id) or ``dockerfile``
+       (a path on the server). Built via ``Image.from_registry`` /
+       ``Image.from_dockerfile`` and NEVER memoized into the module-global
+       ``_image`` (it is per-session, not shared). The custom image MUST
+       already contain the agent-sdk runtime at ``/opt/agent-sdk/runtime``
+       (supervisor.js + node_modules) and node>=18 for the supervisor path
+       to work — see ``create_sandbox``. ``image`` wins over ``dockerfile``
+       when both are set.
 
     1. **Pre-built snapshot** (``.modal-snapshot-tag`` at the repo root).
        Built by ``scripts/release_modal_snapshot.py``. Cold-create from
@@ -184,10 +194,27 @@ async def _get_image():
        error). Slow but always works as long as the Dockerfile is
        valid.
     """
+    modal, _ = _require_modal()
+    # Per-session custom image — do NOT memoize (different sessions may ask
+    # for different images). ``image`` (registry ref / snapshot id) wins;
+    # ``dockerfile`` (a path the server materialized) is the build form.
+    if image:
+        # An ``im-...`` ref is a pre-built modal image id (a filesystem
+        # snapshot) — resolve it with ``from_id`` (same as the default
+        # ``.modal-snapshot-tag`` path). Anything else is a Docker registry
+        # ref (``localstack/localstack:4.4.0``, ``...dkr.ecr...``).
+        if image.startswith("im-"):
+            log.info("modal: using per-session image snapshot id %s", image)
+            return modal.Image.from_id(image)
+        log.info("modal: using per-session registry image %s", image)
+        return modal.Image.from_registry(image)
+    if dockerfile:
+        log.info("modal: using per-session dockerfile %s", dockerfile)
+        return modal.Image.from_dockerfile(str(dockerfile))
+
     global _image
     if _image is not None:
         return _image
-    modal, _ = _require_modal()
     # repo root is 5 levels up from src/api/providers/modal/__init__.py
     # (modal/ → providers/ → api/ → src/ → repo)
     repo_root = Path(__file__).resolve().parents[4]
@@ -369,7 +396,8 @@ async def create_sandbox(
     agent_type: str = "opencode",
     root: str | None = None,
     spawn_env: dict[str, str] | None = None,
-    dockerfile: str | None = None,  # ignored — Modal uses _get_image()
+    dockerfile: str | None = None,  # per-session build (Image.from_dockerfile)
+    image: str | None = None,       # per-session registry ref / snapshot id
     pre_start_commands: list[str] | None = None,
     port: int | None = None,  # accepted for parity; Modal picks its own via tunnel
     sandbox_ref: str | None = None,
@@ -388,7 +416,7 @@ async def create_sandbox(
 
     modal, _ = _require_modal()
     app = await _get_app()
-    image = await _get_image()
+    sandbox_image = await _get_image(image=image, dockerfile=dockerfile)
     vol = await _get_volume(volume_ref)
 
     agent_root = root or _AGENT_HOME_IN
@@ -421,7 +449,7 @@ async def create_sandbox(
     sb = await modal.Sandbox.create.aio(
         "sh", "-c", entrypoint,
         app=app,
-        image=image,
+        image=sandbox_image,
         volumes={_VOLUME_MOUNT: vol},
         timeout=_SANDBOX_TIMEOUT_SEC,
         idle_timeout=_SANDBOX_IDLE_TIMEOUT_SEC,
