@@ -39,6 +39,8 @@ AUTH_KEYS = frozenset({
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_API_KEY",
     "GEMINI_API_KEY",
     "OPENROUTER_API_KEY",
     "GROQ_API_KEY",
@@ -77,14 +79,15 @@ _ACP_BIN_NAMES = {
 _ACP_NPM_SPECS = {
     "claude": "@agentclientprotocol/claude-agent-acp@^0.27.0",
     "opencode": "opencode-ai@^1.4.3",
-    # Only claude + opencode are used. The runtimes below are commented out to
-    # keep the baked agent image small (the supervisor package.json mirrors
-    # this in _disabledDependencies). Uncomment to re-enable the agent_type.
-    # "codex": "@zed-industries/codex-acp@^0.11.1",
-    # NOTE: re-enabling codex requires restoring the codex-only
-    # `authenticate({methodId: "openai-api-key"})` retry in
-    # AcpClient.initialize — deleted as dead in 57a3160^ (audit: safe while
-    # codex is disabled; mandatory for codex bootstrap).
+    # codex: the CURRENT ACP wrapper is @agentclientprotocol/codex-acp (bundles
+    # @openai/codex). The old zed `@zed-industries/codex-acp@^0.11.1` pin is
+    # obsolete. Auth is native: CODEX_ACCESS_TOKEN (a ChatGPT-workspace PAT) in
+    # the child env short-circuits codex-core's authRequired, so no
+    # `authenticate` handshake is needed on the PAT path (AcpClient.initialize
+    # keeps a one-shot api-key fallback for the no-PAT case).
+    "codex": "@agentclientprotocol/codex-acp@^1.0.2",
+    # The runtimes below stay commented out to keep the baked agent image small
+    # (the supervisor package.json mirrors this in _disabledDependencies).
     # "gemini": "@google/gemini-cli@^0.37.2",
     # "cline": "cline-acp@^0.1.6",
     # "deepagents": "deepagents-acp@^0.1.8",

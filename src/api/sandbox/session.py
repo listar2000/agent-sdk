@@ -284,6 +284,12 @@ class BaseSandboxSession(abc.ABC):
                 async def _do(sid: str, _val: str = val) -> None:
                     await client.set_model(sid, _val, agent_type)
                 return _do
+            # thought_level is likewise agent_type-sensitive (codex -> reasoning_effort,
+            # claude -> thinking), so bind it the same way.
+            def _bind_set_thought(val: str):
+                async def _do(sid: str, _val: str = val) -> None:
+                    await client.set_thought_level(sid, _val, agent_type)
+                return _do
             replay = []
             if cfg:
                 if cfg.model:
@@ -292,7 +298,7 @@ class BaseSandboxSession(abc.ABC):
                     replay.append(("mode", client.set_mode, cfg.mode))
                 if cfg.thought_level:
                     replay.append(("thought_level",
-                                   client.set_thought_level,
+                                   _bind_set_thought(cfg.thought_level),
                                    cfg.thought_level))
             for name, fn, val in replay:
                 try:
@@ -656,7 +662,8 @@ class BaseSandboxSession(abc.ABC):
         await self._acp_call("set_model", model, self.state.recipe.agent_type)
 
     async def set_thought_level(self, level: str) -> None:
-        await self._acp_call("set_thought_level", level)
+        # Pass agent_type so codex routes to configId "reasoning_effort" (claude -> "thinking").
+        await self._acp_call("set_thought_level", level, self.state.recipe.agent_type)
 
     # --- Liveness probe hook (subclass overrides if it has a cheap probe) ---
 

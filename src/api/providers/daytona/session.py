@@ -273,6 +273,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
             subpath=self._subpath or f"sessions/{self.session_id}",
             agent_type=self.state.recipe.agent_type,
             dockerfile=self.state.recipe.dockerfile,
+            # Per-session custom image / snapshot from the recipe — the
+            # daytona analog of the modal per-session image (a registered
+            # snapshot name boots the fast path; a registry ref pulls).
+            image=self.state.recipe.image,
             pre_start_commands=self.state.recipe.pre_start_commands or None,
             root=self.state.recipe.root or "/home/daytona",
             shared_mounts=self.state.recipe.shared_mounts or None,

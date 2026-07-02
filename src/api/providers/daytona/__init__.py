@@ -314,9 +314,33 @@ async def start_supervisor_in_sandbox(
     return url
 
 
+# Per-session images that resolved to a REGISTERED daytona snapshot. Positive
+# verdicts are cached (a fleet booting the same snapshot pays the control-plane
+# lookup once); negatives are re-checked every time so registering the snapshot
+# mid-run is picked up without a server restart.
+_snapshot_registered_cache: set[str] = set()
+
+
+async def _snapshot_registered(daytona, name: str) -> bool:
+    """True iff ``name`` is a snapshot registered on this Daytona account."""
+    if name in _snapshot_registered_cache:
+        return True
+    try:
+        await daytona.snapshot.get(name)
+    except Exception as e:
+        log.debug(
+            "daytona: snapshot lookup for %r failed (%s) — treating it as a "
+            "registry ref", name, e,
+        )
+        return False
+    _snapshot_registered_cache.add(name)
+    return True
+
+
 async def provision_daytona_sandbox(
     agent_type: str = "opencode",
     dockerfile: str | None = None,
+    image: str | None = None,
     pre_start_commands: list[str] | None = None,
     root: str = "/tmp",
     volume_id: str | None = None,
@@ -351,47 +375,75 @@ async def provision_daytona_sandbox(
     # legacy "hive-large" default is gone — it predates the runtime
     # baking and would silently skip it.
     #
-    # Snapshot precedence: ``DAYTONA_SNAPSHOT`` env > ``.runtime-snapshot-tag``
-    # repo file. Image precedence: ``DAYTONA_IMAGE`` > ``AGENT_SDK_IMAGE``
-    # > ``.runtime-image-tag``. The repo files are written by release.sh
-    # so a fresh checkout's daytona path "just works" without any env-var
-    # plumbing in launch scripts.
-    snapshot = (
-        os.environ.get("DAYTONA_SNAPSHOT", "").strip()
-        or (_read_runtime_snapshot_tag() or "")
-    )
-    use_snapshot = dockerfile is None and snapshot.lower() not in {"", "0", "false", "image"}
-
-    # Daytona snapshots bake resources in at snapshot-creation time;
-    # CreateSandboxFromSnapshotParams has no ``resources`` field. When the
-    # caller wants per-session resources, fall back to the image path so
-    # the request is honoured (slower cold-create, ~30s vs ~2s).
-    if use_snapshot and resources is not None:
-        log.info(
-            "daytona: resources requested (%s); falling back from snapshot %s "
-            "to image path", resources, snapshot,
-        )
-        use_snapshot = False
-
-    if dockerfile is not None:
+    # Boot-source precedence:
+    #   1. per-session ``image`` (``Recipe.image``) — the daytona analog of
+    #      the modal per-session image. A value naming a REGISTERED daytona
+    #      snapshot boots via the fast snapshot path; anything else is
+    #      treated as a docker registry ref and boots via the per-sandbox
+    #      image path. Wins over ``dockerfile``, mirroring modal.
+    #   2. per-session ``dockerfile`` — declarative image build.
+    #   3. default snapshot: ``DAYTONA_SNAPSHOT`` env > ``.runtime-snapshot-tag``
+    #      repo file. Image fallback: ``DAYTONA_IMAGE`` > ``AGENT_SDK_IMAGE``
+    #      > ``.runtime-image-tag``. The repo files are written by release.sh
+    #      so a fresh checkout's daytona path "just works" without any env-var
+    #      plumbing in launch scripts.
+    boot_image: Any = None  # registry ref (str) or daytona Image object
+    snapshot = ""
+    if image:
+        if await _snapshot_registered(daytona, image):
+            if resources is not None:
+                # Snapshots bake resources at registration time. Honour the
+                # snapshot (its name usually isn't pullable as an image) and
+                # drop the per-session resources instead of mis-routing to
+                # the image path.
+                log.info(
+                    "daytona: per-session snapshot %s ignores requested "
+                    "resources %s (snapshots bake resources at creation)",
+                    image, resources,
+                )
+                resources = None
+            log.info("daytona: using per-session snapshot %s", image)
+            snapshot = image
+        else:
+            log.info("daytona: using per-session registry image %s", image)
+            boot_image = image
+    elif dockerfile is not None:
         if not Path(dockerfile).exists():
             raise FileNotFoundError(f"Dockerfile not found: {dockerfile}")
         from daytona_sdk import Image
-        image = Image.from_dockerfile(dockerfile)
-    elif not use_snapshot:
-        # Same precedence as docker.create_sandbox: per-provider override >
-        # cross-provider override > committed pin.
-        image = (
-            os.environ.get("DAYTONA_IMAGE")
-            or os.environ.get("AGENT_SDK_IMAGE")
-            or _read_runtime_image_tag()
+        boot_image = Image.from_dockerfile(dockerfile)
+    else:
+        snapshot = (
+            os.environ.get("DAYTONA_SNAPSHOT", "").strip()
+            or (_read_runtime_snapshot_tag() or "")
         )
-        if not image:
-            raise RuntimeError(
-                "Daytona provisioning requires DAYTONA_IMAGE / "
-                "AGENT_SDK_IMAGE / .runtime-image-tag (produced by "
-                "scripts/release.sh)."
+        if snapshot.lower() in {"", "0", "false", "image"}:
+            snapshot = ""
+        # Daytona snapshots bake resources in at snapshot-creation time;
+        # CreateSandboxFromSnapshotParams has no ``resources`` field. When the
+        # caller wants per-session resources, fall back to the image path so
+        # the request is honoured (slower cold-create, ~30s vs ~2s).
+        if snapshot and resources is not None:
+            log.info(
+                "daytona: resources requested (%s); falling back from snapshot %s "
+                "to image path", resources, snapshot,
             )
+            snapshot = ""
+        if not snapshot:
+            # Same precedence as docker.create_sandbox: per-provider override >
+            # cross-provider override > committed pin.
+            boot_image = (
+                os.environ.get("DAYTONA_IMAGE")
+                or os.environ.get("AGENT_SDK_IMAGE")
+                or _read_runtime_image_tag()
+            )
+            if not boot_image:
+                raise RuntimeError(
+                    "Daytona provisioning requires DAYTONA_IMAGE / "
+                    "AGENT_SDK_IMAGE / .runtime-image-tag (produced by "
+                    "scripts/release.sh)."
+                )
+    use_snapshot = bool(snapshot)
 
     # Daytona's control plane QUEUES provisioning. On a healthy account a
     # create returns in seconds even under the full `-n auto` burst, but when
@@ -420,7 +472,7 @@ async def provision_daytona_sandbox(
             )
         return await daytona.create(
             CreateSandboxFromImageParams(
-                image=image, auto_stop_interval=0, env_vars=env_vars,
+                image=boot_image, auto_stop_interval=0, env_vars=env_vars,
                 volumes=volumes, labels=labels,
                 resources=_to_daytona_resources(resources),
             ), timeout=create_timeout,
@@ -906,6 +958,7 @@ async def create_sandbox(
     port: int | None = None,
     root: str | None = None,
     dockerfile: str | None = None,
+    image: str | None = None,  # per-session snapshot name / registry ref
     pre_start_commands: list[str] | None = None,
     sandbox_ref: str | None = None,  # accepted for parity; unused here
     shared_mounts: list[str] | None = None,
@@ -931,6 +984,7 @@ async def create_sandbox(
     return await provision_daytona_sandbox(
         agent_type=agent_type,
         dockerfile=dockerfile,
+        image=image,
         pre_start_commands=pre_start_commands,
         root=effective_root,
         volume_id=volume_ref,

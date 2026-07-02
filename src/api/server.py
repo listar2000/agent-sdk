@@ -2012,8 +2012,9 @@ async def _sessions_create_eager(data: dict) -> dict:
     root = data.get("root", config_data.pop("root", None))
     dockerfile = _materialize_dockerfile({**config_data, **data})
     # Optional per-session registry image ref (boots an EXISTING image rather
-    # than building one). Only the modal provider honors it today; other
-    # providers ignore the recipe field.
+    # than building one). Honored by the modal provider (registry ref /
+    # ``im-...`` snapshot id) and the daytona provider (registered snapshot
+    # name / registry ref); other providers ignore the recipe field.
     image = data.get("image") or config_data.pop("image", None)
     shared_mounts = data.get("shared_mounts") or config_data.pop("shared_mounts", None) or []
     config_data.pop("dockerfile_content", None)

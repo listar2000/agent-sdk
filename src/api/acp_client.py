@@ -40,13 +40,31 @@ _VENDOR_META_NAMESPACE: dict[str, str] = {
     # dict is then forwarded into Claude Code's userProvidedOptions
     # (tools, disallowedTools, maxThinkingTokens, extraArgs, ...).
     "claude": "claudeCode",
-    # TODO: confirm the namespace from each wrapper's actual source before
-    # turning these on. Until then the agent_type is unknown and we drop
-    # ``extra_options`` with a warning.
-    # "codex": "<from @zed-industries/codex-acp>",
+    # codex: DELIBERATELY ABSENT. @agentclientprotocol/codex-acp exposes no
+    # `_meta.<vendor>.options` namespace on session/new — tool scoping is done
+    # via session `mode` (read-only / agent / agent-full-access), not free-form
+    # options. So a codex caller must NOT pass extra_options (honeycomb sends
+    # extra_options=None for codex); if any slips through it is dropped with a
+    # warning by _meta_for_extra_options, which is the correct no-op.
     # "opencode": "<from sst/opencode>",
     # "cline": "<from cline-acp>",
 }
+
+
+# Per-agent "run tools without prompting / without an internal sandbox" mode. Claude's
+# `bypassPermissions` and codex's `agent-full-access` are the equivalents; codex's default
+# `agent` mode sandboxes tool execution and would break taskgen's file writes.
+_BYPASS_MODE: dict[str, str] = {"claude": "bypassPermissions", "codex": "agent-full-access"}
+
+
+def _is_auth_required(exc: Exception) -> bool:
+    """Heuristic: does an ACP session/new RuntimeError signal auth-required?
+
+    ``_send_rpc`` raises ``ACP error [<code>]: <message>``; codex-acp surfaces
+    the not-yet-authenticated case as ``-32000`` / an "authenticate"/"auth"
+    message. Only consulted on the codex path, so a broad match is safe."""
+    s = str(exc).lower()
+    return "-32000" in s or "authenticate" in s or "auth required" in s or "not authenticated" in s
 
 
 def _meta_for_extra_options(agent: str, extra_options: dict | None) -> dict | None:
@@ -228,6 +246,7 @@ class AcpClient:
             # gaps — up to ~25s total before we give up.
             backoffs = [1.0, 3.0, 5.0, 8.0]  # 4 waits between 5 attempts
             last_exc = None
+            authenticated_once = False
             for attempt in range(5):
                 try:
                     new_result = await self._send_rpc(session_id, "session/new",
@@ -235,11 +254,21 @@ class AcpClient:
                     last_exc = None
                     break
                 except RuntimeError as e:
-                    # NOTE: no authenticate retry — neither enabled runtime
-                    # (claude-agent-acp 'gateway'-only, opencode no-auth)
-                    # accepts an env-var methodId; auth failures are terminal
-                    # like any other session/new error.
+                    # claude-agent-acp ('gateway'-only) / opencode (no-auth) accept
+                    # no env-var methodId, so their auth failures are terminal. codex
+                    # is the exception: on the PAT path CODEX_ACCESS_TOKEN in the child
+                    # env short-circuits authRequired, but if the child still demands
+                    # auth (no PAT provided), send a ONE-SHOT
+                    # ``authenticate {methodId:"api-key"}`` and retry immediately.
                     last_exc = e
+                    if agent == "codex" and not authenticated_once and _is_auth_required(e):
+                        authenticated_once = True
+                        try:
+                            await self._send_rpc(session_id, "authenticate", {"methodId": "api-key"}, agent=agent)
+                            log.info("codex authenticate(api-key) ok; retrying session/new")
+                            continue  # immediate retry (no backoff consumed)
+                        except Exception as ae:
+                            log.warning("codex authenticate(api-key) failed: %s", ae)
                     if attempt < len(backoffs):
                         log.info(
                             "session/new attempt %d failed (%s); retrying in %.1fs",
@@ -253,7 +282,10 @@ class AcpClient:
             if inner_sid:
                 self._inner_session_ids[session_id] = inner_sid
                 try:
-                    await self.set_mode(session_id, "bypassPermissions")
+                    # codex's default `agent` mode runs tools in an internal sandbox that
+                    # breaks taskgen file writes; `agent-full-access` matches claude's
+                    # `bypassPermissions`. See _BYPASS_MODE.
+                    await self.set_mode(session_id, _BYPASS_MODE.get(agent, "bypassPermissions"))
                 except Exception:
                     pass
         except Exception as e:
@@ -327,7 +359,7 @@ class AcpClient:
                                          extra_options=extra_options)
         self._inner_session_ids[session_id] = inner_session_id
         try:
-            await self.set_mode(session_id, "bypassPermissions")
+            await self.set_mode(session_id, _BYPASS_MODE.get(agent, "bypassPermissions"))
         except Exception:
             pass
         return result
@@ -372,7 +404,8 @@ class AcpClient:
     # should reach for ``call()`` instead of asking us to add a wrapper.
 
     async def set_mode(self, session_id: str, mode: str) -> None:
-        """Set the agent session mode (e.g. 'plan', 'bypassPermissions').
+        """Set the agent session mode (e.g. 'plan', 'bypassPermissions',
+        'agent-full-access').
 
         Tries snake_case then camelCase — ACP servers are inconsistent
         about which they implement. Either-works is more reliable than
@@ -397,11 +430,15 @@ class AcpClient:
             {"configId": "model", "value": _normalize_acp_model(model, agent_type=agent_type)},
         )
 
-    async def set_thought_level(self, session_id: str, level: str) -> None:
-        """Set thinking depth ('high', 'medium', 'low')."""
+    async def set_thought_level(self, session_id: str, level: str, agent_type: str = "claude") -> None:
+        """Set thinking depth ('high', 'medium', 'low').
+
+        The config id is vendor-specific: codex uses ``reasoning_effort``, claude
+        (and the default) use ``thinking``."""
+        config_id = "reasoning_effort" if agent_type == "codex" else "thinking"
         await self.call(
             session_id, "session/set_config_option",
-            {"configId": "thinking", "value": level},
+            {"configId": config_id, "value": level},
         )
 
     async def aclose(self) -> None:

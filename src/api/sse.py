@@ -226,6 +226,26 @@ def extract_tool_name(update: dict) -> str:
     return "unknown"
 
 
+def _extract_done_usage(result: dict) -> dict | None:
+    """Pull a usage dict off a terminal PromptResponse, if present.
+
+    codex-acp reports token usage on the final PromptResponse rather than via
+    ``usage_update`` session events (which claude uses). The exact nesting varies
+    by wrapper version, so probe the common locations and return the first dict
+    found (the client's UsageStats.update tolerates the token-key naming)."""
+    if not isinstance(result, dict):
+        return None
+    for path in (("usage",), ("tokenUsage",), ("_meta", "usage"), ("_meta", "codex", "usage")):
+        node: Any = result
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict) and node:
+            return node
+    return None
+
+
 def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     """Parse an SSE block into a structured event dict for astream().
 
@@ -233,7 +253,7 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     - reasoning:   {"type": "reasoning", "text": "..."}
     - tool:        {"type": "tool", "tool_name": "...", "tool_call_id": "...", "args": ..., "raw": {...}}
     - tool_result: {"type": "tool_result", "tool_name": "...", "tool_call_id": "...", "result": ..., "raw": {...}}
-    - done:        {"type": "done", "stop_reason": "..."}
+    - done:        {"type": "done", "stop_reason": "...", "usage": {...}?}
     - error:       {"type": "error", "text": "...", "kind": "...", "data": {...}}
     - usage:       {"type": "usage", "usage": {...}}
     """
@@ -244,7 +264,11 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     kind, data = parse_acp_payload(payload, rpc_id)
 
     if kind == "done_result":
-        return {"type": "done", "stop_reason": data["stopReason"]}
+        ev: dict = {"type": "done", "stop_reason": data["stopReason"]}
+        usage = _extract_done_usage(data)
+        if usage:
+            ev["usage"] = usage  # codex: tokens ride the terminal PromptResponse, not usage_update
+        return ev
     if kind == "error":
         err_data = data.get("data") or {}
         return {

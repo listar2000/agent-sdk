@@ -427,6 +427,15 @@ class Session:
                             continue
                         event = Event(raw)
                         if event["type"] == "done":
+                            # codex reports tokens on the terminal PromptResponse (no
+                            # usage_update events), so absorb any usage riding the done
+                            # frame before returning — keeps agent.usage populated.
+                            done_usage = event.get("usage")
+                            if done_usage:
+                                try:
+                                    self.usage.update(done_usage)
+                                except Exception:  # noqa: BLE001
+                                    pass
                             yield event
                             return
                         if event["type"] == "error":
@@ -595,7 +604,7 @@ class Agent:
         "agent_type", "provider", "model", "cwd", "root",
         "mcp_servers", "skills", "cli_tools", "dockerfile",
         "image", "volume_id", "pre_start_commands", "shared_mounts",
-        "resources", "workspace", "extra_options",
+        "resources", "workspace", "extra_options", "thought_level",
     )
 
     def __init__(
@@ -623,6 +632,7 @@ class Agent:
         resources: dict[str, Any] | None = None,
         workspace: str | None = None,
         extra_options: dict[str, Any] | None = None,
+        thought_level: str | None = None,
     ):
         self.name = name
         self.agent_type = agent_type
@@ -637,9 +647,10 @@ class Agent:
         self.cli_tools = cli_tools
         self.id: str | None = None  # set after registration (server-side agent_id)
         self.dockerfile = dockerfile
-        # Per-session registry image ref (modal only). Boots an EXISTING image
-        # that MUST already contain the agent-sdk runtime at
-        # /opt/agent-sdk/runtime; pairs with provider="modal".
+        # Per-session image ref (modal: registry ref / im-... snapshot id;
+        # daytona: registered snapshot name / registry ref). Boots an EXISTING
+        # image that MUST already contain the agent-sdk runtime at
+        # /opt/agent-sdk/runtime.
         self.image = image
         self.volume_id = volume_id
         self.pre_start_commands = pre_start_commands
@@ -661,6 +672,10 @@ class Agent:
         # extraArgs, ...). Session-scoped on the server side — set at
         # session/new, immutable for that session's lifetime.
         self.extra_options = dict(extra_options) if extra_options else None
+        # Thinking depth ('low'|'medium'|'high'). Rides config_data (in
+        # _CLONABLE_FIELDS); the server replays it as configId "reasoning_effort"
+        # for codex, "thinking" for claude (see acp_client.set_thought_level).
+        self.thought_level = thought_level
         self._user_secrets: dict[str, str] = dict(secrets) if secrets else {}
 
         if api_url is None:
@@ -672,8 +687,14 @@ class Agent:
         # the SDK only forwards what its caller hands it.
         self._oauth_token = oauth_token or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        # Codex credentials — forwarded ONLY for agent_type="codex", read from the
+        # client env (honeycomb sources .env before running). CODEX_ACCESS_TOKEN is
+        # a ChatGPT-workspace PAT that codex-core reads natively from the child env
+        # (short-circuits authRequired); CODEX_API_KEY is the OpenAI-API-key fallback.
+        self._codex_access_token = os.environ.get("CODEX_ACCESS_TOKEN") if agent_type == CODEX else None
+        self._codex_api_key = os.environ.get("CODEX_API_KEY") if agent_type == CODEX else None
 
-        if (self._oauth_token or self._api_key) and _is_remote_http(self._api_url):
+        if (self._oauth_token or self._api_key or self._codex_access_token or self._codex_api_key) and _is_remote_http(self._api_url):
             raise ValueError(
                 f"refusing to send credentials to {self._api_url!r} over plaintext HTTP; "
                 "use https:// or a localhost URL"
@@ -761,6 +782,10 @@ class Agent:
             secrets.setdefault("CLAUDE_CODE_OAUTH_TOKEN", self._oauth_token)
         if self._api_key:
             secrets.setdefault("ANTHROPIC_API_KEY", self._api_key)
+        if self._codex_access_token:
+            secrets.setdefault("CODEX_ACCESS_TOKEN", self._codex_access_token)
+        if self._codex_api_key:
+            secrets.setdefault("CODEX_API_KEY", self._codex_api_key)
         return secrets
 
     def _registration_payload(self) -> dict[str, Any]:
