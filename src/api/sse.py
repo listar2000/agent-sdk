@@ -235,7 +235,7 @@ def _extract_done_usage(result: dict) -> dict | None:
     found (the client's UsageStats.update tolerates the token-key naming)."""
     if not isinstance(result, dict):
         return None
-    for path in (("usage",), ("tokenUsage",), ("_meta", "usage"), ("_meta", "codex", "usage")):
+    for path in (("usage",), ("tokenUsage",), ("_meta", "usage"), ("_meta", "codex", "usage"), ("_meta", "quota", "token_count")):
         node: Any = result
         for key in path:
             node = node.get(key) if isinstance(node, dict) else None

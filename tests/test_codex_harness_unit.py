@@ -8,11 +8,12 @@ client's env-based codex-credential auto-forward.
 from __future__ import annotations
 
 import asyncio
+import json
 
-from agent_sdk.client import Agent
+from agent_sdk.client import Agent, UsageStats
 from api.acp_client import _BYPASS_MODE, AcpClient, _is_auth_required
 from api.providers._shared import AUTH_KEYS, _ACP_NPM_SPECS, _acp_bin_name, _spec_package_name
-from api.sse import _extract_done_usage
+from api.sse import _extract_done_usage, parse_acp_event
 
 
 def test_codex_acp_spec_bin_and_auth_keys():
@@ -52,7 +53,32 @@ def test_set_thought_level_config_id_routes_by_agent_type():
 def test_extract_done_usage_probes_common_locations():
     assert _extract_done_usage({"stopReason": "end_turn", "usage": {"input_tokens": 10}}) == {"input_tokens": 10}
     assert _extract_done_usage({"stopReason": "end_turn", "_meta": {"usage": {"output_tokens": 5}}}) == {"output_tokens": 5}
+    # codex-acp also mirrors usage under _meta.quota.token_count (snake_case) — cheap forward-compat probe
+    assert _extract_done_usage({"stopReason": "end_turn", "_meta": {"quota": {"token_count": {"input_tokens": 7}}}}) == {"input_tokens": 7}
     assert _extract_done_usage({"stopReason": "end_turn"}) is None  # no usage on the frame -> None (claude path)
+
+
+def test_codex_done_frame_usage_lands_in_usage_stats():
+    # The REAL codex camelCase PromptResponse shape end-to-end: a done frame -> parse_acp_event ->
+    # UsageStats. inputTokens is already net-of-cache; all FIVE numbers must land (this closes the
+    # fixture-shape gap: previously cachedReadTokens + thoughtTokens were dropped).
+    usage = {"totalTokens": 1500, "inputTokens": 1000, "cachedReadTokens": 200, "outputTokens": 500, "thoughtTokens": 300}
+    block = "data: " + json.dumps({"id": "1", "result": {"stopReason": "end_turn", "usage": usage}})
+    ev = parse_acp_event(block, rpc_id=None)
+    assert ev["type"] == "done" and ev["usage"] == usage
+
+    stats = UsageStats()
+    stats.update(ev["usage"])
+    assert stats.input_tokens == 1000 and stats.output_tokens == 500 and stats.total_tokens == 1500
+    assert stats.cached_input_tokens == 200 and stats.thought_tokens == 300
+
+
+def test_usage_stats_accumulates_cache_and_thought_across_calls_snake_and_camel():
+    stats = UsageStats()
+    stats.update({"inputTokens": 100, "outputTokens": 50, "cachedReadTokens": 20, "thoughtTokens": 10})  # codex camelCase
+    stats.update({"input_tokens": 200, "output_tokens": 30, "cache_read_input_tokens": 40, "thought_tokens": 5})  # claude/snake
+    assert stats.input_tokens == 300 and stats.output_tokens == 80 and stats.total_tokens == 380
+    assert stats.cached_input_tokens == 60 and stats.thought_tokens == 15  # additive across both shapes
 
 
 def test_codex_credentials_auto_forwarded_only_for_codex(monkeypatch):

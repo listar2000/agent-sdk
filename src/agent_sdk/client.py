@@ -113,6 +113,11 @@ class UsageStats:
     total_tokens: int = 0
     total_cost_usd: float = 0.0
     call_count: int = 0
+    # codex reports these on its terminal PromptResponse (``cachedReadTokens`` is already netted
+    # out of ``inputTokens``; ``thoughtTokens`` is reasoning output). They were previously dropped,
+    # so a codex run's cache/reasoning tokens were invisible — surface them additively here.
+    cached_input_tokens: int = 0
+    thought_tokens: int = 0
 
     def update(self, usage: dict) -> None:
         """Update stats from a usage event dict.
@@ -129,6 +134,8 @@ class UsageStats:
         self.input_tokens += usage.get("inputTokens", usage.get("input_tokens", 0))
         self.output_tokens += usage.get("outputTokens", usage.get("output_tokens", 0))
         self.total_tokens = self.input_tokens + self.output_tokens
+        self.cached_input_tokens += usage.get("cachedReadTokens", usage.get("cache_read_input_tokens", usage.get("cached_input_tokens", 0))) or 0
+        self.thought_tokens += usage.get("thoughtTokens", usage.get("thought_tokens", 0)) or 0
         cost = usage.get("totalCostUsd", usage.get("total_cost_usd", 0))
         if not cost:
             amount = usage.get("amount")
