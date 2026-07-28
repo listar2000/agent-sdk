@@ -211,6 +211,9 @@ async def _persist_prompt_events(sess, message: str, rpc_id: str) -> None:
 
 @pytest.mark.asyncio
 async def test_persist_logs_empty_done_turn_for_rca(monkeypatch, caplog):
+    """An empty turn (clean done, zero output) persists a synthetic error row
+    AFTER turn_end — the loud-failure net for runtimes that swallow provider
+    errors (e.g. opencode ending the turn cleanly on an expired key 401)."""
     rows = _capture_log_writes(monkeypatch)
     sess = _FakeSession([
         {"type": "usage", "usage": {"amount": 1.25, "currency": "USD"}},
@@ -221,11 +224,69 @@ async def test_persist_logs_empty_done_turn_for_rca(monkeypatch, caplog):
         await _persist_prompt_events(sess, "hi", "rpc-empty")
 
     assert [r[0] for r in rows if r[0] != "user_message"] == [
-        "usage", "turn_end",
+        "usage", "turn_end", "error",
     ]
+    err_payload = next(p for et, p in rows if et == "error")
+    assert err_payload["kind"] == "empty_turn"
+    assert err_payload["prompt_id"] == "rpc-empty"
+    assert "no output" in err_payload["message"]
     messages = [r.message for r in caplog.records]
     assert any("empty prompt turn" in m for m in messages)
     assert any("rpc-empty" in m and "message_chars=2" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_empty_turn_broadcasts_rpc_tagged_error(monkeypatch):
+    """The empty-turn error must ALSO reach live subscribers as an rpc-tagged
+    error dict (the shape server.py's dict branch forwards and terminates on)."""
+    _capture_log_writes(monkeypatch)
+    seen: list[dict] = []
+    sess = _FakeSession([
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    sess._broadcast = lambda evt: seen.append(evt)  # type: ignore[method-assign]
+
+    class _Pool:
+        _active = {sess.session_id: sess}
+    import api.sandbox as _sb
+    monkeypatch.setattr(_sb, "get_pool", lambda: _Pool())
+
+    await _persist_prompt_events(sess, "hi", "rpc-emptycast")
+
+    errs = [e for e in seen if e.get("type") == "error"]
+    assert len(errs) == 1
+    assert errs[0]["rpc_id"] == "rpc-emptycast"
+    assert errs[0]["error"]["data"]["kind"] == "empty_turn"
+
+
+@pytest.mark.asyncio
+async def test_empty_turn_error_opt_out(monkeypatch, caplog):
+    """AGENT_SDK_EMPTY_TURN_AS_ERROR=0 restores the WARNING-only behavior."""
+    from api import turn as _turn
+    monkeypatch.setattr(_turn, "_EMPTY_TURN_AS_ERROR", False)
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+
+    with caplog.at_level("WARNING", logger="api.turn"):
+        await _persist_prompt_events(sess, "hi", "rpc-optout")
+
+    assert "error" not in [r[0] for r in rows]
+    assert any("empty prompt turn" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_empty_turn_is_not_an_error(monkeypatch):
+    """A cancelled turn with no output is a user action, not a failure."""
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "done", "stop_reason": "cancelled"},
+    ])
+
+    await _persist_prompt_events(sess, "hi", "rpc-cancelled")
+
+    assert "error" not in [r[0] for r in rows]
 
 
 @pytest.mark.asyncio
