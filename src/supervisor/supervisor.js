@@ -38,6 +38,25 @@ const SSE_BACKPRESSURE_LIMIT_BYTES = 8 * 1024 * 1024;
 // because we still want a turn-end snapshot even if the client gave up.
 const MAX_PENDING_PROMPT_IDS = 1024;
 
+// Caller-owned credential caches arrive through the existing ``secrets``
+// channel as environment variables. Materialize them before ACP starts, then
+// remove the raw payload from the supervisor environment so neither the ACP
+// child nor /v1/exec inherits it. The marker lets a runtime refresh its own
+// cache without an unchanged bootstrap payload overwriting the refreshed file
+// on every supervisor restart; changing the supplied payload replaces it.
+const SECRET_FILE_BOOTSTRAPS = [
+  {
+    env: "CODEX_AUTH_JSON",
+    relativePath: ".codex/auth.json",
+    validate(value) {
+      const parsed = JSON.parse(value);
+      if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+        throw new Error("credential cache must be a JSON object");
+      }
+    },
+  },
+];
+
 // Paths under args.root that are rebuildable or purely ephemeral. Excluded
 // from snapshots so we don't round-trip hundreds of MB of node_modules
 // through S3 on every turn.
@@ -142,6 +161,45 @@ function parseArgs(argv) {
 function log(...args) {
   const t = new Date().toISOString();
   process.stderr.write(`${t} [supervisor] ${args.join(" ")}\n`);
+}
+
+function materializeSecretFiles(root) {
+  const crypto = require("node:crypto");
+  for (const bootstrap of SECRET_FILE_BOOTSTRAPS) {
+    const value = process.env[bootstrap.env];
+    if (!value) continue;
+
+    // Delete first: validation or filesystem failures must never leave the
+    // credential available to a subsequently spawned child.
+    delete process.env[bootstrap.env];
+    bootstrap.validate(value);
+
+    const target = path.join(root, bootstrap.relativePath);
+    const dir = path.dirname(target);
+    const marker = `${target}.agent-sdk-bootstrap-sha256`;
+    const digest = crypto.createHash("sha256").update(value).digest("hex");
+    let alreadyBootstrapped = false;
+    try {
+      alreadyBootstrapped = fs.existsSync(target)
+        && fs.readFileSync(marker, "utf8").trim() === digest;
+    } catch {
+      alreadyBootstrapped = false;
+    }
+    if (alreadyBootstrapped) continue;
+
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+    const staged = `${target}.tmp-${process.pid}`;
+    try {
+      fs.writeFileSync(staged, value, { mode: 0o600 });
+      fs.renameSync(staged, target);
+      fs.chmodSync(target, 0o600);
+      fs.writeFileSync(marker, `${digest}\n`, { mode: 0o600 });
+    } finally {
+      try { fs.unlinkSync(staged); } catch {}
+    }
+    log(`materialized credential cache ${bootstrap.relativePath}`);
+  }
 }
 
 // ── Boot constants (evaluated at module load, before any helpers run) ──────
@@ -343,6 +401,7 @@ const args = parseArgs(process.argv);
 const _spawnPath = `${path.join(args.root, ".local/bin")}:${process.env.PATH || ""}`;
 ensureRootDir(args.root);
 restoreWorkspace(args, isWarmRestart);
+materializeSecretFiles(args.root);
 markBooted();
 const acp = spawnAgent(args);
 

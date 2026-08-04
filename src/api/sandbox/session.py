@@ -228,9 +228,9 @@ class BaseSandboxSession(abc.ABC):
         Re-applies any persisted ``agents.config.model`` after each fresh
         attach. ``set_model`` only affects the current ACP session — every
         cold-create / Type-2 recovery mints a new ACP session that
-        defaults to ``"default"`` (sonnet 4.6), so without this replay
-        callers who set ``model="haiku"`` once would silently revert to
-        sonnet on the first sandbox restart."""
+        defaults to the adapter's moving ``"default"`` alias, so without
+        this replay callers who set ``model="haiku"`` once could silently
+        switch models on the first sandbox restart."""
         if self._acp_attached:
             return
         if self._supervisor_url is None or self._acp_session_id is None:

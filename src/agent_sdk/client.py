@@ -65,6 +65,13 @@ NATIVE = "native"  # first-party in-server loop (not an ACP CLI)
 
 AGENT_TYPES = frozenset({CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE, NATIVE})
 
+# Public ``oauth_token=`` stays harness-neutral. Each runtime owns the
+# environment variable through which it accepts that token.
+_OAUTH_SECRET_ENV_BY_AGENT_TYPE = {
+    CLAUDE: "CLAUDE_CODE_OAUTH_TOKEN",
+    CODEX: "CODEX_ACCESS_TOKEN",
+}
+
 # ── Provider constants ──
 UNIX_LOCAL = "unix_local"
 DOCKER = "docker"
@@ -408,7 +415,7 @@ class Session:
         via ``ev["type"]``, ``ev["text"]``, etc.
 
         Event types: ``text``, ``reasoning``, ``tool``, ``tool_result``,
-        ``usage``, ``done`` (terminal).
+        ``usage``, ``commands``, ``session_info``, and ``done`` (terminal).
 
         Raises ``PromptError`` on a server error frame, ``StreamError`` on
         connection loss.
@@ -662,10 +669,14 @@ class Agent:
             api_url = os.environ.get("AGENT_API_URL", "https://agent-sdk-server-production.up.railway.app")
         self._api_url = api_url
 
-        # Resolve per-user Claude credentials. Priority: explicit arg > env var.
-        # Cred caching / interactive login happens elsewhere (e.g. hive server);
-        # the SDK only forwards what its caller hands it.
-        self._oauth_token = oauth_token or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        # Resolve the runtime's standard OAuth/access-token variable. Priority:
+        # explicit arg > environment. Credential acquisition (including device
+        # login) happens outside the SDK; this layer only forwards the token.
+        self._oauth_secret_env = _OAUTH_SECRET_ENV_BY_AGENT_TYPE.get(
+            self.agent_type,
+            "CLAUDE_CODE_OAUTH_TOKEN",  # backwards compatibility
+        )
+        self._oauth_token = oauth_token or os.environ.get(self._oauth_secret_env)
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
 
         if (self._oauth_token or self._api_key) and _is_remote_http(self._api_url):
@@ -753,7 +764,7 @@ class Agent:
         # User-supplied secrets win; oauth/api fields fill in only if absent.
         secrets: dict[str, str] = dict(self._user_secrets)
         if self._oauth_token:
-            secrets.setdefault("CLAUDE_CODE_OAUTH_TOKEN", self._oauth_token)
+            secrets.setdefault(self._oauth_secret_env, self._oauth_token)
         if self._api_key:
             secrets.setdefault("ANTHROPIC_API_KEY", self._api_key)
         return secrets

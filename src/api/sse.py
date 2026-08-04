@@ -21,6 +21,8 @@ UT_TOOL_STARTED = "execute_tool_started"   # legacy-compat, see above
 UT_TOOL_CALL_UPDATE = "tool_call_update"
 UT_USAGE_UPDATE = "usage_update"
 UT_USAGE_UPDATED = "usage_updated"        # legacy-compat, see above
+UT_AVAILABLE_COMMANDS_UPDATE = "available_commands_update"
+UT_SESSION_INFO_UPDATE = "session_info_update"
 
 # Read timeout for the session/prompt POST in the SSE prompt-drive
 # (``BaseSandboxSession.execute_prompt``). The SSE GET itself uses
@@ -236,6 +238,8 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
     - done:        {"type": "done", "stop_reason": "..."}
     - error:       {"type": "error", "text": "...", "kind": "...", "data": {...}}
     - usage:       {"type": "usage", "usage": {...}}
+    - commands:    {"type": "commands", "commands": [...], "raw": {...}}
+    - session_info:{"type": "session_info", "raw": {...}}
     """
     payload = parse_sse_data(block)
     if payload is None:
@@ -292,6 +296,17 @@ def parse_acp_event(block: str, rpc_id: str | None = None) -> dict | None:
 
     if ut in (UT_USAGE_UPDATE, UT_USAGE_UPDATED):
         return {"type": "usage", "usage": data.get("cost", data)}
+
+    if ut == UT_AVAILABLE_COMMANDS_UPDATE:
+        commands = data.get("availableCommands", data.get("available_commands", []))
+        return {
+            "type": "commands",
+            "commands": commands if isinstance(commands, list) else [],
+            "raw": data,
+        }
+
+    if ut == UT_SESSION_INFO_UPDATE:
+        return {"type": "session_info", "raw": data}
 
     return None
 

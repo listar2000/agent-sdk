@@ -1,15 +1,19 @@
+FROM node:22-bookworm-slim AS nodejs
+
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install Node.js (required for ACP supervisor) plus zstd (used by supervisor.js
+# Install Node.js 22 (required by the current Claude ACP adapter) plus zstd
+# (used by supervisor.js
 # for cold-tier snapshot compression — bench showed zstd-1 cuts artifact size
 # ~10× with no wall-clock regression on a 1-vCPU sandbox; absence triggers
 # a safe uncompressed fallback in supervisor.js but you lose the win).
-RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm git zstd && rm -rf /var/lib/apt/lists/*
-
-# Install agent CLIs
-RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
+RUN apt-get update && apt-get install -y --no-install-recommends curl git libstdc++6 zstd && rm -rf /var/lib/apt/lists/*
+COPY --from=nodejs /usr/local/bin/node /usr/local/bin/node
+COPY --from=nodejs /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 # Install ``uv`` system-wide so AgentConfig.cli_tools (declarative ``uv tool
 # install`` sources) works on every sandbox without bootstrap-in-pre_start.
@@ -33,12 +37,13 @@ COPY .runtime-image-tag* .runtime-snapshot-tag* .modal-snapshot-tag* ./
 
 RUN pip install --no-cache-dir .
 
-# Pre-install the supervisor's npm deps so first-session startup doesn't
-# wait on npm and the ACP bin symlinks resolve relative to this directory.
+# Pre-install the locked supervisor and ACP runtime dependencies so first-
+# session startup doesn't wait on npm and the ACP bin paths resolve relative
+# to this directory. Each adapter brings its compatible CLI transitively.
 # Note: do NOT pass --omit=optional. opencode-ai's postinstall requires
 # the platform-specific opencode-linux-x64 (an optional dep) and fails
 # with "Cannot find module 'opencode-linux-x64/package.json'" otherwise.
-RUN cd src/supervisor && npm install --loglevel=warn
+RUN cd src/supervisor && npm ci --loglevel=warn
 
 # Symlink ``/opt/agent-sdk/runtime`` to the actual supervisor dir so
 # providers that hardcode the canonical runtime path (daytona/modal/docker

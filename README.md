@@ -72,11 +72,27 @@ await asyncio.gather(a.arun("write notes.md"), b.arun("read notes.md"))
 
 Names are `[a-z0-9][a-z0-9._-]{0,63}`. Supported on `unix_local`, `docker`, `modal`; rejected (HTTP 400) on `daytona` — S3-FUSE + tarball snapshots can't coordinate concurrent writers.
 
-### Per-request Claude credentials
+### Per-session credentials
 
 ```python
 agent = Agent("worker", provider="daytona", oauth_token=user_oauth_token)
-# fallback: oauth_token= > CLAUDE_CODE_OAUTH_TOKEN env > api_key= > ANTHROPIC_API_KEY env
+```
+
+For Codex on a personal ChatGPT account, copy the complete local login cache
+through the secrets channel. The sandbox writes it to `~/.codex/auth.json`
+before ACP starts and keeps Codex's refreshed copy across restarts:
+
+```python
+from pathlib import Path
+
+agent = Agent(
+    "worker",
+    agent_type="codex",
+    provider="daytona",
+    secrets={
+        "CODEX_AUTH_JSON": (Path.home() / ".codex" / "auth.json").read_text(),
+    },
+)
 ```
 
 ## Architecture

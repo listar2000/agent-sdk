@@ -4,6 +4,7 @@ import sys
 import pytest
 
 
+from api.acp_client import ACP_AUTHENTICATION_REQUIRED, AcpError
 from api.providers import ProviderInstance
 from api.providers.modal.session import ModalSandboxSession
 from api.sandbox.state import ModalSandboxState, Recipe
@@ -201,3 +202,28 @@ async def test_modal_start_retries_attach_before_success(monkeypatch):
     assert attach_attempts["count"] == 3
     assert sess.state.sandbox_ref == "sb-retry"
     assert sess.supervisor_url == "https://modal.test"
+
+
+@pytest.mark.asyncio
+async def test_modal_attach_does_not_retry_non_retryable_acp_error(monkeypatch):
+    state = ModalSandboxState(recipe=Recipe())
+    sess = ModalSandboxSession(session_id="sess-modal-auth", state=state)
+
+    attempts = {"count": 0}
+
+    async def _attach_terminal():
+        attempts["count"] += 1
+        try:
+            raise AcpError(
+                ACP_AUTHENTICATION_REQUIRED,
+                "Authentication required",
+            )
+        except AcpError as exc:
+            raise RuntimeError("session/new failed") from exc
+
+    monkeypatch.setattr(sess, "_attach_acp", _attach_terminal)
+
+    with pytest.raises(RuntimeError, match="session/new failed"):
+        await sess._attach_with_retry()
+
+    assert attempts["count"] == 1

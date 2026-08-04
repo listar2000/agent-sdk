@@ -59,6 +59,34 @@ def test_registration_payload_puts_oauth_token_in_secrets():
 
 
 @pytest.mark.timeout(5)
+def test_registration_payload_uses_codex_access_token_for_codex_oauth():
+    a = Agent(
+        "x",
+        agent_type="codex",
+        provider="unix_local",
+        api_url="http://localhost:7778",
+        oauth_token="secret-codex-oauth",
+    )
+    p = _payload(a)
+    assert p["secrets"] == {"CODEX_ACCESS_TOKEN": "secret-codex-oauth"}
+    assert "oauth_token" not in p
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in p["secrets"]
+
+
+@pytest.mark.timeout(5)
+def test_codex_oauth_uses_codex_environment(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-token")
+    monkeypatch.setenv("CODEX_ACCESS_TOKEN", "codex-token")
+    a = Agent(
+        "x",
+        agent_type="codex",
+        provider="unix_local",
+        api_url="http://localhost:7778",
+    )
+    assert _payload(a)["secrets"] == {"CODEX_ACCESS_TOKEN": "codex-token"}
+
+
+@pytest.mark.timeout(5)
 def test_registration_payload_puts_api_key_in_secrets():
     """Same contract for ``api_key``."""
     a = Agent("x", provider="unix_local", api_url="http://localhost:7778",

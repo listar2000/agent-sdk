@@ -21,6 +21,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from api.providers._shared import _ACP_LOCAL_LOGIN_FILES, _acp_bin_name
 from api.providers.unix_local import UnixLocalVolumeAdapter
 
 pytestmark = pytest.mark.skipif(
@@ -189,6 +190,47 @@ async def test_create_sandbox_uses_image_runtime_when_flag_set(
     assert str(legacy_sup) not in argv, (
         f"argv unexpectedly contains the legacy volume path: {argv}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_type,login_file", _ACP_LOCAL_LOGIN_FILES.items())
+async def test_runtime_login_bridged_into_isolated_home(
+    agent_type, login_file, tmp_path, monkeypatch,
+):
+    """Local sessions reuse the runtime login without leaking it via env."""
+    auth_relpath = Path(login_file)
+    host_home = tmp_path / "host-home"
+    host_auth = host_home / auth_relpath
+    host_auth.parent.mkdir(parents=True)
+    host_auth.write_text('{"credential":"fake"}')
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("AGENT_SDK_LOCAL_VOL_ROOT", str(tmp_path / "volumes"))
+
+    runtime_dir = tmp_path / "runtime"
+    bin_dir = runtime_dir / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    (runtime_dir / "supervisor.js").write_text("// stub\n")
+    runtime_bin = bin_dir / _acp_bin_name(agent_type)
+    runtime_bin.write_text("#!/bin/sh\nexit 0\n")
+    runtime_bin.chmod(0o755)
+    monkeypatch.setenv("AGENT_SDK_RUNTIME_PATH", str(runtime_dir))
+
+    from api.providers import unix_local as local
+
+    ref = await local.create_volume(_vol_name())
+    _CapturingPopen.captured.clear()
+    monkeypatch.setattr(local.subprocess, "Popen", _CapturingPopen)
+
+    with pytest.raises(Exception):
+        await local.create_sandbox(
+            volume_ref=ref,
+            subpath="agents/runtime-worker/home",
+            agent_type=agent_type,
+        )
+
+    copied = Path(ref) / "agents" / "runtime-worker" / "home" / auth_relpath
+    assert copied.read_text() == host_auth.read_text()
+    assert copied.stat().st_mode & 0o777 == 0o600
 
 
 # test_create_sandbox_uses_volume_runtime_by_default was deleted in Phase E

@@ -38,6 +38,8 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 AUTH_KEYS = frozenset({
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_AUTH_JSON",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
     "OPENROUTER_API_KEY",
@@ -75,19 +77,18 @@ _ACP_BIN_NAMES = {
     "goose": "goose",
 }
 _ACP_NPM_SPECS = {
-    "claude": "@agentclientprotocol/claude-agent-acp@^0.27.0",
+    "claude": "@agentclientprotocol/claude-agent-acp@0.64.2",
+    "codex": "@agentclientprotocol/codex-acp@1.1.9",
     "opencode": "opencode-ai@^1.4.3",
-    # Only claude + opencode are used. The runtimes below are commented out to
-    # keep the baked agent image small (the supervisor package.json mirrors
-    # this in _disabledDependencies). Uncomment to re-enable the agent_type.
-    # "codex": "@zed-industries/codex-acp@^0.11.1",
-    # NOTE: re-enabling codex requires restoring the codex-only
-    # `authenticate({methodId: "openai-api-key"})` retry in
-    # AcpClient.initialize — deleted as dead in 57a3160^ (audit: safe while
-    # codex is disabled; mandatory for codex bootstrap).
+    # The runtimes below are disabled to keep the baked agent image small.
+    # The supervisor package.json mirrors this in _disabledDependencies.
     # "gemini": "@google/gemini-cli@^0.37.2",
     # "cline": "cline-acp@^0.1.6",
     # "deepagents": "deepagents-acp@^0.1.8",
+}
+_ACP_LOCAL_LOGIN_FILES = {
+    "claude": ".claude/.credentials.json",
+    "codex": ".codex/auth.json",
 }
 _ACP_LAUNCH_ARGS: dict[str, list[str]] = {
     "opencode": ["acp"],

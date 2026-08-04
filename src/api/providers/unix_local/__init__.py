@@ -26,6 +26,7 @@ from .._shared import (
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_BIN_NAMES,
+    _ACP_LOCAL_LOGIN_FILES,
     _ACP_NPM_SPECS,
     _acp_bin_name,
     _acp_launch_args,
@@ -312,9 +313,14 @@ async def create_sandbox(
             )
         acp_bin_str = system_bin
 
+    login_file = _ACP_LOCAL_LOGIN_FILES.get(agent_type)
+    auth_relpath = Path(login_file) if login_file else None
+
     def _mkhome():
         os.makedirs(home_dir, exist_ok=True)
         os.makedirs(home_dir / ".claude", exist_ok=True)
+        if auth_relpath:
+            os.makedirs(home_dir / auth_relpath.parent, exist_ok=True)
     await asyncio.to_thread(_mkhome)
 
     # Build the supervisor env. The local provider runs the agent as a child of
@@ -334,16 +340,22 @@ async def create_sandbox(
     base_env["CLAUDE_CONFIG_DIR"] = str(home_dir / ".claude")
     base_env["AGENT_SHARED_DIR"] = str(vol / "shared")
 
-    # Bridge the host user's existing Claude credentials into the per-sandbox
-    # CLAUDE_CONFIG_DIR on first start. Makes ``claude setup-token`` done once
-    # on the host flow naturally to every sandbox without re-auth per session.
-    host_cred = Path.home() / ".claude" / ".credentials.json"
-    sandbox_cred = home_dir / ".claude" / ".credentials.json"
-    if host_cred.is_file() and not sandbox_cred.exists():
+    # Bridge a runtime's standard host login into its isolated local HOME.
+    # This is deliberately local-provider-only: auth files never enter a
+    # request, environment variable, repository, image, or remote sandbox.
+    host_auth = Path.home() / auth_relpath if auth_relpath else None
+    sandbox_auth = home_dir / auth_relpath if auth_relpath else None
+    if (
+        host_auth is not None
+        and sandbox_auth is not None
+        and host_auth.is_file()
+        and not sandbox_auth.exists()
+    ):
         try:
-            shutil.copy(host_cred, sandbox_cred)
+            shutil.copy2(host_auth, sandbox_auth)
+            sandbox_auth.chmod(0o600)
         except Exception as e:
-            log.warning("could not bridge host .credentials.json: %s", e)
+            log.warning("could not bridge host auth for %s: %s", agent_type, e)
 
     launch_args = _acp_launch_args(agent_type)
     extra: list[str] = []

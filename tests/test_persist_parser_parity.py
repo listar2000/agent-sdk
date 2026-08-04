@@ -12,8 +12,9 @@ Three previously-leaked bugs that this pins:
    ``reasoning`` — silently dropped from canonical log.
 2. ``agent_message_chunk`` with empty text produced an empty
    ``assistant_message`` row that didn't exist in the SSE stream.
-3. ``available_commands_update`` (and other meta updates) were logged
-   as themselves rather than skipped.
+3. ``available_commands_update`` was once silently dropped. It is now a
+   transient live event: visible to SDK/SSE consumers but not duplicated in
+   the persisted session log on every prompt.
 """
 from __future__ import annotations
 
@@ -77,15 +78,37 @@ def test_agent_message_chunk_empty_text_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# The meta-update bug — must skip non-event updates
+# Runtime metadata — expose commands and session information
 # ---------------------------------------------------------------------------
 
-def test_available_commands_update_returns_none():
+def test_available_commands_update_maps_to_transient_commands_event():
     block = _wrap({
         "sessionUpdate": "available_commands_update",
-        "available_commands": [{"name": "Bash"}],
+        "availableCommands": [{"name": "goal", "description": "Set a goal"}],
     })
-    assert _parse_sse_block(block, "rpc-1") is None
+    event = _parse_sse_block(block, "rpc-1")
+    assert event["type"] == "commands"
+    assert event["commands"] == [{"name": "goal", "description": "Set a goal"}]
+
+
+def test_session_info_update_preserves_vendor_metadata():
+    meta = {"vendor": {"state": {"status": "active"}}}
+    block = _wrap({
+        "sessionUpdate": "session_info_update",
+        "_meta": meta,
+    })
+    event = _parse_sse_block(block, "rpc-1")
+    assert event["type"] == "session_info"
+    assert event["raw"]["_meta"] == meta
+
+
+def test_session_info_update_preserves_null_vendor_metadata_values():
+    block = _wrap({
+        "sessionUpdate": "session_info_update",
+        "_meta": {"vendor": {"state": None}},
+    })
+    event = _parse_sse_block(block, "rpc-1")
+    assert event["raw"]["_meta"]["vendor"]["state"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +152,7 @@ def test_heartbeat_returns_none():
     ("usage", "usage"),
     ("error", "error"),
     ("done", "turn_end"),
+    ("session_info", "session_info"),
 ])
 def test_event_type_to_log_covers_parser_outputs(etype, expected_log_type):
     from api.turn import _EVENT_TYPE_TO_LOG
@@ -233,6 +257,35 @@ async def test_persist_logs_empty_done_turn_for_rca(monkeypatch, caplog):
     messages = [r.message for r in caplog.records]
     assert any("empty prompt turn" in m for m in messages)
     assert any("rpc-empty" in m and "message_chars=2" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_available_commands_are_live_only_not_persisted(monkeypatch):
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "commands", "commands": [{"name": "goal"}]},
+        {"type": "text", "text": "ready"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    await _persist_prompt_events(sess, "/goal test", "rpc-commands")
+    assert "commands" not in [event_type for event_type, _ in rows]
+
+
+@pytest.mark.asyncio
+async def test_session_info_only_turn_is_not_reported_as_empty(monkeypatch):
+    rows = _capture_log_writes(monkeypatch)
+    sess = _FakeSession([
+        {"type": "session_info", "raw": {
+            "sessionUpdate": "session_info_update",
+            "_meta": {"vendor": {"state": None}},
+        }},
+        {"type": "done", "stop_reason": "end_turn"},
+    ])
+    await _persist_prompt_events(sess, "/command", "rpc-session-info")
+    event_types = [
+        event_type for event_type, _ in rows if event_type != "user_message"
+    ]
+    assert event_types == ["session_info", "turn_end"]
 
 
 @pytest.mark.asyncio

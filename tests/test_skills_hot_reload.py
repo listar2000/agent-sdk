@@ -110,6 +110,8 @@ async def test_reload_hot_installs_skill_preserves_conversation(acp_runtime):
         pytest.skip("acp_runtime credential missing")
     if not DAYTONA_API_KEY:
         pytest.skip("DAYTONA_API_KEY required")
+    if not acp_runtime.get("secrets"):
+        pytest.skip("runtime authentication is not configured for Daytona")
     if not await _server_up():
         pytest.skip(f"no server at {SERVER}")
 
@@ -123,14 +125,17 @@ async def test_reload_hot_installs_skill_preserves_conversation(acp_runtime):
         f"reload-skill-{uuid.uuid4().hex[:8]}",
         provider="daytona",
         api_url=SERVER,
-        # ``acp_runtime`` carries agent_type + model + secrets for either
-        # claude (oauth) or opencode (openrouter).
+        # ``acp_runtime`` carries agent_type + model + secrets for Claude,
+        # OpenCode, or Codex.
         **acp_runtime,
     )
     sdk = ApiClient(SERVER)
     try:
         # ── Cold-create with NO skills ──────────────────────────────────
-        await agent.configure(model=acp_runtime["model"])
+        if acp_runtime.get("model"):
+            await agent.configure(model=acp_runtime["model"])
+        else:
+            await agent.configure()
         assert agent.session_id and agent.sandbox_ref
 
         # Baseline: hive skills NOT yet on disk.

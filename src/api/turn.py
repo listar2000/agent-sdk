@@ -40,7 +40,14 @@ _EVENT_TYPE_TO_LOG = {
     "usage": EVT_USAGE,
     "error": EVT_ERROR,
     "done": "turn_end",
+    "session_info": "session_info",
 }
+
+# Advertised commands are runtime capability metadata, replayed by the
+# supervisor for every late SSE subscriber. Broadcast them to live SDK/UI
+# consumers, but do not duplicate the same command list in session_log on
+# every prompt.
+_TRANSIENT_EVENT_TYPES = frozenset({"commands"})
 
 # An "empty turn" (clean terminal, zero output, zero errors) almost always
 # means the inner runtime swallowed an upstream failure — e.g. opencode ends
@@ -146,6 +153,10 @@ class TurnRunner:
         # values the persisted row will.
         raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
         if etype in {"text", "reasoning", "tool", "tool_result"}:
+            self.saw_output_event = True
+        elif etype == "session_info":
+            # Session metadata can be the only meaningful result of a command.
+            # Treat it as output rather than fabricating an upstream-error row.
             self.saw_output_event = True
         elif etype == "error":
             self.saw_error_event = True
@@ -285,6 +296,10 @@ class TurnRunner:
                     self.think_buf.append(event.get("text", ""))
                 elif t == "usage":
                     await self._write(event)
+                elif t in _TRANSIENT_EVENT_TYPES:
+                    # execute_prompt already broadcast the raw ACP block.
+                    # This branch only suppresses repetitive persistence.
+                    continue
                 else:
                     await self._flush_buffers()
                     await self._write(event)

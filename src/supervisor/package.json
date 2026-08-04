@@ -12,12 +12,12 @@
     "start": "node supervisor.js"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "^0.27.0",
+    "@agentclientprotocol/claude-agent-acp": "0.64.2",
+    "@agentclientprotocol/codex-acp": "1.1.9",
     "opencode-ai": "^1.4.3"
   },
-  "//_disabledDependencies": "Only claude + opencode ACP runtimes are used. The entries below are commented out (JSON has no comments, so they live in an npm-ignored key) to keep the image small. Move any back into `dependencies` to re-enable.",
+  "//_disabledDependencies": "The entries below are not currently used. They live in an npm-ignored key because JSON has no comments. Move an entry into `dependencies` to enable its agent type.",
   "_disabledDependencies": {
-    "@zed-industries/codex-acp": "^0.11.1",
     "@google/gemini-cli": "^0.37.2",
     "cline-acp": "^0.1.6",
     "deepagents-acp": "^0.1.8"

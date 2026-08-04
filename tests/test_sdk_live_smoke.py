@@ -281,7 +281,10 @@ async def test_agent_sandbox_helpers_round_trip(acp_runtime):
     try:
         # _ensure_registered is private; trigger it via any public call.
         # ``configure`` is cheap and idempotent and forces registration.
-        await agent.configure(model=acp_runtime["model"])
+        if acp_runtime.get("model"):
+            await agent.configure(model=acp_runtime["model"])
+        else:
+            await agent.configure()
 
         sb = agent.sandbox
 
