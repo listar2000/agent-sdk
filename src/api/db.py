@@ -730,8 +730,11 @@ async def log_event(*, session_id: str, agent_id: str,
     )
 
 
-async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
+async def get_session_log(
+    session_id: str, limit: int | None = 500,
+) -> list[LogEntry]:
     # Return the *tail* N events (most recent) in chronological order.
+    # ``limit=None`` is reserved for complete-log exporters.
     # ORDER BY id (BIGSERIAL) — strictly monotonic by insertion order.
     # ``ORDER BY created_at`` ties when two INSERTs land within the same
     # microsecond (Postgres's ``now()`` resolves to transaction start
@@ -744,14 +747,21 @@ async def get_session_log(session_id: str, limit: int = 500) -> list[LogEntry]:
     # the session has more than ``limit`` rows; the outer ``ORDER BY id
     # ASC`` restores chronological order so callers can replay them
     # straight through. Sessions shorter than ``limit`` are unaffected.
-    rows = await _all(
-        "SELECT id, session_id, agent_id, event_type, payload, created_at"
-        " FROM ("
-        "   SELECT id, session_id, agent_id, event_type, payload, created_at"
-        "   FROM session_log WHERE session_id = %s ORDER BY id DESC LIMIT %s"
-        " ) AS t ORDER BY id ASC",
-        (session_id, limit),
-    )
+    if limit is None:
+        rows = await _all(
+            "SELECT id, session_id, agent_id, event_type, payload, created_at"
+            " FROM session_log WHERE session_id = %s ORDER BY id ASC",
+            (session_id,),
+        )
+    else:
+        rows = await _all(
+            "SELECT id, session_id, agent_id, event_type, payload, created_at"
+            " FROM ("
+            "   SELECT id, session_id, agent_id, event_type, payload, created_at"
+            "   FROM session_log WHERE session_id = %s ORDER BY id DESC LIMIT %s"
+            " ) AS t ORDER BY id ASC",
+            (session_id, limit),
+        )
     return [_row_to_log_entry(r) for r in rows]
 
 
