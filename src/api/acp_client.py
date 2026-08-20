@@ -9,24 +9,48 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+ACP_AUTHENTICATION_REQUIRED = -32000
+_NON_RETRYABLE_ACP_CODES = {ACP_AUTHENTICATION_REQUIRED}
+
+
+class AcpError(RuntimeError):
+    """Structured JSON-RPC error returned by an ACP runtime."""
+
+    def __init__(self, code: int | None, message: str | None, data: Any = None):
+        self.code = code
+        self.message = message
+        self.data = data
+        super().__init__(f"ACP error [{code}]: {message}")
+
+
+def is_retryable_acp_error(exc: BaseException) -> bool:
+    """Return whether an ACP failure (possibly wrapped) may be transient."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, AcpError):
+            return current.code not in _NON_RETRYABLE_ACP_CODES
+        current = current.__cause__ or current.__context__
+    return True
+
 
 def _normalize_acp_model(model: str, *, agent_type: str) -> str:
     """Normalize model IDs based on the active ACP runtime.
 
-    ``claude-agent-acp`` only accepts ``default``/``opus``/``haiku`` for
-    ``session/set_config_option``. OpenCode and other ACP runtimes expect
-    concrete provider/model IDs and should receive the user-selected value
-    unchanged.
+    The pinned ``claude-agent-acp`` exposes semantic aliases rather than
+    public API model IDs. OpenCode and other ACP runtimes expect concrete
+    provider/model IDs and should receive the user-selected value unchanged.
     """
     if agent_type != "claude":
         return (model or "").strip()
     if not model:
         return "default"
     s = model.strip().lower()
-    if s in ("default", "opus", "haiku"):
+    if s in ("default", "sonnet", "opus", "haiku"):
         return s
     if "sonnet" in s:
-        return "default"  # ACP's "default" slot points at the latest sonnet
+        return "sonnet"
     if "opus" in s:
         return "opus"
     if "haiku" in s:
@@ -131,9 +155,17 @@ class AcpClient:
             proxy=None,
         )
         self._inner_session_ids: dict[str, str] = {}  # session_id -> agent's internal session ID
+        self._session_config_options: dict[str, list[dict[str, Any]]] = {}
 
     def get_inner_session_id(self, session_id: str) -> str | None:
         return self._inner_session_ids.get(session_id)
+
+    def _remember_config_options(self, session_id: str, result: dict) -> None:
+        options = result.get("configOptions")
+        if isinstance(options, list):
+            self._session_config_options[session_id] = [
+                option for option in options if isinstance(option, dict)
+            ]
 
     async def health_probe(self, timeout: float = 2.0) -> tuple[bool, int | None]:
         """Liveness probe: GET /v1/health using the cached httpx pool.
@@ -178,7 +210,8 @@ class AcpClient:
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
-            raise RuntimeError(f"ACP error [{data['error'].get('code')}]: {data['error'].get('message')}")
+            error = data["error"]
+            raise AcpError(error.get("code"), error.get("message"), error.get("data"))
         return data.get("result", {})
 
     async def _notify(self, session_id: str, method: str, params: dict,
@@ -199,10 +232,9 @@ class AcpClient:
         """ACP protocol handshake only. Does NOT create a session.
 
         Advertises NO optional client capabilities. Verified empirically
-        (2026-06, pinned opencode 1.14.30 + claude-agent-acp 0.27.0): both
-        runtimes execute every tool locally in the ACP child process
-        regardless of advertised capabilities — fs/terminal flags change
-        nothing about tool routing, and writes outside cwd behave
+        against the pinned adapters: runtimes execute tools locally in the ACP
+        child process regardless of advertised capabilities — fs/terminal
+        flags change nothing about tool routing, and writes outside cwd behave
         identically with or without them (the earlier claim here that
         opencode "falls back to a stricter internal filesystem layer"
         without fs capabilities was re-tested and is false on 1.14.30).
@@ -269,6 +301,8 @@ class AcpClient:
                             continue  # immediate retry (no backoff consumed)
                         except Exception as ae:
                             log.warning("codex authenticate(api-key) failed: %s", ae)
+                    if not is_retryable_acp_error(e):
+                        break
                     if attempt < len(backoffs):
                         log.info(
                             "session/new attempt %d failed (%s); retrying in %.1fs",
@@ -281,6 +315,7 @@ class AcpClient:
             log.info("session/new result for %s: sessionId=%s keys=%s", session_id, inner_sid, list(new_result.keys()))
             if inner_sid:
                 self._inner_session_ids[session_id] = inner_sid
+                self._remember_config_options(session_id, new_result)
                 try:
                     # codex's default `agent` mode runs tools in an internal sandbox that
                     # breaks taskgen file writes; `agent-full-access` matches claude's
@@ -343,7 +378,7 @@ class AcpClient:
         result = await self.handshake(session_id, agent)
         mcp_array = _mcp_dict_to_acp_array(mcp_servers) if mcp_servers else []
         try:
-            await self._send_rpc(
+            load_result = await self._send_rpc(
                 session_id,
                 "session/load",
                 {"sessionId": inner_session_id, "cwd": cwd, "mcpServers": mcp_array},
@@ -358,6 +393,7 @@ class AcpClient:
                                          mcp_servers=mcp_servers,
                                          extra_options=extra_options)
         self._inner_session_ids[session_id] = inner_session_id
+        self._remember_config_options(session_id, load_result)
         try:
             await self.set_mode(session_id, _BYPASS_MODE.get(agent, "bypassPermissions"))
         except Exception:
@@ -418,28 +454,114 @@ class AcpClient:
             except Exception:
                 continue
 
+    @staticmethod
+    def _applied_config_value(result: dict, config_id: str) -> Any:
+        """Extract a config option's applied value from common ACP responses."""
+        options = result.get("configOptions") or result.get("options")
+        if isinstance(options, list):
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                if option.get("id") == config_id or option.get("category") == config_id:
+                    for field in ("currentValue", "current_value", "value"):
+                        if field in option:
+                            return option[field]
+        for field in ("currentValue", "current_value", "value"):
+            if field in result:
+                return result[field]
+        return None
+
+    def _advertised_config_id(
+        self,
+        session_id: str,
+        *search_terms: str,
+    ) -> str | None:
+        """Find an ACP config ID by matching its advertised metadata."""
+        for option in self._session_config_options.get(session_id, []):
+            searchable = " ".join(
+                str(option.get(field, ""))
+                for field in ("id", "name", "category")
+            ).lower()
+            if any(term in searchable for term in search_terms):
+                candidate = option.get("id")
+                if isinstance(candidate, str) and candidate:
+                    return candidate
+        return None
+
     async def set_model(self, session_id: str, model: str, agent_type: str = "claude") -> None:
         """Change the agent model mid-session.
 
         For ``agent_type="claude"``, normalizes Anthropic public IDs to
-        Claude ACP aliases (``default``/``opus``/``haiku``). For other
+        Claude ACP aliases (``default``/``sonnet``/``opus``/``haiku``). For other
         runtimes (notably ``opencode``), forwards the value as-is.
         """
-        await self.call(
+        normalized = _normalize_acp_model(model, agent_type=agent_type)
+        config_id = self._advertised_config_id(session_id, "model") or "model"
+        result = await self.call(
             session_id, "session/set_config_option",
-            {"configId": "model", "value": _normalize_acp_model(model, agent_type=agent_type)},
+            {"configId": config_id, "value": normalized},
+        )
+        self._remember_config_options(session_id, result)
+        applied = self._applied_config_value(result, config_id)
+        matches = applied == normalized
+        if agent_type == "claude" and isinstance(applied, str):
+            # Claude accepts semantic aliases but reports the resolved concrete
+            # model ID in configOptions.
+            matches = normalized == "default" or normalized in applied.lower()
+        if applied is not None and not matches:
+            raise RuntimeError(
+                f"ACP {config_id!r} applied {applied!r}, expected {normalized!r}"
+            )
+        log.info(
+            "set_model: session=%s requested=%r normalized=%r applied=%r",
+            session_id,
+            model,
+            normalized,
+            applied,
         )
 
     async def set_thought_level(self, session_id: str, level: str, agent_type: str = "claude") -> None:
-        """Set thinking depth ('high', 'medium', 'low').
+        """Set and verify the runtime-specific reasoning-effort option.
 
-        The config id is vendor-specific: codex uses ``reasoning_effort``, claude
-        (and the default) use ``thinking``."""
-        config_id = "reasoning_effort" if agent_type == "codex" else "thinking"
-        await self.call(
-            session_id, "session/set_config_option",
-            {"configId": config_id, "value": level},
+        ACP standardizes config options but leaves their IDs to agents. Match
+        the advertised option first. Codex falls back to ``reasoning_effort``;
+        Claude tries current ``effort`` and then legacy ``thinking``.
+        """
+        advertised = self._advertised_config_id(session_id, "effort", "thinking")
+        config_ids = (
+            (advertised,)
+            if advertised
+            else (("reasoning_effort",) if agent_type == "codex" else ("effort", "thinking"))
         )
+        last_exc: Exception | None = None
+        for config_id in config_ids:
+            try:
+                result = await self.call(
+                    session_id,
+                    "session/set_config_option",
+                    {"configId": config_id, "value": level},
+                )
+            except Exception as exc:
+                last_exc = exc
+                continue
+            self._remember_config_options(session_id, result)
+            applied = self._applied_config_value(result, config_id)
+            if applied is not None and applied != level:
+                raise RuntimeError(
+                    f"ACP {config_id!r} applied {applied!r}, expected {level!r}"
+                )
+            log.info(
+                "set_thought_level: session=%s agent_type=%s config_id=%s requested=%r applied=%r",
+                session_id,
+                agent_type,
+                config_id,
+                level,
+                applied,
+            )
+            return
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"no effort config is available for agent_type={agent_type!r}")
 
     async def aclose(self) -> None:
         await self._client.aclose()

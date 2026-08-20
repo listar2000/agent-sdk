@@ -824,7 +824,7 @@
               <div class="field-badges"></div>
               <span class="field-name">thought_level</span>
               <span class="field-type">str?</span>
-              <span class="field-desc">"low" | "medium" | "high" — Claude's "thinking" config_id</span>
+              <span class="field-desc">"low" | "medium" | "high" — runtime reasoning-effort option</span>
             </div>
             <div class="relation-note">Stored as JSON in agents.config column. Pure agent identity — cloneable, no per-invocation state. <code style="font-family:monospace;color:#fb923c;">mode</code> + <code style="font-family:monospace;color:#fb923c;">thought_level</code> are persisted here so cold-recovery (Type-2) replays them via <code style="font-family:monospace;color:#fb923c;">_attach_acp</code>.</div>
             <div class="relation-note" style="margin-top:6px;">

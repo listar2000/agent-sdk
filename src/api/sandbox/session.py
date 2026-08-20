@@ -228,9 +228,9 @@ class BaseSandboxSession(abc.ABC):
         Re-applies any persisted ``agents.config.model`` after each fresh
         attach. ``set_model`` only affects the current ACP session — every
         cold-create / Type-2 recovery mints a new ACP session that
-        defaults to ``"default"`` (sonnet 4.6), so without this replay
-        callers who set ``model="haiku"`` once would silently revert to
-        sonnet on the first sandbox restart."""
+        defaults to the adapter's moving ``"default"`` alias, so without
+        this replay callers who set ``model="haiku"`` once could silently
+        switch models on the first sandbox restart."""
         if self._acp_attached:
             return
         if self._supervisor_url is None or self._acp_session_id is None:
@@ -284,8 +284,8 @@ class BaseSandboxSession(abc.ABC):
                 async def _do(sid: str, _val: str = val) -> None:
                     await client.set_model(sid, _val, agent_type)
                 return _do
-            # thought_level is likewise agent_type-sensitive (codex -> reasoning_effort,
-            # claude -> thinking), so bind it the same way.
+            # thought_level is likewise agent_type-sensitive (Codex and Claude
+            # advertise different effort option IDs), so bind it the same way.
             def _bind_set_thought(val: str):
                 async def _do(sid: str, _val: str = val) -> None:
                     await client.set_thought_level(sid, _val, agent_type)
@@ -662,7 +662,8 @@ class BaseSandboxSession(abc.ABC):
         await self._acp_call("set_model", model, self.state.recipe.agent_type)
 
     async def set_thought_level(self, level: str) -> None:
-        # Pass agent_type so codex routes to configId "reasoning_effort" (claude -> "thinking").
+        # Pass agent_type so the ACP client can select the runtime's advertised
+        # effort option and use the correct compatibility fallback.
         await self._acp_call("set_thought_level", level, self.state.recipe.agent_type)
 
     # --- Liveness probe hook (subclass overrides if it has a cheap probe) ---

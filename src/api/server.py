@@ -33,6 +33,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
+from .atif import build_atif_trajectory
 from .event_buffer import start_batcher, stop_batcher
 from .sse import is_terminal_block
 from .timing import extract_session_id, log_request, timed_phase
@@ -1680,6 +1681,18 @@ async def get_session_log_route(session_id: str, limit: int = Query(default=500)
         }
         for e in entries
     ]
+
+
+@app.get("/sessions/{session_id}/trajectory")
+async def get_session_trajectory_route(session_id: str):
+    """Export the complete persisted session log as ATIF v1.7."""
+    session = await _require_session_row(session_id)
+    agent = await _require_agent(session["agent_id"])
+    entries = await get_session_log(session_id, limit=None)
+    try:
+        return build_atif_trajectory(session=session, agent=agent, entries=entries)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

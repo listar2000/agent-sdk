@@ -416,7 +416,12 @@ async def create_sandbox(
 
     modal, _ = _require_modal()
     app = await _get_app()
-    sandbox_image = await _get_image(image=image, dockerfile=dockerfile)
+    # Preserve the no-argument default path for callers/tests that replace the
+    # shared-image resolver. Custom boot sources opt into the extended call.
+    if image is None and dockerfile is None:
+        sandbox_image = await _get_image()
+    else:
+        sandbox_image = await _get_image(image=image, dockerfile=dockerfile)
     vol = await _get_volume(volume_ref)
 
     agent_root = root or _AGENT_HOME_IN

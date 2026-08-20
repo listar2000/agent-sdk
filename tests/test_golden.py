@@ -42,9 +42,8 @@ for per-test invariants. Six thematic groups:
               subscriber-presence is being counted as compute activity
               (the Bug B pin). Drives POST /sessions/{id}/reap?idle_s=0.
 
-Skipped when the provider is unavailable (no docker daemon, no
-DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN, no modal profile, or no
-server on localhost:7778).
+Skipped when the provider, runtime authentication, or local server is
+unavailable.
 """
 from __future__ import annotations
 
@@ -60,6 +59,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import pytest
@@ -71,6 +71,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 load_dotenv(os.path.expanduser("~/.env"), override=False)
 
 from agent_sdk import ApiClient  # noqa: E402
+from api.providers._shared import _ACP_LOCAL_LOGIN_FILES  # noqa: E402
 from api.sse import extract_sse_tag, parse_acp_event  # noqa: E402
 from tests._acp_runtimes import agent_type_param, agent_type_param_with_native  # noqa: E402
 
@@ -97,7 +98,7 @@ def _has_docker() -> bool:
 
 
 def _has_daytona() -> bool:
-    return bool(DAYTONA_API_KEY and OAUTH_TOKEN)
+    return bool(DAYTONA_API_KEY)
 
 
 def _has_modal() -> bool:
@@ -112,7 +113,7 @@ def _has_modal() -> bool:
     except ImportError:
         return False
     modal_toml = os.path.expanduser("~/.modal.toml")
-    return bool(OAUTH_TOKEN) and os.path.exists(modal_toml)
+    return os.path.exists(modal_toml)
 
 
 def _has_server() -> bool:
@@ -134,11 +135,11 @@ def _require_provider(provider: str, agent_type: str = "claude") -> None:
             "docker", "daytona", "modal", "unix_local"):
         pytest.skip(f"native runtime: {provider} transport not built")
     if provider == "daytona" and not _has_daytona():
-        pytest.skip("DAYTONA_API_KEY + CLAUDE_CODE_OAUTH_TOKEN required")
+        pytest.skip("DAYTONA_API_KEY required")
     if provider == "docker" and not _has_docker():
         pytest.skip("docker not available")
     if provider == "modal" and not _has_modal():
-        pytest.skip("modal SDK + ~/.modal.toml + CLAUDE_CODE_OAUTH_TOKEN required")
+        pytest.skip("modal SDK + ~/.modal.toml required")
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +158,61 @@ _RUNTIME_DEFAULTS: dict[str, dict] = {
     "claude": {"model": "haiku", "secret_env": "CLAUDE_CODE_OAUTH_TOKEN"},
     "opencode": {"model": "openrouter/anthropic/claude-3.5-haiku",
                  "secret_env": "OPENROUTER_API_KEY"},
+    "codex": {
+        "model": None,
+        "secret_env": "CODEX_ACCESS_TOKEN",
+        "login_file": f"~/{_ACP_LOCAL_LOGIN_FILES['codex']}",
+    },
     # Native: first-party in-server loop, any LiteLLM model. Pinned to a
     # cheap tool-calling model on openrouter.
     "native": {"model": "openrouter/openai/gpt-4o-mini",
                "secret_env": "OPENROUTER_API_KEY"},
 }
+
+
+def _runtime_secrets(provider: str, agent_type: str) -> dict[str, str]:
+    defaults = _RUNTIME_DEFAULTS[agent_type]
+    key = defaults["secret_env"]
+    value = os.environ.get(key) if key else None
+    if key and value:
+        return {key: value}
+
+    # Personal ChatGPT accounts cannot mint CODEX_ACCESS_TOKEN. For remote
+    # Codex goldens, explicitly copy the caller's complete login cache through
+    # the secrets channel; the sandbox supervisor materializes it with mode
+    # 0600 before ACP starts. unix_local keeps its existing host-cache bridge.
+    login_file = defaults.get("login_file")
+    if agent_type == "codex" and provider != "unix_local" and login_file:
+        path = os.path.expanduser(login_file)
+        if os.path.isfile(path):
+            try:
+                raw = Path(path).read_text()
+                parsed = json.loads(raw)
+            except (OSError, json.JSONDecodeError):
+                return {}
+            if isinstance(parsed, dict):
+                return {"CODEX_AUTH_JSON": raw}
+    return {}
+
+
+def _require_runtime_auth(provider: str, agent_type: str) -> None:
+    defaults = _RUNTIME_DEFAULTS[agent_type]
+    if _runtime_secrets(provider, agent_type):
+        return
+    login_file = defaults.get("login_file")
+    if (
+        provider == "unix_local"
+        and login_file
+        and os.path.isfile(os.path.expanduser(login_file))
+    ):
+        return
+    key = defaults["secret_env"]
+    if key is None:
+        return
+    pytest.skip(
+        f"{key} or a valid local login cache required for "
+        f"{agent_type} on {provider}"
+    )
 
 
 async def _quick_session(
@@ -175,14 +226,16 @@ async def _quick_session(
     # ``model`` body field is forwarded via ``set_model`` after the
     # SandboxSession is up.
     defaults = _RUNTIME_DEFAULTS[agent_type]
+    _require_runtime_auth(provider, agent_type)
     body: dict = {
         "provider": provider,
         "agent_type": agent_type,
-        "model": defaults["model"],
     }
-    secret_val = os.environ.get(defaults["secret_env"])
-    if secret_val:
-        body["secrets"] = {defaults["secret_env"]: secret_val}
+    if defaults["model"]:
+        body["model"] = defaults["model"]
+    secrets = _runtime_secrets(provider, agent_type)
+    if secrets:
+        body["secrets"] = secrets
     sess = await sdk.create_session(**body)
     # Register for autouse-fixture teardown so the daytona/docker/local
     # sandbox provisioned by this session is destroyed even if the test
@@ -2995,16 +3048,18 @@ async def test_credential_refresh_task_cancelled_on_cold_recovery(provider, agen
     try:
         async with ApiClient(SERVER) as sdk:
             defaults = _RUNTIME_DEFAULTS[agent_type]
+            _require_runtime_auth(provider, agent_type)
             body: dict = {
                 "provider": provider,
                 "agent_type": agent_type,
-                "model": defaults["model"],
                 "credential_refresh_url": refresh_url,
                 "credential_refresh_token": "golden-cred-token",
             }
-            secret_val = os.environ.get(defaults["secret_env"])
-            if secret_val:
-                body["secrets"] = {defaults["secret_env"]: secret_val}
+            if defaults["model"]:
+                body["model"] = defaults["model"]
+            secrets = _runtime_secrets(provider, agent_type)
+            if secrets:
+                body["secrets"] = secrets
             sess = await sdk.create_session(**body)
             sid = sess["session_id"]
             _CREATED_SESSIONS.append(sid)
@@ -3155,15 +3210,17 @@ async def test_force_delete_volume_tears_down_session_sandboxes(provider, agent_
             vol_id = vol["id"]
 
             defaults = _RUNTIME_DEFAULTS[agent_type]
+            _require_runtime_auth(provider, agent_type)
             body: dict = {
                 "provider": provider,
                 "agent_type": agent_type,
-                "model": defaults["model"],
                 "volume_id": vol_id,
             }
-            secret_val = os.environ.get(defaults["secret_env"])
-            if secret_val:
-                body["secrets"] = {defaults["secret_env"]: secret_val}
+            if defaults["model"]:
+                body["model"] = defaults["model"]
+            secrets = _runtime_secrets(provider, agent_type)
+            if secrets:
+                body["secrets"] = secrets
             sess = await sdk.create_session(**body)
             sid = sess["session_id"]
             _CREATED_SESSIONS.append(sid)
@@ -3495,4 +3552,3 @@ async def test_wedged_reattach_cold_recovers_not_500(provider):
                 f"[{provider}] recovery must cold-create a FRESH sandbox (the "
                 f"wedged one was abandoned); ref unchanged: "
                 f"{ref_before!r} -> {ref_after!r}")
-

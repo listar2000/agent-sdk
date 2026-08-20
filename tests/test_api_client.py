@@ -355,6 +355,16 @@ async def test_get_session_log_limit_and_unwraps_events():
     assert dict(rec.last.url.params) == {"limit": "100"}
 
 
+@pytest.mark.asyncio
+async def test_get_session_trajectory():
+    rec = _Recorder({"schema_version": "ATIF-v1.7", "steps": []})
+    async with _make_client(rec) as sc:
+        trajectory = await sc.get_session_trajectory("s1")
+    assert trajectory["schema_version"] == "ATIF-v1.7"
+    assert rec.last.method == "GET"
+    assert rec.last.url.path == "/sessions/s1/trajectory"
+
+
 # ---------------------------------------------------------------------------
 # Sessions runtime
 # ---------------------------------------------------------------------------

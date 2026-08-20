@@ -1,11 +1,10 @@
 """Shared ACP runtime parametrization for end-to-end tests.
 
-Tests that drive a real ``Agent`` end-to-end need to cover both ``claude``
-(claude-agent-acp + Anthropic OAuth) and ``opencode`` (opencode CLI +
-OpenRouter API key). The choice of runtime + model + cred-env-var is
-coupled, so this module exposes a single parametrize decorator that
-yields valid (agent_type, model, secrets) triples for whichever
-runtimes have credentials configured locally.
+Tests that drive a real ``Agent`` end-to-end cover ``claude``
+(claude-agent-acp + Anthropic OAuth), ``opencode`` (OpenRouter), and ``codex``
+(the host's ``codex login`` session on unix_local). The choice of runtime,
+model, and authentication is coupled, so this module exposes parametrizers
+that yield valid triples for whichever runtimes are configured locally.
 
 Usage::
 
@@ -27,6 +26,7 @@ from __future__ import annotations
 import os
 
 import pytest
+from api.providers._shared import _ACP_LOCAL_LOGIN_FILES
 
 
 _PARAMS: list = []
@@ -73,6 +73,28 @@ else:
         )
     )
 
+_codex_login = os.path.isfile(os.path.expanduser(
+    f"~/{_ACP_LOCAL_LOGIN_FILES['codex']}"
+))
+if _codex_login:
+    _PARAMS.append(
+        pytest.param(
+            {
+                "agent_type": "codex",
+                "model": None,
+            },
+            id="codex",
+        )
+    )
+else:
+    _PARAMS.append(
+        pytest.param(
+            None,
+            id="codex",
+            marks=pytest.mark.skip(reason="local codex login not found"),
+        )
+    )
+
 
 acp_runtime_param = pytest.mark.parametrize("acp_runtime", _PARAMS)
 
@@ -94,6 +116,17 @@ _AT_PARAMS.append(
         "opencode",
         id="opencode",
         marks=([] if _openrouter else [pytest.mark.skip(reason="OPENROUTER_API_KEY not set")]),
+    )
+)
+_AT_PARAMS.append(
+    pytest.param(
+        "codex",
+        id="codex",
+        marks=(
+            []
+            if _codex_login
+            else [pytest.mark.skip(reason="local codex login not found")]
+        ),
     )
 )
 

@@ -1,0 +1,11 @@
+# Runtime dependencies are installed from lockfiles inside the image. Host
+# environments only inflate the build context and can shadow reproducible installs.
+node_modules/
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

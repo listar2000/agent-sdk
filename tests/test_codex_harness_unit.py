@@ -47,7 +47,7 @@ def test_set_thought_level_config_id_routes_by_agent_type():
 
     asyncio.run(go())
     assert captured[0][1]["configId"] == "reasoning_effort" and captured[0][1]["value"] == "high"  # codex
-    assert captured[1][1]["configId"] == "thinking"  # claude / default
+    assert captured[1][1]["configId"] == "effort"  # pinned claude-agent-acp
 
 
 def test_extract_done_usage_probes_common_locations():

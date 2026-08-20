@@ -344,6 +344,11 @@ class ApiClient:
             return data.get("events") or []
         return data or []
 
+    async def get_session_trajectory(self, session_id: str) -> dict[str, Any]:
+        """``GET /sessions/{id}/trajectory`` — ATIF v1.7 export of the
+        complete persisted session log."""
+        return await self._json("GET", f"/sessions/{session_id}/trajectory")
+
     async def delete_session(self, session_id: str) -> None:
         """``DELETE /sessions/{id}`` — release the pool lease, destroy
         the underlying sandbox, and drop the session row. Idempotent:

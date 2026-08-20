@@ -33,7 +33,7 @@ class AgentConfig:
     # set_mode / set_thought_level. Keep model on its own field above
     # for back-compat (it predates this group).
     mode: str | None = None              # "default" | "plan" | "bypassPermissions" | "acceptEdits" | ...
-    thought_level: str | None = None     # "low" | "medium" | "high" — Claude's "thinking" config_id
+    thought_level: str | None = None     # "low" | "medium" | "high" — runtime effort option
 
     # Native-runtime spec passthrough (agent_type="native" only): the loop's
     # own knobs — instructions, max_turns, temperature, max_tokens,

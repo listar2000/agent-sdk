@@ -65,6 +65,13 @@ NATIVE = "native"  # first-party in-server loop (not an ACP CLI)
 
 AGENT_TYPES = frozenset({CLAUDE, CODEX, OPENCODE, GEMINI, CLINE, DEEPAGENTS, OPENHANDS, GOOSE, NATIVE})
 
+# Public ``oauth_token=`` stays harness-neutral. Each runtime owns the
+# environment variable through which it accepts that token.
+_OAUTH_SECRET_ENV_BY_AGENT_TYPE = {
+    CLAUDE: "CLAUDE_CODE_OAUTH_TOKEN",
+    CODEX: "CODEX_ACCESS_TOKEN",
+}
+
 # ── Provider constants ──
 UNIX_LOCAL = "unix_local"
 DOCKER = "docker"
@@ -415,7 +422,7 @@ class Session:
         via ``ev["type"]``, ``ev["text"]``, etc.
 
         Event types: ``text``, ``reasoning``, ``tool``, ``tool_result``,
-        ``usage``, ``done`` (terminal).
+        ``usage``, ``commands``, ``session_info``, and ``done`` (terminal).
 
         Raises ``PromptError`` on a server error frame, ``StreamError`` on
         connection loss.
@@ -577,6 +584,34 @@ class Session:
         await self.aclose()
 
 
+def _read_codex_auth_json() -> str | None:
+    """Return a validated Codex login cache supplied through the environment.
+
+    ``CODEX_AUTH_JSON`` contains the JSON directly. ``CODEX_AUTH_JSON_FILE``
+    points at a local cache file, normally ``~/.codex/auth.json``. Invalid or
+    unreadable input fails at client construction instead of surfacing later as
+    an opaque ACP authentication error.
+    """
+    raw = os.environ.get("CODEX_AUTH_JSON")
+    source = "CODEX_AUTH_JSON"
+    if not raw:
+        path = os.environ.get("CODEX_AUTH_JSON_FILE")
+        if not path:
+            return None
+        source = f"CODEX_AUTH_JSON_FILE={path}"
+        try:
+            raw = Path(path).expanduser().read_text()
+        except OSError as exc:
+            raise ValueError(f"could not read {source}: {exc}") from exc
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{source} is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{source} must be a JSON object")
+    return raw
+
+
 class Agent:
     """Agent client — spec/factory + default session.
 
@@ -680,8 +715,8 @@ class Agent:
         # session/new, immutable for that session's lifetime.
         self.extra_options = dict(extra_options) if extra_options else None
         # Thinking depth ('low'|'medium'|'high'). Rides config_data (in
-        # _CLONABLE_FIELDS); the server replays it as configId "reasoning_effort"
-        # for codex, "thinking" for claude (see acp_client.set_thought_level).
+        # _CLONABLE_FIELDS); the server resolves the ACP runtime's advertised
+        # effort option and replays it after session creation/recovery.
         self.thought_level = thought_level
         self._user_secrets: dict[str, str] = dict(secrets) if secrets else {}
 
@@ -689,19 +724,40 @@ class Agent:
             api_url = os.environ.get("AGENT_API_URL", "https://agent-sdk-server-production.up.railway.app")
         self._api_url = api_url
 
-        # Resolve per-user Claude credentials. Priority: explicit arg > env var.
-        # Cred caching / interactive login happens elsewhere (e.g. hive server);
-        # the SDK only forwards what its caller hands it.
-        self._oauth_token = oauth_token or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        # Resolve the runtime's standard OAuth/access-token variable. Priority:
+        # explicit arg > environment. Credential acquisition (including device
+        # login) happens outside the SDK; this layer only forwards the token.
+        self._oauth_secret_env = _OAUTH_SECRET_ENV_BY_AGENT_TYPE.get(
+            self.agent_type,
+            "CLAUDE_CODE_OAUTH_TOKEN",  # backwards compatibility
+        )
+        self._oauth_token = oauth_token or os.environ.get(self._oauth_secret_env)
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        # Codex credentials — forwarded ONLY for agent_type="codex", read from the
-        # client env (honeycomb sources .env before running). CODEX_ACCESS_TOKEN is
-        # a ChatGPT-workspace PAT that codex-core reads natively from the child env
-        # (short-circuits authRequired); CODEX_API_KEY is the OpenAI-API-key fallback.
-        self._codex_access_token = os.environ.get("CODEX_ACCESS_TOKEN") if agent_type == CODEX else None
-        self._codex_api_key = os.environ.get("CODEX_API_KEY") if agent_type == CODEX else None
+        # A complete ~/.codex/auth.json is the credential form used by a personal
+        # ChatGPT login. It wins over PAT/API-key variables because codex-core
+        # otherwise prefers the environment token and can charge a different
+        # workspace than the caller intended. The supervisor materializes the
+        # cache at mode 0600 and removes the transport-only JSON from its env.
+        self._codex_auth_json = _read_codex_auth_json() if agent_type == CODEX else None
+        if self._codex_auth_json:
+            self._oauth_token = None
+            self._codex_access_token = None
+            self._codex_api_key = None
+        else:
+            self._codex_access_token = (
+                os.environ.get("CODEX_ACCESS_TOKEN") if agent_type == CODEX else None
+            )
+            self._codex_api_key = (
+                os.environ.get("CODEX_API_KEY") if agent_type == CODEX else None
+            )
 
-        if (self._oauth_token or self._api_key or self._codex_access_token or self._codex_api_key) and _is_remote_http(self._api_url):
+        if (
+            self._oauth_token
+            or self._api_key
+            or self._codex_access_token
+            or self._codex_api_key
+            or self._codex_auth_json
+        ) and _is_remote_http(self._api_url):
             raise ValueError(
                 f"refusing to send credentials to {self._api_url!r} over plaintext HTTP; "
                 "use https:// or a localhost URL"
@@ -786,13 +842,20 @@ class Agent:
         # User-supplied secrets win; oauth/api fields fill in only if absent.
         secrets: dict[str, str] = dict(self._user_secrets)
         if self._oauth_token:
-            secrets.setdefault("CLAUDE_CODE_OAUTH_TOKEN", self._oauth_token)
+            secrets.setdefault(self._oauth_secret_env, self._oauth_token)
         if self._api_key:
             secrets.setdefault("ANTHROPIC_API_KEY", self._api_key)
         if self._codex_access_token:
             secrets.setdefault("CODEX_ACCESS_TOKEN", self._codex_access_token)
         if self._codex_api_key:
             secrets.setdefault("CODEX_API_KEY", self._codex_api_key)
+        if self._codex_auth_json:
+            secrets.setdefault("CODEX_AUTH_JSON", self._codex_auth_json)
+        if self.agent_type == CODEX and secrets.get("CODEX_AUTH_JSON"):
+            # Cache auth is intentionally exclusive. Shipping a PAT/API key too
+            # changes which account codex-core selects.
+            for key in ("CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"):
+                secrets.pop(key, None)
         return secrets
 
     def _registration_payload(self) -> dict[str, Any]:

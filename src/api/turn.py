@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from .event_buffer import get_batcher
 from .db import log_event
@@ -39,7 +40,24 @@ _EVENT_TYPE_TO_LOG = {
     "usage": EVT_USAGE,
     "error": EVT_ERROR,
     "done": "turn_end",
+    "session_info": "session_info",
 }
+
+# Advertised commands are runtime capability metadata, replayed by the
+# supervisor for every late SSE subscriber. Broadcast them to live SDK/UI
+# consumers, but do not duplicate the same command list in session_log on
+# every prompt.
+_TRANSIENT_EVENT_TYPES = frozenset({"commands"})
+
+# An "empty turn" (clean terminal, zero output, zero errors) almost always
+# means the inner runtime swallowed an upstream failure — e.g. opencode ends
+# the turn cleanly when the provider call 401s on an expired key. Surfacing
+# it as a real error row + broadcast makes those failures loud instead of
+# indistinguishable from "the agent had nothing to say". Opt out with
+# AGENT_SDK_EMPTY_TURN_AS_ERROR=0.
+_EMPTY_TURN_AS_ERROR = os.environ.get(
+    "AGENT_SDK_EMPTY_TURN_AS_ERROR", "1"
+).lower() not in ("0", "false", "no")
 
 
 async def _persist_user_message(
@@ -136,6 +154,10 @@ class TurnRunner:
         raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
         if etype in {"text", "reasoning", "tool", "tool_result"}:
             self.saw_output_event = True
+        elif etype == "session_info":
+            # Session metadata can be the only meaningful result of a command.
+            # Treat it as output rather than fabricating an upstream-error row.
+            self.saw_output_event = True
         elif etype == "error":
             self.saw_error_event = True
         elif etype == "usage":
@@ -147,11 +169,13 @@ class TurnRunner:
                 or raw.get("stopReason")
             )
 
-    def _log_empty_turn_if_needed(self) -> None:
+    def _log_empty_turn_if_needed(self) -> bool:
+        """Detect + WARN on an empty turn. Returns True when the turn was
+        empty so ``run()`` can escalate it to a synthetic error event."""
         if self.saw_output_event or self.saw_error_event:
-            return
+            return False
         if self.terminal_stop_reason is None or self.terminal_stop_reason == "cancelled":
-            return
+            return False
         log.warning(
             "empty prompt turn: session=%s agent=%s rpc=%s "
             "stop_reason=%s usage=%r events=%s message_chars=%d",
@@ -163,6 +187,51 @@ class TurnRunner:
             dict(sorted(self.event_counts.items())),
             len(self.message or ""),
         )
+        return True
+
+    async def _emit_empty_turn_error(self) -> None:
+        """Escalate an empty turn to a real error: persisted EVT_ERROR row +
+        rpc-tagged broadcast, mirroring the execute_prompt failure path.
+
+        The row lands AFTER the turn_end row for the same prompt_id (the
+        ``done`` raw block was already broadcast by execute_prompt before we
+        observed it) — consumers that stop at ``done`` won't see the live
+        frame; the row is the RCA contract. Unlike the failure path, the
+        broadcast is best-effort: this branch is a *successful* turn, and a
+        missing pool (unit tests, teardown) must not turn it into a failure.
+        """
+        msg = (
+            f"empty turn: agent produced no output "
+            f"(stop_reason={self.terminal_stop_reason}) — the runtime likely "
+            "swallowed an upstream error (e.g. expired/invalid provider key)"
+        )
+        await self._write({"type": "error", "message": msg, "kind": "empty_turn"})
+        try:
+            from .metrics import get_metrics
+            await get_metrics().record_error(
+                RuntimeError(msg), category="turn",
+                session_id=self.session.session_id,
+                phase="empty_turn", rpc_id=self.rpc_id)
+        except Exception:
+            pass
+        try:
+            from api.sandbox import get_pool as _gp
+            current = _gp()._active.get(self.session.session_id, self.session)  # noqa: SLF001
+            current._broadcast({
+                "type": "error", "rpc_id": self.rpc_id,
+                "jsonrpc": "2.0", "id": self.rpc_id,
+                "error": {
+                    "code": -32603,
+                    "message": msg,
+                    "data": {"kind": "empty_turn",
+                             "stop_reason": self.terminal_stop_reason},
+                },
+            })
+        except Exception:
+            log.exception(
+                "empty-turn broadcast failed for %s rpc=%s",
+                self.session.session_id, self.rpc_id,
+            )
 
     async def _write(self, event: dict) -> None:
         etype = event.get("type", "event")
@@ -227,6 +296,10 @@ class TurnRunner:
                     self.think_buf.append(event.get("text", ""))
                 elif t == "usage":
                     await self._write(event)
+                elif t in _TRANSIENT_EVENT_TYPES:
+                    # execute_prompt already broadcast the raw ACP block.
+                    # This branch only suppresses repetitive persistence.
+                    continue
                 else:
                     await self._flush_buffers()
                     await self._write(event)
@@ -361,7 +434,8 @@ class TurnRunner:
                         },
                     })
                 else:
-                    self._log_empty_turn_if_needed()
+                    if self._log_empty_turn_if_needed() and _EMPTY_TURN_AS_ERROR:
+                        await self._emit_empty_turn_error()
             finally:
                 # Release the in-flight marker on whichever session is current
                 # (the original, or the replacement after a recovery swap) so

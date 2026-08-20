@@ -1,84 +1,64 @@
-# honeycomb-compat — Railway deploy hand-off
+# honeycomb-compat deployment hand-off
 
-A **standalone agent-sdk server** for **honeycomb seed/task generation**, isolated from the shared
-staging/production servers (which serve other clients). This branch targets the **Daytona** sandbox
-backend. Once deployed, hand the service URL back to the honeycomb team.
+This branch provides the standalone agent-sdk service used by Honeycomb task
+generation. It is intentionally kept separate from shared agent-sdk
+deployments and normally uses Daytona sandboxes.
 
-**Branch base:** `honeycomb-compat` = latest `main` (`774ade1`) + one commit (`feat(modal):
-per-session custom image`). The modal commit is **dormant** on the Daytona path (it only activates for
-`provider=modal` + an explicit `image=`); you do **not** need modal for this deploy.
+The branch is synchronized with `origin/main`; the maintained differences are
+listed in [`docs/honeycomb.md`](docs/honeycomb.md). Honeycomb should continue to
+pin `honeycomb-compat`. A main-to-branch synchronization does not require a
+Honeycomb dependency-pin change.
 
----
+## Railway prerequisites
 
-## Prerequisites
+- A Railway service built from this branch.
+- A Postgres service exposed through `DATABASE_URL`.
+- `DAYTONA_API_KEY` for the Daytona organization that will own the sandboxes.
 
-- A Railway project.
-- A **Postgres** addon in that project (Railway provides `DATABASE_URL`).
-- A **Daytona** account + API key (`DAYTONA_API_KEY`) with quota for the intended concurrency
-  (the runtime snapshot footprint assumes up to ~500 concurrent 1‑vCPU/1‑GiB sandboxes).
+Use the repository `Dockerfile` and `railway.toml`. Keep one uvicorn worker per
+replica because the session pool is process-local. If the service is replicated,
+the load balancer must preserve session affinity.
 
-## Deploy steps
+Copy required values from `.env.example`. Do not place model-provider
+credentials in the service environment; the Honeycomb client sends its own
+credentials through each session's `secrets` payload.
 
-1. **Point Railway at this branch.** The repo already ships `railway.toml` (builds the root
-   `Dockerfile`, `healthcheckPath=/health`, `restartPolicyType=ON_FAILURE`). No build config changes
-   needed.
-2. **Set env vars** — see `.env.example`. Minimum: `DATABASE_URL`, `DAYTONA_API_KEY`. Railway injects
-   `PORT`. **Do NOT set any model credential** (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, …) —
-   the server strips them; the honeycomb client forwards its own OAuth token per session.
-3. **Keep the single uvicorn worker.** The `Dockerfile` runs exactly one worker on purpose (in-memory
-   session pool + a 307 session-affinity lease). Scale only by adding **replicas behind a sticky /
-   consistent-hash LB**, never with `--workers`. At current honeycomb concurrency one worker is ample
-   (measured ~1% CPU / ~160 MB RSS at concurrency 5–6; the limiter is the LLM turn, not the server).
-4. **Give the pod generous RAM** (see the blocker note below).
-5. **Resolve the Daytona snapshot** — the one Daytona-specific gotcha:
-   - **Same Daytona org as staging/production** → snapshot `agent-sdk-46606ca` already exists; the
-     committed `.runtime-snapshot-tag` resolves it. Nothing to do.
-   - **A new/different Daytona org** → that snapshot does **not** exist there. Either run
-     `scripts/release.sh --provider daytona` **under this deployment's `DAYTONA_API_KEY`** (~5 min
-     remote `Image.from_dockerfile` build; it rewrites `.runtime-snapshot-tag`), **or** set
-     `DAYTONA_IMAGE`/`AGENT_SDK_IMAGE` to an image carrying the agent-sdk runtime at
-     `/opt/agent-sdk/runtime` (slower cold-create, no pre-registration). Sandbox creation will fail
-     until one of these is done.
+## Runtime artifact
 
-## Post-deploy verification
+Daytona first resolves `DAYTONA_SNAPSHOT`, then `.runtime-snapshot-tag`. The
+committed default is organization-local: confirm that it exists in the Daytona
+organization used by this deployment. If it does not, either:
 
-- `GET /health` → 200 (liveness only — it peeks the in-memory pool, it does **not** prove the DB).
-- `GET /metrics` **or** `GET /sessions` → 200 with data ⇒ Postgres is wired correctly.
-- The honeycomb team then points `HONEYCOMB_API_URL=https://<this-service>.up.railway.app` (must be
-  **https**) and runs a single-task generation at concurrency 1 to confirm a Daytona sandbox
-  provisions (snapshot resolves) and the agent streams end-to-end.
+1. Build and register a snapshot in that organization with
+   `scripts/release.sh --provider daytona`; or
+2. Set `DAYTONA_IMAGE` or `AGENT_SDK_IMAGE` to an image containing the runtime
+   at `/opt/agent-sdk/runtime`.
 
-## Known blocker — long generation turns (gates *scale*, not the deploy)
+Per-session `image=` values are separate from the default runtime artifact. A
+registered Daytona snapshot name uses the snapshot path; another value is
+treated as a registry image reference. In both cases the selected image must
+already contain the agent-sdk runtime.
 
-Heavy/long generation turns (~16–20 min) can drop with
-`RemoteProtocolError: incomplete chunked read`. **This is not an in-app timeout** — every server/
-sandbox timeout is disabled or 1 h. The cut comes from **Railway's edge proxy** (a total-duration
-response cap, configured in the dashboard, not in this repo) and/or single-worker RAM pressure.
+## Verification
 
-**What you can do at deploy:**
-- **Raise or disable the Railway edge response/duration timeout** for this service (the single most
-  useful lever; it is not in the code).
-- Provision **generous RAM**.
-- To tell which cause it is, run one >15‑min heavy turn and watch the deploy logs: an OOM/restart
-  banner ⇒ memory pressure (give more RAM); the server's own `"[r0] turn done … ms"` line printing
-  *after* the client already errored ⇒ the edge proxy severed the response (raise the edge cap).
+After deployment:
 
-The **durable** fix (submit-then-tail via `POST /sessions/{id}/message` → `rpc_id`, catch up with
-`GET /sessions/{id}/log`) is honeycomb-**client** work tracked separately — the server already
-persists every event and supports that recovery path, so no server change is needed here.
+1. `GET /health` returns 200.
+2. `GET /sessions` returns successfully, proving Postgres is reachable.
+3. Run one Honeycomb generation at concurrency 1 and confirm that a Daytona
+   sandbox provisions, events stream, and the session reaches `done`.
+4. Run one generation with Honeycomb's custom `image=` and `thought_level=`
+   values; confirm the requested runtime and effort were applied.
 
-## Security note
+The server has no application-level authentication. Restrict network access or
+place it behind an authenticating proxy; anyone who can reach it can consume
+sandbox quota.
 
-The server has **no application-level auth** on its endpoints. Anyone who can reach the URL can create
-sessions (spending this deployment's Daytona quota). They cannot use *our* model credentials (the
-client supplies its own OAuth token per session), but treat the URL as sensitive: prefer Railway
-private networking, or front it with an authenticating proxy, if exposure is a concern.
+## Honeycomb contract
 
-## Contract the server must keep honoring (do not break on future bumps)
-
-honeycomb's generation loop depends on: eager `POST /sessions` (`agent_type=claude`,
-`provider=daytona`, `model`, `userProvidedOptions` incl. `outputFormat` json_schema, `secrets`);
-the one-shot `POST /sessions/{id}/message+stream` SSE turn (`text` / `tool_result` with
-`raw.rawInput` incl. `StructuredOutput` / `done` / `error`); root `POST /sessions/{id}/sandbox/exec`
-returning `{stdout,stderr,exit_code}`; and `release` / `DELETE`. Keep the agent-sdk server commit, the
-Daytona snapshot tag, and honeycomb's `uv.lock` SDK pin moving together.
+The service must continue to support eager session creation with `agent_type`,
+`provider`, `model`, `image`, `thought_level`, Claude `extra_options`, and
+per-session `secrets`; persisted streaming events and `/log` recovery; sandbox
+execution; release; and terminal deletion. Keep the service commit, runtime
+artifact, and Honeycomb's branch pin coordinated when any of those boundaries
+change.

@@ -202,3 +202,113 @@ async def test_destroy_same_lifetime_path(isolated_vol_root):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def _write_marker_with_home(
+    vol_root: Path,
+    volume_name: str,
+    ref: str,
+    subpath: str,
+) -> tuple[Path, Path]:
+    volume = vol_root / volume_name
+    (volume / "system" / "sandboxes").mkdir(parents=True, exist_ok=True)
+    home = volume / subpath
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "scratch.txt").write_text("x")
+    marker = volume / "system" / "sandboxes" / f"{ref}.json"
+    lp._write_record(marker, lp._SandboxRecord(
+        ref=ref,
+        pid=0,
+        port=0,
+        node="",
+        supervisor_js="",
+        acp_bin="",
+        base_env={"HOME": str(home)},
+    ))
+    return marker, home
+
+
+@pytest.mark.asyncio
+async def test_destroy_removes_ephemeral_agent_workspace(isolated_vol_root):
+    ref = "local-00000000aaaa"
+    marker, home = _write_marker_with_home(
+        isolated_vol_root, "vol", ref, "agents/agent-1",
+    )
+
+    await lp.destroy_sandbox(
+        ProviderInstance(provider="unix_local", url="", sandbox_ref=ref),
+    )
+
+    assert not home.exists()
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_destroy_keeps_deliberate_workspace_subpath(isolated_vol_root):
+    ref = "local-00000000bbbb"
+    marker, home = _write_marker_with_home(
+        isolated_vol_root, "vol", ref, "workspaces/shared-proj",
+    )
+
+    await lp.destroy_sandbox(
+        ProviderInstance(provider="unix_local", url="", sandbox_ref=ref),
+    )
+
+    assert home.exists()
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_destroy_keeps_workspace_shared_with_sibling(isolated_vol_root):
+    ref_a = "local-00000000cccc"
+    ref_b = "local-00000000dddd"
+    _write_marker_with_home(isolated_vol_root, "vol", ref_a, "agents/shared")
+    _, home = _write_marker_with_home(
+        isolated_vol_root, "vol", ref_b, "agents/shared",
+    )
+
+    await lp.destroy_sandbox(
+        ProviderInstance(provider="unix_local", url="", sandbox_ref=ref_a),
+    )
+    assert home.exists()
+
+    await lp.destroy_sandbox(
+        ProviderInstance(provider="unix_local", url="", sandbox_ref=ref_b),
+    )
+    assert not home.exists()
+
+
+@pytest.mark.asyncio
+async def test_destroy_keep_workspaces_env_opt_out(isolated_vol_root, monkeypatch):
+    monkeypatch.setenv("AGENT_SDK_LOCAL_KEEP_WORKSPACES", "1")
+    ref = "local-00000000eeee"
+    _, home = _write_marker_with_home(
+        isolated_vol_root, "vol", ref, "agents/agent-keep",
+    )
+
+    await lp.destroy_sandbox(
+        ProviderInstance(provider="unix_local", url="", sandbox_ref=ref),
+    )
+
+    assert home.exists()
+
+
+def test_ephemeral_workspace_guards(isolated_vol_root):
+    assert lp._ephemeral_workspace(None) is None
+    empty = lp._SandboxRecord(
+        ref="r", pid=0, port=0, node="", supervisor_js="", acp_bin="",
+    )
+    assert lp._ephemeral_workspace(empty) is None
+
+    outside = isolated_vol_root / "random" / "agents" / "x"
+    outside.mkdir(parents=True)
+    unsafe = lp._SandboxRecord(
+        ref="r",
+        pid=0,
+        port=0,
+        node="",
+        supervisor_js="",
+        acp_bin="",
+        base_env={"HOME": str(outside)},
+    )
+    assert lp._ephemeral_workspace(unsafe) is None

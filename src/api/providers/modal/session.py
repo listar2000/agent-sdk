@@ -16,6 +16,7 @@ import logging
 
 import httpx
 
+from api.acp_client import is_retryable_acp_error
 from api.sandbox.state import ModalSandboxState, SandboxState
 from api.sandbox.supervisor_session import SupervisorSandboxSession
 
@@ -79,7 +80,10 @@ class ModalSandboxSession(SupervisorSandboxSession):
                 return
             except Exception as exc:
                 last_error = exc
-                if attempt >= _ATTACH_RETRY_ATTEMPTS:
+                if (
+                    not is_retryable_acp_error(exc)
+                    or attempt >= _ATTACH_RETRY_ATTEMPTS
+                ):
                     break
                 # Diagnostic: probe /v1/health to distinguish supervisor-dead
                 # (health 0/5xx) from POST-handler-broken (health 200, POST fails).

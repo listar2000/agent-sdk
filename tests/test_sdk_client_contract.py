@@ -59,6 +59,34 @@ def test_registration_payload_puts_oauth_token_in_secrets():
 
 
 @pytest.mark.timeout(5)
+def test_registration_payload_uses_codex_access_token_for_codex_oauth():
+    a = Agent(
+        "x",
+        agent_type="codex",
+        provider="unix_local",
+        api_url="http://localhost:7778",
+        oauth_token="secret-codex-oauth",
+    )
+    p = _payload(a)
+    assert p["secrets"] == {"CODEX_ACCESS_TOKEN": "secret-codex-oauth"}
+    assert "oauth_token" not in p
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in p["secrets"]
+
+
+@pytest.mark.timeout(5)
+def test_codex_oauth_uses_codex_environment(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-token")
+    monkeypatch.setenv("CODEX_ACCESS_TOKEN", "codex-token")
+    a = Agent(
+        "x",
+        agent_type="codex",
+        provider="unix_local",
+        api_url="http://localhost:7778",
+    )
+    assert _payload(a)["secrets"] == {"CODEX_ACCESS_TOKEN": "codex-token"}
+
+
+@pytest.mark.timeout(5)
 def test_registration_payload_puts_api_key_in_secrets():
     """Same contract for ``api_key``."""
     a = Agent("x", provider="unix_local", api_url="http://localhost:7778",
@@ -229,3 +257,61 @@ def test_registration_payload_drops_none_keys(monkeypatch):
     p = _payload(a)
     for k in ("model", "prompt", "tools", "mcp_servers", "skills"):
         assert k not in p, f"{k!r} should be omitted when not set"
+
+
+# ---------------------------------------------------------------------------
+# Codex login cache (personal ChatGPT plan) -> secrets
+# ---------------------------------------------------------------------------
+
+@pytest.mark.timeout(5)
+def test_codex_auth_cache_rides_secrets_and_suppresses_token_vars(monkeypatch, tmp_path):
+    cache = '{"tokens": {"access_token": "personal"}}'
+    auth = tmp_path / "auth.json"
+    auth.write_text(cache)
+    monkeypatch.setenv("CODEX_ACCESS_TOKEN", "at-workspace-pat")
+    monkeypatch.setenv("CODEX_API_KEY", "sk-api")
+    monkeypatch.setenv("CODEX_AUTH_JSON_FILE", str(auth))
+    monkeypatch.delenv("CODEX_AUTH_JSON", raising=False)
+
+    agent = Agent(
+        "x",
+        agent_type="codex",
+        provider="unix_local",
+        api_url="http://localhost:7778",
+    )
+    secrets = _payload(agent)["secrets"]
+    assert secrets["CODEX_AUTH_JSON"] == cache
+    assert "CODEX_ACCESS_TOKEN" not in secrets
+    assert "CODEX_API_KEY" not in secrets
+
+
+@pytest.mark.timeout(5)
+def test_codex_auth_cache_is_agent_scoped_and_fails_loudly(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_AUTH_JSON", '{"tokens": {}}')
+    claude = Agent(
+        "x",
+        agent_type="claude",
+        provider="unix_local",
+        api_url="http://localhost:7778",
+        oauth_token="sk-ant-x",
+    )
+    assert "CODEX_AUTH_JSON" not in _payload(claude)["secrets"]
+
+    monkeypatch.setenv("CODEX_AUTH_JSON", "not json")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        Agent(
+            "x",
+            agent_type="codex",
+            provider="unix_local",
+            api_url="http://localhost:7778",
+        )
+
+    monkeypatch.delenv("CODEX_AUTH_JSON")
+    monkeypatch.setenv("CODEX_AUTH_JSON_FILE", str(tmp_path / "missing.json"))
+    with pytest.raises(ValueError, match="could not read"):
+        Agent(
+            "x",
+            agent_type="codex",
+            provider="unix_local",
+            api_url="http://localhost:7778",
+        )

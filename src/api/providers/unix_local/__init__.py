@@ -26,6 +26,7 @@ from .._shared import (
     ProviderInstance,
     VolumeFileExistsError,
     _ACP_BIN_NAMES,
+    _ACP_LOCAL_LOGIN_FILES,
     _ACP_NPM_SPECS,
     _acp_bin_name,
     _acp_launch_args,
@@ -312,9 +313,14 @@ async def create_sandbox(
             )
         acp_bin_str = system_bin
 
+    login_file = _ACP_LOCAL_LOGIN_FILES.get(agent_type)
+    auth_relpath = Path(login_file) if login_file else None
+
     def _mkhome():
         os.makedirs(home_dir, exist_ok=True)
         os.makedirs(home_dir / ".claude", exist_ok=True)
+        if auth_relpath:
+            os.makedirs(home_dir / auth_relpath.parent, exist_ok=True)
     await asyncio.to_thread(_mkhome)
 
     # Build the supervisor env. The local provider runs the agent as a child of
@@ -334,16 +340,22 @@ async def create_sandbox(
     base_env["CLAUDE_CONFIG_DIR"] = str(home_dir / ".claude")
     base_env["AGENT_SHARED_DIR"] = str(vol / "shared")
 
-    # Bridge the host user's existing Claude credentials into the per-sandbox
-    # CLAUDE_CONFIG_DIR on first start. Makes ``claude setup-token`` done once
-    # on the host flow naturally to every sandbox without re-auth per session.
-    host_cred = Path.home() / ".claude" / ".credentials.json"
-    sandbox_cred = home_dir / ".claude" / ".credentials.json"
-    if host_cred.is_file() and not sandbox_cred.exists():
+    # Bridge a runtime's standard host login into its isolated local HOME.
+    # This is deliberately local-provider-only: auth files never enter a
+    # request, environment variable, repository, image, or remote sandbox.
+    host_auth = Path.home() / auth_relpath if auth_relpath else None
+    sandbox_auth = home_dir / auth_relpath if auth_relpath else None
+    if (
+        host_auth is not None
+        and sandbox_auth is not None
+        and host_auth.is_file()
+        and not sandbox_auth.exists()
+    ):
         try:
-            shutil.copy(host_cred, sandbox_cred)
+            shutil.copy2(host_auth, sandbox_auth)
+            sandbox_auth.chmod(0o600)
         except Exception as e:
-            log.warning("could not bridge host .credentials.json: %s", e)
+            log.warning("could not bridge host auth for %s: %s", agent_type, e)
 
     launch_args = _acp_launch_args(agent_type)
     extra: list[str] = []
@@ -587,13 +599,90 @@ async def stop_sandbox(inst: ProviderInstance) -> None:
     await _kill_and_reap(ref, record)
 
 
+def _keep_workspaces() -> bool:
+    """Return whether terminal deletion should retain local workspaces."""
+    return os.environ.get("AGENT_SDK_LOCAL_KEEP_WORKSPACES", "").lower() in {
+        "1", "true", "yes",
+    }
+
+
+def _ephemeral_workspace(record: _SandboxRecord | None) -> Path | None:
+    """Return HOME only when it is a safe auto-provisioned workspace.
+
+    Eligible paths are ``<volume>/agents/<id>`` and
+    ``<volume>/sessions/<id>``. Named ``workspaces/<name>`` shares and
+    caller-pinned roots are deliberately persistent. Realpath containment and
+    the volume's ``system/`` directory prevent a planted symlink or unrelated
+    directory from becoming a recursive-deletion target.
+    """
+    home = ((record.base_env if record else None) or {}).get("HOME") or ""
+    if not home:
+        return None
+    path = Path(home)
+    if path.parent.name not in {"agents", "sessions"}:
+        return None
+    volume = path.parent.parent
+    if not (volume / "system").is_dir():
+        return None
+    resolved_path = Path(os.path.realpath(path))
+    resolved_volume = Path(os.path.realpath(volume))
+    if resolved_path == resolved_volume or resolved_volume not in resolved_path.parents:
+        return None
+    return path
+
+
+def _workspace_shared_by_other_ref(ref: str, home: Path) -> bool:
+    """Return whether another persisted sandbox record uses the same HOME."""
+    target = os.path.realpath(home)
+    seen: set[str] = set()
+    patterns = (
+        str(_index_dir() / "*.json"),
+        str(_vol_root() / "*" / "system" / "sandboxes" / "*.json"),
+    )
+    for pattern in patterns:
+        for marker in glob.glob(pattern):
+            marker_ref = Path(marker).stem
+            if marker_ref == ref or marker_ref in seen:
+                continue
+            seen.add(marker_ref)
+            try:
+                other = _SandboxRecord(**json.loads(Path(marker).read_text()))
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            other_home = (other.base_env or {}).get("HOME") or ""
+            if other_home and os.path.realpath(other_home) == target:
+                return True
+    return False
+
+
+def _cleanup_workspace(ref: str, record: _SandboxRecord | None) -> None:
+    """Best-effort removal of an unshared, ephemeral local workspace."""
+    if _keep_workspaces():
+        return
+    home = _ephemeral_workspace(record)
+    if home is None:
+        return
+    if _workspace_shared_by_other_ref(ref, home):
+        log.info("local workspace %s kept: shared by another sandbox", home)
+        return
+    try:
+        shutil.rmtree(home)
+        log.info("local workspace removed on destroy: %s", home)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask deletion
+        log.warning("local workspace cleanup failed for %s: %s", home, exc)
+
+
 async def destroy_sandbox(inst: ProviderInstance) -> None:
-    """Kill the supervisor and remove its marker — terminal delete."""
+    """Kill the supervisor and remove its marker and ephemeral workspace."""
     ref = getattr(inst, "sandbox_ref", None)
     if not ref:
         return
     marker, record = await asyncio.to_thread(_load_record, ref)
     await _kill_and_reap(ref, record)
+    # Scan for shared HOME users while this ref's own marker still exists.
+    await asyncio.to_thread(_cleanup_workspace, ref, record)
     await asyncio.to_thread(_clear_record, ref, marker, record)
     port = getattr(inst, "port", None) or (record.port if record else None)
     if port:
@@ -842,29 +931,32 @@ async def reconcile_on_startup() -> None:
         log.warning("unix_local reconcile: live-session query failed: %s", e)
         return
 
-    def _scan() -> list[tuple[str, int | None]]:
+    def _scan() -> list[tuple[str, _SandboxRecord | None]]:
         pattern = str(_vol_root() / "*" / "system" / "sandboxes" / "*.json")
-        out: list[tuple[str, int | None]] = []
+        out: list[tuple[str, _SandboxRecord | None]] = []
         for m in glob.glob(pattern):
             path = Path(m)
             if path.stem in live_refs:
                 continue
             try:
-                pid = int(json.loads(path.read_text()).get("pid", 0)) or None
-            except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
-                pid = None
-            out.append((m, pid))
+                record = _SandboxRecord(**json.loads(path.read_text()))
+            except (FileNotFoundError, json.JSONDecodeError, TypeError):
+                record = None
+            out.append((m, record))
         return out
 
-    for path, pid in await asyncio.to_thread(_scan):
+    for path, record in await asyncio.to_thread(_scan):
+        ref = Path(path).stem
+        pid = record.pid if record else 0
         if pid:
             try:
                 await asyncio.to_thread(os.kill, pid, signal.SIGKILL)
-                log.info("unix_local reconcile: killed orphan pid=%d ref=%s", pid, Path(path).stem)
+                log.info("unix_local reconcile: killed orphan pid=%d ref=%s", pid, ref)
             except ProcessLookupError:
                 pass
             except Exception as e:
                 log.warning("unix_local reconcile: kill pid=%d failed: %s", pid, e)
+        await asyncio.to_thread(_cleanup_workspace, ref, record)
         try:
             await asyncio.to_thread(os.remove, path)
         except FileNotFoundError:

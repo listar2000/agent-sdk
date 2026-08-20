@@ -10,10 +10,9 @@ Provider coverage
 
 claude-code    First-class. Full merge semantics characterized (stub vs real,
                FIFO ordering, mid-tool-loop boundary, late-interrupt window).
-codex          First-class for single-prompt and strict-sequential only.
-               Concurrent prompts are broken at the codex ACP adapter layer:
-               codex emits only ONE terminal per session, tagged to the first
-               rpc_id, regardless of how many prompts were submitted.
+codex          First-class for single-prompt and strict-sequential use. The
+               server keeps one prompt active per session, so concurrent
+               callers must serialize or use sibling sessions.
 
 Characterized patterns (see docs/api.md for full writeups)
 ---------------------------------------------------------
@@ -42,10 +41,7 @@ Characterized patterns (see docs/api.md for full writeups)
 6. Codex behaves differently from claude on several dimensions:
    - Terminals always carry `usage: {}` (empty dict), not zero-valued
    - usage_update carries `cost: null` instead of claude's `{amount, currency}`
-   - Concurrent prompts do not merge — only one terminal is emitted per
-     session, tagged to the first submitted rpc_id
-   - The model answers the LATEST prompt but the response is attributed
-     to the first rpc_id on the wire
+   - Concurrent prompts are rejected by the server's per-session gate
 
 Running
 -------
@@ -57,10 +53,8 @@ in roughly 10-20 minutes. All tests are marked `@pytest.mark.integration`
 and skipped unless invoked with `-m integration`.
 
 Target server URL is controlled by the `ACP_TEST_URL` environment variable
-(default `http://localhost:7778`). The server must have `ANTHROPIC_API_KEY`
-set for claude tests and `OPENAI_API_KEY` set for codex tests. Missing
-credentials or unavailable agents cause the affected tests to skip rather
-than fail.
+(default `http://localhost:7778`). Missing runtime authentication or
+unavailable agents cause the affected tests to skip rather than fail.
 """
 from __future__ import annotations
 
@@ -77,6 +71,7 @@ import pytest_asyncio
 
 from agent_sdk import ApiClient
 from agent_sdk.client import Agent
+from api.providers._shared import _ACP_LOCAL_LOGIN_FILES
 
 BASE_URL = os.environ.get("ACP_TEST_URL", "http://localhost:7778")
 
@@ -212,31 +207,31 @@ def untagged_blocks(envelopes: list) -> list:
 # Runtime helpers
 # ---------------------------------------------------------------------------
 
+_LIVE_RUNTIME_REQUIREMENTS = {
+    "codex": {
+        "opt_in_env": "RUN_CODEX_TESTS",
+        "login_file": f"~/{_ACP_LOCAL_LOGIN_FILES['codex']}",
+    },
+}
+
+
 async def _try_create_agent(agent_type: str, name: str) -> Agent | None:
     """Return a registered Agent, or None if the provider failed to initialize.
 
     Returns None instead of raising so fixtures can call pytest.skip() cleanly
-    when a provider requires credentials the server doesn't have (e.g. codex
-    needs OPENAI_API_KEY, opencode needs ACP Phase 7).
+    when a provider requires credentials the server doesn't have.
 
-    Codex tests are opt-in: they need a working OPENAI_API_KEY with quota,
-    which most dev environments don't have. Set ``RUN_CODEX_TESTS=1`` to
-    enable them. Without that flag, codex tests skip cleanly rather than
-    failing with "no terminal arrived" (the symptom of an OpenAI auth or
-    quota error from the spawned codex-acp).
+    Runtime-specific opt-ins and local login requirements are data-driven.
     """
-    secrets: dict[str, str] = {}
-    if agent_type == "codex":
-        if os.environ.get("RUN_CODEX_TESTS") != "1":
+    requirements = _LIVE_RUNTIME_REQUIREMENTS.get(agent_type)
+    if requirements:
+        if os.environ.get(requirements["opt_in_env"]) != "1":
             return None
-        key = os.environ.get("OPENAI_API_KEY")
-        if not key:
+        if not os.path.isfile(os.path.expanduser(requirements["login_file"])):
             return None
-        secrets["OPENAI_API_KEY"] = key
     try:
         agent = Agent(
             name, provider="unix_local", api_url=BASE_URL, agent_type=agent_type,
-            secrets=secrets or None,
         )
         await asyncio.wait_for(agent._ensure_registered(), timeout=20.0)
         return agent
@@ -362,7 +357,7 @@ async def codex_agent(request):
     agent = await _try_create_agent("codex", name)
     if agent is None:
         pytest.skip(
-            "codex agent not available (check server, codex install, and OPENAI_API_KEY)"
+            "codex agent not available (check server, codex install, and auth)"
         )
     yield agent
     await _full_cleanup(agent)
@@ -595,13 +590,9 @@ class TestCodexCharacterization:
     async def test_concurrent_submission_rejected_with_409(self, codex_agent):
         """The codex adapter rejects concurrent submissions with HTTP 409.
 
-        Codex's codex-acp adapter cannot handle more than one prompt per
-        ACP session — even sequential submissions on the same session leave
-        the second prompt orphaned (no terminal, no content). So instead of
-        attempting a server-side workaround, our CodexAdapter enforces a
-        strict one-prompt-at-a-time rule via the agent_busy gate (stricter
-        than claude: the interrupt flag does NOT bypass for codex). Clients
-        must serialize their submissions themselves.
+        Agent SDK enforces a strict one-prompt-at-a-time contract per session.
+        Clients that need concurrency should use sibling sessions rather than
+        racing two prompts through the same ACP session.
         """
         agent = codex_agent
         # Submit A directly via the client's _post_message to kick it off,
